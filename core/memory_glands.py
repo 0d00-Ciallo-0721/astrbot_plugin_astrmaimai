@@ -53,19 +53,23 @@ class MemoryGlands:
         recent_chat = context_messages[-6:]
         
         # 2. 让 LLM 判断是否需要检索 (Self-Questioning)
-        # 使用简单的 Prompt
+        # 使用简单的 Prompt (已汉化)
         check_prompt = [
             {"role": "system", "content": """
-Analyze the chat history. Does the user refer to past events, names, or specific details that are NOT in the current context?
-If YES, formulate a short search query.
-If NO, output "NO".
-Format: just the query or "NO".
+分析对话历史。用户是否提到了当前上下文中**未出现**的“过去事件”、“特定名称”或“具体细节”？
+(即：如果不查阅记忆，是否无法完全理解用户在说什么？)
+
+- 如果是 (YES)：请生成一个简短的**搜索查询语句 (Query)**。
+- 如果否 (NO)：请直接输出 "NO"。
+
+格式要求：仅输出查询语句或 "NO"，不要包含任何解释。
             """.strip()},
             {"role": "user", "content": str(recent_chat)}
         ]
         
         query = await self.api_utils.chat_simple(check_prompt)
         
+        # 保持 "NO" 的判断逻辑不变
         if not query or "NO" in query.upper() or len(query) > 50:
             return "" # 无需检索
             
@@ -77,12 +81,12 @@ Format: just the query or "NO".
         if not memories:
             return ""
             
-        # 4. 格式化结果
-        result_text = "Related Memories:\n"
+        # 4. 格式化结果 (标题汉化)
+        result_text = "[检索到的相关记忆]:\n"
         for i, mem in enumerate(memories):
             # 简单的相关性过滤
             if mem['score'] < 0.01: continue 
-            result_text += f"{i+1}. {mem['content']} (Score: {mem['score']:.2f})\n"
+            result_text += f"{i+1}. {mem['content']} (置信度: {mem['score']:.2f})\n"
             
         return result_text
 
