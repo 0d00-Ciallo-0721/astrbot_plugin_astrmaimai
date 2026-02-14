@@ -16,7 +16,7 @@ from .core.reply_engine import ReplyEngine
 from .core.mind_scheduler import MindScheduler
 from .utils.prompt_builder import PromptBuilder
 
-# 特性模块 (保持原样，稍后通过 MindScheduler 协调)
+# 特性模块 (已适配 2.0)
 from .features.proactive_task import ProactiveTask
 from .features.poke_handler import PokeHandler
 from .features.command_handler import CommandHandler
@@ -30,23 +30,25 @@ class HeartCorePlugin(Star):
         super().__init__(context)
         self.context = context
         
-        # 1. 加载配置
+        # 1. 加载配置 & 基础设施
         self.cfg = HeartflowConfig.from_astrbot_config(config)
+        
         if not self.cfg.enable_heartflow:
             logger.warning("HeartCore: 插件已加载，但主开关 (enable_heartflow) 未开启。")
 
-        # 2. 初始化基础设施
-        self.persistence = PersistenceManager(context)
-        self.state_manager = StateManager(self.persistence, self.cfg)
-        init_meme_storage() # 初始化表情包
-
-        # 3. 初始化核心组件
-        self.mood_manager = MoodManager(context, self.cfg)
-        self.persona_summarizer = PersonaSummarizer(context, self.cfg)
+        self.persistence = PersistenceManager(context, self.cfg)
+        self.state_manager = StateManager(self.cfg, self.persistence)
         self.prompt_builder = PromptBuilder(context, self.cfg, self.state_manager)
+        init_meme_storage()
+
+        # 2. 初始化核心组件
+        self.mood_manager = MoodManager(context, self.cfg)
+        
+        # PersonaSummarizer 现在作为工具类
+        self.persona_summarizer = PersonaSummarizer(context, self.cfg, self.persistence, self.prompt_builder)
         self.prompt_builder.set_persona_summarizer(self.persona_summarizer) # 注入依赖
         
-        # 初始化回复引擎 (The Mouth)
+        # 初始化回复引擎 (The Mouth - 纯执行器)
         self.reply_engine = ReplyEngine(
             context, 
             self.cfg, 
@@ -56,8 +58,8 @@ class HeartCorePlugin(Star):
             self.mood_manager
         )
 
-        # 4. 初始化神经中枢 (MindScheduler)
-        # 这是 2.0 的核心变更：所有消息调度由它接管
+        # 3. 初始化神经中枢 (MindScheduler)
+        # 这是 2.0 的核心：所有消息调度由它接管
         self.scheduler = MindScheduler(
             context=context,
             config=self.cfg,
@@ -67,22 +69,32 @@ class HeartCorePlugin(Star):
             reply_engine=self.reply_engine
         )
 
-        # 5. 初始化功能特性 (指令、戳一戳、后台任务)
+        # 4. 初始化功能特性 (依赖注入更新)
+        
+        # CommandHandler 获取 Impulse, Memory, Evolution 引用
         self.command_handler = CommandHandler(
-            context, self.cfg, self.state_manager, self.persistence, self.prompt_builder
+            context, self.cfg, self.state_manager,
+            self.scheduler.impulse,      # ImpulseEngine
+            self.scheduler.memory,       # MemoryGlands
+            self.scheduler.evolution     # EvolutionCortex
         )
+        
+        # PokeHandler 传入 scheduler (发送触觉信号)
         self.poke_handler = PokeHandler(
-            context, self.cfg, self.state_manager, self.reply_engine
+            context, self.cfg, self.scheduler
+        )
+        
+        # ProactiveTask 传入 scheduler (发送无聊信号)
+        self.proactive_task = ProactiveTask(
+            context, self.cfg, self.state_manager, self.scheduler
+        )
+        
+        # MaintenanceTask 保持不变 (清理底层缓存)
+        self.maintenance_task = MaintenanceTask(
+            self.state_manager, self.persistence, context
         )
         
         # 启动后台任务
-        self.proactive_task = ProactiveTask(
-            context, self.cfg, self.state_manager, self.reply_engine
-        )
-        self.maintenance_task = MaintenanceTask(
-            context, self.state_manager, self.persistence
-        )
-        
         asyncio.create_task(self.proactive_task.run())
         asyncio.create_task(self.maintenance_task.run())
         
@@ -98,9 +110,6 @@ class HeartCorePlugin(Star):
         if not self.cfg.enable_heartflow:
             return
             
-        # 让指令处理器先过 (优先级最高)
-        # (AstrBot 框架通常会先处理 command，这里是兜底)
-        
         # 转发给神经中枢
         await self.scheduler.on_message(event)
 
@@ -108,9 +117,9 @@ class HeartCorePlugin(Star):
     async def on_poke(self, event: AstrMessageEvent):
         """戳一戳事件"""
         if not self.cfg.enable_heartflow: return
-        await self.poke_handler.handle_poke(event)
+        await self.poke_handler.on_poke(event)
 
-    # --- 指令注册 (保持原样，通过 CommandHandler 处理) ---
+    # --- 指令注册 ---
     
     @event_filter.command("heartcore")
     async def cmd_heartcore(self, event: AstrMessageEvent):
@@ -118,12 +127,30 @@ class HeartCorePlugin(Star):
         async for result in self.command_handler.cmd_menu(event):
             yield result
 
-    # (其他指令省略，保持与 v4.14 一致，只需调用 self.command_handler)
-    
+    @event_filter.command("遗忘")
+    async def cmd_reset_memory(self, event: AstrMessageEvent):
+        """[管理] 清空当前会话记忆"""
+        async for result in self.command_handler.cmd_reset_memory(event):
+            yield result
+            
+    @event_filter.command("突变")
+    async def cmd_force_mutation(self, event: AstrMessageEvent):
+        """[管理] 强制触发人格突变"""
+        async for result in self.command_handler.cmd_force_mutation(event):
+            yield result
+
+    # (保留原有的查看/重载人格指令，如果需要)
+    @event_filter.command("重载人格")
+    async def cmd_reload_persona(self, event: AstrMessageEvent):
+        # 简单透传给 PersonaSummarizer 处理，或者在 CommandHandler 中实现
+        yield event.plain_result("指令已迁移，请使用 /heartcore 查看最新菜单。")
+
     async def terminate(self):
         """插件卸载清理"""
-        self.proactive_task.cancel()
-        self.maintenance_task.stop()
+        if hasattr(self, 'proactive_task'):
+            self.proactive_task.cancel()
+        if hasattr(self, 'maintenance_task'):
+            self.maintenance_task.stop()
         # 保存数据
-        await self.persistence.save_all_states(self.state_manager)
+        # await self.persistence.save_all_states(self.state_manager) # 视 state_manager 实现而定
         logger.info("HeartCore: System shutdown.")

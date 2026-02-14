@@ -16,7 +16,7 @@ from ..datamodels import BrainActionPlan, ChatState, UserProfile
 from ..config import HeartflowConfig
 from ..core.state_manager import StateManager
 from ..persistence import PersistenceManager
-
+from .time_utils import get_relative_time_str
 
 if TYPE_CHECKING:
     from ..features.persona_summarizer import PersonaSummarizer
@@ -770,3 +770,40 @@ JSON 格式要求 (JSON Format):
         ]
         
         return messages
+
+
+    async def get_reply_prompt(self, event, instruction: str) -> list:
+        """
+        (v2.0) 构建回复生成 Prompt (由指令驱动)
+        """
+        base_persona = self._get_persona_prompt()
+        
+        # 将提示词部分翻译为中文，保持结构严谨
+        system = f"""
+{base_persona}
+
+[来自大脑的任务指令]
+{instruction}
+
+[回复约束]
+- 表达自然、口语化，多使用短句。
+- 严禁输出 'Assistant:' 或 '助手:' 等前缀。
+- 如果需要执行肢体动作或表情，请使用括号包裹，例如：(挥手)。
+"""
+        # 这里为了简化，暂时只返回 system，实际应包含历史记录
+        # 在 Phase 3 中我们会完善 context 组装
+        return [{"role": "system", "content": system}]
+
+    # [新增] 时间感知历史构建
+    def _build_time_aware_history(self, events: list) -> list:
+        """
+        (v2.0) 构建带相对时间戳的历史记录
+        """
+        formatted = []
+        for evt in events:
+            # 假设 evt 是 SensoryInput 对象
+            rel_time = get_relative_time_str(evt.timestamp)
+            # 中文化历史记录格式：[时间偏移] 发送者: 内容
+            content = f"[{rel_time}] {evt.sender_name}: {evt.text}"
+            formatted.append({"role": "user", "content": content})
+        return formatted

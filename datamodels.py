@@ -22,12 +22,14 @@ class SensoryInput:
 
     @classmethod
     def from_event(cls, event) -> 'SensoryInput':
-        # 简单的图像提取逻辑 (需根据实际 adapter 调整)
+        # 简单的图像提取逻辑
         images = []
         if hasattr(event, "message_obj") and event.message_obj.message:
             for comp in event.message_obj.message:
                 if comp.type == "image":
-                    images.append(comp.url or comp.file)
+                    # 兼容不同协议适配器的图片字段
+                    url = getattr(comp, "url", None) or getattr(comp, "file", None)
+                    if url: images.append(url)
         
         return cls(
             text=event.message_str or "",
@@ -52,6 +54,7 @@ class ImpulseDecision:
     action: str           # REPLY, WAIT, COMPLETE_TALK, IGNORE
     thought: str          # 内心独白
     goals_update: List[dict] = field(default_factory=list)
+    state_diff: Dict[str, Any] = field(default_factory=dict) # 状态变更 (Energy/Mood)
     params: Dict[str, Any] = field(default_factory=dict) # 如 wait_seconds
 
 @dataclass
@@ -67,7 +70,7 @@ class ChatState:
     
     # --- 2.0 New Fields ---
     current_goals: List[Goal] = field(default_factory=list)
-    current_persona_mutation: str = "" # 当前激活的突变状态 (如 "moody")
+    current_persona_mutation: str = "" # 当前激活的突变状态
     
     # --- Runtime ---
     last_reply_time: float = 0.0
@@ -80,8 +83,8 @@ class ChatState:
     window_remaining: int = 0
     
     # 双池 (2.0 在 MindScheduler 中直接操作这些池)
-    accumulation_pool: List[SensoryInput] = field(default_factory=list) # 改存 SensoryInput
-    background_buffer: List[SensoryInput] = field(default_factory=list) # 改存 SensoryInput
+    accumulation_pool: List[SensoryInput] = field(default_factory=list)
+    background_buffer: List[SensoryInput] = field(default_factory=list)
     
     # 锁
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

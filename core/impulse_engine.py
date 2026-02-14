@@ -1,106 +1,117 @@
 ### 📄 core/impulse_engine.py
-# heartflow/core/impulse_engine.py
-# (HeartCore 2.0 - The ReAct Brain)
-
-import json
+import time
 import asyncio
+from typing import Dict, Any, List
 from astrbot.api import logger
 from astrbot.api.star import Context
 
-from ..datamodels import ImpulseDecision, ChatState
+from ..datamodels import ImpulseDecision, ChatState, SensoryInput
+from ..config import HeartflowConfig
 from ..utils.prompt_builder import PromptBuilder
-from .memory_glands import MemoryGlands
-from .evolution_cortex import EvolutionCortex
+from ..services.llm_helper import LLMHelper
 from .goals import GoalStateMachine
-from ..utils.api_utils import APIUtils # 复用 v4.14 的 API 工具
+# 注意：MemoryGlands 和 EvolutionCortex 将在 Phase 3/4 接入，此处预留接口或接收 None
 
 class ImpulseEngine:
     """
-    冲动引擎 (ImpulseEngine)
-    职责：运行 ReAct 思考循环，管理目标状态机
+    (v2.0) 冲动引擎 (The ReAct Brain)
+    职责：
+    1. 接收感知输入 (Context)
+    2. 执行 ReAct 思考循环 (Think)
+    3. 输出决策与状态变更 (Decide)
     """
     def __init__(self, 
                  context: Context, 
-                 config,
+                 config: HeartflowConfig,
                  prompt_builder: PromptBuilder,
-                 memory_glands: MemoryGlands, 
-                 evolution_cortex: EvolutionCortex):
+                 memory_glands=None, 
+                 evolution_cortex=None):
         self.context = context
         self.config = config
         self.prompt_builder = prompt_builder
+        self.llm_helper = LLMHelper(context)
         self.memory = memory_glands
         self.evolution = evolution_cortex
-        self.api_utils = APIUtils(context) # 复用 API 工具
 
     async def think(self, 
                     session_id: str, 
                     chat_state: ChatState,
-                    context_messages: list) -> ImpulseDecision:
+                    context_inputs: List[SensoryInput]) -> ImpulseDecision:
         """
-        ReAct 核心思考接口
+        核心思考接口
         """
-        # 1. 准备数据
-        # (P3) 记忆检索
-        retrieved_memory = await self.memory.active_retrieve(session_id, context_messages)
-        # (P4) 人格突变
-        persona_mutation = await self.evolution.get_mutation_state(session_id)
-        # 目标状态
-        goals_desc = self._get_goals_desc(chat_state)
+        # 1. 准备上下文数据
+        # (P3/P4 接入点)
+        retrieved_memory = ""
+        if self.memory:
+            # 转换 SensoryInput 为 text list 供检索
+            msgs = [{"role": "user", "content": s.text} for s in context_inputs]
+            retrieved_memory = await self.memory.active_retrieve(session_id, msgs)
+            
+        persona_mutation = ""
+        if self.evolution:
+            persona_mutation = await self.evolution.get_mutation_state(session_id)
 
-        # 2. 构建 Prompt
+        # 恢复目标状态机
+        gsm = GoalStateMachine(chat_state.current_goals)
+        current_goals_desc = gsm.get_goals_description()
+
+        # 2. 构建 Prompt (使用 utils/prompt_builder.py 中的新方法)
+        # 将 SensoryInput 列表转换为 LLM 消息格式 (带时间戳)
+        history_msgs = self.prompt_builder._build_time_aware_history(context_inputs)
+        
         prompt_messages = self.prompt_builder.build_impulse_prompt(
-            context_messages=context_messages,
+            context_messages=history_msgs,
             persona_mutation=persona_mutation,
             retrieved_memory=retrieved_memory,
-            current_goals=goals_desc
+            current_goals=current_goals_desc
         )
 
         # 3. LLM 决策调用
-        # 优先使用配置的 judge_provider (小模型)，如果没有则使用默认
+        # 优先使用配置的 judge_provider
         provider_id = self.config.judge_provider_names[0] if self.config.judge_provider_names else None
         
-        try:
-            # 调用 LLM (要求 JSON)
-            response_data = await self.api_utils.chat_json(
-                prompt_messages, 
-                provider_id=provider_id,
-                retries=self.config.judge_max_retries
-            )
+        decision_data = await self.llm_helper.chat_json(
+            prompt_messages, 
+            provider_id=provider_id,
+            retries=self.config.judge_max_retries
+        )
+
+        # 4. 解析决策与计算状态变更 (State收敛)
+        action = decision_data.get("action", "REPLY") # 默认回复
+        thought = decision_data.get("thought", "I should reply.")
+        goals_update = decision_data.get("goals_update", [])
+        params = decision_data.get("params", {})
+
+        state_diff = {}
+        
+        # 计算精力与心情变更 (副作用剥离)
+        if action == "REPLY":
+            # 扣除精力
+            new_energy = max(0.0, chat_state.energy - 0.05) # 示例数值
+            state_diff["energy"] = new_energy
+            state_diff["last_reply_time"] = time.time()
+            state_diff["total_replies"] = chat_state.total_replies + 1
             
-            # 4. 解析决策
-            if not response_data:
-                raise ValueError("Empty response from LLM")
+            # 如果有目标更新，应用到状态机并保存
+            if goals_update:
+                new_goals = gsm.update_goals(goals_update)
+                state_diff["current_goals"] = new_goals
 
-            decision = ImpulseDecision(
-                action=response_data.get("action", "REPLY"),
-                thought=response_data.get("thought", "I should reply."),
-                goals_update=response_data.get("goals_update", []),
-                params=response_data.get("params", {})
-            )
-            
-            # 5. 更新目标状态机 (Side Effect)
-            self._apply_goal_updates(chat_state, decision.goals_update)
-            
-            return decision
+        elif action == "IGNORE":
+            # 恢复少量精力
+            new_energy = min(1.0, chat_state.energy + 0.01)
+            state_diff["energy"] = new_energy
 
-        except Exception as e:
-            logger.error(f"ImpulseEngine Think Error: {e}", exc_info=True)
-            # 降级策略：默认回复
-            return ImpulseDecision(action="REPLY", thought="System error, fallback to reply.")
+        elif action == "COMPLETE_TALK":
+            # 清空目标
+            gsm.update_goals([{"action": "clear"}])
+            state_diff["current_goals"] = gsm.goals
 
-    def _get_goals_desc(self, state: ChatState) -> str:
-        """从 ChatState 中恢复 GoalStateMachine 并获取描述"""
-        # 这里是一个临时的适配逻辑，实际上 GoalStateMachine 应该挂载在 state 上
-        # 简化处理：每次重建或从 state.current_goals 读取
-        gsm = GoalStateMachine()
-        gsm.goals = state.current_goals
-        return gsm.get_goals_description()
-
-    def _apply_goal_updates(self, state: ChatState, updates: list):
-        """更新 ChatState 中的目标"""
-        if not updates:
-            return
-        gsm = GoalStateMachine()
-        gsm.goals = state.current_goals
-        gsm.update_goals(updates)
-        state.current_goals = gsm.goals # 回写
+        return ImpulseDecision(
+            action=action,
+            thought=thought,
+            goals_update=goals_update,
+            state_diff=state_diff,
+            params=params
+        )

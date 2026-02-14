@@ -13,13 +13,10 @@ class HeartflowConfig:
     
     # 防噪
     enable_noise_control: bool = True
-    reply_composite_threshold: float = 60.0
-    extreme_relevance_trigger: int = 9 # (P2: 将被 ImpulseEngine 的新逻辑替代，暂时保留)
-    energy_soft_filter_limit: float = 0.6
     image_spam_limit: int = 2
     
     # 大脑与生成
-    judge_provider_names: list = field(default_factory=list) # (P2: ImpulseEngine 使用)
+    judge_provider_names: list = field(default_factory=list) # 小模型 (Brain/Impulse)
     summarize_provider_name: str = ""
     humanization_word_count: int = 30
     judge_max_retries: int = 3
@@ -31,7 +28,6 @@ class HeartflowConfig:
     energy_decay_rate: float = 0.05
     energy_recovery_rate: float = 0.02
     score_positive_interaction: float = 2.0
-    max_consecutive_replies: int = 3
     
     # 节流
     enable_throttling: bool = False
@@ -53,19 +49,18 @@ class HeartflowConfig:
     enable_emotion_sending: bool = True
     emotions_probability: int = 50
     emotion_model_provider_name: str = ""
-    mood_decay: float = 0.1
     emotion_mapping: dict = field(default_factory=dict)
     emotion_mapping_string: str = ""
     
     # --- HeartCore 2.0 新增配置 ---
     
-    # P3: 海马体 (LivingMemory)
-    enable_memory_glands: bool = False # 是否启用主动记忆检索
+    # 海马体 (LivingMemory)
+    enable_memory_glands: bool = True # 默认开启主动记忆检索
     memory_importance_threshold: float = 0.6 # 记忆存入阈值
     
-    # P4: 进化皮层 (SelfLearning)
-    enable_evolution: bool = False # 是否启用自我进化
-    persona_mutation_rate: float = 0.1 # 人格突变概率 (0.0 - 1.0)
+    # 进化皮层 (SelfLearning)
+    enable_evolution: bool = True # 默认开启自我进化
+    persona_mutation_rate: float = 0.2 # 人格突变概率 (0.0 - 1.0)
     
     # 视觉感知
     use_native_vision: bool = True # 默认开启原生视觉
@@ -74,13 +69,12 @@ class HeartflowConfig:
 
     @classmethod
     def from_astrbot_config(cls, raw_config: dict):
-        # (保持原有的加载逻辑不变，自动映射新字段)
         instance = cls()
         for key, value in raw_config.items():
             if hasattr(instance, key):
                 setattr(instance, key, value)
         
-        # 处理表情映射 (保持原逻辑)
+        # 处理表情映射
         emotion_json_str = raw_config.get("emotion_descriptions", "{}")
         try:
             if isinstance(emotion_json_str, str):
@@ -88,9 +82,10 @@ class HeartflowConfig:
             elif isinstance(emotion_json_str, dict):
                 instance.emotion_mapping = emotion_json_str
             
-            instance.emotion_mapping_string = "\n".join(
-                [f"- {key}: {desc}" for key, desc in instance.emotion_mapping.items()]
-            )
+            if instance.emotion_mapping:
+                instance.emotion_mapping_string = "\n".join(
+                    [f"- {key}: {desc}" for key, desc in instance.emotion_mapping.items()]
+                )
         except Exception as e:
             logger.error(f"Config Error: {e}")
             

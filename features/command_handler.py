@@ -17,29 +17,36 @@ from ..utils.db_migrate import migrate_legacy_data
 if TYPE_CHECKING:
     from ..features.proactive_task import ProactiveTask
 
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
+from astrbot.api.star import Context
+
+from ..config import HeartflowConfig
+from ..core.state_manager import StateManager
+from ..core.impulse_engine import ImpulseEngine
+from ..core.memory_glands import MemoryGlands
+from ..core.evolution_cortex import EvolutionCortex
+
 class CommandHandler:
     """
-    (v4.14 升级版) 权限指令处理器
-    新增：动态菜单、画像生成指令、ProactiveTask 联动
+    (v2.0) 指令处理器
+    职责：处理管理指令，调试 2.0 组件状态
     """
 
     def __init__(self, 
                  context: Context, 
                  config: HeartflowConfig, 
                  state_manager: StateManager,
-                 persona_summarizer: PersonaSummarizer,
-                 brain_planner: BrainPlanner,
-                 proactive_task: 'ProactiveTask' = None ,
-                 pre_filters = None 
+                 impulse_engine: ImpulseEngine,
+                 memory_glands: MemoryGlands,
+                 evolution_cortex: EvolutionCortex
                  ):
         self.context = context
         self.config = config
         self.state_manager = state_manager
-        self.persona_summarizer = persona_summarizer
-        self.brain_planner = brain_planner
-        self.proactive_task = proactive_task
-        self.pre_filters = pre_filters
-
+        self.impulse = impulse_engine
+        self.memory = memory_glands
+        self.evolution = evolution_cortex
         # 参数别名映射表 (中文指令 -> 配置键名)
         self.ALIAS_MAP = {
             "回复阈值": "reply_composite_threshold",
@@ -50,6 +57,43 @@ class CommandHandler:
             "加分权重": "score_positive_interaction",
             "扣分权重": "score_negative_interaction"
         }
+    async def cmd_reset_memory(self, event: AstrMessageEvent):
+        """/遗忘"""
+        if not self._check_admin(event): return
+        
+        session_id = event.unified_msg_origin
+        # 调用 MemoryGlands 清除 (需实现该接口，或直接操作 underlying engine)
+        # 这里暂时只清除 ChatState 中的短期缓存
+        state = await self.state_manager.get_chat_state(session_id)
+        state.accumulation_pool.clear()
+        state.background_buffer.clear()
+        
+        # 若需清除向量库，需在 MemoryGlands 增加 clear_session 接口
+        # await self.memory.clear_session(session_id)
+        
+        yield event.plain_result("✅ 短期记忆缓冲区已清空。")
+
+    async def cmd_force_mutation(self, event: AstrMessageEvent):
+        """/突变"""
+        if not self._check_admin(event): return
+        
+        session_id = event.unified_msg_origin
+        if self.evolution:
+            # 强制刷新状态
+            # 这里的逻辑取决于 EvolutionCortex 的实现，假设它有 force_refresh
+            # 简单起见，我们直接清除缓存让其下次自动生成
+            if session_id in self.evolution.active_mutations:
+                del self.evolution.active_mutations[session_id]
+            
+            yield event.plain_result("🧬 人格状态缓存已清除，下次对话将触发新突变。")
+        else:
+            yield event.plain_result("❌ 进化皮层未启用。")
+
+    def _check_admin(self, event: AstrMessageEvent) -> bool:
+        sender = event.get_sender_id()
+        if sender in self.config.super_admin_id or sender == self.config.super_admin_id:
+            return True
+        return False
 
     # =================================================================
     # Level 1: 普通用户指令

@@ -1,7 +1,4 @@
 ### 📄 core/goals.py
-# heartflow/core/goals.py
-# (HeartCore 2.0 - Goal State Machine)
-
 import time
 from typing import List, Dict, Optional
 from ..datamodels import Goal
@@ -9,10 +6,10 @@ from ..datamodels import Goal
 class GoalStateMachine:
     """
     目标状态机 (Goal State Machine)
-    维护当前对话的短期目标列表（如：'安抚用户', '询问详情', '结束话题'）。
+    维护当前对话的短期目标列表。
     """
-    def __init__(self):
-        self.goals: List[Goal] = []
+    def __init__(self, goals: List[Goal] = None):
+        self.goals = goals or []
 
     def get_active_goals(self) -> List[Goal]:
         """获取当前活跃目标"""
@@ -27,22 +24,26 @@ class GoalStateMachine:
         desc_list = [f"- {g.description}" for g in active_goals]
         return "\n".join(desc_list)
 
-    def update_goals(self, updates: List[Dict]):
+    def update_goals(self, updates: List[Dict]) -> List[Goal]:
         """
-        根据 LLM 的决策更新目标
+        根据 LLM 的决策更新目标，并返回更新后的列表
         updates 结构示例: 
         [
             {"action": "add", "description": "安慰用户"}, 
-            {"action": "complete", "id": "goal_1"},
+            {"action": "complete", "description": "打招呼"},
             {"action": "clear"} 
         ]
         """
+        if not updates:
+            return self.goals
+
         for op in updates:
             action = op.get("action")
+            description = op.get("description")
             
-            if action == "add":
-                description = op.get("description")
-                if description:
+            if action == "add" and description:
+                # 查重
+                if not any(g.description == description and g.status == "active" for g in self.goals):
                     new_goal = Goal(
                         id=f"g_{int(time.time())}_{len(self.goals)}",
                         description=description
@@ -50,19 +51,13 @@ class GoalStateMachine:
                     self.goals.append(new_goal)
             
             elif action == "complete" or action == "remove":
-                # 简单实现：通过描述或ID匹配（LLM通常更擅长按描述操作）
-                target_desc = op.get("description")
-                target_id = op.get("id")
-                
+                # 模糊匹配描述
                 for g in self.goals:
-                    if (target_id and g.id == target_id) or \
-                       (target_desc and target_desc in g.description):
+                    if description and description in g.description:
                         g.status = "completed" if action == "complete" else "failed"
             
             elif action == "clear":
-                # 结束话题时清空所有目标
                 for g in self.goals:
                     g.status = "completed"
-
-    def clear_all(self):
-        self.goals.clear()
+        
+        return self.goals
