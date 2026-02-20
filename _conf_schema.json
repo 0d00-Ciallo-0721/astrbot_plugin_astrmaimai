@@ -1,98 +1,20 @@
 {
-  "enable_heartflow": {
-    "description": "【总开关】启用心芯 (HeartCore)",
+  "system1_provider_id": {
+    "description": "System 1 (直觉层) 模型 Provider ID",
+    "type": "string",
+    "hint": "用于 Judge 和快速判断的小模型 (e.g., gemma-2b, qwen-turbo)",
+    "_special": "select_provider"
+  },
+  "system2_provider_id": {
+    "description": "System 2 (认知层) 模型 Provider ID",
+    "type": "string",
+    "hint": "用于 Planner 和复杂推理的大模型 (e.g., gpt-4, claude-3-5-sonnet)",
+    "_special": "select_provider"
+  },
+  "debug_mode": {
+    "description": "调试模式",
     "type": "bool",
     "default": false,
-    "hint": "开启后，机器人将获得拟人化灵魂，具备情绪、记忆和主动性。"
-  },
-  "general_pool": {
-    "description": "【全局】通用模型池",
-    "type": "list",
-    "default": [],
-    "hint": "指定用于生成的通用大模型列表。"
-  },
-  "judge_provider_names": {
-    "description": "【大脑】思考模型 (Impulse Engine)",
-    "type": "list",
-    "default": [],
-    "hint": "用于 ReAct 思考和决策的**小模型** (推荐 Gemini-Flash / GPT-3.5 / Haiku)。请务必配置一个响应速度快的模型。"
-  },
-  "enable_memory_glands": {
-    "description": "【2.0 海马体】启用长期记忆检索",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，机器人将具备“回忆”能力，能主动检索过往对话细节 (Vector + BM25)。"
-  },
-  "enable_evolution": {
-    "description": "【2.0 进化皮层】启用自我进化与人格突变",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，机器人会学习用户的说话风格，并随机产生“心情波动”或“特殊状态”。"
-  },
-  "persona_mutation_rate": {
-    "description": "【2.0 进化皮层】人格突变概率",
-    "type": "float",
-    "default": 0.2,
-    "hint": "每次对话开始时，产生随机情绪状态（如“心情低落”、“兴奋”）的概率 (0.0 - 1.0)。"
-  },
-  "bot_nicknames": {
-    "description": "【感知】机器人昵称列表",
-    "type": "list",
-    "default": [],
-    "hint": "当用户消息包含这些昵称时，会增加回复的概率。"
-  },
-  "enable_noise_control": {
-    "description": "【防噪】启用噪音控制",
-    "type": "bool",
-    "default": true,
-    "hint": "自动忽略过短的无意义消息（如“6”、“？”）或刷屏图片。"
-  },
-  "image_spam_limit": {
-    "description": "【防噪】图片刷屏阈值",
-    "type": "int",
-    "default": 2,
-    "hint": "允许连续发送图片的最大数量，超过后将暂时忽略。"
-  },
-  "use_native_vision": {
-    "description": "【视觉】使用 LLM 原生视觉",
-    "type": "bool",
-    "default": true,
-    "hint": "如果你的主模型 (Reply Engine) 支持图片输入 (如 GPT-4o, Gemini)，请开启此项。"
-  },
-  "image_recognition_provider_name": {
-    "description": "【视觉】视觉识别模型 (备用)",
-    "type": "string",
-    "default": "",
-    "hint": "如果主模型不支持视觉，请指定一个专门用于看图的模型 ID。"
-  },
-  "enable_emotion_sending": {
-    "description": "【表达】启用表情包回复",
-    "type": "bool",
-    "default": true,
-    "hint": "根据当前情绪，自动发送表情包。"
-  },
-  "emotion_descriptions": {
-    "description": "【表达】表情包映射配置 (JSON)",
-    "type": "string",
-    "default": "{\n  \"happy\": \"开心/大笑/得意\",\n  \"sad\": \"难过/哭泣/委屈\",\n  \"angry\": \"生气/愤怒/炸毛\",\n  \"surprise\": \"惊讶/震惊/疑惑\",\n  \"fear\": \"害怕/紧张/惊恐\",\n  \"disgust\": \"嫌弃/鄙视/无语/翻白眼\",\n  \"neutral\": \"发呆/平静/面无表情/吃瓜\",\n  \"shy\": \"害羞/脸红/不好意思\",\n  \"tired\": \"累/困/想睡觉/叹气\",\n  \"excited\": \"兴奋/期待/两眼放光/打call/色/好耶\",\n  \"cat\": \"猫猫头/猫咪卖萌\",\n  \"dog\": \"狗狗/修勾\",\n  \"hit\": \"挨打/被揍/求饶/投降\",\n  \"wink\": \"眨眼/kswl/磕到了/姨母笑\"\n}",
-    "hint": "定义情绪标签与表情包文件夹的映射关系。格式为 JSON 字符串。"
-  },
-  "enable_segmentation": {
-    "description": "【拟人化】启用分段发送",
-    "type": "bool",
-    "default": true,
-    "hint": "模拟人类打字，将长回复拆分为多条气泡发送。"
-  },
-  "min_reply_interval": {
-    "description": "【拟人化】最小回复间隔 (秒)",
-    "type": "float",
-    "default": 2.0,
-    "hint": "机器人在回复前的最小“思考/打字”延迟。"
-  },
-  "super_admin_id": {
-    "description": "【权限】超级管理员 ID",
-    "type": "string",
-    "default": "",
-    "hint": "用于执行 /heartcore 菜单中的高级指令。"
+    "hint": "开启后将输出详细的思维链和状态日志"
   }
 }

@@ -1,1 +1,0 @@
-# astrbot_plugin_astrmaimai

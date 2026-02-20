@@ -1,7 +1,5 @@
-numpy
+tenacity
 aiosqlite
+faiss-cpu
+numpy
 scikit-learn
-rank_bm25
-jieba>=0.42.1
-aiosqlite>=0.17.0
-numpy>=1.24.0
