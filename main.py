@@ -32,6 +32,7 @@ class AstrMaiPlugin(Star):
         
         sys1 = config.get('system1_provider_id', 'Unconfigured')
         sys2 = config.get('system2_provider_id', 'Unconfigured')
+        emb_id = config.get('embedding_provider_id', '')
         logger.info(f"[AstrMai] 🚀 Booting... Sys1: {sys1} | Sys2: {sys2}")
 
         # ==========================================
@@ -43,9 +44,10 @@ class AstrMaiPlugin(Star):
         self.gateway = GlobalModelGateway(context, config)
         
         # --- Phase 4: Living Memory Mount ---
+        # [Fix] 传入 embedding_provider_id
+        self.memory_engine = MemoryEngine(context, self.gateway, embedding_provider_id=emb_id)
+        
         self.memory_engine = MemoryEngine(context, self.gateway)
-        # 异步初始化数据库与向量库，并启动清道夫
-        asyncio.create_task(self._init_memory())
 
         # --- Phase 5: Subconscious Evolution Mount ---
         self.evolution = EvolutionManager(self.db_service, self.gateway)
@@ -68,9 +70,32 @@ class AstrMaiPlugin(Star):
         )
         
         logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-5 Mounted).")
-
+    
+    @filter.on_astrbot_loaded()
+    async def on_program_start(self):
+        logger.info("[AstrMai] 🏁 AstrBot Loaded. Starting System Initialization...")
+        
+        # [Fix] 1. 优先初始化基础设施 (DatabaseService)
+        # 即使 MemoryEngine 不直接用它，BM25 或其他组件可能隐式依赖它
+        try:
+            if hasattr(self.db_service, 'initialize'):
+                await self.db_service.initialize()
+                logger.info("[AstrMai] 🗄️ Database Service Initialized.")
+            elif hasattr(self.db_service, 'init'): # 兼容常见的命名
+                await self.db_service.init()
+                logger.info("[AstrMai] 🗄️ Database Service Initialized.")
+        except Exception as e:
+            logger.error(f"[AstrMai] ❌ Database Service Init Failed: {e}")
+            # 数据库失败是致命的，但我们尝试继续以暴露更多问题
+            
+        # 2. 初始化记忆引擎
+        logger.info("[AstrMai] 🧠 Initializing Memory Engine...")
+        await self._init_memory()
+    
     async def _init_memory(self):
         """异步唤醒记忆引擎与后台任务"""
+        # 为了极度稳健，这里甚至可以再 sleep 1秒，但通常 on_astrbot_loaded 已经足够
+        await asyncio.sleep(1) 
         await self.memory_engine.initialize()
         await self.memory_engine.start_background_tasks()
 
@@ -97,6 +122,7 @@ class AstrMaiPlugin(Star):
             "🧠 架构状态: Phase 5 (Evolution Ready)\n"
             f"🔌 Sys1 Provider: {self.config.get('system1_provider_id')}\n"
             f"🔌 Sys2 Provider: {self.config.get('system2_provider_id')}\n"
+            f"🔌 Emb Provider: {self.config.get('embedding_provider_id')}\n"
             "💾 SQLite & Faiss RAG: Connected\n"
             "🌀 Subconscious Miner: Running\n"
             "🛡️ Dual-Process: Active"

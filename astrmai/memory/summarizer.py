@@ -48,25 +48,74 @@ class ChatHistorySummarizer:
         """核心处理逻辑：扫描并压缩过长对话"""
         conv_mgr = self.context.conversation_manager
         
-        # 遍历系统中的所有对话列表
-        conversations = await conv_mgr.get_conversations(unified_msg_origin=None, platform_id=None)
+        try:
+            conversations = await conv_mgr.get_conversations(unified_msg_origin=None, platform_id=None)
+        except Exception as e:
+            logger.error(f"[Memory Summarizer] 获取对话列表失败: {e}")
+            return
         
         for conv in conversations:
-            if not conv.history or len(conv.history) < self.msg_threshold:
+            # [Fix] 安全获取 history 并解析 JSON
+            raw_history = conv.history
+            history_list = []
+            
+            if not raw_history:
+                continue
+
+            # 1. 如果是字符串，尝试解析 JSON
+            if isinstance(raw_history, str):
+                try:
+                    history_list = json.loads(raw_history)
+                except json.JSONDecodeError:
+                    logger.warning(f"[Memory Summarizer] 无法解析历史记录 JSON: {str(raw_history)[:50]}...")
+                    continue
+            # 2. 如果已经是列表，直接使用
+            elif isinstance(raw_history, list):
+                history_list = raw_history
+            else:
+                continue
+
+            if len(history_list) < self.msg_threshold:
                 continue
                 
-            session_id = conv.id
-            logger.info(f"[Memory Summarizer] 发现长对话 (Session: {session_id}), 长度: {len(conv.history)}，开始压缩提取...")
+            # [Fix] 既然 debug 显示属性叫 'cid'，那就直接用它
+            session_id = getattr(conv, "cid", None)
+            
+            # 兜底：如果 cid 也没有，尝试构建
+            if not session_id:
+                if hasattr(conv, "platform_id") and hasattr(conv, "user_id"):
+                    session_id = f"{conv.platform_id}:{conv.user_id}"
+                else:
+                    session_id = "unknown_session"
+            logger.info(f"[Memory Summarizer] 发现长对话 (Session: {session_id}), 长度: {len(history_list)}，开始压缩提取...")
             
             # 提取前 N 条消息文本
             messages_block = ""
-            for idx, msg_dict in enumerate(conv.history[:self.msg_threshold]):
+            for idx, msg_dict in enumerate(history_list[:self.msg_threshold]):
+                # 防御性编程：确保 msg_dict 是字典
+                if isinstance(msg_dict, str):
+                    try:
+                        msg_dict = json.loads(msg_dict)
+                    except:
+                        continue
+                if not isinstance(msg_dict, dict):
+                    continue
+
                 role = msg_dict.get("role", "unknown")
                 content = ""
                 # 解析 AstrBot 的 message part 格式
-                for part in msg_dict.get("content", []):
-                    if isinstance(part, TextPart) or (isinstance(part, dict) and part.get("type") == "text"):
-                        content += getattr(part, 'text', part.get('text', ''))
+                # 兼容 content 可能是字符串的情况 (非标准但可能存在)
+                raw_content = msg_dict.get("content", [])
+                if isinstance(raw_content, str):
+                    content = raw_content
+                elif isinstance(raw_content, list):
+                    for part in raw_content:
+                        if isinstance(part, TextPart) or (isinstance(part, dict) and part.get("type") == "text"):
+                            content += getattr(part, 'text', part.get('text', ''))
+                        # 处理旧版本可能存在的纯文本结构
+                        elif isinstance(part, dict) and 'text' in part:
+                            content += part['text']
+                            
                 messages_block += f"[{idx}] {role}: {content}\n"
 
             # 构造摘要 Prompt
@@ -80,20 +129,29 @@ class ChatHistorySummarizer:
             """
             
             try:
+                # [Debug] 阶段 1: 调用 LLM
+                logger.debug(f"[Memory Summarizer] 正在调用 System 1 进行压缩 (Prompt len: {len(prompt)})...")
                 result = await self.gateway.call_judge(prompt)
                 memories = result.get("memories", [])
                 
-                # 入库
+                if not memories:
+                    logger.debug("[Memory Summarizer] 未提取到有效记忆。")
+                    return
+
+                # [Debug] 阶段 2: 记忆入库
+                logger.info(f"[Memory Summarizer] 提取到 {len(memories)} 条记忆，准备入库...")
+                
                 for memory_text in memories:
                     if memory_text.strip():
+                        # 这里是可能抛出 "Database connection is not initialized" 的地方
                         await self.engine.add_memory(
                             content=memory_text.strip(),
                             session_id=str(session_id)
                         )
                         logger.debug(f"[Memory Summarizer] 💾 已入库长期记忆: {memory_text}")
                 
-                # ⚠ 危险操作：在真实部署中，压缩成功后应使用 conv_mgr 截断历史列表
-                # 这里仅作为提取不删除历史的保守实现
-                
             except Exception as e:
+                # [Debug] 捕获异常并打印堆栈，帮助定位是 Gateway 还是 Engine 报错
+                import traceback
                 logger.error(f"[Memory Summarizer] 压缩对话时发生错误: {e}")
+                logger.error(traceback.format_exc()) # 如果需要更详细堆栈可取消注释
