@@ -66,3 +66,35 @@ class EvolutionManager:
             
             # 4. 标记已处理
             self.db.mark_logs_processed([l.id for l in logs])
+
+
+    async def analyze_and_get_goal(self, chat_id: str, recent_messages: str) -> str:
+        """
+        目标分析器 (Reference: pfc.py GoalAnalyzer)
+        动态分析当前的短期对话意图或目标。
+        """
+        prompt = f"""
+        作为对话意图分析器，请根据最近的对话上下文，用一句话（不超过20个字）总结当前对话的核心目标或主要话题。
+        对话上下文:
+        {recent_messages}
+
+        严格返回 JSON 格式: {{"goal": "string"}}
+        """
+        try:
+            result = await self.miner.gateway.call_judge(prompt)
+            return result.get("goal", "陪伴用户，提供有趣且连贯的对话")
+        except Exception as e:
+            logger.error(f"[Evolution] 目标分析异常: {e}")
+            return "陪伴用户，提供有趣且连贯的对话"
+
+
+    def get_active_patterns(self, chat_id: str, limit: int = 5) -> str:
+        """获取当前群组高频/活跃的黑话和表达句式"""
+        patterns = self.db.get_patterns(chat_id, limit)
+        if not patterns:
+            return "暂无特殊语言风格记录。"
+        
+        lines = []
+        for p in patterns:
+            lines.append(f"- 当【{p.situation}】时 -> 习惯使用表达/黑话：【{p.expression}】")
+        return "\n".join(lines)                    

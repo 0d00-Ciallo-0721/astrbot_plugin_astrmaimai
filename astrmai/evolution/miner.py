@@ -16,7 +16,7 @@ class ExpressionMiner:
 
     async def mine(self, group_id: str, messages: List[MessageLog]) -> List[ExpressionPattern]:
         """
-        执行挖掘任务
+        执行挖掘任务：融合句式与黑话的双重提取 (Reference: expression_learner.py & jargon_miner.py)
         """
         if len(messages) < 10:
             return []
@@ -24,35 +24,29 @@ class ExpressionMiner:
         # 1. 构建 Context
         context_str = self._build_context(messages)
         
-        # 2. 构建 Prompt (源自 Self_Learning)
+        # 2. 构建融合 Prompt
         prompt = f"""
 {context_str}
 
-请从上面这段群聊中概括除了人名为"SELF"之外的人的语言风格
-1. 只考虑文字，不要考虑表情包和图片
-2. 不要涉及具体的人名，但是可以涉及具体名词  
-3. 思考有没有特殊的梗，一并总结成语言风格
-4. 例子仅供参考，请严格根据群聊内容总结!!!
+请从上面这段群聊记录中，分析并概括除了人名为"SELF"（也就是你自己）之外的用户的语言风格和专属黑话。
+任务1（语言风格）：总结特定的表达规律，例如"当[某场景]时，喜欢说[某句话]"。
+任务2（群组黑话）：提取群友发明的特殊词汇、简称或梗，并解释其场景。
 
-注意：总结成如下格式的规律，总结的内容要详细，但具有概括性：
-例如：当"AAAAA"时，可以"BBBBB", AAAAA代表某个具体的场景，不超过20个字。BBBBB代表对应的语言风格，特定句式或表达方式，不超过20个字。
-
-例如：
-当"对某件事表示十分惊叹"时，使用"我嘞个xxxx"
-当"表示讽刺的赞同，不讲道理"时，使用"对对对"
-当"想说明某个具体的事实观点，但懒得明说"时，使用"懂的都懂"
-当"涉及游戏相关时，夸赞，略带戏谑意味"时，使用"这么强！"
-
-请注意：不要总结你自己（SELF）的发言，尽量保证总结内容的逻辑性。
-返回 JSON 格式: [{{"situation": "...", "expression": "..."}}, ...]
+严格返回 JSON 数组格式，每个对象包含 situation（场景/梗的含义）和 expression（表达方式/黑话词汇）：
+[
+    {{"situation": "打招呼或者赞同别人时", "expression": "确实"}},
+    {{"situation": "群友发送好笑的事情时", "expression": "草"}},
+    {{"situation": "用来指代游戏里的某个特定BOSS", "expression": "大鸟"}}
+]
 """
-        # 3. 调用 LLM (使用 System 2 模型以保证质量)
-        # 注意: 这里我们请求 JSON 格式以便于解析
         try:
+            # 借用 System 1 (Judge) 的低成本请求跑离线任务
             raw_result = await self.gateway.call_planner(messages=[{"role": "user", "content": prompt}])
             patterns_data = self._parse_json(raw_result)
             
             patterns = []
+            import time
+            from astrmai.infra.database import ExpressionPattern
             for item in patterns_data:
                 if "situation" in item and "expression" in item:
                     patterns.append(ExpressionPattern(
@@ -66,7 +60,7 @@ class ExpressionMiner:
             return patterns
             
         except Exception as e:
-            logger.error(f"[Evolution] Mining failed: {e}")
+            logger.error(f"[Evolution] 风格与黑话挖掘失败: {e}")
             return []
 
     def _build_context(self, messages: List[MessageLog]) -> str:

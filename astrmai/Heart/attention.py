@@ -82,12 +82,18 @@ class AttentionGate:
         pool = self.focus_pools.get(chat_id)
         if not pool or not pool['queue']:
             return
-
-        messages = list(pool['queue'])
-        pool['queue'].clear() # 清空队列
+            
+        # 提取并清空当前聚合队列
+        events = pool['queue'][:]
+        pool['queue'].clear()
         
-        logger.info(f"[{chat_id}] System 1 -> System 2 ({len(messages)} msgs)")
+        # 合并消息内容 (防抖期间的多条消息视为同一上下文)
+        merged_text = "\n".join([e.message_str for e in events])
+        logger.info(f"[{chat_id}] 聚合了 {len(events)} 条消息, 准备进入 System 2。")
         
-        # 调用 System 2 处理 (Fire and Forget or Await?)
-        # 这里使用 await 确保顺序，但 main.py 中可能是 create_task
-        await self.sys2_process(chat_id, messages)
+        # 选出最后一条事件作为对象载体，并将合并后的文本动态挂载
+        main_event = events[-1]
+        main_event.merged_text = merged_text 
+        
+        if self.sys2_process:
+            await self.sys2_process(main_event)

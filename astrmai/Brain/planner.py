@@ -1,82 +1,43 @@
-import json
-import re
-import time
-from typing import List, Dict, Any, Tuple
-from json_repair import repair_json
-from astrbot.api import logger
+from typing import List
+from astrbot.api.event import AstrMessageEvent
 
 from astrmai.infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
+from .executor import ConcurrentExecutor
+from .tools.pfc_tools import WaitTool, FetchKnowledgeTool
 
 class Planner:
     """
-    规划器 (System 2)
-    职责: CoT 规划, JSON 提取, ReAct 循环
-    Reference: Maibot/brain_planner.py
+    认知总控 (System 2)
+    职责: 统筹编排 System 2。将聚合的消息与环境状态拼装，定义原生工具栈，然后下发给 Executor 驱动智能体循环。
     """
-    def __init__(self, gateway: GlobalModelGateway, context_engine: ContextEngine):
+    def __init__(self, context, gateway: GlobalModelGateway, context_engine: ContextEngine):
         self.gateway = gateway
         self.context_engine = context_engine
+        self.executor = ConcurrentExecutor(context, gateway)
 
-    async def plan(self, 
-                   chat_id: str, 
-                   event_messages: List[Any], # 聚合的消息列表
-                   tools_map: Dict[str, Any]) -> Dict[str, Any]:
+    async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
-        生成行动计划
-        Returns: {
-            "thought": str,
-            "action": "reply" | "tool_use" | "wait",
-            "args": dict
-        }
+        重构后的核心入口：跳过脆弱的手工 ReAct，全面基于 AstrBot Agent。
         """
-        # 1. 构建 Prompt
-        # TODO: 将 event_messages 转换为文本历史
-        context_str = "\n".join([f"{m.get_sender_name()}: {m.message_str}" for m in event_messages])
+        chat_id = event.unified_msg_origin
         
-        # 简单构建 Tool 描述
-        tool_descs = "\n".join([f"- {name}: {info}" for name, info in tools_map.items()])
+        # 1. 消息重组：将防抖队列中积压的消息合并为单个用户 Prompt
+        prompt = "\n".join([f"{m.get_sender_name()}: {m.message_str}" for m in event_messages])
         
-        system_prompt = await self.context_engine.build_prompt(chat_id, [], tool_descs)
+        # 2. 潜意识与动态状态注入 (System Prompt 构建)
+        system_prompt = await self.context_engine.build_prompt(chat_id=chat_id)
         
-        full_prompt = f"{system_prompt}\n\nUser Messages:\n{context_str}\n\nThink and Respond:"
-
-        # 2. 调用 System 2 (Brain)
-        raw_response = await self.gateway.call_planner(
-            messages=[{"role": "user", "content": full_prompt}]
+        # 3. 装配前额叶基建工具 (PFC Actions)
+        pfc_tools = [
+            WaitTool(),
+            FetchKnowledgeTool()
+        ]
+        
+        # 4. 移交并发执行器引爆思考闭环
+        await self.executor.execute(
+            event=event,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tools=pfc_tools
         )
-
-        # 3. 解析响应 (提取 JSON)
-        return self._parse_response(raw_response)
-
-    def _parse_response(self, content: str) -> Dict[str, Any]:
-        """
-        移植自 Maibot BrainPlanner._extract_json_from_markdown
-        """
-        try:
-            # 1. 尝试提取 ```json ... ```
-            match = re.search(r"```json\s*(.*?)\s*```", content, re.DOTALL)
-            json_str = match.group(1) if match else content
-
-            # 2. 修复 JSON
-            json_str = repair_json(json_str)
-            
-            # 3. 解析
-            data = json.loads(json_str)
-            
-            # 兼容列表或字典
-            if isinstance(data, list): data = data[0]
-            
-            return {
-                "thought": data.get("reason", "No thought provided"),
-                "action": data.get("action", "reply"),
-                "args": data
-            }
-
-        except Exception as e:
-            logger.warning(f"[Planner] JSON Parse Failed: {e}. Fallback to direct reply.")
-            return {
-                "thought": "Failed to parse JSON, treating as direct reply.",
-                "action": "reply",
-                "args": {"content": content} # 假设整个内容就是回复
-            }

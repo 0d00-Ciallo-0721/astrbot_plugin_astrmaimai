@@ -14,6 +14,8 @@ class MemoryEngine:
     Reference: LivingMemory/core/managers/memory_engine.py
     """
     def __init__(self):
+        self.context = context
+        self.gateway = gateway
         # 路径配置
         self.data_path = get_astrbot_data_path() / "plugin_data" / "astrmai" / "memory"
         if not os.path.exists(self.data_path):
@@ -24,6 +26,7 @@ class MemoryEngine:
         # 初始化组件占位
         self.vec_db = None
         self.retriever = None
+        self.summarizer = None # 新增：记忆清道夫
 
     async def initialize(self):
         """初始化所有子系统"""
@@ -64,15 +67,28 @@ class MemoryEngine:
         })
 
     async def recall(self, query: str, session_id: str) -> str:
-        """RAG 回调接口"""
-        if not self.retriever: return ""
+        """RAG 回调接口: 将记忆组装为 System 2 友好的上下文"""
+        if not self.retriever: 
+            return "（记忆模块离线）"
         
-        results = await self.retriever.search(query, k=3)
-        # 过滤 session (简单过滤)
-        # 实际应在 VectorRetriever 层面过滤，这里做二次筛选
-        valid_results = [r for r in results if r.metadata.get("session_id") == session_id]
+        # 检索最相关的 5 条记忆片段
+        results = await self.retriever.search(query, k=5)
         
-        if not valid_results: return ""
+        if not results:
+            logger.debug(f"[Memory] 未找到关于 '{query}' 的相关记忆。")
+            return f"你努力在记忆中搜索关于 '{query}' 的事情，但是什么也没想起来。"
+
+        all_results = []
+        for r in results:
+            all_results.append(f"- {r.content}")
+
+        retrieved_memory = "\n".join(all_results)
+        logger.info(f"[Memory] 记忆闪回成功，耗时极短，共检索到 {len(results)} 条相关记忆。")
         
-        context = "\n".join([f"- {r.content}" for r in valid_results])
-        return f"相关记忆:\n{context}"
+        return f"你突然回忆起了以下关于 '{query}' 的相关信息：\n{retrieved_memory}\n（请在后续的回复中，根据当前语境自然地参考这些记忆）"
+    
+    async def start_background_tasks(self):
+        """启动后台记忆清道夫任务 (Task Scheduler)"""
+        from .summarizer import ChatHistorySummarizer
+        self.summarizer = ChatHistorySummarizer(self.context, self.gateway, self)
+        await self.summarizer.start()    

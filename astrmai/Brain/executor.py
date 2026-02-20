@@ -1,50 +1,60 @@
-import asyncio
-from typing import Dict, Any, List
+from typing import Any, List
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from astrbot.core.agent.tool import ToolSet
+from astrmai.infra.gateway import GlobalModelGateway
+from .reply_checker import ReplyChecker
 
 class ConcurrentExecutor:
     """
-    并发执行器 (System 2)
-    职责: 执行 Plan, 调用 Tools, 发送 Reply
-    Reference: Maibot/brain_chat.py (_execute_action)
+    智能体执行器 (System 2)
+    使用 AstrBot 原生 tool_loop_agent 替代原有手写 Action Loop。
     """
-    def __init__(self, context):
+    def __init__(self, context, gateway: GlobalModelGateway):
         self.context = context
+        self.gateway = gateway
+        self.reply_checker = ReplyChecker(gateway)
 
-    async def execute(self, plan: Dict[str, Any], event: AstrMessageEvent):
-        action_type = plan.get("action")
-        args = plan.get("args", {})
+    async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any]):
+        chat_id = event.unified_msg_origin
+        sys2_id = self.gateway.sys2_id
         
-        tasks = []
+        if not sys2_id:
+            logger.error(f"[{chat_id}] System 2 Provider ID 未配置，无法执行动作。")
+            return
 
-        # 1. 并发执行: 文本回复
-        if action_type == "reply" or "reply_text" in args:
-            text = args.get("reply_text") or args.get("content")
-            if text:
-                tasks.append(self._send_reply(event, text))
+        tool_set = ToolSet(tools)
+        logger.info(f"[{chat_id}] 🧠 Brain 启动原生 Agent Loop (Max Steps: 5)...")
 
-        # 2. 并发执行: 工具调用
-        if action_type not in ["reply", "wait", "complete_talk"]:
-            # 假设 action_type 就是工具名
-            tasks.append(self._call_tool(action_type, args, event))
+        try:
+            # 调用 AstrBot 协议中提供的原生 Agent (集成工具调用和多轮反思)
+            llm_resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=sys2_id,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                tools=tool_set,
+                max_steps=5,
+                tool_call_timeout=60
+            )
 
-        # 3. 表情包匹配 (System 1 混入)
-        # tasks.append(self._match_meme(text))
+            reply_text = llm_resp.completion_text
 
-        # 等待所有任务完成
-        await asyncio.gather(*tasks, return_exceptions=True)
+            # 处理特定工具触发的中断信号
+            if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
+                logger.info(f"[{chat_id}] 💤 Brain 决定挂起并倾听后续消息 (Wait/Listening)。")
+                return
 
-    async def _send_reply(self, event: AstrMessageEvent, text: str):
-        """发送文本回复"""
-        # 模拟打字机效果? (Maibot feature)
-        # 这里简化为直接发送
-        await event.send(event.plain_result(text))
-
-    async def _call_tool(self, tool_name: str, args: dict, event: AstrMessageEvent):
-        """调用工具"""
-        logger.info(f"[Executor] Calling Tool: {tool_name} with {args}")
-        # TODO: 适配 AstrBot 工具调用接口
-        # result = await self.context.call_tool(tool_name, **args)
-        # await event.send(event.plain_result(f"Tool Result: {result}"))
-        pass
+            # 发送前的反思校验 (Reply Checker)
+            if reply_text:
+                is_suitable, reason = await self.reply_checker.check(reply_text, chat_id)
+                if not is_suitable:
+                    logger.warning(f"[{chat_id}] ⚠️ 触发降级机制：回复未通过安全审判。")
+                    reply_text = "（陷入了短暂的沉默，似乎在思考些什么...）"
+                    
+                # 最终执行回复
+                await event.send(event.plain_result(reply_text))
+                
+        except Exception as e:
+            logger.error(f"[{chat_id}] ❌ Agent Loop 执行严重异常: {e}")
+            await event.send(event.plain_result("（大脑似乎宕机了... 让我缓一缓。）"))

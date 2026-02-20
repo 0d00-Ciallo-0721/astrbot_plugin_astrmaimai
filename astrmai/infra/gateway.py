@@ -1,80 +1,87 @@
 import json
+import re
 from typing import Optional, List, Dict, Any
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-
 from astrbot.api import logger
 from astrbot.api.star import Context
-from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import UserMessageSegment, TextPart
+
+# 尝试导入 json_repair，如果未安装则回退到基础正则解析 (借鉴 MaiBot 容错设计)
+try:
+    from json_repair import repair_json
+except ImportError:
+    repair_json = None
 
 class GlobalModelGateway:
     """
     统一模型网关 (Infrastructure Layer)
-    负责路由 System 1 (Judge) 和 System 2 (Planner) 的请求，并处理重试与容错。
-    Reference: HeartCore/utils/api_utils.py
+    基于 AstrBot v4.12 API 进行降维封装
     """
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict):
         self.context = context
-        # 从配置获取 Provider ID
-        self.sys1_id = context.get_config("system1_provider_id")
-        self.sys2_id = context.get_config("system2_provider_id")
+        self.sys1_id = config.get("system1_provider_id")
+        self.sys2_id = config.get("system2_provider_id")
 
-    @retry(
-        stop=stop_after_attempt(3), 
-        wait=wait_fixed(1),
-        retry=retry_if_exception_type(json.JSONDecodeError)
-    )
+    def _extract_json(self, text: str) -> str:
+        """粗略提取 Markdown 中的 JSON 块"""
+        text = text.strip()
+        match = re.search(r"```(?:json)?(.*?)```", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return text
+
     async def call_judge(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """
-        System 1 调用: 快速、低成本、结构化输出
-        用于: Judge, Analyzer
+        System 1 调用 (Judge): 快速、低成本、强制返回 JSON
+        借鉴 MaiBot 的 json_fix 兜底逻辑
         """
         if not self.sys1_id:
-            logger.warning("[AstrMai] System 1 Provider ID not configured.")
+            logger.warning("[AstrMai] System 1 Provider ID not configured!")
             return {}
 
-        contexts = []
-        if system_prompt:
-            contexts.append({"role": "system", "content": system_prompt})
+        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
 
         try:
-            # 使用 llm_generate 适配 v4.12
+            # 调用 AstrBot 原生 LLM 接口
             resp = await self.context.llm_generate(
                 chat_provider_id=self.sys1_id,
-                prompt=prompt,
-                contexts=contexts
+                prompt=full_prompt
             )
             
             content = resp.completion_text
             if not content:
                 raise ValueError("Empty response from System 1")
 
-            # 清洗 Markdown 标记
-            content = content.strip()
-            if content.startswith("```json"): 
-                content = content[7:]
-            if content.startswith("```"): 
-                content = content[3:]
-            if content.endswith("```"): 
-                content = content[:-3]
-            
-            return json.loads(content.strip())
+            raw_json_str = self._extract_json(content)
+
+            # 解析容错
+            try:
+                return json.loads(raw_json_str)
+            except json.JSONDecodeError:
+                if repair_json:
+                    return json.loads(repair_json(raw_json_str))
+                else:
+                    logger.error("[AstrMai] JSON Decode Failed and json_repair not installed.")
+                    return {}
 
         except Exception as e:
-            logger.error(f"[AstrMai] System 1 (Judge) Error: {e}")
-            raise # 抛出给 tenacity 重试
+            logger.error(f"[AstrMai] ❌ System 1 (Judge) Error: {e}")
+            return {}
 
-    async def call_planner(self, messages: List[Dict], tools: List[Any] = None) -> str:
+    async def call_planner(self, prompt: str) -> str:
         """
-        System 2 调用: 智能、高消耗、支持工具
-        用于: Planner, Chat
+        System 2 调用 (Brain): 高算力推理
+        后续阶段将升级为 tool_loop_agent
         """
         if not self.sys2_id:
-            return "⚠️ System 2 Brain Missing (Check Config)"
+            logger.error("[AstrMai] System 2 Brain Missing (Check Config)")
+            return ""
 
-        # 如果需要工具调用，未来在这里集成 tool_loop_agent
-        # Phase 1: 仅文本生成
-        resp = await self.context.llm_generate(
-            chat_provider_id=self.sys2_id,
-            contexts=messages # 这里的 messages 结构需符合 AstrBot 标准
-        )
-        return resp.completion_text
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=self.sys2_id,
+                prompt=prompt
+            )
+            return resp.completion_text
+        except Exception as e:
+            logger.error(f"[AstrMai] ❌ System 2 (Planner) Error: {e}")
+            return ""
