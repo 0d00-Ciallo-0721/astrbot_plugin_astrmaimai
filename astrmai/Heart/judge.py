@@ -1,4 +1,4 @@
-from astrmai.infra.gateway import GlobalModelGateway
+from ..infra.gateway import GlobalModelGateway
 from .state_engine import StateEngine
 import time
 import json

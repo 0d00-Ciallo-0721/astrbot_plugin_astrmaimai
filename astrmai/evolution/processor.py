@@ -1,8 +1,8 @@
 import asyncio
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrmai.infra.database import DatabaseService
-from astrmai.infra.gateway import GlobalModelGateway
+from ..infra.database import DatabaseService
+from ..infra.gateway import GlobalModelGateway
 from .miner import ExpressionMiner
 
 class EvolutionManager:

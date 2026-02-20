@@ -1,4 +1,4 @@
-from astrmai.infra.database import DatabaseService
+from ..infra.database import DatabaseService
 
 class ContextEngine:
     """

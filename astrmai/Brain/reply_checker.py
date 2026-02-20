@@ -1,6 +1,6 @@
 from typing import Tuple
 from astrbot.api import logger
-from astrmai.infra.gateway import GlobalModelGateway
+from ..infra.gateway import GlobalModelGateway
 
 class ReplyChecker:
     """回复检查器 (防幻觉与违规) - 借鉴 MaiBot reply_checker.py"""

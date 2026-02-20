@@ -2,9 +2,8 @@ import json
 import time
 from typing import List, Dict, Any
 from astrbot.api import logger
-from astrmai.infra.database import ExpressionPattern, MessageLog
-from astrmai.infra.gateway import GlobalModelGateway
-
+from ..infra.database import ExpressionPattern, MessageLog
+from ..infra.gateway import GlobalModelGateway
 class ExpressionMiner:
     """
     风格挖掘器 (System 2 Offline Task)

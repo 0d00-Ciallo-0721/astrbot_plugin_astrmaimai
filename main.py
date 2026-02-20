@@ -26,9 +26,9 @@ from .astrmai.Heart.attention import AttentionGate
 
 @register("astrmai", "Gemini Antigravity", "AstrMai: Dual-Process Architecture Plugin", "1.0.0", "https://github.com/astrmai")
 class AstrMaiPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        self.config = config if config else context.get_config()
         
         sys1 = config.get('system1_provider_id', 'Unconfigured')
         sys2 = config.get('system2_provider_id', 'Unconfigured')

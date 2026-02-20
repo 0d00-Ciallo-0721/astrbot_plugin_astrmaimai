@@ -1,7 +1,7 @@
 from typing import List
 from astrbot.api.event import AstrMessageEvent
 
-from astrmai.infra.gateway import GlobalModelGateway
+from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .tools.pfc_tools import WaitTool, FetchKnowledgeTool

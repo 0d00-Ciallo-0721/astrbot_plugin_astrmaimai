@@ -3,9 +3,8 @@ import random
 import json
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrmai.infra.database import DatabaseService, ChatState, UserProfile
-from astrmai.infra.gateway import GlobalModelGateway
-
+from ..infra.database import DatabaseService, ChatState, UserProfile
+from ..infra.gateway import GlobalModelGateway
 class StateEngine:
     """
     状态引擎 (System 1)

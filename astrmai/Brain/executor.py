@@ -2,7 +2,7 @@ from typing import Any, List
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.tool import ToolSet
-from astrmai.infra.gateway import GlobalModelGateway
+from ..infra.gateway import GlobalModelGateway
 from .reply_checker import ReplyChecker
 
 class ConcurrentExecutor:

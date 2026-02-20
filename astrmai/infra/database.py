@@ -1,6 +1,7 @@
 import os
 import time
 from typing import Optional, List
+from pathlib import Path
 from sqlmodel import SQLModel, Field, create_engine, Session, select, desc
 from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -11,6 +12,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 class ChatState(SQLModel, table=True):
     """群聊/私聊心流状态表 (System 1 生理状态)"""
+    __table_args__ = {"extend_existing": True} 
     chat_id: str = Field(primary_key=True)
     energy: float = Field(default=0.5)         # 精力值 (0.0 - 1.0)
     mood: float = Field(default=0.0)           # 情绪值 (-1.0 - 1.0)
@@ -20,6 +22,7 @@ class ChatState(SQLModel, table=True):
 
 class UserProfile(SQLModel, table=True):
     """用户画像与好感度表"""
+    __table_args__ = {"extend_existing": True}
     user_id: str = Field(primary_key=True)
     name: str = Field(default="Unknown")
     social_score: float = Field(default=0.0)   # 社交好感度 (-100 to 100)
@@ -27,6 +30,7 @@ class UserProfile(SQLModel, table=True):
 
 class ExpressionPattern(SQLModel, table=True):
     """表达模式表 (潜意识挖掘的黑话与句式)"""
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     situation: str = Field(index=True)  # 场景描述
     expression: str                     # 表达方式
@@ -37,6 +41,7 @@ class ExpressionPattern(SQLModel, table=True):
 
 class MessageLog(SQLModel, table=True):
     """短期滚动消息日志 (用于后台离线挖掘)"""
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     group_id: str = Field(index=True)
     sender_id: str
@@ -52,8 +57,11 @@ class MessageLog(SQLModel, table=True):
 class DatabaseService:
     def __init__(self):
         # 统一存储路径: data/plugin_data/astrmai/astrmai.db
-        base_path = get_astrbot_data_path() / "plugin_data" / "astrmai"
+        base_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai"
         os.makedirs(base_path, exist_ok=True)
+            
+        if not os.path.exists(base_path):
+            os.makedirs(base_path, exist_ok=True)
             
         db_url = f"sqlite:///{base_path}/astrmai.db"
         self.engine = create_engine(db_url)
