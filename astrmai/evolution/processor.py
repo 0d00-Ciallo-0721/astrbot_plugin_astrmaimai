@@ -21,10 +21,15 @@ class EvolutionManager:
         """
         消息发送后的回调 (Subconscious)
         """
+        # 【修复】安全获取 bot_id
+        bot_id = getattr(event.message_obj, 'self_id', 'SELF_BOT')
+        if hasattr(event, 'bot') and getattr(event, 'bot', None):
+            bot_id = getattr(event.bot, 'self_id', bot_id)
+
         # 1. 记录当前消息 (Self)
         self.db.add_message_log(
             group_id=event.unified_msg_origin,
-            sender_id=event.get_self_id(),
+            sender_id=str(bot_id),
             sender_name="SELF",
             content=event.message_str
         )
@@ -32,7 +37,6 @@ class EvolutionManager:
         # 2. 检查是否触发学习 (例如: 每积压 20 条消息)
         # 这里使用 Fire-and-Forget 方式启动任务
         asyncio.create_task(self._try_trigger_mining(event.unified_msg_origin))
-
     async def record_user_message(self, event: AstrMessageEvent):
         """记录用户消息 (在 System 1 阶段调用)"""
         self.db.add_message_log(

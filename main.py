@@ -138,13 +138,22 @@ class AstrMaiPlugin(Star):
         """
         [入口] 接管所有平台消息，将数据泵入双系统架构与进化层。
         """
+        msg = event.message_str.strip()
+        if msg.startswith("/") or msg.startswith("！") or msg.startswith("!"):
+            return
+
         # 防止处理机器人自己发出的消息导致死循环
-        if event.get_sender_id() == event.bot.self_id:
+        # [Fix] 2. 兼容 WebChat 的 self_id 获取方式
+        try:
+            self_id = event.message_obj.self_id
+        except AttributeError:
+            self_id = "unknown" # 兜底
+
+        if event.get_sender_id() == self_id:
             return
 
         sender_name = event.get_sender_name()
         msg_str = event.message_str
-        unified_id = event.unified_msg_origin
         
         # [Debug Mode] 控制台输出拦截日志
         if self.config.get("debug_mode", False):
@@ -155,9 +164,6 @@ class AstrMaiPlugin(Star):
 
         # --- 分流 2: 泵入 System 1 注意力门控 (判断防抖、拦截或上抛给 Sys2) ---
         await self.attention_gate.process_event(event)
-        
-        # 注意: 这里不调用 event.stop_event()，以便 AstrBot 原生的其他插件指令依然能够生效。
-        # 如果你想将 AstrMai 做为独占机器人，可以在这里加上 event.stop_event()
 
     @filter.after_message_sent()
     async def after_message_sent_hook(self, event: AstrMessageEvent):

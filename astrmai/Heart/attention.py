@@ -30,11 +30,19 @@ class AttentionGate:
         sender_id = event.get_sender_id()
         self_id = event.get_self_id()
 
-        # 0. 预过滤
-        if self.sensors.is_noise(event):
+        # =================================================================
+        # 0. 安全网与预过滤 (The Firewall)
+        # =================================================================
+        # 异步调用强化后的预过滤器
+        should_process = await self.sensors.should_process_message(event)
+        
+        # 如果判定为无需处理，或被强制打上了指令标记，立即执行短路阻断
+        if not should_process or event.get_extra("astrmai_is_command"):
             return
 
-        # 1. 唤醒检测
+        # =================================================================
+        # 1. 唤醒检测与判官路由
+        # =================================================================
         is_wakeup = self.sensors.is_wakeup_signal(event, self_id)
 
         # 2. 判官介入 (Judge)

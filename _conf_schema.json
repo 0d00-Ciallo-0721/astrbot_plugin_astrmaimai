@@ -1,22 +1,26 @@
 {
   "system1_provider_id": {
-    "description": "System 1 (直觉/情绪) 模型 Provider ID",
+    "description": "System 1 (直觉层) 模型 Provider ID",
     "type": "string",
-    "hint": "用于快速情绪判断和简单回复，建议使用更快速便宜的模型 (如 gpt-3.5, gemini-flash)"
+    "hint": "用于 Judge 和快速判断的小模型 (e.g., gemma-2b, qwen-turbo)",
+    "_special": "select_provider"
   },
   "system2_provider_id": {
-    "description": "System 2 (大脑/规划) 模型 Provider ID",
+    "description": "System 2 (认知层) 模型 Provider ID",
     "type": "string",
-    "hint": "用于复杂推理和工具调用，建议使用高智商模型 (如 gpt-4o, claude-3.5-sonnet)"
-  },
-  "embedding_provider_id": {
-    "description": "Embedding (记忆) 模型 Provider ID",
-    "type": "string",
-    "hint": "必填！用于向量数据库。请填写 AstrBot 后台配置的 Embedding 模型 ID (例如: openai_embedding)"
+    "hint": "用于 Planner 和复杂推理的大模型 (e.g., gpt-4, claude-3-5-sonnet)",
+    "_special": "select_provider"
   },
   "debug_mode": {
-    "description": "开启调试日志",
+    "description": "调试模式",
     "type": "bool",
-    "default": false
-  }
+    "default": false,
+    "hint": "开启后将输出详细的思维链和状态日志"
+  },
+  "embedding_provider_id": {
+    "description": "Embedding 模型提供商 ID",
+    "type": "string",
+    "hint": "请填写在 AstrBot 配置页面中显示的 Embedding 模型提供商 ID（如 openai_embedding）。留空或配置错误时系统将自动获取可用模型兜底。",
+    "default": ""
+  }  
 }

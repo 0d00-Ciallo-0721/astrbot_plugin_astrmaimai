@@ -26,7 +26,11 @@ class Planner:
         prompt = "\n".join([f"{m.get_sender_name()}: {m.message_str}" for m in event_messages])
         
         # 2. 潜意识与动态状态注入 (System Prompt 构建)
-        system_prompt = await self.context_engine.build_prompt(chat_id=chat_id)
+        # [Fix] 传入 event_messages 给 ContextEngine
+        system_prompt = await self.context_engine.build_prompt(
+            chat_id=chat_id, 
+            messages=event_messages
+        )
         
         # 3. 装配前额叶基建工具 (PFC Actions)
         pfc_tools = [
