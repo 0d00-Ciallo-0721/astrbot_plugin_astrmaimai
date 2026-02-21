@@ -1,7 +1,15 @@
+import os
+import json
 import time
+import faiss
+import numpy as np
 from typing import List, Dict, Any
+from astrbot.api import logger
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 from .utils import SearchResult, TextProcessor
+
+# 👇 补充缺失的 EmbeddingClient 导入
+from .embedding import EmbeddingClient
 
 class VectorRetriever:
     """

@@ -8,6 +8,7 @@ from pathlib import Path
 from .bm25 import BM25Retriever
 from .vector_store import VectorRetriever
 from .retriever import HybridRetriever
+from .embedding import EmbeddingClient 
 
 class MemoryEngine:
     """
@@ -20,7 +21,7 @@ class MemoryEngine:
         self.embedding_provider_id = embedding_provider_id # 新增：接收配置 ID
         
         # 路径配置
-        self.data_path = get_astrbot_data_path() / "plugin_data" / "astrmai" / "memory"
+        self.data_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai" / "memory"
         if not os.path.exists(self.data_path):
             os.makedirs(self.data_path)
             

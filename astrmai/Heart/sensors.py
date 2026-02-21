@@ -1,6 +1,7 @@
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
+from astrbot.core.star.command_management import list_commands
 
 class PreFilters:
     """

@@ -10,7 +10,7 @@ from .astrmai.infra.gateway import GlobalModelGateway
 
 # --- Phase 4: Memory ---
 from .astrmai.memory.engine import MemoryEngine
-
+from .astrmai.memory.engine import MemoryEngine
 # --- Phase 5: Evolution ---
 from .astrmai.evolution.processor import EvolutionManager
 
@@ -30,9 +30,11 @@ class AstrMaiPlugin(Star):
         super().__init__(context)
         self.config = config if config else context.get_config()
         
-        sys1 = config.get('system1_provider_id', 'Unconfigured')
-        sys2 = config.get('system2_provider_id', 'Unconfigured')
-        emb_id = config.get('embedding_provider_id', '')
+        # [Fix] 必须使用 self.config.get() 而不是局部的 config.get()
+        sys1 = self.config.get('system1_provider_id', 'Unconfigured')
+        sys2 = self.config.get('system2_provider_id', 'Unconfigured')
+        emb_id = self.config.get('embedding_provider_id', '')
+        
         logger.info(f"[AstrMai] 🚀 Booting... Sys1: {sys1} | Sys2: {sys2}")
 
         # ==========================================
@@ -46,8 +48,7 @@ class AstrMaiPlugin(Star):
         # --- Phase 4: Living Memory Mount ---
         # [Fix] 传入 embedding_provider_id
         self.memory_engine = MemoryEngine(context, self.gateway, embedding_provider_id=emb_id)
-        
-        self.memory_engine = MemoryEngine(context, self.gateway)
+
 
         # --- Phase 5: Subconscious Evolution Mount ---
         self.evolution = EvolutionManager(self.db_service, self.gateway)
@@ -91,7 +92,10 @@ class AstrMaiPlugin(Star):
         # 2. 初始化记忆引擎
         logger.info("[AstrMai] 🧠 Initializing Memory Engine...")
         await self._init_memory()
-    
+        
+        #提前唤醒并构建指令黑名单防火墙，减少 System 1 误判的概率    
+        await self.sensors._load_foreign_commands()
+
     async def _init_memory(self):
         """异步唤醒记忆引擎与后台任务"""
         # 为了极度稳健，这里甚至可以再 sleep 1秒，但通常 on_astrbot_loaded 已经足够
