@@ -137,9 +137,16 @@ class DatabaseService:
                 existing.weight += 1.0
                 existing.last_active_time = time.time()
                 session.add(existing)
+                target = existing
             else:
                 session.add(pattern)
+                target = pattern
+                
             session.commit()
+            # 【核心修复】在 Session 关闭前刷新对象，并访问属性以强制加载到内存
+            session.refresh(target)
+            _ = target.situation 
+            _ = target.expression
 
     def get_patterns(self, group_id: str, limit: int = 5) -> List[ExpressionPattern]:
         with self.get_session() as session:

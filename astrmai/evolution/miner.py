@@ -40,12 +40,12 @@ class ExpressionMiner:
 """
         try:
             # 借用 System 1 (Judge) 的低成本请求跑离线任务
-            raw_result = await self.gateway.call_planner(messages=[{"role": "user", "content": prompt}])
+            raw_result = await self.gateway.call_planner(prompt=prompt)
             patterns_data = self._parse_json(raw_result)
             
             patterns = []
             import time
-            from astrmai.infra.database import ExpressionPattern
+
             for item in patterns_data:
                 if "situation" in item and "expression" in item:
                     patterns.append(ExpressionPattern(

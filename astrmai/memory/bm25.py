@@ -32,7 +32,7 @@ class BM25Retriever:
             )
             await db.commit()
 
-    async def search(self, query: str, limit: int = 20) -> List[SearchResult]:
+    async def search(self, query: str, k: int = 20, **kwargs) -> List[SearchResult]:
         tokens = self.processor.tokenize(query)
         if not tokens: return []
         
@@ -49,7 +49,7 @@ class BM25Retriever:
                 ORDER BY score
                 LIMIT ?
                 """,
-                (fts_query, limit)
+                (fts_query, k)  # 这里把原来的 limit 变量替换为 k
             )
             rows = await cursor.fetchall()
             

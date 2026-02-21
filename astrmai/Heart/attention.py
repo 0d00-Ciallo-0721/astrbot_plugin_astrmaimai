@@ -29,16 +29,26 @@ class AttentionGate:
         chat_id = event.unified_msg_origin
         sender_id = event.get_sender_id()
         self_id = event.get_self_id()
-
+        msg_str = event.message_str.strip()
+        is_cmd = await self.sensors.is_command(msg_str)
+        
         # =================================================================
         # 0. 安全网与预过滤 (The Firewall)
         # =================================================================
         # 异步调用强化后的预过滤器
+
+        if is_cmd:
+            # 【完善】给事件打上标签，供后续 Subconscious 识别
+            setattr(event, "is_command_trigger", True)
+            logger.info(f"[AstrMai-Sensor] 🛡️ 识别到指令: {msg_str[:10]}... 已标记并拦截。")
+            return # 彻底拦截，不进入 System 2
+                
         should_process = await self.sensors.should_process_message(event)
         
         # 如果判定为无需处理，或被强制打上了指令标记，立即执行短路阻断
         if not should_process or event.get_extra("astrmai_is_command"):
             return
+        # 检测是否命中指令防火墙
 
         # =================================================================
         # 1. 唤醒检测与判官路由

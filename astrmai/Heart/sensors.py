@@ -127,3 +127,21 @@ class PreFilters:
             
         # 昵称唤醒已在 should_process_message 提权，此处若需强唤醒也可复用检测
         return False
+    
+
+    async def is_command(self, text: str) -> bool:
+        """
+        [新增] 判断文本是否命中指令防火墙
+        """
+        if not text: return False
+        
+        # 1. 检查基础指令前缀
+        if text.startswith(("/", "!", "！")):
+            return True
+            
+        # 2. 检查动态加载的系统指令库
+        first_word = text.split()[0].lower()
+        if self.foreign_commands and first_word in self.foreign_commands:
+            return True
+            
+        return False    

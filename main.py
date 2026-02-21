@@ -146,14 +146,25 @@ class AstrMaiPlugin(Star):
         if msg.startswith("/") or msg.startswith("！") or msg.startswith("!"):
             return
 
-        # 防止处理机器人自己发出的消息导致死循环
-        # [Fix] 2. 兼容 WebChat 的 self_id 获取方式
-        try:
-            self_id = event.message_obj.self_id
-        except AttributeError:
-            self_id = "unknown" # 兜底
-
-        if event.get_sender_id() == self_id:
+        # ================= [Fix Start] =================
+        # 修复 QQ/OneBot 平台下 self_id 获取失败导致自回复的问题
+        self_id = None
+        
+        # 1. 尝试从 message_obj 获取 (兼容 WebChat)
+        if hasattr(event.message_obj, 'self_id'):
+            self_id = str(event.message_obj.self_id)
+        
+        # 2. 尝试从 bot 平台实例获取 (兼容 Aiocqhttp/OneBot)
+        # event.bot 通常是平台适配器的 Client 实例，它一定知道自己是谁
+        if not self_id and hasattr(event, 'bot') and hasattr(event.bot, 'self_id'):
+            self_id = str(event.bot.self_id)
+            
+        # 3. 兜底
+        if not self_id:
+            self_id = "unknown"
+            
+        # 4. 执行过滤
+        if str(event.get_sender_id()) == self_id:
             return
 
         sender_name = event.get_sender_name()
@@ -172,13 +183,17 @@ class AstrMaiPlugin(Star):
     @filter.after_message_sent()
     async def after_message_sent_hook(self, event: AstrMessageEvent):
         """
-        [出口] 消息发送后的回调钩子 (Subconscious Feedback Loop)
-        用于记录 AI 自己的发言并触发后台挖掘清算任务。
+        [出口] 消息发送后的回调钩子
         """
+        # 检查是否携带指令触发标签
+        is_command_res = getattr(event, "is_command_trigger", False)
+        
         if self.config.get("debug_mode", False):
-            logger.info(f"[AstrMai-Subconscious] 💡 消息发送完毕，触发后台状态机与反馈循环。")
+            tag = "[指令回复]" if is_command_res else "[普通对话]"
+            logger.info(f"[AstrMai-Subconscious]💡 消息发送完毕，触发后台状态机与反馈循环")
             
-        await self.evolution.process_feedback(event)
+        # 将标签传递给进化模块，以便在存入数据库时进行区分
+        await self.evolution.process_feedback(event, is_command=is_command_res)
 
     async def terminate(self):
         """卸载时的资源清理"""

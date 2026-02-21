@@ -17,26 +17,36 @@ class EvolutionManager:
         self.miner = ExpressionMiner(gateway)
         self.mining_lock = asyncio.Lock()
 
-    async def process_feedback(self, event: AstrMessageEvent):
+    async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):
         """
-        消息发送后的回调 (Subconscious)
+        消息发送后的回调 (Subconscious Feedback Loop)
         """
-        # 【修复】安全获取 bot_id
+        # 1. 安全获取 bot_id (保持你的修复逻辑)
         bot_id = getattr(event.message_obj, 'self_id', 'SELF_BOT')
         if hasattr(event, 'bot') and getattr(event, 'bot', None):
             bot_id = getattr(event.bot, 'self_id', bot_id)
 
-        # 1. 记录当前消息 (Self)
+        # 2. 内容修饰：根据是否为指令回复，给内容打上认知标签
+        # 这样做是为了在 ContextEngine 召回记忆时，AI 能意识到这是系统行为
+        raw_content = event.message_str
+        processed_content = raw_content
+        
+        if is_command:
+            # 注入“元认知”前缀，防止 AI 以后模仿这些死板的指令格式
+            processed_content = f"(系统指令执行结果): {raw_content}"
+
+        # 3. 记录当前消息到短期日志
         self.db.add_message_log(
             group_id=event.unified_msg_origin,
             sender_id=str(bot_id),
             sender_name="SELF",
-            content=event.message_str
+            content=processed_content # 记录带标签的内容
         )
         
-        # 2. 检查是否触发学习 (例如: 每积压 20 条消息)
-        # 这里使用 Fire-and-Forget 方式启动任务
+        # 4. 触发后台挖掘任务 (Fire-and-Forget)
+        # 如果是指令消息，通常不包含情感模式，可以在挖掘逻辑里进一步过滤
         asyncio.create_task(self._try_trigger_mining(event.unified_msg_origin))
+
     async def record_user_message(self, event: AstrMessageEvent):
         """记录用户消息 (在 System 1 阶段调用)"""
         self.db.add_message_log(
@@ -65,7 +75,9 @@ class EvolutionManager:
             
             # 3. 保存结果
             for p in patterns:
+                # 调用修改后的 save_pattern，内部已解决 Detached 风险
                 self.db.save_pattern(p)
+                # 此时访问 p.situation 是安全的
                 logger.debug(f"[Evolution] Learned: {p.situation} -> {p.expression}")
             
             # 4. 标记已处理
