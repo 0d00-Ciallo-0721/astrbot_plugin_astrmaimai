@@ -4,16 +4,18 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.tool import ToolSet
 from ..infra.gateway import GlobalModelGateway
 from .reply_checker import ReplyChecker
+from .reply_engine import ReplyEngine 
 
 class ConcurrentExecutor:
     """
     智能体执行器 (System 2)
     使用 AstrBot 原生 tool_loop_agent 替代原有手写 Action Loop。
     """
-    def __init__(self, context, gateway: GlobalModelGateway):
+    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine):
         self.context = context
         self.gateway = gateway
         self.reply_checker = ReplyChecker(gateway)
+        self.reply_engine = reply_engine
 
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any]):
         chat_id = event.unified_msg_origin

@@ -1,108 +1,28 @@
-import os
 import time
-from typing import Optional, List
-from pathlib import Path
-from sqlmodel import SQLModel, Field, create_engine, Session, select, desc
-from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-
-# ==========================================
-# 1. Data Models (数据模型)
-# ==========================================
-
-class ChatState(SQLModel, table=True):
-    """群聊/私聊心流状态表 (System 1 生理状态)"""
-    __table_args__ = {"extend_existing": True} 
-    chat_id: str = Field(primary_key=True)
-    energy: float = Field(default=0.5)         # 精力值 (0.0 - 1.0)
-    mood: float = Field(default=0.0)           # 情绪值 (-1.0 - 1.0)
-    last_reply_time: float = Field(default=0.0) # 上次回复时间戳
-    last_reset_date: str = Field(default="")   # 上次重置日期 (ISO)
-    total_replies: int = Field(default=0)
-
-class UserProfile(SQLModel, table=True):
-    """用户画像与好感度表"""
-    __table_args__ = {"extend_existing": True}
-    user_id: str = Field(primary_key=True)
-    name: str = Field(default="Unknown")
-    social_score: float = Field(default=0.0)   # 社交好感度 (-100 to 100)
-    last_seen: float = Field(default_factory=time.time)
-
-class ExpressionPattern(SQLModel, table=True):
-    """表达模式表 (潜意识挖掘的黑话与句式)"""
-    __table_args__ = {"extend_existing": True}
-    id: Optional[int] = Field(default=None, primary_key=True)
-    situation: str = Field(index=True)  # 场景描述
-    expression: str                     # 表达方式
-    weight: float = Field(default=1.0)  # 权重/频率
-    last_active_time: float = Field(default_factory=time.time)
-    create_time: float = Field(default_factory=time.time)
-    group_id: str = Field(index=True)
-
-class MessageLog(SQLModel, table=True):
-    """短期滚动消息日志 (用于后台离线挖掘)"""
-    __table_args__ = {"extend_existing": True}
-    id: Optional[int] = Field(default=None, primary_key=True)
-    group_id: str = Field(index=True)
-    sender_id: str
-    sender_name: str
-    content: str
-    timestamp: float = Field(default_factory=time.time)
-    processed: bool = Field(default=False) # 是否已被挖掘过
-
-# ==========================================
-# 2. Database Service (持久化基座)
-# ==========================================
+import sqlite3
+import json
+from typing import List, Optional
+from sqlmodel import Session, select, desc
+from .datamodels import ExpressionPattern, MessageLog, ChatState
+from .persistence import PersistenceManager
 
 class DatabaseService:
-    def __init__(self):
-        # 统一存储路径: data/plugin_data/astrmai/astrmai.db
-        base_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai"
-        os.makedirs(base_path, exist_ok=True)
-            
-        if not os.path.exists(base_path):
-            os.makedirs(base_path, exist_ok=True)
-            
-        db_url = f"sqlite:///{base_path}/astrmai.db"
-        self.engine = create_engine(db_url)
-        
-        # 初始化建表
-        SQLModel.metadata.create_all(self.engine)
-        logger.info(f"[AstrMai] 💾 Database connected at {db_url}")
+    """
+    数据库服务层 (向下兼容代理)
+    职责：包装 PersistenceManager，给 Memory/Evolution 等尚未重构的模块提供旧版同步接口
+    """
+    def __init__(self, persistence: PersistenceManager):
+        self.persistence = persistence
 
     def get_session(self) -> Session:
-        return Session(self.engine)
+        return self.persistence.get_session()
 
-    # --- State & Profile API ---
-    def get_chat_state(self, chat_id: str) -> Optional[ChatState]:
-        with self.get_session() as session:
-            return session.get(ChatState, chat_id)
-
-    def save_chat_state(self, state: ChatState):
-        with self.get_session() as session:
-            session.add(state)
-            session.commit()
-            session.refresh(state)
-
-    def get_user_profile(self, user_id: str) -> Optional[UserProfile]:
-        with self.get_session() as session:
-            return session.get(UserProfile, user_id)
-
-    def save_user_profile(self, profile: UserProfile):
-        with self.get_session() as session:
-            session.add(profile)
-            session.commit()
-            session.refresh(profile)
-
-    # --- Subconscious Evolution API ---
+    # ==========================================
+    # 兼容 API: 供 Evolution / Memory 模块使用
+    # ==========================================
     def add_message_log(self, group_id: str, sender_id: str, sender_name: str, content: str):
         with self.get_session() as session:
-            log = MessageLog(
-                group_id=group_id, 
-                sender_id=sender_id, 
-                sender_name=sender_name, 
-                content=content
-            )
+            log = MessageLog(group_id=group_id, sender_id=sender_id, sender_name=sender_name, content=content)
             session.add(log)
             session.commit()
 
@@ -113,7 +33,7 @@ class DatabaseService:
                 MessageLog.processed == False
             ).order_by(MessageLog.timestamp.desc()).limit(limit)
             results = session.exec(statement).all()
-            return list(reversed(results)) # 返回按时间正序
+            return list(reversed(results))
 
     def mark_logs_processed(self, log_ids: List[int]):
         with self.get_session() as session:
@@ -132,7 +52,6 @@ class DatabaseService:
                 ExpressionPattern.expression == pattern.expression
             )
             existing = session.exec(statement).first()
-            
             if existing:
                 existing.weight += 1.0
                 existing.last_active_time = time.time()
@@ -141,9 +60,7 @@ class DatabaseService:
             else:
                 session.add(pattern)
                 target = pattern
-                
             session.commit()
-            # 【核心修复】在 Session 关闭前刷新对象，并访问属性以强制加载到内存
             session.refresh(target)
             _ = target.situation 
             _ = target.expression
@@ -154,3 +71,20 @@ class DatabaseService:
                 ExpressionPattern.group_id == group_id
             ).order_by(desc(ExpressionPattern.weight)).limit(limit)
             return session.exec(statement).all()
+
+    # ==========================================
+    # 临时过渡 API: 供 ContextEngine 使用
+    # (这部分将在阶段四全面改写为异步缓存读取)
+    # ==========================================
+    def get_chat_state(self, chat_id: str) -> Optional[ChatState]:
+        """使用 sqlite3 同步读取持久化文件，供老模块兼容读取"""
+        with sqlite3.connect(self.persistence.db_path) as conn:
+            cursor = conn.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
+            row = cursor.fetchone()
+            if row:
+                state = ChatState(chat_id=row[0], energy=row[1], mood=row[2])
+                state.group_config = json.loads(row[3]) if row[3] else {}
+                state.last_reset_date = row[4]
+                state.total_replies = row[5]
+                return state
+        return None

@@ -5,6 +5,7 @@ from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .tools.pfc_tools import WaitTool, FetchKnowledgeTool
+from .reply_engine import ReplyEngine
 
 class Planner:
     """
@@ -14,7 +15,7 @@ class Planner:
     def __init__(self, context, gateway: GlobalModelGateway, context_engine: ContextEngine):
         self.gateway = gateway
         self.context_engine = context_engine
-        self.executor = ConcurrentExecutor(context, gateway)
+        self.executor = ConcurrentExecutor(context, gateway, reply_engine)
 
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """

@@ -11,12 +11,15 @@ from .astrmai.infra.gateway import GlobalModelGateway
 # --- Phase 4: Memory ---
 from .astrmai.memory.engine import MemoryEngine
 from .astrmai.memory.engine import MemoryEngine
-# --- Phase 5: Evolution ---
-from .astrmai.evolution.processor import EvolutionManager
 
 # --- Phase 3: System 2 (Brain) ---
 from .astrmai.Brain.context_engine import ContextEngine
 from .astrmai.Brain.planner import Planner
+
+# --- Phase 5: Evolution & Expression ---
+from .astrmai.evolution.processor import EvolutionManager
+from .astrmai.meme_engine.meme_init import init_meme_storage # [新增]
+from .astrmai.Brain.reply_engine import ReplyEngine # [新增]
 
 # --- Phase 2: System 1 (Heart) ---
 from .astrmai.Heart.state_engine import StateEngine
@@ -42,7 +45,8 @@ class AstrMaiPlugin(Star):
         # ==========================================
 
         # --- Phase 1: Infrastructure Mount ---
-        self.db_service = DatabaseService()
+        self.persistence = PersistenceManager()                 # [核心修改]: 初始化底座
+        self.db_service = DatabaseService(self.persistence)     # [核心修改]: 兼容代理包装
         self.gateway = GlobalModelGateway(context, config)
         
         # --- Phase 4: Living Memory Mount ---
@@ -50,18 +54,22 @@ class AstrMaiPlugin(Star):
         self.memory_engine = MemoryEngine(context, self.gateway, embedding_provider_id=emb_id)
 
 
-        # --- Phase 5: Subconscious Evolution Mount ---
-        self.evolution = EvolutionManager(self.db_service, self.gateway)
+        # --- [新增] Phase 5: Expression Engine Mount ---
+        # 需要 StateEngine 和 MoodManager (StateEngine 中已包含 MoodManager 逻辑或实例)
+        # 这里的 StateEngine.mood_manager 是在 Phase 3 添加的
+        self.reply_engine = ReplyEngine(self.state_engine, self.state_engine.mood_manager)
 
         # --- Phase 3: System 2 (Brain) Mount ---
         self.context_engine = ContextEngine(self.db_service)
         self.system2_planner = Planner(context, self.gateway, self.context_engine)
 
         # --- Phase 2: System 1 (Heart) Mount ---
-        self.state_engine = StateEngine(self.db_service, self.gateway)
-        self.judge = Judge(self.gateway, self.state_engine)
-        self.sensors = PreFilters(config)
-        
+        self.state_engine = StateEngine(self.persistence, self.gateway)
+        # [修改] 传入 self.config
+        self.judge = Judge(self.gateway, self.state_engine, self.config) 
+        self.sensors = PreFilters(self.config) 
+        self.system2_planner = Planner(context, self.gateway, self.context_engine, self.reply_engine)
+
         # 组装 AttentionGate，并将 System 2 的入口作为防抖结束后的回调传入
         self.attention_gate = AttentionGate(
             state_engine=self.state_engine,
@@ -75,24 +83,11 @@ class AstrMaiPlugin(Star):
     @filter.on_astrbot_loaded()
     async def on_program_start(self):
         logger.info("[AstrMai] 🏁 AstrBot Loaded. Starting System Initialization...")
-        
-        # [Fix] 1. 优先初始化基础设施 (DatabaseService)
-        # 即使 MemoryEngine 不直接用它，BM25 或其他组件可能隐式依赖它
-        try:
-            if hasattr(self.db_service, 'initialize'):
-                await self.db_service.initialize()
-                logger.info("[AstrMai] 🗄️ Database Service Initialized.")
-            elif hasattr(self.db_service, 'init'): # 兼容常见的命名
-                await self.db_service.init()
-                logger.info("[AstrMai] 🗄️ Database Service Initialized.")
-        except Exception as e:
-            logger.error(f"[AstrMai] ❌ Database Service Init Failed: {e}")
-            # 数据库失败是致命的，但我们尝试继续以暴露更多问题
             
         # 2. 初始化记忆引擎
         logger.info("[AstrMai] 🧠 Initializing Memory Engine...")
         await self._init_memory()
-        
+        init_meme_storage()        
         #提前唤醒并构建指令黑名单防火墙，减少 System 1 误判的概率    
         await self.sensors._load_foreign_commands()
 
@@ -103,9 +98,9 @@ class AstrMaiPlugin(Star):
         await self.memory_engine.initialize()
         await self.memory_engine.start_background_tasks()
 
-    async def _system2_entry(self, event: AstrMessageEvent):
+    async def _system2_entry(self, main_event: AstrMessageEvent, queue_events: list):
         """AttentionGate 防抖结束后的回调，负责真正拉起 System 2 进行深度思考"""
-        chat_id = event.unified_msg_origin
+        chat_id = main_event.unified_msg_origin
         
         # 1. 取出 AttentionGate 聚合的消息队列
         pool = self.attention_gate.focus_pools.get(chat_id)
@@ -115,7 +110,7 @@ class AstrMaiPlugin(Star):
         await self.state_engine.consume_energy(chat_id)
         
         # 3. 引爆 System 2 认知循环
-        await self.system2_planner.plan_and_execute(event, queue_events)
+        await self.system2_planner.plan_and_execute(main_event, queue_events)
 
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
