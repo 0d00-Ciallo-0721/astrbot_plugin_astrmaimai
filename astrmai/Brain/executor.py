@@ -1,3 +1,4 @@
+# astrmai/Brain/executor.py
 from typing import Any, List
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -30,6 +31,7 @@ class ConcurrentExecutor:
 
         try:
             # 调用 AstrBot 协议中提供的原生 Agent (集成工具调用和多轮反思)
+            # 注意：system_prompt 由 ContextEngine 动态构建，已包含 Memory/State/Persona
             llm_resp = await self.context.tool_loop_agent(
                 event=event,
                 chat_provider_id=sys2_id,
@@ -52,11 +54,14 @@ class ConcurrentExecutor:
                 is_suitable, reason = await self.reply_checker.check(reply_text, chat_id)
                 if not is_suitable:
                     logger.warning(f"[{chat_id}] ⚠️ 触发降级机制：回复未通过安全审判。")
+                    # 降级策略：可以是沉默，或者发送一个通用表情
                     reply_text = "（陷入了短暂的沉默，似乎在思考些什么...）"
                     
-                # 最终执行回复
-                await event.send(event.plain_result(reply_text))
+                # 最终执行回复 (交给 ReplyEngine 处理分段、表情包等)
+                # ReplyEngine.handle_reply 负责最终的 send 操作
+                await self.reply_engine.handle_reply(event, reply_text, chat_id)
                 
         except Exception as e:
             logger.error(f"[{chat_id}] ❌ Agent Loop 执行严重异常: {e}")
+            # 仅在 Debug 模式下发送错误详情，否则发送通用错误
             await event.send(event.plain_result("（大脑似乎宕机了... 让我缓一缓。）"))

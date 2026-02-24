@@ -22,6 +22,11 @@ class PersistenceManager:
         self.db_path = base_path / "astrmai.db"
         self.db_url = f"sqlite:///{self.db_path}"
         
+        # 缓存文件路径
+        self.cache_dir = base_path / "cache"
+        self.cache_dir.mkdir(exist_ok=True)
+        self.persona_cache_path = self.cache_dir / "persona_cache.json"
+        
         # 兼容旧逻辑的同步 Engine (用于 Vector Store 等)
         self.engine = create_engine(self.db_url)
         SQLModel.metadata.create_all(self.engine)
@@ -64,6 +69,31 @@ class PersistenceManager:
                 await db.commit()
         except Exception as e:
             logger.error(f"[AstrMai-Infra] 数据库异步表初始化失败: {e}")
+
+    # ==========================================
+    # Cache I/O (Persona Summarizer)
+    # ==========================================
+    def load_persona_cache(self) -> Dict[str, Any]:
+        """加载人设摘要缓存"""
+        if not self.persona_cache_path.exists():
+            return {}
+        try:
+            with open(self.persona_cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"[Persistence] 加载人设缓存失败: {e}")
+            return {}
+
+    def save_persona_cache(self, cache_data: Dict[str, Any]):
+        """保存人设摘要缓存"""
+        try:
+            with open(self.persona_cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[Persistence] 保存人设缓存失败: {e}")
+
+
+
 
     # ==========================================
     # State & Profile 异步高频 I/O

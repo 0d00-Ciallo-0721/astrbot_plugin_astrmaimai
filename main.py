@@ -15,7 +15,7 @@ from .astrmai.memory.engine import MemoryEngine
 # --- Phase 3: System 2 (Brain) ---
 from .astrmai.Brain.context_engine import ContextEngine
 from .astrmai.Brain.planner import Planner
-
+from .astrmai.Brain.persona_summarizer import PersonaSummarizer
 # --- Phase 5: Evolution & Expression ---
 from .astrmai.evolution.processor import EvolutionManager
 from .astrmai.meme_engine.meme_init import init_meme_storage # [新增]
@@ -58,28 +58,45 @@ class AstrMaiPlugin(Star):
         # 需要 StateEngine 和 MoodManager (StateEngine 中已包含 MoodManager 逻辑或实例)
         # 这里的 StateEngine.mood_manager 是在 Phase 3 添加的
         self.reply_engine = ReplyEngine(self.state_engine, self.state_engine.mood_manager)
-
-        # --- Phase 3: System 2 (Brain) Mount ---
-        self.context_engine = ContextEngine(self.db_service)
-        self.system2_planner = Planner(context, self.gateway, self.context_engine)
+        self.evolution = EvolutionManager(self.db_service, self.gateway)
+        # --- Phase 3 & 4: System 2 (Brain) Mount ---
+        # [修改] 初始化人设压缩器
+        self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
+        
+        # [修改] 注入 summarizer 到 ContextEngine
+        self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
+        
+        # [修改] 注入 memory_engine 和 evolution 到 Planner (实现完全体 System 2)
+        self.system2_planner = Planner(
+            context, 
+            self.gateway, 
+            self.context_engine, 
+            self.reply_engine,
+            self.memory_engine, 
+            self.evolution
+        )
 
         # --- Phase 2: System 1 (Heart) Mount ---
+        # (注意: 这里 state_engine 被提前使用了，建议将 Phase 2 代码块移到 Phase 5 之前)
         self.state_engine = StateEngine(self.persistence, self.gateway)
-        # [修改] 传入 self.config
         self.judge = Judge(self.gateway, self.state_engine, self.config) 
         self.sensors = PreFilters(self.config) 
         self.system2_planner = Planner(context, self.gateway, self.context_engine, self.reply_engine)
+        self.sensors = PreFilters(self.config)
+        
+        # 修正依赖顺序后的 ReplyEngine 重新赋值 (如果上方报错)
+        self.reply_engine.state_engine = self.state_engine 
+        self.reply_engine.mood_manager = self.state_engine.mood_manager
 
-        # 组装 AttentionGate，并将 System 2 的入口作为防抖结束后的回调传入
+        # 组装 AttentionGate
         self.attention_gate = AttentionGate(
             state_engine=self.state_engine,
             judge=self.judge,
             sensors=self.sensors,
-            system2_callback=self._system2_entry # 绑定跨系统回调
+            system2_callback=self._system2_entry
         )
         
         logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-5 Mounted).")
-    
     @filter.on_astrbot_loaded()
     async def on_program_start(self):
         logger.info("[AstrMai] 🏁 AstrBot Loaded. Starting System Initialization...")
