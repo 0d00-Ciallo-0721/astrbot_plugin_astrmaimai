@@ -131,3 +131,44 @@ class StateEngine:
         self.db.save_user_profile(profile)
         
         logger.info(f"[Social] 🤝 用户 {profile.name}({user_id}) 好感度变更: {old_score:.1f} -> {profile.social_score:.1f} (Δ{impact_score})")
+
+    def get_active_states(self) -> List[ChatState]:
+        """[Phase 6] 获取当前内存中活跃的所有群状态"""
+        return list(self.chat_states.values())
+
+    def get_active_profiles(self) -> List[UserProfile]:
+        """[Phase 6] 获取当前内存中活跃的所有用户画像"""
+        return list(self.user_profiles.values())
+
+    def apply_natural_decay(self, state: ChatState):
+        """
+        [Phase 6] 自然状态衰减 (Metabolism)
+        - 精力(Energy): 若群冷场，缓慢恢复，准备下次 active。
+        - 情绪(Mood): 随时间趋于平静 (0.0)。
+        """
+        now = time.time()
+        # 1. 计算静默时间 (分钟)
+        minutes_silent = 999
+        if state.last_reply_time != 0:
+            minutes_silent = (now - state.last_reply_time) / 60
+        
+        # 2. 精力恢复 (Energy Recovery)
+        # 如果静默超过 60 分钟且精力不满，则恢复
+        if minutes_silent > 60 and state.energy < 0.8:
+            state.energy = min(0.8, state.energy + 0.1)
+            state.is_dirty = True
+            logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 精力恢复 -> {state.energy:.2f}")
+
+        # 3. 情绪平复 (Mood Decay)
+        # 每 1 小时衰减一次
+        if now - state.last_passive_decay_time > 3600:
+            state.last_passive_decay_time = now
+            decay_rate = 0.1 # 每次向 0 靠近 0.1
+            
+            if state.mood > 0:
+                state.mood = max(0.0, state.mood - decay_rate)
+            elif state.mood < 0:
+                state.mood = min(0.0, state.mood + decay_rate)
+            
+            state.is_dirty = True
+            logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 情绪平复 -> {state.mood:.2f}")

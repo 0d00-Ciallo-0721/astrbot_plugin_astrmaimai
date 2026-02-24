@@ -94,7 +94,9 @@ class ChatState:
     background_buffer: List[Any] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_msg_info: LastMessageMetadata = field(default_factory=LastMessageMetadata)
-
+    # --- Phase 6: Lifecycle Fields ---
+    next_wakeup_timestamp: float = 0.0 # 下次计划唤醒时间
+    last_passive_decay_time: float = 0.0 # 上次自然衰减时间
     # --- 缓存控制 ---
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
@@ -106,7 +108,9 @@ class UserProfile:
     name: str = "Unknown"
     social_score: float = 0.0
     last_seen: float = 0.0 
-    persona_analysis: str = "" 
+    persona_analysis: str = "" # 深度心理侧写
+    message_count_for_profiling: int = 0 # 距离上次画像生成后的消息数
+    last_persona_gen_time: float = 0.0 # 上次生成时间
     identity: str = ""
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     

@@ -20,7 +20,8 @@ from .astrmai.Brain.persona_summarizer import PersonaSummarizer
 from .astrmai.evolution.processor import EvolutionManager
 from .astrmai.meme_engine.meme_init import init_meme_storage # [新增]
 from .astrmai.Brain.reply_engine import ReplyEngine # [新增]
-
+# --- Phase 6: Proactive (Life) ---
+from .astrmai.evolution.proactive_task import ProactiveTask  # [新增]
 # --- Phase 2: System 1 (Heart) ---
 from .astrmai.Heart.state_engine import StateEngine
 from .astrmai.Heart.judge import Judge
@@ -95,6 +96,14 @@ class AstrMaiPlugin(Star):
             sensors=self.sensors,
             system2_callback=self._system2_entry
         )
+        # --- Phase 6: Proactive Task (Lifecycle) ---
+        # 挂载后台任务，注入依赖
+        self.proactive_task = ProactiveTask(
+            context=context,
+            state_engine=self.state_engine,
+            gateway=self.gateway,
+            persistence=self.persistence
+        )        
         
         logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-5 Mounted).")
     @filter.on_astrbot_loaded()
@@ -107,7 +116,8 @@ class AstrMaiPlugin(Star):
         init_meme_storage()        
         #提前唤醒并构建指令黑名单防火墙，减少 System 1 误判的概率    
         await self.sensors._load_foreign_commands()
-
+         # [Phase 6] 启动生命周期循环
+        await self.proactive_task.start()
     async def _init_memory(self):
         """异步唤醒记忆引擎与后台任务"""
         # 为了极度稳健，这里甚至可以再 sleep 1秒，但通常 on_astrbot_loaded 已经足够
@@ -135,13 +145,13 @@ class AstrMaiPlugin(Star):
         help_text = (
             "🤖 **AstrMai (v1.0.0)**\n"
             "-----------------------\n"
-            "🧠 架构状态: Phase 5 (Evolution Ready)\n"
+            "🧠 架构状态: Phase 6 (Lifecycle Active)\n"
             f"🔌 Sys1 Provider: {self.config.get('system1_provider_id')}\n"
             f"🔌 Sys2 Provider: {self.config.get('system2_provider_id')}\n"
             f"🔌 Emb Provider: {self.config.get('embedding_provider_id')}\n"
             "💾 SQLite & Faiss RAG: Connected\n"
             "🌀 Subconscious Miner: Running\n"
-            "🛡️ Dual-Process: Active"
+            "🌱 Proactive Life: Running"
         )
         yield event.plain_result(help_text)
 
@@ -185,12 +195,22 @@ class AstrMaiPlugin(Star):
         # [Debug Mode] 控制台输出拦截日志
         if self.config.get("debug_mode", False):
             logger.info(f"[AstrMai-Sensor] 📡 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
-
+        
+        user_id = event.get_sender_id()
+        if user_id:
+            # 异步非阻塞更新
+            asyncio.create_task(self._update_user_stats(user_id))
         # --- 分流 1: 泵入 Evolution 潜意识层 (记录语料与触发挖掘) ---
         await self.evolution.record_user_message(event)
 
         # --- 分流 2: 泵入 System 1 注意力门控 (判断防抖、拦截或上抛给 Sys2) ---
         await self.attention_gate.process_event(event)
+
+    async def _update_user_stats(self, user_id: str):
+        """[Phase 6] 更新用户活跃统计"""
+        profile = await self.state_engine.get_user_profile(user_id)
+        profile.message_count_for_profiling += 1
+        profile.is_dirty = True
 
     @filter.after_message_sent()
     async def after_message_sent_hook(self, event: AstrMessageEvent):
@@ -212,3 +232,7 @@ class AstrMaiPlugin(Star):
         logger.info("[AstrMai] 🛑 Terminating processes and unmounting...")
         if hasattr(self, 'memory_engine') and self.memory_engine.summarizer:
             await self.memory_engine.summarizer.stop()
+        
+        # [Phase 6] 停止生命周期
+        if hasattr(self, 'proactive_task'):
+            await self.proactive_task.stop()
