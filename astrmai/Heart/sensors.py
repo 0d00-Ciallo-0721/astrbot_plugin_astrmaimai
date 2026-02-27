@@ -11,8 +11,8 @@ class PreFilters:
     感知与过滤器 (System 1: Fused Version)
     职责: 构建指令防火墙，执行严格的消息清洗与拦截。
     """
-    def __init__(self, config: dict):
-        self.config = config or {}
+    def __init__(self, config):
+        self.config = config
         self.foreign_commands = set()
         self._commands_loaded = False 
 
@@ -22,6 +22,7 @@ class PreFilters:
             return
 
         try:
+            from astrbot.core.star.command_management import list_commands
             all_cmds = await list_commands()
             if all_cmds:
                 for cmd in all_cmds:
@@ -31,14 +32,17 @@ class PreFilters:
                     for alias in cmd.get("aliases", []):
                         self.foreign_commands.add(alias.lower())
             
-            # 追加配置中自定义的拦截词
-            extra_cmds = self.config.get("extra_command_list", [])
+            # [修复点] 兼容强类型 Config 对象，不再使用 dict.get()
+            extra_cmds = []
+            if hasattr(self.config, "system1") and hasattr(self.config.system1, "extra_command_list"):
+                 extra_cmds = self.config.system1.extra_command_list
+                 
             for extra in extra_cmds:
                 if extra:
                     self.foreign_commands.add(extra.lower())
-            
-            logger.info(f"[AstrMai-Sensor] 🛡️ 指令防火墙已加载。共监控 {len(self.foreign_commands)} 个指令词。")
+
             self._commands_loaded = True
+            logger.debug(f"[AstrMai-Sensor] 🛡️ 成功加载外部系统指令隔离名单 ({len(self.foreign_commands)} 条)")
         except Exception as e:
             logger.warning(f"[AstrMai-Sensor] ⚠️ 加载外部指令列表失败: {e}")
 
@@ -93,7 +97,7 @@ class PreFilters:
 
         # 5. 昵称点名提权
         raw_msg = event.message_str or ""
-        nicknames = self.config.get('bot_nicknames', [])
+        nicknames = self.config.system1.nicknames
         if nicknames and raw_msg:
             for nickname in nicknames:
                 if nickname and nickname in raw_msg:
@@ -127,8 +131,8 @@ class PreFilters:
         """
         if not text: return False
         
-        # 1. 检查基础指令前缀
-        if text.startswith(("/", "!", "！")):
+        # 1. 检查基础指令前缀 (接入 Config)
+        if any(text.startswith(prefix) for prefix in self.config.global_settings.command_prefixes):
             return True
             
         # 2. 检查动态加载的系统指令库
@@ -136,4 +140,4 @@ class PreFilters:
         if self.foreign_commands and first_word in self.foreign_commands:
             return True
             
-        return False            
+        return False

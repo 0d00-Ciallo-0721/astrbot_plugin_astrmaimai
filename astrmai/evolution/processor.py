@@ -12,9 +12,11 @@ class EvolutionManager:
     1. 监听消息发送后事件 -> 记录 Log
     2. 触发异步挖掘任务
     """
-    def __init__(self, db: DatabaseService, gateway: GlobalModelGateway):
+    def __init__(self, db: DatabaseService, gateway: GlobalModelGateway, config=None):
         self.db = db
-        self.miner = ExpressionMiner(gateway)
+        self.gateway = gateway
+        self.config = config if config else gateway.config
+        self.miner = ExpressionMiner(gateway, self.config)
         self.mining_lock = asyncio.Lock()
 
     async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):
@@ -61,11 +63,13 @@ class EvolutionManager:
             return
 
         async with self.mining_lock:
-            # 1. 获取未处理消息
-            logs = self.db.get_unprocessed_logs(group_id, limit=50)
+            # 1. 获取未处理消息 (接入 Config 批次大小)
+            batch_size = self.config.evolution.batch_size
+            logs = self.db.get_unprocessed_logs(group_id, limit=batch_size)
             
-            # 阈值检测 (Self_Learning 默认 25，这里设为 20)
-            if len(logs) < 20:
+            # 阈值检测 (接入 Config 触发阈值)
+            mining_trigger = self.config.evolution.mining_trigger
+            if len(logs) < mining_trigger:
                 return
 
             logger.info(f"[Evolution] Triggering pattern mining for {group_id} ({len(logs)} msgs)...")

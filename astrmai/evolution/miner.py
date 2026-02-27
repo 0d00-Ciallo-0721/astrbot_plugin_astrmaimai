@@ -10,19 +10,22 @@ class ExpressionMiner:
     职责: 从历史消息中提炼 Expression Patterns
     Reference: Self_Learning/expression_pattern_learner.py
     """
-    def __init__(self, gateway: GlobalModelGateway):
+    def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
-
+        self.config = config if config else gateway.config
     async def mine(self, group_id: str, messages: List[MessageLog]) -> List[ExpressionPattern]:
         """
         执行挖掘任务：融合句式与黑话的双重提取 (Reference: expression_learner.py & jargon_miner.py)
         """
-        if len(messages) < 10:
+        # 接入 Config 阈值
+        min_mining_context = self.config.evolution.min_mining_context
+        if len(messages) < min_mining_context:
             return []
 
         # 1. 构建 Context
         context_str = self._build_context(messages)
         
+        # [省略下方原有 _build_context 和 prompt 构建及调用等未修改的代码...]
         # 2. 构建融合 Prompt
         prompt = f"""
 {context_str}

@@ -14,11 +14,13 @@ class AttentionGate:
     注意力门控 (System 1: Dual-Pool Locked Version)
     职责: 双池路由，滑动窗口聚合，防止高并发打断。
     """
-    def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters, system2_callback):
+    def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters, system2_callback, config=None):
         self.state_engine = state_engine
         self.judge = judge
         self.sensors = sensors
         self.sys2_process = system2_callback 
+        self.config = config if config else state_engine.config
+
 
     async def process_event(self, event: AstrMessageEvent):
         chat_id = event.unified_msg_origin
@@ -83,9 +85,9 @@ class AttentionGate:
                     chat_state.lock.release()
                 chat_state.owner_id = None
         else:
-            # 被 IGNORE 的消息，作为环境上下文放入背景池
+            # 被 IGNORE 的消息，作为环境上下文放入背景池 (接入 Config)
             chat_state.background_buffer.append(event)
-            if len(chat_state.background_buffer) > 20: # 限制溢出
+            if len(chat_state.background_buffer) > self.config.attention.bg_pool_size:
                 chat_state.background_buffer.pop(0)
 
     async def _wait_and_process(self, chat_id: str, state: Any):
@@ -93,9 +95,10 @@ class AttentionGate:
         滑动窗口聚合：等待 User A 说完。
         """
         try:
-            logger.debug(f"[{chat_id}] ⏱️ 开启 2 秒聚合滑动窗口...")
+            logger.debug(f"[{chat_id}] ⏱️ 开启聚合滑动窗口...")
             no_msg_start_time = time.time()
             last_pool_len = 0
+            debounce_window = self.config.attention.debounce_window
             
             # 动态防抖循环
             while True:
@@ -107,8 +110,8 @@ class AttentionGate:
                     ts = state.accumulation_pool[-1].get_extra("astrmai_timestamp")
                     if ts: no_msg_start_time = ts
                 
-                # 如果超过 2 秒没有新消息，跳出循环
-                if time.time() - no_msg_start_time > 2.0:
+                # 如果超过防抖窗口没有新消息，跳出循环 (接入 Config)
+                if time.time() - no_msg_start_time > debounce_window:
                     break
                 await asyncio.sleep(0.5)
 

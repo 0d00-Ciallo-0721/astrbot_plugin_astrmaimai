@@ -1,4 +1,3 @@
-# astrmai/infra/gateway.py
 import json
 import re
 import asyncio
@@ -14,11 +13,13 @@ except ImportError:
 class GlobalModelGateway:
     """
     统一模型网关 (重构版：增加弹性熔断与指数退避)
+    已彻底接入 Pydantic AstrMaiConfig 对象。
     """
-    def __init__(self, context: Context, config: dict):
+    def __init__(self, context: Context, config: Any):
         self.context = context
-        self.sys1_id = config.get("system1_provider_id")
-        self.sys2_id = config.get("system2_provider_id")
+        self.config = config
+        self.sys1_id = self.config.provider.system1_provider_id
+        self.sys2_id = self.config.provider.system2_provider_id
 
     def _extract_json(self, text: str) -> str:
         text = text.strip()
@@ -27,7 +28,7 @@ class GlobalModelGateway:
             return match.group(1).strip()
         return text
 
-    async def call_judge(self, prompt: str, system_prompt: str = "", max_retries: int = 2) -> Dict[str, Any]:
+    async def call_judge(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """
         System 1 (Judge) 弹性 JSON 接口
         包含指数退避策略与 JsonRepair 自动修复
@@ -38,6 +39,10 @@ class GlobalModelGateway:
 
         contexts = [{"role": "system", "content": system_prompt}] if system_prompt else []
         last_error = ""
+        
+        # 动态读取基础配置
+        max_retries = self.config.infra.llm_retries
+        backoff_factor = self.config.infra.backoff_factor
 
         for attempt in range(max_retries + 1):
             try:
@@ -66,12 +71,12 @@ class GlobalModelGateway:
                 last_error = str(e)
                 logger.warning(f"[AstrMai-Gateway] System 1 失败 (Try {attempt+1}/{max_retries+1}): {e}")
                 if attempt < max_retries:
-                    await asyncio.sleep(1.5 ** attempt) # 指数退避: 1s, 1.5s, 2.25s...
+                    await asyncio.sleep(backoff_factor ** attempt) # 指数退避: 例如 1s, 1.5s, 2.25s...
                 
         logger.error(f"[AstrMai-Gateway] ❌ System 1 最终异常: {last_error}")
         return {}
 
-    async def call_planner(self, prompt: str, max_retries: int = 2) -> str:
+    async def call_planner(self, prompt: str) -> str:
         """
         System 2 (Brain) 弹性纯文本接口
         """
@@ -80,6 +85,9 @@ class GlobalModelGateway:
             return ""
 
         last_error = ""
+        max_retries = self.config.infra.llm_retries
+        backoff_factor = self.config.infra.backoff_factor
+
         for attempt in range(max_retries + 1):
             try:
                 resp = await self.context.llm_generate(
@@ -92,9 +100,10 @@ class GlobalModelGateway:
                 
             except Exception as e:
                 last_error = str(e)
-                logger.warning(f"[AstrMai-Gateway] System 2 失败 (Try {attempt+1}): {e}")
+                logger.warning(f"[AstrMai-Gateway] System 2 失败 (Try {attempt+1}/{max_retries+1}): {e}")
                 if attempt < max_retries:
-                    await asyncio.sleep(2.0 ** attempt) # 慢思考退避：1s, 2s, 4s...
+                    # 慢思考模块容错增加惩罚系数
+                    await asyncio.sleep((backoff_factor + 0.5) ** attempt) 
                     
         logger.error(f"[AstrMai-Gateway] ❌ System 2 最终异常: {last_error}")
         return ""

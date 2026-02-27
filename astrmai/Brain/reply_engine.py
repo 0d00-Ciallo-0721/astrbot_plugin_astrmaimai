@@ -17,14 +17,16 @@ class ReplyEngine:
     回复引擎 (Expression Layer)
     职责: 清洗 LLM 输出、拟人化分段、情绪后处理与表情包发送
     """
-    def __init__(self, state_engine: StateEngine, mood_manager: MoodManager):
+    def __init__(self, state_engine: StateEngine, mood_manager: MoodManager, config=None):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
+        self.config = config if config else state_engine.config
         
-        # 配置项 (可后续通过 config 传入，此处使用 HeartFlow 默认值)
-        self.segmentation_threshold = 15 # 分段阈值
-        self.no_segment_limit = 120      # 长文不分段阈值
-        self.meme_probability = 60       # 表情包概率
+        # 接入 Config (不再硬编码)
+        self.segmentation_threshold = self.config.reply.segment_min_len # 分段阈值
+        self.no_segment_limit = self.config.reply.no_segment_max_len      # 长文不分段阈值
+        self.meme_probability = self.config.reply.meme_probability       # 表情包概率
+
 
     def _clean_reply_content(self, text: str) -> str:
         """
@@ -114,9 +116,9 @@ class ReplyEngine:
         segments = self._segment_reply_content(clean_text)
         for i, seg in enumerate(segments):
             await event.send(event.plain_result(seg))
-            # 拟人化打字延迟
+            # 拟人化打字延迟 (接入 Config)
             if i < len(segments) - 1:
-                delay = min(2.0, max(0.5, len(seg) * 0.1))
+                delay = min(2.0, max(0.5, len(seg) * self.config.reply.typing_speed_factor))
                 await asyncio.sleep(delay)
 
         # 4. 发送表情包 (基于刚才分析出的 tag)

@@ -12,17 +12,19 @@ class ContextEngine:
     职责: 动态编织 Prompt，集成人设压缩、状态注入、记忆回溯与黑话植入。
     设计原则: Anti-Bloat (结构化标签), Dynamic Injection (动态注入), Native Chinese (中文原声)
     """
-    def __init__(self, db: DatabaseService, persona_summarizer: PersonaSummarizer):
+    def __init__(self, db: DatabaseService, persona_summarizer: PersonaSummarizer, config=None, context=None):
         self.db = db
         self.summarizer = persona_summarizer
+        # 通过依赖链反向获取 config 和 context，避免修改 main.py 的实例化签名
+        self.config = config if config else self.summarizer.gateway.config
+        self.context = context if context else self.summarizer.gateway.context
 
     async def build_prompt(self, 
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
                            memory_context: str = "",
                            slang_patterns: str = "",
-                           tool_descs: str = "") -> str:
-        
+                           tool_descs: str = "") -> str: 
         # 1. 获取基础状态数据
         # 注意: 如果 db_service 是同步的，这里直接调用；如果是异步的需 await
         # 假设 DatabaseService 提供了兼容的同步/异步接口，这里按 Phase 4 标准使用
@@ -33,9 +35,28 @@ class ContextEngine:
         sender_name = event_messages[-1].get_sender_name()
         user_profile = self.db.get_user_profile(sender_id)
         
-        # 2. 获取并压缩人设 (Anti-Bloat & Anti-OOC)
-        # 获取原始人设 Prompt (这里通常从 AstrBot 配置或 Context 获取，此处为示例占位，实际应传入配置中的 prompt)
+        # 2. 获取并压缩人设 (Anti-Bloat & Anti-OOC) [接入 Config 与动态人设]
         raw_persona = "你是一个名为 AstrMai 的高级智能体，拥有丰富的情感和独特的个性..." 
+        
+        if self.config and self.context:
+            persona_id = self.config.persona.persona_id
+            if persona_id:
+                try:
+                    # 读取配置中的固定人设
+                    persona_data = self.context.persona_manager.get_persona(persona_id)
+                    if persona_data:
+                        raw_persona = persona_data.system_prompt
+                except Exception as e:
+                    logger.warning(f"[ContextEngine] 无法加载配置的人设 {persona_id}: {e}")
+            else:
+                try:
+                    # 没有绑定时，使用当前会话的使用的人格即默认人设
+                    default_persona = self.context.persona_manager.get_default_persona_v3(chat_id)
+                    if default_persona:
+                        raw_persona = default_persona.get("prompt", raw_persona)
+                except Exception as e:
+                    logger.warning(f"[ContextEngine] 无法加载默认人设: {e}")
+
         # 调用 Summarizer 获取压缩后的人设和风格指南
         persona_summary, style_guide = await self.summarizer.get_summary(raw_persona)
 
@@ -68,6 +89,7 @@ class ContextEngine:
 4. 必须使用中文回复，除非用户主动使用其他语言。
 5. 你的回复长度和积极性应受当前[State] (Mood/Energy) 的动态影响。
 """
+        return prompt.strip()
         return prompt.strip()
 
     def _build_state_block(self, state: Optional[ChatState]) -> str:

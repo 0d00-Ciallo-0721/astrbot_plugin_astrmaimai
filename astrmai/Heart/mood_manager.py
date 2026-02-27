@@ -8,18 +8,33 @@ class MoodManager:
     职责: 调用 LLM 分析文本对机器人的情绪影响，输出情绪标签与数值变化。
     Reference: HeartFlow/core/mood_manager.py
     """
-    def __init__(self, gateway: GlobalModelGateway):
+    def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
-        # 默认情绪映射表
-        self.emotion_mapping = {
-            "happy": "积极、开心、感谢",
-            "sad": "悲伤、遗憾、道歉",
-            "angry": "生气、抱怨、攻击",
-            "neutral": "平静、客观、陈述",
-            "curious": "好奇、提问、困惑",
-            "surprise": "惊讶、意外"
-        }
+        self.config = config if config else gateway.config
+        
+        self.emotion_mapping = {}
+        
+        # [修改] 将配置中的 List 动态解析为字典，兼容中英文冒号
+        if hasattr(self.config, 'mood') and hasattr(self.config.mood, 'emotion_mapping'):
+            mapping_list = self.config.mood.emotion_mapping
+            for item in mapping_list:
+                if ":" in item:
+                    k, v = item.split(":", 1)
+                    self.emotion_mapping[k.strip()] = v.strip()
+                elif "：" in item: # 兼容全角冒号
+                    k, v = item.split("：", 1)
+                    self.emotion_mapping[k.strip()] = v.strip()
 
+        # 兜底默认值
+        if not self.emotion_mapping:
+            self.emotion_mapping = {
+                "happy": "积极、开心、感谢",
+                "sad": "悲伤、遗憾、道歉",
+                "angry": "生气、抱怨、攻击",
+                "neutral": "平静、客观、陈述",
+                "curious": "好奇、提问、困惑",
+                "surprise": "惊讶、意外"
+            }
     async def analyze_text_mood(self, text: str, current_mood: float) -> tuple[str, float]:
         """
         核心情绪分析
@@ -70,6 +85,6 @@ class MoodManager:
 
         except Exception as e:
             logger.warning(f"[Mood] ⚠️ 分析失败，执行自然衰减: {e}")
-            # 失败时的自然衰减逻辑
-            decayed = current_mood * 0.9
+            # 失败时的自然衰减逻辑 (接入 Config)
+            decayed = current_mood * self.config.mood.unknown_decay
             return "neutral", decayed

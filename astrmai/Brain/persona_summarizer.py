@@ -12,9 +12,10 @@ class PersonaSummarizer:
     人设摘要/压缩管理器 (System 2)
     职责: 将冗长的 System Prompt 压缩为高密度的核心特征与风格指南，减少 Token 消耗。
     """
-    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway):
+    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None):
         self.persistence = persistence
         self.gateway = gateway
+        self.config = config if config else gateway.config
         # 加载持久化缓存
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁
@@ -30,7 +31,10 @@ class PersonaSummarizer:
         获取人设摘要。
         Returns: (summarized_persona, style_guide)
         """
-        if not original_prompt or len(original_prompt) < 300:
+        # 接入 Config 阈值
+        summary_threshold = self.config.performance.summary_threshold
+        
+        if not original_prompt or len(original_prompt) < summary_threshold:
             # 如果人设很短，直接返回原始值，不做压缩
             return original_prompt, "保持原始风格"
 

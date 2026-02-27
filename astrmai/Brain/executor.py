@@ -12,11 +12,12 @@ class ConcurrentExecutor:
     智能体执行器 (System 2)
     使用 AstrBot 原生 tool_loop_agent 替代原有手写 Action Loop。
     """
-    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine):
+    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine, config=None):
         self.context = context
         self.gateway = gateway
         self.reply_checker = ReplyChecker(gateway)
         self.reply_engine = reply_engine
+        self.config = config if config else gateway.config
 
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any]):
         chat_id = event.unified_msg_origin
@@ -27,7 +28,13 @@ class ConcurrentExecutor:
             return
 
         tool_set = ToolSet(tools)
-        logger.info(f"[{chat_id}] 🧠 Brain 启动原生 Agent Loop (Max Steps: 5)...")
+        
+        # 接入 Config
+        max_steps = self.config.agent.max_steps
+        timeout = self.config.agent.timeout
+        fallback_text = self.config.reply.fallback_text
+        
+        logger.info(f"[{chat_id}] 🧠 Brain 启动原生 Agent Loop (Max Steps: {max_steps})...")
 
         try:
             # 调用 AstrBot 协议中提供的原生 Agent (集成工具调用和多轮反思)
@@ -38,8 +45,8 @@ class ConcurrentExecutor:
                 prompt=prompt,
                 system_prompt=system_prompt,
                 tools=tool_set,
-                max_steps=5,
-                tool_call_timeout=60
+                max_steps=max_steps,
+                tool_call_timeout=timeout
             )
 
             reply_text = llm_resp.completion_text
@@ -55,7 +62,7 @@ class ConcurrentExecutor:
                 if not is_suitable:
                     logger.warning(f"[{chat_id}] ⚠️ 触发降级机制：回复未通过安全审判。")
                     # 降级策略：可以是沉默，或者发送一个通用表情
-                    reply_text = "（陷入了短暂的沉默，似乎在思考些什么...）"
+                    reply_text = fallback_text
                     
                 # 最终执行回复 (交给 ReplyEngine 处理分段、表情包等)
                 # ReplyEngine.handle_reply 负责最终的 send 操作
@@ -63,5 +70,5 @@ class ConcurrentExecutor:
                 
         except Exception as e:
             logger.error(f"[{chat_id}] ❌ Agent Loop 执行严重异常: {e}")
-            # 仅在 Debug 模式下发送错误详情，否则发送通用错误
-            await event.send(event.plain_result("（大脑似乎宕机了... 让我缓一缓。）"))
+            # 仅在 Debug 模式下发送错误详情，否则发送通用错误 (接入 Config)
+            await event.send(event.plain_result(fallback_text))

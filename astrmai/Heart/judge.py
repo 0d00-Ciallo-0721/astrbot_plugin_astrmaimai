@@ -12,9 +12,10 @@ class Judge:
     判官 (System 1: Fused 3-State Version)
     职责: 决定 System 2 的初步动作倾向 (REPLY, WAIT, IGNORE)
     """
-    def __init__(self, gateway: GlobalModelGateway, state_engine: StateEngine):
+    def __init__(self, gateway: GlobalModelGateway, state_engine: StateEngine, config=None):
         self.gateway = gateway
         self.state_engine = state_engine
+        self.config = config if config else gateway.config
 
     async def evaluate(self, chat_id: str, message: str, is_force_wakeup: bool) -> BrainActionPlan:
         """
@@ -23,8 +24,8 @@ class Judge:
         start_time = time.perf_counter()
         state = await self.state_engine.get_state(chat_id)
         
-        # 1. 能量硬限制 (Low Energy -> Ignore unless forced)
-        if state.energy < 0.1 and not is_force_wakeup:
+        # 1. 能量硬限制 (接入 Config)
+        if state.energy < self.config.energy.min_reply_threshold and not is_force_wakeup:
             logger.debug(f"[{chat_id}] Judge: 能量过低 ({state.energy:.2f})，抑制回复。")
             return BrainActionPlan(action="IGNORE", thought="能量耗尽", necessity=0)
 
@@ -33,13 +34,11 @@ class Judge:
             logger.debug(f"[{chat_id}] Judge: 强唤醒，最高优先级放行。")
             return BrainActionPlan(action="REPLY", thought="受到强唤醒", necessity=10, relevance=10)
 
-        # 3. 关键词短路
-        wakeup_words = self.config.get("wakeup_words", [])
-        # 预处理消息：去除首尾空格并转小写
+        # 3. 关键词短路 (接入 Config 修复隐患 Bug)
+        wakeup_words = self.config.system1.wakeup_words
         msg_lower = message.strip().lower()
         
         for kw in wakeup_words:
-            # 必须匹配句子开头 (startswith)
             if msg_lower.startswith(kw.lower()):
                 logger.debug(f"[{chat_id}] Judge: 唤醒词 [{kw}] 命中首部，快速放行。")
                 return BrainActionPlan(action="REPLY", thought=f"命中唤醒词 [{kw}]", necessity=9, relevance=10)

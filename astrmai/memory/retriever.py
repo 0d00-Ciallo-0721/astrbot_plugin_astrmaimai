@@ -14,10 +14,11 @@ class HybridRetriever:
     结合 BM25 + Vector + RRF
     Reference: LivingMemory/core/retrieval/hybrid_retriever.py
     """
-    def __init__(self, bm25: BM25Retriever, vector: VectorRetriever):
+    def __init__(self, bm25: BM25Retriever, vector: VectorRetriever, config=None):
         self.bm25 = bm25
         self.vector = vector
         self.rrf = RRFFusion()
+        self.config = config
 
     async def add_memory(self, content: str, metadata: Dict[str, Any]) -> int:
         # 1. 存入向量库 (主库)
@@ -51,6 +52,10 @@ class HybridRetriever:
 
     def _apply_weighting(self, results: List[SearchResult]) -> List[SearchResult]:
         now = time.time()
+        
+        # 接入 Config (时间衰减率)
+        time_decay_rate = getattr(self.config.memory, 'time_decay_rate', 0.01) if self.config else 0.01
+        
         for r in results:
             meta = r.metadata
             create_time = meta.get("create_time", now)
@@ -58,7 +63,7 @@ class HybridRetriever:
             
             # 衰减公式: score * importance * e^(-lambda * days)
             days_old = (now - create_time) / 86400
-            decay = math.exp(-0.01 * days_old)
+            decay = math.exp(-time_decay_rate * days_old)
             
             r.score = r.score * importance * decay
             

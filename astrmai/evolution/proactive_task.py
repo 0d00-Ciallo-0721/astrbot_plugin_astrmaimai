@@ -23,15 +23,18 @@ class ProactiveTask:
                  context: Context, 
                  state_engine: StateEngine, 
                  gateway: GlobalModelGateway,
-                 persistence: PersistenceManager):
+                 persistence: PersistenceManager,
+                 config=None):
         self.context = context
         self.state_engine = state_engine
         self.gateway = gateway
         self.persistence = persistence
+        self.config = config if config else gateway.config
         
         self._is_running = False
         self._task = None
         self._last_profile_run = 0
+
 
     async def start(self):
         """启动后台循环"""
@@ -83,9 +86,11 @@ class ProactiveTask:
         active_states = self.state_engine.get_active_states()
         now = time.time()
         
-        # 配置阈值 (可从 config 读取，这里暂时硬编码)
-        SILENCE_THRESHOLD_MIN = 120 # 2小时冷场
-        ENERGY_THRESHOLD = 0.6      # 精力充沛才主动说话
+        # 配置阈值 (接入 Config)
+        SILENCE_THRESHOLD_MIN = self.config.life.silence_threshold
+        ENERGY_THRESHOLD = self.config.life.wakeup_min_energy
+        WAKEUP_COST = self.config.life.wakeup_cost
+        WAKEUP_COOLDOWN = self.config.life.wakeup_cooldown
         
         for state in active_states:
             # 基础过滤
@@ -117,9 +122,9 @@ class ProactiveTask:
                         chain = MessageChain().message(opening)
                         await self.context.send_message(state.chat_id, chain)
                         
-                        # 消耗精力并设置冷却 (8小时内不再主动唤醒该群)
-                        await self.state_engine.consume_energy(state.chat_id, amount=0.2)
-                        state.next_wakeup_timestamp = now + (8 * 3600)
+                        # 消耗精力并设置冷却 (接入 Config)
+                        await self.state_engine.consume_energy(state.chat_id, amount=WAKEUP_COST)
+                        state.next_wakeup_timestamp = now + WAKEUP_COOLDOWN
                         logger.info(f"[Life] 🗣️ 主动破冰成功: {opening}")
                     except Exception as e:
                         logger.error(f"[Life] 发送主动消息失败: {e}")
@@ -139,8 +144,8 @@ class ProactiveTask:
 
     async def _run_profiling_task(self):
         """侧写任务：扫描并生成用户画像"""
-        # 阈值配置
-        MSG_THRESHOLD = 200 # 交互超过 200 条触发
+        # 阈值配置 (动态兼容，若 config 中未配则默认200)
+        MSG_THRESHOLD = getattr(self.config.evolution, 'profile_threshold', 200) 
         
         profiles = self.state_engine.get_active_profiles()
         candidates = [

@@ -15,10 +15,16 @@ class MemoryEngine:
     统一记忆引擎 (Infrastructure Layer)
     Reference: LivingMemory/core/managers/memory_engine.py
     """
-    def __init__(self, context, gateway, embedding_provider_id: str = ""):
+    def __init__(self, context, gateway, embedding_provider_id: str = "", config=None):
         self.context = context
         self.gateway = gateway
-        self.embedding_provider_id = embedding_provider_id # 新增：接收配置 ID
+        self.config = config if config else gateway.config
+        
+        # 新增：优先从配置读取 Embedding Provider ID
+        if hasattr(self.config, 'provider') and getattr(self.config.provider, 'embedding_provider_id', None):
+            self.embedding_provider_id = self.config.provider.embedding_provider_id
+        else:
+            self.embedding_provider_id = embedding_provider_id
         
         # 路径配置
         self.data_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai" / "memory"
@@ -58,7 +64,8 @@ class MemoryEngine:
         bm25 = BM25Retriever(self.db_path)
         await bm25.initialize()
         
-        self.retriever = HybridRetriever(bm25, self.vec_retriever)
+        # 传入 config 对象
+        self.retriever = HybridRetriever(bm25, self.vec_retriever, config=self.config)
         logger.info("[AstrMai] Memory Engine Initialized (Standardized Embedding RAG Ready)")
 
     async def add_memory(self, content: str, session_id: str):
@@ -73,8 +80,11 @@ class MemoryEngine:
         if not self.retriever: 
             return "（记忆模块离线）"
         
-        # 检索最相关的 5 条记忆片段
-        results = await self.retriever.search(query, k=5)
+        # 接入 Config 阈值
+        recall_top_k = getattr(self.config.memory, 'recall_top_k', 5)
+        
+        # 检索最相关的记忆片段
+        results = await self.retriever.search(query, k=recall_top_k)
         
         if not results:
             logger.debug(f"[Memory] 未找到关于 '{query}' 的相关记忆。")
@@ -92,5 +102,6 @@ class MemoryEngine:
     async def start_background_tasks(self):
         """启动后台记忆清道夫任务 (Task Scheduler)"""
         from .summarizer import ChatHistorySummarizer
-        self.summarizer = ChatHistorySummarizer(self.context, self.gateway, self)
+        # 传入 config 对象
+        self.summarizer = ChatHistorySummarizer(self.context, self.gateway, self, config=self.config)
         await self.summarizer.start()

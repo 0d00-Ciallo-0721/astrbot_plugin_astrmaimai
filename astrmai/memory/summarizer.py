@@ -8,15 +8,18 @@ class ChatHistorySummarizer:
     历史摘要清道夫 (System 2 / Memory Lifecycle)
     定期在后台扫描超长的历史对话，调用模型进行话题总结，并压入长期记忆库。
     """
-    def __init__(self, context, gateway, engine):
+    def __init__(self, context, gateway, engine, config=None):
         self.context = context
         self.gateway = gateway
         self.engine = engine
+        self.config = config if config else gateway.config
         
         self._running = False
         self._periodic_task = None
-        self.check_interval = 3600  # 每小时检查一次
-        self.msg_threshold = 30     # 当对话记录超过 30 条时触发压缩
+        
+        # 接入 Config 阈值
+        self.check_interval = getattr(self.config.memory, 'cleanup_interval', 3600)  # 后台整理间隔
+        self.msg_threshold = getattr(self.config.memory, 'summary_threshold', 30)    # 触发压缩条数阈值
 
     async def start(self):
         """启动后台定期检查循环"""

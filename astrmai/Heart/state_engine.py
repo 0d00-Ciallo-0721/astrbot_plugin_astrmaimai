@@ -2,7 +2,7 @@
 import time
 import datetime
 import asyncio
-from typing import Dict, Optional
+from typing import Dict, Optional, List 
 from astrbot.api import logger
 from ..infra.persistence import PersistenceManager
 from ..infra.datamodels import ChatState, UserProfile
@@ -17,15 +17,16 @@ class StateEngine:
     2. 维护 UserProfile (Social Score) 懒加载
     3. 管理多模态消息关联状态
     """
-    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway):
+    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None):
         self.persistence = persistence
         self.gateway = gateway
+        self.config = config if config else gateway.config
         
         # 内存态活跃数据
         self.chat_states: Dict[str, ChatState] = {}
         self.user_profiles: Dict[str, UserProfile] = {}
-        # [新增] 初始化情绪管理器
-        self.mood_manager = MoodManager(gateway)        
+        # 初始化情绪管理器
+        self.mood_manager = MoodManager(gateway, self.config)        
         # 并发防击穿锁
         self._lock = asyncio.Lock()
 
@@ -58,7 +59,8 @@ class StateEngine:
         today = datetime.date.today().isoformat()
         if state.last_reset_date != today:
             state.last_reset_date = today
-            state.energy = min(1.0, state.energy + 0.2)
+            # 接入 Config
+            state.energy = min(1.0, state.energy + self.config.energy.daily_recovery)
             state.mood = 0.0
             state.is_dirty = True
 
@@ -84,20 +86,21 @@ class StateEngine:
             return profile
 
     async def update_mood(self, chat_id: str, text: str):
-        """
-        基于最新消息更新情绪状态 (Mood Dynamics)
-        """
+        """基于最新消息更新情绪状态 (Mood Dynamics)"""
         state = await self.get_state(chat_id)
         
-        # 调用情绪管理器获取分析结果
         tag, new_value = await self.mood_manager.analyze_text_mood(text, state.mood)
         
-        # 更新状态
         state.mood = new_value
-        self.db.save_chat_state(state) # 持久化
+        await self.persistence.save_chat_state(chat_id, state) # 修复原版 self.db 调用报错
         
         return tag, new_value
-    async def consume_energy(self, chat_id: str, amount: float = 0.05):
+    
+    async def consume_energy(self, chat_id: str, amount: float = None):
+        # 接入 Config 默认消耗
+        if amount is None:
+            amount = self.config.energy.cost_per_reply
+            
         state = await self.get_state(chat_id)
         old_energy = state.energy
         
@@ -109,14 +112,11 @@ class StateEngine:
 
     # [新增] 社交好感度闭环
     async def update_social_score_from_fact(self, user_id: str, impact_score: float):
-        """
-        [New] 基于交互事实的动态好感度闭环
-        impact_score: 正数增加好感，负数扣除
-        """
+        """[New] 基于交互事实的动态好感度闭环"""
         if not user_id: return
         
-        # 获取 UserProfile (利用 db service)
-        profile = self.db.get_user_profile(user_id)
+        # 修复原版 self.db.get_user_profile 调用
+        profile = await self.get_user_profile(user_id)
         if not profile:
             profile = UserProfile(user_id=user_id, name="Unknown")
             
@@ -128,7 +128,7 @@ class StateEngine:
         profile.social_score = max(-100.0, min(100.0, profile.social_score))
         
         profile.last_seen = time.time()
-        self.db.save_user_profile(profile)
+        profile.is_dirty = True # 依赖周期落盘
         
         logger.info(f"[Social] 🤝 用户 {profile.name}({user_id}) 好感度变更: {old_score:.1f} -> {profile.social_score:.1f} (Δ{impact_score})")
 
@@ -143,27 +143,22 @@ class StateEngine:
     def apply_natural_decay(self, state: ChatState):
         """
         [Phase 6] 自然状态衰减 (Metabolism)
-        - 精力(Energy): 若群冷场，缓慢恢复，准备下次 active。
-        - 情绪(Mood): 随时间趋于平静 (0.0)。
         """
         now = time.time()
-        # 1. 计算静默时间 (分钟)
         minutes_silent = 999
         if state.last_reply_time != 0:
             minutes_silent = (now - state.last_reply_time) / 60
         
-        # 2. 精力恢复 (Energy Recovery)
-        # 如果静默超过 60 分钟且精力不满，则恢复
-        if minutes_silent > 60 and state.energy < 0.8:
+        # 2. 精力恢复 (Energy Recovery) 接入 Config
+        if minutes_silent > self.config.energy.recovery_silence_min and state.energy < 0.8:
             state.energy = min(0.8, state.energy + 0.1)
             state.is_dirty = True
             logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 精力恢复 -> {state.energy:.2f}")
 
-        # 3. 情绪平复 (Mood Decay)
-        # 每 1 小时衰减一次
-        if now - state.last_passive_decay_time > 3600:
+        # 3. 情绪平复 (Mood Decay) 接入 Config
+        if now - state.last_passive_decay_time > self.config.mood.decay_interval:
             state.last_passive_decay_time = now
-            decay_rate = 0.1 # 每次向 0 靠近 0.1
+            decay_rate = self.config.mood.decay_rate 
             
             if state.mood > 0:
                 state.mood = max(0.0, state.mood - decay_rate)

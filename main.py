@@ -2,26 +2,31 @@ import asyncio
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.all import AstrBotConfig
+
+# --- Config ---
+from .config import AstrMaiConfig
 
 # --- Phase 1: Infra ---
+from .astrmai.infra.persistence import PersistenceManager
 from .astrmai.infra.database import DatabaseService
 from .astrmai.infra.gateway import GlobalModelGateway
 
 # --- Phase 4: Memory ---
-from .astrmai.memory.engine import MemoryEngine
 from .astrmai.memory.engine import MemoryEngine
 
 # --- Phase 3: System 2 (Brain) ---
 from .astrmai.Brain.context_engine import ContextEngine
 from .astrmai.Brain.planner import Planner
 from .astrmai.Brain.persona_summarizer import PersonaSummarizer
+
 # --- Phase 5: Evolution & Expression ---
 from .astrmai.evolution.processor import EvolutionManager
-from .astrmai.meme_engine.meme_init import init_meme_storage # [新增]
-from .astrmai.Brain.reply_engine import ReplyEngine # [新增]
+from .astrmai.meme_engine.meme_init import init_meme_storage 
+from .astrmai.Brain.reply_engine import ReplyEngine 
+
 # --- Phase 6: Proactive (Life) ---
-from .astrmai.evolution.proactive_task import ProactiveTask  # [新增]
+from .astrmai.evolution.proactive_task import ProactiveTask  
+
 # --- Phase 2: System 1 (Heart) ---
 from .astrmai.Heart.state_engine import StateEngine
 from .astrmai.Heart.judge import Judge
@@ -30,14 +35,15 @@ from .astrmai.Heart.attention import AttentionGate
 
 @register("astrmai", "Gemini Antigravity", "AstrMai: Dual-Process Architecture Plugin", "1.0.0", "https://github.com/astrmai")
 class AstrMaiPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig = None):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.config = config if config else context.get_config()
+        # 核心修改：反序列化传入的 dict 为 Pydantic 对象
+        raw_config = config if config else context.get_config()
+        self.config = AstrMaiConfig(**raw_config)
         
-        # [Fix] 必须使用 self.config.get() 而不是局部的 config.get()
-        sys1 = self.config.get('system1_provider_id', 'Unconfigured')
-        sys2 = self.config.get('system2_provider_id', 'Unconfigured')
-        emb_id = self.config.get('embedding_provider_id', '')
+        sys1 = self.config.provider.system1_provider_id or 'Unconfigured'
+        sys2 = self.config.provider.system2_provider_id or 'Unconfigured'
+        emb_id = self.config.provider.embedding_provider_id or ''
         
         logger.info(f"[AstrMai] 🚀 Booting... Sys1: {sys1} | Sys2: {sys2}")
 
@@ -46,28 +52,26 @@ class AstrMaiPlugin(Star):
         # ==========================================
 
         # --- Phase 1: Infrastructure Mount ---
-        self.persistence = PersistenceManager()                 # [核心修改]: 初始化底座
-        self.db_service = DatabaseService(self.persistence)     # [核心修改]: 兼容代理包装
-        self.gateway = GlobalModelGateway(context, config)
+        self.persistence = PersistenceManager()                 
+        self.db_service = DatabaseService(self.persistence)     
+        self.gateway = GlobalModelGateway(context, self.config) # 注入 AstrMaiConfig
         
         # --- Phase 4: Living Memory Mount ---
-        # [Fix] 传入 embedding_provider_id
         self.memory_engine = MemoryEngine(context, self.gateway, embedding_provider_id=emb_id)
 
+        # --- Phase 2: System 1 (Heart) Mount ---
+        # (Fix: 将 Heart 初始化提前，解决向下游注入的依赖问题)
+        self.state_engine = StateEngine(self.persistence, self.gateway)
+        self.judge = Judge(self.gateway, self.state_engine) # Judge 和 Sensors 的 Config 注入将在 Step 3 适配，暂时保持旧签名或等待修改
+        self.sensors = PreFilters(self.config) 
 
-        # --- [新增] Phase 5: Expression Engine Mount ---
-        # 需要 StateEngine 和 MoodManager (StateEngine 中已包含 MoodManager 逻辑或实例)
-        # 这里的 StateEngine.mood_manager 是在 Phase 3 添加的
+        # --- Phase 5: Expression Engine Mount ---
         self.reply_engine = ReplyEngine(self.state_engine, self.state_engine.mood_manager)
         self.evolution = EvolutionManager(self.db_service, self.gateway)
+
         # --- Phase 3 & 4: System 2 (Brain) Mount ---
-        # [修改] 初始化人设压缩器
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
-        
-        # [修改] 注入 summarizer 到 ContextEngine
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
-        
-        # [修改] 注入 memory_engine 和 evolution 到 Planner (实现完全体 System 2)
         self.system2_planner = Planner(
             context, 
             self.gateway, 
@@ -77,18 +81,6 @@ class AstrMaiPlugin(Star):
             self.evolution
         )
 
-        # --- Phase 2: System 1 (Heart) Mount ---
-        # (注意: 这里 state_engine 被提前使用了，建议将 Phase 2 代码块移到 Phase 5 之前)
-        self.state_engine = StateEngine(self.persistence, self.gateway)
-        self.judge = Judge(self.gateway, self.state_engine, self.config) 
-        self.sensors = PreFilters(self.config) 
-        self.system2_planner = Planner(context, self.gateway, self.context_engine, self.reply_engine)
-        self.sensors = PreFilters(self.config)
-        
-        # 修正依赖顺序后的 ReplyEngine 重新赋值 (如果上方报错)
-        self.reply_engine.state_engine = self.state_engine 
-        self.reply_engine.mood_manager = self.state_engine.mood_manager
-
         # 组装 AttentionGate
         self.attention_gate = AttentionGate(
             state_engine=self.state_engine,
@@ -96,8 +88,8 @@ class AstrMaiPlugin(Star):
             sensors=self.sensors,
             system2_callback=self._system2_entry
         )
+        
         # --- Phase 6: Proactive Task (Lifecycle) ---
-        # 挂载后台任务，注入依赖
         self.proactive_task = ProactiveTask(
             context=context,
             state_engine=self.state_engine,
@@ -105,38 +97,28 @@ class AstrMaiPlugin(Star):
             persistence=self.persistence
         )        
         
-        logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-5 Mounted).")
+        logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-6 Mounted).")
+
     @filter.on_astrbot_loaded()
     async def on_program_start(self):
         logger.info("[AstrMai] 🏁 AstrBot Loaded. Starting System Initialization...")
-            
-        # 2. 初始化记忆引擎
         logger.info("[AstrMai] 🧠 Initializing Memory Engine...")
         await self._init_memory()
         init_meme_storage()        
-        #提前唤醒并构建指令黑名单防火墙，减少 System 1 误判的概率    
         await self.sensors._load_foreign_commands()
-         # [Phase 6] 启动生命周期循环
         await self.proactive_task.start()
+
     async def _init_memory(self):
-        """异步唤醒记忆引擎与后台任务"""
-        # 为了极度稳健，这里甚至可以再 sleep 1秒，但通常 on_astrbot_loaded 已经足够
         await asyncio.sleep(1) 
         await self.memory_engine.initialize()
         await self.memory_engine.start_background_tasks()
 
     async def _system2_entry(self, main_event: AstrMessageEvent, queue_events: list):
-        """AttentionGate 防抖结束后的回调，负责真正拉起 System 2 进行深度思考"""
         chat_id = main_event.unified_msg_origin
-        
-        # 1. 取出 AttentionGate 聚合的消息队列
         pool = self.attention_gate.focus_pools.get(chat_id)
-        queue_events = pool['queue'] if pool else [event]
+        queue_events = pool['queue'] if pool else [main_event]
         
-        # 2. 情绪与能量结算
         await self.state_engine.consume_energy(chat_id)
-        
-        # 3. 引爆 System 2 认知循环
         await self.system2_planner.plan_and_execute(main_event, queue_events)
 
     @filter.command("mai")
@@ -146,9 +128,9 @@ class AstrMaiPlugin(Star):
             "🤖 **AstrMai (v1.0.0)**\n"
             "-----------------------\n"
             "🧠 架构状态: Phase 6 (Lifecycle Active)\n"
-            f"🔌 Sys1 Provider: {self.config.get('system1_provider_id')}\n"
-            f"🔌 Sys2 Provider: {self.config.get('system2_provider_id')}\n"
-            f"🔌 Emb Provider: {self.config.get('embedding_provider_id')}\n"
+            f"🔌 Sys1 Provider: {self.config.provider.system1_provider_id}\n"
+            f"🔌 Sys2 Provider: {self.config.provider.system2_provider_id}\n"
+            f"🔌 Emb Provider: {self.config.provider.embedding_provider_id}\n"
             "💾 SQLite & Faiss RAG: Connected\n"
             "🌀 Subconscious Miner: Running\n"
             "🌱 Proactive Life: Running"
@@ -165,74 +147,63 @@ class AstrMaiPlugin(Star):
         [入口] 接管所有平台消息，将数据泵入双系统架构与进化层。
         """
         msg = event.message_str.strip()
-        if msg.startswith("/") or msg.startswith("！") or msg.startswith("!"):
+        
+        # [修改点 1] 兼容用户自定义前缀
+        if any(msg.startswith(prefix) for prefix in self.config.global_settings.command_prefixes):
             return
 
+        # [修改点 2] 接入群聊白名单机制
+        group_id = event.get_group_id()
+        enabled_groups = self.config.global_settings.enabled_groups
+        if enabled_groups and group_id:
+            if str(group_id) not in enabled_groups:
+                return
+
         # ================= [Fix Start] =================
-        # 修复 QQ/OneBot 平台下 self_id 获取失败导致自回复的问题
         self_id = None
-        
-        # 1. 尝试从 message_obj 获取 (兼容 WebChat)
         if hasattr(event.message_obj, 'self_id'):
             self_id = str(event.message_obj.self_id)
-        
-        # 2. 尝试从 bot 平台实例获取 (兼容 Aiocqhttp/OneBot)
-        # event.bot 通常是平台适配器的 Client 实例，它一定知道自己是谁
         if not self_id and hasattr(event, 'bot') and hasattr(event.bot, 'self_id'):
             self_id = str(event.bot.self_id)
-            
-        # 3. 兜底
         if not self_id:
             self_id = "unknown"
             
-        # 4. 执行过滤
         if str(event.get_sender_id()) == self_id:
             return
 
         sender_name = event.get_sender_name()
         msg_str = event.message_str
         
-        # [Debug Mode] 控制台输出拦截日志
-        if self.config.get("debug_mode", False):
+        # [修改点 3] 接入 Config Debug Mode
+        if self.config.global_settings.debug_mode:
             logger.info(f"[AstrMai-Sensor] 📡 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
         
         user_id = event.get_sender_id()
         if user_id:
-            # 异步非阻塞更新
             asyncio.create_task(self._update_user_stats(user_id))
-        # --- 分流 1: 泵入 Evolution 潜意识层 (记录语料与触发挖掘) ---
+            
         await self.evolution.record_user_message(event)
-
-        # --- 分流 2: 泵入 System 1 注意力门控 (判断防抖、拦截或上抛给 Sys2) ---
         await self.attention_gate.process_event(event)
 
     async def _update_user_stats(self, user_id: str):
-        """[Phase 6] 更新用户活跃统计"""
         profile = await self.state_engine.get_user_profile(user_id)
         profile.message_count_for_profiling += 1
         profile.is_dirty = True
 
     @filter.after_message_sent()
     async def after_message_sent_hook(self, event: AstrMessageEvent):
-        """
-        [出口] 消息发送后的回调钩子
-        """
-        # 检查是否携带指令触发标签
         is_command_res = getattr(event, "is_command_trigger", False)
         
-        if self.config.get("debug_mode", False):
+        if self.config.global_settings.debug_mode:
             tag = "[指令回复]" if is_command_res else "[普通对话]"
             logger.info(f"[AstrMai-Subconscious]💡 消息发送完毕，触发后台状态机与反馈循环")
             
-        # 将标签传递给进化模块，以便在存入数据库时进行区分
         await self.evolution.process_feedback(event, is_command=is_command_res)
 
     async def terminate(self):
-        """卸载时的资源清理"""
         logger.info("[AstrMai] 🛑 Terminating processes and unmounting...")
         if hasattr(self, 'memory_engine') and self.memory_engine.summarizer:
             await self.memory_engine.summarizer.stop()
         
-        # [Phase 6] 停止生命周期
         if hasattr(self, 'proactive_task'):
             await self.proactive_task.stop()
