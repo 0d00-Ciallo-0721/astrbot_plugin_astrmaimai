@@ -1,18 +1,19 @@
 import json
 import aiosqlite
-from typing import List, Optional
+from typing import List, Optional, Any
 from astrbot.api import logger
 from .utils import TextProcessor, SearchResult
 
 class BM25Retriever:
     """
-    基于 SQLite FTS5 的 BM25 检索器
-    Reference: LivingMemory/core/retrieval/bm25_retriever.py
+    BM25 稀疏检索器
+    升级：添加 metadata 过滤支持 (session_id 和 persona_id)。
     """
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.processor = TextProcessor()
         self.table = "memories_fts"
+        self.doc_table = "documents" # 依赖 Faiss 底层共享的 documents 表
 
     async def initialize(self):
         async with aiosqlite.connect(self.db_path) as db:
@@ -32,53 +33,75 @@ class BM25Retriever:
             )
             await db.commit()
 
-    async def search(self, query: str, k: int = 20, **kwargs) -> List[SearchResult]:
+    async def search(self, query: str, k: int = 20, session_id: Optional[str] = None, persona_id: Optional[str] = None) -> List[SearchResult]:
         tokens = self.processor.tokenize(query)
         if not tokens: return []
         
-        # 构造 OR 查询以提高召回
-        fts_query = " OR ".join([f'"{t}"' for t in tokens])
+        escaped_tokens = []
+        for t in tokens:
+            escaped = t.replace('"', '""')
+            escaped_tokens.append(f'"{escaped}"')
+            
+        fts_query = " OR ".join(escaped_tokens)
         
         async with aiosqlite.connect(self.db_path) as db:
-            # 获取 ID 和 分数
             cursor = await db.execute(
                 f"""
                 SELECT doc_id, bm25({self.table}) as score
                 FROM {self.table}
                 WHERE {self.table} MATCH ?
-                ORDER BY score
+                ORDER BY score DESC
                 LIMIT ?
                 """,
-                (fts_query, k)  # 这里把原来的 limit 变量替换为 k
+                (fts_query, k * 2) 
             )
-            rows = await cursor.fetchall()
+            fts_results = await cursor.fetchall()
             
-            if not rows: return []
+            if not fts_results: return []
             
-            # 获取完整内容 (需要关联 documents 表，假设 engine 会处理表创建)
-            doc_ids = [r[0] for r in rows]
-            id_str = ",".join(map(str, doc_ids))
+            doc_ids = [r[0] for r in fts_results]
+            placeholders = ",".join("?" * len(doc_ids))
             
-            # 注意：这里假设 documents 表存在于同一个 DB 文件中
-            cursor = await db.execute(f"SELECT id, text, metadata FROM documents WHERE id IN ({id_str})")
+            # 从主表拉取全量数据以供过滤
+            cursor = await db.execute(
+                f"SELECT id, text, metadata FROM {self.doc_table} WHERE id IN ({placeholders})", doc_ids
+            )
+            
             docs = {}
             async for r in cursor:
-                docs[r[0]] = {"text": r[1], "meta": json.loads(r[2]) if r[2] else {}}
+                doc_id, text, metadata_json = r
+                metadata = json.loads(metadata_json) if metadata_json else {}
+                docs[doc_id] = {"text": text, "metadata": metadata}
                 
             results = []
-            for doc_id, score in rows:
-                if doc_id in docs:
-                    # 归一化处理在 Hybrid 中做，或者这里简单处理
-                    # FTS5 bm25 返回负数，越小越好(绝对值越大越相关?) 
-                    # 修正: FTS5 bm25 越小越相关 (more negative is better usually, but standard sqlite bm25 returns positive where smaller is better? 
-                    # 引用源文件逻辑: "注意: bm25()返回负数,越大(越接近0)越相关" -> 实际上是越负越相关? 
-                    # 源文件逻辑: "ORDER BY score DESC" (从大到小). 
-                    # 我们保持源文件逻辑
-                    results.append(SearchResult(
-                        doc_id=doc_id,
-                        score=score, # 原始分数
-                        content=docs[doc_id]["text"],
-                        metadata=docs[doc_id]["meta"],
-                        source="bm25"
-                    ))
+            for doc_id, bm25_score in fts_results:
+                if doc_id not in docs: continue
+                
+                doc = docs[doc_id]
+                metadata = doc["metadata"]
+                
+                # 执行精确隔离过滤
+                if session_id is not None and metadata.get("session_id") != session_id:
+                    continue
+                if persona_id is not None and metadata.get("persona_id") != persona_id:
+                    continue
+                    
+                results.append(SearchResult(
+                    doc_id=doc_id,
+                    score=bm25_score,
+                    content=doc["text"],
+                    metadata=metadata,
+                    source="bm25"
+                ))
+                
+                if len(results) >= k: break
+                
+            # 分数归一化处理
+            if results:
+                scores = [r.score for r in results]
+                max_score, min_score = max(scores), min(scores)
+                score_range = max_score - min_score if max_score != min_score else 1.0
+                for r in results:
+                    r.score = (r.score - min_score) / score_range
+                    
             return results

@@ -1,8 +1,10 @@
 import asyncio
+import re
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-
+from astrbot.api.provider import ProviderRequest, LLMResponse
+from astrbot.api import AstrBotConfig
 # --- Config ---
 from .config import AstrMaiConfig
 
@@ -37,9 +39,9 @@ from .astrmai.Heart.attention import AttentionGate
 class AstrMaiPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        # 核心修改：反序列化传入的 dict 为 Pydantic 对象
-        raw_config = config if config else context.get_config()
-        self.config = AstrMaiConfig(**raw_config)
+        # [修改] 保存原始 dict 引用供框架使用，并构建 Pydantic 数据模型
+        self.raw_config = config 
+        self.config = AstrMaiConfig(**(config or {}))  
         
         sys1 = self.config.provider.system1_provider_id or 'Unconfigured'
         sys2 = self.config.provider.system2_provider_id or 'Unconfigured'
@@ -189,6 +191,73 @@ class AstrMaiPlugin(Star):
         profile = await self.state_engine.get_user_profile(user_id)
         profile.message_count_for_profiling += 1
         profile.is_dirty = True
+
+
+# [新增] 函数位置: class AstrMaiPlugin 的任意位置（建议与其他 @filter.xxx 放在一起）
+    @filter.on_llm_request()
+    async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
+        """[新增] 阶段四：全局记忆无感注入钩子"""
+        if not hasattr(self, 'memory_engine') or not self.memory_engine: return
+        
+        chat_id = event.unified_msg_origin
+        
+        # 1. 彻底清洗：利用正则清理上下文历史中所有先前注入的记忆块，防止上下文窗口被旧记忆污染
+        for msg in req.system_message + req.messages:
+            if isinstance(msg.content, str):
+                msg.content = re.sub(r"<injected_memory>.*?</injected_memory>\n?", "", msg.content, flags=re.DOTALL)
+        
+        # 2. 触发新召回
+        current_query = event.message_str
+        if not current_query: return
+        
+        memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
+        
+        # 3. 无感注入：通过专门的 XML 标签作为 System Prompt 塞入本次请求
+        if memory_text and "什么也没想起来" not in memory_text:
+            injection = f"<injected_memory>\n[潜意识涌现：基于当前话题，你回忆起了以下事情：]\n{memory_text}\n</injected_memory>\n"
+            
+            if req.system_message:
+                req.system_message[0].content += f"\n{injection}"
+            elif req.messages:
+                req.messages[-1].content = injection + req.messages[-1].content
+
+    @filter.on_llm_response()
+    async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
+        """[新增] 阶段四：全局记忆反思与自动清理钩子"""
+        if not hasattr(self, 'memory_engine') or not self.memory_engine.summarizer: return
+        
+        chat_id = event.unified_msg_origin
+        user_msg = event.message_str
+        ai_msg = resp.completion_text
+        
+        # 初始化会话内存池
+        if not hasattr(self, '_session_history_buffer'):
+            self._session_history_buffer = {}
+            
+        if chat_id not in self._session_history_buffer:
+            self._session_history_buffer[chat_id] = []
+            
+        # 记录对话
+        buffer = self._session_history_buffer[chat_id]
+        if user_msg and user_msg.strip(): buffer.append(f"用户：{user_msg}")
+        if ai_msg and ai_msg.strip(): buffer.append(f"Bot：{ai_msg}")
+        
+        # 获取阈值并触发认知降维
+        threshold = getattr(self.config.memory, 'summary_threshold', 30)
+        
+        # buffer 记录的是单句，一问一答算两句，所以阈值乘以 2
+        if len(buffer) >= threshold * 2:
+            history_text = "\n".join(buffer)
+            # 将收集好的满溢对话异步扔进认知大脑进行多维提取
+            import asyncio
+            asyncio.create_task(
+                self.memory_engine.summarizer.summarize_session(
+                    session_id=chat_id,
+                    chat_history_text=history_text
+                )
+            )
+            # 清理缓存池，开始下一轮积累
+            self._session_history_buffer[chat_id] = []
 
     @filter.after_message_sent()
     async def after_message_sent_hook(self, event: AstrMessageEvent):

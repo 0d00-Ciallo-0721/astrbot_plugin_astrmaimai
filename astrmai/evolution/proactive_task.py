@@ -24,11 +24,13 @@ class ProactiveTask:
                  state_engine: StateEngine, 
                  gateway: GlobalModelGateway,
                  persistence: PersistenceManager,
+                 memory_engine = None,  # [新增参数] 注入记忆引擎
                  config=None):
         self.context = context
         self.state_engine = state_engine
         self.gateway = gateway
         self.persistence = persistence
+        self.memory_engine = memory_engine
         self.config = config if config else gateway.config
         
         self._is_running = False
@@ -75,11 +77,61 @@ class ProactiveTask:
                 await asyncio.sleep(5)
 
     async def _run_decay_task(self):
-        """代谢任务：遍历活跃状态执行衰减"""
+        """代谢任务：遍历活跃状态执行衰减，并附加长期记忆物理衰减 (带错过补偿机制)"""
+        # 1. 原有的短期状态代谢 (精力恢复、情绪平复等)
         active_states = self.state_engine.get_active_states()
         for state in active_states:
             self.state_engine.apply_natural_decay(state)
             # 如果有脏数据，PersistenceManager 的定时任务会处理，这里不强制落盘
+
+        # 2. [新增] 长期记忆物理衰减 (每日执行 + 补偿机制)
+        if not self.memory_engine:
+            return
+            
+        now = time.time()
+        decay_interval = 86400  # 物理衰减周期：24小时
+        
+        import os
+        import json
+        from pathlib import Path
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+        
+        # 借鉴 LivingMemory：使用文件记录上次衰减时间，防止重启丢失状态
+        state_file = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai" / "decay_state.json"
+        last_decay_time = now
+        
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    last_decay_time = data.get("last_decay_time", now)
+            except Exception as e:
+                logger.error(f"[Life] 读取衰减状态文件失败: {e}")
+        else:
+            # 第一次运行，初始化时间
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(state_file, "w", encoding="utf-8") as f:
+                json.dump({"last_decay_time": now}, f)
+                
+        elapsed_seconds = now - last_decay_time
+        days_missed = int(elapsed_seconds / decay_interval)
+        
+        # 如果距离上次执行已经超过 1 天（含错过多天的情况）
+        if days_missed >= 1:
+            decay_rate = getattr(self.config.memory, 'time_decay_rate', 0.01)
+            logger.info(f"[Life] 🥀 触发长期记忆物理衰减，补偿天数: {days_missed}，衰减率: {decay_rate}")
+            
+            # 批量执行底层 SQL 衰减
+            affected_rows = await self.memory_engine.apply_daily_decay(decay_rate=decay_rate, days=days_missed)
+            logger.info(f"[Life] 🥀 物理衰减完成，重要度降低，共影响了 {affected_rows} 条记忆。")
+            
+            # 更新状态文件，推进最后执行时间（保留余数）
+            try:
+                new_decay_time = last_decay_time + days_missed * decay_interval
+                with open(state_file, "w", encoding="utf-8") as f:
+                    json.dump({"last_decay_time": new_decay_time}, f)
+            except Exception as e:
+                logger.error(f"[Life] 保存衰减状态失败: {e}")
 
     async def _run_wakeup_task(self):
         """唤醒任务：检测冷场并尝试发言"""

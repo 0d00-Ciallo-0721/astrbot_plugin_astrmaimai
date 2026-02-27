@@ -41,14 +41,6 @@ class MoodConfig(BaseModel):
     decay_interval: int = Field(default=3600)
     decay_rate: float = Field(default=0.1)
     unknown_decay: float = Field(default=0.9)
-    emotion_mapping: List[str] = Field(default=[
-        "happy: 积极、开心、感谢",
-        "sad: 悲伤、遗憾、道歉",
-        "angry: 生气、抱怨、攻击",
-        "neutral: 平静、客观、陈述",
-        "curious: 好奇、提问、困惑",
-        "surprise: 惊讶、意外"
-    ])
 
 class EvolutionConfig(BaseModel):
     min_mining_context: int = Field(default=10)
@@ -66,6 +58,15 @@ class ReplyConfig(BaseModel):
     segment_min_len: int = Field(default=15)
     no_segment_max_len: int = Field(default=120)
     meme_probability: int = Field(default=60)
+    # [新增] 对齐 _conf_schema.json 中的 reply 节点
+    emotion_mapping: List[str] = Field(default=[
+        "happy: 积极、开心、感谢",
+        "sad: 悲伤、遗憾、道歉",
+        "angry: 生气、抱怨、攻击",
+        "neutral: 平静、客观、陈述",
+        "curious: 好奇、提问、困惑",
+        "surprise: 惊讶、意外"
+    ])
     typing_speed_factor: float = Field(default=0.1)
 
 class MemoryConfig(BaseModel):

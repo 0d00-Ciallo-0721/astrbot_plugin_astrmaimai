@@ -22,7 +22,7 @@ class ContextEngine:
     async def build_prompt(self, 
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
-                           memory_context: str = "",
+                           # [修改] 移除了原有的 memory_context 参数
                            slang_patterns: str = "",
                            tool_descs: str = "") -> str: 
         # 1. 获取基础状态数据
