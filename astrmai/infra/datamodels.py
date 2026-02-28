@@ -104,15 +104,42 @@ class ChatState:
 @dataclass
 class UserProfile:
     """用户画像 (内存对象)"""
-    user_id: str = ""
-    name: str = "Unknown"
-    social_score: float = 0.0
-    last_seen: float = 0.0 
+    user_id: str = ""   # 用户id
+    name: str = "Unknown"# 用户姓名
+    social_score: float = 0.0 #用户好感度
+    last_seen: float = 0.0  #上次看见的时间
     persona_analysis: str = "" # 深度心理侧写
     message_count_for_profiling: int = 0 # 距离上次画像生成后的消息数
     last_persona_gen_time: float = 0.0 # 上次生成时间
-    identity: str = ""
+    identity: str = "" #身份
+    #运行时字段
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
+
+class Jargon(SQLModel, table=True):
+    """[新增] 群组黑话与网络用语表"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    content: str = Field(index=True)        # 词条内容
+    raw_content: str = Field(default="")    # 推断用的原始上下文
+    meaning: str = Field(default="")        # 词条解释
+    is_jargon: bool = Field(default=False)  # 是否确认为黑话
+    count: int = Field(default=1)           # 出现频次
+    is_complete: bool = Field(default=False)# 是否完成推断
+    group_id: str = Field(index=True)
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+class SocialRelation(SQLModel, table=True):
+    """[新增] 群组内成员社交关系图谱表"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    group_id: str = Field(index=True)
+    from_user: str = Field(index=True)      # 发起互动的用户
+    to_user: str = Field(index=True)        # 接收互动的用户
+    relation_type: str = Field(default="interaction") # 关系类型(如:mention, reply)
+    strength: float = Field(default=0.0)    # 关系强度(0-1)
+    frequency: int = Field(default=0)       # 互动频次
+    last_interaction: float = Field(default_factory=time.time)    

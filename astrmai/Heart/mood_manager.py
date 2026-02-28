@@ -1,4 +1,5 @@
 import json
+from typing import Tuple  # <--- 新增这一行
 from astrbot.api import logger
 from ..infra.gateway import GlobalModelGateway
 
@@ -35,10 +36,9 @@ class MoodManager:
                 "curious": "好奇、提问、困惑",
                 "surprise": "惊讶、意外"
             }
-    async def analyze_text_mood(self, text: str, current_mood: float) -> tuple[str, float]:
+    async def analyze_mood(self, text: str, current_mood: float, user_affection: float = 0.0) -> Tuple[str, float]:
         """
-        核心情绪分析
-        Returns: (mood_tag, new_mood_value)
+        [修改] 分析情绪时，引入当前用户的好感度 (Affection) 维度，模拟更真实的复合心理状态。
         """
         if not text or len(text) < 2:
             return "neutral", current_mood
@@ -51,6 +51,10 @@ class MoodManager:
 [我的当前情绪]
 {current_mood:.2f} (范围 -1.0[极度沮丧] ~ 1.0[极度开心]，0.0 为平静)
 
+[当前用户对我的好感度]
+{user_affection:.2f} (范围 -100 ~ 100。正数代表关系亲密，负数代表关系恶劣)
+*提示：对于高好感度用户，你可以表现得更包容、更易开心；对于低好感度用户，你的情绪更容易受负面影响。*
+
 [可用情绪标签]
 {mapping_desc}
 
@@ -58,7 +62,7 @@ class MoodManager:
 "{text}"
 
 [任务]
-请基于当前情绪，分析这段文本会让我产生什么感觉？
+请基于当前情绪和用户好感度，综合分析这段文本会让我产生什么感觉？
 返回一个 JSON，包含：
 1. "mood_tag": (字符串) 从可用标签中选一个最匹配的。
 2. "mood_value": (浮点数) 计算新的情绪值 (-1.0 到 1.0)。
@@ -70,21 +74,24 @@ class MoodManager:
 """
         try:
             # 使用 System 1 快速模型
-            result = await self.gateway.call_judge(prompt, system_prompt="你是一个专业的情绪分析师。")
+            result = await self.gateway.call_judge(prompt, system_prompt="你是一个具备丰富情感和社交包容度的专业分析师。")
             
-            new_tag = result.get("mood_tag", "neutral").lower()
-            new_value = float(result.get("mood_value", current_mood))
+            # 安全解析 JSON
+            import json
+            import re
+            json_str = result
+            match = re.search(r'\{.*\}', result, re.DOTALL)
+            if match:
+                json_str = match.group(0)
             
-            # 数据清洗与边界限制
-            if new_tag not in self.emotion_mapping:
-                new_tag = "neutral"
-            new_value = max(-1.0, min(1.0, new_value))
+            data = json.loads(json_str)
+            mood_tag = data.get("mood_tag", "neutral")
+            mood_value = float(data.get("mood_value", current_mood))
             
-            logger.debug(f"[Mood] 💓 情绪波动: {current_mood:.2f} -> {new_value:.2f} | 标签: {new_tag}")
-            return new_tag, new_value
-
+            # 限幅
+            mood_value = max(-1.0, min(1.0, mood_value))
+            return mood_tag, mood_value
+            
         except Exception as e:
-            logger.warning(f"[Mood] ⚠️ 分析失败，执行自然衰减: {e}")
-            # 失败时的自然衰减逻辑 (接入 Config)
-            decayed = current_mood * self.config.mood.unknown_decay
-            return "neutral", decayed
+            logger.debug(f"[MoodManager] 情绪分析失败 (降级到当前状态): {e}")
+            return "neutral", current_mood

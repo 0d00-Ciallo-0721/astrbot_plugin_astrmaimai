@@ -3,7 +3,7 @@ import sqlite3
 import json
 from typing import List, Optional
 from sqlmodel import Session, select, desc
-from .datamodels import ExpressionPattern, MessageLog, ChatState
+from .datamodels import ExpressionPattern, MessageLog, ChatState, Jargon, SocialRelation
 from .persistence import PersistenceManager
 
 class DatabaseService:
@@ -88,3 +88,71 @@ class DatabaseService:
                 state.total_replies = row[5]
                 return state
         return None
+    
+
+
+    def save_jargon(self, jargon: Jargon):
+        """[新增] 保存或更新黑话，基于内容和群组防重"""
+        with self.get_session() as session:
+            statement = select(Jargon).where(
+                Jargon.group_id == jargon.group_id,
+                Jargon.content == jargon.content
+            )
+            existing = session.exec(statement).first()
+            if existing:
+                existing.count += 1
+                existing.updated_at = time.time()
+                # 如果传入了新的推断含义，则更新它
+                if jargon.meaning:
+                    existing.meaning = jargon.meaning
+                    existing.is_complete = jargon.is_complete
+                    existing.is_jargon = jargon.is_jargon
+                session.add(existing)
+            else:
+                session.add(jargon)
+            session.commit()
+
+    def get_jargons(self, group_id: str, limit: int = 20, only_confirmed: bool = True) -> List[Jargon]:
+        """[新增] 获取群组的黑话列表，供 Brain 检索使用"""
+        with self.get_session() as session:
+            statement = select(Jargon).where(Jargon.group_id == group_id)
+            if only_confirmed:
+                statement = statement.where(Jargon.is_jargon == True)
+            statement = statement.order_by(desc(Jargon.updated_at)).limit(limit)
+            return session.exec(statement).all()
+
+    def update_social_relation(self, group_id: str, from_user: str, to_user: str, relation_type: str, strength_delta: float):
+        """[新增] 更新成员间的互动图谱强度"""
+        with self.get_session() as session:
+            statement = select(SocialRelation).where(
+                SocialRelation.group_id == group_id,
+                SocialRelation.from_user == from_user,
+                SocialRelation.to_user == to_user,
+                SocialRelation.relation_type == relation_type
+            )
+            existing = session.exec(statement).first()
+            if existing:
+                existing.strength = min(1.0, max(0.0, existing.strength + strength_delta))
+                existing.frequency += 1
+                existing.last_interaction = time.time()
+                session.add(existing)
+            else:
+                new_relation = SocialRelation(
+                    group_id=group_id,
+                    from_user=from_user,
+                    to_user=to_user,
+                    relation_type=relation_type,
+                    strength=min(1.0, max(0.0, strength_delta)),
+                    frequency=1
+                )
+                session.add(new_relation)
+            session.commit()
+
+    def get_user_relations(self, group_id: str, user_id: str) -> List[SocialRelation]:
+        """[新增] 提取某用户相关的社交关系（双向）"""
+        with self.get_session() as session:
+            statement = select(SocialRelation).where(
+                (SocialRelation.group_id == group_id) & 
+                ((SocialRelation.from_user == user_id) | (SocialRelation.to_user == user_id))
+            ).order_by(desc(SocialRelation.strength))
+            return session.exec(statement).all()

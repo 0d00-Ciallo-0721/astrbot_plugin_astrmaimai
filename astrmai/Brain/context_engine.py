@@ -23,46 +23,42 @@ class ContextEngine:
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
                            slang_patterns: str = "",
-                           tool_descs: str = "") -> str: 
+                           tool_descs: str = "",
+                           current_goal: str = "") -> str: 
+        """[修改] 动态编织 Prompt，集成目标驱动、状态注入、记忆与社交上下文"""
         # 1. 获取基础状态数据
         state = self.db.get_chat_state(chat_id)
         
         # 获取当前发言者的 Profile (取最后一条消息的发送者)
-        sender_id = event_messages[-1].get_sender_id()
-        sender_name = event_messages[-1].get_sender_name()
-        user_profile = self.db.get_user_profile(sender_id)
+        user_profile = None
+        if event_messages:
+            last_msg = event_messages[-1]
+            # 兼容旧代码，如果没有从 state_engine 直接获取的方法，尝试从 db 或运行时缓存获取
+            # 这里假定已经可以通过 user_id 获取
+            sender_id = last_msg.get_sender_id()
+            if hasattr(self.db, 'get_user_profile'):
+                user_profile = self.db.get_user_profile(sender_id)
         
-        # 2. 获取并压缩人设 (Anti-Bloat & Anti-OOC) [接入 Config 与动态人设]
-        raw_persona = "你是一个名为 AstrMai 的高级智能体，拥有丰富的情感和独特的个性..." 
+        # 2. 调用 Summarizer 获取压缩人设 (传入好感度以动态调整风格)
+        affection_score = getattr(user_profile, 'social_score', 0.0) if user_profile else 0.0
+        persona_summary, style_guide = await self.summarizer.get_summary(
+            self.config.persona.prompt, 
+            user_affection=affection_score
+        )
         
-        if self.config and self.context:
-            persona_id = getattr(self.config.persona, 'persona_id', None)
-            if persona_id:
-                try:
-                    # 读取配置中的固定人设
-                    persona_data = self.context.persona_manager.get_persona(persona_id)
-                    if persona_data:
-                        raw_persona = persona_data.system_prompt
-                except Exception as e:
-                    logger.warning(f"[ContextEngine] 无法加载配置的人设 {persona_id}: {e}")
-            else:
-                try:
-                    # 没有绑定时，使用当前会话的使用的人格即默认人设
-                    default_persona = self.context.persona_manager.get_default_persona_v3(chat_id)
-                    if default_persona:
-                        raw_persona = default_persona.get("prompt", raw_persona)
-                except Exception as e:
-                    logger.warning(f"[ContextEngine] 无法加载默认人设: {e}")
-
-        # 调用 Summarizer 获取压缩后的人设和风格指南
-        persona_summary, style_guide = await self.summarizer.get_summary(raw_persona)
-
-        # 3. 动态构建各结构化板块 (已移除崩溃的 memory_context 引用)
+        # 3. 构建各个信息块
         state_block = self._build_state_block(state)
-        user_block = self._build_user_block(user_profile, sender_name)
-        slang_block = self._build_slang_block(slang_patterns)
+        user_block = self._build_user_block(user_profile)
         
-        # 4. 组装最终 System Prompt (结构化/高密度/中文指令)
+        slang_block = ""
+        if slang_patterns:
+            slang_block = f"[Group Patterns]\n群组专属表达模式与黑话参考:\n{slang_patterns}"
+            
+        goal_block = ""
+        if current_goal:
+            goal_block = f"[Current Goal]\n当前对话阶段的隐式目标是：「{current_goal}」。\n请自然地推进对话朝着这个方向发展，避免机械地提及目标。"
+
+        # 4. 组装最终 Prompt
         prompt = f"""
 [Role]
 {persona_summary}
@@ -73,16 +69,17 @@ class ContextEngine:
 {state_block}
 {user_block}
 {slang_block}
+{goal_block}
 
 [Tools]
 {tool_descs}
 
 [Instruction]
-1. 模拟该人设的意识，完全沉浸在角色中。
-2. 如果[Role]中缺少信息，请依赖潜意识涌现的内容或使用'fetch_knowledge'工具检索。
+1. 模拟该人设的意识，完全沉浸在角色中，结合[User Info]中的好感度和关系动态调整对用户的态度。
+2. 如果遇到不懂的词汇，可以调用 'query_jargon' 工具查询；缺少背景信息请调用 'fetch_knowledge' 工具检索。
 3. 回复必须严格遵循[Style Guide]中的语气和格式要求。
 4. 必须使用中文回复，除非用户主动使用其他语言。
-5. 你的回复长度和积极性应受当前[State] (Mood/Energy) 的动态影响。
+5. 你的回复长度和积极性应受当前[State] (Mood/Energy) 的动态影响，并服务于[Current Goal]。
 """
         return prompt.strip()
 
@@ -101,14 +98,38 @@ class ContextEngine:
         
         return f"[State: {mood_tag} (Mood: {mood_val:.2f}) | Energy: {state.energy:.2f}]"
 
-    def _build_user_block(self, profile: Optional[UserProfile], sender_name: str) -> str:
-        """构建用户画像标签"""
+    def _build_user_block(self, profile: Optional[UserProfile]) -> str:
+        """[修改] 构建包含好感度、互动倾向和心理画像的动态社交上下文"""
         if not profile:
-            return f"[User: {sender_name} | Relation: 陌生人]"
+            return "[User Info: 未知的新用户，保持礼貌与观察]"
+            
+        # 根据好感度划分社交距离
+        affection = getattr(profile, 'social_score', 0.0)
+        relation_desc = "普通群友"
+        if affection > 80:
+            relation_desc = "极其亲密的挚友/灵魂伴侣"
+        elif affection > 50:
+            relation_desc = "关系很好的熟人/好朋友"
+        elif affection > 20:
+            relation_desc = "有好感的交流对象"
+        elif affection < -50:
+            relation_desc = "关系恶劣，抱有敌意"
+        elif affection < -20:
+            relation_desc = "关系疏远，有些反感"
+            
+        block = f"[User Info]\n当前互动用户: {profile.name} (好感度: {affection:.1f} - {relation_desc})\n"
         
-        identity = profile.identity if profile.identity else "群友"
-        return f"[User: {profile.name} | Score: {profile.social_score:.1f} | Identity: {identity}]"
-
+        # 注入心理侧写
+        if hasattr(profile, 'persona_analysis') and profile.persona_analysis:
+            block += f"该用户的心理侧写与行为习惯: {profile.persona_analysis}\n"
+            
+        # 动态社交指南
+        if affection > 50:
+            block += "💡 社交指南: 对方好感度很高，请使用更亲昵、自然、无防备的语气，可以适度撒娇或开玩笑。\n"
+        elif affection < -20:
+            block += "💡 社交指南: 对方好感度较低，请保持距离感，使用客气、简短甚至带点冷淡的语气。\n"
+            
+        return block
 
     def _build_slang_block(self, patterns: str) -> str:
         """动态构建潜意识/黑话板块"""

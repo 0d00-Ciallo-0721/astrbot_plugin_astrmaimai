@@ -4,6 +4,7 @@ from astrbot.api.event import AstrMessageEvent
 from ..infra.database import DatabaseService
 from ..infra.gateway import GlobalModelGateway
 from .miner import ExpressionMiner
+from typing import List
 
 class EvolutionManager:
     """
@@ -58,34 +59,39 @@ class EvolutionManager:
             content=event.message_str
         )
 
-    async def _try_trigger_mining(self, group_id: str):
-        if self.mining_lock.locked():
+    async def process_logs_and_mine(self, group_id: str, logs: List['MessageLog']):
+        """
+        [修改] 执行综合挖掘任务（表达模式 + 群组黑话）
+        （注：如果原文件中该函数名为 _run_mining 或类似名称，请直接替换对应逻辑）
+        """
+        if not logs:
             return
 
         async with self.mining_lock:
-            # 1. 获取未处理消息 (接入 Config 批次大小)
-            batch_size = self.config.evolution.batch_size
-            logs = self.db.get_unprocessed_logs(group_id, limit=batch_size)
-            
-            # 阈值检测 (接入 Config 触发阈值)
-            mining_trigger = self.config.evolution.mining_trigger
-            if len(logs) < mining_trigger:
-                return
+            try:
+                # 1. 挖掘用户的表达模式 (Expression Pattern)
+                patterns = await self.miner.mine(group_id, logs)
+                for p in patterns:
+                    self.db.save_pattern(p)
+                    logger.debug(f"[Evolution] Learned Pattern: {p.situation} -> {p.expression}")
 
-            logger.info(f"[Evolution] Triggering pattern mining for {group_id} ({len(logs)} msgs)...")
-            
-            # 2. 执行挖掘
-            patterns = await self.miner.mine(group_id, logs)
-            
-            # 3. 保存结果
-            for p in patterns:
-                # 调用修改后的 save_pattern，内部已解决 Detached 风险
-                self.db.save_pattern(p)
-                # 此时访问 p.situation 是安全的
-                logger.debug(f"[Evolution] Learned: {p.situation} -> {p.expression}")
-            
-            # 4. 标记已处理
-            self.db.mark_logs_processed([l.id for l in logs])
+                # 2. [新增] 挖掘群组黑话 (Jargon)
+                if hasattr(self.db, 'save_jargon'):
+                    jargons = await self.miner.mine_jargons(group_id, logs)
+                    for j in jargons:
+                        self.db.save_jargon(j)
+                        if j.is_jargon and j.is_complete:
+                            logger.info(f"[Evolution] Learned Jargon: {j.content} -> {j.meaning}")
+                            
+                            # 触发新知识事件总线，通知系统进行认知刷新
+                            from ..infra.event_bus import EventBus
+                            EventBus().trigger_knowledge_update()
+
+                # 3. 标记已处理
+                self.db.mark_logs_processed([l.id for l in logs])
+
+            except Exception as e:
+                logger.error(f"[Evolution] 综合挖掘任务执行失败: {e}")
 
 
     async def analyze_and_get_goal(self, chat_id: str, recent_messages: str) -> str:

@@ -29,6 +29,10 @@ class StateEngine:
         self.mood_manager = MoodManager(gateway, self.config)        
         # 并发防击穿锁
         self._lock = asyncio.Lock()
+        
+        # [新增] 引入事件总线
+        from ..infra.event_bus import EventBus
+        self.event_bus = EventBus()
 
     async def get_state(self, chat_id: str) -> ChatState:
         """异步懒加载获取状态"""
@@ -167,3 +171,40 @@ class StateEngine:
             
             state.is_dirty = True
             logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 情绪平复 -> {state.mood:.2f}")
+
+
+    async def calculate_and_update_affection(self, user_id: str, group_id: str, mood_tag: str, intensity: float = 1.0):
+        """
+        [新增] 基于 System 1 解析出的情绪标签，动态计算并更新用户的好感度(Affection)。
+        """
+        async with self._lock:
+            # 懒加载获取/初始化 UserProfile
+            if user_id not in self.user_profiles:
+                # 兼容旧逻辑，如果没有持久化获取方法，先初始化一个内存态对象
+                self.user_profiles[user_id] = UserProfile(user_id=user_id)
+            
+            profile = self.user_profiles[user_id]
+            
+            # 定义情绪对好感度的影响权重 (可根据自学习模块的逻辑精调)
+            affection_deltas = {
+                "happy": 2.0,
+                "excited": 3.0,
+                "playful": 1.5,
+                "calm": 0.5,
+                "sad": -1.0,
+                "angry": -3.0,
+                "anxious": -1.0
+            }
+            
+            delta = affection_deltas.get(mood_tag, 0.0) * intensity
+            
+            # 应用变化并限制在 -100 到 100 之间
+            old_score = profile.social_score
+            profile.social_score = max(-100.0, min(100.0, profile.social_score + delta))
+            
+            if old_score != profile.social_score:
+                profile.is_dirty = True
+                logger.debug(f"[StateEngine] 💗 好感度更新: 用户 {user_id} 在群 {group_id} 的好感度 {old_score:.1f} -> {profile.social_score:.1f} (Δ{delta:.1f})")
+                
+                # 触发好感度变更事件广播，通知 Brain 或后续的 ContextInjector 刷新系统提示词
+                self.event_bus.trigger_affection_change()            

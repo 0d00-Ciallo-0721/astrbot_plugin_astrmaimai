@@ -141,3 +141,36 @@ class PreFilters:
             return True
             
         return False
+
+
+    def extract_social_relations(self, event: AstrMessageEvent, group_id: str) -> list:
+        """
+        [新增] 静默抽取社交互动关系，构建群组社交图谱
+        返回格式: [(from_user, to_user, relation_type, strength_delta)]
+        """
+        relations = []
+        if not event.message_obj or not event.message_obj.message:
+            return relations
+            
+        from_user = event.get_sender_id()
+        
+        try:
+            for component in event.message_obj.message:
+                # 检测 @ 提及行为 (Mention)
+                if isinstance(component, Comp.At):
+                    to_user = str(component.qq)
+                    if to_user and to_user != from_user:
+                        relations.append((from_user, to_user, "mention", 0.1))
+                
+                # 检测回复行为 (Reply) - 如果消息包含引用组件
+                elif isinstance(component, Comp.Reply):
+                    # 注意：部分平台的 Reply 组件可能不直接提供 target_user_id，这里作示意
+                    # 如果有具体的目标用户ID可以提取，则计入强度更高的回复关系
+                    # 假设 AstrBot 的某些适配器在 Reply 中有 sender_id
+                    to_user = getattr(component, 'sender_id', None) 
+                    if to_user and to_user != from_user:
+                        relations.append((from_user, to_user, "reply", 0.3))
+        except Exception as e:
+            logger.debug(f"[AstrMai-Sensor] 抽取社交关系失败: {e}")
+            
+        return relations    
