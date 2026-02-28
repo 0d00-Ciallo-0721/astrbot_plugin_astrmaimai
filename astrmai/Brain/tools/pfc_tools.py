@@ -1,9 +1,9 @@
+from typing import Any, Optional
 from pydantic import Field
 from pydantic.dataclasses import dataclass 
 
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
-# 注意：不需要导入 ToolExecResult 了，或者保留导入但也别调用它
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 @dataclass
@@ -13,8 +13,7 @@ class WaitTool(FunctionTool[AstrAgentContext]):
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        # [Fix] 这里的 ToolExecResult 是个类型别名，不能实例化！
-        # 直接返回字符串，AstrBot 的 Agent Runner 会处理它。
+        # 触发执行器的挂起逻辑
         return "[SYSTEM_WAIT_SIGNAL] 已挂起，等待用户后续输入。"
 
 @dataclass
@@ -31,7 +30,21 @@ class FetchKnowledgeTool(FunctionTool[AstrAgentContext]):
         }
     )
 
+    # [新增] 依赖注入，使用 exclude=True 避免被序列化到 LLM 的 Schema 中
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    chat_id: str = Field(default="", exclude=True)
+
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         query = kwargs.get("query", "")
-        # [Fix] 同样直接返回字符串
-        return f"[Knowledge] 模拟检索关于 '{query}' 的记忆... (待 Memory 层接入)"
+        
+        # [完善] 接入真实的 Memory 混合检索
+        if self.memory_engine and self.chat_id:
+            try:
+                # 调用 memory_engine 的 recall 方法 (它已内置向量/BM25双路检索和时间衰减)
+                result = await self.memory_engine.recall(query=query, session_id=self.chat_id)
+                return result
+            except Exception as e:
+                return f"[Knowledge] 检索记忆时发生底层异常: {str(e)}"
+                
+        # 兜底：如果外部未正确挂载引擎
+        return f"[Knowledge] 无法检索 '{query}' 的记忆，记忆引擎离线或丢失会话 ID。"

@@ -22,12 +22,9 @@ class ContextEngine:
     async def build_prompt(self, 
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
-                           # [修改] 移除了原有的 memory_context 参数
                            slang_patterns: str = "",
                            tool_descs: str = "") -> str: 
         # 1. 获取基础状态数据
-        # 注意: 如果 db_service 是同步的，这里直接调用；如果是异步的需 await
-        # 假设 DatabaseService 提供了兼容的同步/异步接口，这里按 Phase 4 标准使用
         state = self.db.get_chat_state(chat_id)
         
         # 获取当前发言者的 Profile (取最后一条消息的发送者)
@@ -39,7 +36,7 @@ class ContextEngine:
         raw_persona = "你是一个名为 AstrMai 的高级智能体，拥有丰富的情感和独特的个性..." 
         
         if self.config and self.context:
-            persona_id = self.config.persona.persona_id
+            persona_id = getattr(self.config.persona, 'persona_id', None)
             if persona_id:
                 try:
                     # 读取配置中的固定人设
@@ -60,10 +57,9 @@ class ContextEngine:
         # 调用 Summarizer 获取压缩后的人设和风格指南
         persona_summary, style_guide = await self.summarizer.get_summary(raw_persona)
 
-        # 3. 动态构建各结构化板块
+        # 3. 动态构建各结构化板块 (已移除崩溃的 memory_context 引用)
         state_block = self._build_state_block(state)
         user_block = self._build_user_block(user_profile, sender_name)
-        memory_block = self._build_memory_block(memory_context)
         slang_block = self._build_slang_block(slang_patterns)
         
         # 4. 组装最终 System Prompt (结构化/高密度/中文指令)
@@ -76,7 +72,6 @@ class ContextEngine:
 
 {state_block}
 {user_block}
-{memory_block}
 {slang_block}
 
 [Tools]
@@ -84,12 +79,11 @@ class ContextEngine:
 
 [Instruction]
 1. 模拟该人设的意识，完全沉浸在角色中。
-2. 如果[Role]中缺少信息，请依赖[Memory Retrieval]或使用'fetch_knowledge'工具检索。
+2. 如果[Role]中缺少信息，请依赖潜意识涌现的内容或使用'fetch_knowledge'工具检索。
 3. 回复必须严格遵循[Style Guide]中的语气和格式要求。
 4. 必须使用中文回复，除非用户主动使用其他语言。
 5. 你的回复长度和积极性应受当前[State] (Mood/Energy) 的动态影响。
 """
-        return prompt.strip()
         return prompt.strip()
 
     def _build_state_block(self, state: Optional[ChatState]) -> str:
@@ -115,11 +109,6 @@ class ContextEngine:
         identity = profile.identity if profile.identity else "群友"
         return f"[User: {profile.name} | Score: {profile.social_score:.1f} | Identity: {identity}]"
 
-    def _build_memory_block(self, memory_context: str) -> str:
-        """动态构建记忆板块"""
-        if not memory_context:
-            return ""
-        return f"\n[Memory Retrieval]\n{memory_context}"
 
     def _build_slang_block(self, patterns: str) -> str:
         """动态构建潜意识/黑话板块"""

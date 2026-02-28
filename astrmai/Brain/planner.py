@@ -53,12 +53,12 @@ class Planner:
             slang_patterns=slang_context
         )
         
-        
         # 4. 装配前额叶基建工具 (PFC Actions)
         # 可以在这里动态添加更多工具
         pfc_tools = [
             WaitTool(),
-            FetchKnowledgeTool()
+            # [修改] 将 memory_engine 和 chat_id 注入到工具中
+            FetchKnowledgeTool(memory_engine=self.memory_engine, chat_id=chat_id)
         ]
         
         # 5. 移交并发执行器引爆思考闭环

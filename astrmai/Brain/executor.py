@@ -37,8 +37,10 @@ class ConcurrentExecutor:
         logger.info(f"[{chat_id}] 🧠 Brain 启动原生 Agent Loop (Max Steps: {max_steps})...")
 
         try:
+            # === [核心新增] 生命周期加锁：向事件总线广播当前进入了“最终回复生成阶段” ===
+            setattr(event, '_is_final_reply_phase', True)
+            
             # 调用 AstrBot 协议中提供的原生 Agent (集成工具调用和多轮反思)
-            # 注意：system_prompt 由 ContextEngine 动态构建，已包含 Memory/State/Persona
             llm_resp = await self.context.tool_loop_agent(
                 event=event,
                 chat_provider_id=sys2_id,
@@ -48,7 +50,11 @@ class ConcurrentExecutor:
                 max_steps=max_steps,
                 tool_call_timeout=timeout
             )
+        finally:
+            # === [核心新增] 生命周期解锁：无论执行成功还是崩溃，必须卸载标记 ===
+            setattr(event, '_is_final_reply_phase', False)
 
+        try:
             reply_text = llm_resp.completion_text
 
             # 处理特定工具触发的中断信号
@@ -61,14 +67,11 @@ class ConcurrentExecutor:
                 is_suitable, reason = await self.reply_checker.check(reply_text, chat_id)
                 if not is_suitable:
                     logger.warning(f"[{chat_id}] ⚠️ 触发降级机制：回复未通过安全审判。")
-                    # 降级策略：可以是沉默，或者发送一个通用表情
                     reply_text = fallback_text
                     
-                # 最终执行回复 (交给 ReplyEngine 处理分段、表情包等)
-                # ReplyEngine.handle_reply 负责最终的 send 操作
+                # 最终执行回复
                 await self.reply_engine.handle_reply(event, reply_text, chat_id)
                 
         except Exception as e:
             logger.error(f"[{chat_id}] ❌ Agent Loop 执行严重异常: {e}")
-            # 仅在 Debug 模式下发送错误详情，否则发送通用错误 (接入 Config)
             await event.send(event.plain_result(fallback_text))

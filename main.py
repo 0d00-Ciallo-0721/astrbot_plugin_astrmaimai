@@ -193,12 +193,16 @@ class AstrMaiPlugin(Star):
         profile.is_dirty = True
 
 
-# [新增] 函数位置: class AstrMaiPlugin 的任意位置（建议与其他 @filter.xxx 放在一起）
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
-        """[新增] 阶段四：全局记忆无感注入钩子"""
+        """[修改] 阶段四：全局记忆无感注入钩子 (基于物理生命周期标记)"""
         if not hasattr(self, 'memory_engine') or not self.memory_engine: return
         
+        # === [核心修复] 硬隔离校验：只认 executor 打上的物理标记 ===
+        if not getattr(event, '_is_final_reply_phase', False):
+            # 任何来自 GlobalModelGateway (后台认知) 的调用，标记均为 False，直接拦截，拒绝 Token 泄露
+            return
+            
         chat_id = event.unified_msg_origin
         
         # 1. 彻底清洗：利用正则清理上下文历史中所有先前注入的记忆块，防止上下文窗口被旧记忆污染
@@ -220,7 +224,6 @@ class AstrMaiPlugin(Star):
                 req.system_message[0].content += f"\n{injection}"
             elif req.messages:
                 req.messages[-1].content = injection + req.messages[-1].content
-
     @filter.on_llm_response()
     async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
         """[新增] 阶段四：全局记忆反思与自动清理钩子"""
