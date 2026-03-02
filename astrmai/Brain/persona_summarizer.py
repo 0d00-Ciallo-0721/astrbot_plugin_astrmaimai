@@ -26,87 +26,264 @@ class PersonaSummarizer:
         """计算人设内容的 Hash 值，用于缓存 Key"""
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
-    async def get_summary(self, original_prompt: str) -> Tuple[str, str]:
+    async def get_summary(self, original_prompt: str, **kwargs) -> Dict[str, Any]:
         """
-        获取人设摘要。
-        Returns: (summarized_persona, style_guide)
+        获取人设切片与摘要。
+        Returns: Dict 包含 summary, style, shards, is_full_ready, raw 等复合结构
         """
         # 接入 Config 阈值
         summary_threshold = self.config.performance.summary_threshold
         
         if not original_prompt or len(original_prompt) < summary_threshold:
-            # 如果人设很短，直接返回原始值，不做压缩
-            return original_prompt, "保持原始风格"
+            # 如果人设很短，直接组装兜底字典返回，无需切片
+            return {
+                "summary": original_prompt,
+                "style": "保持原始风格",
+                "shards": {},
+                "is_full_ready": True,
+                "raw": original_prompt
+            }
 
         # 1. 计算 Hash Key
         cache_key = self._compute_hash(original_prompt)
 
         # 2. 查缓存 (Fast Path)
         if cache_key in self.cache:
-            data = self.cache[cache_key]
-            return data.get("summary", original_prompt), data.get("style", "")
+            return self.cache[cache_key]
 
-        # 3. 缓存未命中，发起压缩任务 (Locking Path)
+        # 3. 缓存未命中，启动渐进式加载 (Progressive Loading)
         async with self._lock:
-            # 双重检查
+            # 双重检查锁
             if cache_key in self.cache:
-                data = self.cache[cache_key]
-                return data.get("summary", original_prompt), data.get("style", "")
+                return self.cache[cache_key]
+                
+            # [步骤 1] 首先同步调用 Sys1 生成 Summary 和 Style（作为首屏兜底，实现秒开回复）
+            summary, style = await self._summarize_remote(original_prompt)
             
-            # 检查是否有正在进行的任务
-            if cache_key in self.pending_tasks:
-                task = self.pending_tasks[cache_key]
-            else:
-                task = asyncio.create_task(self._summarize_remote(original_prompt))
-                self.pending_tasks[cache_key] = task
-
-        try:
-            # 等待任务完成
-            summary, style = await task
-            
-            # 更新缓存
-            self.cache[cache_key] = {
+            # [步骤 2] 构建并保存初始缓存结构（is_full_ready 初始为 False）
+            new_cache_data = {
                 "summary": summary,
                 "style": style,
+                "shards": {},
+                "is_full_ready": False,
+                "raw": original_prompt,
                 "timestamp": __import__("time").time()
             }
+            self.cache[cache_key] = new_cache_data
             self.persistence.save_persona_cache(self.cache)
-            return summary, style
             
-        except Exception as e:
-            logger.error(f"[PersonaSummarizer] 压缩任务失败: {e}")
-            return original_prompt, "保持原始风格" # 降级：使用原始 Prompt
-        finally:
-            # 清理任务记录
-            async with self._lock:
-                self.pending_tasks.pop(cache_key, None)
+            # [步骤 3] 抛出后台任务，异步顺序生成8大维度切片，防止主回复程序卡死
+            task = asyncio.create_task(self._generate_all_shards_background(original_prompt, cache_key))
+            self.pending_tasks[cache_key] = task
+            
+            return new_cache_data
 
     async def _summarize_remote(self, original_prompt: str) -> Tuple[str, str]:
-        """调用 Sys1 (Judge) 模型进行压缩"""
-        logger.info(f"[PersonaSummarizer] 🔨 正在压缩人设 (Len: {len(original_prompt)})...")
+        """调用 Sys1 (Judge) 模型进行核心压缩 (作为渐进式加载的底层兜底)"""
+        logger.info(f"[PersonaSummarizer] 🔨 正在生成核心人设摘要 (首屏兜底) (Len: {len(original_prompt)})...")
         
         prompt = f"""
-你的任务是将以下[原始人设]压缩为高密度的核心特征，以便让AI在极低Token消耗下仍能完美扮演。
+你的任务是将以下[原始人设]压缩为极高密度的【基础特征】和【回复风格】，作为AI的临时底层人格。
 
 [原始人设]
 {original_prompt}
 
 [压缩要求]
-1. **summarized_persona**: 提取核心身份、性格关键词、说话习惯。去除冗余描述。
-2. **style_guide**: 提取具体的回复格式要求（如：不加句号、喜欢用波浪号、傲娇语气等）。
+1. **summarized_persona**: 提取最核心的身份、基础性格。必须控制在200字以内。不要写具体经历或复杂关系，只保留最基本的人设骨架。
+2. **style_guide**: 提取具体的回复格式要求（如：不加句号、傲娇语气、特殊口癖等）。
 
-请严格返回 JSON 格式:
+请严格按照以下 JSON 格式返回:
 {{
-    "summarized_persona": "string (200字以内)",
-    "style_guide": "string (简短的风格指导)"
+    "summarized_persona": "string",
+    "style_guide": "string"
 }}
 """
         try:
             # 使用 Gateway 的 call_judge (Sys1) 进行低成本压缩
-            result = await self.gateway.call_judge(prompt, system_prompt="你是一个资深的角色扮演专家。")
-            summary = result.get("summarized_persona", original_prompt)
-            style = result.get("style_guide", "")
+            result = await self.gateway.call_judge(prompt, system_prompt="你是一个资深的角色扮演设定提取专家。")
+            
+            # 拿到结果，做安全回退
+            summary = result.get("summarized_persona", "")
+            if not summary:
+                summary = original_prompt[:300] + "..." # 防止原始人设过长导致兜底失败
+                
+            style = result.get("style_guide", "保持自然对话风格")
             return summary, style
+            
         except Exception as e:
-            logger.warning(f"[PersonaSummarizer] LLM 调用失败: {e}")
-            return original_prompt, ""
+            logger.warning(f"[PersonaSummarizer] 核心摘要提取失败，触发截断降级: {e}")
+            # 降级：如果 LLM 挂了，强行截断原文前 300 字作为兜底，绝对不返回完整的 5000 字
+            return original_prompt[:300] + "...", "保持自然对话风格"
+        
+
+    async def _generate_all_shards_background(self, original_prompt: str, cache_key: str):
+        """后台顺序生成所有维度的切片，完成后修改状态并放行"""
+        try:
+            shards = {}
+            # 采用按顺序生成，避免大模型并发导致 Token 超限或接口卡死
+            shards["logic_style"] = await self._summarize_logic_style(original_prompt)
+            shards["speech_style"] = await self._summarize_speech_style(original_prompt)
+            shards["world_view"] = await self._summarize_world_view(original_prompt)
+            shards["timeline"] = await self._summarize_timeline(original_prompt)
+            shards["relations"] = await self._summarize_relations(original_prompt)
+            shards["skills"] = await self._summarize_skills(original_prompt)
+            shards["values"] = await self._summarize_values(original_prompt)
+            shards["secrets"] = await self._summarize_secrets(original_prompt)
+
+            # 写入缓存并标记 is_full_ready 为 True，宣告完整版降临准备就绪
+            async with self._lock:
+                if cache_key in self.cache:
+                    self.cache[cache_key]["shards"] = shards
+                    self.cache[cache_key]["is_full_ready"] = True
+                    self.persistence.save_persona_cache(self.cache)
+            logger.info(f"[PersonaSummarizer] 🎉 后台任务：8个维度人格切片生成并挂载完毕！")
+            
+        except Exception as e:
+            logger.error(f"[PersonaSummarizer] 后台切片生成异常: {e}")
+        finally:
+            async with self._lock:
+                self.pending_tasks.pop(cache_key, None)
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_logic_style(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 性格逻辑 (logic_style)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【性格逻辑】维度的切片信息。
+[提取要求]
+重点关注：角色的内在行为模式、战斗与日常状态的切换逻辑、思考方式。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_speech_style(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 语言风格 (speech_style)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【语言风格】维度的切片信息。
+[提取要求]
+重点关注：角色的口癖、特殊发声习惯、语调特点、标志性词汇。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_world_view(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 世界观 (world_view)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【世界观】维度的切片信息。
+[提取要求]
+重点关注：角色所处的社会现象、政治立场、地理位置、常识与阵营设定。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_timeline(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 生平经历 (timeline)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【生平经历】维度的切片信息。
+[提取要求]
+重点关注：角色过去的关键事件、创伤、童年回忆或重大转折。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_relations(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 人际关系 (relations)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【人际关系】维度的切片信息。
+[提取要求]
+重点关注：角色对特定设定的亲友、其他角色的称呼、态度和关系。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_skills(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 技能能力 (skills)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【技能能力】维度的切片信息。
+[提取要求]
+重点关注：角色的战斗方式、生活技能、特殊天赋或魔法能力。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_values(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 价值观 (values)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【价值观】维度的切片信息。
+[提取要求]
+重点关注：角色的喜好、厌恶、恐惧、面临道德抉择时的倾向。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"
+
+    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    async def _summarize_secrets(self, original_prompt: str) -> str:
+        logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 深层秘密 (secrets)...")
+        prompt = f"""
+你的任务是从以下[原始人设]中提取出【深层秘密】维度的切片信息。
+[提取要求]
+重点关注：角色的黑历史、潜意识深处的恐惧、不可告人的秘密。
+只返回提取后的核心设定内容，提炼成高密度的描述，不要有任何多余的开头/结尾问候或解释。
+如果人设中完全没有提到相关内容，请回复“无”。
+
+[原始人设]
+{original_prompt}
+"""
+        try:
+            return await self.gateway.call_planner(prompt)
+        except Exception:
+            return "无"

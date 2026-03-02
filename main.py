@@ -193,11 +193,22 @@ class AstrMaiPlugin(Star):
         profile.is_dirty = True
 
 
+# [修改] 具体位置：类 AstrMaiPlugin 中，替换原有的 handle_memory_recall 函数
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
-        """[修改] 阶段四：全局记忆无感注入钩子 (基于物理生命周期标记)"""
+        """[修改] 阶段四：全局记忆无感注入钩子 (加入关闭开关)"""
         if not hasattr(self, 'memory_engine') or not self.memory_engine: return
         
+        # [新增] 记忆关闭开关：检测是否处于 ALL 沉浸模式
+        disable_rag = False
+        if hasattr(self.context, "get"):
+            disable_rag = self.context.get("disable_rag_injection")
+        elif hasattr(self.context, "shared_dict"):
+            disable_rag = self.context.shared_dict.get("disable_rag_injection", False)
+            
+        if disable_rag:
+            return
+            
         # === [核心修复] 硬隔离校验：只认 executor 打上的物理标记 ===
         if not getattr(event, '_is_final_reply_phase', False):
             # 任何来自 GlobalModelGateway (后台认知) 的调用，标记均为 False，直接拦截，拒绝 Token 泄露
@@ -224,6 +235,7 @@ class AstrMaiPlugin(Star):
                 req.system_message[0].content += f"\n{injection}"
             elif req.messages:
                 req.messages[-1].content = injection + req.messages[-1].content
+                
     @filter.on_llm_response()
     async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
         """[新增] 阶段四：全局记忆反思与自动清理钩子"""
