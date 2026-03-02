@@ -47,16 +47,16 @@
       }
     }
   },
-  "persona": {
+"persona": {
+    "title": "🎭 人设与记忆配置 (Persona)",
     "type": "object",
-    "description": "🎭 核心人设 (Persona)",
-    "items": {
+    "properties": {
       "persona_id": {
-        "description": "绑定核心人设",
+        "title": "🏷️ 人设绑定 ID (Persona ID)",
         "type": "string",
         "default": "",
-        "hint": "选择预设人格。不选则自动使用当前会话默认人设。",
-        "_special": "select_persona"
+        "description": "自定义人设的唯一标识（如：cat_girl_v1）。\n1. 留空（默认）：绑定当前会话 ID，每个群/人拥有独立记忆。\n2. 填写：强制绑定特定 ID，实现跨群共享同一人设与记忆。\n3. 只要 ID 不变，将直接加载缓存，忽略系统提示词的修改。",
+        "hint": "留空=千人千面；填写=全局唯一。"
       }
     }
   },

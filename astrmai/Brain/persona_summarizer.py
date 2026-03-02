@@ -26,37 +26,48 @@ class PersonaSummarizer:
         """计算人设内容的 Hash 值，用于缓存 Key"""
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
-    async def get_summary(self, original_prompt: str, **kwargs) -> Dict[str, Any]:
+    async def get_summary(self, original_prompt: str, persona_id: str = "", session_id: str = "global") -> Dict[str, Any]:
         """
-        获取人设切片与摘要。
-        Returns: Dict 包含 summary, style, shards, is_full_ready, raw 等复合结构
+        [修改] 基于 Persona ID 获取人设切片。
+        :param original_prompt: 原始人设文本（用于首次生成）。
+        :param persona_id: 配置中填写的唯一 ID。
+        :param session_id: 如果 ID 为空，用 session_id 做兜底（实现千人千面缓存）。
         """
         # 接入 Config 阈值
         summary_threshold = self.config.performance.summary_threshold
+
+        # 1. 确定 Cache Key (ID 优先)
+        if persona_id and persona_id.strip():
+            cache_key = persona_id.strip()
+        else:
+            # 如果没填 ID，默认绑定到当前会话 (chat_id)
+            cache_key = f"session_{session_id}"
+
+        # 2. 查缓存 (Fast Path) - 只要 ID 命中，直接返回，忽略 Prompt 内容变化
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        # 3. 缓存未命中（新 ID 或新会话），启动生成流程
         
+        # 如果 Prompt 太短或为空，直接返回兜底结构，不进行切片
+        # (注意：如果是初次配置 ID 且没填 System Prompt，这里会返回空结构，避免报错)
         if not original_prompt or len(original_prompt) < summary_threshold:
-            # 如果人设很短，直接组装兜底字典返回，无需切片
             return {
                 "summary": original_prompt,
                 "style": "保持原始风格",
                 "shards": {},
                 "is_full_ready": True,
-                "raw": original_prompt
+                "raw": original_prompt,
+                "timestamp": __import__("time").time()
             }
 
-        # 1. 计算 Hash Key
-        cache_key = self._compute_hash(original_prompt)
-
-        # 2. 查缓存 (Fast Path)
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-
-        # 3. 缓存未命中，启动渐进式加载 (Progressive Loading)
         async with self._lock:
             # 双重检查锁
             if cache_key in self.cache:
                 return self.cache[cache_key]
                 
+            logger.info(f"[PersonaSummarizer] 🆕 未找到 ID [{cache_key}] 的缓存，开始构建新的人设切片...")
+            
             # [步骤 1] 首先同步调用 Sys1 生成 Summary 和 Style（作为首屏兜底，实现秒开回复）
             summary, style = await self._summarize_remote(original_prompt)
             

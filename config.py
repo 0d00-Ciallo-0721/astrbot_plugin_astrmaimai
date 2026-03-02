@@ -12,7 +12,8 @@ class GlobalSettingsConfig(BaseModel):
     enabled_groups: List[str] = Field(default=[])
 
 class PersonaConfig(BaseModel):
-    persona_id: str = Field(default="")
+    # [修改] 增加 description 描述，明确 ID 为空时的默认行为
+    persona_id: str = Field(default="", description="人设唯一ID。不填则默认为当前对话ID（实现千人千面）。若填写则强制绑定该ID（实现单一人设）。")
 
 class AgentConfig(BaseModel):
     max_steps: int = Field(default=5)

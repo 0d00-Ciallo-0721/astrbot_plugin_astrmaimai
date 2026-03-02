@@ -49,8 +49,17 @@ class ContextEngine:
                 user_profile = self.db.get_user_profile(sender_id)
         
         # 2. 调用 Summarizer 获取人格切片数据
+        # [修改] 获取配置中的 ID 并传递给 Summarizer，实现 ID 绑定逻辑
+        target_persona_id = getattr(self.config.persona, 'persona_id', "")
+        # 获取原始 Prompt (System 1/2 Prompt 配置通常在 config.persona.prompt 或 context 中)
+        raw_prompt = getattr(self.config.persona, 'prompt', "")
+
         # 此时已经传入了配置的 Prompt，并且无需考虑以前的方法签名
-        persona_data = await self.summarizer.get_summary(self.config.persona.prompt)
+        persona_data = await self.summarizer.get_summary(
+            original_prompt=raw_prompt,
+            persona_id=target_persona_id,
+            session_id=chat_id
+        )
         
         # 安全解析字典结构 (兼容第一阶段修改后的格式)
         if isinstance(persona_data, dict):

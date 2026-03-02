@@ -74,7 +74,7 @@ class PersistenceManager:
     # Cache I/O (Persona Summarizer)
     # ==========================================
     def load_persona_cache(self) -> Dict[str, Any]:
-        """加载人设摘要缓存"""
+        """[修改] 加载人设摘要缓存 (Key: Persona ID / Session ID)"""
         if not self.persona_cache_path.exists():
             return {}
         try:
@@ -85,14 +85,12 @@ class PersistenceManager:
             return {}
 
     def save_persona_cache(self, cache_data: Dict[str, Any]):
-        """保存人设摘要缓存"""
+        """[修改] 保存人设摘要缓存 (持久化为 {'persona_id': {...}} 结构)"""
         try:
             with open(self.persona_cache_path, "w", encoding="utf-8") as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"[Persistence] 保存人设缓存失败: {e}")
-
-
 
 
     # ==========================================
