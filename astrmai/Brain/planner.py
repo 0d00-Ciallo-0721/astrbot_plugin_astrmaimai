@@ -102,10 +102,10 @@ class Planner:
             user_message = event.message_str
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
         
-        # 7. 下发给 Executor
+        # 7. 下发给 Executor (修复: 将 user_prompt 修正为正确的传参 prompt)
         await self.executor.execute(
             event=event,
             system_prompt=system_prompt,
-            user_prompt=prompt_content,
+            prompt=prompt_content,
             tools=tools
         )

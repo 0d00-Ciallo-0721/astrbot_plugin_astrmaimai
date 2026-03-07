@@ -90,12 +90,11 @@ class ChatState:
     last_reply_time: float = 0.0
     total_messages: int = 0
     judgment_mode: str = "single"
-    accumulation_pool: List[Any] = field(default_factory=list)
-    background_buffer: List[Any] = field(default_factory=list)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+
     last_msg_info: LastMessageMetadata = field(default_factory=LastMessageMetadata)
     # --- Phase 6: Lifecycle Fields ---
-    next_wakeup_timestamp: float = 0.0 # 下次计划唤醒时间
     last_passive_decay_time: float = 0.0 # 上次自然衰减时间
     # --- 缓存控制 ---
     is_dirty: bool = False

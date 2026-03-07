@@ -37,7 +37,6 @@ class ProactiveTask:
         self._task = None
         self._last_profile_run = 0
 
-
     async def start(self):
         """[修改] 启动多维后台主动任务循环 (心跳机制)"""
         if self._is_running:
@@ -66,14 +65,13 @@ class ProactiveTask:
                 
                 # 2. 执行主动唤醒 (Wakeup)
                 await self._run_wakeup_task()
-                # 2. 深度侧写任务 (Profiling)
+                
+                # 3. 深度侧写任务 (Profiling)
                 now = time.time()
                 if now - self._last_profile_run > 3600: # 每小时巡检一次侧写
                     await self._run_profiling_task()
                     self._last_profile_run = now
 
-                # (其他如冷场唤醒任务可以在此继续堆叠)
-                
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -81,18 +79,34 @@ class ProactiveTask:
                 await asyncio.sleep(60)
 
     async def _run_decay_task(self):
-        """代谢任务：遍历活跃状态执行衰减，并附加长期记忆物理衰减 (带错过补偿机制)"""
-        # 1. 原有的短期状态代谢 (精力恢复、情绪平复等)
+        """整合版代谢任务：包含精力恢复、情绪平复、好感度衰减与长期记忆物理衰减"""
+        now = time.time()
+        
+        # 1. 群组级状态自然代谢 (精力恢复、情绪平复等)
         active_states = self.state_engine.get_active_states()
         for state in active_states:
             self.state_engine.apply_natural_decay(state)
-            # 如果有脏数据，PersistenceManager 的定时任务会处理，这里不强制落盘
+            
+        # 2. 用户级好感度缓慢衰减 (向趋中值 0 回落)
+        active_profiles = self.state_engine.get_active_profiles()
+        for profile in active_profiles:
+            # 假设每 24 小时自然衰减 1 点好感度（仅对绝对值大于10的生效）
+            if now - profile.last_access_time > 86400: # 一天未交互
+                old_score = profile.social_score
+                if old_score > 10:
+                    profile.social_score -= 1
+                elif old_score < -10:
+                    profile.social_score += 1
+                    
+                if old_score != profile.social_score:
+                    profile.is_dirty = True
+                    profile.last_access_time = now
+                    logger.debug(f"[Life] 🍂 时间流逝: 用户 {profile.name} 的好感度自然衰减至 {profile.social_score}")            
 
-        # 2. [新增] 长期记忆物理衰减 (每日执行 + 补偿机制)
+        # 3. 长期记忆物理衰减 (带错过补偿机制)
         if not self.memory_engine:
             return
             
-        now = time.time()
         decay_interval = 86400  # 物理衰减周期：24小时
         
         import os
@@ -150,7 +164,7 @@ class ProactiveTask:
         
         for state in active_states:
             # 基础过滤
-            if state.lock.locked(): continue # 正在处理消息
+            if hasattr(state, "lock") and state.lock.locked(): continue # 正在处理消息
             if not state.chat_id: continue
             
             # 计算静默时间
@@ -241,31 +255,3 @@ class ProactiveTask:
             # 立即保存
             await self.persistence.save_user_profile(profile)
             logger.info(f"[Life] ✅ 画像生成完成: {analysis[:20]}...")
-
-    async def _run_decay_task(self):
-        """
-        [新增] 执行好感度与群组活跃度的自然衰减
-        """
-        now = time.time()
-        
-        # 1. 群组级状态自然代谢
-        active_states = self.state_engine.get_active_states()
-        for state in active_states:
-            self.state_engine.apply_natural_decay(state)
-            
-        # 2. 用户级好感度缓慢衰减 (向趋中值 0 回落)
-        active_profiles = self.state_engine.get_active_profiles()
-        for profile in active_profiles:
-            # 假设每 24 小时自然衰减 1 点好感度（仅对绝对值大于10的生效）
-            # 这里简化为按小时判定
-            if now - profile.last_access_time > 86400: # 一天未交互
-                old_score = profile.social_score
-                if old_score > 10:
-                    profile.social_score -= 1
-                elif old_score < -10:
-                    profile.social_score += 1
-                    
-                if old_score != profile.social_score:
-                    profile.is_dirty = True
-                    profile.last_access_time = now
-                    logger.debug(f"[Life] 🍂 时间流逝: 用户 {profile.name} 的好感度自然衰减至 {profile.social_score}")            

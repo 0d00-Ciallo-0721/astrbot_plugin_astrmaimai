@@ -29,7 +29,8 @@ class MemoryEngine:
         if not os.path.exists(self.data_path):
             os.makedirs(self.data_path)
             
-        self.db_path = str(self.data_path / "memory_bm25.db") 
+        # 🔑 【修改点】统一 DB 寻址：AstrBot v4.12 的 FaissVecDB 会自动创建 docs.db 存储文档
+        self.db_path = str(self.data_path / "docs.db") 
         
         self.faiss_db = None
         self.vec_retriever = None
@@ -42,63 +43,62 @@ class MemoryEngine:
 
     async def initialize(self):
         """初始化基础骨架 (跳过模型挂载，转移到运行时)"""
-        # 仅初始化不需要模型的 BM25 辅库
-        db_path_for_bm25 = str(Path(get_astrbot_data_path()) / "data.db")
-        self.bm25_retriever = BM25Retriever(db_path_for_bm25)
+        # 🔑 【修改点】BM25 引擎指向正确的独立插件数据库，而不是全局 data.db
+        self.bm25_retriever = BM25Retriever(self.db_path)
         await self.bm25_retriever.initialize()
         
         logger.info("[AstrMai] 🧬 记忆模块骨架已装载，等待首次对话时唤醒向量引擎...")
-
+    
     async def _ensure_faiss_initialized(self):
-        """延迟唤醒机制：在真正需要时再拉取 Provider 实例"""
+        """延迟唤醒机制：完全对齐 AstrBot v4.12 核心源码标准"""
         if self._is_ready: 
             return True
             
         provider_instance = None
+        
+        # 1. 优先使用官方推荐的 get_provider_by_id 获取 EmbeddingProvider
         if self.embedding_provider_id:
-            pm = getattr(self.context, 'provider_manager', None)
-            if pm:
-                providers_dict = getattr(pm, 'providers', {})
-                if isinstance(providers_dict, dict):
-                    # 精确匹配 ID
-                    provider_instance = providers_dict.get(self.embedding_provider_id)
-                    # 容错匹配：如果字典的 key 不是 id，遍历查找
-                    if not provider_instance:
-                        for p in providers_dict.values():
-                            if getattr(p, 'id', '') == self.embedding_provider_id:
-                                provider_instance = p
-                                break
-                elif hasattr(pm, 'get_provider'):
-                    provider_instance = pm.get_provider(self.embedding_provider_id)
-                    
+            if hasattr(self.context, 'get_provider_by_id'):
+                provider_instance = self.context.get_provider_by_id(self.embedding_provider_id)
+            
+            # 兼容性兜底获取
             if not provider_instance and hasattr(self.context, 'get_provider'):
                 provider_instance = self.context.get_provider(self.embedding_provider_id)
 
         if not provider_instance:
-            logger.error(f"[AstrMai] ❌ 记忆模块唤醒失败: 找不到 Embedding 模型 ID '{self.embedding_provider_id}'")
+            logger.error(f"[AstrMai] ❌ 记忆模块唤醒失败: 找不到有效 Embedding 模型 '{self.embedding_provider_id}'")
             return False
 
-        try:
-            self.faiss_db = FaissVecDB(
-                str(self.data_path), 
-                "astrmai_memory", 
-                embedding_provider=provider_instance
-            )
-        except TypeError:
-            self.faiss_db = FaissVecDB(
-                namespace="astrmai_memory", 
-                embedding_provider=provider_instance
-            )
+        # 2. 准备符合核心源码要求的存储路径 [依据 vec_db.py 构造函数]
+        # v4.12 要求明确区分 doc_store (SQLite) 和 index_store (FAISS Index)
+        doc_store_path = str(self.data_path / "docs.db")
+        index_store_path = str(self.data_path / "vectors.index")
 
-        # 执行原生启动并挂载混合检索器
-        await self.faiss_db.init()
+        try:
+            # 3. 实例化 FaissVecDB [严格对齐 vec_db.py:21 行签名]
+            # 参数: doc_store_path, index_store_path, embedding_provider
+            self.faiss_db = FaissVecDB(
+                doc_store_path=doc_store_path,
+                index_store_path=index_store_path,
+                embedding_provider=provider_instance
+            )
+            
+            # 4. 调用正确的异步初始化方法 [依据 base.py:12 及 vec_db.py:32]
+            # 这会触发 DocumentStorage 的引擎创建，解决 "Database not initialized"
+            await self.faiss_db.initialize()
+            
+        except Exception as e:
+            logger.error(f"[AstrMai] ❌ FaissVecDB 核心实例化失败: {e}", exc_info=True)
+            return False
+
+        # 5. 挂载上层检索包装器
         self.vec_retriever = VectorRetriever(self.faiss_db, self.config)
         self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
         
         self._is_ready = True
-        logger.info("[AstrMai] 🧬 向量引擎已成功唤醒！(FaissVecDB Ready)")
+        logger.info("[AstrMai] 🧬 向量引擎已成功唤醒并完成数据库通电 (FaissVecDB Ready)")
         return True
-
+    
     async def add_memory(self, content: str, session_id: str, persona_id: str = None, importance: float = 0.8):
         # 拦截校验：确保模型已挂载
         if not await self._ensure_faiss_initialized(): return
@@ -136,10 +136,10 @@ class MemoryEngine:
         
     async def apply_daily_decay(self, decay_rate: float, days: int = 1) -> int:
         await self._ensure_faiss_initialized()
-        db_path = str(Path(get_astrbot_data_path()) / "data.db")
         decay_factor = (1 - decay_rate) ** days
         try:
-            async with aiosqlite.connect(db_path) as db:
+            # 🔑 【修改点】物理衰减 SQL 连接指向正确的 docs.db (self.db_path)，阻止表查询失败
+            async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute("""
                     UPDATE documents
                     SET metadata = json_set(

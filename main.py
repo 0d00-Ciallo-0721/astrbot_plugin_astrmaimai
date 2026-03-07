@@ -12,6 +12,7 @@ from .config import AstrMaiConfig
 from .astrmai.infra.persistence import PersistenceManager
 from .astrmai.infra.database import DatabaseService
 from .astrmai.infra.gateway import GlobalModelGateway
+from .astrmai.infra.event_bus import EventBus 
 
 # --- Phase 4: Memory ---
 from .astrmai.memory.engine import MemoryEngine
@@ -57,6 +58,7 @@ class AstrMaiPlugin(Star):
         self.persistence = PersistenceManager()                 
         self.db_service = DatabaseService(self.persistence)     
         self.gateway = GlobalModelGateway(context, self.config) # 注入 AstrMaiConfig
+        self.event_bus = EventBus()   
         
         # --- Phase 4: Living Memory Mount ---
         self.memory_engine = MemoryEngine(context, self.gateway, embedding_provider_id=emb_id)
@@ -115,14 +117,18 @@ class AstrMaiPlugin(Star):
         await self.memory_engine.initialize()
         await self.memory_engine.start_background_tasks()
 
-    async def _system2_entry(self, main_event: AstrMessageEvent, queue_events: list):
+    async def _system2_entry(self, main_event: AstrMessageEvent, events_to_process: list = None):
         chat_id = main_event.unified_msg_origin
-        pool = self.attention_gate.focus_pools.get(chat_id)
-        queue_events = pool['queue'] if pool else [main_event]
+        
+        # 抛弃旧的字典读取逻辑，直接使用 AttentionGate 喂过来的聚合列表
+        if isinstance(events_to_process, list) and len(events_to_process) > 0:
+            queue_events = events_to_process
+        else:
+            queue_events = [main_event]
         
         await self.state_engine.consume_energy(chat_id)
         await self.system2_planner.plan_and_execute(main_event, queue_events)
-
+        
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
         '''AstrMai 状态面板'''

@@ -2,7 +2,7 @@
 import time
 import datetime
 import asyncio
-from typing import Dict, Optional, List 
+from typing import Dict, Optional, List
 from astrbot.api import logger
 from ..infra.persistence import PersistenceManager
 from ..infra.datamodels import ChatState, UserProfile
@@ -52,7 +52,6 @@ class StateEngine:
                 state.last_reset_date = datetime.date.today().isoformat()
                 
             # 补齐运行时动态属性
-            state.lock = asyncio.Lock()
             state.last_access_time = now
             state.is_dirty = True 
             

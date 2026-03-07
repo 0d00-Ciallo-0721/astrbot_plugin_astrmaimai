@@ -38,7 +38,7 @@ JSON 格式要求：
         if not chat_history_text or not chat_history_text.strip():
             return self._get_default_structured_data()
             
-        prompt = self.prompt_template.format(history=chat_history_text)
+        prompt = self.prompt_template.replace("{history}", chat_history_text)
         
         try:
             # 这里的 gateway.call_judge 是 astrmai 的 LLM 调用封装

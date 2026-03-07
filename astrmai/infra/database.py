@@ -108,9 +108,28 @@ class DatabaseService:
                     existing.is_complete = jargon.is_complete
                     existing.is_jargon = jargon.is_jargon
                 session.add(existing)
+                target = existing
             else:
                 session.add(jargon)
+                target = jargon
+                
             session.commit()
+            session.refresh(target)
+            
+            # 【核心修复】脱水处理 (Detachment Fix)
+            # 强制触发对象的属性加载，将数据固化到本地内存中。
+            # 这样即使退出了 with 代码块 (Session 断开)，外部处理器仍能安全访问，不会引发 Not Bound to Session 错误。
+            _ = target.is_jargon
+            _ = target.is_complete
+            _ = target.content
+            _ = target.meaning
+            
+            # 将值同步回原始对象，确保外部直接引用 jargon 时不会报错
+            jargon.is_jargon = target.is_jargon
+            jargon.is_complete = target.is_complete
+            jargon.content = target.content
+            jargon.meaning = target.meaning
+            
 
     def get_jargons(self, group_id: str, limit: int = 20, only_confirmed: bool = True) -> List[Jargon]:
         """[新增] 获取群组的黑话列表，供 Brain 检索使用"""

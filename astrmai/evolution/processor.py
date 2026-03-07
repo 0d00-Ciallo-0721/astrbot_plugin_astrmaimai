@@ -124,3 +124,26 @@ class EvolutionManager:
         for p in patterns:
             lines.append(f"- 当【{p.situation}】时 -> 习惯使用表达/黑话：【{p.expression}】")
         return "\n".join(lines)                    
+    
+
+    async def _try_trigger_mining(self, group_id: str):
+        """
+        私有方法：尝试触发异步挖掘 [新增]
+        逻辑：检查未处理日志数量，达到阈值则执行 process_logs_and_mine
+        """
+        try:
+            # 从数据库获取未处理的日志
+            unprocessed_logs = self.db.get_unprocessed_logs(group_id, limit=100)
+            
+            # 设置触发阈值（例如：累积 20 条消息触发一次进化挖掘）
+            threshold = getattr(self.config.evolution, 'mining_threshold', 20)
+            
+            if len(unprocessed_logs) >= threshold:
+                logger.info(f"[Evolution] 群组 {group_id} 积攒日志达标 ({len(unprocessed_logs)}条)，启动进化挖掘...")
+                # 调用已有的综合挖掘任务
+                await self.process_logs_and_mine(group_id, unprocessed_logs)
+            else:
+                logger.debug(f"[Evolution] 群组 {group_id} 当前日志数: {len(unprocessed_logs)}，未达阈值 {threshold}。")
+                
+        except Exception as e:
+            logger.error(f"[Evolution] _try_trigger_mining 异常: {e}")    

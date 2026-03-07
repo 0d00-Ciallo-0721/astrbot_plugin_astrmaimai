@@ -41,7 +41,7 @@ class ReplyEngine:
 
     def _segment_reply_content(self, text: str) -> List[str]:
         """
-        拟人化分段算法
+        [修改] 拟人化分段算法 (增强版，解决空段和颜文字重组导致的段数溢出)
         """
         if len(text) > self.no_segment_limit:
             return [text]
@@ -62,25 +62,26 @@ class ReplyEngine:
         segments = []
         current = ""
         for part in parts:
-            if not part: continue
+            if not part.strip(): continue # 强化过滤：忽略纯空白片段
+            
             if re.match(split_pattern, part):
+                current += part
                 if len(current) >= self.segmentation_threshold:
                     segments.append(current.strip())
                     current = ""
-                else:
-                    current += part
             else:
                 current += part
         
         if current.strip():
             segments.append(current.strip())
             
-        # 还原
+        # 还原颜文字并执行二次净化
         final_segments = []
         for seg in segments:
             for i, k in enumerate(kaomojis):
                 seg = seg.replace(f"__KAOMOJI_{i}__", k)
-            final_segments.append(seg)
+            if seg.strip(): # 最后一道防线，确保绝不把空字符串当做独立段落
+                final_segments.append(seg.strip())
             
         return final_segments
 
@@ -94,20 +95,44 @@ class ReplyEngine:
         clean_text = self._clean_reply_content(raw_text)
         if not clean_text: return
 
+        tag = "neutral"
         # 2. 情绪后处理 (Post-Processing Mood)
         # LLM 的回复本身蕴含了它的情绪，我们需要解析它来更新 Bot 的心情状态
         try:
-            # 获取当前状态
+            # 获取当前状态与触发本次交互的用户画像
             state = await self.state_engine.get_state(chat_id)
+            user_id = event.get_sender_id()
             
-            # 分析回复文本的情绪
-            (tag, new_mood) = await self.mood_manager.analyze_text_mood(clean_text, state.mood)
+            # 安全获取画像，容错处理
+            if hasattr(self.state_engine, 'get_user_profile'):
+                profile = await self.state_engine.get_user_profile(user_id)
+                user_affection = getattr(profile, 'social_score', 0.0) if profile else 0.0
+            else:
+                user_affection = 0.0
             
-            # 更新状态 (StateEngine 会处理持久化)
+            # 适配 MoodManager 的方法调用
+            if hasattr(self.mood_manager, 'analyze_mood'):
+                (tag, new_mood) = await self.mood_manager.analyze_mood(
+                    text=clean_text, 
+                    current_mood=state.mood,
+                    user_affection=user_affection
+                )
+            elif hasattr(self.mood_manager, 'analyze_text_mood'):
+                (tag, new_mood) = await self.mood_manager.analyze_text_mood(clean_text, state.mood)
+            else:
+                new_mood = state.mood
+                
+            # 更新状态 (修复: 补充传入缺失的 chat_id 位置参数)
             state.mood = new_mood
-            await self.state_engine.db.save_chat_state(state)
+            if hasattr(self.state_engine, 'persistence'):
+                await self.state_engine.persistence.save_chat_state(chat_id, state)
+            elif hasattr(self.state_engine, 'db'):
+                await self.state_engine.db.save_chat_state(chat_id, state)
             
             logger.debug(f"[Reply] 😃 情绪更新: {tag} ({new_mood:.2f})")
+        except AttributeError as e:
+            logger.warning(f"[Reply] 情绪模块 API 漂移/失效: {e}")
+            tag = "neutral"
         except Exception as e:
             logger.warning(f"[Reply] 情绪分析失败: {e}")
             tag = "neutral"
