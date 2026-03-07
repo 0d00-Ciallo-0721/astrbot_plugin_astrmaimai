@@ -4,7 +4,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.tool import ToolSet
 from ..infra.gateway import GlobalModelGateway
-from .reply_checker import ReplyChecker
 from .reply_engine import ReplyEngine 
 
 class ConcurrentExecutor:
@@ -15,7 +14,7 @@ class ConcurrentExecutor:
     def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine, config=None):
         self.context = context
         self.gateway = gateway
-        self.reply_checker = ReplyChecker(gateway)
+        
         self.reply_engine = reply_engine
         self.config = config if config else gateway.config
 
@@ -62,13 +61,8 @@ class ConcurrentExecutor:
                 logger.info(f"[{chat_id}] 💤 Brain 决定挂起并倾听后续消息 (Wait/Listening)。")
                 return
 
-            # 发送前的反思校验 (Reply Checker)
+            # 直接发送，剥离 Reply Checker (节约 Token 并加速响应)
             if reply_text:
-                is_suitable, reason = await self.reply_checker.check(reply_text, chat_id)
-                if not is_suitable:
-                    logger.warning(f"[{chat_id}] ⚠️ 触发降级机制：回复未通过安全审判。")
-                    reply_text = fallback_text
-                    
                 # 最终执行回复
                 await self.reply_engine.handle_reply(event, reply_text, chat_id)
                 
