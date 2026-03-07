@@ -202,7 +202,7 @@ class AstrMaiPlugin(Star):
 # [修改] 具体位置：类 AstrMaiPlugin 中，替换原有的 handle_memory_recall 函数
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
-        """[修改] 阶段四：全局记忆无感注入钩子 (加入关闭开关)"""
+        """[修改] 阶段四：全局记忆无感注入钩子 (加入关闭开关并封堵注入漏洞)"""
         if not hasattr(self, 'memory_engine') or not self.memory_engine: return
         
         # [新增] 记忆关闭开关：检测是否处于 ALL 沉浸模式
@@ -235,7 +235,10 @@ class AstrMaiPlugin(Star):
         
         # 3. 无感注入：通过专门的 XML 标签作为 System Prompt 塞入本次请求
         if memory_text and "什么也没想起来" not in memory_text:
-            injection = f"<injected_memory>\n[潜意识涌现：基于当前话题，你回忆起了以下事情：]\n{memory_text}\n</injected_memory>\n"
+            import html
+            # [核心安全补丁] 对提取的文本进行实体转义，防止污染大模型的思维链指令边界
+            safe_memory_text = html.escape(memory_text)
+            injection = f"<injected_memory>\n[潜意识涌现：基于当前话题，你回忆起了以下事情：]\n{safe_memory_text}\n</injected_memory>\n"
             
             if req.system_message:
                 req.system_message[0].content += f"\n{injection}"

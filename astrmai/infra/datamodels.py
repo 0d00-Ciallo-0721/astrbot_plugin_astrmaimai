@@ -66,7 +66,7 @@ class BrainActionPlan:
     
     # 理性评分 (1-10)
     relevance: int = 0      # 话题相关性
-    necessity: int = 0      # 回复必要性
+    necessity: float = 0.0  # 回复必要性
     confidence: int = 0     # 执行自信度
     
     # 携带的元数据 (如情绪标签)
@@ -91,14 +91,15 @@ class ChatState:
     total_messages: int = 0
     judgment_mode: str = "single"
 
-
-
     last_msg_info: LastMessageMetadata = field(default_factory=LastMessageMetadata)
     # --- Phase 6: Lifecycle Fields ---
     last_passive_decay_time: float = 0.0 # 上次自然衰减时间
     # --- 缓存控制 ---
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
+    
+    # [新增] 生命周期轮询时间戳字段
+    next_wakeup_timestamp: float = 0.0
 
 @dataclass
 class UserProfile:

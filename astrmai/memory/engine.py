@@ -120,12 +120,16 @@ class MemoryEngine:
         recall_top_k = getattr(self.config.memory, 'recall_top_k', 5)
         results = await self.retriever.search(query, k=recall_top_k, session_id=session_id, persona_id=persona_id)
         
-        if not results:
+        # [修改] 增加低权重衰减防线，过滤掉因长期未调用导致 score 过低的残余记忆
+        # 阈值设为 0.005（因采用RRF融合算法基础分较小，低于此值代表已高度衰减）
+        valid_results = [r for r in results if getattr(r, 'score', 1.0) >= 0.02]
+        
+        if not valid_results:
             return f"你努力在记忆中搜索关于 '{query}' 的事情，但是什么也没想起来。"
 
-        all_results = [f"- {r.content}" for r in results]
+        all_results = [f"- {r.content}" for r in valid_results]
         retrieved_memory = "\n".join(all_results)
-        logger.info(f"[Memory] 💡 记忆闪回成功，检索到 {len(results)} 条强相关片段。")
+        logger.info(f"[Memory] 💡 记忆闪回成功，检索到 {len(valid_results)} 条强相关片段。")
         
         return f"你突然回忆起了以下关于 '{query}' 的信息：\n{retrieved_memory}\n（请在后续的回复中自然地参考这些记忆）"
     

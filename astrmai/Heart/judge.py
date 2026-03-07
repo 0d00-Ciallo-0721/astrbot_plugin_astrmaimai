@@ -28,12 +28,12 @@ class Judge:
         # 1. 能量硬限制 (接入 Config)
         if state.energy < self.config.energy.min_reply_threshold and not is_force_wakeup:
             logger.debug(f"[{chat_id}] Judge: 能量过低 ({state.energy:.2f})，抑制回复。")
-            return BrainActionPlan(action="IGNORE", thought="好累...不想说话...", necessity=0)
+            return BrainActionPlan(action="IGNORE", thought="好累...不想说话...", necessity=0.0)
 
         # 2. 强唤醒直接通过
         if is_force_wakeup:
             logger.debug(f"[{chat_id}] Judge: 强唤醒，最高优先级放行。")
-            plan = BrainActionPlan(action="REPLY", thought="有人在很用力地叫我，我必须回应！", necessity=10, relevance=10)
+            plan = BrainActionPlan(action="REPLY", thought="有人在很用力地叫我，我必须回应！", necessity=10.0, relevance=10)
             plan.meta["retrieve_keys"] = ["ALL"] # 强唤醒默认直接完整降临
             return plan
 
@@ -44,7 +44,7 @@ class Judge:
         for kw in wakeup_words:
             if msg_lower.startswith(kw.lower()):
                 logger.debug(f"[{chat_id}] Judge: 唤醒词 [{kw}] 命中首部，快速放行。")
-                plan = BrainActionPlan(action="REPLY", thought=f"听到了熟悉的呼唤 [{kw}]，马上回答！", necessity=9, relevance=10)
+                plan = BrainActionPlan(action="REPLY", thought=f"听到了熟悉的呼唤 [{kw}]，马上回答！", necessity=9.0, relevance=10)
                 plan.meta["retrieve_keys"] = []
                 return plan
 
@@ -79,7 +79,7 @@ class Judge:
             "thought": "以第一人称和你的角色语气，写下对这段话的内心吐槽/想法，以及你决定调用哪些记忆的过程...",
             "action": "REPLY"|"WAIT"|"IGNORE",
             "relevance": int(1-10),
-            "necessity": int(1-10),
+            "necessity": float(1.0-10.0),
             "retrieve_keys": ["key1"] // 仅在 REPLY 且需深层记忆时填写，否则 []
         }}
         """
@@ -89,8 +89,17 @@ class Judge:
             result = await self.gateway.call_judge(prompt)
             plan.thought = result.get("thought", "")
             plan.action = result.get("action", "IGNORE").upper()
-            plan.relevance = int(result.get("relevance", 0))
-            plan.necessity = int(result.get("necessity", 0))
+            
+            # 强化类型转换包容度
+            try:
+                plan.relevance = int(float(result.get("relevance", 0)))
+            except (ValueError, TypeError):
+                plan.relevance = 0
+                
+            try:
+                plan.necessity = float(result.get("necessity", 0.0))
+            except (ValueError, TypeError):
+                plan.necessity = 0.0
             
             # 提取 retrieve_keys 写入 meta，交给下游
             keys = result.get("retrieve_keys", [])
