@@ -41,8 +41,8 @@ JSON 格式要求：
         prompt = self.prompt_template.replace("{history}", chat_history_text)
         
         try:
-            # 这里的 gateway.call_judge 是 astrmai 的 LLM 调用封装
-            result = await self.gateway.call_judge(prompt)
+            # [修改点] 这里的 gateway.call_data_process_task 是重构后的 LLM 调用封装
+            result = await self.gateway.call_data_process_task(prompt, is_json=True)
             
             # 解析兼容：如果网关直接返回了 dict 则直接使用，否则解析 JSON 字符串
             if isinstance(result, dict) and "summary" in result:

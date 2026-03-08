@@ -107,8 +107,17 @@ class EvolutionManager:
         严格返回 JSON 格式: {{"goal": "string"}}
         """
         try:
-            result = await self.miner.gateway.call_judge(prompt)
-            return result.get("goal", "陪伴用户，提供有趣且连贯的对话")
+            # [修改点] 调用数据处理专项模型，由于原代码调用的是 self.miner.gateway，这里保持一致
+            result = await self.miner.gateway.call_data_process_task(prompt=prompt, is_json=True)
+            if isinstance(result, dict):
+                return result.get("goal", "陪伴用户，提供有趣且连贯的对话")
+            else:
+                import json, re
+                match = re.search(r'\{.*\}', str(result), re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                    return data.get("goal", "陪伴用户，提供有趣且连贯的对话")
+                return "陪伴用户，提供有趣且连贯的对话"
         except Exception as e:
             logger.error(f"[Evolution] 目标分析异常: {e}")
             return "陪伴用户，提供有趣且连贯的对话"

@@ -15,6 +15,7 @@ class ExpressionMiner:
     def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
         self.config = config if config else gateway.config
+
     async def mine(self, group_id: str, messages: List[MessageLog]) -> List[ExpressionPattern]:
         """
         执行挖掘任务：融合句式与黑话的双重提取 (Reference: expression_learner.py & jargon_miner.py)
@@ -44,9 +45,12 @@ class ExpressionMiner:
 ]
 """
         try:
-            # 借用 System 1 (Judge) 的低成本请求跑离线任务
-            raw_result = await self.gateway.call_planner(prompt=prompt)
-            patterns_data = self._parse_json(raw_result)
+            # [修改点] 调用数据处理接口
+            raw_result = await self.gateway.call_data_process_task(prompt=prompt, is_json=True)
+            if isinstance(raw_result, list):
+                patterns_data = raw_result
+            else:
+                patterns_data = self._parse_json(str(raw_result))
             
             patterns = []
             import time
@@ -88,11 +92,6 @@ class ExpressionMiner:
             return []
         
 
-
-
-
-
-
     async def mine_jargons(self, group_id: str, messages: List[MessageLog]) -> List[Jargon]:
         """
         [新增] 从历史消息中挖掘群组黑话，并使用三步推断法尝试解析含义
@@ -118,8 +117,12 @@ class ExpressionMiner:
 如果没有找到任何黑话，请返回 []。
 """
         try:
-            raw_result = await self.gateway.call_planner(prompt=extract_prompt)
-            jargon_candidates = self._parse_json(raw_result)
+            # [修改点] 调用数据处理接口
+            raw_result = await self.gateway.call_data_process_task(prompt=extract_prompt, is_json=True)
+            if isinstance(raw_result, list):
+                jargon_candidates = raw_result
+            else:
+                jargon_candidates = self._parse_json(str(raw_result))
             
             jargons = []
             import time
@@ -146,6 +149,7 @@ class ExpressionMiner:
             logger.error(f"[Evolution] 黑话挖掘异常: {e}")
             return []
 
+
     async def _infer_jargon_meaning(self, jargon_word: str, raw_context: str) -> dict:
         """
         [新增] 核心三步推断法 (融合上下文与基础词义)
@@ -167,17 +171,25 @@ class ExpressionMiner:
 }}
 """
         try:
-            result = await self.gateway.call_judge(prompt=infer_prompt)
-            import re
-            match = re.search(r'\{.*\}', result, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                return {
-                    "meaning": data.get("meaning", ""),
-                    "is_jargon": bool(data.get("is_jargon", False)),
-                    "is_complete": bool(data.get("is_complete", False))
-                }
+            # [修改点] 调用数据处理接口
+            result = await self.gateway.call_data_process_task(prompt=infer_prompt, is_json=True)
+            if isinstance(result, dict) and "meaning" in result:
+                data = result
+            else:
+                import re
+                import json
+                match = re.search(r'\{.*\}', str(result), re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                else:
+                    data = {}
+
+            return {
+                "meaning": data.get("meaning", ""),
+                "is_jargon": bool(data.get("is_jargon", False)),
+                "is_complete": bool(data.get("is_complete", False))
+            }
         except Exception as e:
             logger.debug(f"[Evolution] 黑话推断解析失败: {e}")
             
-        return {"meaning": "", "is_jargon": False, "is_complete": False}        
+        return {"meaning": "", "is_jargon": False, "is_complete": False}

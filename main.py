@@ -44,11 +44,12 @@ class AstrMaiPlugin(Star):
         self.raw_config = config 
         self.config = AstrMaiConfig(**(config or {}))  
         
-        sys1 = self.config.provider.system1_provider_id or 'Unconfigured'
-        sys2 = self.config.provider.system2_provider_id or 'Unconfigured'
+        # [核心修改] 对接新的精细化模型配置体系
+        judge_id = self.config.provider.judge_model or 'Unconfigured'
+        agent_id = self.config.provider.agent_model or 'Unconfigured'
         emb_id = self.config.provider.embedding_provider_id or ''
         
-        logger.info(f"[AstrMai] 🚀 Booting... Sys1: {sys1} | Sys2: {sys2}")
+        logger.info(f"[AstrMai] 🚀 Booting... Judge: {judge_id} | Agent: {agent_id}")
 
         # ==========================================
         # 🛠️ 架构层级挂载 (Layer Initialization)
@@ -132,12 +133,13 @@ class AstrMaiPlugin(Star):
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
         '''AstrMai 状态面板'''
+        # [核心修改] 替换为细粒度模型的名称读取
         help_text = (
             "🤖 **AstrMai (v1.0.0)**\n"
             "-----------------------\n"
             "🧠 架构状态: Phase 6 (Lifecycle Active)\n"
-            f"🔌 Sys1 Provider: {self.config.provider.system1_provider_id}\n"
-            f"🔌 Sys2 Provider: {self.config.provider.system2_provider_id}\n"
+            f"🔌 Judge Provider: {self.config.provider.judge_model}\n"
+            f"🔌 Agent Provider: {self.config.provider.agent_model}\n"
             f"🔌 Emb Provider: {self.config.provider.embedding_provider_id}\n"
             "💾 SQLite & Faiss RAG: Connected\n"
             "🌀 Subconscious Miner: Running\n"

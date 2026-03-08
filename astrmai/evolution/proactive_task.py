@@ -200,52 +200,58 @@ class ProactiveTask:
                         logger.error(f"[Life] 发送主动消息失败: {e}")
 
     async def _generate_opening_line(self, chat_id: str) -> str:
-        """调用 System 2 生成有趣的开场白"""
+        """调用主动任务模型生成有趣的开场白，并注入人设防止 OC"""
+        
+        # [新增] 从持久化缓存中读取人设压缩摘要
+        persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
+        cache = self.persistence.load_persona_cache()
+        persona_data = cache.get(persona_id, {})
+        summary = persona_data.get("summary", "")
+        style = persona_data.get("style", "")
+        
+        persona_injection = ""
+        if summary:
+            persona_injection = f"\n[你的核心人设]: {summary}\n[回复风格]: {style}\n"
+
         prompt = f"""
 你是一个群聊活跃气氛的群友。这个群已经冷场很久了（超过2小时没人说话）。
+请你完全沉浸于以下设定中：{persona_injection}
+
 请你根据你的设定，生成一个简短、有趣、自然的开场白，试图引起大家的讨论。
 可以是分享一个生活小事、问一个无厘头的问题，或者发一个简短的感慨。
 不要太生硬，不要像个机器人客服。
 长度限制：20字以内。
 直接输出内容，不要带引号。
 """
-        # 使用 Gateway 调用 Planner (System 2)
-        return await self.gateway.call_planner(prompt)
+        # [修改点] 调用主动任务专项模型接口 (Phase 4 重构)
+        return await self.gateway.call_proactive_task(prompt)
 
-    async def _run_profiling_task(self):
-        """侧写任务：扫描并生成用户画像"""
-        # 阈值配置 (动态兼容，若 config 中未配则默认200)
-        MSG_THRESHOLD = getattr(self.config.evolution, 'profile_threshold', 200) 
-        
-        profiles = self.state_engine.get_active_profiles()
-        candidates = [
-            p for p in profiles 
-            if p.message_count_for_profiling > MSG_THRESHOLD
-        ]
-        
-        if not candidates: return
-        
-        # 每次只处理一个，避免拥塞
-        target = candidates[0]
-        logger.info(f"[Life] 🕵️‍♂️ 触发深度侧写: 用户 {target.name} (Msg: {target.message_count_for_profiling})")
-        
-        await self._generate_persona_analysis(target)
-
+    # [修改] 具体位置：类 ProactiveTask 中
     async def _generate_persona_analysis(self, profile):
-        """生成并保存画像"""
-        prompt = f"""
+        """生成并保存画像，并注入人设防止 OC"""
+        
+        # [新增] 从持久化缓存中读取人设压缩摘要
+        persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
+        cache = self.persistence.load_persona_cache()
+        persona_data = cache.get(persona_id, {})
+        summary = persona_data.get("summary", "")
+        
+        persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""
+
+        prompt = f"""{persona_injection}
 请基于用户 "{profile.name}" 与你的历史交互，构建深度人物画像。
 他已经与你互动了 {profile.message_count_for_profiling} 次。
 
 [任务]
-请以“我”的视角，生成一段 100 字以内的**深度印象侧写**。
+请以“我”（符合你的人设设定）的视角，生成一段 100 字以内的**深度印象侧写**。
 - 重点提取：具体的行为习惯、性格底色、对你的态度。
 - 输出为一段流畅的自然语言文本，像老朋友的私密备注。
 - 不要使用 Markdown 列表。
 
 (由于当前无法获取全量历史，请基于你对他的一贯印象进行创作)
 """
-        analysis = await self.gateway.call_planner(prompt)
+        # [修改点] 调用主动任务专项模型接口 (Phase 4 重构)
+        analysis = await self.gateway.call_proactive_task(prompt)
         if analysis:
             profile.persona_analysis = analysis.strip()
             profile.message_count_for_profiling = 0 # 重置计数器

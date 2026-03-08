@@ -3,16 +3,52 @@
     "type": "object",
     "description": "🔌 模型提供商配置 (Provider)",
     "items": {
-      "system1_provider_id": {
-        "description": "System 1 (直觉层) 模型 Provider ID",
+      "fallback_models": {
+        "description": "总模型池 (Fallback Models)",
+        "type": "list",
+        "default": [],
+        "hint": "备用模型池。当某个专项模型调用失败或未配置时，将依次尝试此列表中的模型"
+      },
+      "judge_model": {
+        "description": "意图与动作快速判决模型",
         "type": "string",
-        "hint": "用于 Judge 和快速判断的小模型",
+        "default": "",
+        "hint": "用于快速意图判断，建议使用快速的小模型",
         "_special": "select_provider"
       },
-      "system2_provider_id": {
-        "description": "System 2 (认知层) 模型 Provider ID",
+      "agent_model": {
+        "description": "智能体循环核心生成模型",
         "type": "string",
-        "hint": "用于 Planner 和复杂推理的大模型 ",
+        "default": "",
+        "hint": "用于反思、工具调用与长文本生成，建议使用强逻辑的大模型",
+        "_special": "select_provider"
+      },
+      "mood_model": {
+        "description": "情绪值与好感度分析模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于分析文本情绪并闭环更新好感度",
+        "_special": "select_provider"
+      },
+      "data_process_model": {
+        "description": "数据处理与降维挖掘模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于离线记忆结构化、黑话推断提取、语癖提取与对话目标分析",
+        "_special": "select_provider"
+      },
+      "proactive_model": {
+        "description": "主动行为与侧写模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于主动冷场破冰开场白生成及深度用户心理画像侧写",
+        "_special": "select_provider"
+      },
+      "persona_model": {
+        "description": "人格压缩总模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于人设压缩与多维切片",
         "_special": "select_provider"
       },
       "embedding_provider_id": {
@@ -47,7 +83,7 @@
       }
     }
   },
-"persona": {
+  "persona": {
     "title": "🎭 人设与记忆配置 (Persona)",
     "type": "object",
     "items": {
@@ -89,7 +125,7 @@
       }
     }
   },
-"system1": {
+  "system1": {
     "type": "object",
     "description": "❤️ 感知心智 (System 1)",
     "items": {
@@ -250,7 +286,7 @@
         "type": "int",
         "default": 60
       },
-    "emotion_mapping": {
+      "emotion_mapping": {
         "description": "自定义情绪与表情包字典 (格式: 情绪名:内涵描述)",
         "type": "list",
         "default": [

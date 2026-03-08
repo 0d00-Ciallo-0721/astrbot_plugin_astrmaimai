@@ -86,7 +86,8 @@ class Judge:
         
         plan = BrainActionPlan()
         try:
-            result = await self.gateway.call_judge(prompt)
+            # [修改点] 调用专属意图判决任务接口
+            result = await self.gateway.call_judge_task(prompt)
             plan.thought = result.get("thought", "")
             plan.action = result.get("action", "IGNORE").upper()
             

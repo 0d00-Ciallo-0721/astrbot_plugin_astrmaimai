@@ -89,6 +89,7 @@ class PersonaSummarizer:
             
             return new_cache_data
 
+# [修改] 替换 call_judge 为 call_persona_task
     async def _summarize_remote(self, original_prompt: str) -> Tuple[str, str]:
         """调用 Sys1 (Judge) 模型进行核心压缩 (作为渐进式加载的底层兜底)"""
         logger.info(f"[PersonaSummarizer] 🔨 正在生成核心人设摘要 (首屏兜底) (Len: {len(original_prompt)})...")
@@ -110,8 +111,16 @@ class PersonaSummarizer:
 }}
 """
         try:
-            # 使用 Gateway 的 call_judge (Sys1) 进行低成本压缩
-            result = await self.gateway.call_judge(prompt, system_prompt="你是一个资深的角色扮演设定提取专家。")
+            # [修改点] 使用人设压缩专项接口
+            result = await self.gateway.call_persona_task(prompt, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=True)
+            
+            if not isinstance(result, dict):
+                import re, json
+                match = re.search(r'\{.*\}', str(result), re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                else:
+                    result = {}
             
             # 拿到结果，做安全回退
             summary = result.get("summarized_persona", "")
@@ -125,37 +134,8 @@ class PersonaSummarizer:
             logger.warning(f"[PersonaSummarizer] 核心摘要提取失败，触发截断降级: {e}")
             # 降级：如果 LLM 挂了，强行截断原文前 300 字作为兜底，绝对不返回完整的 5000 字
             return original_prompt[:300] + "...", "保持自然对话风格"
-        
 
-    async def _generate_all_shards_background(self, original_prompt: str, cache_key: str):
-        """后台顺序生成所有维度的切片，完成后修改状态并放行"""
-        try:
-            shards = {}
-            # 采用按顺序生成，避免大模型并发导致 Token 超限或接口卡死
-            shards["logic_style"] = await self._summarize_logic_style(original_prompt)
-            shards["speech_style"] = await self._summarize_speech_style(original_prompt)
-            shards["world_view"] = await self._summarize_world_view(original_prompt)
-            shards["timeline"] = await self._summarize_timeline(original_prompt)
-            shards["relations"] = await self._summarize_relations(original_prompt)
-            shards["skills"] = await self._summarize_skills(original_prompt)
-            shards["values"] = await self._summarize_values(original_prompt)
-            shards["secrets"] = await self._summarize_secrets(original_prompt)
-
-            # 写入缓存并标记 is_full_ready 为 True，宣告完整版降临准备就绪
-            async with self._lock:
-                if cache_key in self.cache:
-                    self.cache[cache_key]["shards"] = shards
-                    self.cache[cache_key]["is_full_ready"] = True
-                    self.persistence.save_persona_cache(self.cache)
-            logger.info(f"[PersonaSummarizer] 🎉 后台任务：8个维度人格切片生成并挂载完毕！")
-            
-        except Exception as e:
-            logger.error(f"[PersonaSummarizer] 后台切片生成异常: {e}")
-        finally:
-            async with self._lock:
-                self.pending_tasks.pop(cache_key, None)
-
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_logic_style(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 性格逻辑 (logic_style)...")
         prompt = f"""
@@ -169,11 +149,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_speech_style(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 语言风格 (speech_style)...")
         prompt = f"""
@@ -187,11 +167,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_world_view(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 世界观 (world_view)...")
         prompt = f"""
@@ -205,11 +185,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_timeline(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 生平经历 (timeline)...")
         prompt = f"""
@@ -223,11 +203,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_relations(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 人际关系 (relations)...")
         prompt = f"""
@@ -241,11 +221,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_skills(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 技能能力 (skills)...")
         prompt = f"""
@@ -259,11 +239,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_values(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 价值观 (values)...")
         prompt = f"""
@@ -277,11 +257,11 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"
 
-    # [新增] 具体位置：类 PersonaSummarizer 的末尾
+    # [修改] 替换 call_planner 为 call_persona_task
     async def _summarize_secrets(self, original_prompt: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 深层秘密 (secrets)...")
         prompt = f"""
@@ -295,6 +275,6 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_planner(prompt)
+            return await self.gateway.call_persona_task(prompt, is_json=False)
         except Exception:
             return "无"

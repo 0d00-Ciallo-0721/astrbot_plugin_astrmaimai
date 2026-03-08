@@ -2,8 +2,13 @@ from pydantic import BaseModel, Field
 from typing import List,Dict
 
 class ProviderConfig(BaseModel):
-    system1_provider_id: str = Field(default="")
-    system2_provider_id: str = Field(default="")
+    fallback_models: List[str] = Field(default=[])
+    judge_model: str = Field(default="")
+    agent_model: str = Field(default="")
+    mood_model: str = Field(default="")
+    data_process_model: str = Field(default="")
+    proactive_model: str = Field(default="")
+    persona_model: str = Field(default="")
     embedding_provider_id: str = Field(default="")
 
 class GlobalSettingsConfig(BaseModel):

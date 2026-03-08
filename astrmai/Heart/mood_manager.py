@@ -46,7 +46,7 @@ class MoodManager:
         # 构造 Prompt
         mapping_desc = "\n".join([f"- {k}: {v}" for k, v in self.emotion_mapping.items()])
         prompt = f"""
-你的任务是分析[待分析文本]，并评估它对“我”（AI助手）的情绪影响。
+你的任务是分析[待分析文本]，并评估它对“我”（你自己）的情绪影响。
 
 [我的当前情绪]
 {current_mood:.2f} (范围 -1.0[极度沮丧] ~ 1.0[极度开心]，0.0 为平静)
@@ -73,18 +73,22 @@ class MoodManager:
 严格返回 JSON: {{"mood_tag": "string", "mood_value": float}}
 """
         try:
-            # 使用 System 1 快速模型
-            result = await self.gateway.call_judge(prompt, system_prompt="你是一个具备丰富情感和社交包容度的专业分析师。")
+            # [修改点] 使用专属的情绪分析任务接口
+            result = await self.gateway.call_mood_task(prompt, system_prompt="你是一个具备丰富情感和社交包容度的专业分析师。")
             
             # 安全解析 JSON
             import json
             import re
             json_str = result
-            match = re.search(r'\{.*\}', result, re.DOTALL)
+            match = re.search(r'\{.*\}', str(result), re.DOTALL)
             if match:
                 json_str = match.group(0)
             
-            data = json.loads(json_str)
+            if isinstance(json_str, str):
+                data = json.loads(json_str)
+            else:
+                data = json_str
+                
             mood_tag = data.get("mood_tag", "neutral")
             mood_value = float(data.get("mood_value", current_mood))
             
