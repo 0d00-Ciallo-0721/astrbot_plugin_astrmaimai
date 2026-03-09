@@ -82,6 +82,7 @@ class AttentionGate:
         asyncio.create_task(self._debounce_and_judge(chat_id, session, self_id))
 
     async def _debounce_and_judge(self, chat_id: str, session: SessionContext, self_id: str):
+        """[修改] _debounce_and_judge (捕获潜意识)"""
         try:
             logger.debug(f"[{chat_id}] ⏱️ 开启聚合滑动窗口...")
             no_msg_start_time = time.time()
@@ -115,6 +116,9 @@ class AttentionGate:
             
             # 纯粹的真实调用，不做任何 mock 拦截
             plan = await self.judge.evaluate(chat_id, combined_text, is_wakeup)
+            
+            # [新增] 将 System 1 的直觉 (thought) 挂载到主事件上，传递给 System 2
+            main_event.set_extra("sys1_thought", plan.thought)
 
             if plan.action in ["REPLY", "WAIT"]:
                 if self.sys2_process:

@@ -35,7 +35,7 @@ class Planner:
 
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
-        [修改] 动态上下文修剪、按需注入路由与沉浸模式屏蔽
+        [修改] 动态上下文修剪、按需注入路由、拦截目标并注入直觉与沉浸模式屏蔽
         """
         chat_id = event.unified_msg_origin
         
@@ -56,9 +56,11 @@ class Planner:
         # 3. 预加载上下文数据
         slang_context = await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id) 
         
-        current_goal = ""
-        if hasattr(self.evolution_manager, 'analyze_and_get_goal'):
-            current_goal = await self.evolution_manager.analyze_and_get_goal(chat_id, prompt_content)
+        # [修改] 提取 System 1 产生的潜意识，并移除原本缓慢的目标分析
+        sys1_thought = event.get_extra("sys1_thought", "")
+        # current_goal = ""
+        # if hasattr(self.evolution_manager, 'analyze_and_get_goal'):
+        #     current_goal = await self.evolution_manager.analyze_and_get_goal(chat_id, prompt_content)
         
         # 4. 装配工具与 RAG 屏蔽 (实现记忆关闭开关)
         from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool
@@ -94,7 +96,7 @@ class Planner:
             retrieve_keys=retrieve_keys,
             slang_patterns=slang_context,
             tool_descs=tool_descs,
-            current_goal=current_goal
+            sys1_thought=sys1_thought # [修改] 传入提取到的潜意识
         )
         
         # 6. 沉浸模式强制收束：使用极致的强调语法防止跑题

@@ -18,15 +18,15 @@ class ContextEngine:
         # 通过依赖链反向获取 config 和 context，避免修改 main.py 的实例化签名
         self.config = config if config else self.summarizer.gateway.config
         self.context = context if context else self.summarizer.gateway.context
-
+    
     async def build_prompt(self, 
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
                            retrieve_keys: List[str] = None,
                            slang_patterns: str = "",
                            tool_descs: str = "",
-                           current_goal: str = "") -> str: 
-        """[修改] 动态编织 Prompt，集成按需组装人格、目标驱动、状态注入、记忆与社交上下文"""
+                           sys1_thought: str = "") -> str: 
+        """[修改] 动态编织 Prompt，集成按需组装人格、潜意识直觉驱动、状态注入、记忆与社交上下文"""
         if retrieve_keys is None:
             retrieve_keys = []
             
@@ -106,9 +106,10 @@ class ContextEngine:
         if slang_patterns:
             slang_block = f"[Group Patterns]\n群组专属表达模式与黑话参考:\n{slang_patterns}"
             
-        goal_block = ""
-        if current_goal:
-            goal_block = f"[Current Goal]\n当前对话阶段的隐式目标是：「{current_goal}」。\n请自然地推进对话朝着这个方向发展，避免机械地提及目标。"
+        # [修改] 替换原来的 goal_block 为 subconscious_block
+        subconscious_block = ""
+        if sys1_thought:
+            subconscious_block = f"[Subconscious / 潜意识]\n在看到用户的消息时，你脑海中闪过的第一反应（内心戏）是：\n\"{sys1_thought}\"\n\n💡 指南：\n这是你最真实的直觉。在接下来的回复中，请自然地顺应、延伸或掩饰这种情绪。绝对禁止像复读机一样直接说出你的内心戏。"
 
         # 5. 组装最终 Prompt
         prompt = f"""
@@ -120,7 +121,7 @@ class ContextEngine:
 {state_block}
 {user_block}
 {slang_block}
-{goal_block}
+{subconscious_block}
 
 [Tools]
 {tool_descs}
@@ -130,7 +131,7 @@ class ContextEngine:
 2. 如果遇到不懂的词汇，可以调用 'query_jargon' 工具查询；缺少背景信息请调用 'fetch_knowledge' 工具检索。
 3. 回复必须严格遵循[Style Guide]中的语气和格式要求。
 4. 必须使用中文回复，除非用户主动使用其他语言。
-5. 你的回复长度和积极性应受当前[State] (Mood/Energy) 的动态影响，并服务于[Current Goal]。
+5. 你的回复长度和积极性应受当前[State] (Mood/Energy) 的动态影响，并自然地流露潜意识的情绪，但绝对不要复述原话。
 """
         return prompt.strip()
 

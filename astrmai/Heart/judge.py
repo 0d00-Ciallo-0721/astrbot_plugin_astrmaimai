@@ -50,18 +50,19 @@ class Judge:
 
         # 4. LLM 三态判决 (REPLY / WAIT / IGNORE) + 沉浸式思维链寻址 (CoT)
         prompt = f"""
-        你是群聊中的这个角色（System 1 大脑），请完全沉浸于以下设定中：
+        你是群聊中的这个角色的潜意识大脑，请完全沉浸于以下设定中：
         [你的核心人设]: {persona_summary if persona_summary else '保持你原本的性格特征'}
 
         当前群聊情绪: {state.mood:.2f} (-1.0 到 1.0)。
         用户消息: "{message}"
         
         【思考与决策流】
-        1. 首先，开启思维链 (thought)，请**完全以你角色第一人称的口吻和性格**，分析用户的意图，以及你此刻的心情是否想理会这条消息。
-           - REPLY: 包含明确问题，或话题直接相关，必须立刻回复。
+        1. 意图判决 (action): 
+           - REPLY: 包含明确问题，提及你，或话题直接相关，必须立刻回复。
            - WAIT: 话似乎没说完（例如“那个..”或半截句子），稍微等等看。
            - IGNORE: 明显的闲聊、无意义刷屏且没叫你，没兴趣理会。
-        2. 其次，**仅当**你的 action 决定为 REPLY 时，才需要判断当前回复需要调用你脑海中的哪部分【人格记忆 (retrieve_keys)】。如果 action 为 WAIT 或 IGNORE，或者只是极简单的日常寒暄，列表请严格保持为空 []。
+        2. 潜意识生成 (thought): **仅当 action 为 REPLY 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
+        3. 记忆提取 (retrieve_keys): **仅当 action 为 REPLY 时**才需要判断当前回复需要调用你脑海中的哪部分【人格记忆 (retrieve_keys)】。如果 action 为 WAIT 或 IGNORE，或者只是极简单的日常寒暄，列表请严格保持为空 []。
         
         可选的人格维度 Key (中英双语说明):
         - logic_style (性格逻辑): 内在行为模式、战斗/日常切换、思考方式
@@ -74,10 +75,11 @@ class Judge:
         - secrets (深层秘密): 黑历史、潜意识深处的恐惧
         - ALL (完整降临): 无法确定具体领域，或需要调动全部灵魂设定进行深度交互时
         
-        请严格按照以下 JSON 格式输出（必须先输出 thought 进行推理分析）：
+        请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
         {{
-            "thought": "以第一人称和你的角色语气，写下对这段话的内心吐槽/想法，以及你决定调用哪些记忆的过程...",
+            "reason": "极简的判定理由，例如：'对方在提问' 或 '无意义刷屏'（限20字内）",
             "action": "REPLY"|"WAIT"|"IGNORE",
+            "thought": "【仅当 action 为 REPLY 时生成】第一人称的真实内心戏。如果不回复，请严格输出空字符串 \"\"",
             "relevance": int(1-10),
             "necessity": float(1.0-10.0),
             "retrieve_keys": ["key1"] // 仅在 REPLY 且需深层记忆时填写，否则 []
@@ -86,11 +88,15 @@ class Judge:
         
         plan = BrainActionPlan()
         try:
-            # [修改点] 调用专属意图判决任务接口
             result = await self.gateway.call_judge_task(prompt)
-            plan.thought = result.get("thought", "")
-            plan.action = result.get("action", "IGNORE").upper()
             
+            plan.action = result.get("action", "IGNORE").upper()
+            # 只有在 REPLY 时才提取 thought，否则强制清空，避免携带垃圾数据
+            if plan.action == "REPLY":
+                plan.thought = result.get("thought", "")
+            else:
+                plan.thought = ""
+                
             # 强化类型转换包容度
             try:
                 plan.relevance = int(float(result.get("relevance", 0)))
@@ -112,11 +118,13 @@ class Judge:
                 plan.action = "IGNORE"
                 
             elapsed = time.perf_counter() - start_time
-            logger.debug(f"[{chat_id}] Judge 耗时 {elapsed:.2f}s | Action: {plan.action} | Keys: {keys} | 内部思考: {plan.thought}")
-            
+            # 日志中可以顺便打印出极简的 reason 方便调试
+            reason = result.get("reason", "")
+            logger.debug(f"[{chat_id}] Judge耗时 {elapsed:.2f}s | Action: {plan.action} | 理由: {reason} | 潜意识: {plan.thought}")
+        
         except Exception as e:
             logger.warning(f"[{chat_id}] Judge LLM 失败，默认放行: {e}")
             plan.action = "REPLY" # 降级放行
             plan.meta["retrieve_keys"] = []
             
-        return plan
+        return plan   
