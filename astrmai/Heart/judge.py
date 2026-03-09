@@ -49,12 +49,14 @@ class Judge:
                 return plan
 
         # 4. LLM 三态判决 (REPLY / WAIT / IGNORE) + 沉浸式思维链寻址 (CoT)
+        # [修改点] 将“用户消息:”修改为“近期发生的连续对话”，引导 AI 适应多用户的格式
         prompt = f"""
         你是群聊中的这个角色的潜意识大脑，请完全沉浸于以下设定中：
         [你的核心人设]: {persona_summary if persona_summary else '保持你原本的性格特征'}
 
         当前群聊情绪: {state.mood:.2f} (-1.0 到 1.0)。
-        用户消息: "{message}"
+        近期发生的连续对话 (可能包含多人交谈或单人连续发言):
+        {message}
         
         【思考与决策流】
         1. 意图判决 (action): 
@@ -77,7 +79,7 @@ class Judge:
         
         请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
         {{
-            "reason": "极简的判定理由，例如：'对方在提问' 或 '无意义刷屏'（限20字内）",
+            "reason": "极简的判定理由，例如：'有人在提问' 或 '无意义刷屏'（限20字内）",
             "action": "REPLY"|"WAIT"|"IGNORE",
             "thought": "【仅当 action 为 REPLY 时生成】第一人称的真实内心戏。如果不回复，请严格输出空字符串 \"\"",
             "relevance": int(1-10),
@@ -127,4 +129,4 @@ class Judge:
             plan.action = "REPLY" # 降级放行
             plan.meta["retrieve_keys"] = []
             
-        return plan   
+        return plan

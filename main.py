@@ -21,6 +21,7 @@ from .astrmai.memory.engine import MemoryEngine
 from .astrmai.Brain.context_engine import ContextEngine
 from .astrmai.Brain.planner import Planner
 from .astrmai.Brain.persona_summarizer import PersonaSummarizer
+from .astrmai.Brain.prompt_refiner import PromptRefiner
 
 # --- Phase 5: Evolution & Expression ---
 from .astrmai.evolution.processor import EvolutionManager
@@ -77,6 +78,7 @@ class AstrMaiPlugin(Star):
         # --- Phase 3 & 4: System 2 (Brain) Mount ---
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
+        self.prompt_refiner = PromptRefiner(self.memory_engine) # [新增挂载]
         self.system2_planner = Planner(
             context, 
             self.gateway, 
@@ -204,49 +206,17 @@ class AstrMaiPlugin(Star):
 # [修改] 具体位置：类 AstrMaiPlugin 中，替换原有的 handle_memory_recall 函数
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
-        """[修改] 阶段四：全局记忆无感注入钩子 (加入关闭开关并封堵注入漏洞)"""
+        """[修改] 阶段三/四：全局记忆无感注入与剧场模式折叠钩子"""
         if not hasattr(self, 'memory_engine') or not self.memory_engine: return
-        
-        # [新增] 记忆关闭开关：检测是否处于 ALL 沉浸模式
-        disable_rag = False
-        if hasattr(self.context, "get"):
-            disable_rag = self.context.get("disable_rag_injection")
-        elif hasattr(self.context, "shared_dict"):
-            disable_rag = self.context.shared_dict.get("disable_rag_injection", False)
-            
-        if disable_rag:
-            return
             
         # === [核心修复] 硬隔离校验：只认 executor 打上的物理标记 ===
         if not getattr(event, '_is_final_reply_phase', False):
-            # 任何来自 GlobalModelGateway (后台认知) 的调用，标记均为 False，直接拦截，拒绝 Token 泄露
+            # 任何来自 GlobalModelGateway (后台认知/工具调用) 的调用，直接放行原生格式
             return
             
-        chat_id = event.unified_msg_origin
-        
-        # 1. 彻底清洗：利用正则清理上下文历史中所有先前注入的记忆块，防止上下文窗口被旧记忆污染
-        for msg in req.system_message + req.messages:
-            if isinstance(msg.content, str):
-                msg.content = re.sub(r"<injected_memory>.*?</injected_memory>\n?", "", msg.content, flags=re.DOTALL)
-        
-        # 2. 触发新召回
-        current_query = event.message_str
-        if not current_query: return
-        
-        memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
-        
-        # 3. 无感注入：通过专门的 XML 标签作为 System Prompt 塞入本次请求
-        if memory_text and "什么也没想起来" not in memory_text:
-            import html
-            # [核心安全补丁] 对提取的文本进行实体转义，防止污染大模型的思维链指令边界
-            safe_memory_text = html.escape(memory_text)
-            injection = f"<injected_memory>\n[潜意识涌现：基于当前话题，你回忆起了以下事情：]\n{safe_memory_text}\n</injected_memory>\n"
-            
-            if req.system_message:
-                req.system_message[0].content += f"\n{injection}"
-            elif req.messages:
-                req.messages[-1].content = injection + req.messages[-1].content
-                
+        # 将复杂的格式重组与记忆注入委托给专属引擎
+        if hasattr(self, 'prompt_refiner'):
+            await self.prompt_refiner.refine_prompt(event, req, self.context)
     @filter.on_llm_response()
     async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
         """[新增] 阶段四：全局记忆反思与自动清理钩子"""

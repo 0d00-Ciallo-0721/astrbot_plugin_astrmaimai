@@ -40,21 +40,29 @@ class ContextEngine:
         # 1. 获取基础状态数据
         state = self.db.get_chat_state(chat_id)
         
-        # 获取当前发言者的 Profile
+        # ==========================================
+        # [新增] 动态探测单/多用户模式
+        # ==========================================
         user_profile = None
+        is_multi_user = False
+        
         if event_messages:
-            last_msg = event_messages[-1]
-            sender_id = last_msg.get_sender_id()
-            if hasattr(self.db, 'get_user_profile'):
-                user_profile = self.db.get_user_profile(sender_id)
+            # 提取滑动窗口内所有不同的发送者 ID
+            senders = {m.get_sender_id() for m in event_messages if m.get_sender_id()}
+            is_multi_user = len(senders) > 1
+            
+            # 只有在单用户模式下，才去查库获取专属的好感度与心理画像
+            if not is_multi_user:
+                last_msg = event_messages[-1]
+                sender_id = last_msg.get_sender_id()
+                if hasattr(self.db, 'get_user_profile'):
+                    user_profile = self.db.get_user_profile(sender_id)
+        # ==========================================
         
         # 2. 调用 Summarizer 获取人格切片数据
-        # [修改] 获取配置中的 ID 并传递给 Summarizer，实现 ID 绑定逻辑
         target_persona_id = getattr(self.config.persona, 'persona_id', "")
-        # 获取原始 Prompt (System 1/2 Prompt 配置通常在 config.persona.prompt 或 context 中)
         raw_prompt = getattr(self.config.persona, 'prompt', "")
 
-        # 此时已经传入了配置的 Prompt，并且无需考虑以前的方法签名
         persona_data = await self.summarizer.get_summary(
             original_prompt=raw_prompt,
             persona_id=target_persona_id,
@@ -100,18 +108,24 @@ class ContextEngine:
 
         # 4. 构建各个信息块
         state_block = self._build_state_block(state)
-        user_block = self._build_user_block(user_profile)
         
+        # ==========================================
+        # [修改] 动态装配 user_block (多用户模式下隐藏/替换)
+        # ==========================================
+        if is_multi_user:
+            user_block = "[User Info]\n请你基于你对大脑思考选择消息进行回复" 
+        else:
+            user_block = self._build_user_block(user_profile)
+            
         slang_block = ""
         if slang_patterns:
             slang_block = f"[Group Patterns]\n群组专属表达模式与黑话参考:\n{slang_patterns}"
             
-        # [修改] 替换原来的 goal_block 为 subconscious_block
         subconscious_block = ""
         if sys1_thought:
             subconscious_block = f"[Subconscious / 潜意识]\n在看到用户的消息时，你脑海中闪过的第一反应（内心戏）是：\n\"{sys1_thought}\"\n\n💡 指南：\n这是你最真实的直觉。在接下来的回复中，请自然地顺应、延伸或掩饰这种情绪。绝对禁止像复读机一样直接说出你的内心戏。"
 
-        # 5. 组装最终 Prompt
+        # 5. 组装最终 Prompt (保持不变)
         prompt = f"""
 {role_block}
 
