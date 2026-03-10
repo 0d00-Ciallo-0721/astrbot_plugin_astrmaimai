@@ -160,10 +160,10 @@
         "hint": "在此时间内连续收到的消息将被打包处理"
       },
       "bg_pool_size": {
-        "description": "背景池大小",
+        "description": "获取的历史消息条数",
         "type": "int",
         "default": 20,
-        "hint": "记忆上下文背景消息的条数上限"
+        "hint": "构建历史消息上下文"
       }
     }
   },

@@ -1,6 +1,5 @@
 import asyncio
 import re
-from astrbot.core.provider.entities import ProviderRequest, ProviderMessage
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -79,7 +78,7 @@ class AstrMaiPlugin(Star):
         # --- Phase 3 & 4: System 2 (Brain) Mount ---
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
-        self.prompt_refiner = PromptRefiner(self.memory_engine) # [新增挂载]
+        self.prompt_refiner = PromptRefiner(self.memory_engine, self.config) 
         self.system2_planner = Planner(
             context, 
             self.gateway, 
