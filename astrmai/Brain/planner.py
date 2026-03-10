@@ -6,11 +6,9 @@ import asyncio
 from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
-from .tools.pfc_tools import WaitTool, FetchKnowledgeTool
 from .reply_engine import ReplyEngine
 from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool
         
-# 引入依赖类型
 from ..memory.engine import MemoryEngine
 from ..evolution.processor import EvolutionManager
 
@@ -24,8 +22,8 @@ class Planner:
                  gateway: GlobalModelGateway, 
                  context_engine: ContextEngine, 
                  reply_engine: ReplyEngine,
-                 memory_engine: MemoryEngine,      # [新增] 注入记忆引擎
-                 evolution_manager: EvolutionManager # [新增] 注入进化管理器
+                 memory_engine: MemoryEngine,
+                 evolution_manager: EvolutionManager
                  ):
         self.gateway = gateway
         self.context_engine = context_engine
@@ -35,23 +33,20 @@ class Planner:
 
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
-        [修改] 动态上下文修剪、按需注入路由、拦截目标并注入直觉与沉浸模式屏蔽。
-        并切分视界消息构造纯文本当前指令格式。
+        [修改] 动态上下文修剪、切分视界消息构造纯文本当前剧本格式。
         """
         chat_id = event.unified_msg_origin
         
-        # 1. 提取检索 Keys (从 System 1 在 event 或 meta 中携带的标签中获取)
         retrieve_keys = event.get_extra("retrieve_keys", [])
         if not isinstance(retrieve_keys, list):
             retrieve_keys = []
             
         is_all_mode = "ALL" in retrieve_keys
         
-        # 2. 上下文修剪 (感官剥夺模式：处于 ALL 完整降临时，抛弃冗长历史)
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
             
-        # [修改] 将滑动窗口内的“当前视界消息”扁平化为台词格式，不含底层数组残留
+        # [修改] 将滑动窗口内的“当前视界消息”彻底扁平化为纯台词格式
         window_lines = []
         for m in event_messages:
             sender_name = m.get_sender_name() or "群友/用户"
@@ -59,18 +54,11 @@ class Planner:
         prompt_content = "\n".join(window_lines)
         
         import asyncio
-        # 3. 预加载上下文数据
         slang_context = await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id) 
-        
-        # 提取 System 1 产生的潜意识
         sys1_thought = event.get_extra("sys1_thought", "")
-        
-        # 4. 装配工具与 RAG 屏蔽 (实现记忆关闭开关)
-        from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool
         
         ctx = getattr(self.context_engine, 'context', None)
         if is_all_mode:
-            # 沉浸模式：清空工具，强制底层拦截 RAG
             tools = []
             if ctx:
                 if hasattr(ctx, "set"):
@@ -78,7 +66,6 @@ class Planner:
                 elif hasattr(ctx, "shared_dict"):
                     ctx.shared_dict["disable_rag_injection"] = True
         else:
-            # 常规模式：挂载工具
             tools = [
                 WaitTool(),
                 FetchKnowledgeTool(memory_engine=self.memory_engine, chat_id=chat_id),
@@ -92,7 +79,6 @@ class Planner:
                     
         tool_descs = "\n".join([f"- {t.name}: {t.description}" for t in tools]) if tools else "无可用工具"
         
-        # 5. 构建 System Prompt
         system_prompt = await self.context_engine.build_prompt(
             chat_id=chat_id, 
             event_messages=event_messages,
@@ -102,13 +88,10 @@ class Planner:
             sys1_thought=sys1_thought 
         )
         
-        # 6. 沉浸模式强制收束：使用极致的强调语法防止跑题
         if is_all_mode:
             user_message = event.message_str
-            # 不再在此处粗暴拼接用户消息，仅加入强指令，具体结构交由 PromptRefiner 和 prompt_content
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
         
-        # 7. 下发给 Executor (这里将格式化好的“当前消息”作为 prompt 传入)
         await self.executor.execute(
             event=event,
             system_prompt=system_prompt,

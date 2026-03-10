@@ -8,9 +8,9 @@ class PromptRefiner:
     """
     第三阶段：剧场模式与潜意识注入中心 (Phase 3: Theater & Subconscious Injection)
     职责：
-    1. 底层记忆回溯：使用锚点截取 AstrBot 原生历史，防止滑动窗口的重复污染。
-    2. 工具链安全：保护原生 tool_calls 结构不被破坏。
-    3. 剧场坍缩：将文本消息全部折叠为 System Prompt 里的自然语言剧本，打破 AI 思想钢印。
+    1. 底层记忆回溯：使用锚点截取 AstrBot 原生历史，彻底扁平化为纯文本剧本。
+    2. 工具链安全：保护原生 tool_calls 结构不被破坏，同时清空历史数组污染。
+    3. 剧场坍缩：将上下文折叠为 System Prompt 里的自然语言，打破 AI 思想钢印。
     """
     def __init__(self, memory_engine):
         self.memory_engine = memory_engine
@@ -28,7 +28,6 @@ class PromptRefiner:
         if disable_rag:
             return
 
-        # 彻底清洗：利用正则清理上下文历史中所有先前注入的记忆块，防止上下文窗口膨胀
         for msg in req.system_message + req.messages:
             if isinstance(msg.content, str):
                 msg.content = re.sub(r"<injected_memory>.*?</injected_memory>\n?", "", msg.content, flags=re.DOTALL)
@@ -44,10 +43,10 @@ class PromptRefiner:
             memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
             if memory_text and "什么也没想起来" not in memory_text:
                 safe_memory_text = html.escape(memory_text)
-                injection = f"<injected_memory>\n记忆涌现：基于当前话题，你回忆起了以下事情：\n{safe_memory_text}\n</injected_memory>\n"
+                injection = f"<injected_memory>\n记忆涌现（记忆模块）：基于当前话题，你回忆起了以下事情：\n{safe_memory_text}\n</injected_memory>\n"
 
         # ==========================================
-        # 3. 底层历史拉取与滑动窗口防污染截断
+        # 3. 底层历史拉取与剧本化格式转换
         # ==========================================
         anchor_event = event.get_extra("astrmai_anchor_event")
         anchor_text = anchor_event.message_str.strip() if anchor_event else None
@@ -61,12 +60,11 @@ class PromptRefiner:
             raw_history = conversation.history
             cutoff_idx = len(raw_history)
             
-            # 倒序查找锚点，截断包含滑动窗口的重复数据
+            # 定位滑动窗口的断点
             if anchor_text:
                 for i in range(len(raw_history) - 1, -1, -1):
                     msg_data = raw_history[i]
                     content = ""
-                    # 兼容 AstrBot 底层字典和对象两种序列化形态
                     if isinstance(msg_data, dict):
                         if 'content' in msg_data:
                             if isinstance(msg_data['content'], str):
@@ -83,10 +81,11 @@ class PromptRefiner:
                         cutoff_idx = i
                         break
                         
-            # 获取无污染的真实历史
-            valid_history = raw_history[:cutoff_idx]
+            # [核心修改] 向上拉取指定的历史条数并进行彻底的纯文本转换
+            fetch_count = 10 # 默认向上拉取 10 条
+            start_idx = max(0, cutoff_idx - fetch_count)
+            valid_history = raw_history[start_idx:cutoff_idx]
             
-            # 格式化为剧本台词
             for msg_data in valid_history:
                 role = msg_data.get("role", "") if isinstance(msg_data, dict) else getattr(msg_data, "role", "")
                 content = ""
@@ -105,6 +104,7 @@ class PromptRefiner:
                 if not content: continue
                     
                 if role == "user":
+                    # 尝试切分出用户姓名
                     match = re.match(r"^(.*?):\s*(.*)$", content, re.DOTALL)
                     if match:
                         sender, text = match.groups()
@@ -117,7 +117,7 @@ class PromptRefiner:
         history_script = "\n".join(history_lines) if history_lines else "无近期历史记录。"
 
         # ==========================================
-        # 4. 当前视界提取与标签替换 (修复占位符错位)
+        # 4. 当前视界提取与标签替换
         # ==========================================
         current_msg_text = ""
         current_user_msg_idx = -1
@@ -131,42 +131,38 @@ class PromptRefiner:
                     break
                     
             if current_user_msg_idx != -1:
-                last_msg_content = str(req.messages[current_user_msg_idx].content)
-                for line in last_msg_content.split("\n"):
-                    match = re.match(r"^(.*?):\s*(.*)$", line, re.DOTALL)
-                    if match:
-                        current_msg_text += f"[{match.group(1)}] 说: {match.group(2)}\n"
-                    else:
-                        current_msg_text += f"[群友/用户] 说: {line}\n"
+                # 这个 content 实际上就是 planner.py 传过来的扁平化 prompt_content
+                current_msg_text = str(req.messages[current_user_msg_idx].content)
 
-        # 执行正则替换，兼容新旧版本占位符
+        # 替换占位符
         if req.system_message and req.system_message[0].content:
             final_prompt = req.system_message[0].content
-            final_prompt = re.sub(r'<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}', f"历史对话记忆：\n{history_script}", final_prompt)
+            final_prompt = re.sub(r'<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}', f"群聊历史消息：\n{history_script}", final_prompt)
             final_prompt = re.sub(r'<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\}', current_msg_text.strip(), final_prompt)
             final_prompt = re.sub(r'<RAG_MEMORY>|\{MEMORY_PLACEHOLDER\}', injection, final_prompt)
             req.system_message[0].content = final_prompt
 
         # ==========================================
-        # 5. 混合剧场坍缩与工具保护
+        # 5. 混合剧场坍缩与工具保护 (心智隔离核心)
         # ==========================================
         if not req.messages: return
 
         preserved_messages = []
         for i, msg in enumerate(req.messages):
             if i < current_user_msg_idx:
-                # 保护历史工具链结构
+                # 【防污染隔离】丢弃所有常规的纯文本 user/assistant 历史（因为已经放进剧本了）
+                # 【工具保护】绝对保留所有含有 tool_calls, tool_call_id 的记录，防止大模型执行中断
                 if getattr(msg, "tool_calls", None) or getattr(msg, "tool_call_id", None) or msg.role not in ["user", "assistant"]:
                     preserved_messages.append(msg)
             elif i == current_user_msg_idx:
-                # 剧本化当前指令包装
+                # 对当前的最终输入包裹上“导演旁白”，强化角色沉浸，拒绝客服前缀
                 original_content = msg.content
-                msg.content = f"(导演旁白：请仔细阅读系统设定的世界观和前面的历史记忆，这是当前你看到的最新消息：\n{original_content}\n\n请直接沉浸在角色中给出回应。不要使用诸如'Bot:'或'[我]:'之类的角色名前缀！)"
+                msg.content = f"(导演旁白：请仔细阅读设定和前面的剧本。这是当前你看到的最新消息：\n{original_content}\n\n请直接沉浸在角色中说出台词或执行心理动作，不要带任何角色名前缀！)"
                 preserved_messages.append(msg)
             else:
                 # 保护当前可能正在进行的流式/迭代工具调用
                 preserved_messages.append(msg)
 
-        # 覆写底层消息矩阵
+        # 覆写底层消息矩阵，消除 JSON 污染
         req.messages = preserved_messages
-        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成。真实历史截取锚点命中: {anchor_text[:10] if anchor_text else '无锚点'}")
+        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成。底层历史已提取并清除，工具上下文安全保护中。")
