@@ -30,23 +30,54 @@ class Judge:
             logger.debug(f"[{chat_id}] Judge: 能量过低 ({state.energy:.2f})，抑制回复。")
             return BrainActionPlan(action="IGNORE", thought="好累...不想说话...", necessity=0.0)
 
-        # 2. 强唤醒直接通过
-        if is_force_wakeup:
-            logger.debug(f"[{chat_id}] Judge: 强唤醒，最高优先级放行。")
-            plan = BrainActionPlan(action="REPLY", thought="有人在很用力地叫我，我必须回应！", necessity=10.0, relevance=10)
-            plan.meta["retrieve_keys"] = ["ALL"] # 强唤醒默认直接完整降临
-            return plan
-
-        # 3. 关键词短路 (接入 Config 修复隐患 Bug)
-        wakeup_words = self.config.system1.wakeup_words
         msg_lower = message.strip().lower()
-        
+        wakeup_words = self.config.system1.wakeup_words
+
+        is_keyword_wakeup = False
+        matched_kw = ""
         for kw in wakeup_words:
             if msg_lower.startswith(kw.lower()):
-                logger.debug(f"[{chat_id}] Judge: 唤醒词 [{kw}] 命中首部，快速放行。")
-                plan = BrainActionPlan(action="REPLY", thought=f"听到了熟悉的呼唤 [{kw}]，马上回答！", necessity=9.0, relevance=10)
-                plan.meta["retrieve_keys"] = []
+                is_keyword_wakeup = True
+                matched_kw = kw
+                break
+
+        # 仅当存在唤醒信号时，才进入四维评估漏斗
+        if is_force_wakeup or is_keyword_wakeup:
+            # 维度 1: 🌡️ 对话温度 (Chat State) - 必须距上次回复超 3 分钟 (180s)
+            time_since_last_reply = time.time() - state.last_reply_time
+            is_cold_chat = time_since_last_reply > 180
+
+            # 维度 3: 📦 窗口信息熵 (Window Entropy) - 必须没人在刷屏或分段说话
+            is_low_entropy = (window_events_count == 1)
+
+            # 维度 4: 唤醒位置 (Position) - 必须是滑动窗口期内的第一条消息
+            is_valid_position = (is_force_wakeup and is_first_event_wakeup) or is_keyword_wakeup
+
+            # 维度 2: 🧮 载荷复杂度 (Payload Complexity) - 剔除无用前缀后长度不能太长，且无复杂疑问词
+            complex_keywords = ["为什么", "怎么", "帮我", "代码", "解释", "写", "什么", "翻译", "分析"]
+            
+            # 粗略剔除 AttentionGate 聚合时引入的用户名头部，例如 "张三：@bot 你好" -> "@bot 你好"
+            clean_text = msg_lower.split("：", 1)[-1].strip() if "：" in msg_lower else msg_lower
+            if is_keyword_wakeup:
+                clean_text = msg_lower[len(matched_kw):].strip()
+                
+            is_simple_payload = len(clean_text) <= 15 and not any(cw in clean_text for cw in complex_keywords)
+
+            # [四维总决选] 全部通过才允许极速穿透
+            if is_cold_chat and is_low_entropy and is_valid_position and is_simple_payload:
+                if is_keyword_wakeup:
+                    logger.debug(f"[{chat_id}] Judge: 满足4维极速条件，触发唤醒词 [{matched_kw}] 穿透！")
+                    plan = BrainActionPlan(action="REPLY", thought=f"[极速反射] 捕捉到指令词 [{matched_kw}]。", necessity=9.0, relevance=10)
+                else:
+                    logger.debug(f"[{chat_id}] Judge: 满足4维极速条件，触发强唤醒穿透！")
+                    plan = BrainActionPlan(action="REPLY", thought="[极速反射] 听到召唤，立即响应。", necessity=10.0, relevance=10)
+
+                plan.meta["retrieve_keys"] = ["CORE_ONLY"] 
+                plan.meta["is_fast_mode"] = True
                 return plan
+            else:
+                logger.debug(f"[{chat_id}] Judge: 拦截极速穿透 (Cold:{is_cold_chat}, Entropy:{is_low_entropy}, Pos:{is_valid_position}, Simple:{is_simple_payload})。回落 System 1 完整思考。")
+
 
         # 4. LLM 三态判决 (REPLY / WAIT / IGNORE) + 沉浸式思维链寻址 (CoT)
         # [修改点] 将“用户消息:”修改为“近期发生的连续对话”，引导 AI 适应多用户的格式

@@ -58,7 +58,8 @@ class LifeConfig(BaseModel):
     wakeup_min_energy: float = Field(default=0.6)
     wakeup_cost: float = Field(default=0.2)
     wakeup_cooldown: int = Field(default=28800)
-
+    profiling_msg_threshold: int = Field(default=50)
+    
 class ReplyConfig(BaseModel):
     fallback_text: str = Field(default="（陷入了短暂的沉默...）")
     segment_min_len: int = Field(default=15)

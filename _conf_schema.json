@@ -259,6 +259,12 @@
         "description": "主动唤醒冷却时间 (秒)",
         "type": "int",
         "default": 28800
+      },
+      "profiling_msg_threshold": {
+        "description": "人物分析消息条数",
+        "type": "int",
+        "default": 200,
+        "hint": "积累多少条互动消息后触发人物分析"
       }
     }
   },

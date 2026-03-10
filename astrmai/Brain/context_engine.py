@@ -25,9 +25,11 @@ class ContextEngine:
                            slang_patterns: str = "",
                            tool_descs: str = "",
                            sys1_thought: str = "") -> str: 
-        """[修改] 动态编织 Prompt，完全采用剧本模式，并注入工具调用心智隔离元规则"""
+        """[修改] 动态编织 Prompt，完全采用剧本模式，并注入工具调用心智隔离元规则。"""
         if retrieve_keys is None:
             retrieve_keys = []
+            
+        is_fast_mode = "CORE_ONLY" in retrieve_keys # [新增] 判断极速模式
             
         valid_keys = []
         if hasattr(self, "filter_retrieve_keys"):
@@ -45,7 +47,8 @@ class ContextEngine:
         if event_messages:
             senders = {m.get_sender_id() for m in event_messages if m.get_sender_id()}
             is_multi_user = len(senders) > 1
-            if not is_multi_user:
+            # [修改] 极速模式下彻底跳过用户画像数据库查询，节省耗时
+            if not is_multi_user and not is_fast_mode:
                 last_msg = event_messages[-1]
                 sender_id = last_msg.get_sender_id()
                 if hasattr(self.db, 'get_user_profile'):
@@ -76,7 +79,7 @@ class ContextEngine:
             
         if not is_full_ready:
             valid_keys = []
-            if retrieve_keys:
+            if retrieve_keys and not is_fast_mode:
                 persona_summary += "\n(你正在努力回忆更深层的记忆细节，但暂时只能想起个大概。)"
 
         # 3. 按需组装 Role 区块与动态 Style 区块
@@ -86,6 +89,9 @@ class ContextEngine:
         if "ALL" in valid_keys:
             role_block = f"{raw_persona}"
             style_guide = "" 
+        elif is_fast_mode:
+            # [修改] 极速模式只使用主压缩人格，不附加任何切片回忆，减少 Token
+            role_block = f"{persona_summary}"
         else:
             role_block = f"{persona_summary}"
             if valid_keys:
@@ -101,20 +107,20 @@ class ContextEngine:
 
         state_block = self._build_state_block(state)
         
-        if is_multi_user:
+        if is_multi_user or is_fast_mode: # [修改] 极速模式不附加详细用户区块数据
             user_block = "" 
         else:
             user_block = self._build_user_block(user_profile)
             
         slang_block = ""
-        if slang_patterns:
+        if slang_patterns and not is_fast_mode:
             slang_block = f"群组专属表达模式与黑话参考:\n{slang_patterns}\n"
             
         subconscious_block = ""
         if sys1_thought:
             subconscious_block = f"大脑潜意识：\"{sys1_thought}\"\n指南：这是你最真实的直觉。在接下来的回复中，请自然地顺应、延伸或掩饰这种情绪。绝对禁止像复读机一样直接说出你的内心戏。\n"
 
-        # 4. [核心] 组装最终 Prompt (全面剧本模式化 + 心智隔离机制)
+        # 4. [核心] 组装最终 Prompt
         prompt = f"""核心人格设定：
 {role_block}
 

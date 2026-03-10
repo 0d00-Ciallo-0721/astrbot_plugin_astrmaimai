@@ -179,10 +179,18 @@ class AttentionGate:
 
             logger.info(f"[{chat_id}] 📦 窗口闭合。过滤后留存 {len(final_events)} 条消息。\n聚合内容:\n{combined_text}")
             
-            is_wakeup = self.sensors.is_wakeup_signal(main_event, self_id)
+            is_wakeup = any(self.sensors.is_wakeup_signal(e, self_id) for e in final_events)
+            is_first_event_wakeup = self.sensors.is_wakeup_signal(final_events[0], self_id) if final_events else False
             
-            # 纯粹的真实调用，不做任何 mock 拦截
-            plan = await self.judge.evaluate(chat_id, combined_text, is_wakeup)
+            # 纯粹的真实调用，向下传递窗口信息熵(window_events_count)与位置(is_first_event_wakeup)
+            plan = await self.judge.evaluate(
+                chat_id=chat_id, 
+                message=combined_text, 
+                is_force_wakeup=is_wakeup,
+                persona_summary="",
+                window_events_count=len(final_events),
+                is_first_event_wakeup=is_first_event_wakeup
+            )
             
             # 将 System 1 的直觉 (thought) 挂载到主事件上，传递给 System 2
             main_event.set_extra("sys1_thought", plan.thought)

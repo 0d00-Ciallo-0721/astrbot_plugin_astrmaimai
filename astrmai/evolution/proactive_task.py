@@ -261,3 +261,21 @@ class ProactiveTask:
             # 立即保存
             await self.persistence.save_user_profile(profile)
             logger.info(f"[Life] ✅ 画像生成完成: {analysis[:20]}...")
+
+
+    async def _run_profiling_task(self):
+        """深度侧写任务：筛选互动频次达标的用户，更新其心理画像"""
+        # 获取所有活跃的用户档案
+        active_profiles = self.state_engine.get_active_profiles()
+        
+        # 从配置中获取侧写触发阈值，默认设为 50 条消息
+        threshold = getattr(self.config.life, 'profiling_msg_threshold', 200)
+        
+        for profile in active_profiles:
+            # 如果该用户自上次侧写以来的互动次数达到阈值
+            if getattr(profile, 'message_count_for_profiling', 0) >= threshold:
+                logger.info(f"[Life] 🕵️ 用户 {profile.name} 互动频次达标，开始进行深度心理侧写...")
+                try:
+                    await self._generate_persona_analysis(profile)
+                except Exception as e:
+                    logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")            

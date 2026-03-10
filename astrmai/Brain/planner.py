@@ -42,6 +42,7 @@ class Planner:
             retrieve_keys = []
             
         is_all_mode = "ALL" in retrieve_keys
+        is_fast_mode = "CORE_ONLY" in retrieve_keys # [新增] 极速穿透模式标志
         
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
@@ -54,11 +55,18 @@ class Planner:
         prompt_content = "\n".join(window_lines)
         
         import asyncio
-        slang_context = await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id) 
+        # [修改] 极速模式下直接砍掉群组黑话与专属表达的检索
+        if is_fast_mode:
+            slang_context = ""
+        else:
+            slang_context = await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id) 
+            
         sys1_thought = event.get_extra("sys1_thought", "")
         
         ctx = getattr(self.context_engine, 'context', None)
-        if is_all_mode:
+        
+        # [修改] 极速模式下不提供任何工具，强迫 AI 瞬间作答
+        if is_all_mode or is_fast_mode:
             tools = []
             if ctx:
                 if hasattr(ctx, "set"):
@@ -91,6 +99,10 @@ class Planner:
         if is_all_mode:
             user_message = event.message_str
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
+            
+        # [新增] 极速模式强化约束
+        if is_fast_mode:
+            system_prompt += "\n\n>>> [极速穿透模式] 你被强唤醒！请立刻、简短、直接地响应最新呼唤，忽略不必要的长篇大论。 <<<"
         
         await self.executor.execute(
             event=event,
