@@ -1,5 +1,6 @@
 import asyncio
 import re
+from astrbot.core.provider.entities import ProviderRequest, ProviderMessage
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -203,20 +204,76 @@ class AstrMaiPlugin(Star):
         profile.is_dirty = True
 
 
-# [修改] 具体位置：类 AstrMaiPlugin 中，替换原有的 handle_memory_recall 函数
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
-        """[修改] 阶段三/四：全局记忆无感注入与剧场模式折叠钩子"""
-        if not hasattr(self, 'memory_engine') or not self.memory_engine: return
-            
-        # === [核心修复] 硬隔离校验：只认 executor 打上的物理标记 ===
+        """【剧本模式核心】全局记忆注入 & JSON 格式彻底扁平化"""
         if not getattr(event, '_is_final_reply_phase', False):
-            # 任何来自 GlobalModelGateway (后台认知/工具调用) 的调用，直接放行原生格式
             return
             
-        # 将复杂的格式重组与记忆注入委托给专属引擎
-        if hasattr(self, 'prompt_refiner'):
-            await self.prompt_refiner.refine_prompt(event, req, self.context)
+        chat_id = event.unified_msg_origin
+        
+        # 1. 提取框架自动生成的历史记录并扁平化 (剔除 JSON role 结构)
+        history_lines = []
+        if req.messages and len(req.messages) > 1:
+            for msg in req.messages[:-1]: # 排除最后一条（当前消息）
+                if msg.role == "user":
+                    # AstrBot 原生会加上 "名字: 内容" 的前缀，我们提取出来
+                    match = re.match(r"^(.*?):\s*(.*)$", str(msg.content), re.DOTALL)
+                    if match:
+                        sender, content = match.groups()
+                        history_lines.append(f"[{sender}] 说: {content}")
+                    else:
+                        history_lines.append(f"[群友/用户] 说: {msg.content}")
+                elif msg.role == "assistant":
+                    # 自己说过的话
+                    if msg.content and not getattr(msg, 'tool_calls', None):
+                        history_lines.append(f"[我] 说: {msg.content}")
+        
+        history_text = "\n".join(history_lines) if history_lines else "无近期历史记录。"
+
+        # 2. 提取当前滑动窗口合并的最新消息
+        current_msg_text = ""
+        if req.messages:
+            last_msg_content = str(req.messages[-1].content)
+            # 同样格式化为 [名字] 说: 的格式
+            for line in last_msg_content.split("\n"):
+                match = re.match(r"^(.*?):\s*(.*)$", line, re.DOTALL)
+                if match:
+                    current_msg_text += f"[{match.group(1)}] 说: {match.group(2)}\n"
+                else:
+                    current_msg_text += f"[群友/用户] 说: {line}\n"
+
+        # 3. 获取 RAG 长期记忆
+        memory_text = ""
+        if hasattr(self, 'memory_engine') and self.memory_engine:
+            current_query = event.message_str
+            if current_query:
+                raw_mem = await self.memory_engine.recall(current_query, session_id=chat_id)
+                if raw_mem and "什么也没想起来" not in raw_mem:
+                    memory_text = f"记忆涌现（记忆模块）：基于当前话题，你回忆起了以下事情：\n{raw_mem}\n"
+
+        # 4. 拼图归位：提取 ContextEngine 生成的骨架，替换占位符
+        if req.system_message and req.system_message[0].content:
+            final_prompt = req.system_message[0].content
+            final_prompt = final_prompt.replace("{HISTORY_PLACEHOLDER}", history_text)
+            final_prompt = final_prompt.replace("{CURRENT_MSG_PLACEHOLDER}", current_msg_text.strip())
+            final_prompt = final_prompt.replace("{MEMORY_PLACEHOLDER}", memory_text)
+            
+            # ========================================================
+            # 5. 摧毁旧世界 (JSON Array)，建立新世界 (单一剧本文本)
+            # ========================================================
+            # 清空所有历史 JSON 数组
+            req.messages.clear()
+            req.system_message.clear()
+            
+            # 将完整的剧本作为一个唯一的 System 指令（或者 User 指令）发送给大模型
+            # 这样做彻底斩断了 LLM 把自己当成问答机器人的后路
+            req.messages.append(
+                ProviderMessage(role="user", content=final_prompt)
+            )
+            
+            logger.info(f"[{chat_id}] 🎬 剧本模式拼装完成，已扁平化注入 LLM。")
+
     @filter.on_llm_response()
     async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
         """[新增] 阶段四：全局记忆反思与自动清理钩子"""

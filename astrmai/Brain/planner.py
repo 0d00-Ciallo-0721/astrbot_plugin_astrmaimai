@@ -35,7 +35,8 @@ class Planner:
 
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
-        [修改] 动态上下文修剪、按需注入路由、拦截目标并注入直觉与沉浸模式屏蔽
+        [修改] 动态上下文修剪、按需注入路由、拦截目标并注入直觉与沉浸模式屏蔽。
+        并切分视界消息构造纯文本当前指令格式。
         """
         chat_id = event.unified_msg_origin
         
@@ -50,17 +51,19 @@ class Planner:
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
             
-        prompt_content = "\n".join([f"{m.get_sender_name()}: {m.message_str}" for m in event_messages])
+        # [修改] 将滑动窗口内的“当前视界消息”扁平化为台词格式，不含底层数组残留
+        window_lines = []
+        for m in event_messages:
+            sender_name = m.get_sender_name() or "群友/用户"
+            window_lines.append(f"[{sender_name}] 说: {m.message_str}")
+        prompt_content = "\n".join(window_lines)
         
         import asyncio
         # 3. 预加载上下文数据
         slang_context = await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id) 
         
-        # [修改] 提取 System 1 产生的潜意识，并移除原本缓慢的目标分析
+        # 提取 System 1 产生的潜意识
         sys1_thought = event.get_extra("sys1_thought", "")
-        # current_goal = ""
-        # if hasattr(self.evolution_manager, 'analyze_and_get_goal'):
-        #     current_goal = await self.evolution_manager.analyze_and_get_goal(chat_id, prompt_content)
         
         # 4. 装配工具与 RAG 屏蔽 (实现记忆关闭开关)
         from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool
@@ -96,15 +99,16 @@ class Planner:
             retrieve_keys=retrieve_keys,
             slang_patterns=slang_context,
             tool_descs=tool_descs,
-            sys1_thought=sys1_thought # [修改] 传入提取到的潜意识
+            sys1_thought=sys1_thought 
         )
         
         # 6. 沉浸模式强制收束：使用极致的强调语法防止跑题
         if is_all_mode:
             user_message = event.message_str
+            # 不再在此处粗暴拼接用户消息，仅加入强指令，具体结构交由 PromptRefiner 和 prompt_content
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
         
-        # 7. 下发给 Executor (修复: 将 user_prompt 修正为正确的传参 prompt)
+        # 7. 下发给 Executor (这里将格式化好的“当前消息”作为 prompt 传入)
         await self.executor.execute(
             event=event,
             system_prompt=system_prompt,
