@@ -8,15 +8,16 @@ class PromptRefiner:
     """
     第三阶段：剧场模式与潜意识注入中心 (Phase 3: Theater & Subconscious Injection)
     职责：
-    1. 拦截底层机械化的 OpenAI 格式，将其折叠为自然语言的剧场剧本，打破 AI 思想钢印。
-    2. 处理 RAG 潜意识记忆的安全无感注入。
+    1. 底层记忆回溯：使用锚点截取 AstrBot 原生历史，防止滑动窗口的重复污染。
+    2. 工具链安全：保护原生 tool_calls 结构不被破坏。
+    3. 剧场坍缩：将文本消息全部折叠为 System Prompt 里的自然语言剧本，打破 AI 思想钢印。
     """
     def __init__(self, memory_engine):
         self.memory_engine = memory_engine
 
     async def refine_prompt(self, event: AstrMessageEvent, req: ProviderRequest, context) -> None:
         # ==========================================
-        # 1. 状态校验与清理
+        # 1. 状态校验与污染清理
         # ==========================================
         disable_rag = False
         if hasattr(context, "get"):
@@ -27,82 +28,145 @@ class PromptRefiner:
         if disable_rag:
             return
 
-        # 彻底清洗：利用正则清理上下文历史中所有先前注入的记忆块，防止上下文窗口被旧记忆污染
+        # 彻底清洗：利用正则清理上下文历史中所有先前注入的记忆块，防止上下文窗口膨胀
         for msg in req.system_message + req.messages:
             if isinstance(msg.content, str):
                 msg.content = re.sub(r"<injected_memory>.*?</injected_memory>\n?", "", msg.content, flags=re.DOTALL)
 
+        chat_id = event.unified_msg_origin
+
         # ==========================================
         # 2. 潜意识召回 (RAG)
         # ==========================================
-        chat_id = event.unified_msg_origin
-        current_query = event.message_str
         injection = ""
-        
+        current_query = event.message_str
         if self.memory_engine and current_query:
             memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
             if memory_text and "什么也没想起来" not in memory_text:
-                # [核心安全补丁] 对提取的文本进行实体转义，防止污染指令边界
                 safe_memory_text = html.escape(memory_text)
-                # 使用新的剧本模式拼接格式
                 injection = f"<injected_memory>\n记忆涌现：基于当前话题，你回忆起了以下事情：\n{safe_memory_text}\n</injected_memory>\n"
 
         # ==========================================
-        # 3. 混合剧场坍缩与工具保护层 (Theater Collapse & Tool Calling Protection)
+        # 3. 底层历史拉取与滑动窗口防污染截断
         # ==========================================
-        if not req.messages:
-            return
+        anchor_event = event.get_extra("astrmai_anchor_event")
+        anchor_text = anchor_event.message_str.strip() if anchor_event else None
+        
+        conv_mgr = context.conversation_manager
+        curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
+        conversation = await conv_mgr.get_conversation(chat_id, curr_cid)
+        
+        history_lines = []
+        if conversation and hasattr(conversation, "history") and conversation.history:
+            raw_history = conversation.history
+            cutoff_idx = len(raw_history)
+            
+            # 倒序查找锚点，截断包含滑动窗口的重复数据
+            if anchor_text:
+                for i in range(len(raw_history) - 1, -1, -1):
+                    msg_data = raw_history[i]
+                    content = ""
+                    # 兼容 AstrBot 底层字典和对象两种序列化形态
+                    if isinstance(msg_data, dict):
+                        if 'content' in msg_data:
+                            if isinstance(msg_data['content'], str):
+                                content = msg_data['content']
+                            elif isinstance(msg_data['content'], list):
+                                content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
+                    elif hasattr(msg_data, 'content'):
+                        if isinstance(msg_data.content, str):
+                            content = msg_data.content
+                        elif isinstance(msg_data.content, list):
+                            content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
+                            
+                    if anchor_text in content:
+                        cutoff_idx = i
+                        break
+                        
+            # 获取无污染的真实历史
+            valid_history = raw_history[:cutoff_idx]
+            
+            # 格式化为剧本台词
+            for msg_data in valid_history:
+                role = msg_data.get("role", "") if isinstance(msg_data, dict) else getattr(msg_data, "role", "")
+                content = ""
+                if isinstance(msg_data, dict):
+                    if 'content' in msg_data:
+                        if isinstance(msg_data['content'], str):
+                            content = msg_data['content']
+                        elif isinstance(msg_data['content'], list):
+                            content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
+                elif hasattr(msg_data, 'content'):
+                    if isinstance(msg_data.content, str):
+                        content = msg_data.content
+                    elif isinstance(msg_data.content, list):
+                        content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
+                        
+                if not content: continue
+                    
+                if role == "user":
+                    match = re.match(r"^(.*?):\s*(.*)$", content, re.DOTALL)
+                    if match:
+                        sender, text = match.groups()
+                        history_lines.append(f"[{sender}] 说: {text}")
+                    else:
+                        history_lines.append(f"[群友/用户] 说: {content}")
+                elif role == "assistant":
+                    history_lines.append(f"[我] 说: {content}")
 
-        # 找到当前回合的起始点（当前触发的最终 user 消息）
-        # 从后往前找，找到第一个 role == 'user' 且没有 tool_call_id 的消息
+        history_script = "\n".join(history_lines) if history_lines else "无近期历史记录。"
+
+        # ==========================================
+        # 4. 当前视界提取与标签替换 (修复占位符错位)
+        # ==========================================
+        current_msg_text = ""
         current_user_msg_idx = -1
-        for i in range(len(req.messages) - 1, -1, -1):
-            msg = req.messages[i]
-            # 兼容性判断：普通文本 user 消息，不含 tool_call_id
-            if msg.role == "user" and getattr(msg, "tool_call_id", None) is None:
-                if isinstance(msg.content, str):
+        
+        if req.messages:
+            # 逆向寻找触发本次推理的最后一条用户指令
+            for i in range(len(req.messages) - 1, -1, -1):
+                msg = req.messages[i]
+                if msg.role == "user" and getattr(msg, "tool_call_id", None) is None:
                     current_user_msg_idx = i
                     break
-        
-        if current_user_msg_idx == -1:
-            current_user_msg_idx = len(req.messages) - 1 # 兜底
+                    
+            if current_user_msg_idx != -1:
+                last_msg_content = str(req.messages[current_user_msg_idx].content)
+                for line in last_msg_content.split("\n"):
+                    match = re.match(r"^(.*?):\s*(.*)$", line, re.DOTALL)
+                    if match:
+                        current_msg_text += f"[{match.group(1)}] 说: {match.group(2)}\n"
+                    else:
+                        current_msg_text += f"[群友/用户] 说: {line}\n"
 
-        history_lines = []
+        # 执行正则替换，兼容新旧版本占位符
+        if req.system_message and req.system_message[0].content:
+            final_prompt = req.system_message[0].content
+            final_prompt = re.sub(r'<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}', f"历史对话记忆：\n{history_script}", final_prompt)
+            final_prompt = re.sub(r'<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\}', current_msg_text.strip(), final_prompt)
+            final_prompt = re.sub(r'<RAG_MEMORY>|\{MEMORY_PLACEHOLDER\}', injection, final_prompt)
+            req.system_message[0].content = final_prompt
+
+        # ==========================================
+        # 5. 混合剧场坍缩与工具保护
+        # ==========================================
+        if not req.messages: return
+
         preserved_messages = []
-        
         for i, msg in enumerate(req.messages):
             if i < current_user_msg_idx:
-                # 历史消息提取
+                # 保护历史工具链结构
                 if getattr(msg, "tool_calls", None) or getattr(msg, "tool_call_id", None) or msg.role not in ["user", "assistant"]:
-                    # 保护：保留历史中的工具调用链格式
                     preserved_messages.append(msg)
-                else:
-                    # 纯文本历史，彻底扁平化转为剧本历史线
-                    if isinstance(msg.content, str):
-                        speaker = "[我]" if msg.role == "assistant" else "[群友/用户]"
-                        history_lines.append(f"{speaker} 说: {msg.content}")
             elif i == current_user_msg_idx:
-                # 当前触发视界的终极指令封装
+                # 剧本化当前指令包装
                 original_content = msg.content
-                msg.content = f"当前你看到的消息：\n{original_content}\n\n(导演旁白请仔细阅读上述群聊历史和当前消息，顺着场景，完全沉浸在你的角色中直接给出你的回应。绝不要输出诸如'Bot:'或'[我]:'之类的角色名前缀，像真人一样直接接话。)"
+                msg.content = f"(导演旁白：请仔细阅读系统设定的世界观和前面的历史记忆，这是当前你看到的最新消息：\n{original_content}\n\n请直接沉浸在角色中给出回应。不要使用诸如'Bot:'或'[我]:'之类的角色名前缀！)"
                 preserved_messages.append(msg)
             else:
-                # current_user_msg_idx 之后的工具调用链，原样保护放行
+                # 保护当前可能正在进行的流式/迭代工具调用
                 preserved_messages.append(msg)
 
-        # ==========================================
-        # 4. 终极 Payload 组装
-        # ==========================================
-        history_script = ""
-        if history_lines:
-            history_script = "\n群聊历史消息：\n" + "\n".join(history_lines) + "\n"
-            
-        if req.system_message and isinstance(req.system_message[0].content, str):
-            # 将生成的扁平化历史与潜意识记忆均注入到系统前传世界观中
-            if injection:
-                req.system_message[0].content += f"\n{injection}"
-            if history_script:
-                req.system_message[0].content += f"\n{history_script}"
-                
-        # 用提取并保护了工具链的 messages 替换掉原有的底层数组
+        # 覆写底层消息矩阵
         req.messages = preserved_messages
+        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成。真实历史截取锚点命中: {anchor_text[:10] if anchor_text else '无锚点'}")
