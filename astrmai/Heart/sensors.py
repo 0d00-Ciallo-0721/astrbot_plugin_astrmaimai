@@ -174,3 +174,50 @@ class PreFilters:
             logger.debug(f"[AstrMai-Sensor] 抽取社交关系失败: {e}")
             
         return relations    
+    
+    async def process_poke_event(self, event: AstrMessageEvent, context, attention_gate):
+        """
+        [新增] 拦截底层戳一戳事件，执行回戳，并生成虚拟消息送入注意力门控
+        """
+        # 尝试提取底层 raw_event 数据 (适用于 OneBot/Aiocqhttp 等标准协议)
+        raw = getattr(event.message_obj, "raw_event", {})
+        
+        if raw.get("notice_type") == "notify" and raw.get("sub_type") == "poke":
+            sender_id = str(raw.get("user_id", ""))
+            target_id = str(raw.get("target_id", ""))
+            group_id = raw.get("group_id", "")
+            bot_id = str(event.get_self_id())
+            
+            # 尝试获取发送者名称，若无则降级为 QQ 号
+            sender_name = event.get_sender_name() or sender_id
+            
+            # 获取当前机器人的配置昵称
+            bot_name = "我"
+            if hasattr(self, 'config') and self.config and hasattr(self.config, 'system1'):
+                if self.config.system1.nicknames:
+                    bot_name = self.config.system1.nicknames[0]
+                    
+            target_name = bot_name if target_id == bot_id else target_id
+            
+            # 1. 捏造虚拟互动标记
+            virtual_text = f"(Interaction: {sender_name} -> {target_name})"
+            logger.info(f"[AstrMai-Sensor] 👉 捕获互动事件: {virtual_text}")
+            
+            # 2. 如果被戳的是自己，执行回戳反击逻辑
+            if target_id == bot_id:
+                try:
+                    from astrbot.api.event import filter as astr_filter
+                    platform = context.get_platform(astr_filter.PlatformAdapterType.AIOCQHTTP)
+                    if platform:
+                        client = platform.get_client()
+                        await client.api.call_action('group_poke', group_id=group_id, user_id=sender_id)
+                        logger.info(f"[AstrMai-Sensor] 👈 已回戳反击用户: {sender_name}")
+                except Exception as e:
+                    logger.debug(f"[AstrMai-Sensor] 回戳操作暂不支持当前平台或发生异常: {e}")
+
+            # 3. 伪装事件并强制推入滑动窗口
+            event.message_str = virtual_text
+            event.set_extra("is_virtual_poke", True)
+            event.set_extra("astrmai_bonus_score", 2.0) # 赋予高优权重，提高理睬概率
+            
+            await attention_gate.process_event(event)    

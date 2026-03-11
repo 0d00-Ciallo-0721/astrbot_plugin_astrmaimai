@@ -89,14 +89,98 @@ class AttentionGate:
         logger.info(f"[{chat_id}] 👁️ 注意力聚焦，开启多用户并发聚合池!")
         asyncio.create_task(self._debounce_and_judge(chat_id, session, self_id))
 
+    def _normalize_content_to_str(self, components: Any) -> str:
+        """
+        [新增] 将底层富文本组件规范化为字符串标记
+        """
+        import astrbot.api.message_components as Comp
+        
+        if not components:
+            return ""
+        if isinstance(components, str):
+            return components
+            
+        text_parts = []
+        if isinstance(components, list):
+            for comp in components:
+                # 适配 AstrBot 原生 Component 对象
+                if isinstance(comp, Comp.Plain):
+                    text_parts.append(comp.text)
+                elif isinstance(comp, Comp.At):
+                    text_parts.append(f"[@{comp.qq}]")
+                elif isinstance(comp, Comp.Image):
+                    text_parts.append("[图片]")
+                elif isinstance(comp, Comp.Reply):
+                    text_parts.append("(回复消息)")
+                # 兼容普通字典格式 (Dict)
+                elif isinstance(comp, dict):
+                    t = comp.get("type")
+                    if t in ["plain", "text"]:
+                        text_parts.append(comp.get("text", ""))
+                    elif t == "image":
+                        text_parts.append("[图片]")
+                    elif t == "at":
+                        text_parts.append(f"[@{comp.get('qq', 'User')}]")
+                    else:
+                        val = comp.get("text", "")
+                        if val: text_parts.append(val)
+                # 兜底
+                else:
+                    val = getattr(comp, "text", "")
+                    if val: text_parts.append(val)
+                    
+        return "".join(text_parts)
+
+    def _convert_interaction_to_narrative(self, content: str, bot_name: str) -> str:
+        """
+        [新增] 将技术标记转换为自然叙述/动作描写
+        """
+        import re
+        if not content: return ""
+
+        # 1. 戳一戳虚拟事件翻译 (Interaction: A -> B)
+        match = re.search(r"\(Interaction: (.*?) -> (.*?)\)", content)
+        if match:
+            s_name, t_name = match.groups()
+            if bot_name and (t_name == bot_name or t_name == '我'):
+                return f"[{s_name} 伸出手指戳了戳你]"
+            return f"[{s_name} 伸出手指戳了戳 {t_name}]"
+            
+        # 2. 图片内容翻译
+        if "[图片描述:" in content:
+            desc_match = re.search(r"\[图片描述: (.*?) \(Ref:", content)
+            if desc_match:
+                return f"[分享了一张图片: {desc_match.group(1)}]"
+        if "[图片" in content:
+            return "[发了一张图片]"
+
+        # 3. 引用回复翻译
+        if "(回复消息)" in content:
+            content = content.replace("(回复消息)", "[回复对方的话]")
+        elif "(回复" in content:
+            content = content.replace("(回复", "[回复对方的话]")
+
+        # 4. @提及翻译
+        if bot_name:
+            content = content.replace(f"[@{bot_name}]")
+        
+        # 替换其他 @ 用户
+        content = re.sub(r"\[@(.*?)\]", r"[对\1说]", content)
+        # 清理多余 Ref ID
+        content = re.sub(r"\(Ref:.*?\)", "", content).strip()
+        
+        return content
+
     def _format_and_filter_messages(self, events: List[AstrMessageEvent]):
-        """斗图过滤与同源消息折叠"""
+        """
+        [修改] 斗图过滤与同源消息折叠，接入转义层
+        """
         if not events: return "", []
         
         filtered_events = []
         continuous_img_count = 0
         
-        # 1. 斗图过滤阶段：连续 >= 3 图片时，保留第一个，抛弃后续
+        # 1. 斗图过滤阶段
         for e in events:
             if self._is_image_only(e):
                 continuous_img_count += 1
@@ -106,14 +190,33 @@ class AttentionGate:
                 continuous_img_count = 0
             filtered_events.append(e)
 
-        # 2. 同源聚合阶段
         grouped_texts = []
         curr_sender = None
         curr_msgs = []
         
+        # 尝试获取机器人主称呼
+        bot_name = "我"
+        if hasattr(self, 'config') and self.config and hasattr(self.config, 'system1'):
+            if self.config.system1.nicknames:
+                bot_name = self.config.system1.nicknames[0]
+                
+        # 2. 同源聚合与画面感转义阶段
         for e in filtered_events:
             sender = e.get_sender_name()
-            content = e.message_str.strip() if e.message_str.strip() else "[图片]"
+            
+            # [核心修改] 区分虚拟事件与普通消息组件提取
+            if e.get_extra("is_virtual_poke"):
+                raw_content = e.message_str
+            else:
+                components = e.message_obj.message if (hasattr(e, "message_obj") and e.message_obj) else e.message_str
+                raw_content = self._normalize_content_to_str(components)
+                
+            # [核心修改] 执行叙事转义
+            content = self._convert_interaction_to_narrative(raw_content, bot_name)
+            
+            # 兜底空消息
+            if not content.strip():
+                content = "[图片]"
             
             if sender != curr_sender:
                 if curr_sender is not None:

@@ -202,7 +202,16 @@ class AstrMaiPlugin(Star):
         profile.message_count_for_profiling += 1
         profile.is_dirty = True
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_notice_event(self, event: AstrMessageEvent):
+        """
+        [新增] 接管底层通知事件（戳一戳等），转交 Sensor 模块处理
+        """
+        # 由于拦截了所有事件，我们将其无脑推给 sensor，由 sensor 内部的 raw.get("notice_type") == "notify" 去做精确过滤
+        if hasattr(self, 'sensors') and hasattr(self, 'attention_gate'):
+            await self.sensors.process_poke_event(event, self.context, self.attention_gate)
 
+            
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
         """【剧本模式核心】全局记忆注入、底层历史防污染截取 & 工具链保护"""
