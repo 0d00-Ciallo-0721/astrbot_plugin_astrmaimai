@@ -177,7 +177,7 @@ class PreFilters:
     
     async def process_poke_event(self, event: AstrMessageEvent, context, attention_gate):
         """
-        [新增] 拦截底层戳一戳事件，执行回戳，并生成虚拟消息送入注意力门控
+        [优化版] 拦截底层戳一戳事件，执行回戳，并生成虚拟消息送入注意力门控
         """
         # 尝试提取底层 raw_event 数据 (适用于 OneBot/Aiocqhttp 等标准协议)
         raw = getattr(event.message_obj, "raw_event", {})
@@ -199,25 +199,30 @@ class PreFilters:
                     
             target_name = bot_name if target_id == bot_id else target_id
             
-            # 1. 捏造虚拟互动标记
+            # 1. 捏造虚拟互动标记 (供大模型产生画面感)
             virtual_text = f"(Interaction: {sender_name} -> {target_name})"
             logger.info(f"[AstrMai-Sensor] 👉 捕获互动事件: {virtual_text}")
             
-            # 2. 如果被戳的是自己，执行回戳反击逻辑
+            # 2. 如果被戳的是自己，执行回戳反击逻辑 (采用更现代、兼容性更强的 API)
             if target_id == bot_id:
                 try:
-                    from astrbot.api.event import filter as astr_filter
-                    platform = context.get_platform(astr_filter.PlatformAdapterType.AIOCQHTTP)
-                    if platform:
-                        client = platform.get_client()
-                        await client.api.call_action('group_poke', group_id=group_id, user_id=sender_id)
+                    client = getattr(event, 'bot', None)
+                    if client and hasattr(client, 'api'):
+                        if group_id:
+                            # 群聊回戳需要带上 group_id
+                            await client.api.call_action('send_poke', user_id=int(sender_id), group_id=int(group_id))
+                        else:
+                            # 私聊回戳只需 user_id
+                            await client.api.call_action('send_poke', user_id=int(sender_id))
                         logger.info(f"[AstrMai-Sensor] 👈 已回戳反击用户: {sender_name}")
+                    else:
+                        logger.warning("[AstrMai-Sensor] 无法获取底层 bot 实例，跳过回戳")
                 except Exception as e:
-                    logger.debug(f"[AstrMai-Sensor] 回戳操作暂不支持当前平台或发生异常: {e}")
+                    logger.debug(f"[AstrMai-Sensor] 回戳操作发生异常 (可能由于平台暂不支持): {e}")
 
-            # 3. 伪装事件并强制推入滑动窗口
+            # 3. 伪装事件并强制推入滑动窗口 (无论是否回戳，都让大模型知道自己被戳了)
             event.message_str = virtual_text
             event.set_extra("is_virtual_poke", True)
-            event.set_extra("astrmai_bonus_score", 2.0) # 赋予高优权重，提高理睬概率
+            event.set_extra("astrmai_bonus_score", 2.0) # 赋予高优权重，提高 AI 理睬的概率
             
-            await attention_gate.process_event(event)    
+            await attention_gate.process_event(event)  

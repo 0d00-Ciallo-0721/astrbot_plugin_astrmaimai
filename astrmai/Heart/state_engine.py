@@ -207,3 +207,35 @@ class StateEngine:
                 
                 # 触发好感度变更事件广播，通知 Brain 或后续的 ContextInjector 刷新系统提示词
                 self.event_bus.trigger_affection_change()            
+
+    async def should_drop_by_energy(self, chat_id: str, msg_count: int) -> bool:
+        """
+        [新增] 中间组件 2 - 动态能量退避机制
+        """
+        async with self._lock:
+            if chat_id not in self.chat_states:
+                return False
+            state = self.chat_states[chat_id]
+            current_energy = state.energy
+            min_threshold = self.config.energy.min_reply_threshold
+            
+            # 如果精力大于一半则认为非常安全，不触发节流丢包
+            if current_energy >= 0.5:
+                return False
+                
+            import random
+            if current_energy <= min_threshold:
+                drop_prob = 1.0
+            else:
+                # 线性插值，越逼近 min_threshold，丢弃概率越高
+                drop_prob = max(0.0, (0.5 - current_energy) / (0.5 - min_threshold))
+                
+            if random.random() < drop_prob:
+                # 命中丢弃概率，执行回血并放弃处理
+                recover_amount = msg_count * self.config.energy.cost_per_reply
+                state.energy = min(1.0, state.energy + recover_amount)
+                state.is_dirty = True
+                logger.debug(f"[{chat_id}] 🔋 动态能量退避生效，命中丢弃概率({drop_prob:.2f})。恢复精力: +{recover_amount:.2f} -> {state.energy:.2f}")
+                return True
+                
+            return False                

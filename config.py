@@ -36,7 +36,12 @@ class System1Config(BaseModel):
 class AttentionConfig(BaseModel):
     debounce_window: float = Field(default=2.0)
     bg_pool_size: int = Field(default=20)
-
+    # [新增] 节流与复读控制
+    throttle_probability: float = Field(default=0.1)
+    throttle_min_entropy: int = Field(default=2)
+    repeater_threshold: int = Field(default=3)
+    max_message_length: int = Field(default=100)
+    
 class EnergyConfig(BaseModel):
     min_reply_threshold: float = Field(default=0.1)
     cost_per_reply: float = Field(default=0.05)

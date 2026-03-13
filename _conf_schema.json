@@ -164,6 +164,27 @@
         "type": "int",
         "default": 20,
         "hint": "构建历史消息上下文"
+      },
+      "throttle_probability": {
+        "description": "群聊开启滑动窗口的随机概率",
+        "type": "float",
+        "default": 0.1
+      },
+      "throttle_min_entropy": {
+        "description": "开启窗口所需的最小字符长度",
+        "type": "int",
+        "default": 2
+      },
+      "repeater_threshold": {
+        "description": "触发复读机的相同消息阈值",
+        "type": "int",
+        "default": 3
+      },
+      "max_message_length": {
+        "description": "单条消息最大字符限制",
+        "type": "int",
+        "default": 100,
+        "hint": "超过此长度的消息将被直接拦截丢弃，用于防长文本刷屏或提示词注入"
       }
     }
   },
