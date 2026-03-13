@@ -42,6 +42,12 @@ class AttentionConfig(BaseModel):
     repeater_threshold: int = Field(default=3)
     max_message_length: int = Field(default=100)
     
+    # === [新增] 情绪归因启发式算法超参数 ===
+    history_pull_count: int = Field(default=20)
+    affection_weights: Dict[str, float] = Field(default={"trigger": 20.0, "window": 50.0, "history": 30.0})
+    adjudication_threshold: float = Field(default=50.0)
+    sensitive_words: List[str] = Field(default=["傻逼", "弱智", "滚", "死", "妈", "废物", "神经", "有病"])
+    
 class EnergyConfig(BaseModel):
     min_reply_threshold: float = Field(default=0.1)
     cost_per_reply: float = Field(default=0.05)

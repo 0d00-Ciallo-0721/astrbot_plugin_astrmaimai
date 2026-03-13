@@ -4,7 +4,8 @@ import random
 from typing import List
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-
+# [阶段四新增] 引入情绪归因路由器
+from ..Heart.affection_router import AffectionRouter
 # 引入依赖模块
 from ..infra.datamodels import ChatState
 from ..Heart.state_engine import StateEngine
@@ -85,7 +86,56 @@ class ReplyEngine:
             
         return final_segments
 
-    async def handle_reply(self, event: AstrMessageEvent, raw_text: str, chat_id: str):
+    async def _fetch_history(self, chat_id: str, anchor_text: str) -> list:
+        """
+        [阶段二新增] 历史记录获取 ($H$)：向上安全截取固定条数的原始历史记录数组，供路由统计算法使用。
+        """
+        history_list = []
+        try:
+            # 借助 Gateway 透传获取底层 Context
+            context = getattr(self.state_engine.gateway, 'context', None)
+            if not context: return []
+            
+            conv_mgr = context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
+            conversation = await conv_mgr.get_conversation(chat_id, curr_cid)
+            
+            if conversation and hasattr(conversation, "history") and conversation.history:
+                raw_history = conversation.history
+                cutoff_idx = len(raw_history)
+                
+                # 寻找破窗锚点位置
+                if anchor_text:
+                    for i in range(len(raw_history) - 1, -1, -1):
+                        msg_data = raw_history[i]
+                        content = ""
+                        if isinstance(msg_data, dict):
+                            if 'content' in msg_data:
+                                if isinstance(msg_data['content'], str):
+                                    content = msg_data['content']
+                                elif isinstance(msg_data['content'], list):
+                                    content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
+                        elif hasattr(msg_data, 'content'):
+                            if isinstance(msg_data.content, str):
+                                content = msg_data.content
+                            elif isinstance(msg_data.content, list):
+                                content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
+                                
+                        if anchor_text in content:
+                            cutoff_idx = i
+                            break
+                            
+                # 根据配置向上切片
+                fetch_count = getattr(self.config.attention, 'history_pull_count', 20) if self.config else 20
+                start_idx = max(0, cutoff_idx - fetch_count)
+                history_list = raw_history[start_idx:cutoff_idx]
+                
+        except Exception as e:
+            logger.warning(f"[ReplyEngine] 历史记录拉取异常(降级放行): {e}")
+            
+        return history_list
+
+async def handle_reply(self, event: AstrMessageEvent, raw_text: str, chat_id: str):
         """
         执行回复全流程
         """
@@ -130,6 +180,43 @@ class ReplyEngine:
                 await self.state_engine.db.save_chat_state(chat_id, state)
             
             logger.debug(f"[Reply] 😃 情绪更新: {tag} ({new_mood:.2f})")
+            
+            # =======================================================
+            # [阶段二: 数据流透传与结算准备]
+            # =======================================================
+            # 1. 获取已透传过来的窗口期消息池 (W)
+            window_events = event.get_extra("astrmai_window_events", [])
+            
+            # 2. 获取锚点定位器
+            anchor_event = event.get_extra("astrmai_anchor_event")
+            anchor_text = anchor_event.message_str.strip() if anchor_event else ""
+            
+            # 3. 拉取原始历史记录池 (H)
+            history_events = await self._fetch_history(chat_id, anchor_text)
+            
+            # =======================================================
+            # [阶段四: 情绪路由器拦截与最终结算 (Affection Router Hook)]
+            # =======================================================
+            target_user_id = AffectionRouter.route(
+                history_events=history_events,
+                window_events=window_events,
+                trigger_event=event,
+                mood_tag=tag,
+                config=self.config
+            )
+
+            if target_user_id:
+                logger.info(f"[ReplyEngine] 🤝 情绪路由器裁决完毕，准备为核心引导用户 {target_user_id} 结算好感度。")
+                if hasattr(self.state_engine, 'calculate_and_update_affection'):
+                    await self.state_engine.calculate_and_update_affection(
+                        user_id=target_user_id,
+                        group_id=chat_id,
+                        mood_tag=tag,
+                        intensity=1.0
+                    )
+            else:
+                logger.debug(f"[ReplyEngine] 🤷‍♂️ 情绪路由器判为流局，仅更新系统心情，跳过所有用户的好感度结算。")
+            
         except AttributeError as e:
             logger.warning(f"[Reply] 情绪模块 API 漂移/失效: {e}")
             tag = "neutral"

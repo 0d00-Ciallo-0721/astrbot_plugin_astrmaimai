@@ -7,8 +7,8 @@ from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
-from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool
-        
+from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool, QueryPersonProfileTool
+
 from ..memory.engine import MemoryEngine
 from ..evolution.processor import EvolutionManager
 
@@ -23,19 +23,23 @@ class Planner:
                  context_engine: ContextEngine, 
                  reply_engine: ReplyEngine,
                  memory_engine: MemoryEngine,
-                 evolution_manager: EvolutionManager
+                 evolution_manager: EvolutionManager,
+                 state_engine=None  # [新增] 接收 state_engine 用于底层用户状态查询
                  ):
         self.gateway = gateway
         self.context_engine = context_engine
         self.memory_engine = memory_engine
         self.evolution_manager = evolution_manager
+        self.state_engine = state_engine  # [新增] 挂载到实例
         self.executor = ConcurrentExecutor(context, gateway, reply_engine)
 
+    
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
         [修改] 动态上下文修剪、切分视界消息构造纯文本当前剧本格式。
         """
         chat_id = event.unified_msg_origin
+        user_id = event.get_sender_id() 
         
         retrieve_keys = event.get_extra("retrieve_keys", [])
         if not isinstance(retrieve_keys, list):
@@ -77,7 +81,13 @@ class Planner:
             tools = [
                 WaitTool(),
                 FetchKnowledgeTool(memory_engine=self.memory_engine, chat_id=chat_id),
-                QueryJargonTool(db_service=self.context_engine.db, chat_id=chat_id)
+                QueryJargonTool(db_service=self.context_engine.db, chat_id=chat_id),
+                # === [新增] 挂载主动拉取画像的工具 ===
+                QueryPersonProfileTool(
+                    state_engine=self.state_engine, 
+                    db_service=self.context_engine.db, 
+                    current_user_id=user_id
+                )
             ]
             if ctx:
                 if hasattr(ctx, "set"):

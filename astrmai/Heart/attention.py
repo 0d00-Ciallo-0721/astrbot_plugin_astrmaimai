@@ -457,6 +457,8 @@ class AttentionGate:
             anchor_event = final_events[0]
             main_event = final_events[-1] 
             main_event.set_extra("astrmai_anchor_event", anchor_event)
+            # [阶段二新增] 透传完整的窗口期消息事件队列 (W) 供下游情绪路由计算
+            main_event.set_extra("astrmai_window_events", final_events)
 
             logger.info(f"[{chat_id}] 📦 窗口闭合。过滤后留存 {len(final_events)} 条消息。\n聚合内容:\n{combined_text}")
             
@@ -483,7 +485,7 @@ class AttentionGate:
         finally:
             async with session.lock:
                 session.is_evaluating = False
-                # [新增] 滑动窗口关闭时清理复读机记忆，防止跨窗口期的误判
+                # 滑动窗口关闭时清理复读机记忆，防止跨窗口期的误判
                 session.last_hash = None
                 session.repeat_count = 0
             logger.debug(f"[{chat_id}] 🔓 注意力评估状态已释放。")

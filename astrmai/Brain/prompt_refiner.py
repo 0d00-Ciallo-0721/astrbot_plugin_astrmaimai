@@ -93,7 +93,8 @@ class PromptRefiner:
                             break
                             
                 # 向上拉取指定的历史条数并进行彻底的纯文本转换
-                fetch_count = getattr(self.config.attention, 'bg_pool_size', 20) if self.config else 20
+                # [阶段二修改] 替换为最新的 history_pull_count 配置
+                fetch_count = getattr(self.config.attention, 'history_pull_count', 20) if self.config else 20
                 start_idx = max(0, cutoff_idx - fetch_count)
                 valid_history = raw_history[start_idx:cutoff_idx]
                 
@@ -169,9 +170,14 @@ class PromptRefiner:
             elif i == current_user_msg_idx:
                 # 对当前的最终输入包裹上“导演旁白”，强化角色沉浸，拒绝客服前缀
                 original_content = msg.content
-                # [新增] 极速模式导演旁白加急
-                fast_mode_alert = "【极速唤醒】立刻作答！" if is_fast_mode else ""
-                msg.content = f"(导演旁白：请仔细阅读设定和前面的剧本。这是当前你看到的最新消息：\n{original_content}\n\n{fast_mode_alert}请直接沉浸在角色中说出台词或执行心理动作，不要带任何角色名前缀！)"
+                
+                # [修改] 根据模式动态强化导演旁白的压迫感与动作暗示
+                if is_fast_mode:
+                    director_voice = "【极速唤醒】立刻作答！请直接沉浸在角色中说出台词，不要带任何角色名前缀！"
+                else:
+                    director_voice = "【动作提示】请先判断是否需要调用工具（如 query_person_profile 查阅羁绊等）。如果不需要，请直接沉浸在角色中说出你的台词，不要带任何角色名前缀！"
+                    
+                msg.content = f"(导演旁白：请仔细阅读设定和前面的剧本。这是当前你看到的最新消息：\n{original_content}\n\n>> {director_voice})"
                 preserved_messages.append(msg)
             else:
                 # 保护当前可能正在进行的流式/迭代工具调用

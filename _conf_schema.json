@@ -185,6 +185,43 @@
         "type": "int",
         "default": 100,
         "hint": "超过此长度的消息将被直接拦截丢弃，用于防长文本刷屏或提示词注入"
+      },
+      "history_pull_count": {
+        "description": "情绪归因：历史拉取条数",
+        "type": "int",
+        "default": 20,
+        "hint": "参与统计算法的历史上下文消息条数"
+      },
+      "affection_weights": {
+        "description": "情绪归因：三维权重分配",
+        "type": "dict",
+        "default": {
+          "trigger": 20.0,
+          "window": 50.0,
+          "history": 30.0
+        },
+        "hint": "破窗消息、窗口期、历史消息三者的最高权重池上限"
+      },
+      "adjudication_threshold": {
+        "description": "情绪归因：最终裁决及格线",
+        "type": "float",
+        "default": 50.0,
+        "hint": "总归因分超过此线才会被认定为情绪引导人，否则流局(Draw)"
+      },
+      "sensitive_words": {
+        "description": "情绪归因：极端情绪敏感词库",
+        "type": "list",
+        "default": [
+          "傻逼",
+          "弱智",
+          "滚",
+          "死",
+          "妈",
+          "废物",
+          "神经",
+          "有病"
+        ],
+        "hint": "当触发此词库时，将激活沉默刺客制裁（权重瞬间拉满）"
       }
     }
   },
