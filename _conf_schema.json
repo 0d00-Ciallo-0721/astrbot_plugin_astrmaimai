@@ -194,13 +194,25 @@
       },
       "affection_weights": {
         "description": "情绪归因：三维权重分配",
-        "type": "dict",
-        "default": {
-          "trigger": 20.0,
-          "window": 50.0,
-          "history": 30.0
-        },
-        "hint": "破窗消息、窗口期、历史消息三者的最高权重池上限"
+        "type": "object",
+        "hint": "破窗消息、窗口期、历史消息三者的最高权重池上限",
+        "items": {
+          "trigger": {
+            "description": "破窗消息权重",
+            "type": "float",
+            "default": 20.0
+          },
+          "window": {
+            "description": "窗口期权重",
+            "type": "float",
+            "default": 50.0
+          },
+          "history": {
+            "description": "历史消息权重",
+            "type": "float",
+            "default": 30.0
+          }
+        }
       },
       "adjudication_threshold": {
         "description": "情绪归因：最终裁决及格线",
