@@ -4,3 +4,5 @@ faiss-cpu
 numpy
 scikit-learn
 json-repair
+sqlmodel
+pydantic

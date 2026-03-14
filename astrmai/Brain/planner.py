@@ -40,7 +40,8 @@ class Planner:
         """
         chat_id = event.unified_msg_origin
         user_id = event.get_sender_id() 
-        
+        sender_name = event.get_sender_name() or "群友/用户"
+
         retrieve_keys = event.get_extra("retrieve_keys", [])
         if not isinstance(retrieve_keys, list):
             retrieve_keys = []
@@ -84,9 +85,9 @@ class Planner:
                 QueryJargonTool(db_service=self.context_engine.db, chat_id=chat_id),
                 # === [新增] 挂载主动拉取画像的工具 ===
                 QueryPersonProfileTool(
-                    state_engine=self.state_engine, 
                     db_service=self.context_engine.db, 
-                    current_user_id=user_id
+                    current_sender_id=str(user_id) if user_id is not None else "",
+                    current_sender_name=sender_name
                 )
             ]
             if ctx:
