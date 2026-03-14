@@ -129,7 +129,11 @@ class PreFilters:
         """
         [新增] 判断文本是否命中指令防火墙
         """
-        if not text: return False
+        if not text:
+            return False
+
+        # 确保外部指令库已加载，避免冷启动时首条指令漏检
+        await self._load_foreign_commands()
         
         # 1. 检查基础指令前缀 (接入 Config)
         if any(text.startswith(prefix) for prefix in self.config.global_settings.command_prefixes):
@@ -137,7 +141,8 @@ class PreFilters:
             
         # 2. 检查动态加载的系统指令库
         first_word = text.split()[0].lower()
-        if self.foreign_commands and first_word in self.foreign_commands:
+        cmd_key_no_prefix = first_word[1:] if first_word.startswith("/") else first_word
+        if self.foreign_commands and (first_word in self.foreign_commands or cmd_key_no_prefix in self.foreign_commands):
             return True
             
         return False

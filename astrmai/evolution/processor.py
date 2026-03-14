@@ -145,8 +145,7 @@ class EvolutionManager:
             unprocessed_logs = self.db.get_unprocessed_logs(group_id, limit=100)
             
             # 设置触发阈值（例如：累积 20 条消息触发一次进化挖掘）
-            threshold = getattr(self.config.evolution, 'mining_threshold', 20)
-            
+            threshold = getattr(self.config.evolution, 'mining_trigger', 20)
             if len(unprocessed_logs) >= threshold:
                 logger.info(f"[Evolution] 群组 {group_id} 积攒日志达标 ({len(unprocessed_logs)}条)，启动进化挖掘...")
                 # 调用已有的综合挖掘任务
