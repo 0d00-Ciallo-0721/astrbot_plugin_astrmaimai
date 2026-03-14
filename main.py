@@ -101,7 +101,9 @@ class AstrMaiPlugin(Star):
             context=context,
             state_engine=self.state_engine,
             gateway=self.gateway,
-            persistence=self.persistence
+            persistence=self.persistence,
+            memory_engine=self.memory_engine,
+            config=self.config,
         )        
         
         logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-6 Mounted).")
