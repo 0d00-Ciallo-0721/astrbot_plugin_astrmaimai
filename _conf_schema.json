@@ -1,0 +1,451 @@
+{
+  "provider": {
+    "type": "object",
+    "description": "🔌 模型提供商配置 (Provider)",
+    "items": {
+      "fallback_models": {
+        "description": "总模型池 (Fallback Models)",
+        "type": "list",
+        "default": [],
+        "hint": "备用模型池。当某个专项模型调用失败或未配置时，将依次尝试此列表中的模型"
+      },
+      "judge_model": {
+        "description": "意图与动作快速判决模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于快速意图判断，建议使用快速的小模型",
+        "_special": "select_provider"
+      },
+      "agent_model": {
+        "description": "智能体循环核心生成模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于反思、工具调用与长文本生成，建议使用强逻辑的大模型",
+        "_special": "select_provider"
+      },
+      "mood_model": {
+        "description": "情绪值与好感度分析模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于分析文本情绪并闭环更新好感度",
+        "_special": "select_provider"
+      },
+      "data_process_model": {
+        "description": "数据处理与降维挖掘模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于离线记忆结构化、黑话推断提取、语癖提取与对话目标分析",
+        "_special": "select_provider"
+      },
+      "proactive_model": {
+        "description": "主动行为与侧写模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于主动冷场破冰开场白生成及深度用户心理画像侧写",
+        "_special": "select_provider"
+      },
+      "persona_model": {
+        "description": "人格压缩总模型",
+        "type": "string",
+        "default": "",
+        "hint": "用于人设压缩与多维切片",
+        "_special": "select_provider"
+      },
+      "vision_model": {
+         "description": "多模态视觉专属大模型",
+         "type": "string",
+        "_special": "select_provider",
+         "hint": "用于处理图片解析的专属模型 (如 gpt-4o / gemini-1.5-pro)。如果不配置将无法看图。"
+      }, 
+      "embedding_provider_id": {
+        "description": "Embedding 模型提供商 ID",
+        "type": "string",
+        "hint": "请填写 Embedding 模型 ID（如 openai_embedding）。留空则自动兜底。",
+        "default": ""
+      }
+    }
+  },
+  "global_settings": {
+    "type": "object",
+    "description": "⚙️ 全局设置 (Global)",
+    "items": {
+      "debug_mode": {
+        "description": "调试模式",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后将输出详细的思维链和状态日志"
+      },
+      "command_prefixes": {
+        "description": "指令前缀",
+        "type": "list",
+        "default": ["/", "!", "！"],
+        "hint": "识别系统指令的前缀列表"
+      },
+      "enabled_groups": {
+        "description": "启用群聊白名单",
+        "type": "list",
+        "default": [],
+        "hint": "填写群号。只在这些群聊内生效，为空则全群生效"
+      }
+    }
+  },
+  "persona": {
+    "title": "🎭 人设与记忆配置 (Persona)",
+    "type": "object",
+    "items": {
+      "persona_id": {
+        "title": "🏷️ 人设绑定 ID (Persona ID)",
+        "type": "string",
+        "default": "",
+        "description": "人设ID",
+        "hint": "留默认对话人设"
+      }
+    }
+  },
+  "agent": {
+    "type": "object",
+    "description": "🧠 认知引擎 (Agent)",
+    "items": {
+      "max_steps": {
+        "description": "最大思考步数",
+        "type": "int",
+        "default": 5,
+        "hint": "防止陷入死循环"
+      },
+      "timeout": {
+        "description": "工具调用超时时间 (秒)",
+        "type": "int",
+        "default": 60
+      }
+    }
+  },
+  "performance": {
+    "type": "object",
+    "description": "⚡ 性能配置 (Performance)",
+    "items": {
+      "summary_threshold": {
+        "description": "人设压缩 Token 阈值",
+        "type": "int",
+        "default": 300,
+        "hint": "人设长度超过此值时将触发自动压缩"
+      }
+    }
+  },
+  "system1": {
+    "type": "object",
+    "description": "❤️ 感知心智 (System 1)",
+    "items": {
+      "wakeup_words": {
+        "description": "自定义唤醒词",
+        "type": "list",
+        "default": [],
+        "hint": "命中唤醒词时无视能量状态强制回复"
+      },
+      "nicknames": {
+        "description": "机器人昵称",
+        "type": "list",
+        "default": [],
+        "hint": "用于点名提权，提升被叫到名字时的回复意愿"
+      },
+      "extra_command_list": {
+        "description": "手动隔离指令名单",
+        "type": "list",
+        "default": [],
+        "hint": "手动添加无法被自动识别的指令。"
+      }
+    }
+  },
+  "attention": {
+    "type": "object",
+    "description": "🎯 注意力门控 (Attention)",
+    "items": {
+      "debounce_window": {
+        "description": "防抖聚合窗口 (秒)",
+        "type": "float",
+        "default": 2.0,
+        "hint": "在此时间内连续收到的消息将被打包处理"
+      },
+      "bg_pool_size": {
+        "description": "获取的历史消息条数",
+        "type": "int",
+        "default": 20,
+        "hint": "构建历史消息上下文"
+      },
+      "throttle_probability": {
+        "description": "群聊开启滑动窗口的随机概率",
+        "type": "float",
+        "default": 0.1
+      },
+      "throttle_min_entropy": {
+        "description": "开启窗口所需的最小字符长度",
+        "type": "int",
+        "default": 2
+      },
+      "repeater_threshold": {
+        "description": "触发复读机的相同消息阈值",
+        "type": "int",
+        "default": 3
+      },
+      "max_message_length": {
+        "description": "单条消息最大字符限制",
+        "type": "int",
+        "default": 100,
+        "hint": "超过此长度的消息将被直接拦截丢弃，用于防长文本刷屏或提示词注入"
+      },
+      "history_pull_count": {
+        "description": "情绪归因：历史拉取条数",
+        "type": "int",
+        "default": 20,
+        "hint": "参与统计算法的历史上下文消息条数"
+      },
+      "affection_weights": {
+        "description": "情绪归因：三维权重分配",
+        "type": "object",
+        "hint": "破窗消息、窗口期、历史消息三者的最高权重池上限",
+        "items": {
+          "trigger": {
+            "description": "破窗消息权重",
+            "type": "float",
+            "default": 20.0
+          },
+          "window": {
+            "description": "窗口期权重",
+            "type": "float",
+            "default": 50.0
+          },
+          "history": {
+            "description": "历史消息权重",
+            "type": "float",
+            "default": 30.0
+          }
+        }
+      },
+      "adjudication_threshold": {
+        "description": "情绪归因：最终裁决及格线",
+        "type": "float",
+        "default": 50.0,
+        "hint": "总归因分超过此线才会被认定为情绪引导人，否则流局(Draw)"
+      },
+      "sensitive_words": {
+        "description": "情绪归因：极端情绪敏感词库",
+        "type": "list",
+        "default": [
+          "傻逼",
+          "弱智",
+          "滚",
+          "死",
+          "妈",
+          "废物",
+          "神经",
+          "有病"
+        ],
+        "hint": "当触发此词库时，将激活沉默刺客制裁（权重瞬间拉满）"
+      }
+    }
+  },
+  "energy": {
+    "type": "object",
+    "description": "🔋 精力系统 (Energy)",
+    "items": {
+      "min_reply_threshold": {
+        "description": "最低回复阈值",
+        "type": "float",
+        "default": 0.1,
+        "hint": "低于此值时机器人将倾向于不回复"
+      },
+      "cost_per_reply": {
+        "description": "单次回复消耗",
+        "type": "float",
+        "default": 0.05
+      },
+      "daily_recovery": {
+        "description": "每日自然恢复量",
+        "type": "float",
+        "default": 0.2
+      },
+      "recovery_silence_min": {
+        "description": "判定休息需静默时长 (分钟)",
+        "type": "int",
+        "default": 60
+      }
+    }
+  },
+  "mood": {
+    "type": "object",
+    "description": "💓 情绪系统 (Mood)",
+    "items": {
+      "decay_interval": {
+        "description": "情绪自然衰减周期 (秒)",
+        "type": "int",
+        "default": 3600
+      },
+      "decay_rate": {
+        "description": "衰减幅度",
+        "type": "float",
+        "default": 0.1
+      },
+      "unknown_decay": {
+        "description": "异常默认衰减系数",
+        "type": "float",
+        "default": 0.1
+      }
+    }
+  },
+  "evolution": {
+    "type": "object",
+    "description": "🧬 潜意识进化 (Evolution)",
+    "items": {
+      "min_mining_context": {
+        "description": "风格挖掘最少消息数",
+        "type": "int",
+        "default": 10
+      },
+      "batch_size": {
+        "description": "挖掘任务批次大小",
+        "type": "int",
+        "default": 50
+      },
+      "mining_trigger": {
+        "description": "触发后台挖掘阈值",
+        "type": "int",
+        "default": 20
+      }
+    }
+  },
+  "life": {
+    "type": "object",
+    "description": "🌱 生命循环 (Life)",
+    "items": {
+      "silence_threshold": {
+        "description": "冷场判定时长 (分钟)",
+        "type": "int",
+        "default": 120
+      },
+      "wakeup_min_energy": {
+        "description": "主动破冰最低精力",
+        "type": "float",
+        "default": 0.6
+      },
+      "wakeup_cost": {
+        "description": "主动破冰消耗精力",
+        "type": "float",
+        "default": 0.2
+      },
+      "wakeup_cooldown": {
+        "description": "主动唤醒冷却时间 (秒)",
+        "type": "int",
+        "default": 28800
+      },
+      "profiling_msg_threshold": {
+        "description": "人物分析消息条数",
+        "type": "int",
+        "default": 200,
+        "hint": "积累多少条互动消息后触发人物分析"
+      }
+    }
+  },
+  "reply": {
+    "type": "object",
+    "description": "💬 表达引擎 (Reply)",
+    "items": {
+      "fallback_text": {
+        "description": "系统异常兜底文本",
+        "type": "string",
+        "default": "（陷入了短暂的沉默...）"
+      },
+      "segment_min_len": {
+        "description": "最小分段字符长度",
+        "type": "int",
+        "default": 15
+      },
+      "no_segment_max_len": {
+        "description": "不分段最大长度",
+        "type": "int",
+        "default": 120
+      },
+      "meme_probability": {
+        "description": "表情包发送概率 (%)",
+        "type": "int",
+        "default": 60
+      },
+      "emotion_mapping": {
+        "description": "自定义情绪与表情包字典 (格式: 情绪名:内涵描述)",
+        "type": "list",
+        "default": [
+          "happy: 积极、开心、感谢",
+          "sad: 悲伤、遗憾、道歉",
+          "angry: 生气、抱怨、攻击",
+          "neutral: 平静、客观、陈述",
+          "curious: 好奇、提问、困惑",
+          "surprise: 惊讶、意外"
+        ],
+        "hint": "请使用 [情绪名:内涵] 的格式。冒号前的英文必须和表情包文件夹名称一致，如 'shy: 害羞、不好意思'。"
+      },
+      "typing_speed_factor": {
+        "description": "拟人化打字速度系数",
+        "type": "float",
+        "default": 0.1
+      }
+    }
+  },
+  "memory": {
+    "type": "object",
+    "description": "💾 记忆机制 (Memory)",
+    "items": {
+      "time_decay_rate": {
+        "description": "时间衰减率",
+        "type": "float",
+        "default": 0.01
+      },
+      "cleanup_interval": {
+        "description": "后台整理间隔 (秒)",
+        "type": "int",
+        "default": 3600
+      },
+      "summary_threshold": {
+        "description": "触发压缩条数阈值",
+        "type": "int",
+        "default": 30
+      },
+      "recall_top_k": {
+        "description": "每次对话召回记忆数",
+        "type": "int",
+        "default": 5
+      }
+    }
+  },
+  "vision": {
+    "type": "object",
+    "description": "👁️ 多模态视觉皮层 (Vision)",
+    "items": {
+      "enable_vision": {
+        "description": "多模态视觉总开关",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，系统将尝试异步解析聊天中的图片与表情包内容"
+      },
+      "image_recognition_probability": {
+        "description": "图片识别概率",
+        "type": "float",
+        "default": 0.5,
+        "hint": "取值 0.0~1.0。用于节约 API Token 成本，未命中概率的图片将被系统直接忽略"
+      }
+    }
+  },
+  "infra": {
+    "type": "object",
+    "description": "🏗️ 基础设施 (Infra)",
+    "items": {
+      "llm_retries": {
+        "description": "模型调用最大重试次数",
+        "type": "int",
+        "default": 2
+      },
+      "backoff_factor": {
+        "description": "指数退避系数",
+        "type": "float",
+        "default": 1.5
+      }
+    }
+  }
+}
