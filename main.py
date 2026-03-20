@@ -94,7 +94,9 @@ class AstrMaiPlugin(Star):
             state_engine=self.state_engine,
             judge=self.judge,
             sensors=self.sensors,
-            system2_callback=self._system2_entry
+            system2_callback=self._system2_entry,
+            config=self.config,                           # [新增] 传入配置项
+            persona_summarizer=self.persona_summarizer    # [新增] 注入人设压缩器
         )
         
         self.proactive_task = ProactiveTask(
@@ -107,7 +109,7 @@ class AstrMaiPlugin(Star):
         )        
         
         logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-6 Mounted).")
-
+        
     # [修改] 保留此唯一的统计更新方法，彻底删除原文件末尾多余的 _get_user_lock 和 _update_user_stats
     async def _update_user_stats(self, user_id: str):
         # [修复 Bug 1] 完全移除越权的锁逻辑，强制下推给专门管理状态的 StateEngine 执行原子操作，消灭脏写
