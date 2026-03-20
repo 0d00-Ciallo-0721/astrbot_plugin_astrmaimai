@@ -19,7 +19,7 @@ class Judge:
         # [新增] Sys1 专属群组级思考锁，防止同一群重入
         self.active_sys1_groups = set()
 
-async def evaluate(self, chat_id: str, message: str, is_force_wakeup: bool, persona_summary: str = "", window_events_count: int = 1, is_first_event_wakeup: bool = False) -> BrainActionPlan:
+    async def evaluate(self, chat_id: str, message: str, is_force_wakeup: bool, persona_summary: str = "", window_events_count: int = 1, is_first_event_wakeup: bool = False) -> BrainActionPlan:
         """
         输出结构化的 BrainActionPlan，融合了 HeartFlow 的评分机制和 3 态决策。
         [修改]: 注入系统级共享配置的短期历史对话，并进行 JSON 组件树的纯文本扁平化，提供极致的沉浸式语境。
