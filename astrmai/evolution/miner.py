@@ -28,7 +28,6 @@ class ExpressionMiner:
         # 1. 构建 Context
         context_str = self._build_context(messages)
         
-        # [省略下方原有 _build_context 和 prompt 构建及调用等未修改的代码...]
         # 2. 构建融合 Prompt
         prompt = f"""
 {context_str}
@@ -45,26 +44,36 @@ class ExpressionMiner:
 ]
 """
         try:
-            # [修改点] 调用数据处理接口
+            # [修改点] 调用数据处理接口，深度防御数据类型异常
             raw_result = await self.gateway.call_data_process_task(prompt=prompt, is_json=True)
+            
+            patterns_data = []
             if isinstance(raw_result, list):
                 patterns_data = raw_result
-            else:
-                patterns_data = self._parse_json(str(raw_result))
+            elif isinstance(raw_result, str):
+                patterns_data = self._parse_json(raw_result)
+            
+            # 确保最终一定是 list
+            if not isinstance(patterns_data, list):
+                patterns_data = []
             
             patterns = []
             import time
 
             for item in patterns_data:
-                if "situation" in item and "expression" in item:
-                    patterns.append(ExpressionPattern(
-                        situation=item["situation"],
-                        expression=item["expression"],
-                        group_id=group_id,
-                        weight=1.0,
-                        last_active_time=time.time(),
-                        create_time=time.time()
-                    ))
+                # 🟢 防御：严格检查 item 必须是字典，防止 LLM 在数组里混入字符串导致 TypeError
+                if isinstance(item, dict):
+                    situation = item.get("situation")
+                    expression = item.get("expression")
+                    if situation and expression:
+                        patterns.append(ExpressionPattern(
+                            situation=str(situation),
+                            expression=str(expression),
+                            group_id=group_id,
+                            weight=1.0,
+                            last_active_time=time.time(),
+                            create_time=time.time()
+                        ))
             return patterns
             
         except Exception as e:
@@ -94,7 +103,7 @@ class ExpressionMiner:
 
     async def mine_jargons(self, group_id: str, messages: List[MessageLog]) -> List[Jargon]:
         """
-        [新增] 从历史消息中挖掘群组黑话，并使用三步推断法尝试解析含义
+        [修改] 从历史消息中挖掘群组黑话，并使用三步推断法尝试解析含义
         """
         min_mining_context = getattr(self.config.evolution, 'min_mining_context', 20)
         if len(messages) < min_mining_context:
@@ -117,33 +126,41 @@ class ExpressionMiner:
 如果没有找到任何黑话，请返回 []。
 """
         try:
-            # [修改点] 调用数据处理接口
+            # [修改点] 深度防御数据类型异常
             raw_result = await self.gateway.call_data_process_task(prompt=extract_prompt, is_json=True)
+            
+            jargon_candidates = []
             if isinstance(raw_result, list):
                 jargon_candidates = raw_result
-            else:
-                jargon_candidates = self._parse_json(str(raw_result))
+            elif isinstance(raw_result, str):
+                jargon_candidates = self._parse_json(raw_result)
+            
+            # 确保最终一定是 list
+            if not isinstance(jargon_candidates, list):
+                jargon_candidates = []
             
             jargons = []
             import time
             
             for item in jargon_candidates:
-                word = item.get("jargon")
-                raw_context = item.get("raw_context")
-                if word and raw_context:
-                    # 步骤 2 & 3: 三步推断法解析含义
-                    inferred_data = await self._infer_jargon_meaning(word, raw_context)
-                    
-                    jargons.append(Jargon(
-                        content=word,
-                        raw_content=raw_context,
-                        meaning=inferred_data.get("meaning", ""),
-                        is_jargon=inferred_data.get("is_jargon", False),
-                        is_complete=inferred_data.get("is_complete", False),
-                        group_id=group_id,
-                        created_at=time.time(),
-                        updated_at=time.time()
-                    ))
+                # 🟢 防御：严格检查 item 必须是字典
+                if isinstance(item, dict):
+                    word = item.get("jargon")
+                    raw_context = item.get("raw_context")
+                    if word and raw_context:
+                        # 步骤 2 & 3: 三步推断法解析含义
+                        inferred_data = await self._infer_jargon_meaning(str(word), str(raw_context))
+                        
+                        jargons.append(Jargon(
+                            content=str(word),
+                            raw_content=str(raw_context),
+                            meaning=inferred_data.get("meaning", ""),
+                            is_jargon=inferred_data.get("is_jargon", False),
+                            is_complete=inferred_data.get("is_complete", False),
+                            group_id=group_id,
+                            created_at=time.time(),
+                            updated_at=time.time()
+                        ))
             return jargons
         except Exception as e:
             logger.error(f"[Evolution] 黑话挖掘异常: {e}")
@@ -152,7 +169,8 @@ class ExpressionMiner:
 
     async def _infer_jargon_meaning(self, jargon_word: str, raw_context: str) -> dict:
         """
-        [新增] 核心三步推断法 (融合上下文与基础词义)
+        [修改] 核心三步推断法 (融合上下文与基础词义)
+        防御性编程：重构类型判断与 JSON 提取逻辑，彻底消除 JSONDecodeError
         """
         infer_prompt = f"""
 **待推断词条**: {jargon_word}
@@ -171,24 +189,33 @@ class ExpressionMiner:
 }}
 """
         try:
-            # [修改点] 调用数据处理接口
             result = await self.gateway.call_data_process_task(prompt=infer_prompt, is_json=True)
-            if isinstance(result, dict) and "meaning" in result:
+            
+            # 🟢 [核心修复] 深度防御：严禁使用 str(dict) 导致单引号污染，只在确认为 string 时才进行正则提取
+            data = {}
+            if isinstance(result, dict):
                 data = result
-            else:
+            elif isinstance(result, str):
                 import re
                 import json
-                match = re.search(r'\{.*\}', str(result), re.DOTALL)
+                match = re.search(r'\{.*\}', result, re.DOTALL)
                 if match:
-                    data = json.loads(match.group(0))
-                else:
-                    data = {}
+                    try:
+                        data = json.loads(match.group(0))
+                    except json.JSONDecodeError:
+                        data = {}
+            
+            # 🟢 [核心修复] 安全寻址，哪怕大模型完全漏发某个 key，也能平滑降级
+            meaning = str(data.get("meaning", "")) if data.get("meaning") else ""
+            is_jargon = bool(data.get("is_jargon", False))
+            is_complete = bool(data.get("is_complete", False))
 
             return {
-                "meaning": data.get("meaning", ""),
-                "is_jargon": bool(data.get("is_jargon", False)),
-                "is_complete": bool(data.get("is_complete", False))
+                "meaning": meaning,
+                "is_jargon": is_jargon,
+                "is_complete": is_complete
             }
+            
         except Exception as e:
             logger.debug(f"[Evolution] 黑话推断解析失败: {e}")
             

@@ -149,6 +149,7 @@ class EvolutionManager:
         """
         目标分析器 (Reference: pfc.py GoalAnalyzer)
         动态分析当前的短期对话意图或目标。
+        [修改] 添加深度类型防御，安全降级 JSON 破损的情况
         """
         prompt = f"""
         作为对话意图分析器，请根据最近的对话上下文，用一句话（不超过20个字）总结当前对话的核心目标或主要话题。
@@ -159,16 +160,23 @@ class EvolutionManager:
         """
         try:
             result = await self.miner.gateway.call_data_process_task(prompt=prompt, is_json=True)
+            
+            # 🟢 防御：多层级安全拆包
             if isinstance(result, dict):
-                return result.get("goal", "陪伴用户，提供有趣且连贯的对话")
-            else:
+                return str(result.get("goal", "陪伴用户，提供有趣且连贯的对话"))
+            elif isinstance(result, str):
                 import json, re
-                # [修正] 修改为非贪婪模式 .*? ，防止 LLM 附加多余括号时导致 JSON 破损
-                match = re.search(r'\{.*?\}', str(result), re.DOTALL)
+                match = re.search(r'\{.*?\}', result, re.DOTALL)
                 if match:
-                    data = json.loads(match.group(0))
-                    return data.get("goal", "陪伴用户，提供有趣且连贯的对话")
-                return "陪伴用户，提供有趣且连贯的对话"
+                    try:
+                        data = json.loads(match.group(0))
+                        if isinstance(data, dict):
+                            return str(data.get("goal", "陪伴用户，提供有趣且连贯的对话"))
+                    except json.JSONDecodeError:
+                        pass # 捕获异常，平滑坠落到兜底分支
+                        
+            return "陪伴用户，提供有趣且连贯的对话"
+            
         except Exception as e:
             logger.error(f"[Evolution] 目标分析异常: {e}")
             return "陪伴用户，提供有趣且连贯的对话"

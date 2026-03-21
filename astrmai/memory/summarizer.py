@@ -53,6 +53,7 @@ class ChatHistorySummarizer:
         """
         核心记忆提炼流水线
         调用时机：当特定会话消息积累达到阈值时触发
+        [修改] 引入终极防御性编程，消除所有字典强取操作，彻底预防 LLM 漏字段导致的 KeyError 崩溃。
         """
         if not chat_history_text.strip():
             return
@@ -62,24 +63,50 @@ class ChatHistorySummarizer:
         # 1. 调用认知大脑进行结构化解析
         memory_data = await self.processor.process_conversation(chat_history_text)
         
+        # 🟢 [核心修复] 终极防御：如果 LLM 完全幻觉返回了非字典类型，直接拦截，保护后续流程
+        if not isinstance(memory_data, dict):
+            logger.debug(f"[Memory Summarizer] Session {session_id} 认知处理返回异常格式，跳过提取。")
+            return
+
+        # 🟢 [核心修复] 安全读取，告别 dict["key"]，使用 .get() 提供类型兜底
+        summary = memory_data.get("summary", "")
+        key_facts = memory_data.get("key_facts", [])
+        topics = memory_data.get("topics", [])
+        sentiment = memory_data.get("sentiment", "neutral")
+        
+        # 确保 importance 为数字类型防毒
+        try:
+            importance = float(memory_data.get("importance", 0.0))
+        except (ValueError, TypeError):
+            importance = 0.0
+            
+        # 防止 LLM 幻觉把数组输出成了单行字符串
+        if not isinstance(key_facts, list):
+            key_facts = [str(key_facts)] if key_facts else []
+        if not isinstance(topics, list):
+            topics = [str(topics)] if topics else []
+        
         # 2. 空转检测：如果没有任何有价值的事实，或者完全是系统默认回复，直接抛弃
-        if not memory_data["key_facts"] and memory_data["summary"] == "对话记录":
+        if not key_facts and summary == "对话记录":
             logger.debug(f"[Memory Summarizer] Session {session_id} 未提取到有效事实，跳过。")
             return
             
-        importance = memory_data["importance"]
-        
         # 3. 极速遗忘机制：重要性过低的内容不占用数据库和后续召回算力
         if importance < 0.2:
             logger.debug(f"[Memory Summarizer] 提取内容重要度过低 (importance={importance})，触发即时遗忘。")
             return
 
         # 4. 富文本组装：将多维数据渲染为对 System 2 的 Prompt 友好的易读格式
-        content_lines = [f"【摘要】{memory_data['summary']}"]
-        if memory_data["key_facts"]:
-            content_lines.append("【核心事实】\n- " + "\n- ".join(memory_data["key_facts"]))
-        if memory_data["topics"]:
-            content_lines.append(f"【话题标签】{', '.join(memory_data['topics'])}")
+        content_lines = [f"【摘要】{summary}"]
+        
+        # 清理数组中的空字符串或非法数据
+        valid_facts = [str(f) for f in key_facts if str(f).strip()]
+        if valid_facts:
+            content_lines.append("【核心事实】\n- " + "\n- ".join(valid_facts))
+            
+        valid_topics = [str(t) for t in topics if str(t).strip()]
+        if valid_topics:
+            content_lines.append(f"【话题标签】{', '.join(valid_topics)}")
             
         final_content = "\n".join(content_lines)
 
@@ -92,6 +119,6 @@ class ChatHistorySummarizer:
                 persona_id=persona_id,
                 importance=importance
             )
-            logger.info(f"[Memory Summarizer] 💾 已入库立体记忆 (Sentiment: {memory_data['sentiment']}, Importance: {importance})")
+            logger.info(f"[Memory Summarizer] 💾 已入库立体记忆 (Sentiment: {sentiment}, Importance: {importance})")
         except Exception as e:
             logger.error(f"[Memory Summarizer] 记忆入库失败: {e}", exc_info=True)
