@@ -108,15 +108,21 @@ class MemoryEngine:
             logger.error(f"[AstrMai] ❌ FaissVecDB 核心实例化失败: {e}。熔断保护 {backoff} 秒。", exc_info=True)
             return False
 
-        # 装载完成
+        # 🟢 [核心修复 1] 补全被遗漏的 BM25 延迟加载 (Lazy Load)
+        # 确保即使没有经过 main 生命周期，只要唤醒引擎，BM25 也必须通电！
+        if not self.bm25_retriever:
+            self.bm25_retriever = BM25Retriever(self.db_path)
+            await self.bm25_retriever.initialize()
+
+        # 装载完成：现在注入的绝不可能是 None
         self.vec_retriever = VectorRetriever(self.faiss_db, self.config)
         self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
         
         self._is_ready = True
         self._init_failures = 0  # 恢复健康状态后清零熔断计数
-        logger.info("[AstrMai] 🧬 向量引擎已成功唤醒并完成数据库通电 (FaissVecDB Ready)")
+        logger.info("[AstrMai] 🧬 混合记忆引擎已成功双路唤醒 (BM25 & FaissVecDB Ready)")
         return True
-    
+
     async def add_memory(self, content: str, session_id: str, persona_id: str = None, importance: float = 0.8):
         # 拦截校验：确保模型已挂载
         if not await self._ensure_faiss_initialized(): return
