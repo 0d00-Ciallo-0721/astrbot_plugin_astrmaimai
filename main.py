@@ -565,6 +565,13 @@ class AstrMaiPlugin(Star):
         if hasattr(self, 'attention_gate') and hasattr(self.attention_gate, '_background_tasks'):
             tasks_to_wait.extend(list(self.attention_gate._background_tasks))
             
+        # 🟢 [核心修复 Bug 3] 将进化模块与生命周期模块的异步任务纳入安全回收名单
+        if hasattr(self, 'evolution') and hasattr(self.evolution, '_background_tasks'):
+            tasks_to_wait.extend(list(self.evolution._background_tasks))
+
+        if hasattr(self, 'proactive_task') and hasattr(self.proactive_task, '_background_tasks'):
+            tasks_to_wait.extend(list(self.proactive_task._background_tasks))
+            
         if tasks_to_wait:
             logger.info(f"[AstrMai] ⏳ 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
             # 广播取消信号，激活 CancelledError 捕获快照
@@ -572,7 +579,7 @@ class AstrMaiPlugin(Star):
                 if not task.done():
                     task.cancel()
             
-            # 🟢 [核心修复 Bug 3] 给予最大 3.0 秒缓冲期，让所有 try...finally 彻底释放文件锁和 SQLite DB 句柄
+            # 给予最大 3.0 秒缓冲期，让所有 try...finally 彻底释放文件锁和 SQLite DB 句柄
             done, pending = await asyncio.wait(tasks_to_wait, timeout=3.0)
             if pending:
                 logger.warning(f"[AstrMai] ⚠️ 仍有 {len(pending)} 个任务未能优雅退出，已强行终止。")

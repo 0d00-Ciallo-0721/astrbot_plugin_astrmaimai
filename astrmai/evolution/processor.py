@@ -30,6 +30,27 @@ class EvolutionManager:
                 self._mining_locks[group_id] = asyncio.Lock()
             return self._mining_locks[group_id]
 
+    # [新增]
+    def _fire_background_task(self, coro):
+        """安全触发后台任务，接管游离 Task 防止 GC 销毁与静默崩溃"""
+        if not hasattr(self, '_background_tasks'):
+            self._background_tasks = set()
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._handle_task_result)
+
+    # [新增]
+    def _handle_task_result(self, task: asyncio.Task):
+        """清理已完成的任务并暴露异常"""
+        if hasattr(self, '_background_tasks'):
+            self._background_tasks.discard(task)
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"[Evolution Task Error] 潜意识挖掘任务发生异常: {exc}", exc_info=exc)
+        except asyncio.CancelledError:
+            pass    
+
     async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):
         """
         消息发送后的回调 (Subconscious Feedback Loop)
@@ -56,9 +77,8 @@ class EvolutionManager:
         else:
             self.db.add_message_log(group_id=event.unified_msg_origin, sender_id=str(bot_id), sender_name="SELF", content=processed_content)
         
-        # 4. 触发后台挖掘任务 (Fire-and-Forget)
-        asyncio.create_task(self._try_trigger_mining(event.unified_msg_origin))
-
+        # 4. 🟢 [核心修复 Bug 1] 触发后台挖掘任务，使用安全托管池代替裸奔的 create_task
+        self._fire_background_task(self._try_trigger_mining(event.unified_msg_origin))
     async def record_user_message(self, event: AstrMessageEvent):
         """记录用户消息 (在 System 1 阶段调用)"""
         # [修改] 使用异步方法记录用户消息

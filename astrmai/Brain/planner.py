@@ -74,8 +74,8 @@ class Planner:
         
         ctx = getattr(self.context_engine, 'context', None)
         
-        # 🟢 [核心修复 Bug 2] 极速模式下传入 None 而不是 []，斩断底层大模型的 JSON 工具幻觉
-        if is_all_mode or is_fast_mode:
+        # 🟢 [核心修复 Bug 2] 极速模式不再剥夺 tools，仅剥夺 RAG，确保动作能力（表情包等）正常运转
+        if is_all_mode:
             tools = None
             if ctx:
                 if hasattr(ctx, "set"):
@@ -100,10 +100,17 @@ class Planner:
                 ProactiveMemeTool(emotion_mapping=self.reply_engine.config.reply.emotion_mapping)
             ]
             if ctx:
-                if hasattr(ctx, "set"):
-                    ctx.set("disable_rag_injection", False)
-                elif hasattr(ctx, "shared_dict"):
-                    ctx.shared_dict["disable_rag_injection"] = False
+                if is_fast_mode:
+                    # 极速模式也禁用 RAG 减轻上下文包袱
+                    if hasattr(ctx, "set"):
+                        ctx.set("disable_rag_injection", True)
+                    elif hasattr(ctx, "shared_dict"):
+                        ctx.shared_dict["disable_rag_injection"] = True
+                else:
+                    if hasattr(ctx, "set"):
+                        ctx.set("disable_rag_injection", False)
+                    elif hasattr(ctx, "shared_dict"):
+                        ctx.shared_dict["disable_rag_injection"] = False
 
         tool_descs = "\n".join([f"- {t.name}: {t.description}" for t in tools]) if tools else "无可用工具"
         
@@ -137,4 +144,3 @@ class Planner:
             prompt=prompt_content,
             tools=tools
         )
-

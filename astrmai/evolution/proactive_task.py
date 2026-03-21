@@ -54,6 +54,34 @@ class ProactiveTask:
             self._task.cancel()
             logger.info("[AstrMai-Life] 🛑 生命循环已停止")
 
+    # [新增]
+    def _fire_background_task(self, coro):
+        """安全触发后台任务，接管游离 Task 防止 GC 销毁与静默崩溃"""
+        if not hasattr(self, '_background_tasks'):
+            self._background_tasks = set()
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._handle_task_result)
+
+    # [新增]
+    def _handle_task_result(self, task: asyncio.Task):
+        """清理已完成的任务并暴露异常"""
+        if hasattr(self, '_background_tasks'):
+            self._background_tasks.discard(task)
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"[Proactive Task Error] 生命周期后台任务发生异常: {exc}", exc_info=exc)
+        except asyncio.CancelledError:
+            pass
+
+    # [新增] 将带抖动的耗时任务独立出去
+    async def _run_daily_diary_task_with_jitter(self):
+        """异步执行午夜日记任务，包含随机睡眠防熔断"""
+        # 增加睡眠抖动 (Jitter)，打散多群组并发请求，防止熔断
+        await asyncio.sleep(random.randint(1, 300))
+        await self._run_daily_diary_task()
+
     async def _loop(self):
         """[修改] 维持后台心跳与任务调度"""
         while self._is_running:
@@ -72,6 +100,16 @@ class ProactiveTask:
                 if now - self._last_profile_run > 3600: # 每小时巡检一次侧写
                     await self._run_profiling_task()
                     self._last_profile_run = now
+
+                # 4. 🟢 [核心修复 Bug 2] 午夜记忆日记任务 (凌晨 3-4 点执行)
+                current_time_struct = time.localtime(now)
+                current_hour = current_time_struct.tm_hour
+                current_date = time.strftime("%Y-%m-%d", current_time_struct)
+                
+                if 3 <= current_hour < 4 and self._last_diary_date != current_date:
+                    self._last_diary_date = current_date
+                    # 将极其耗时的抖动休眠和日记任务抛入后台执行，绝不阻塞当前的心跳轮询！
+                    self._fire_background_task(self._run_daily_diary_task_with_jitter())
 
             except asyncio.CancelledError:
                 break

@@ -195,7 +195,8 @@ class ReplyEngine:
         tag = "neutral"
         force_meme_flag = False
         
-        _bypassed_tag = bypassed_tag or getattr(event, "astrmai_bypass_mood_analysis", None)
+        # 🟢 [彻底修复 Bug 1] 使用 get_extra 读取底层工具注入的 bypass 标签，而非 getattr
+        _bypassed_tag = bypassed_tag or event.get_extra("astrmai_bypass_mood_analysis", None)
         _window_events = window_events if window_events is not None else getattr(event, "astrmai_window_events", [])
         _anchor_event = anchor_event or getattr(event, "astrmai_anchor_event", None)
         _pending_actions = pending_actions if pending_actions is not None else getattr(event, "astrmai_pending_actions", [])

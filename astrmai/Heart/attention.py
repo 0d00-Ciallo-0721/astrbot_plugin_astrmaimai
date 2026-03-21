@@ -167,7 +167,8 @@ class AttentionGate:
             event.set_extra("is_fast_mode", True)
             event.set_extra("sys1_thought", "听到召唤，立即响应。")
             if self.sys2_process:
-                await self.sys2_process(event, [event])
+                # 🟢 [彻底修复 Bug 3] 将同步阻塞的 await 改为安全的 Fire-and-Forget 后台抛出，保护窗口计时不坍缩
+                self._fire_background_task(self.sys2_process(event, [event]))
             return "ENGAGED"
 
         is_cmd = await self.sensors.is_command(msg_str)

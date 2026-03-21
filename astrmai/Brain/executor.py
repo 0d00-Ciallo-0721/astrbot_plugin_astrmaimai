@@ -17,7 +17,7 @@ class ConcurrentExecutor:
         
         self.reply_engine = reply_engine
         self.config = config if config else gateway.config
-
+        
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None):
         """[修改] 执行最终规划动作并维持底层状态机握手"""
         chat_id = event.unified_msg_origin
@@ -27,15 +27,17 @@ class ConcurrentExecutor:
             logger.error(f"[{chat_id}] Agent 模型未配置且无备用池，无法执行动作。")
             return
 
-        max_steps = self.config.agent.max_steps
-        timeout = self.config.agent.timeout
+        # 🟢 [动态配置] 极速模式下极大收缩智能体反射步数，使其仅能做必要动作并极速回绝深层循环
+        is_fast_mode = event.get_extra("is_fast_mode", False)
+        max_steps = 1 if is_fast_mode else self.config.agent.max_steps
+        timeout = 15 if is_fast_mode else self.config.agent.timeout
         
         try:
             # 🟢 [核心修复 Bug 2] 严格先决控制 _is_final_reply_phase 标志，确保 memory hook 能够无缝匹配抓取
             event._is_final_reply_phase = True 
             
             if tools is None or len(tools) == 0:
-                logger.debug(f"[{chat_id}] ⚡ 极速模式：降级为纯文本生成器，剥离 Agent 环境...")
+                logger.debug(f"[{chat_id}] ⚡ 纯文本模式：降级为纯文本生成器，剥离 Agent 环境...")
                 from astrbot.core.agent.message import SystemMessageSegment, TextPart
                 contexts = [SystemMessageSegment(content=[TextPart(text=system_prompt)])]
                 last_error = ""
@@ -58,7 +60,7 @@ class ConcurrentExecutor:
                         logger.warning(f"[{chat_id}] ⚠️ 纯文本模型 {provider_id} 调用异常，尝试切换备用: {e}")
                         continue
                         
-                logger.error(f"[{chat_id}] ❌ 极速模式模型池耗尽: {last_error}")
+                logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
             else:
                 # 原有的 Tool Loop 逻辑
                 tool_set = ToolSet(tools)
