@@ -287,16 +287,21 @@ class AstrMaiPlugin(Star):
 
     def _is_framework_command(self, msg: str) -> bool:
         """
-        [新增] 实时探测并解析当前消息是否命中 AstrBot 底层注册的指令。
-        采用无状态设计 (Stateless)，完美兼容插件热加载，避免初始化时序导致的“幽灵指令”吞噬问题。
+        [深度修复版] 实时探测并解析当前消息是否命中 AstrBot 底层注册的指令。
+        采用无状态设计 (Stateless) 与最新 V4 API，完美免疫零宽字符污染。
         """
         if not msg:
             return False
             
-        # 1. 提取首词
-        first_word = msg.split()[0].lower()
+        # 1. 深度清洗干扰字符：强力移除 QQ 等平台自带的零宽空格 (\u200b) 
+        clean_text = msg.replace('\u200b', '').strip()
+        if not clean_text:
+            return False
+            
+        # 2. 提取首词
+        first_word = clean_text.split()[0].lower()
         
-        # 2. 剥离可能的前缀 (支持自定义前缀与默认斜杠)
+        # 3. 剥离可能的前缀 (支持自定义前缀与默认斜杠)
         clean_cmd = first_word
         prefixes = getattr(self.config.global_settings, 'command_prefixes', [])
         if not prefixes:
@@ -310,22 +315,47 @@ class AstrMaiPlugin(Star):
             if first_word.startswith("/"):
                 clean_cmd = first_word[1:]
                 
-        # 3. 构建实时指令池 (始终包含最核心系统指令兜底)
+        # 4. 构建实时指令池 (始终包含最核心系统指令兜底)
         registered_cmds = {"help", "plugin", "restart", "reload", "stop", "start", "list", "provider"}
         
+        # 🟢 [核心修复 A] 采用最新的 AstrBot V4 指令管理器 API 获取全局注册的指令及其别名 
         try:
-            # 动态穿透：直接读取 AstrBot 当前内存中最实时的命令管理器
-            cmd_mgr = getattr(self.context, 'command_manager', None)
-            if cmd_mgr and hasattr(cmd_mgr, 'commands'):
-                registered_cmds.update([str(k).lower() for k in cmd_mgr.commands.keys()])
+            from astrbot.core.star.command_management import list_commands
+            all_cmds = list_commands()
+            for cmd in all_cmds:
+                # 兼容底层 API 可能返回 dict 或 object 的多态情况
+                name = cmd.get("name") if isinstance(cmd, dict) else getattr(cmd, "name", "")
+                if name:
+                    registered_cmds.add(str(name).lower())
                 
-            plugin_mgr = getattr(self.context, 'plugin_manager', None)
-            if plugin_mgr and hasattr(plugin_mgr, 'commands'):
-                registered_cmds.update([str(k).lower() for k in plugin_mgr.commands.keys()])
+                aliases = cmd.get("aliases", []) if isinstance(cmd, dict) else getattr(cmd, "aliases", [])
+                if aliases:
+                    for alias in aliases:
+                        registered_cmds.add(str(alias).lower())
         except Exception as e:
-            logger.debug(f"[AstrMai-Filter] 探测系统指令域发生轻微异常 (已安全兜底): {e}")
+            from astrbot.api import logger
+            logger.debug(f"[AstrMai-Filter] 穿透 V4 指令域失败，降级回旧版内存嗅探: {e}")
+            # 兼容旧版的后备方案
+            try:
+                cmd_mgr = getattr(self.context, 'command_manager', None)
+                if cmd_mgr and hasattr(cmd_mgr, 'commands'):
+                    registered_cmds.update([str(k).lower() for k in cmd_mgr.commands.keys()])
+                    
+                plugin_mgr = getattr(self.context, 'plugin_manager', None)
+                if plugin_mgr and hasattr(plugin_mgr, 'commands'):
+                    registered_cmds.update([str(k).lower() for k in plugin_mgr.commands.keys()])
+            except Exception:
+                pass
+
+        # 🟢 [核心修复 B] 融合用户在 config 中手动配置的额外指令兜底黑名单 
+        try:
+            extra_cmds = getattr(self.config.system1, 'extra_command_list', [])
+            if extra_cmds:
+                registered_cmds.update([str(c).lower() for c in extra_cmds])
+        except Exception:
+            pass
             
-        # 4. 判断该词是否被框架注册为指令
+        # 5. 判断该词是否被框架注册为指令
         return clean_cmd in registered_cmds
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
