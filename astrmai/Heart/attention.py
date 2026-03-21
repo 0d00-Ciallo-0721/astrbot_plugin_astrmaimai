@@ -20,20 +20,20 @@ class SessionContext:
 
 
 class AttentionGate:
-    def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters, system2_callback, config=None, visual_cortex=None):
+    def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters, system2_callback, config=None, visual_cortex=None, persona_summarizer=None):
         self.state_engine = state_engine
         self.judge = judge
         self.sensors = sensors
         self.sys2_process = system2_callback 
         self.config = config if config else state_engine.config
         self.visual_cortex = visual_cortex # [新增] 多模态视觉皮层
+        self.persona_summarizer = persona_summarizer # [新增] 挂载人设压缩器
         
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
         
         # [彻底修复 Bug 3] 新增受控的后台任务追踪池
         self._background_tasks = set()
-
 
     # [新增] 从 Image 组件提取 Base64 数据的辅助方法
     async def _extract_image_base64(self, image_component: Any) -> str:
