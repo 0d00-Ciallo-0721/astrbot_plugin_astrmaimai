@@ -304,7 +304,6 @@ class ProactiveTask:
             await self.persistence.save_user_profile(profile)
             logger.info(f"[Life] ✅ 画像生成完成: {analysis[:20]}...")
 
-
     async def _run_profiling_task(self):
         """深度侧写任务：筛选互动频次达标的用户，更新其心理画像"""
         # 获取所有活跃的用户档案
@@ -320,7 +319,7 @@ class ProactiveTask:
                 try:
                     await self._generate_persona_analysis(profile)
                 except Exception as e:
-                    logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")          
+                    logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")
 
 
     async def _loop(self):

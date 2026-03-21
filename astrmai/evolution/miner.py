@@ -28,6 +28,8 @@ class ExpressionMiner:
         # 1. 构建 Context
         context_str = self._build_context(messages)
         
+        logger.info(f"[Evolution-Miner] 🧠 启动后台任务: 开始挖掘群组 {group_id} 的表达风格 (分析上下文: {len(messages)}条)...")
+        
         # 2. 构建融合 Prompt
         prompt = f"""
 {context_str}
@@ -74,10 +76,13 @@ class ExpressionMiner:
                             last_active_time=time.time(),
                             create_time=time.time()
                         ))
+
+            logger.info(f"[Evolution-Miner] ✅ 风格挖掘完成: 群组 {group_id} 成功提取 {len(patterns)} 条表达习惯。")
+                       
             return patterns
             
         except Exception as e:
-            logger.error(f"[Evolution] 风格与黑话挖掘失败: {e}")
+            logger.error(f"[Evolution-Miner] ❌ 风格挖掘任务失败: {e}")
             return []
 
     def _build_context(self, messages: List[MessageLog]) -> str:
@@ -111,6 +116,9 @@ class ExpressionMiner:
 
         context_str = self._build_context(messages)
         
+        logger.info(f"[Evolution-Miner] 🕵️ 启动后台任务: 开始挖掘群组 {group_id} 的潜藏黑话 (分析上下文: {len(messages)}条)...")
+        
+        # 👆【新增结束】
         # 步骤 1: 识别潜在黑话
         extract_prompt = f"""
 {context_str}
@@ -161,9 +169,15 @@ class ExpressionMiner:
                             created_at=time.time(),
                             updated_at=time.time()
                         ))
+            # 👇【新增】在此处插入成功结果日志
+            logger.info(f"[Evolution-Miner] ✅ 黑话挖掘完成: 群组 {group_id} 成功提取 {len(jargons)} 条特殊词汇。")
+            # 👆【新增结束】
+            
             return jargons
         except Exception as e:
-            logger.error(f"[Evolution] 黑话挖掘异常: {e}")
+            # 👇【修改】完善异常日志
+            logger.error(f"[Evolution-Miner] ❌ 黑话挖掘任务异常: {e}")
+            # 👆【修改结束】
             return []
 
 
@@ -172,6 +186,8 @@ class ExpressionMiner:
         [修改] 核心三步推断法 (融合上下文与基础词义)
         防御性编程：重构类型判断与 JSON 提取逻辑，彻底消除 JSONDecodeError
         """
+        logger.info(f"[Evolution-Miner] 🔍 正在调用 LLM 推断词汇含义: '{jargon_word}' ...")
+
         infer_prompt = f"""
 **待推断词条**: {jargon_word}
 **出现的上下文**: {raw_context}
@@ -209,7 +225,9 @@ class ExpressionMiner:
             meaning = str(data.get("meaning", "")) if data.get("meaning") else ""
             is_jargon = bool(data.get("is_jargon", False))
             is_complete = bool(data.get("is_complete", False))
-
+            
+            logger.info(f"[Evolution-Miner] 💡 '{jargon_word}' 推断完毕 -> 确认为黑话: {is_jargon} | 含义: {meaning[:30]}...")
+            # 👆【新增结束】
             return {
                 "meaning": meaning,
                 "is_jargon": is_jargon,

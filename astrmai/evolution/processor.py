@@ -151,6 +151,9 @@ class EvolutionManager:
         动态分析当前的短期对话意图或目标。
         [修改] 添加深度类型防御，安全降级 JSON 破损的情况
         """
+
+        logger.info(f"[Evolution-Processor] 🎯 启动后台任务: 开始分析会话目标 (chat_id: {chat_id})...")
+        
         prompt = f"""
         作为对话意图分析器，请根据最近的对话上下文，用一句话（不超过20个字）总结当前对话的核心目标或主要话题。
         对话上下文:
@@ -174,11 +177,17 @@ class EvolutionManager:
                             return str(data.get("goal", "陪伴用户，提供有趣且连贯的对话"))
                     except json.JSONDecodeError:
                         pass # 捕获异常，平滑坠落到兜底分支
-                        
-            return "陪伴用户，提供有趣且连贯的对话"
+            
+            # 👇【新增】在此处插入成功结果日志
+            logger.info(f"[Evolution-Processor] ✅ 会话目标分析完成: {goal_result}")
+            # 👆【新增结束】
+            
+            return goal_result
             
         except Exception as e:
-            logger.error(f"[Evolution] 目标分析异常: {e}")
+            # 👇【修改】完善异常日志
+            logger.error(f"[Evolution-Processor] ❌ 目标分析异常: {e}")
+            # 👆【修改结束】
             return "陪伴用户，提供有趣且连贯的对话"
 
 

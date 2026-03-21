@@ -58,14 +58,14 @@ class ChatHistorySummarizer:
         if not chat_history_text.strip():
             return
             
-        logger.debug(f"[Memory Summarizer] 🧠 正在对 Session {session_id} 进行多维认知降维...")
-        
+        logger.info(f"[Memory Summarizer] 🧠 启动后台任务: 正在对 Session {session_id} 的历史记录进行多维认知降维...")
+
         # 1. 调用认知大脑进行结构化解析
         memory_data = await self.processor.process_conversation(chat_history_text)
         
         # 🟢 [核心修复] 终极防御：如果 LLM 完全幻觉返回了非字典类型，直接拦截，保护后续流程
         if not isinstance(memory_data, dict):
-            logger.debug(f"[Memory Summarizer] Session {session_id} 认知处理返回异常格式，跳过提取。")
+            logger.warning(f"[Memory Summarizer] ⚠️ Session {session_id} 认知处理返回异常格式，跳过提取。")
             return
 
         # 🟢 [核心修复] 安全读取，告别 dict["key"]，使用 .get() 提供类型兜底
@@ -88,12 +88,14 @@ class ChatHistorySummarizer:
         
         # 2. 空转检测：如果没有任何有价值的事实，或者完全是系统默认回复，直接抛弃
         if not key_facts and summary == "对话记录":
-            logger.debug(f"[Memory Summarizer] Session {session_id} 未提取到有效事实，跳过。")
+            logger.info(f"[Memory Summarizer] ⏭️ Session {session_id} 未提取到有效事实或信息，跳过入库。")
+            # 👆【修改结束】
             return
             
         # 3. 极速遗忘机制：重要性过低的内容不占用数据库和后续召回算力
         if importance < 0.2:
-            logger.debug(f"[Memory Summarizer] 提取内容重要度过低 (importance={importance})，触发即时遗忘。")
+            logger.info(f"[Memory Summarizer] 📉 提取内容重要度过低 (importance={importance})，触发即时遗忘机制。")
+            # 👆【修改结束】
             return
 
         # 4. 富文本组装：将多维数据渲染为对 System 2 的 Prompt 友好的易读格式
@@ -110,15 +112,20 @@ class ChatHistorySummarizer:
             
         final_content = "\n".join(content_lines)
 
+        # 👇【新增】在压入数据库前，打印 LLM 究竟提炼了什么核心要素
+        logger.info(f"[Memory Summarizer] ✨ Session {session_id} 记忆提炼成功 -> 摘要: {summary[:20]}... | 事实数: {len(valid_facts)} | 标签数: {len(valid_topics)} | 重要度: {importance}")
+        # 👆【新增结束】
+
         # 5. 压入统一底层引擎
         try:
-            # 在阶段一重构中，engine.add_memory 接收 importance
             await self.engine.add_memory(
                 content=final_content,
                 session_id=str(session_id),
                 persona_id=persona_id,
                 importance=importance
             )
-            logger.info(f"[Memory Summarizer] 💾 已入库立体记忆 (Sentiment: {sentiment}, Importance: {importance})")
+            # 👇【修改】强化入库成功日志
+            logger.info(f"[Memory Summarizer] 💾 已将立体记忆成功压入 Faiss 向量数据库 (Sentiment: {sentiment})。")
+            # 👆【修改结束】
         except Exception as e:
-            logger.error(f"[Memory Summarizer] 记忆入库失败: {e}", exc_info=True)
+            logger.error(f"[Memory Summarizer] ❌ 记忆向量库写入失败: {e}", exc_info=True)
