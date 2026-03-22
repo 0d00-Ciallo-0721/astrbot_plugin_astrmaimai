@@ -35,7 +35,7 @@ class PromptRefiner:
 
         chat_id = event.unified_msg_origin
         
-        # [新增] 读取极速模式信标
+        # 读取极速模式信标
         retrieve_keys = event.get_extra("retrieve_keys", [])
         is_fast_mode = "CORE_ONLY" in retrieve_keys
 
@@ -44,7 +44,7 @@ class PromptRefiner:
         # ==========================================
         injection = ""
         current_query = event.message_str
-        # [修改] 极速穿透模式下强制短路 RAG 向量检索
+        # [修改] 极速穿透模式下强制短路 RAG 向量检索（保持原本的性能优化点，不查外部知识库）
         if self.memory_engine and current_query and not is_fast_mode:
             memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
             if memory_text and "什么也没想起来" not in memory_text:
@@ -55,51 +55,25 @@ class PromptRefiner:
         # 3. 底层历史拉取与剧本化格式转换
         # ==========================================
         history_script = "无近期历史记录。"
-        # [修改] 极速穿透模式下强制短路历史长文组装
-        if is_fast_mode:
-            history_script = "（极速唤醒模式：已省略长程历史，请直接回答当前呼唤）"
-        else:
-            anchor_event = event.get_extra("astrmai_anchor_event")
-            anchor_text = anchor_event.message_str.strip() if anchor_event else None
+        
+        # [核心改造] 解除极速模式的历史拦截。
+        # 即使是极速唤醒模式，也允许拉取完整历史，以防止回复牛头不对马嘴。
+        anchor_event = event.get_extra("astrmai_anchor_event")
+        anchor_text = anchor_event.message_str.strip() if anchor_event else None
+        
+        conv_mgr = context.conversation_manager
+        curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
+        conversation = await conv_mgr.get_conversation(chat_id, curr_cid)
+        
+        history_lines = []
+        if conversation and hasattr(conversation, "history") and conversation.history:
+            raw_history = conversation.history
+            cutoff_idx = len(raw_history)
             
-            conv_mgr = context.conversation_manager
-            curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
-            conversation = await conv_mgr.get_conversation(chat_id, curr_cid)
-            
-            history_lines = []
-            if conversation and hasattr(conversation, "history") and conversation.history:
-                raw_history = conversation.history
-                cutoff_idx = len(raw_history)
-                
-                # 定位滑动窗口的断点
-                if anchor_text:
-                    for i in range(len(raw_history) - 1, -1, -1):
-                        msg_data = raw_history[i]
-                        content = ""
-                        if isinstance(msg_data, dict):
-                            if 'content' in msg_data:
-                                if isinstance(msg_data['content'], str):
-                                    content = msg_data['content']
-                                elif isinstance(msg_data['content'], list):
-                                    content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
-                        elif hasattr(msg_data, 'content'):
-                            if isinstance(msg_data.content, str):
-                                content = msg_data.content
-                            elif isinstance(msg_data.content, list):
-                                content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
-                                
-                        if anchor_text in content:
-                            cutoff_idx = i
-                            break
-                            
-                # 向上拉取指定的历史条数并进行彻底的纯文本转换
-                # [阶段二修改] 替换为最新的 history_pull_count 配置
-                fetch_count = getattr(self.config.attention, 'history_pull_count', 20) if self.config else 20
-                start_idx = max(0, cutoff_idx - fetch_count)
-                valid_history = raw_history[start_idx:cutoff_idx]
-                
-                for msg_data in valid_history:
-                    role = msg_data.get("role", "") if isinstance(msg_data, dict) else getattr(msg_data, "role", "")
+            # 定位滑动窗口的断点
+            if anchor_text:
+                for i in range(len(raw_history) - 1, -1, -1):
+                    msg_data = raw_history[i]
                     content = ""
                     if isinstance(msg_data, dict):
                         if 'content' in msg_data:
@@ -113,21 +87,47 @@ class PromptRefiner:
                         elif isinstance(msg_data.content, list):
                             content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
                             
-                    if not content: continue
+                    if anchor_text in content:
+                        cutoff_idx = i
+                        break
                         
-                    if role == "user":
-                        # 尝试切分出用户姓名
-                        match = re.match(r"^(.*?):\s*(.*)$", content, re.DOTALL)
-                        if match:
-                            sender, text = match.groups()
-                            history_lines.append(f"[{sender}] 说: {text}")
-                        else:
-                            history_lines.append(f"[群友/用户] 说: {content}")
-                    elif role == "assistant":
-                        history_lines.append(f"[我] 说: {content}")
+            # 向上拉取指定的历史条数并进行彻底的纯文本转换
+            fetch_count = getattr(self.config.attention, 'history_pull_count', 20) if self.config else 20
+            start_idx = max(0, cutoff_idx - fetch_count)
+            valid_history = raw_history[start_idx:cutoff_idx]
+            
+            for msg_data in valid_history:
+                role = msg_data.get("role", "") if isinstance(msg_data, dict) else getattr(msg_data, "role", "")
+                content = ""
+                if isinstance(msg_data, dict):
+                    if 'content' in msg_data:
+                        if isinstance(msg_data['content'], str):
+                            content = msg_data['content']
+                        elif isinstance(msg_data['content'], list):
+                            content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
+                elif hasattr(msg_data, 'content'):
+                    if isinstance(msg_data.content, str):
+                        content = msg_data.content
+                    elif isinstance(msg_data.content, list):
+                        content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
+                        
+                if not content: continue
+                    
+                if role == "user":
+                    # 尝试切分出用户姓名
+                    match = re.match(r"^(.*?):\s*(.*)$", content, re.DOTALL)
+                    if match:
+                        sender, text = match.groups()
+                        history_lines.append(f"[{sender}] 说: {text}")
+                    else:
+                        history_lines.append(f"[群友/用户] 说: {content}")
+                elif role == "assistant":
+                    history_lines.append(f"[我] 说: {content}")
 
-            if history_lines:
-                history_script = "\n".join(history_lines)
+        if history_lines:
+            history_script = "\n".join(history_lines)
+            if is_fast_mode:
+                history_script = f"（极速唤醒：已同步最近 {len(history_lines)} 条群聊剧本）\n" + history_script
 
         # ==========================================
         # 4. 当前视界提取与标签替换
@@ -163,26 +163,23 @@ class PromptRefiner:
         preserved_messages = []
         for i, msg in enumerate(req.messages):
             if i < current_user_msg_idx:
-                # 【防污染隔离】丢弃所有常规的纯文本 user/assistant 历史（因为已经放进剧本了）
-                # 【工具保护】绝对保留所有含有 tool_calls, tool_call_id 的记录，防止大模型执行中断
+                # 【防污染隔离】丢弃所有常规的纯文本 user/assistant 历史
+                # 【工具保护】绝对保留所有含有 tool_calls, tool_call_id 的记录
                 if getattr(msg, "tool_calls", None) or getattr(msg, "tool_call_id", None) or msg.role not in ["user", "assistant"]:
                     preserved_messages.append(msg)
             elif i == current_user_msg_idx:
-                # 对当前的最终输入包裹上“导演旁白”，强化角色沉浸，拒绝客服前缀
+                # 强化角色沉浸
                 original_content = msg.content
                 
-                # [修改] 根据模式动态强化导演旁白的压迫感与动作暗示
                 if is_fast_mode:
-                    director_voice = "【极速唤醒】立刻作答！请直接沉浸在角色中说出台词，不要带任何角色名前缀！"
+                    director_voice = "【极速唤醒】虽然参考了前面的剧本，但请保持回复极其简短、直接，不要带任何角色名前缀！"
                 else:
-                    director_voice = "【动作提示】请先判断是否需要调用工具（如 query_person_profile 查阅羁绊等）。如果不需要，请直接沉浸在角色中说出你的台词，不要带任何角色名前缀！"
+                    director_voice = "【动作提示】请先判断是否需要调用工具。如果不需要，请直接沉浸在角色中说出你的台词，不要带任何角色名前缀！"
                     
                 msg.content = f"(导演旁白：请仔细阅读设定和前面的剧本。这是当前你看到的最新消息：\n{original_content}\n\n>> {director_voice})"
                 preserved_messages.append(msg)
             else:
-                # 保护当前可能正在进行的流式/迭代工具调用
                 preserved_messages.append(msg)
 
-        # 覆写底层消息矩阵，消除 JSON 污染
         req.messages = preserved_messages
-        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成。底层历史已提取并清除，工具上下文安全保护中。")
+        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成（模式: {'极速' if is_fast_mode else '标准'}）。历史已提取，工具上下文受保护。")

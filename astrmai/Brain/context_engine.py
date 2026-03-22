@@ -165,7 +165,7 @@ class ContextEngine:
             role_block = f"{raw_persona}"
             style_guide = "" 
         elif is_fast_mode:
-            role_block = f"{persona_summary}"
+            role_block = f"{raw_persona}"
         else:
             role_block = f"{persona_summary}"
             if valid_keys:

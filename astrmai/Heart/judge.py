@@ -94,7 +94,7 @@ class Judge:
                     return BrainActionPlan(action="IGNORE", thought="好累...不想说话...", necessity=0.0)
 
             # =====================================================================
-            # 🟢 【架构级升级】: 提取短程历史记忆，并进行组件扁平化 (Flattening)
+            # 🟢 【架构级升级】: 提取与 System 2 对齐的历史记忆
             # =====================================================================
             def _flatten_content(raw_val: any) -> str:
                 """内部防御性解析器：将底层 JSON 格式的消息组件数组降维成纯文字剧本"""
@@ -125,8 +125,8 @@ class Judge:
 
             history_context = ""
             try:
-                sys2_config = getattr(self.config, "system2", None)
-                history_limit = getattr(sys2_config, "history_messages_count", 5) if sys2_config else 5
+                # [核心对齐点] 改为读取 attention 配置中的 history_pull_count，默认 20 条
+                history_limit = getattr(self.config.attention, 'history_pull_count', 20)
                 
                 history_records = []
                 persistence = getattr(self.state_engine, "persistence", None)
@@ -138,7 +138,8 @@ class Judge:
                         history_records = await persistence.get_chat_history(chat_id, limit=history_limit)
                         
                 if history_records:
-                    history_context = f"【历史对话语境 (前 {history_limit} 条)】\n"
+                    # 动态提示当前获取的历史条数
+                    history_context = f"【历史对话语境 (前 {len(history_records)} 条)】\n"
                     for record in history_records:
                         if isinstance(record, dict):
                             sender = record.get("sender_name") or record.get("role") or "User"
