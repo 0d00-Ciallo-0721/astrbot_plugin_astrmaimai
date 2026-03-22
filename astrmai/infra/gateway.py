@@ -50,7 +50,7 @@ class GlobalModelGateway:
     
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None) -> Union[str, Dict[str, Any]]: 
-        """统一网关底层调用引擎 (动态凭证注入防递归版 + 异常快速熔断)"""
+        """统一网关底层调用引擎 (动态凭证注入防递归版 + 异常快速熔断 + 视觉临时文件防泄漏)"""
         
         modified_system_prompt = f"{system_prompt}\n\n{self.internal_marker}" if system_prompt else self.internal_marker
         
@@ -65,6 +65,7 @@ class GlobalModelGateway:
         for model_id in models:
             logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
             for attempt in range(max_retries + 1):
+                temp_files_to_clean = []  # 🔴 核心修改：在 try 外层初始化清理名单，确保 finally 能访问
                 try:
                     contexts = []
                     if modified_system_prompt:
@@ -78,17 +79,31 @@ class GlobalModelGateway:
                             if current_prompt:
                                 user_content.append(TextPart(text=current_prompt))
                             for url in image_urls:
+                                # -------- 核心修改部分开始 --------
                                 if url.startswith("data:image"):
-                                    import base64
-                                    # 剥离 "data:image/jpeg;base64," 前缀
-                                    b64_data = url.split(",", 1)[1]
-                                    # 将 Base64 解码为原始 bytes 字节流
-                                    img_bytes = base64.b64decode(b64_data)
-                                    # 通过 file 参数传递字节流，避免触发本地路径检测
-                                    user_content.append(ImagePart(file=img_bytes))
+                                    import tempfile, os, base64
+                                    try:
+                                        # 分离头部和 base64 数据
+                                        header, encoded = url.split(",", 1)
+                                        ext = header.split(";")[0].split("/")[1]
+                                        if ext == "jpeg": ext = "jpg"
+                                        img_bytes = base64.b64decode(encoded)
+
+                                        # 创建真实的本地临时文件
+                                        fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
+                                        with os.fdopen(fd, 'wb') as f:
+                                            f.write(img_bytes)
+
+                                        # 传入绝对短路径，完美规避操作系统的文件名长度检测
+                                        user_content.append(ImagePart(file=temp_path))
+                                        temp_files_to_clean.append(temp_path)  # 🔴 登记到清理名单
+                                    except Exception as e:
+                                        logger.error(f"[AstrMai-Gateway] 临时文件转换失败: {e}")
+                                        user_content.append(ImagePart(url=url))
                                 else:
                                     user_content.append(ImagePart(url=url))
-                                user_content.append(ImagePart(url=url))
+                                # -------- 核心修改部分结束 --------
+                                
                             contexts.append(UserMessageSegment(content=user_content))
                             current_prompt = "" 
                         else:
@@ -132,8 +147,20 @@ class GlobalModelGateway:
                     last_error = str(e)
                     logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
                     if attempt < max_retries:
+                        import asyncio
                         await asyncio.sleep((backoff_factor + retry_penalty) ** attempt) 
-            
+                        
+                # 🔴 核心修改：终极物理防泄漏屏障
+                finally:
+                    import os
+                    for temp_path in temp_files_to_clean:
+                        if os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                                logger.debug(f"[AstrMai-Gateway] 🧹 已安全销毁临时视觉文件: {temp_path}")
+                            except Exception as e:
+                                logger.error(f"[AstrMai-Gateway] ⚠️ 无法删除临时视觉文件 {temp_path}: {e}")
+
         logger.error(f"[AstrMai-Gateway] ❌ 所有模型池耗尽，最终异常: {last_error}")
         return {} if is_json else ""
     
