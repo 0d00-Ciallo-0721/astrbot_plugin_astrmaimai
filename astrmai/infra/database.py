@@ -220,7 +220,7 @@ class DatabaseService:
         astr_ctx=None  # AstrBot Context, 用于阶段二的会话历史拉取
     ) -> Optional[tuple[str, str]]:
         """
-        [修改] 时空双维度实体解析器 (增强正则提取版)
+        [修改] 时空双维度实体解析器 (增强正则提取版 + 当前事件 At 组件扫描兜底)
         支持直接提取大模型传入的带有 (QQ) 的格式，极大提升实体解析成功率。
         """
         if not target_name or not current_event:
@@ -249,6 +249,23 @@ class DatabaseService:
             extracted_id = match.group(2).strip()
             # 既然大模型已经把 ID 完整传过来了，直接采信，O(1) 返回，免去后续遍历查库
             return (extracted_id, group_id)
+            
+        # 🟢 [新增] 拦截模式 B.5：物理环境兜底检查 (扫描用户当前消息中的 @ 组件)
+        # 解决群友主动要求机器人去戳另一个人的场景 (如 "帮我戳 @某某")，即使大模型变笨只传了名字，也能锁头定位。
+        import astrbot.api.message_components as Comp
+        if current_event.message_obj and hasattr(current_event.message_obj, 'message'):
+            at_targets = []
+            self_id = str(current_event.get_self_id())
+            for comp in current_event.message_obj.message:
+                if isinstance(comp, Comp.At):
+                    at_qq = str(comp.qq)
+                    # 排除机器人自己
+                    if at_qq != self_id:
+                        at_targets.append(at_qq)
+            
+            # 如果用户的消息里只明确 @ 了一个人，极大概率就是大模型想要锁定的目标
+            if len(at_targets) == 1:
+                return (at_targets[0], group_id)
 
         # 🟢 4. 拦截模式 C：如果只是单纯的姓名，继续走下方的时空搜索逻辑
         # 注意：后续的判断都要使用 clean_name 进行比对

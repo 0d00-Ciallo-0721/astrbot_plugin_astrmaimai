@@ -230,14 +230,15 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
         "当你需要主动呼叫、强力提醒群内的某个人，或者想对特定成员的言论进行针对性回复/反驳时调用此工具。"
         "⚠️注意：你绝对不能 @ 你自己。"
     )
-    db_service: Any = None  # 依赖注入数据库服务用于实体反推
+    db_service: Any = None 
 
+    # [修改] 强化 target_name 描述，诱导 LLM 传入数字 ID
     parameters: dict = Field(default_factory=lambda: {
         "type": "object",
         "properties": {
             "target_name": {
                 "type": "string",
-                "description": "你需要 @ 的目标用户的名字（必须严格是你刚刚在聊天记录中看到的名字）"
+                "description": "你需要 @ 的目标用户的名字。（必须严格是你刚刚在聊天记录中看到的名字）🚨 强烈要求：如果你在上下文中看到该用户名字后附带了数字ID（如：张三(123456)），请【直接填入纯数字ID】或完整填入【张三(123456)】，千万不要只填名字以防丢失实体！"
             }
         },
         "required": ["target_name"]
@@ -304,7 +305,7 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
         "properties": {
             "target_name": {
                 "type": "string",
-                "description": "你想戳的用户的名字。如果不填，将默认戳当前正在和你对话的用户。"
+               "description": "你想戳的用户的名字。🚨 强烈要求：如果你在聊天上下文中看到该用户名字后带有数字ID（如：张三(123456)），请务必【直接填入纯数字ID】或完整填入【张三(123456)】！如果不填，默认戳当前和你对话的用户。"
             }
         }
     })
