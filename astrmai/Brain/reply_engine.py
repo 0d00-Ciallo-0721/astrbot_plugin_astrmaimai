@@ -244,17 +244,19 @@ class ReplyEngine:
             )
 
             if target_user_id:
-                logger.info(f"[ReplyEngine] 🤝 情绪路由器裁决完毕，准备为核心引导用户 {target_user_id} 结算好感度。")
+                # [修复 Bug 2]: 强制将其转换为字符串，防止引发 StateEngine 字典缓存击穿与双重锁
+                safe_target_uid = str(target_user_id)
+                logger.info(f"[ReplyEngine] 🤝 情绪路由器裁决完毕，准备为核心引导用户 {safe_target_uid} 结算好感度。")
+                
                 if hasattr(self.state_engine, 'calculate_and_update_affection'):
                     await self.state_engine.calculate_and_update_affection(
-                        user_id=target_user_id,
+                        user_id=safe_target_uid,
                         group_id=chat_id,
                         mood_tag=tag,
                         intensity=1.0
                     )
             else:
                 logger.debug(f"[ReplyEngine] 🤷‍♂️ 情绪路由器判为流局，仅更新系统心情，跳过所有用户的好感度结算。")
-            
         except AttributeError as e:
             logger.warning(f"[Reply] 情绪模块 API 漂移/失效: {e}")
             tag = "neutral"

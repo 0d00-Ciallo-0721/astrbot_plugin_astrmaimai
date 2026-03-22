@@ -213,8 +213,8 @@ class StateEngine:
 
 
     async def calculate_and_update_affection(self, user_id: str, group_id: str, mood_tag: str, intensity: float = 1.0):
-        """[修正] 修复好感度清零 Bug 与事件总线死锁问题"""
-        # 1. 在锁外安全地进行懒加载与数据库读取（get_user_profile 自带防击穿锁）
+        """[修正] 修复好感度静默流局 Bug 与字典错配问题"""
+        # 1. 在锁外安全地进行懒加载与数据库读取
         profile = await self.get_user_profile(user_id)
         
         is_changed = False
@@ -222,32 +222,35 @@ class StateEngine:
         old_score = 0.0
         
         # 2. 进入轻量级临界区，仅执行数值结算
-        async with self._get_user_lock(user_id): # [修改] 切换细粒度锁
-            # 定义情绪对好感度的影响权重
+        async with self._get_user_lock(user_id):
+            # [修复 Bug 1] 完全对齐 config.py 的 emotion_mapping 输出域
             affection_deltas = {
                 "happy": 2.0,
-                "excited": 3.0,
-                "playful": 1.5,
-                "calm": 0.5,
+                "surprise": 1.0,
+                "curious": 0.5,
+                "neutral": 0.0,
                 "sad": -1.0,
-                "angry": -3.0,
-                "anxious": -1.0
+                "angry": -2.0
             }
             
             delta = affection_deltas.get(mood_tag, 0.0) * intensity
-            
-            # 应用变化并限制在 -100 到 100 之间
             old_score = profile.social_score
-            profile.social_score = max(-100.0, min(100.0, profile.social_score + delta))
             
-            if old_score != profile.social_score:
-                profile.is_dirty = True
-                is_changed = True
+            if delta != 0.0:
+                # 应用变化并限制在 -100 到 100 之间
+                profile.social_score = max(-100.0, min(100.0, profile.social_score + delta))
+                if old_score != profile.social_score:
+                    profile.is_dirty = True
+                    is_changed = True
 
-        # 3. 在锁外安全地触发事件总线广播，防止监听器反向请求状态导致死锁
+        # 3. 在锁外安全地触发事件总线广播
         if is_changed:
-            logger.debug(f"[StateEngine] 💗 好感度更新: 用户 {user_id} 在群 {group_id} 的好感度 {old_score:.1f} -> {profile.social_score:.1f} (Δ{delta:.1f})")
-            await self.event_bus.trigger_affection_change()
+            logger.info(f"[StateEngine] 💗 好感度更新: 用户 {user_id} 在群 {group_id} 的好感度 {old_score:.1f} -> {profile.social_score:.1f} (Δ{delta:.1f})")
+            if hasattr(self.event_bus, 'trigger_affection_change'):
+                await self.event_bus.trigger_affection_change()
+        else:
+            # 增加兜底日志，让开发者知道程序活得好好的，只是因为权重问题没变动
+            logger.debug(f"[StateEngine] ⚖️ 好感度结算完成: 用户 {user_id} 当前情绪标签 ({mood_tag}) 无明显波动权重或已达阈值，数值维持 {old_score:.1f}。")
 
             
     async def should_drop_by_energy(self, chat_id: str, msg_count: int) -> bool:

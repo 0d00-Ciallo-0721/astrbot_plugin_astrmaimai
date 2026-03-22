@@ -78,6 +78,16 @@ class GlobalModelGateway:
                             if current_prompt:
                                 user_content.append(TextPart(text=current_prompt))
                             for url in image_urls:
+                                if url.startswith("data:image"):
+                                    import base64
+                                    # 剥离 "data:image/jpeg;base64," 前缀
+                                    b64_data = url.split(",", 1)[1]
+                                    # 将 Base64 解码为原始 bytes 字节流
+                                    img_bytes = base64.b64decode(b64_data)
+                                    # 通过 file 参数传递字节流，避免触发本地路径检测
+                                    user_content.append(ImagePart(file=img_bytes))
+                                else:
+                                    user_content.append(ImagePart(url=url))
                                 user_content.append(ImagePart(url=url))
                             contexts.append(UserMessageSegment(content=user_content))
                             current_prompt = "" 
