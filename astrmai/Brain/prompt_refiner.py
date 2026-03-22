@@ -1,5 +1,6 @@
 import re
 import html
+import json  # [新增] 用于处理被序列化为字符串的历史记录
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.api import logger
@@ -25,9 +26,6 @@ class PromptRefiner:
             disable_rag = context.get("disable_rag_injection")
         elif hasattr(context, "shared_dict"):
             disable_rag = context.shared_dict.get("disable_rag_injection", False)
-            
-        if disable_rag:
-            return
 
         for msg in req.system_message + req.messages:
             if isinstance(msg.content, str):
@@ -44,8 +42,7 @@ class PromptRefiner:
         # ==========================================
         injection = ""
         current_query = event.message_str
-        # [修改] 极速穿透模式下强制短路 RAG 向量检索（保持原本的性能优化点，不查外部知识库）
-        if self.memory_engine and current_query and not is_fast_mode:
+        if not disable_rag and self.memory_engine and current_query and not is_fast_mode:
             memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
             if memory_text and "什么也没想起来" not in memory_text:
                 safe_memory_text = html.escape(memory_text)
@@ -56,8 +53,6 @@ class PromptRefiner:
         # ==========================================
         history_script = "无近期历史记录。"
         
-        # [核心改造] 解除极速模式的历史拦截。
-        # 即使是极速唤醒模式，也允许拉取完整历史，以防止回复牛头不对马嘴。
         anchor_event = event.get_extra("astrmai_anchor_event")
         anchor_text = anchor_event.message_str.strip() if anchor_event else None
         
@@ -67,54 +62,71 @@ class PromptRefiner:
         
         history_lines = []
         if conversation and hasattr(conversation, "history") and conversation.history:
-            raw_history = conversation.history
+            raw_history = list(conversation.history)
             cutoff_idx = len(raw_history)
             
             # 定位滑动窗口的断点
             if anchor_text:
+                clean_anchor = re.sub(r'\s+', '', anchor_text)
                 for i in range(len(raw_history) - 1, -1, -1):
                     msg_data = raw_history[i]
                     content = ""
-                    if isinstance(msg_data, dict):
-                        if 'content' in msg_data:
-                            if isinstance(msg_data['content'], str):
-                                content = msg_data['content']
-                            elif isinstance(msg_data['content'], list):
-                                content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
+                    
+                    # 🟢 [终极修复]：增加对 <class 'str'> 的反序列化与纯文本兜底
+                    if isinstance(msg_data, str):
+                        try:
+                            parsed = json.loads(msg_data)
+                            if isinstance(parsed, dict):
+                                c = parsed.get('content', '')
+                                content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
+                            else:
+                                content = msg_data
+                        except json.JSONDecodeError:
+                            content = msg_data  # 纯文本兜底
+                    elif isinstance(msg_data, dict):
+                        c = msg_data.get('content', '')
+                        content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
                     elif hasattr(msg_data, 'content'):
-                        if isinstance(msg_data.content, str):
-                            content = msg_data.content
-                        elif isinstance(msg_data.content, list):
-                            content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
+                        c = getattr(msg_data, 'content', '')
+                        content = c if isinstance(c, str) else "".join([getattr(part, "text", "") for part in c if hasattr(part, "text")])
                             
-                    if anchor_text in content:
+                    clean_content = re.sub(r'\s+', '', content) if content else ""
+                    if clean_anchor and clean_anchor in clean_content:
                         cutoff_idx = i
                         break
                         
-            # 向上拉取指定的历史条数并进行彻底的纯文本转换
             fetch_count = getattr(self.config.attention, 'bg_pool_size', 20) if self.config else 20
             start_idx = max(0, cutoff_idx - fetch_count)
             valid_history = raw_history[start_idx:cutoff_idx]
             
             for msg_data in valid_history:
-                role = msg_data.get("role", "") if isinstance(msg_data, dict) else getattr(msg_data, "role", "")
+                role = ""
                 content = ""
-                if isinstance(msg_data, dict):
-                    if 'content' in msg_data:
-                        if isinstance(msg_data['content'], str):
-                            content = msg_data['content']
-                        elif isinstance(msg_data['content'], list):
-                            content = "".join([c.get("text", "") for c in msg_data['content'] if c.get("type") == "text"])
+                
+                # 再次应用降维解析
+                if isinstance(msg_data, str):
+                    try:
+                        parsed = json.loads(msg_data)
+                        if isinstance(parsed, dict):
+                            role = parsed.get("role", "")
+                            c = parsed.get("content", "")
+                            content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
+                        else:
+                            content = msg_data
+                    except json.JSONDecodeError:
+                        content = msg_data
+                elif isinstance(msg_data, dict):
+                    role = msg_data.get("role", "")
+                    c = msg_data.get("content", "")
+                    content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
                 elif hasattr(msg_data, 'content'):
-                    if isinstance(msg_data.content, str):
-                        content = msg_data.content
-                    elif isinstance(msg_data.content, list):
-                        content = "".join([getattr(c, "text", "") for c in msg_data.content if getattr(c, "type", "") == "text"])
+                    role = getattr(msg_data, "role", "")
+                    c = getattr(msg_data, "content", "")
+                    content = c if isinstance(c, str) else "".join([getattr(part, "text", "") for part in c if hasattr(part, "text")])
                         
                 if not content: continue
                     
                 if role == "user":
-                    # 尝试切分出用户姓名
                     match = re.match(r"^(.*?):\s*(.*)$", content, re.DOTALL)
                     if match:
                         sender, text = match.groups()
@@ -123,6 +135,9 @@ class PromptRefiner:
                         history_lines.append(f"[群友/用户] 说: {content}")
                 elif role == "assistant":
                     history_lines.append(f"[我] 说: {content}")
+                else:
+                    # 如果没有 role（纯文本字符串），作为上下文直接塞入剧本
+                    history_lines.append(content)
 
         if history_lines:
             history_script = "\n".join(history_lines)
@@ -136,7 +151,6 @@ class PromptRefiner:
         current_user_msg_idx = -1
         
         if req.messages:
-            # 逆向寻找触发本次推理的最后一条用户指令
             for i in range(len(req.messages) - 1, -1, -1):
                 msg = req.messages[i]
                 if msg.role == "user" and getattr(msg, "tool_call_id", None) is None:
@@ -144,10 +158,8 @@ class PromptRefiner:
                     break
                     
             if current_user_msg_idx != -1:
-                # 这个 content 实际上就是 planner.py 传过来的扁平化 prompt_content
                 current_msg_text = str(req.messages[current_user_msg_idx].content)
 
-        # 替换占位符
         if req.system_message and req.system_message[0].content:
             final_prompt = req.system_message[0].content
             final_prompt = re.sub(r'<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}', f"群聊历史消息：\n{history_script}", final_prompt)
@@ -156,21 +168,17 @@ class PromptRefiner:
             req.system_message[0].content = final_prompt
 
         # ==========================================
-        # 5. 混合剧场坍缩与工具保护 (心智隔离核心)
+        # 5. 混合剧场坍缩与工具保护
         # ==========================================
         if not req.messages: return
 
         preserved_messages = []
         for i, msg in enumerate(req.messages):
             if i < current_user_msg_idx:
-                # 【防污染隔离】丢弃所有常规的纯文本 user/assistant 历史
-                # 【工具保护】绝对保留所有含有 tool_calls, tool_call_id 的记录
                 if getattr(msg, "tool_calls", None) or getattr(msg, "tool_call_id", None) or msg.role not in ["user", "assistant"]:
                     preserved_messages.append(msg)
             elif i == current_user_msg_idx:
-                # 强化角色沉浸
                 original_content = msg.content
-                
                 if is_fast_mode:
                     director_voice = "【极速唤醒】虽然参考了前面的剧本，但请保持回复极其简短、直接，不要带任何角色名前缀！"
                 else:
@@ -182,4 +190,4 @@ class PromptRefiner:
                 preserved_messages.append(msg)
 
         req.messages = preserved_messages
-        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成（模式: {'极速' if is_fast_mode else '标准'}）。历史已提取，工具上下文受保护。")
+        logger.info(f"[{chat_id}] 🎬 剧本坍缩完成（模式: {'极速' if is_fast_mode else '标准'}）。已成功解析 {len(history_lines)} 条底层历史数据。")

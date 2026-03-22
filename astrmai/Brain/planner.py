@@ -7,7 +7,7 @@ from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
-from .tools.pfc_tools import WaitTool, FetchKnowledgeTool, QueryJargonTool, QueryPersonProfileTool, ConstructAtEventTool, ProactivePokeTool, ProactiveMemeTool
+from .tools.pfc_tools import WaitTool, OmniPerceptionTool, ConstructAtEventTool, ProactivePokeTool, ProactiveMemeTool
 
 from ..memory.engine import MemoryEngine
 from ..evolution.processor import EvolutionManager
@@ -35,8 +35,8 @@ class Planner:
         # 🟢 [核心修复]: 必须将 reply_engine 挂载到实例属性，否则后续 plan_and_execute 无法访问其配置
         self.reply_engine = reply_engine 
         
-        self.executor = ConcurrentExecutor(context, gateway, reply_engine)
-
+        # 🟢 [核心修改 Bug 2]: 将 evolution_manager 传入 Executor，以便其进行潜意识写入
+        self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
     
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
@@ -85,11 +85,10 @@ class Planner:
         else:
             tools = [
                 WaitTool(),
-                FetchKnowledgeTool(memory_engine=self.memory_engine, chat_id=chat_id),
-                QueryJargonTool(db_service=self.context_engine.db, chat_id=chat_id),
-                # === [新增] 挂载主动拉取画像的工具 ===
-                QueryPersonProfileTool(
-                    db_service=self.context_engine.db, 
+                OmniPerceptionTool(
+                    memory_engine=self.memory_engine,
+                    db_service=self.context_engine.db,
+                    chat_id=chat_id,
                     current_sender_id=str(user_id) if user_id is not None else "",
                     current_sender_name=sender_name
                 ),

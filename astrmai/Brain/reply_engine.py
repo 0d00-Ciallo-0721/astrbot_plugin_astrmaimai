@@ -157,6 +157,30 @@ class ReplyEngine:
         clean_text = self._clean_reply_content(raw_text)
         if not clean_text: return
 
+        # =====================================================================
+        # 🟢 [核心修复] 强行同步至 AstrBot 原生历史记录（打破永久失忆魔咒）
+        # =====================================================================
+        try:
+            context = getattr(self.state_engine.gateway, 'context', None)
+            if context:
+                conv_mgr = context.conversation_manager
+                curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
+                if curr_cid:
+                    from astrbot.core.agent.message import UserMessageSegment, AssistantMessageSegment, TextPart
+                    # 将本次用户的原生文本和Bot清洗后的文本配对，强行压入 AstrBot 记忆库
+                    user_msg = UserMessageSegment(content=[TextPart(text=event.message_str)])
+                    ast_msg = AssistantMessageSegment(content=[TextPart(text=clean_text)])
+                    
+                    await conv_mgr.add_message_pair(
+                        cid=curr_cid,
+                        user_message=user_msg,
+                        assistant_message=ast_msg
+                    )
+                    logger.debug(f"[{chat_id}] 📝 成功将对话对强制同步至 AstrBot 原生历史记录。")
+        except Exception as e:
+            logger.error(f"[ReplyEngine] 强制同步历史记录失败: {e}")
+        # ===
+
         tag = "neutral"
         force_meme_flag = False
         

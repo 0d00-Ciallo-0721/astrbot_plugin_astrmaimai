@@ -11,16 +11,20 @@ class ConcurrentExecutor:
     智能体执行器 (System 2)
     使用 AstrBot 原生 tool_loop_agent 替代原有手写 Action Loop。
     """
-    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine, config=None):
+    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine, evolution_manager, config=None):
         self.context = context
         self.gateway = gateway
-        
         self.reply_engine = reply_engine
+        self.evolution_manager = evolution_manager  # 挂载进化管理器
         self.config = config if config else gateway.config
         
+        
+    # [修改] 在执行成功的两个分支内，调用 evolution_manager.process_bot_reply 闭环反馈
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None):
         """[修改] 执行最终规划动作并维持底层状态机握手"""
         chat_id = event.unified_msg_origin
+        # 🟢 [新增] 提取安全的 Bot ID
+        bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
         models = self.gateway.get_agent_models()
         if not models:
@@ -54,6 +58,11 @@ class ConcurrentExecutor:
                             raise ValueError(f"模型 {provider_id} 生成的回复文本为空")
                             
                         await self.reply_engine.handle_reply(event, reply_text, chat_id)
+                        
+                        # 🟢 [核心修复 Bug 2] 主动记录真实回复文本，防止记忆被污染
+                        if hasattr(self.evolution_manager, 'process_bot_reply'):
+                            await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
+                            
                         return # 执行成功直接退出
                     except Exception as e:
                         last_error = str(e)
@@ -84,6 +93,11 @@ class ConcurrentExecutor:
                             return
 
                         await self.reply_engine.handle_reply(event, reply_text, chat_id)
+                        
+                        # 🟢 [核心修复 Bug 2] 主动记录真实回复文本，防止记忆被污染
+                        if hasattr(self.evolution_manager, 'process_bot_reply'):
+                            await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
+                            
                         return # 执行成功直接退出
                     except Exception as e:
                         logger.warning(f"[{chat_id}] ⚠️ Agent 模型 {provider_id} 调用异常，尝试切换备用: {e}")

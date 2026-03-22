@@ -226,3 +226,26 @@ class EvolutionManager:
                 
         except Exception as e:
             logger.error(f"[Evolution] _try_trigger_mining 异常: {e}") 
+
+    async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
+        """
+        [核心修复 Bug 2] 主动接收 executor 传来的、真正属于 AI 的生成文本并入库。
+        """
+        if not reply_text or not reply_text.strip():
+            return
+            
+        logger.info(f"[Evolution-Processor] 🧠 正在将真实的 Bot 回复计入潜意识日志: {reply_text[:20]}...")
+            
+        # 1. 使用异步方法记录真实消息
+        if hasattr(self.db, 'add_message_log_async'):
+            await self.db.add_message_log_async(
+                group_id=chat_id,
+                sender_id=bot_id,
+                sender_name="SELF",
+                content=reply_text
+            )
+        else:
+            self.db.add_message_log(group_id=chat_id, sender_id=bot_id, sender_name="SELF", content=reply_text)
+        
+        # 2. 触发后台挖掘任务
+        self._fire_background_task(self._try_trigger_mining(chat_id))

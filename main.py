@@ -40,6 +40,7 @@ from .astrmai.Heart.state_engine import StateEngine
 from .astrmai.Heart.judge import Judge
 from .astrmai.Heart.sensors import PreFilters
 from .astrmai.Heart.attention import AttentionGate
+from .astrmai.Heart.visual_cortex import VisualCortex 
 
 @register("astrmai", "Gemini Antigravity", "AstrMai: Dual-Process Architecture Plugin", "1.0.0", "https://github.com/0d00-Ciallo-0721/astrbot_plugin_astrmaimai")
 class AstrMaiPlugin(Star):
@@ -74,6 +75,8 @@ class AstrMaiPlugin(Star):
         self.judge = Judge(self.gateway, self.state_engine)
         self.sensors = PreFilters(self.config) 
 
+        self.visual_cortex = VisualCortex(self.gateway, self.db_service) 
+
         self.reply_engine = ReplyEngine(self.state_engine, self.state_engine.mood_manager)
         self.evolution = EvolutionManager(self.db_service, self.gateway)
 
@@ -95,8 +98,9 @@ class AstrMaiPlugin(Star):
             judge=self.judge,
             sensors=self.sensors,
             system2_callback=self._system2_entry,
-            config=self.config,                           # [新增] 传入配置项
-            persona_summarizer=self.persona_summarizer    # [新增] 注入人设压缩器
+            config=self.config,                          
+            persona_summarizer=self.persona_summarizer,  
+            visual_cortex=self.visual_cortex     
         )
         
         self.proactive_task = ProactiveTask(
@@ -144,6 +148,7 @@ class AstrMaiPlugin(Star):
         init_meme_storage()        
         await self.sensors._load_foreign_commands()
         await self.proactive_task.start()
+        self.visual_cortex.start()
         # 拉起内存后台代谢任务
         self._fire_and_forget(self._memory_gc_task())
         # 🟢 [彻底修复 Bug 5] 拉起数据库批量同步后台任务
@@ -232,21 +237,13 @@ class AstrMaiPlugin(Star):
 
     async def _system2_entry(self, main_event: AstrMessageEvent, events_to_process: list = None): 
         chat_id = main_event.unified_msg_origin
-        
-        # 🟢 [核心修改] 引入排队特权：区分普通积压消息与 System 1 授权的高优先级穿透消息
         lock = self._get_sys2_lock(chat_id)
-        is_fast_mode = main_event.get_extra("is_fast_mode", False)
         
-        if lock.locked():
-            if is_fast_mode:
-                logger.warning(f"[{chat_id}] ⚠️ System 2 脑区繁忙中，但识别到[快速穿透特权]，准许进入排队序列等待。")
-                # 穿透模式：不执行 return，强制流向下方 async with lock 产生异步阻塞等待（Queueing）
-            else:
-                logger.warning(f"[{chat_id}] ⚠️ System 2 脑区繁忙中，正在拦截并丢弃高并发的普通唤醒请求。")
-                return  # 普通并发消息：拒绝排队，直接 Fast-Fail 阻断
+        # 🟢 [核心修复 Bug 1] 删除了 lock.locked() 的丢弃判定，让所有通过了 Sys1 审核的有效请求排队处理。
+        # 否则会导致花费 Token 判定为 REPLY 的长文上下文被并发的短消息鸠占鹊巢并无情抹杀！
+        logger.debug(f"[{chat_id}] 🧠 System 2 请求已注册，正在排队等待进入主执行队列...")
             
         async with lock:
-
             try:
                 if isinstance(events_to_process, list) and len(events_to_process) > 0:
                     queue_events = events_to_process.copy()
@@ -257,7 +254,7 @@ class AstrMaiPlugin(Star):
                 await self.system2_planner.plan_and_execute(main_event, queue_events)
             finally:
                 logger.debug(f"[AstrMai] 🛡️ System2 任务链执行完毕，安全退出规划层。")
-    
+
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
         '''AstrMai 状态面板'''
@@ -560,16 +557,6 @@ class AstrMaiPlugin(Star):
 
                 self._fire_and_forget(safe_summarize_task())
 
-    @filter.after_message_sent()
-    async def after_message_sent_hook(self, event: AstrMessageEvent):
-        is_command_res = getattr(event, "is_command_trigger", False)
-        
-        if self.config.global_settings.debug_mode:
-            tag = "[指令回复]" if is_command_res else "[普通对话]"
-            logger.info(f"[AstrMai-Subconscious]💡 消息发送完毕，触发后台状态机与反馈循环")
-            
-        await self.evolution.process_feedback(event, is_command=is_command_res)
-
     async def terminate(self):
         """[修改] 优雅停机协调器 (Graceful Shutdown)"""
         logger.info("[AstrMai] 🛑 Terminating processes and unmounting...")
@@ -594,7 +581,10 @@ class AstrMaiPlugin(Star):
 
         if hasattr(self, 'proactive_task') and hasattr(self.proactive_task, '_background_tasks'):
             tasks_to_wait.extend(list(self.proactive_task._background_tasks))
-            
+        
+        if hasattr(self, 'visual_cortex'):
+            self.visual_cortex.stop()             
+        
         if tasks_to_wait:
             logger.info(f"[AstrMai] ⏳ 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
             # 广播取消信号，激活 CancelledError 捕获快照
