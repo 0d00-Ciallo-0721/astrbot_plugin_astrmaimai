@@ -27,6 +27,7 @@ class PromptRefiner:
         elif hasattr(context, "shared_dict"):
             disable_rag = context.shared_dict.get("disable_rag_injection", False)
 
+        import re
         for msg in req.system_message + req.messages:
             if isinstance(msg.content, str):
                 msg.content = re.sub(r"<injected_memory>.*?</injected_memory>\n?", "", msg.content, flags=re.DOTALL)
@@ -42,6 +43,7 @@ class PromptRefiner:
         # ==========================================
         injection = ""
         current_query = event.message_str
+        import html
         if not disable_rag and self.memory_engine and current_query and not is_fast_mode:
             memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
             if memory_text and "什么也没想起来" not in memory_text:
@@ -49,9 +51,6 @@ class PromptRefiner:
                 injection = f"<injected_memory>\n记忆涌现（记忆模块）：基于当前话题，你回忆起了以下事情：\n{safe_memory_text}\n</injected_memory>\n"
 
         # ==========================================
-        # 3. 底层历史拉取与剧本化格式转换
-        # ==========================================
-    # ==========================================
         # 3. 底层历史拉取与剧本化格式转换
         # ==========================================
         history_script = "无近期历史记录。"
@@ -68,6 +67,7 @@ class PromptRefiner:
             raw_history = list(conversation.history)
             cutoff_idx = len(raw_history)
             
+            import json
             # 🟢 [统一解析核心函数] 专门用于降维解析底层多模态 Dict 结构
             def _parse_msg_data(raw_data):
                 role, text = "", ""
@@ -147,11 +147,50 @@ class PromptRefiner:
             if current_user_msg_idx != -1:
                 current_msg_text = str(req.messages[current_user_msg_idx].content)
 
+        # 🟢 [终极核心修复] 定义全局异步记忆解析器：
+        # 它会在发给 LLM 的最后一刻，扫描字符串中所有的 [picid:xxx] (包含历史记录和当次消息)
+        # 并从数据库中提取真正的画面描述，实现彻底的“反幻觉防盲”！
+        async def _resolve_visual_memory(text: str) -> str:
+            if not isinstance(text, str): return text
+            picids = set(re.findall(r'\[picid:([a-fA-F0-9]{32})\]', text))
+            if not picids: return text
+            
+            # 安全获取数据库服务实例
+            db_service = getattr(self.memory_engine, 'db', getattr(self.memory_engine, 'db_service', None))
+            for picid in picids:
+                resolved_text = "[一张尚未看清的图片]"
+                if db_service:
+                    for _ in range(15): # 轮询软阻塞，确保视觉异步皮层处理完毕
+                        with db_service.get_session() as session:
+                            from ..infra.datamodels import VisualMemory
+                            import json
+                            mem = session.get(VisualMemory, picid)
+                            if mem:
+                                try:
+                                    tags = json.loads(mem.emotion_tags)
+                                    tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+                                except Exception:
+                                    tags_str = ""
+                                if mem.type == "emoji":
+                                    resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]" if tags_str else f"[发了一个表情包，画面是：{mem.description}]"
+                                else:
+                                    resolved_text = f"[发了一张图片，画面是：{mem.description}]"
+                                break # 解析成功，跳出等待
+                        import asyncio
+                        await asyncio.sleep(1.0)
+                text = text.replace(f"[picid:{picid}]", resolved_text)
+            return text
+
         if req.system_message and req.system_message[0].content:
             final_prompt = req.system_message[0].content
             final_prompt = re.sub(r'<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}', f"群聊历史消息：\n{history_script}", final_prompt)
             final_prompt = re.sub(r'<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\}', current_msg_text.strip(), final_prompt)
             final_prompt = re.sub(r'<RAG_MEMORY>|\{MEMORY_PLACEHOLDER\}', injection, final_prompt)
+            
+            # 🟢 执行深层视觉记忆联想翻译（完美覆盖 CHAT_HISTORY 里的历史占位符）
+            from astrbot.api import logger
+            final_prompt = await _resolve_visual_memory(final_prompt)
+            
             req.system_message[0].content = final_prompt
 
         # ==========================================
@@ -166,6 +205,11 @@ class PromptRefiner:
                     preserved_messages.append(msg)
             elif i == current_user_msg_idx:
                 original_content = msg.content
+                
+                # 🟢 [用户消息兜底] 对大模型原生 user 队列里的乱码同步进行净化
+                if isinstance(original_content, str):
+                    original_content = await _resolve_visual_memory(original_content)
+                    
                 if is_fast_mode:
                     director_voice = "【极速唤醒】虽然参考了前面的剧本，但请保持回复极其简短、直接，不要带任何角色名前缀！"
                 else:
