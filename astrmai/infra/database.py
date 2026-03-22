@@ -220,8 +220,8 @@ class DatabaseService:
         astr_ctx=None  # AstrBot Context, 用于阶段二的会话历史拉取
     ) -> Optional[tuple[str, str]]:
         """
-        [修改] 时空双维度实体解析器
-        修复：将阶段三的持久化记忆兜底 (Level 3 - DB Fallback) 的同步查库逻辑推入线程池，消除伪异步阻塞。
+        [修改] 时空双维度实体解析器 (增强正则提取版)
+        支持直接提取大模型传入的带有 (QQ) 的格式，极大提升实体解析成功率。
         """
         if not target_name or not current_event:
             return None
@@ -231,12 +231,33 @@ class DatabaseService:
             group_id = current_event.unified_msg_origin
         group_id = str(group_id)
 
-        if current_event.get_sender_name() == target_name:
+        # 🟢 1. 预处理：剔除可能携带的 '@' 符号和两端空格
+        target_name = target_name.strip().lstrip('@')
+        clean_name = target_name
+
+        import re
+
+        # 🟢 2. 拦截模式 A：大模型直接传入了纯数字 ID
+        if target_name.isdigit():
+            return (target_name, group_id)
+
+        # 🟢 3. 拦截模式 B：大模型传入了 "姓名(ID)" 或 "姓名（ID）" 格式
+        # 正则匹配：任意字符开头，接着是半角/全角左括号，中间是纯数字，以半角/全角右括号结尾
+        match = re.search(r'^(.*?)[\(（]([0-9]+)[\)）]$', target_name)
+        if match:
+            extracted_name = match.group(1).strip()
+            extracted_id = match.group(2).strip()
+            # 既然大模型已经把 ID 完整传过来了，直接采信，O(1) 返回，免去后续遍历查库
+            return (extracted_id, group_id)
+
+        # 🟢 4. 拦截模式 C：如果只是单纯的姓名，继续走下方的时空搜索逻辑
+        # 注意：后续的判断都要使用 clean_name 进行比对
+        if current_event.get_sender_name() == clean_name:
             return (str(current_event.get_sender_id()), group_id)
 
         window_events = current_event.get_extra("astrmai_window_events", [])
         for w_event in reversed(window_events):
-            if w_event.get_sender_name() == target_name:
+            if w_event.get_sender_name() == clean_name:
                 return (str(w_event.get_sender_id()), group_id)
 
         if astr_ctx and hasattr(astr_ctx, 'conversation_manager'):
@@ -257,18 +278,19 @@ class DatabaseService:
                             sender_name = getattr(msg_data.sender, "nickname", getattr(msg_data.sender, "name", ""))
                             sender_id = getattr(msg_data.sender, "user_id", "")
                             
-                        if sender_name == target_name and sender_id:
+                        # [修改] 使用 clean_name 比较
+                        if sender_name == clean_name and sender_id:
                             return (str(sender_id), group_id)
             except Exception as e:
                 pass
 
-        # [核心修复点] 将原先的同步 session.exec() 包装进异步线程执行
+        # [修改] 数据库兜底也使用 clean_name
         def _sync_db_fallback():
             from sqlmodel import select
             with self.get_session() as session:
                 statement = select(MessageLog.sender_id).where(
                     MessageLog.group_id == group_id,
-                    MessageLog.sender_name == target_name
+                    MessageLog.sender_name == clean_name
                 ).distinct()
                 results = session.exec(statement).all()
                 if len(results) == 1:

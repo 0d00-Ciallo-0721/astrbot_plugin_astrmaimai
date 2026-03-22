@@ -100,7 +100,7 @@ class ReplyEngine:
         [终极修复版] 历史记录获取：解决核心库同步延迟导致的锚点丢失。
         """
         history_list = []
-        fetch_count = getattr(self.config.attention, 'history_pull_count', 20) if self.config else 20
+        fetch_count = getattr(self.config.attention, 'bg_pool_size', 20) if self.config else 20
         
         try:
             # 借助 Gateway 透传获取底层 Context
@@ -197,10 +197,10 @@ class ReplyEngine:
         
         # 🟢 [彻底修复 Bug 1] 使用 get_extra 读取底层工具注入的 bypass 标签，而非 getattr
         _bypassed_tag = bypassed_tag or event.get_extra("astrmai_bypass_mood_analysis", None)
-        _window_events = window_events if window_events is not None else getattr(event, "astrmai_window_events", [])
-        _anchor_event = anchor_event or getattr(event, "astrmai_anchor_event", None)
-        _pending_actions = pending_actions if pending_actions is not None else getattr(event, "astrmai_pending_actions", [])
-        
+        _window_events = window_events if window_events is not None else event.get_extra("astrmai_window_events", [])
+        _anchor_event = anchor_event or event.get_extra("astrmai_anchor_event", None)
+        _pending_actions = pending_actions if pending_actions is not None else event.get_extra("astrmai_pending_actions", [])
+
         # 2. 情绪后处理 (Post-Processing Mood)
         try:
             state = await self.state_engine.get_state(chat_id)

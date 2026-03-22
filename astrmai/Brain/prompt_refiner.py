@@ -92,7 +92,7 @@ class PromptRefiner:
                         break
                         
             # 向上拉取指定的历史条数并进行彻底的纯文本转换
-            fetch_count = getattr(self.config.attention, 'history_pull_count', 20) if self.config else 20
+            fetch_count = getattr(self.config.attention, 'bg_pool_size', 20) if self.config else 20
             start_idx = max(0, cutoff_idx - fetch_count)
             valid_history = raw_history[start_idx:cutoff_idx]
             

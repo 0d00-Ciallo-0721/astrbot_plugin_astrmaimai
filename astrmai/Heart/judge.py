@@ -125,8 +125,8 @@ class Judge:
 
             history_context = ""
             try:
-                # [核心对齐点] 改为读取 attention 配置中的 history_pull_count，默认 20 条
-                history_limit = getattr(self.config.attention, 'history_pull_count', 20)
+                # [核心对齐点] 改为读取 attention 配置中的 bg_pool_size，默认 20 条
+                history_limit = getattr(self.config.attention, 'bg_pool_size', 20)
                 
                 history_records = []
                 persistence = getattr(self.state_engine, "persistence", None)

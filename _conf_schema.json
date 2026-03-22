@@ -192,12 +192,6 @@
         "default": 100,
         "hint": "超过此长度的消息将被直接拦截丢弃，用于防长文本刷屏或提示词注入"
       },
-      "history_pull_count": {
-        "description": "情绪归因：历史拉取条数",
-        "type": "int",
-        "default": 20,
-        "hint": "参与统计算法的历史上下文消息条数"
-      },
       "affection_weights": {
         "description": "情绪归因：三维权重分配",
         "type": "object",

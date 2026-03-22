@@ -16,8 +16,8 @@ class MoodManager:
         self.emotion_mapping = {}
         
         # [修改] 将配置中的 List 动态解析为字典，兼容中英文冒号
-        if hasattr(self.config, 'mood') and hasattr(self.config.mood, 'emotion_mapping'):
-            mapping_list = self.config.mood.emotion_mapping
+        if hasattr(self.config, 'reply') and hasattr(self.config.reply, 'emotion_mapping'):
+            mapping_list = self.config.reply.emotion_mapping
             for item in mapping_list:
                 if ":" in item:
                     k, v = item.split(":", 1)
