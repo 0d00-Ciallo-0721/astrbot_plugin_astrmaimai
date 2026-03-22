@@ -118,10 +118,15 @@ class VisualCortex:
             logger.error(f"[AstrMai-VisualCortex] GIF 转换失败: {e}")
             return None
 
-    # [新增] 核心处理流程：单通 VLM 识别并入库
 # [修改] 核心处理流程：单通 VLM 识别并入库
     async def process_image_async(self, picid: str, base64_data: str):
         try:
+            # 🟢 [核心修复] 缓存拦截屏障：如果数据库中已经存在该图片，直接跳过识别，杜绝重复消耗 Token
+            with self.db_service.get_session() as session:
+                if session.get(VisualMemory, picid):
+                    logger.info(f"[AstrMai-VisualCortex] ⚡ 命中视觉记忆缓存，跳过重复解析: {picid}")
+                    return
+
             image_bytes = base64.b64decode(base64_data)
             image_format = Image.open(io.BytesIO(image_bytes)).format.lower()
             
@@ -162,7 +167,7 @@ class VisualCortex:
 
             logger.info(f"[AstrMai-VisualCortex] ✅ 解析完成 {picid} | 类型:{img_type} | 描述:{description[:20]}... | 标签:{tags_json_str}")
 
-            # [修改] 将同步写库逻辑提取为一个内部函数，并推入 asyncio.to_thread 防止阻塞 Worker
+            # 将同步写库逻辑提取为一个内部函数，并推入 asyncio.to_thread 防止阻塞 Worker
             def _save_db():
                 with self.db_service.get_session() as session:
                     import time

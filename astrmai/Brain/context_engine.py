@@ -30,48 +30,7 @@ class ContextEngine:
                            tool_descs: str = "",
                            sys1_thought: str = "") -> str: 
         
-        # ==========================================
-        # [新增] Phase 5: 视觉记忆软阻塞与剧本格式化渲染
-        # ==========================================
-        for msg in event_messages:
-            if not getattr(msg, 'message_str', ''):
-                continue
-                
-            # 正则扫描提取所有的 [picid:xxx] (假设 MD5 为 32 位)
-            picids = re.findall(r'\[picid:([a-fA-F0-9]{32})\]', msg.message_str)
-            
-            # 去重轮询，避免同一条消息里多个相同的 picid 浪费资源
-            for picid in set(picids):
-                resolved_text = "[一张尚未看清的图片]"
-                
-                # 软阻塞等待：轮询 3 次，每次 0.5s
-                for _ in range(3):
-                    with self.db.get_session() as session:
-                        mem = session.get(VisualMemory, picid)
-                        if mem:
-                            # 尝试解析情绪标签 (JSON 数组)
-                            try:
-                                tags = json.loads(mem.emotion_tags)
-                                tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
-                            except Exception:
-                                tags_str = ""
-                                
-                            # 格式化剧本台词替换
-                            if mem.type == "emoji":
-                                if tags_str:
-                                    resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]"
-                                else:
-                                    resolved_text = f"[发了一个表情包，画面是：{mem.description}]"
-                            else:
-                                resolved_text = f"[发了一张图片，画面是：{mem.description}]"
-                            break # 成功获取，跳出轮询
-                    
-                    # 如果查不到，休眠 0.5s 后重试
-                    await asyncio.sleep(0.5)
-                    
-                # 将原来的占位符替换为剧本格式文本，若超时则使用兜底文本
-                msg.message_str = msg.message_str.replace(f"[{'picid'}:{picid}]", resolved_text)
-        # ==========================================
+        # [核心修复] 已删除原版在最开头的不完善局部扫描代码
         
         if retrieve_keys is None:
             retrieve_keys = []
@@ -91,7 +50,6 @@ class ContextEngine:
         target_persona_id = getattr(self.config.persona, 'persona_id', "")
         raw_prompt = getattr(self.config.persona, 'prompt', "")
 
-        # 🟢 [核心修改]: 增加内存指纹防抖，只在内容变化时打印长日志
         if target_persona_id and not raw_prompt:
             try:
                 _persona_text = ""
@@ -99,14 +57,12 @@ class ContextEngine:
                 if not _config and hasattr(self.context, "get_config"):
                     _config = self.context.get_config()
                     
-                # 扫描策略 1: 穿透到 AstrBot 全局 config.yaml 的 personas 数组
                 if isinstance(_config, dict) and "personas" in _config:
                     for p in _config.get("personas", []):
                         if str(p.get("persona_id")) == target_persona_id or str(p.get("id")) == target_persona_id or str(p.get("name")) == target_persona_id:
                             _persona_text = p.get("prompt", "") or p.get("system_prompt", "")
                             break
                             
-                # 扫描策略 2: 穿透到 AstrBot 的原生 Persona Manager (防备未来的新版架构)
                 if not _persona_text and hasattr(self.context, "persona_manager"):
                     p_mgr = self.context.persona_manager
                     if hasattr(p_mgr, "personas"):
@@ -123,7 +79,6 @@ class ContextEngine:
 
                 if _persona_text:
                     raw_prompt = _persona_text
-                    # 🟢 [防抖校验] 引入状态感知，避免无限刷屏
                     if getattr(self, "_last_logged_persona", "") != _persona_text:
                         logger.info(f"[ContextEngine] 🧬 成功从 AstrBot 核心框架自动提取了 ID 为 [{target_persona_id}] 的原生人格内容 (长度: {len(raw_prompt)}字)。")
                         self._last_logged_persona = _persona_text
@@ -222,8 +177,47 @@ class ContextEngine:
 2. 你的回复长度和积极性应受当前心情/精力的动态影响。
 3. 必须使用中文回复。
 """
+        # ==========================================
+        # 🟢 [终极修复] 全局视觉记忆软阻塞与渲染 (修复历史记录失明 & 等待不足)
+        # ==========================================
+        # 在最终生成的 Prompt 中进行全局正则扫描，这样连带 Chat History 中的 picid 也会被处理
+        import re
+        import json
+        import asyncio
+        picids = re.findall(r'\[picid:([a-fA-F0-9]{32})\]', prompt)
+        
+        for picid in set(picids):
+            resolved_text = "[一张尚未看清的图片]"
+            
+            # 延长软阻塞等待：轮询 15 次，每次 1.0s (最多等 15 秒)
+            for _ in range(15):
+                with self.db.get_session() as session:
+                    from ..infra.datamodels import VisualMemory
+                    mem = session.get(VisualMemory, picid)
+                    if mem:
+                        try:
+                            tags = json.loads(mem.emotion_tags)
+                            tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+                        except Exception:
+                            tags_str = ""
+                            
+                        if mem.type == "emoji":
+                            if tags_str:
+                                resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]"
+                            else:
+                                resolved_text = f"[发了一个表情包，画面是：{mem.description}]"
+                        else:
+                            resolved_text = f"[发了一张图片，画面是：{mem.description}]"
+                        break # 成功获取，跳出轮询
+                
+                # 如果查不到，休眠 1.0s 后重试
+                await asyncio.sleep(1.0)
+                
+            # 执行全局文本替换
+            prompt = prompt.replace(f"[picid:{picid}]", resolved_text)
+        # ==========================================
+
         return prompt.strip()
-    
 
     def _build_state_block(self, state: Optional[ChatState]) -> str:
         if not state:

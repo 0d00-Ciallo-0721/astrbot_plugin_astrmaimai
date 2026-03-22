@@ -570,11 +570,9 @@ class AttentionGate:
                 if not events_to_process:
                     break 
 
-                # 🟢 [新增日志] 窗口截断，移交 Sys1 裁决追踪
                 logger.info(f"[{chat_id}] 🚪 [窗口关闭] 写入sys1进行评估 (共处理 {len(events_to_process)} 条消息)...")
 
                 try:
-                    # [详细追踪 1] 观察文本格式化
                     logger.info(f"[{chat_id}] 🔍 [Sys1 追踪] 开始格式化与过滤消息...")
                     combined_text, final_events = await self._format_and_filter_messages(events_to_process)
                     logger.info(f"[{chat_id}] 🔍 [Sys1 追踪] 消息格式化完毕。最终文本: '{combined_text[:50]}...' (有效事件数: {len(final_events)})")
@@ -588,51 +586,43 @@ class AttentionGate:
                         is_wakeup = any(self.sensors.is_wakeup_signal(e, self_id) for e in final_events)
                         is_first_event_wakeup = self.sensors.is_wakeup_signal(final_events[0], self_id) if final_events else False
                         
-                        # ==========================================
-                        # 🟢 [新增] Sys1 轻量级人设提取逻辑 (心智共享)
-                        # ==========================================
                         sys1_persona = "保持你原本的性格特征"
                         
                         if getattr(self, 'persona_summarizer', None):
                             target_persona_id = getattr(self.config.persona, 'persona_id', "")
-                            # 1. 尝试使用 ID 作为 Cache Key
                             cache_key = target_persona_id.strip() if target_persona_id else f"session_{chat_id}"
                             
-                            # 2. 极速读取内存缓存（绝不触发 LLM 阻塞）
                             cached_data = self.persona_summarizer.cache.get(cache_key)
                             if cached_data and isinstance(cached_data, dict):
                                 sys1_persona = cached_data.get("summary", "")
                             else:
-                                # 3. 如果连缓存都没有，降级为名字或简述兜底
                                 sys1_persona = f"角色ID: {target_persona_id}" if target_persona_id else "傲娇系AI智能体"
-                        # ==========================================
 
-                        # [详细追踪 2] 观察唤醒状态与投递 Judge
                         logger.info(f"[{chat_id}] ⚖️ [Sys1 追踪] 移交 Judge 裁决 (强唤醒={is_wakeup}, 携带人设长度={len(sys1_persona)})...")
+                        
+                        # 🟢 [核心修复] Sys1 判决盲症修复：将生硬的 picid 替换为 [图片]，防止 Sys1 判为乱码而直接 IGNORE
+                        import re
+                        sys1_eval_text = re.sub(r'\[picid:[a-fA-F0-9]{32}\]', '[图片]', combined_text)
                         
                         plan = await self.judge.evaluate(
                             chat_id=chat_id, 
-                            message=combined_text, 
+                            message=sys1_eval_text,  # 使用清洗后的文本评估
                             is_force_wakeup=is_wakeup,
-                            persona_summary=sys1_persona,    # 👈 [修复] 传入真实且极速的缓存人设
+                            persona_summary=sys1_persona,
                             window_events_count=len(final_events),
                             is_first_event_wakeup=is_first_event_wakeup
                         )
                         
-                        # [详细追踪 3] 暴漏 Judge 真实想法
                         logger.info(f"[{chat_id}] 📋 [Sys1 追踪] Judge 裁决结果 -> Action: {plan.action} | Thought: {plan.thought}")
                         
                         main_event.set_extra("sys1_thought", plan.thought)
 
                         if plan.action in ["REPLY", "WAIT"]:
-                            # 🟢 [新增] 提取并截断 thought 字段 (仅保留前5个字)
                             safe_thought = plan.thought or "无"
                             thought_abbr = safe_thought[:5] + "..." if len(safe_thought) > 5 else safe_thought
                             
-                            # 🟢 [新增] 提取记忆提取键
                             retrieve_keys = plan.meta.get("retrieve_keys", [])
 
-                            # 🟢 [修改日志] 融合你原有的追踪与新增的详细上下文载荷
                             logger.info(
                                 f"[{chat_id}] 🚀 [窗口结束] 快速注入sys2 | "
                                 f"动作: {plan.action} | "
@@ -645,20 +635,17 @@ class AttentionGate:
                                 await self.sys2_process(main_event, final_events)
                                 logger.info(f"[{chat_id}] ✅ [Sys1 追踪] sys2_process 调用完成。")
                         else:
-                            # [详细追踪 4] 强制把 Debug 升级为 Info，抓出静默元凶
                             logger.info(f"[{chat_id}] 💤 [窗口结束] Sys1 决定静默不回复 (判定Action: {plan.action})")
                     else:
                         logger.info(f"[{chat_id}] 🈳 [Sys1 追踪] 过滤后无有效事件，放弃评估。")
                         
                 except Exception as inner_e:
-                    # [详细追踪 5] 打印完整报错堆栈
                     logger.error(f"[{chat_id}] ⚠️ 批次消息处理失败，安全拦截防崩溃: {inner_e}", exc_info=True)
 
                 async with session.lock:
                     if not session.accumulation_pool:
                         break
                     else:
-                        # 🟢 [新增日志] 积压消息循环追踪
                         logger.info(f"[{chat_id}] ⚠️ [发现积压消息] 写入sys1，开启新一轮注意力维持...")
 
         except Exception as e:
