@@ -246,12 +246,6 @@ class AstrMaiPlugin(Star):
                 return  # 普通并发消息：拒绝排队，直接 Fast-Fail 阻断
             
         async with lock:
-            try:
-                from astrbot.api.event import MessageChain
-                mc = MessageChain().message("💭 神经网络运转中...")
-                await self.context.send_message(chat_id, mc)
-            except Exception as e:
-                logger.debug(f"[AstrMai] 过渡态发送异常 (可忽略): {e}")
 
             try:
                 if isinstance(events_to_process, list) and len(events_to_process) > 0:

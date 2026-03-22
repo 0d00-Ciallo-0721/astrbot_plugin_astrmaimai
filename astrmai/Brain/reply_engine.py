@@ -28,7 +28,13 @@ class ReplyEngine:
         self.segmentation_threshold = self.config.reply.segment_min_len # 分段阈值
         self.no_segment_limit = self.config.reply.no_segment_max_len      # 长文不分段阈值
         self.meme_probability = self.config.reply.meme_probability       # 表情包概率
-
+        
+        # [新增] 引入独立的智能分段器，挂载至引擎实例
+        from .text_segmenter import TextSegmenter
+        self.segmenter = TextSegmenter(
+            min_length=self.segmentation_threshold,
+            max_length=self.no_segment_limit
+        )
 
     def _clean_reply_content(self, text: str) -> str:
         """
@@ -44,56 +50,15 @@ class ReplyEngine:
     def _segment_reply_content(self, text: str) -> List[str]:
         """
         [修改] 拟人化分段算法 (安全闭环版，彻底解决颜文字切片错位与正则冲突)
+        代理调用独立的 TextSegmenter 核心，解决正则切割太粗暴与换行符逃逸的问题。
         """
         if len(text) > self.no_segment_limit:
-            return [text]
+            # 即使触发不分段机制，也必须净化首尾换行符，斩杀导致气泡错位的幽灵字符
+            cleaned = re.sub(r'^\n+|\n+$', '', text.strip())
+            return [cleaned] if cleaned else []
 
-        # 保护颜文字
-        kaomoji_pattern = r'(\(.*?\)|（.*?）)'
-        kaomojis = []
-        
-        def replace_kaomoji(match):
-            kaomojis.append(match.group(0))
-            return f"__K_M_J_{len(kaomojis)-1}__" # 使用高唯一性替换符
-        
-        protected_text = re.sub(kaomoji_pattern, replace_kaomoji, text)
-        
-        # 标点切分
-        split_pattern = r'([。！？；!?;~]+)'
-        parts = re.split(split_pattern, protected_text)
-        
-        segments = []
-        current = ""
-        for part in parts:
-            if not part.strip(): continue # 强化过滤：忽略纯空白片段
-            
-            if re.match(split_pattern, part):
-                current += part
-                if len(current) >= self.segmentation_threshold:
-                    segments.append(current.strip())
-                    current = ""
-            else:
-                current += part
-        
-        if current.strip():
-            segments.append(current.strip())
-            
-        # 还原颜文字并执行二次净化
-        final_segments = []
-        for seg in segments:
-            # 仅在当前切片内进行正则提取与安全回调，防止跨段污染
-            def restore_kaomoji(match):
-                idx = int(match.group(1))
-                if 0 <= idx < len(kaomojis):
-                    return kaomojis[idx]
-                return match.group(0)
-            
-            seg = re.sub(r'__K_M_J_(\d+)__', restore_kaomoji, seg)
-            
-            if seg.strip(): # 最后一道防线，确保绝不把空字符串当做独立段落
-                final_segments.append(seg.strip())
-            
-        return final_segments
+        # 直接调用外置的智能状态机分段器，其内部已经妥善处理了片段粘连、标点吞噬和换行符逃逸
+        return self.segmenter.segment(text)
 
     async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
         """
