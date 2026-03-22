@@ -62,13 +62,12 @@ class ReplyEngine:
 
     async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
         """
-        [终极修复版] 历史记录获取：解决核心库同步延迟导致的锚点丢失。
+        [终极修复版] 历史记录获取：完全适配底层的 Dict 与 List 多模态数据结构，放弃无效的 message_id。
         """
         history_list = []
         fetch_count = getattr(self.config.attention, 'bg_pool_size', 20) if self.config else 20
         
         try:
-            # 借助 Gateway 透传获取底层 Context
             context = getattr(self.state_engine.gateway, 'context', None)
             if not context: return []
             
@@ -77,64 +76,58 @@ class ReplyEngine:
             conversation = await conv_mgr.get_conversation(chat_id, curr_cid)
             
             if conversation and hasattr(conversation, "history") and conversation.history:
-                # 生成硬拷贝快照，彻底阻断并发追加导致的 len() 突变
                 raw_history = list(conversation.history)
                 cutoff_idx = -1
                 found_anchor = False
                 
-                # 提取事件真实的 message_id
-                target_msg_id = str(getattr(anchor_event.message_obj, "message_id", "")) if anchor_event and hasattr(anchor_event, "message_obj") else None
-                # 预清洗锚点文本，移除所有空白符和不可见字符，用于最高强度模糊比对
+                # 预清洗锚点文本
                 clean_anchor = re.sub(r'\s+', '', anchor_text) if anchor_text else ""
 
-                # 1. 逆序检索：寻找破窗锚点位置 (最高优先级: ID 匹配 > 降级: 鲁棒性文本匹配)
+                # 逆序检索：提取 dict -> content (list) -> type=="text" 结构
                 for i in range(len(raw_history) - 1, -1, -1):
                     msg_data = raw_history[i]
+                    content = ""
                     
-                    # --- A. 尝试 message_id 匹配 ---
-                    current_msg_id = str(msg_data.get('message_id', '')) if isinstance(msg_data, dict) else str(getattr(msg_data, 'message_id', ''))
-                    if target_msg_id and current_msg_id == target_msg_id:
+                    # 兼容可能存在的字符串序列化
+                    if isinstance(msg_data, str):
+                        import json
+                        try:
+                            msg_data = json.loads(msg_data)
+                        except Exception:
+                            pass
+
+                    # 💥 精准打击你提取出的 JSON 结构
+                    if isinstance(msg_data, dict):
+                        c = msg_data.get('content', '')
+                        if isinstance(c, str):
+                            content = c
+                        elif isinstance(c, list):
+                            content = "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
+                    elif hasattr(msg_data, 'content'):
+                        c = getattr(msg_data, 'content', '')
+                        if isinstance(c, str):
+                            content = c
+                        elif isinstance(c, list):
+                            content = "".join([getattr(part, "text", "") for part in c if hasattr(part, "text")])
+                    
+                    # 子串强匹配 (无视空格和换行)
+                    if content and clean_anchor and clean_anchor in re.sub(r'\s+', '', content):
                         cutoff_idx = i
                         found_anchor = True
                         break
-                        
-                    # --- B. 鲁棒性文本模糊匹配 (降级方案) ---
-                    if clean_anchor:
-                        content = ""
-                        if isinstance(msg_data, dict):
-                            if 'content' in msg_data:
-                                if isinstance(msg_data['content'], str):
-                                    content = msg_data['content']
-                                elif isinstance(msg_data['content'], list):
-                                    content = "".join([c.get("text", "") for c in msg_data['content'] if "text" in c])
-                        elif hasattr(msg_data, 'content'):
-                            if isinstance(msg_data.content, str):
-                                content = msg_data.content
-                            elif isinstance(msg_data.content, list):
-                                content = "".join([getattr(c, "text", "") for c in msg_data.content if hasattr(c, "text")])
-                        
-                        # 消除所有换行、空格干扰后进行子串匹配
-                        if content and clean_anchor in re.sub(r'\s+', '', content):
-                            cutoff_idx = i
-                            found_anchor = True
-                            break
                             
-                # 2. 🟢 [核心逻辑升级]：处理 AstrBot 同步延迟补偿
                 if found_anchor:
-                    # 找到了锚点，执行常规精准硬截断
                     start_idx = max(0, cutoff_idx - fetch_count)
                     history_list = raw_history[start_idx:cutoff_idx + 1]
+                    logger.debug(f"[ReplyEngine] 锚点匹配成功！精确截取最后 {len(history_list)} 条记忆。")
                 else:
-                    # 没找到锚点，说明当前触发回复的消息还没存入 history
-                    # 此时历史记录的末尾即为最实时的上下文边界，执行“即时切片”补偿模式
-                    logger.debug(f"[ReplyEngine] 破窗锚点未实时入库，已启动“即时切片”模式补偿提取。")
+                    logger.debug(f"[ReplyEngine] 文本匹配未命中，启动“即时切片”模式补偿提取。")
                     history_list = raw_history[-fetch_count:]
                 
         except Exception as e:
             logger.warning(f"[ReplyEngine] 历史记录拉取异常: {e}")
             
         return history_list
-
 
     # [修改] 函数位置：astrmai/Brain/reply_engine.py -> ReplyEngine 类下
     async def handle_reply(
@@ -167,8 +160,15 @@ class ReplyEngine:
                 curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
                 if curr_cid:
                     from astrbot.core.agent.message import UserMessageSegment, AssistantMessageSegment, TextPart
-                    # 将本次用户的原生文本和Bot清洗后的文本配对，强行压入 AstrBot 记忆库
-                    user_msg = UserMessageSegment(content=[TextPart(text=event.message_str)])
+                    
+                    # 💡 获取发送者姓名
+                    sender_name = event.get_sender_name() or "群友"
+                    
+                    # 💡 【关键修改】：将文本存为 "姓名: 内容" 的标准格式
+                    # 这样 PromptRefiner 的正则 ^(.*?):\s*(.*)$ 就能完美匹配出姓名
+                    formatted_user_text = f"{sender_name}: {event.message_str}"
+                    
+                    user_msg = UserMessageSegment(content=[TextPart(text=formatted_user_text)])
                     ast_msg = AssistantMessageSegment(content=[TextPart(text=clean_text)])
                     
                     await conv_mgr.add_message_pair(
@@ -176,7 +176,7 @@ class ReplyEngine:
                         user_message=user_msg,
                         assistant_message=ast_msg
                     )
-                    logger.debug(f"[{chat_id}] 📝 成功将对话对强制同步至 AstrBot 原生历史记录。")
+                    logger.debug(f"[{chat_id}] 📝 成功同步对话对（已刻入姓名: {sender_name}）。")
         except Exception as e:
             logger.error(f"[ReplyEngine] 强制同步历史记录失败: {e}")
         # ===

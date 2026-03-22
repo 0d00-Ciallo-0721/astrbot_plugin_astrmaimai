@@ -51,6 +51,9 @@ class PromptRefiner:
         # ==========================================
         # 3. 底层历史拉取与剧本化格式转换
         # ==========================================
+    # ==========================================
+        # 3. 底层历史拉取与剧本化格式转换
+        # ==========================================
         history_script = "无近期历史记录。"
         
         anchor_event = event.get_extra("astrmai_anchor_event")
@@ -65,31 +68,36 @@ class PromptRefiner:
             raw_history = list(conversation.history)
             cutoff_idx = len(raw_history)
             
-            # 定位滑动窗口的断点
+            # 🟢 [统一解析核心函数] 专门用于降维解析底层多模态 Dict 结构
+            def _parse_msg_data(raw_data):
+                role, text = "", ""
+                if isinstance(raw_data, str):
+                    try:
+                        raw_data = json.loads(raw_data)
+                    except json.JSONDecodeError:
+                        return "", raw_data
+                
+                if isinstance(raw_data, dict):
+                    role = raw_data.get("role", "")
+                    c = raw_data.get("content", "")
+                    if isinstance(c, str):
+                        text = c
+                    elif isinstance(c, list):
+                        text = "".join([p.get("text", "") for p in c if isinstance(p, dict) and "text" in p])
+                elif hasattr(raw_data, 'content'): # 兼容旧版对象
+                    role = getattr(raw_data, "role", "")
+                    c = getattr(raw_data, "content", "")
+                    if isinstance(c, str):
+                        text = c
+                    elif isinstance(c, list):
+                        text = "".join([getattr(p, "text", "") for p in c if hasattr(p, "text")])
+                return role, text
+
+            # 寻找锚点位置
             if anchor_text:
                 clean_anchor = re.sub(r'\s+', '', anchor_text)
                 for i in range(len(raw_history) - 1, -1, -1):
-                    msg_data = raw_history[i]
-                    content = ""
-                    
-                    # 🟢 [终极修复]：增加对 <class 'str'> 的反序列化与纯文本兜底
-                    if isinstance(msg_data, str):
-                        try:
-                            parsed = json.loads(msg_data)
-                            if isinstance(parsed, dict):
-                                c = parsed.get('content', '')
-                                content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
-                            else:
-                                content = msg_data
-                        except json.JSONDecodeError:
-                            content = msg_data  # 纯文本兜底
-                    elif isinstance(msg_data, dict):
-                        c = msg_data.get('content', '')
-                        content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
-                    elif hasattr(msg_data, 'content'):
-                        c = getattr(msg_data, 'content', '')
-                        content = c if isinstance(c, str) else "".join([getattr(part, "text", "") for part in c if hasattr(part, "text")])
-                            
+                    _, content = _parse_msg_data(raw_history[i])
                     clean_content = re.sub(r'\s+', '', content) if content else ""
                     if clean_anchor and clean_anchor in clean_content:
                         cutoff_idx = i
@@ -99,34 +107,14 @@ class PromptRefiner:
             start_idx = max(0, cutoff_idx - fetch_count)
             valid_history = raw_history[start_idx:cutoff_idx]
             
+            # 组装扁平化剧本
             for msg_data in valid_history:
-                role = ""
-                content = ""
-                
-                # 再次应用降维解析
-                if isinstance(msg_data, str):
-                    try:
-                        parsed = json.loads(msg_data)
-                        if isinstance(parsed, dict):
-                            role = parsed.get("role", "")
-                            c = parsed.get("content", "")
-                            content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
-                        else:
-                            content = msg_data
-                    except json.JSONDecodeError:
-                        content = msg_data
-                elif isinstance(msg_data, dict):
-                    role = msg_data.get("role", "")
-                    c = msg_data.get("content", "")
-                    content = c if isinstance(c, str) else "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
-                elif hasattr(msg_data, 'content'):
-                    role = getattr(msg_data, "role", "")
-                    c = getattr(msg_data, "content", "")
-                    content = c if isinstance(c, str) else "".join([getattr(part, "text", "") for part in c if hasattr(part, "text")])
-                        
-                if not content: continue
+                role, content = _parse_msg_data(msg_data)
+                if not content: 
+                    continue
                     
                 if role == "user":
+                    # 匹配是否带有 "SenderName: Message" 前缀
                     match = re.match(r"^(.*?):\s*(.*)$", content, re.DOTALL)
                     if match:
                         sender, text = match.groups()
@@ -136,14 +124,13 @@ class PromptRefiner:
                 elif role == "assistant":
                     history_lines.append(f"[我] 说: {content}")
                 else:
-                    # 如果没有 role（纯文本字符串），作为上下文直接塞入剧本
                     history_lines.append(content)
 
         if history_lines:
             history_script = "\n".join(history_lines)
             if is_fast_mode:
                 history_script = f"（极速唤醒：已同步最近 {len(history_lines)} 条群聊剧本）\n" + history_script
-
+                
         # ==========================================
         # 4. 当前视界提取与标签替换
         # ==========================================
