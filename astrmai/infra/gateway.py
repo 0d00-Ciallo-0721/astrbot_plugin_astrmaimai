@@ -65,49 +65,58 @@ class GlobalModelGateway:
         for model_id in models:
             logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
             for attempt in range(max_retries + 1):
-                temp_files_to_clean = []  # 🔴 核心修改：在 try 外层初始化清理名单，确保 finally 能访问
+                temp_files_to_clean = []  # 🔴 登记名单：确保 finally 能清理
                 try:
+                    # 🟢 1. 剥离环境依赖，前置临时文件转换逻辑
+                    processed_image_urls = []
+                    if image_urls and len(image_urls) > 0:
+                        import tempfile, os, base64
+                        for url in image_urls:
+                            if url.startswith("data:image"):
+                                try:
+                                    header, encoded = url.split(",", 1)
+                                    ext = header.split(";")[0].split("/")[1]
+                                    if ext == "jpeg": ext = "jpg"
+                                    img_bytes = base64.b64decode(encoded)
+
+                                    # 创建真实的本地临时文件
+                                    fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
+                                    with os.fdopen(fd, 'wb') as f:
+                                        f.write(img_bytes)
+
+                                    processed_image_urls.append(temp_path)
+                                    temp_files_to_clean.append(temp_path)
+                                except Exception as e:
+                                    logger.error(f"[AstrMai-Gateway] 临时文件转换失败: {e}")
+                                    processed_image_urls.append(url)
+                            else:
+                                processed_image_urls.append(url)
+
+                    # 🟢 2. 构建上下文请求
                     contexts = []
                     if modified_system_prompt:
                         contexts.append(SystemMessageSegment(content=[TextPart(text=modified_system_prompt)]))
                         
                     llm_kwargs = {}
                     current_prompt = prompt
-                    if image_urls and len(image_urls) > 0:
+                    
+                    if processed_image_urls:
+                        # 兼容 AstrBot 各个版本的底层结构
                         if ImagePart:
                             user_content = []
                             if current_prompt:
                                 user_content.append(TextPart(text=current_prompt))
-                            for url in image_urls:
-                                # -------- 核心修改部分开始 --------
-                                if url.startswith("data:image"):
-                                    import tempfile, os, base64
-                                    try:
-                                        # 分离头部和 base64 数据
-                                        header, encoded = url.split(",", 1)
-                                        ext = header.split(";")[0].split("/")[1]
-                                        if ext == "jpeg": ext = "jpg"
-                                        img_bytes = base64.b64decode(encoded)
-
-                                        # 创建真实的本地临时文件
-                                        fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
-                                        with os.fdopen(fd, 'wb') as f:
-                                            f.write(img_bytes)
-
-                                        # 传入绝对短路径，完美规避操作系统的文件名长度检测
-                                        user_content.append(ImagePart(file=temp_path))
-                                        temp_files_to_clean.append(temp_path)  # 🔴 登记到清理名单
-                                    except Exception as e:
-                                        logger.error(f"[AstrMai-Gateway] 临时文件转换失败: {e}")
-                                        user_content.append(ImagePart(url=url))
+                            for path_or_url in processed_image_urls:
+                                import os
+                                if os.path.exists(path_or_url):
+                                    user_content.append(ImagePart(file=path_or_url))
                                 else:
-                                    user_content.append(ImagePart(url=url))
-                                # -------- 核心修改部分结束 --------
-                                
+                                    user_content.append(ImagePart(url=path_or_url))
                             contexts.append(UserMessageSegment(content=user_content))
                             current_prompt = "" 
                         else:
-                            llm_kwargs["image_urls"] = image_urls
+                            # 即使 ImagePart 导入失败，传入的也是合法的短路径临时文件，不会报错
+                            llm_kwargs["image_urls"] = processed_image_urls
                             
                     resp = await self.context.llm_generate(
                         chat_provider_id=model_id,
@@ -127,7 +136,6 @@ class GlobalModelGateway:
                     try:
                         return json.loads(raw_json_str)
                     except json.JSONDecodeError:
-                        # 🟢 [核心修复 Bug 4] 快速熔断防线：如果文本中连 `{` 或 `[` 都没有，说明模型完全脱轨输出纯对话，立即熔断放弃死磕重试
                         if "{" not in raw_json_str and "[" not in raw_json_str:
                             logger.error(f"[AstrMai-Gateway] 🚨 快速熔断：模型 {model_id} 严重幻觉(完全丢失 JSON 结构)，拒绝重试，直接抛弃。")
                             return {}
@@ -150,7 +158,7 @@ class GlobalModelGateway:
                         import asyncio
                         await asyncio.sleep((backoff_factor + retry_penalty) ** attempt) 
                         
-                # 🔴 核心修改：终极物理防泄漏屏障
+                # 🔴 3. 终极物理防泄漏屏障：阅后即焚
                 finally:
                     import os
                     for temp_path in temp_files_to_clean:
