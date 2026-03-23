@@ -21,9 +21,8 @@ class ConcurrentExecutor:
         
     # [修改] 在执行成功的两个分支内，调用 evolution_manager.process_bot_reply 闭环反馈
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None):
-        """[修改] 执行最终规划动作并维持底层状态机握手"""
+        """[修改] 显式安插 👁️‍🗨️【全知视界】探针，并手动闭环记忆处理"""
         chat_id = event.unified_msg_origin
-        # 🟢 [新增] 提取安全的 Bot ID
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
         models = self.gateway.get_agent_models()
@@ -31,13 +30,28 @@ class ConcurrentExecutor:
             logger.error(f"[{chat_id}] Agent 模型未配置且无备用池，无法执行动作。")
             return
 
-        # 🟢 [动态配置] 极速模式下极大收缩智能体反射步数，使其仅能做必要动作并极速回绝深层循环
         is_fast_mode = event.get_extra("is_fast_mode", False)
         max_steps = 1 if is_fast_mode else self.config.agent.max_steps
         timeout = 15 if is_fast_mode else self.config.agent.timeout
         
+        # 🟢 显式打印全知视界探针
+        if getattr(self.config.global_settings, 'debug_mode', True):
+            task_type = "🧠 [System 2 / 主脑决策]"
+            logger.info(
+                f"\n{'='*70}\n"
+                f"👁️‍🗨️ 【全知视界】 准备发往大模型的 Payload 快照\n"
+                f"🎯 目标: {chat_id}\n"
+                f"🔖 链路归属: {task_type}\n"
+                f"{'='*70}\n"
+                f"👇 【SYSTEM PROMPT (系统设定 & 剧本 & 记忆)】 👇\n"
+                f"{system_prompt}\n"
+                f"{'-'*70}\n"
+                f"👇 【USER PROMPT (当前消息/旁白)】 👇\n"
+                f"{prompt}\n"
+                f"{'='*70}"
+            )
+        
         try:
-            # 🟢 [核心修复 Bug 2] 严格先决控制 _is_final_reply_phase 标志，确保 memory hook 能够无缝匹配抓取
             event._is_final_reply_phase = True 
             
             if tools is None or len(tools) == 0:
@@ -59,11 +73,18 @@ class ConcurrentExecutor:
                             
                         await self.reply_engine.handle_reply(event, reply_text, chat_id)
                         
-                        # 🟢 [核心修复 Bug 2] 主动记录真实回复文本，防止记忆被污染
                         if hasattr(self.evolution_manager, 'process_bot_reply'):
                             await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
+                        
+                        # 🟢 手动闭环记忆处理
+                        try:
+                            plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.gateway.context, 'astrmai', None)
+                            if plugin and hasattr(plugin, 'memory_engine') and plugin.memory_engine.summarizer:
+                                await plugin.memory_engine.summarizer.pump_memory_reflection(chat_id, prompt, reply_text)
+                        except Exception as mem_e:
+                            logger.debug(f"[{chat_id}] 手动闭环记忆处理失败: {mem_e}")
                             
-                        return # 执行成功直接退出
+                        return 
                     except Exception as e:
                         last_error = str(e)
                         logger.warning(f"[{chat_id}] ⚠️ 纯文本模型 {provider_id} 调用异常，尝试切换备用: {e}")
@@ -71,7 +92,6 @@ class ConcurrentExecutor:
                         
                 logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
             else:
-                # 原有的 Tool Loop 逻辑
                 tool_set = ToolSet(tools)
                 for provider_id in models:
                     try:
@@ -94,15 +114,21 @@ class ConcurrentExecutor:
 
                         await self.reply_engine.handle_reply(event, reply_text, chat_id)
                         
-                        # 🟢 [核心修复 Bug 2] 主动记录真实回复文本，防止记忆被污染
                         if hasattr(self.evolution_manager, 'process_bot_reply'):
                             await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
+
+                        # 🟢 手动闭环记忆处理
+                        try:
+                            plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.gateway.context, 'astrmai', None)
+                            if plugin and hasattr(plugin, 'memory_engine') and plugin.memory_engine.summarizer:
+                                await plugin.memory_engine.summarizer.pump_memory_reflection(chat_id, prompt, reply_text)
+                        except Exception as mem_e:
+                            logger.debug(f"[{chat_id}] 手动闭环记忆处理失败: {mem_e}")
                             
-                        return # 执行成功直接退出
+                        return 
                     except Exception as e:
                         logger.warning(f"[{chat_id}] ⚠️ Agent 模型 {provider_id} 调用异常，尝试切换备用: {e}")
                         continue
         finally:
-            # 🟢 绝对释放防线：通过 finally 块确保即使模型崩溃或超时，也绝不让标志位逃逸到下一个生命周期
             if hasattr(event, '_is_final_reply_phase'):
                 delattr(event, '_is_final_reply_phase')

@@ -24,23 +24,22 @@ class Planner:
                  reply_engine: ReplyEngine,
                  memory_engine: MemoryEngine,
                  evolution_manager: EvolutionManager,
-                 state_engine=None  # [新增] 接收 state_engine 用于底层用户状态查询
+                 state_engine=None,
+                 prompt_refiner=None  # [新增] 接收注入的 Refiner
                  ):
         self.gateway = gateway
         self.context_engine = context_engine
         self.memory_engine = memory_engine
         self.evolution_manager = evolution_manager
-        self.state_engine = state_engine  # [新增] 挂载到实例
-        
-        # 🟢 [核心修复]: 必须将 reply_engine 挂载到实例属性，否则后续 plan_and_execute 无法访问其配置
+        self.state_engine = state_engine  
         self.reply_engine = reply_engine 
+        self.prompt_refiner = prompt_refiner # [新增] 挂载 Refiner
         
-        # 🟢 [核心修改 Bug 2]: 将 evolution_manager 传入 Executor，以便其进行潜意识写入
         self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
-    
+        
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
-        [修改] 动态上下文修剪、切分视界消息构造纯文本当前剧本格式。
+        [修改] 在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
         """
         chat_id = event.unified_msg_origin
         user_id = event.get_sender_id() 
@@ -51,22 +50,19 @@ class Planner:
             retrieve_keys = []
             
         is_all_mode = "ALL" in retrieve_keys
-        is_fast_mode = "CORE_ONLY" in retrieve_keys # [新增] 极速穿透模式标志
+        is_fast_mode = "CORE_ONLY" in retrieve_keys
         
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
             
-        # [修改] 将滑动窗口内的“当前视界消息”彻底扁平化为纯台词格式
         window_lines = []
         for m in event_messages:
             sender_name = m.get_sender_name() or "群友/用户"
-            # ✨ 【修改此行】：优先读取 sys1 已经解析好的富文本剧本，兜底才用 message_str
             rich_text = m.get_extra("astrmai_rich_text", m.message_str)
             window_lines.append(f"[{sender_name}] 说: {rich_text}")
         prompt_content = "\n".join(window_lines)
         
         import asyncio
-        # [修改] 极速模式下直接砍掉群组黑话与专属表达的检索
         if is_fast_mode:
             slang_context = ""
         else:
@@ -76,7 +72,6 @@ class Planner:
         
         ctx = getattr(self.context_engine, 'context', None)
         
-        # 🟢 [核心修复 Bug 2] 极速模式不再剥夺 tools，仅剥夺 RAG，确保动作能力（表情包等）正常运转
         if is_all_mode:
             tools = None
             if ctx:
@@ -95,14 +90,11 @@ class Planner:
                     current_sender_name=sender_name
                 ),
                 ConstructAtEventTool(db_service=self.context_engine.db),
-                # === [新增] 挂载主动戳一戳工具 ===
                 ProactivePokeTool(db_service=self.context_engine.db),
-                # === [新增] 挂载主动表情包工具，并注入 Config 中的映射规则 ===
                 ProactiveMemeTool(emotion_mapping=self.reply_engine.config.reply.emotion_mapping)
             ]
             if ctx:
                 if is_fast_mode:
-                    # 极速模式也禁用 RAG 减轻上下文包袱
                     if hasattr(ctx, "set"):
                         ctx.set("disable_rag_injection", True)
                     elif hasattr(ctx, "shared_dict"):
@@ -130,31 +122,23 @@ class Planner:
 
         if not is_all_mode and not is_fast_mode:
              system_prompt += "\n\n>>> [物理动作规范] 你现在拥有了在群聊中执行物理动作的能力（如 @群友）。如果你决定使用工具执行动作，你依然必须在工具执行成功后输出最终的文本回复来解释你的行为。不要在执行完动作后就突然沉默！ <<<"
-             
-             # [安全加固] 在 system_prompt 尾部强化输出约束，防止非标准 JSON 导致 Executor 崩溃
              if tools:
                  system_prompt += "\n\n>>> [工具输出约束] 若你决定调用上述工具，你的输出 MUST 严格遵守 JSON 格式规范。不要包含任何除 JSON 之外的聊天解释或代码块修饰符！ <<<"
             
-        # [新增] 极速模式强化约束
         if is_fast_mode:
             system_prompt += "\n\n>>> [极速穿透模式] 你被强唤醒！请立刻、简短、直接地响应最新呼唤，忽略不必要的长篇大论。 <<<"
         
-        # =====================================================================
-        # 🟢 [核心修复] 幽灵信标：为 Sys2 注入 Task ID，防底层框架丢失 Event
-        # =====================================================================
-        import uuid
-        task_id = f"sys2_{uuid.uuid4().hex}"
-        system_prompt += f"\n\n[ASTRMAI_TASK_ID:{task_id}]"
-        
-        from ..infra.event_bus import EventBus
-        if not hasattr(EventBus, '_task_events'):
-            EventBus._task_events = {}
-        EventBus._task_events[task_id] = event
-        # =====================================================================
+        # 🟢 [核心重构] 显式调用 Refiner 进行字符串渲染，直接闭环获得处理后的 Prompt
+        final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
+            event=event, 
+            system_prompt=system_prompt, 
+            prompt=prompt_content, 
+            context=ctx
+        )
 
         await self.executor.execute(
             event=event,
-            system_prompt=system_prompt,
-            prompt=prompt_content,
+            system_prompt=final_system_prompt,
+            prompt=final_prompt,
             tools=tools
         )

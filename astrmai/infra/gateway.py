@@ -4,7 +4,6 @@ import asyncio
 from typing import Dict, Any,List,Union
 from astrbot.api import logger
 from astrbot.api.star import Context
-import contextvars
 
 # [修改] 引入 AstrBot 标准消息片段类，并添加防崩溃动态导入 (兼容 v4.12 - v4.18+)
 from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
@@ -18,21 +17,15 @@ try:
 except ImportError:
     repair_json = None
 
-_internal_call_flag = contextvars.ContextVar('astrmai_internal_call', default=False)
-
-
 class GlobalModelGateway:
     """
     统一模型网关 (重构版：增加弹性熔断与指数退避)
     已彻底接入 Pydantic AstrMaiConfig 对象。
     """
     def __init__(self, context: Context, config: Any):
-        import uuid
         self.context = context
         self.config = config
-        # 🟢 [深层修复 Bug 3] 生成运行时级唯一高熵防伪凭证，免疫 Prompt 注入
-        self.internal_marker = f"__ASTRMAI_INTERNAL_{uuid.uuid4().hex}__"
-
+        # 🟢 [核心清理] 既然废弃了 main.py 中的拦截器，此处不再需要生成 internal_marker 隐身凭证
 
     # [新增] 统一列表合成器：获取用于当前任务的模型轮询列表
     def get_models_for_task(self, specific_model: str) -> List[str]:
@@ -50,10 +43,9 @@ class GlobalModelGateway:
     
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None) -> Union[str, Dict[str, Any]]: 
-        """统一网关底层调用引擎 (动态凭证注入防递归版 + 异常快速熔断 + 视觉临时文件防泄漏)"""
+        """统一网关底层调用引擎 (异常快速熔断 + 视觉临时文件防泄漏)"""
         
-        modified_system_prompt = f"{system_prompt}\n\n{self.internal_marker}" if system_prompt else self.internal_marker
-        
+        # 🟢 [核心清理] 删除了对 internal_marker 的拼装，还系统一个纯净无污染的 Prompt
         if not models:
             logger.warning("[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池！")
             return {} if is_json else ""
@@ -67,7 +59,7 @@ class GlobalModelGateway:
             for attempt in range(max_retries + 1):
                 temp_files_to_clean = []  # 🔴 登记名单：确保 finally 能清理
                 try:
-                    # 🟢 1. 剥离环境依赖，前置临时文件转换逻辑
+                    # 1. 剥离环境依赖，前置临时文件转换逻辑
                     processed_image_urls = []
                     if image_urls and len(image_urls) > 0:
                         import tempfile, os, base64
@@ -92,10 +84,10 @@ class GlobalModelGateway:
                             else:
                                 processed_image_urls.append(url)
 
-                    # 🟢 2. 构建上下文请求
+                    # 2. 构建上下文请求
                     contexts = []
-                    if modified_system_prompt:
-                        contexts.append(SystemMessageSegment(content=[TextPart(text=modified_system_prompt)]))
+                    if system_prompt:
+                        contexts.append(SystemMessageSegment(content=[TextPart(text=system_prompt)]))
                         
                     llm_kwargs = {}
                     current_prompt = prompt
@@ -158,7 +150,7 @@ class GlobalModelGateway:
                         import asyncio
                         await asyncio.sleep((backoff_factor + retry_penalty) ** attempt) 
                         
-                # 🔴 3. 终极物理防泄漏屏障：阅后即焚
+                # 3. 终极物理防泄漏屏障：阅后即焚
                 finally:
                     import os
                     for temp_path in temp_files_to_clean:

@@ -23,6 +23,11 @@ class ChatHistorySummarizer:
         
         # 挂载认知处理器
         self.processor = MemoryProcessor(gateway)
+        
+        # 🟢 [新增] 接管原本在 main.py 里的高内聚状态变量，消除在 main 中的松散耦合
+        self._session_history_buffer = {}
+        self._memory_locks = {}
+        self._background_tasks = set()
 
     async def start(self):
         """启动后台定期检查循环"""
@@ -129,3 +134,120 @@ class ChatHistorySummarizer:
             # 👆【修改结束】
         except Exception as e:
             logger.error(f"[Memory Summarizer] ❌ 记忆向量库写入失败: {e}", exc_info=True)
+
+
+
+# 文件位置: astrmai/memory/summarizer.py
+# 新增函数: _get_memory_lock
+
+    def _get_memory_lock(self, chat_id: str) -> asyncio.Lock:
+        """[新增] 安全获取记忆缓冲区的原子操作锁"""
+        lock = self._memory_locks.get(chat_id)
+        if lock is None:
+            import asyncio
+            lock = asyncio.Lock()
+            self._memory_locks[chat_id] = lock
+        return lock
+
+# 文件位置: astrmai/memory/summarizer.py
+# 新增函数: _fire_and_forget
+
+    def _fire_and_forget(self, coro):
+        """[新增] 安全触发后台任务的通用封装，防止被 GC 和吞噬异常"""
+        import asyncio
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._handle_task_result)
+
+# 文件位置: astrmai/memory/summarizer.py
+# 新增函数: _handle_task_result
+
+    def _handle_task_result(self, task: asyncio.Task):
+        """[新增] 处理后台任务完成后的清理与异常捕获"""
+        import asyncio
+        self._background_tasks.discard(task)
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"[AstrMai-Memory] 后台摘要任务异常: {exc}", exc_info=exc)
+        except asyncio.CancelledError:
+            pass
+
+# 文件位置: astrmai/memory/summarizer.py
+# 新增函数: pump_memory_reflection
+
+    async def pump_memory_reflection(self, chat_id: str, user_msg: str, ai_msg: str):
+        """
+        [新增] 显式闭环的记忆反思泵，接管原本飘忽不定的 main.py 全局拦截器。
+        在此处将对话存入 Buffer，达到阈值后触发 summarize_session。
+        """
+        import time
+        import asyncio
+        if not ai_msg: return
+        
+        # 防止漏网之鱼的后台 JSON 流入
+        if ai_msg.strip().startswith('{') or ai_msg.strip().startswith('```json'):
+            return
+            
+        lock = self._get_memory_lock(chat_id)
+        async with lock:
+            if chat_id not in self._session_history_buffer:
+                self._session_history_buffer[chat_id] = {"buffer": [], "last_update": time.time(), "cooldown_until": 0, "failures": 0}
+                
+            session_data = self._session_history_buffer[chat_id]
+            buffer = session_data["buffer"]
+            session_data["last_update"] = time.time()
+            
+            if user_msg and user_msg.strip(): buffer.append(f"用户/旁白：{user_msg}")
+            if ai_msg and ai_msg.strip(): buffer.append(f"Bot：{ai_msg}")
+            
+            threshold = getattr(self.config.memory, 'summary_threshold', 30)
+            
+            if time.time() < session_data.get("cooldown_until", 0):
+                return
+            
+            if len(buffer) >= threshold * 2:
+                messages_to_process = buffer.copy()
+                self._session_history_buffer[chat_id]["buffer"] = []
+                
+                history_text = "\n".join(messages_to_process)
+                
+                async def safe_summarize_task():
+                    try:
+                        await self.summarize_session(
+                            session_id=chat_id,
+                            chat_history_text=history_text
+                        )
+                        async with self._get_memory_lock(chat_id):
+                            if chat_id in self._session_history_buffer:
+                                self._session_history_buffer[chat_id]["failures"] = 0
+                    except asyncio.CancelledError:
+                        # 🟢 [核心修复] 当协程被外力终止时，强制触发安全回滚，避免记忆蒸发
+                        logger.info(f"[{chat_id}] ⚠️ 记忆摘要任务被强行中断，执行安全回滚...")
+                        async with self._get_memory_lock(chat_id):
+                            current_data = self._session_history_buffer.get(chat_id, {"buffer": [], "cooldown_until": 0, "failures": 0})
+                            current_data["buffer"] = messages_to_process + current_data["buffer"]
+                            self._session_history_buffer[chat_id] = current_data
+                        raise
+                    except Exception as e:
+                        logger.error(f"[AstrMai-Memory] 🚨 记忆摘要生成失败，进入指数退避: {e}")
+                        async with self._get_memory_lock(chat_id):
+                            current_data = self._session_history_buffer.get(chat_id, {"buffer": [], "cooldown_until": 0, "failures": 0})
+                            merged_buffer = messages_to_process + current_data["buffer"]
+                            
+                            max_capacity = threshold * 3
+                            if len(merged_buffer) > max_capacity:
+                                logger.warning(f"[AstrMai-Memory] ⚠️ 触及硬截断上限，丢弃 {len(merged_buffer) - max_capacity} 条极旧记忆防雪崩。")
+                                merged_buffer = merged_buffer[-max_capacity:]
+                                
+                            current_data["buffer"] = merged_buffer
+                            current_data["last_update"] = time.time()
+                            
+                            failures = current_data.get("failures", 0) + 1
+                            current_data["failures"] = failures
+                            backoff_time = min(3600, 300 * (2 ** (failures - 1)))
+                            current_data["cooldown_until"] = time.time() + backoff_time
+                            
+                            self._session_history_buffer[chat_id] = current_data
+
+                self._fire_and_forget(safe_summarize_task())            
