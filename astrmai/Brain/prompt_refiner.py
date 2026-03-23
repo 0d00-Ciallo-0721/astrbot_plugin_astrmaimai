@@ -13,8 +13,12 @@ class PromptRefiner:
     2. 工具链安全：保护原生 tool_calls 结构不被破坏，同时清空历史数组污染。
     3. 剧场坍缩：将上下文折叠为 System Prompt 里的自然语言，打破 AI 思想钢印。
     """
-    def __init__(self, memory_engine, config=None):
+# 文件位置: astrmai/Brain/prompt_refiner.py
+# 标注: 修改 __init__ 和 refine_prompt
+
+    def __init__(self, memory_engine, db_service=None, config=None):
         self.memory_engine = memory_engine
+        self.db_service = db_service # 🟢 [新增] 直接接收数据库服务
         self.config = config
 
     async def refine_prompt(self, event: AstrMessageEvent, system_prompt: str, prompt: str, context) -> tuple[str, str]:
@@ -52,7 +56,6 @@ class PromptRefiner:
         
         history_lines = []
         if conversation and hasattr(conversation, "history") and conversation.history:
-            # 🟢 [修复 Bug 1] 安全地进行 JSON 反序列化，防止长字符串被切碎为单字符数组
             import json
             raw_history_data = conversation.history
             if isinstance(raw_history_data, str):
@@ -135,26 +138,12 @@ class PromptRefiner:
             picids = set(re.findall(r'\[picid:([a-fA-F0-9]{32})\]', text))
             if not picids: return text
             
-            # 🟢 [修复 Bug 2] 穿透获取全局数据库服务，唤醒机器人的视觉海马体
-            db_service = None
-            try:
-                plugin_mgr = getattr(context, 'plugin_manager', None)
-                if plugin_mgr and hasattr(plugin_mgr, 'plugins'):
-                    for p in plugin_mgr.plugins.values():
-                        if getattr(p, 'name', '') == 'astrmai' or 'astrmai' in str(type(p)).lower():
-                            db_service = getattr(p, 'db_service', None)
-                            break
-            except Exception:
-                pass
-                
-            if not db_service:
-                db_service = getattr(self.memory_engine, 'db', getattr(self.memory_engine, 'db_service', None))
-
+            # 🟢 [核心修复 Bug 2] 直接使用类实例挂载的 db_service
             for picid in picids:
                 resolved_text = "[一张尚未看清的图片]"
-                if db_service:
+                if self.db_service:
                     for _ in range(15): 
-                        with db_service.get_session() as session:
+                        with self.db_service.get_session() as session:
                             from ..infra.datamodels import VisualMemory
                             import json
                             mem = session.get(VisualMemory, picid)
@@ -165,12 +154,14 @@ class PromptRefiner:
                                 except Exception:
                                     tags_str = ""
                                 if mem.type == "emoji":
-                                    resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]" if tags_str else f"[发了一个表情包，画面是：{mem.description}]"
-                                else:
-                                    resolved_text = f"[发了一张图片，画面是：{mem.description}]"
+                                    resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]" if tags_str else f"[发了一张图片，画面是：{mem.description}]"
                                 break
                         import asyncio
                         await asyncio.sleep(1.0)
+                else:
+                    from astrbot.api import logger
+                    logger.warning(f"[PromptRefiner] ⚠️ db_service 未挂载，无法解析图片 ID: {picid}")
+                    
                 text = text.replace(f"[picid:{picid}]", resolved_text)
             return text
 

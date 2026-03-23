@@ -81,7 +81,9 @@ class AstrMaiPlugin(Star):
 
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
-        self.prompt_refiner = PromptRefiner(self.memory_engine, self.config) 
+        
+        # 🟢 [修改] 显式传入 db_service 给 PromptRefiner，解决图片失忆症
+        self.prompt_refiner = PromptRefiner(self.memory_engine, self.db_service, self.config) 
         
         self.system2_planner = Planner(
             context, 
