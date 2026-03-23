@@ -443,6 +443,40 @@ class AstrMaiPlugin(Star):
         # [核心修复] 将杂乱的替换逻辑全部移交至 PromptRefiner 专业模块处理
         await self.prompt_refiner.refine_prompt(event, req, self.context)
 
+        # =====================================================================
+        # 🟢 [新增] System 2 终极上下文核验探针
+        # 作用：在发给大模型的前一毫秒，拦截并打印完整的 System Prompt 和 Messages
+        # =====================================================================
+        try:
+            # 只有在开启 debug_mode 时才打印，防止刷屏（如果你想一直看，可以把这个 if 去掉）
+            if getattr(self.config.global_settings, 'debug_mode', True):
+                chat_id = event.unified_msg_origin
+                sys_msg = str(req.system_message[0].content) if req.system_message else "None"
+                
+                history_msgs = []
+                for m in req.messages:
+                    role = getattr(m, 'role', 'unknown')
+                    content = getattr(m, 'content', '')
+                    # 为了排版美观，截断极长可能包含 Base64 的异常数据
+                    if isinstance(content, str) and len(content) > 2000:
+                        content = content[:2000] + "\n...[内容过长已截断]..."
+                    history_msgs.append(f"<{role.upper()}>\n{content}")
+                    
+                full_history = "\n\n".join(history_msgs)
+                
+                logger.info(
+                    f"\n{'='*60}\n"
+                    f"🧠 [System 2 终极透视探针] 目标: {chat_id}\n"
+                    f"{'='*60}\n"
+                    f"👇 【SYSTEM PROMPT (系统设定 & 剧本 & 记忆)】 👇\n"
+                    f"{sys_msg}\n"
+                    f"{'-'*60}\n"
+                    f"👇 【MESSAGES 队列 (用户当前消息)】 👇\n"
+                    f"{full_history}\n"
+                    f"{'='*60}"
+                )
+        except Exception as e:
+            logger.error(f"[System 2 探针] 打印日志时出错: {e}")
     @filter.on_llm_request()
     async def handle_internal_call_marker(self, event: AstrMessageEvent, req: ProviderRequest):
         """[修改] 拦截底层网关注入的动态唯一隐身标记，免疫 Prompt 注入，并支持 contexts 深度解析"""
