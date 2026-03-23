@@ -120,10 +120,7 @@ class Planner:
             user_message = event.message_str
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
 
-        if not is_all_mode and not is_fast_mode:
-             system_prompt += "\n\n>>> [物理动作规范] 你现在拥有了在群聊中执行物理动作的能力（如 @群友）。如果你决定使用工具执行动作，你依然必须在工具执行成功后输出最终的文本回复来解释你的行为。不要在执行完动作后就突然沉默！ <<<"
-             if tools:
-                 system_prompt += "\n\n>>> [工具输出约束] 若你决定调用上述工具，你的输出 MUST 严格遵守 JSON 格式规范。不要包含任何除 JSON 之外的聊天解释或代码块修饰符！ <<<"
+        # 🟢 [核心瘦身] 彻底删除了重复的 [物理动作规范] 和 [工具输出约束]，依靠 ContextEngine 中更系统的指南即可。
             
         if is_fast_mode:
             system_prompt += "\n\n>>> [极速穿透模式] 你被强唤醒！请立刻、简短、直接地响应最新呼唤，忽略不必要的长篇大论。 <<<"

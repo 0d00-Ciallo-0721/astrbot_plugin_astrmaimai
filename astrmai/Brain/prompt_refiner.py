@@ -168,7 +168,11 @@ class PromptRefiner:
         import re
         final_system_prompt = system_prompt
         final_system_prompt = re.sub(r'<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}', f"群聊历史消息：\n{history_script}", final_system_prompt)
-        final_system_prompt = re.sub(r'<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\}', prompt.strip(), final_system_prompt)
+        
+        # 🟢 [核心瘦身] 连同 "当前你看到的消息：" 这个标题一起，把 System Prompt 里的冗余消息占位符彻底抹除
+        final_system_prompt = re.sub(r'当前你看到的消息：\s*(<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\})', '', final_system_prompt)
+        final_system_prompt = re.sub(r'<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\}', '', final_system_prompt)
+        
         final_system_prompt = re.sub(r'<RAG_MEMORY>|\{MEMORY_PLACEHOLDER\}', injection, final_system_prompt)
         
         final_system_prompt = await _resolve_visual_memory(final_system_prompt)
@@ -181,6 +185,7 @@ class PromptRefiner:
         else:
             director_voice = "【动作提示】请先判断是否需要调用工具。如果不需要，请直接沉浸在角色中说出你的台词，不要带任何角色名前缀！"
             
+        # 🟢 [精简 User Prompt] 保持 User Prompt 为唯一携带最新消息的地方
         final_prompt = f"(导演旁白：请仔细阅读设定和前面的剧本。这是当前你看到的最新消息：\n{original_content}\n\n>> {director_voice})"
 
         from astrbot.api import logger
