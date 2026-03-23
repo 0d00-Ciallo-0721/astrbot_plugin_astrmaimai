@@ -433,75 +433,108 @@ class AstrMaiPlugin(Star):
         status = await self.attention_gate.process_event(event)
         if status == "ENGAGED":
             event.stop_event()
-            
-    @filter.on_llm_request()
-    async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
-        """【剧本模式核心】全局记忆注入、底层历史防污染截取 & 工具链保护"""
-        if not getattr(event, '_is_final_reply_phase', False):
-            return
-            
-        # [核心修复] 将杂乱的替换逻辑全部移交至 PromptRefiner 专业模块处理
-        await self.prompt_refiner.refine_prompt(event, req, self.context)
 
-        # =====================================================================
-        # 🟢 [新增] System 2 终极上下文核验探针
-        # 作用：在发给大模型的前一毫秒，拦截并打印完整的 System Prompt 和 Messages
-        # =====================================================================
+    # =====================================================================
+    # 👁️‍🗨️ [核心重构] 主拦截网关 & 全知视界探针 (整合 Sys1 隐身与 Sys2 注入)
+    # =====================================================================
+    @filter.on_llm_request()
+    async def astrmai_master_interceptor(self, event: AstrMessageEvent, req: ProviderRequest):
+        """【主拦截网关】整合内部标记清理、RAG 注入及终极日志快照打印"""
+        if not event:
+            return
+
         try:
-            # 只有在开启 debug_mode 时才打印，防止刷屏（如果你想一直看，可以把这个 if 去掉）
+            # --- 0. 兼容性提取 System Prompt ---
+            sys_msg_text = ""
+            if req.system_message and req.system_message[0].content:
+                sys_msg_text = str(req.system_message[0].content)
+            elif hasattr(req, 'system_prompt') and req.system_prompt: # 兼容极老版本或特殊模型适配器
+                sys_msg_text = str(req.system_prompt)
+
+            task_type = "UNKNOWN"
+            is_internal = False
+
+            # ---------------------------------------------------------
+            # 1. 🥷 拦截底层网关注入的动态唯一隐身标记 (System 1)
+            # ---------------------------------------------------------
+            marker = getattr(self.gateway, 'internal_marker', '__ASTRMAI_INTERNAL_CALL__')
+            
+            # 清理系统提示词中的标记
+            if marker in sys_msg_text:
+                is_internal = True
+                sys_msg_text = sys_msg_text.replace(marker, "").strip()
+                # 写回修改
+                if req.system_message:
+                    req.system_message[0].content = sys_msg_text
+                elif hasattr(req, 'system_prompt'):
+                    req.system_prompt = sys_msg_text
+
+            # 深度遍历 contexts (解决 v4.5.7+ 架构下 Marker 随 SystemMessageSegment 逃逸的问题)
+            if hasattr(req, 'contexts') and isinstance(req.contexts, list):
+                from astrbot.core.agent.message import SystemMessageSegment, TextPart
+                for msg in req.contexts:
+                    if isinstance(msg, SystemMessageSegment):
+                        for part in getattr(msg, 'content', []):
+                            if isinstance(part, TextPart) and marker in part.text:
+                                is_internal = True
+                                part.text = part.text.replace(marker, "").strip()
+
+            if is_internal:
+                event._system_internal_task = True
+                task_type = "🥷 [System 1 / 后台推断]"
+
+            # ---------------------------------------------------------
+            # 2. 🧠 全局记忆注入 & 剧本模式核心 (System 2)
+            # ---------------------------------------------------------
+            # [核心修复] 彻底丢弃脆弱的 _is_final_reply_phase，改用特征文本锚定
+            is_sys2 = "<CHAT_HISTORY>" in sys_msg_text or "{HISTORY_PLACEHOLDER}" in sys_msg_text
+            
+            if is_sys2:
+                task_type = "🧠 [System 2 / 主脑决策]"
+                
+                # 将杂乱的替换逻辑全部移交至 PromptRefiner 专业模块处理
+                await self.prompt_refiner.refine_prompt(event, req, self.context)
+                
+                # Refiner 注入完毕后，重新读取已被替换为完美剧本的 Prompt
+                if req.system_message and req.system_message[0].content:
+                    sys_msg_text = str(req.system_message[0].content)
+
+            # ---------------------------------------------------------
+            # 3. 👁️‍🗨️ 终极上下文核验探针 (全知视界日志打印)
+            # ---------------------------------------------------------
             if getattr(self.config.global_settings, 'debug_mode', True):
-                chat_id = event.unified_msg_origin
-                sys_msg = str(req.system_message[0].content) if req.system_message else "None"
+                chat_id = getattr(event, 'unified_msg_origin', 'Unknown')
                 
                 history_msgs = []
-                for m in req.messages:
-                    role = getattr(m, 'role', 'unknown')
-                    content = getattr(m, 'content', '')
-                    # 为了排版美观，截断极长可能包含 Base64 的异常数据
-                    if isinstance(content, str) and len(content) > 2000:
-                        content = content[:2000] + "\n...[内容过长已截断]..."
-                    history_msgs.append(f"<{role.upper()}>\n{content}")
-                    
-                full_history = "\n\n".join(history_msgs)
-                
-                logger.info(
-                    f"\n{'='*60}\n"
-                    f"🧠 [System 2 终极透视探针] 目标: {chat_id}\n"
-                    f"{'='*60}\n"
-                    f"👇 【SYSTEM PROMPT (系统设定 & 剧本 & 记忆)】 👇\n"
-                    f"{sys_msg}\n"
-                    f"{'-'*60}\n"
-                    f"👇 【MESSAGES 队列 (用户当前消息)】 👇\n"
-                    f"{full_history}\n"
-                    f"{'='*60}"
-                )
-        except Exception as e:
-            logger.error(f"[System 2 探针] 打印日志时出错: {e}")
-    @filter.on_llm_request()
-    async def handle_internal_call_marker(self, event: AstrMessageEvent, req: ProviderRequest):
-        """[修改] 拦截底层网关注入的动态唯一隐身标记，免疫 Prompt 注入，并支持 contexts 深度解析"""
-        if not event: return
-        marker = getattr(self.gateway, 'internal_marker', '__ASTRMAI_INTERNAL_CALL__')
-        is_internal = False
-        
-        # 1. 检查传统的 system_prompt 字符串 (兼容旧版架构)
-        if req.system_prompt and marker in req.system_prompt:
-            is_internal = True
-            req.system_prompt = req.system_prompt.replace(marker, "").strip()
-            
-        # 2. 🟢 [核心修复 Bug 1] 深度遍历 contexts (解决 v4.5.7+ 架构下 Marker 随 SystemMessageSegment 逃逸的问题)
-        if hasattr(req, 'contexts') and isinstance(req.contexts, list):
-            from astrbot.core.agent.message import SystemMessageSegment, TextPart
-            for msg in req.contexts:
-                if isinstance(msg, SystemMessageSegment):
-                    for part in getattr(msg, 'content', []):
-                        if isinstance(part, TextPart) and marker in part.text:
-                            is_internal = True
-                            part.text = part.text.replace(marker, "").strip()
+                if req.messages:
+                    for m in req.messages:
+                        role = getattr(m, 'role', 'unknown')
+                        content = getattr(m, 'content', '')
+                        
+                        # 为了排版美观，截断极长可能包含 Base64 的异常数据
+                        if isinstance(content, str) and len(content) > 2000:
+                            content = content[:2000] + "\n...[内容过长已截断]..."
+                        history_msgs.append(f"<{role.upper()}>\n{content}")
+                        
+                full_history = "\n\n".join(history_msgs) if history_msgs else "无 Message 队列"
 
-        # 一旦确认为后台任务，从物理层挂载内部标识
-        if is_internal:
-            event._system_internal_task = True
+                logger.info(
+                    f"\n{'='*70}\n"
+                    f"👁️‍🗨️ 【全知视界】 拦截到即将发往大模型的 HTTP Payload 快照\n"
+                    f"🎯 目标群聊: {chat_id}\n"
+                    f"🔖 链路归属: {task_type}\n"
+                    f"{'='*70}\n"
+                    f"👇 【SYSTEM PROMPT (系统设定 & 剧本 & 记忆)】 👇\n"
+                    f"{sys_msg_text}\n"
+                    f"{'-'*70}\n"
+                    f"👇 【MESSAGES 队列 (用户当前消息/工具链)】 👇\n"
+                    f"{full_history}\n"
+                    f"{'='*70}"
+                )
+
+        except Exception as e:
+            logger.error(f"【全知视界探针】主拦截网关执行异常: {e}", exc_info=True)
+
 
     @filter.on_llm_response()
     async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
