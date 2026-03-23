@@ -139,6 +139,19 @@ class Planner:
         if is_fast_mode:
             system_prompt += "\n\n>>> [极速穿透模式] 你被强唤醒！请立刻、简短、直接地响应最新呼唤，忽略不必要的长篇大论。 <<<"
         
+        # =====================================================================
+        # 🟢 [核心修复] 幽灵信标：为 Sys2 注入 Task ID，防底层框架丢失 Event
+        # =====================================================================
+        import uuid
+        task_id = f"sys2_{uuid.uuid4().hex}"
+        system_prompt += f"\n\n[ASTRMAI_TASK_ID:{task_id}]"
+        
+        from ..infra.event_bus import EventBus
+        if not hasattr(EventBus, '_task_events'):
+            EventBus._task_events = {}
+        EventBus._task_events[task_id] = event
+        # =====================================================================
+
         await self.executor.execute(
             event=event,
             system_prompt=system_prompt,

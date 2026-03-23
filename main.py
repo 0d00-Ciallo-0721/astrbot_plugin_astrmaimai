@@ -440,11 +440,7 @@ class AstrMaiPlugin(Star):
     @filter.on_llm_request()
     async def astrmai_master_interceptor(self, event: AstrMessageEvent, req: ProviderRequest):
         """【主拦截网关】整合内部标记清理、RAG 注入及终极日志快照打印"""
-        if not event:
-            return
-
         try:
-            # --- 0. 兼容性提取 System Prompt ---
             sys_msg_text = ""
             if req.system_message and req.system_message[0].content:
                 sys_msg_text = str(req.system_message[0].content)
@@ -455,21 +451,38 @@ class AstrMaiPlugin(Star):
             is_internal = False
 
             # ---------------------------------------------------------
+            # 0. 🚑 [终极修复] 通过幽灵信标找回底层丢失的 Event
+            # ---------------------------------------------------------
+            import re
+            from .astrmai.infra.event_bus import EventBus
+            
+            match = re.search(r'\[ASTRMAI_TASK_ID:(.*?)\]', sys_msg_text)
+            if match:
+                task_id = match.group(1)
+                sys_msg_text = sys_msg_text.replace(match.group(0), "").strip()
+                # 抹除信标痕迹
+                if req.system_message:
+                    req.system_message[0].content = sys_msg_text
+                elif hasattr(req, 'system_prompt'):
+                    req.system_prompt = sys_msg_text
+                    
+                # 强行复活 Event
+                if hasattr(EventBus, '_task_events') and task_id in EventBus._task_events:
+                    event = EventBus._task_events[task_id]
+
+            # ---------------------------------------------------------
             # 1. 🥷 拦截底层网关注入的动态唯一隐身标记 (System 1)
             # ---------------------------------------------------------
             marker = getattr(self.gateway, 'internal_marker', '__ASTRMAI_INTERNAL_CALL__')
-            
-            # 清理系统提示词中的标记
+
             if marker in sys_msg_text:
                 is_internal = True
                 sys_msg_text = sys_msg_text.replace(marker, "").strip()
-                # 写回修改
                 if req.system_message:
                     req.system_message[0].content = sys_msg_text
                 elif hasattr(req, 'system_prompt'):
                     req.system_prompt = sys_msg_text
 
-            # 深度遍历 contexts (解决 v4.5.7+ 架构下 Marker 随 SystemMessageSegment 逃逸的问题)
             if hasattr(req, 'contexts') and isinstance(req.contexts, list):
                 from astrbot.core.agent.message import SystemMessageSegment, TextPart
                 for msg in req.contexts:
@@ -480,48 +493,47 @@ class AstrMaiPlugin(Star):
                                 part.text = part.text.replace(marker, "").strip()
 
             if is_internal:
-                event._system_internal_task = True
+                if event: event._system_internal_task = True
                 task_type = "🥷 [System 1 / 后台推断]"
 
             # ---------------------------------------------------------
             # 2. 🧠 全局记忆注入 & 剧本模式核心 (System 2)
             # ---------------------------------------------------------
-            # [核心修复] 彻底丢弃脆弱的 _is_final_reply_phase，改用特征文本锚定
             is_sys2 = "<CHAT_HISTORY>" in sys_msg_text or "{HISTORY_PLACEHOLDER}" in sys_msg_text
             
             if is_sys2:
                 task_type = "🧠 [System 2 / 主脑决策]"
                 
-                # 将杂乱的替换逻辑全部移交至 PromptRefiner 专业模块处理
-                await self.prompt_refiner.refine_prompt(event, req, self.context)
-                
-                # Refiner 注入完毕后，重新读取已被替换为完美剧本的 Prompt
-                if req.system_message and req.system_message[0].content:
-                    sys_msg_text = str(req.system_message[0].content)
+                if event:
+                    await self.prompt_refiner.refine_prompt(event, req, self.context)
+                    if req.system_message and req.system_message[0].content:
+                        sys_msg_text = str(req.system_message[0].content)
+                else:
+                    from astrbot.api import logger
+                    logger.error("🚨 致命错误：Sys2 拦截网关未能找回 Event，RAG 注入失败！")
 
             # ---------------------------------------------------------
             # 3. 👁️‍🗨️ 终极上下文核验探针 (全知视界日志打印)
             # ---------------------------------------------------------
             if getattr(self.config.global_settings, 'debug_mode', True):
-                chat_id = getattr(event, 'unified_msg_origin', 'Unknown')
+                chat_id = getattr(event, 'unified_msg_origin', 'Unknown/ProactiveTask') if event else 'Unknown/ProactiveTask'
                 
                 history_msgs = []
                 if req.messages:
                     for m in req.messages:
                         role = getattr(m, 'role', 'unknown')
                         content = getattr(m, 'content', '')
-                        
-                        # 为了排版美观，截断极长可能包含 Base64 的异常数据
                         if isinstance(content, str) and len(content) > 2000:
                             content = content[:2000] + "\n...[内容过长已截断]..."
                         history_msgs.append(f"<{role.upper()}>\n{content}")
                         
                 full_history = "\n\n".join(history_msgs) if history_msgs else "无 Message 队列"
 
+                from astrbot.api import logger
                 logger.info(
                     f"\n{'='*70}\n"
                     f"👁️‍🗨️ 【全知视界】 拦截到即将发往大模型的 HTTP Payload 快照\n"
-                    f"🎯 目标群聊: {chat_id}\n"
+                    f"🎯 目标: {chat_id}\n"
                     f"🔖 链路归属: {task_type}\n"
                     f"{'='*70}\n"
                     f"👇 【SYSTEM PROMPT (系统设定 & 剧本 & 记忆)】 👇\n"
@@ -533,8 +545,8 @@ class AstrMaiPlugin(Star):
                 )
 
         except Exception as e:
+            from astrbot.api import logger
             logger.error(f"【全知视界探针】主拦截网关执行异常: {e}", exc_info=True)
-
 
     @filter.on_llm_response()
     async def handle_memory_reflection(self, event: AstrMessageEvent, resp: LLMResponse):
