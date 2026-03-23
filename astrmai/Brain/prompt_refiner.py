@@ -52,10 +52,23 @@ class PromptRefiner:
         
         history_lines = []
         if conversation and hasattr(conversation, "history") and conversation.history:
-            raw_history = list(conversation.history)
+            # 🟢 [修复 Bug 1] 安全地进行 JSON 反序列化，防止长字符串被切碎为单字符数组
+            import json
+            raw_history_data = conversation.history
+            if isinstance(raw_history_data, str):
+                try:
+                    raw_history_data = json.loads(raw_history_data)
+                except json.JSONDecodeError:
+                    from astrbot.api import logger
+                    logger.error("[PromptRefiner] 🚨 底层历史记录 JSON 反序列化失败！已清空防污染。")
+                    raw_history_data = []
+            
+            if not isinstance(raw_history_data, list):
+                raw_history_data = list(raw_history_data)
+                
+            raw_history = raw_history_data
             cutoff_idx = len(raw_history)
             
-            import json
             import re
             def _parse_msg_data(raw_data):
                 role, text = "", ""
@@ -122,7 +135,21 @@ class PromptRefiner:
             picids = set(re.findall(r'\[picid:([a-fA-F0-9]{32})\]', text))
             if not picids: return text
             
-            db_service = getattr(self.memory_engine, 'db', getattr(self.memory_engine, 'db_service', None))
+            # 🟢 [修复 Bug 2] 穿透获取全局数据库服务，唤醒机器人的视觉海马体
+            db_service = None
+            try:
+                plugin_mgr = getattr(context, 'plugin_manager', None)
+                if plugin_mgr and hasattr(plugin_mgr, 'plugins'):
+                    for p in plugin_mgr.plugins.values():
+                        if getattr(p, 'name', '') == 'astrmai' or 'astrmai' in str(type(p)).lower():
+                            db_service = getattr(p, 'db_service', None)
+                            break
+            except Exception:
+                pass
+                
+            if not db_service:
+                db_service = getattr(self.memory_engine, 'db', getattr(self.memory_engine, 'db_service', None))
+
             for picid in picids:
                 resolved_text = "[一张尚未看清的图片]"
                 if db_service:
