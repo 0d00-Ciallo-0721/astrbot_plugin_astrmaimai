@@ -1,0 +1,374 @@
+graph TD
+    %% ============================================================
+    %% 样式定义
+    %% ============================================================
+    classDef user fill:#2d3436,stroke:#dfe6e9,stroke-width:2px,color:#fff;
+    classDef framework fill:#f5f6fa,stroke:#b2bec3,stroke-width:1px,stroke-dasharray: 5 5,color:#636e72;
+    classDef heart fill:#ff7675,stroke:#d63031,stroke-width:2px,color:#fff;
+    classDef memory fill:#74b9ff,stroke:#0984e3,stroke-width:2px,color:#fff;
+    classDef brain fill:#ffeaa7,stroke:#fdcb6e,stroke-width:3px,color:#2d3436;
+    classDef evolution fill:#a29bfe,stroke:#6c5ce7,stroke-width:2px,color:#fff;
+    classDef action fill:#00b894,stroke:#00cec9,stroke-width:2px,color:#fff;
+    classDef guard fill:#fab1a0,stroke:#e17055,stroke-width:2px,color:#fff;
+    classDef error fill:#d63031,stroke:#fab1a0,stroke-width:2px,color:#fff,stroke-dasharray: 5 5;
+    classDef db fill:#dfe6e9,stroke:#636e72,stroke-width:2px,stroke-dasharray: 2 2,color:#2d3436;
+    classDef infra fill:#6c5ce7,stroke:#a29bfe,stroke-width:2px,color:#fff;
+
+    %% ============================================================
+    %% 0. 基础设施与数据基座 (Infrastructure)
+    %% ============================================================
+    subgraph Storage ["💾 持久化层 (Data Foundation)"]
+        direction LR
+        DB_State[(ChatState & Profile)]:::db
+        DB_Memory[(LivingMemory VecDB\nSession Isolated)]:::db
+        DB_Patterns[(Expression Patterns\n& Jargon)]:::db
+    end
+
+    subgraph InfraService ["🧱 基础设施服务 (Infrastructure)"]
+        direction TB
+        GlobalModelGateway{{"🧠 Elastic Model Client\n(全局模型网关)"}}:::infra
+        EventBus["📡 事件总线 (Event Bus)"]:::framework
+    end
+
+    %% ============================================================
+    %% 1. 输入层：感知与预处理 (Hot Path Entry)
+    %% ============================================================
+    User(("👤 用户输入")):::user -->|"消息事件"| OnMessage["📨 消息接收 (AstrBot Hook)"]:::framework
+    Timer(("⏰ 全局时钟")):::user -->|"Tick"| ProactiveTask
+
+    subgraph InputProcessing ["⚙️ 输入预处理 (Pre-Processing)"]
+        direction TB
+        OnMessage --> MsgNormalizer["🔄 消息标准化 (UnifiedMsg)"]:::framework
+        MsgNormalizer --> CommandFilter{"🛡️ 指令过滤器"}:::guard
+        
+        %% [Update] 消息标准化直接连接打断信号
+        MsgNormalizer -.->|"📢 触发打断信号"| EventBus
+        
+        CommandFilter -->|"是指令"| NativeHandler["📦 原生指令处理"]:::framework
+        CommandFilter -->|"是对话"| AttentionGate{"👁️ 注意力门控"}:::heart
+        
+        %% HeartCore: 双池机制
+        AttentionGate -->|"当前对话者"| FocusPool["🔥 聚焦池 (Aggregation)"]:::heart
+        AttentionGate -->|"闲杂人等"| BackgroundPool["🌫️ 背景缓冲池 (Buffer)"]:::heart
+
+        %% [新增] 背景池的瞥见机制
+        MiniSummarizer["🔈 环境噪音摘要"]:::heart
+        BackgroundPool -.-> MiniSummarizer
+    end
+
+    %% ============================================================
+    %% 2. System 1: 直觉与判官 (HeartCore + SelfLearning)
+    %% ============================================================
+    subgraph HeartSystem ["❤️ System 1: 生理直觉 (Intuition Layer)"]
+        direction TB
+        
+        %% [新增] 正在思考检查 (热打断)
+        ThinkingCheck{"🤔 正在思考?"}:::guard
+        FocusPool --> ThinkingCheck
+        ThinkingCheck -->|"是 (触发打断)"| EventBus
+        
+        %% 数据加载
+        StateLoader["📥 状态加载 & 上下文重构"]:::heart
+        ThinkingCheck -->|"否 (空闲)"| StateLoader
+        StateLoader <--> DB_State
+        
+        %% [Update] 打断回路接收
+        EventBus -.->|"⚡ ABORT SIGNAL (终止思考)"| PlannerCall
+        PlannerCall -.->|"🛑 Reset (重置上下文)"| StateLoader
+
+        %% SelfLearning: 快速感知与注入
+        subgraph IntuitionProcess ["⚡ 直觉处理"]
+            AffectionCheck["🤝 好感度/关系快查"]:::evolution
+            JargonInjector["💉 黑话识别与注入 (Jargon Injector)"]:::evolution
+        end
+        
+        StateLoader --> AffectionCheck
+        StateLoader --> JargonInjector
+        DB_Patterns -.-> JargonInjector
+        
+        %% HeartCore: 状态机
+        StateTracker["💓 生理状态机 (Energy/Mood)"]:::heart
+        StateLoader --> StateTracker
+        
+        %% [新增] 状态结算闭环
+        StateUpdate -.->|"更新状态"| StateTracker
+
+        %% HeartCore: 判官
+        JudgeModel{{"⚖️ 小模型判官 (Elastic Judge)"}}:::heart
+        GlobalModelGateway -.->|"API Support"| JudgeModel
+        
+        StateGate{"🛑 决策门控"}:::heart
+        
+        AffectionCheck -->|"普通关系"| StateGate
+        %% [新增] 基于关系的插队权限
+        AffectionCheck ==>|"❤️ 亲密好友 (VIP通道)"| HardEnergyLimit
+
+        StateTracker -->|"注入Mood/Energy"| JudgeModel
+        JargonInjector -->|"注入黑话Context"| JudgeModel
+        
+        JudgeModel -->|"评分 (Necessity/Confidence)"| StateGate
+        
+        StateGate -->|"分数低/疲惫"| ToBackground["⬇️ 降级至背景池"]:::heart
+        ToBackground -.-> BackgroundPool
+        
+        %% 主动性注入
+        ProactiveTask["⚡ 主动话题生成 (HeartCore)"]:::heart
+        ProactiveTask -->|"强制唤醒 (Wake Up)"| HardEnergyLimit
+        StateGate -->|"高分通过"| HardEnergyLimit
+
+        %% [新增] 能量强制限制
+        HardEnergyLimit{"🔋 能量硬校验"}:::guard
+        HardEnergyLimit -->|"Energy < 5%"| Downgrade
+        HardEnergyLimit -->|"能量充足"| CognitiveLoopStart["🚀 启动 BrainChat 循环"]:::brain
+
+    end
+
+    %% ============================================================
+    %% 3. 上下文构建 (Hot Path Retrieval)
+    %% ============================================================
+    subgraph ContextEngine ["📚 上下文构建引擎 (Context Engine)"]
+        direction TB
+        
+        %% 人设摘要版本校验
+        HashCheck{"🔄 Config Hash 校验"}:::guard
+        CognitiveLoopStart --> HashCheck
+        
+        HashCheck -->|"Hash不一致"| PersonaSummarizer["🆔 人格摘要重构 (Summarization)"]:::evolution
+        HashCheck -->|"Hash命中"| CachedPersona["💾 读取缓存人设"]:::memory
+        
+        GlobalModelGateway -.->|"Persona Gen"| PersonaSummarizer
+        
+        %% Maibot: 反思
+        SelfQuery["🤔 自我提问 (Self-Query)"]:::brain
+        CognitiveLoopStart --> SelfQuery
+        
+        %% LivingMemory: 混合检索
+        subgraph MemoryRetrieval ["🔥 记忆检索 (Hot Path)"]
+            HybridSearch["🔍 混合检索 (Vector + BM25)"]:::memory
+            RRF["⚗️ RRF 结果融合"]:::memory
+            
+            EmptyCheck{"❓ 检索结果为空?"}:::guard
+            InjectFallback["💉 注入背景摘要/Unknown"]:::memory
+            MemoryReinforce["💉 记忆强化 (Update LastAccess)"]:::memory
+            
+            DB_Memory <--> HybridSearch
+            HybridSearch --> RRF
+            RRF --> EmptyCheck
+            
+            EmptyCheck -->|"是"| InjectFallback
+            EmptyCheck -->|"否"| MemoryReinforce
+            
+            MemoryReinforce -.-> DB_Memory
+        end
+        
+        %% 风格与模式注入
+        DynamicStyle["🎨 动态风格指南 (Mood-Driven)"]:::evolution
+        GoalContext["🎯 对话目标状态"]:::evolution
+        StyleInjector["🧬 风格/句式注入 (Style Injector)"]:::evolution
+        
+        DB_Patterns -.-> StyleInjector
+        
+        SelfQuery --> HybridSearch
+        
+        StateTracker -.->|"Mood注入"| DynamicStyle
+        CognitiveLoopStart --> GoalContext
+        CognitiveLoopStart --> StyleInjector
+        
+        PromptAssembler["📝 最终 Prompt 组装器"]:::brain
+        TokenTrimmer["✂️ Token 修剪 (Smart Window)"]:::guard
+        
+        CachedPersona --> PromptAssembler
+        PersonaSummarizer --> PromptAssembler
+        
+        InjectFallback --> PromptAssembler
+        MemoryReinforce -->|"相关记忆"| PromptAssembler
+        
+        DynamicStyle --> PromptAssembler
+        GoalContext --> PromptAssembler
+        StyleInjector --> PromptAssembler
+        
+        %% [新增] 背景噪音注入
+        MiniSummarizer -.-> PromptAssembler
+        
+        PromptAssembler --> TokenTrimmer
+    end
+
+    %% ============================================================
+    %% 4. System 2: 认知核心 (Maibot BrainChat)
+    %% ============================================================
+    subgraph CognitiveCore ["🧠 System 2: 认知核心 (BrainChat Loop)"]
+        direction TB
+        
+        ActionHistory["🎬 动作历史 (Action History)"]:::brain
+        TokenTrimmer --> ActionHistory
+        
+        %% HeartCore: 弹性模型池机制
+        PlannerCall{{"🤖 LLM 调用 (BrainPlanner)"}}:::brain
+        GlobalModelGateway -.->|"Inference"| PlannerCall
+        
+        Failover{"⚠️ 失败检测 & 重试"}:::error
+        CircuitBreaker{"🔌 熔断器"}:::error
+        
+        ActionHistory -->|"System Prompt"| PlannerCall
+        PlannerCall --> Failover
+        
+        %% [新增] 弹性模型重试逻辑线
+        Failover -->|"模型崩溃"| GlobalModelGateway
+        
+        Failover -->|"Error"| CircuitBreaker
+        CircuitBreaker -->|"Retry"| PlannerCall
+        CircuitBreaker -->|"Open"| StopLogic
+        Failover -->|"Success"| Planner
+        
+        subgraph ReActProcess ["🔄 ReAct 规划流程"]
+            Planner["🗺️ 规划器 (BrainPlanner)"]:::brain
+            JSONRepair["🛠️ JSON 修复与清洗"]:::guard
+            
+            %% [新增] 意图恢复
+            IntentRecovery{"🚑 意图恢复"}:::guard
+            FallbackThought["💭 预设兜底思维"]:::brain
+
+            ActionValidator{"👮 Action语义/能量自检"}:::guard
+            AutoCorrect["🔧 强制修正 (Wait/Shorten)"]:::guard
+            SafetyCheck{"🛡️ 安全/伦理检查"}:::guard
+        end
+        
+        Planner -->|"Action Plan"| JSONRepair
+        JSONRepair --> IntentRecovery
+        
+        IntentRecovery -->|"JSON损坏"| FallbackThought
+        FallbackThought --> ActionValidator
+        IntentRecovery -->|"正常"| ActionValidator
+        
+        ActionValidator -->|"合法"| SafetyCheck
+        ActionValidator -->|"非法/低能量"| AutoCorrect
+        AutoCorrect --> SafetyCheck
+        
+        SafetyCheck -->|"违规"| Downgrade["📉 降级为 Wait"]:::guard
+        SafetyCheck -->|"通过"| ExecutionPlan
+    end
+
+    %% ============================================================
+    %% 5. 表达与执行 (Execution & Wait Loop)
+    %% ============================================================
+    subgraph ExpressionSystem ["🗣️ 并发执行系统 (ActionManager)"]
+        direction TB
+        
+        ExecutionPlan["📋 执行计划"]:::action
+        ConcurrentExecutor{{"⚡ 并发执行器"}}:::action
+        ExecutionFeedback["🔄 执行反馈 (Observation)"]:::brain
+        
+        ExecutionPlan --> ConcurrentExecutor
+        
+        %% 分支 1: 工具调用
+        ConcurrentExecutor -->|"Tool Use"| Tools["🛠️ 调用工具"]:::action
+        Tools --> ExecutionFeedback
+        
+        %% [新增] ReAct 幻觉死循环防御
+        ToolRedundancyCheck{"🔄 工具重复自检"}:::guard
+        ExecutionFeedback --> ToolRedundancyCheck
+        ToolRedundancyCheck -->|"无意义重复"| StopLogic
+
+        DepthGuard{"📏 迭代深度 > 5?"}:::guard
+        ToolRedundancyCheck -->|"正常"| DepthGuard
+        
+        DepthGuard -->|"否 (Continue)"| ActionHistory
+        DepthGuard -->|"是 (Break Loop)"| ForceOutput["🛑 强制输出当前结论"]:::error
+        ForceOutput --> Generator
+        
+        %% 分支 2: 生成回复
+        ConcurrentExecutor -->|"Reply"| Generator["💬 回复生成器"]:::action
+        Generator --> MemeEngine["🖼️ 表情包匹配 (HeartCore)"]:::action
+        MemeEngine --> TTS["🎙️ 语音合成 (Optional)"]:::action
+        
+        %% 分支 3: 观察-等待循环 (Observe-Wait Loop)
+        ConcurrentExecutor -->|"Wait"| TimerCalc["🧮 阅读时间计算"]:::action
+        TimerCalc --> WaitSuspend["⏳ 挂起等待 (Suspend & Observe)"]:::action
+        
+        WaitSuspend -.->|"超时 (Timeout)"| ProactiveTask
+        WaitSuspend -.->|"打断 (Interrupt)"| EventBus
+        
+        %% 分支 4: 结束
+        ConcurrentExecutor -->|"Complete"| StopLogic["🛑 结束话题"]:::action
+        Downgrade --> WaitSuspend
+    end
+
+    %% ============================================================
+    %% 6. 输出与闭环
+    %% ============================================================
+    TTS --> OutputGuard{"🛡️ 输出过滤器"}:::guard
+    
+    OutputGuard -->|"敏感词"| StopLogic
+    OutputGuard -->|"安全"| PlatformAdapter["🔌 平台发送适配器"]:::framework
+    
+    %% 状态结算与情感回馈
+    SentimentEval["😍 好感度/质量回馈"]:::heart
+    PlatformAdapter --> SentimentEval
+    
+    SentimentEval --> StateUpdate["💾 状态结算 (Energy/Mood Update)"]:::heart
+    StateUpdate --> DB_State
+    
+    %% ============================================================
+    %% 7. 潜意识 (Cold Path / Async)
+    %% ============================================================
+    subgraph Subconscious ["💤 潜意识/冷路径 (Cold Path - Async)"]
+        direction TB
+        TaskScheduler["⏰ 任务调度器 (Idle/Cron)"]:::evolution
+        
+        %% [新增] 冷启动补偿
+        WarmUp{"🔥 冷启动扫描"}:::evolution
+        TaskScheduler --> WarmUp
+        
+        ResponseEvent["✨ 响应完成事件 (Signal)"]
+        
+        %% 异步触发，不阻塞回复
+        PlatformAdapter -.->|"🚀 异步触发 (Non-blocking)"| ResponseEvent
+        
+        %% LivingMemory: 记忆生命周期
+        subgraph MemoryLifecycle ["🧠 记忆巩固与遗忘"]
+            MemoryProcessor["📝 记忆摘要 (LLM Reflection)"]:::memory
+            
+            %% [新增] 记忆归因分析 (从大脑提取Thought)
+            Planner -.->|"思维链 (Thought)"| MemoryProcessor
+            
+            QualityFilter{"💎 记忆价值评估"}:::memory
+            VectorIngest["💾 向量库入库"]:::memory
+            DecayTask["📉 记忆衰减 (Decay)"]:::memory
+            PruningTask["🗑️ 记忆遗忘 (Pruning)"]:::memory
+        end
+        
+        GlobalModelGateway -.->|"Summarization"| MemoryProcessor
+        
+        ResponseEvent --> MemoryProcessor
+        MemoryProcessor --> QualityFilter
+        
+        QualityFilter -->|"高价值"| VectorIngest
+        QualityFilter -->|"噪音/低价值"| DB_Discard["🗑️ 丢弃"]:::db
+        
+        VectorIngest --> DB_Memory
+        
+        %% SelfLearning: 进化
+        subgraph Evolution ["🧬 自我进化 (Closed Loop)"]
+            ExpressionMiner["⛏️ 风格挖掘 (Pattern Mining)"]:::evolution
+            GoalUpdate["🎯 目标状态推进"]:::evolution
+            RelationUpdate["💞 关系结算"]:::evolution
+        end
+        
+        GlobalModelGateway -.->|"Analysis"| ExpressionMiner
+        
+        ResponseEvent --> ExpressionMiner
+        ResponseEvent --> GoalUpdate
+        ResponseEvent --> RelationUpdate
+        
+        ExpressionMiner --> DB_Patterns
+        RelationUpdate --> DB_State
+        
+        TaskScheduler --> DecayTask
+        DecayTask --> PruningTask
+        PruningTask --> DB_Memory
+        TaskScheduler --> ExpressionMiner
+        
+        %% [新增] 冷启动逻辑连接
+        WarmUp -->|"拉取历史"| ExpressionMiner
+        DB_Memory -.->|"历史数据"| WarmUp
+    end

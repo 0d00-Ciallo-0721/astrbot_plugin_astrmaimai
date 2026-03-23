@@ -79,19 +79,28 @@ class EvolutionManager:
         
         # 4. 🟢 [核心修复 Bug 1] 触发后台挖掘任务，使用安全托管池代替裸奔的 create_task
         self._fire_background_task(self._try_trigger_mining(event.unified_msg_origin))
+    
     async def record_user_message(self, event: AstrMessageEvent):
         """记录用户消息 (在 System 1 阶段调用)"""
+        # ✨ 【修改此行】：获取富文本
+        rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+        
         # [修改] 使用异步方法记录用户消息
         if hasattr(self.db, 'add_message_log_async'):
             await self.db.add_message_log_async(
                 group_id=event.unified_msg_origin,
                 sender_id=event.get_sender_id(),
                 sender_name=event.get_sender_name(),
-                content=event.message_str
+                content=rich_text # ✨ 【修改此行】
             )
         else:
-            self.db.add_message_log(group_id=event.unified_msg_origin, sender_id=event.get_sender_id(), sender_name=event.get_sender_name(), content=event.message_str)
-
+            self.db.add_message_log(
+                group_id=event.unified_msg_origin, 
+                sender_id=event.get_sender_id(), 
+                sender_name=event.get_sender_name(), 
+                content=rich_text # ✨ 【修改此行】
+            )
+            
     async def process_logs_and_mine(self, group_id: str, logs: List['MessageLog']):
         """
         [修正] 使用群组级细粒度锁进行二次校验，极大解放多群并发挖掘吞吐量

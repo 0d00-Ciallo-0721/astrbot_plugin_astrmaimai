@@ -517,6 +517,8 @@ class AttentionGate:
             # [核心修改] 执行叙事转义
             content = self._convert_interaction_to_narrative(raw_content, bot_name)
             
+            e.set_extra("astrmai_rich_text", content)
+            
             # 兜底空消息
             if not content.strip():
                 content = "[图片]"

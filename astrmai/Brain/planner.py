@@ -60,7 +60,9 @@ class Planner:
         window_lines = []
         for m in event_messages:
             sender_name = m.get_sender_name() or "群友/用户"
-            window_lines.append(f"[{sender_name}] 说: {m.message_str}")
+            # ✨ 【修改此行】：优先读取 sys1 已经解析好的富文本剧本，兜底才用 message_str
+            rich_text = m.get_extra("astrmai_rich_text", m.message_str)
+            window_lines.append(f"[{sender_name}] 说: {rich_text}")
         prompt_content = "\n".join(window_lines)
         
         import asyncio

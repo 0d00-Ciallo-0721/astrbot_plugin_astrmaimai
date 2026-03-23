@@ -164,9 +164,9 @@ class ReplyEngine:
                     # 💡 获取发送者姓名
                     sender_name = event.get_sender_name() or "群友"
                     
-                    # 💡 【关键修改】：将文本存为 "姓名: 内容" 的标准格式
-                    # 这样 PromptRefiner 的正则 ^(.*?):\s*(.*)$ 就能完美匹配出姓名
-                    formatted_user_text = f"{sender_name}: {event.message_str}"
+                    # ✨ 【修改此行】：使用富文本保存长期记忆，保留引用和 At 的上下文
+                    rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+                    formatted_user_text = f"{sender_name}: {rich_text}"
                     
                     user_msg = UserMessageSegment(content=[TextPart(text=formatted_user_text)])
                     ast_msg = AssistantMessageSegment(content=[TextPart(text=clean_text)])
