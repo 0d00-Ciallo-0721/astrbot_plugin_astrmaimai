@@ -449,7 +449,7 @@ class AttentionGate:
 
         # 3. 引用回复翻译 (联动上方更新的格式)
         # 将结构化的: 「↪ 引用 张三(12345) 的消息：你好呀」 翻译成 AI 更能理解的画面感动作: [指着 张三(12345) 的话回应：你好呀]
-        content = re.sub(r"「↪ 引用 (.*?) 的消息：(.*?)」", r"[指着 \1 的话回应：\2]", content)
+        content = re.sub(r"「↪ 引用 (.*?) 的消息：(.*?)」", r"[回复 \1 的话\2]", content)
         
         # 兼容旧版的简易匹配格式
         content = re.sub(r"\(回复\s*(.*?):.*?\)", r"[指着 \1 的话回应]", content)
@@ -459,10 +459,10 @@ class AttentionGate:
         # 4. @提及翻译
         if bot_name:
             # 如果艾特了机器人本身 (带或不带QQ号)
-            content = re.sub(rf"\[@{bot_name}(?:\([^)]+\))?\]", "[看向你]", content)
+            content = re.sub(rf"\[@{bot_name}(?:\([^)]+\))?\]", "[@你]", content)
         
         # 替换其他 @ 用户 (抹平艾特带来的割裂感，将其转换为动作描写)
-        content = re.sub(r"\[@(.*?)\]", r"[看向 \1]", content)
+        content = re.sub(r"\[@(.*?)\]", r"[@ \1]", content)
         
         # 5. 网址链接防噪过滤 (防止极长 URL 破坏 LLM 上下文注意力)
         content = re.sub(r"(https?://[^\s]+)", r"[分享了一个网页链接]", content)
