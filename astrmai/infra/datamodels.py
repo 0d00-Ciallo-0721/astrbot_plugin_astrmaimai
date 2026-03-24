@@ -159,3 +159,38 @@ class VisualMemory(SQLModel, table=True):
     description: str = Field(default="", description="VLM 提取的画面内容描述")
     emotion_tags: str = Field(default="[]", description="情绪标签的 JSON 数组 (主要针对 emoji)")
     timestamp: float = Field(default_factory=time.time, description="解析完成的时间戳")    
+
+
+# [新增]
+class MemoryNode(SQLModel, table=True):
+    """[新增] 记忆节点表 (长期实体概念记忆)"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    type: str = Field(default="")
+    description: str = Field(default="")
+    last_updated: float = Field(default_factory=time.time)
+
+# [新增]
+class DailyReflection(SQLModel, table=True):
+    """[新增] 每日感悟表"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    date: str = Field(index=True, unique=True) # 格式 YYYY-MM-DD
+    reflection: str = Field(default="")
+    created_at: float = Field(default_factory=time.time)
+
+# [新增]
+class MemoryEvent(SQLModel, table=True):
+    """[新增] 长期记忆事件表 (扩充 Event 维度)"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    event_id: str = Field(index=True, unique=True)
+    date: str = Field(index=True)
+    narrative: str = Field(default="")
+    emotion: str = Field(default="")
+    importance: int = Field(default=5)
+    emotional_intensity: int = Field(default=5)
+    reflection: str = Field(default="")
+    tags: str = Field(default="[]") # JSON string list
+    created_at: float = Field(default_factory=time.time)

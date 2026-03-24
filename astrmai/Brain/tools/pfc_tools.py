@@ -31,24 +31,28 @@ class WaitTool(FunctionTool[AstrAgentContext]):
 # ==========================================
 @dataclass
 class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
-    """全局潜意识感知与检索工具 (记忆/黑话/人物画像)"""
+    """全局潜意识感知与检索工具 (记忆/黑话/人物档案/节点/感悟)"""
     name: str = "omni_perception_query"
     description: str = (
-        "【核心检索接口】当你需要查阅内部知识、回想过去的聊天记忆、或者查看某人的好感度档案时调用。"
-        "你可以指定想查询的 '具体事件/黑话' (query)，也可以指定想查阅的 '特定人物' (target_name)。"
-        "如果想精准回忆你和某个人发生的某件事，请同时填入这两个参数。"
+        "【核心检索接口】当你需要查阅内部知识、回想过去的聊天记忆与反思、查看某人的好感度档案、"
+        "查阅特定实体与概念（节点），或者回忆某天的深度日记感悟时调用。"
+        "你可以指定想查询的 '具体事件/黑话/概念' (query)，也可以指定想查阅的 '特定人物' (target_name)，或者指定 '特定日期' (recall_date)。"
     )
-    # [优化 1] 参数分离：将人和事件分开，引导大模型进行多维度结构化思考
+    # [修改] 参数分离扩充：加入 recall_date，引导大模型进行多维度结构化思考
     parameters: dict = Field(default_factory=lambda: {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "需要检索的具体事件、概念或不懂的梗（如'昨天吵架'、'Ciallo'）。如果仅想看某人的档案，此项可留空。"
+                "description": "需要检索的具体事件、实体概念（节点）或不懂的梗（如'昨天吵架'、'王小美'）。如果仅想看档案或日记，此项可留空。"
             },
             "target_name": {
                 "type": "string",
-                "description": "特定群友的名字或ID。填入后系统将精准提取该用户的心理侧写和好感度。指代当前用户可填'当前用户'。"
+                "description": "特定群友的名字或ID。填入后系统将精准提取该用户的心理侧写和好感度档案。"
+            },
+            "recall_date": {
+                "type": "string",
+                "description": "特定日期（格式 YYYY-MM-DD）。仅当你需要回想起那一天的整体私密日记或深度感悟时填入此项。"
             }
         }
     })
@@ -62,16 +66,17 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         query = kwargs.get("query", "").strip()
         target_name = kwargs.get("target_name", "").strip()
+        recall_date = kwargs.get("recall_date", "").strip()
         
-        if not query and not target_name:
-            return "执行失败：请至少提供 'query' (要查的事) 或 'target_name' (要查的人)。"
+        if not query and not target_name and not recall_date:
+            return "执行失败：请至少提供 'query', 'target_name' 或 'recall_date' 中的一项进行检索。"
 
-        logger.info(f"[Omni-Tool] 🧠 发起潜意识扫描 | 事件: '{query}' | 目标: '{target_name}'")
+        logger.info(f"[Omni-Tool] 🧠 发起潜意识扫描 | 事件/节点: '{query}' | 目标: '{target_name}' | 日期: '{recall_date}'")
 
-        # 1. 记忆查询优化：如果有特定人物，将人物名字融入查询上下文中，提高向量召回权重
+        # 1. 记忆与事件反思查询 (天然包含已入库的 Event Reflection)
         async def fetch_memory():
             if not self.memory_engine or not self.chat_id: return None
-            if not query: return None # 如果只查人，不一定要触发全局记忆搜素
+            if not query: return None
             
             search_query = f"{target_name} {query}".strip() if target_name else query
             try:
@@ -83,7 +88,7 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
                 logger.debug(f"[Omni-Tool] 记忆检索失败: {e}")
             return None
 
-        # 2. 黑话查询优化：仅当 query 存在时触发
+        # 2. 黑话查询
         async def fetch_jargon():
             if not self.db_service or not self.chat_id or not query: return None
             try:
@@ -95,11 +100,9 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
                 logger.debug(f"[Omni-Tool] 黑话检索失败: {e}")
             return None
 
-        # 3. 档案查询优化：精准靶向解析
+        # 3. 档案查询
         async def fetch_profile():
             if not self.db_service: return None
-            
-            # 决定要查询的实体名
             entity_to_search = target_name if target_name else query
             if not entity_to_search: return None
 
@@ -134,26 +137,55 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
                 logger.debug(f"[Omni-Tool] 画像检索失败: {e}")
             return None
 
-        # 4. 并发执行所有查询
-        mem_res, jar_res, prof_res = await asyncio.gather(
-            fetch_memory(), fetch_jargon(), fetch_profile()
+        # 4. 节点查询优化 (新增)
+        async def fetch_nodes():
+            if not self.db_service: return None
+            search_term = target_name if target_name else query
+            if not search_term: return None
+            try:
+                if hasattr(self.db_service, "search_nodes_async"):
+                    nodes = await self.db_service.search_nodes_async(search_term, limit=2, include_description=True)
+                    if nodes:
+                        return "\n".join([f"📌 {n.name} ({n.type}): {n.description}" for n in nodes])
+            except Exception as e:
+                logger.debug(f"[Omni-Tool] 节点检索失败: {e}")
+            return None
+
+        # 5. 每日反思查询优化 (新增)
+        async def fetch_daily_reflection():
+            if not self.db_service or not recall_date: return None
+            try:
+                if hasattr(self.db_service, "get_reflection_async"):
+                    ref = await self.db_service.get_reflection_async(recall_date)
+                    if ref:
+                        return f"[{ref.date} 的私密日记与反思]\n{ref.reflection}"
+            except Exception as e:
+                logger.debug(f"[Omni-Tool] 感悟检索失败: {e}")
+            return None
+
+        # 6. 并发执行所有查询
+        mem_res, jar_res, prof_res, node_res, daily_res = await asyncio.gather(
+            fetch_memory(), fetch_jargon(), fetch_profile(), fetch_nodes(), fetch_daily_reflection()
         )
 
-        # 5. 结果组装
+        # 7. 结果组装
         report_sections = []
         if mem_res:
-            report_sections.append(f"--- 💭 记忆回溯片段 ---\n{mem_res}")
+            report_sections.append(f"--- 💭 记忆与事件反思回溯 ---\n{mem_res}")
         if jar_res:
             report_sections.append(f"--- 📖 字典释义匹配 ---\n词汇: {query}\n释义: {jar_res}")
         if prof_res:
-            report_sections.append(f"--- 👤 人物档案侧写 ---\n{prof_res}\n*(注意：请内化以上好感度态度，绝对不要在台词中念出好感度数值)*")
+            report_sections.append(f"--- 👤 人物档案侧写 ---\n{prof_res}\n*(注意：请内化以上态度，绝对不要在台词中念出好感度数值)*")
+        if node_res:
+            report_sections.append(f"--- 🗂️ 实体概念档案 (Memory Nodes) ---\n{node_res}")
+        if daily_res:
+            report_sections.append(f"--- 📓 每日深度反思 (Daily Reflection) ---\n{daily_res}")
 
         if not report_sections:
-            return f"系统提示：潜意识中没有任何关于该请求的记忆、黑话或人物档案。你可以自然地向对方发问。"
+            return f"系统提示：潜意识中没有任何关于该请求的记忆、黑话、节点档案或反思。你可以自然地向对方发问。"
 
         final_report = f"🔮 【全局潜意识扫描报告】\n\n" + "\n\n".join(report_sections)
         return final_report
-
         
 # ==========================================
 # 工具 2：主动 @ (At) 构造工具
@@ -532,9 +564,25 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
             elif result: 
                 is_success = True
                 
-            # 4. 双线操作闭环：发送掩护话语
+            # 4. 双线操作闭环：发送掩护话语并埋设跨界信标
             if is_success:
                 logger.info(f"🤫 [Space Transition] ✅ 悄悄话已成功投递给 {target_user_id}。")
+                
+                # === [新增修复逻辑: 埋设跨界信标] ===
+                shared_dict = context.context.shared_dict
+                if "astrmai_space_jumps" not in shared_dict:
+                    shared_dict["astrmai_space_jumps"] = {}
+                    
+                import time
+                # 记录：[谁] 在 [什么时间] 从 [哪个群] 收到了 [什么悄悄话]
+                source_group = current_event.get_group_id()
+                shared_dict["astrmai_space_jumps"][target_user_id] = {
+                    "private_message": private_message,
+                    "group_id": source_group,
+                    "timestamp": time.time()
+                }
+                # ==================================
+
                 # 返回强硬指令，强迫大模型在群里打掩护，达成完美时间差
                 return (
                     f"[ACTION COMPLETED: 悄悄话已真实且成功发送给 {target_user_id}] \n"

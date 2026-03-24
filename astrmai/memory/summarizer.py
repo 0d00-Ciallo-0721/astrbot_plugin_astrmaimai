@@ -43,73 +43,125 @@ class ChatHistorySummarizer:
         if self._periodic_task and not self._periodic_task.done():
             self._periodic_task.cancel()
 
+    async def extract_and_summarize_history(self, session_id: str, days: int = 1):
+        """[新增] 从底层数据库批量拉取历史消息，格式化后进行摘要。完美整合 chat_history_extract 提取大段历史的逻辑"""
+        import time
+        
+        plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.gateway.context, 'astrmai', None)
+        if not plugin or not hasattr(plugin, 'db_service'):
+            return
+            
+        db = plugin.db_service
+        try:
+            from sqlmodel import select
+            from ..infra.datamodels import MessageLog
+            
+            cutoff_time = time.time() - (days * 86400)
+            
+            async def fetch_logs():
+                with db.get_session() as session:
+                    statement = select(MessageLog).where(
+                        MessageLog.group_id == session_id,
+                        MessageLog.timestamp >= cutoff_time
+                    ).order_by(MessageLog.timestamp.asc())
+                    results = session.exec(statement).all()
+                    return [MessageLog.model_validate(r.model_dump()) for r in results]
+                    
+            import asyncio
+            logs = await asyncio.to_thread(fetch_logs)
+            if not logs:
+                return
+                
+            history_lines = []
+            for log in logs:
+                content = log.content
+                if not content: continue
+                # 避免单条数据过长冲毁上下文
+                if len(content) > 2000:
+                    content = content[:2000] + "..."
+                    
+                time_str = time.strftime("%H:%M:%S", time.localtime(log.timestamp))
+                history_lines.append(f"[{time_str}] {log.sender_name}: {content}")
+                
+            full_history = "\n".join(history_lines)
+            
+            if full_history:
+                await self.summarize_session(session_id, full_history)
+                
+        except Exception as e:
+            logger.error(f"[Memory Summarizer] 批量历史提取异常: {e}", exc_info=True)
+
+    # 位置: astrmai/memory/summarizer.py -> ChatHistorySummarizer 类下
     async def _periodic_check_loop(self):
+        """[修改] 定期轮询时使用批量提取合并记录"""
+        import asyncio
         while self._running:
             try:
                 await asyncio.sleep(self.check_interval)
-                # 注：实际的扫描逻辑可在此结合 AstrBot/数据库 的 get_messages 进行批量处理
-                # 此处保留循环框架，等待与阶段四的 Event Hook 结合实现即时/延时摘要
+                active_sessions = list(self._session_history_buffer.keys())
+                for session_id in active_sessions:
+                    await self.extract_and_summarize_history(session_id, days=1)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[Memory Summarizer] 后台循环异常: {e}")
 
     async def summarize_session(self, session_id: str, chat_history_text: str, persona_id: Optional[str] = None):
-        """
-        核心记忆提炼流水线
-        调用时机：当特定会话消息积累达到阈值时触发
-        [修改] 引入终极防御性编程，消除所有字典强取操作，彻底预防 LLM 漏字段导致的 KeyError 崩溃。
-        """
+        """[修改] 核心记忆提炼流水线，保存反思和记忆节点到多表数据库"""
         if not chat_history_text.strip():
             return
             
         logger.info(f"[Memory Summarizer] 🧠 启动后台任务: 正在对 Session {session_id} 的历史记录进行多维认知降维...")
 
-        # 1. 调用认知大脑进行结构化解析
         memory_data = await self.processor.process_conversation(chat_history_text)
         
-        # 🟢 [核心修复] 终极防御：如果 LLM 完全幻觉返回了非字典类型，直接拦截，保护后续流程
         if not isinstance(memory_data, dict):
             logger.warning(f"[Memory Summarizer] ⚠️ Session {session_id} 认知处理返回异常格式，跳过提取。")
             return
 
-        # 🟢 [核心修复] 安全读取，告别 dict["key"]，使用 .get() 提供类型兜底
         summary = memory_data.get("summary", "")
         key_facts = memory_data.get("key_facts", [])
         topics = memory_data.get("topics", [])
         sentiment = memory_data.get("sentiment", "neutral")
+        reflection = memory_data.get("reflection", "无")
+        nodes = memory_data.get("nodes", [])
         
-        # 确保 importance 为数字类型防毒
         try:
             importance = float(memory_data.get("importance", 0.0))
         except (ValueError, TypeError):
             importance = 0.0
             
-        # 防止 LLM 幻觉把数组输出成了单行字符串
         if not isinstance(key_facts, list):
             key_facts = [str(key_facts)] if key_facts else []
         if not isinstance(topics, list):
             topics = [str(topics)] if topics else []
         
-        # 2. 空转检测：如果没有任何有价值的事实，或者完全是系统默认回复，直接抛弃
         if not key_facts and summary == "对话记录":
             logger.info(f"[Memory Summarizer] ⏭️ Session {session_id} 未提取到有效事实或信息，跳过入库。")
-            # 👆【修改结束】
             return
             
-        # 3. 极速遗忘机制：重要性过低的内容不占用数据库和后续召回算力
         if importance < 0.2:
             logger.info(f"[Memory Summarizer] 📉 提取内容重要度过低 (importance={importance})，触发即时遗忘机制。")
-            # 👆【修改结束】
             return
 
-        # 4. 富文本组装：将多维数据渲染为对 System 2 的 Prompt 友好的易读格式
+        # 🟢 分流一：保存记忆节点实体
+        plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.gateway.context, 'astrmai', None)
+        if plugin and hasattr(plugin, 'db_service'):
+            db = plugin.db_service
+            from ..infra.datamodels import MemoryNode
+            if nodes and hasattr(db, 'update_nodes_async'):
+                node_objs = [MemoryNode(**n) for n in nodes if isinstance(n, dict)]
+                await db.update_nodes_async(node_objs)
+
+        # 🟢 分流二：富文本组装，喂给 Faiss Vector
         content_lines = [f"【摘要】{summary}"]
         
-        # 清理数组中的空字符串或非法数据
         valid_facts = [str(f) for f in key_facts if str(f).strip()]
         if valid_facts:
             content_lines.append("【核心事实】\n- " + "\n- ".join(valid_facts))
+            
+        if reflection and reflection != "无":
+            content_lines.append(f"【深度反思】{reflection}")
             
         valid_topics = [str(t) for t in topics if str(t).strip()]
         if valid_topics:
@@ -117,24 +169,43 @@ class ChatHistorySummarizer:
             
         final_content = "\n".join(content_lines)
 
-        # 👇【新增】在压入数据库前，打印 LLM 究竟提炼了什么核心要素
-        logger.info(f"[Memory Summarizer] ✨ Session {session_id} 记忆提炼成功 -> 摘要: {summary[:20]}... | 事实数: {len(valid_facts)} | 标签数: {len(valid_topics)} | 重要度: {importance}")
-        # 👆【新增结束】
+        logger.info(f"[Memory Summarizer] ✨ Session {session_id} 记忆提炼成功 -> 摘要: {summary[:20]}... | 事实数: {len(valid_facts)} | 节点数: {len(nodes)}")
 
-        # 5. 压入统一底层引擎
         try:
+            # 存入引擎底层 (Vector + BM25)
             await self.engine.add_memory(
                 content=final_content,
                 session_id=str(session_id),
                 persona_id=persona_id,
                 importance=importance
             )
-            # 👇【修改】强化入库成功日志
-            logger.info(f"[Memory Summarizer] 💾 已将立体记忆成功压入 Faiss 向量数据库 (Sentiment: {sentiment})。")
-            # 👆【修改结束】
-        except Exception as e:
-            logger.error(f"[Memory Summarizer] ❌ 记忆向量库写入失败: {e}", exc_info=True)
 
+            # 🟢 分流三：存入结构化的 Event 表扩充属性维度，便于回溯提取
+            import time
+            import uuid
+            import datetime
+            import json
+            date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+            from ..infra.datamodels import MemoryEvent
+            
+            event_id = f"evt_{date_str.replace('-', '')}_{uuid.uuid4().hex[:8]}"
+            event = MemoryEvent(
+                event_id=event_id,
+                date=date_str,
+                narrative="\n".join(valid_facts),
+                emotion=sentiment,
+                importance=int(importance * 10),
+                emotional_intensity=int(importance * 10),
+                reflection=reflection,
+                tags=json.dumps(valid_topics)
+            )
+            
+            if plugin and hasattr(plugin, 'db_service') and hasattr(plugin.db_service, 'save_event_async'):
+                await plugin.db_service.save_event_async(event)
+
+            logger.info(f"[Memory Summarizer] 💾 已将立体记忆成功压入 Faiss 向量数据库并落盘长期事件。")
+        except Exception as e:
+            logger.error(f"[Memory Summarizer] ❌ 记忆存储失败: {e}", exc_info=True)
 
 
 # 文件位置: astrmai/memory/summarizer.py

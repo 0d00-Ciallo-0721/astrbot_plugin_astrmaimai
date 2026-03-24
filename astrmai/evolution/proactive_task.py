@@ -402,8 +402,8 @@ class ProactiveTask:
                 await asyncio.sleep(60)
 
     async def _run_daily_diary_task(self):
-        """[修改] 午夜记忆日记撰写任务：异步查询缓存与群聊黑话"""
-        logger.info("[Life] 🌙 夜深了，机器大脑开始为各个群聊撰写每日内部日记...")
+        """[修改] 午夜记忆日记撰写任务：不仅生成文本日记，还要触发深度的事件结构化、反思生成和节点提取。"""
+        logger.info("[Life] 🌙 夜深了，机器大脑开始为各个群聊撰写每日内部日记并进行深度记忆归档...")
         active_states = self.state_engine.get_active_states()
         
         from ..infra.database import DatabaseService
@@ -411,7 +411,6 @@ class ProactiveTask:
         
         persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
         
-        # [修改点] 异步加载人设缓存
         if hasattr(self.persistence, 'load_persona_cache_async'):
             cache = await self.persistence.load_persona_cache_async()
         else:
@@ -425,12 +424,18 @@ class ProactiveTask:
             group_id = state.chat_id
             if not group_id: continue
             
+            # 🟢 1. 挂接自动触发系统：启动群组历史记忆批量回溯与节点提取
+            if self.memory_engine and hasattr(self.memory_engine, 'summarizer'):
+                logger.info(f"[Life] 启动群 {group_id} 的长对话历史回溯与多维节点打点...")
+                if hasattr(self.memory_engine.summarizer, 'extract_and_summarize_history'):
+                    await self.memory_engine.summarizer.extract_and_summarize_history(group_id, days=1)
+
+            # 🟢 2. 生成文本日记和每日自由感悟
             recent_memories = []
             if self.memory_engine and hasattr(self.memory_engine, 'get_recent_memories'):
                 recent_memories = await self.memory_engine.get_recent_memories(group_id, hours=24)
                 
             recent_jargons = []
-            # [修改点] 使用异步方法查询近期黑话，消除 DB 同步阻塞
             if hasattr(db, 'get_recent_jargons_async'):
                 recent_jargons = await db.get_recent_jargons_async(group_id, hours=24)
             elif hasattr(db, 'get_recent_jargons'):
@@ -440,12 +445,13 @@ class ProactiveTask:
             energy_val = state.energy
             
             if not recent_memories and not recent_jargons and abs(mood_val) < 0.2:
-                logger.debug(f"[Life] 📖 群 {group_id} 今天非常安静且情绪平稳，跳过日记撰写，防止流水账。")
+                logger.debug(f"[Life] 📖 群 {group_id} 今天非常安静且情绪平稳，跳过日记撰写。")
                 continue
                 
             memory_context = "\n".join([f"- {m}" for m in recent_memories]) if recent_memories else "无特别事实发生。"
             jargon_context = "\n".join([f"- {j.content} (含义: {j.meaning})" for j in recent_jargons]) if recent_jargons else "无新学词汇。"
             
+            import time
             prompt = f"""你现在进入了深度睡眠的“潜意识反思模式”。
 今天是 {time.strftime("%Y年%m月%d日")}。夜深人静，你需要静下心来，写一篇属于你自己的“内部私人日记”。
 你正在回顾群聊【{group_id}】今天发生的事情。
@@ -474,7 +480,8 @@ class ProactiveTask:
                 diary_content = await self.gateway.call_proactive_task(prompt)
                 
                 if diary_content and self.memory_engine:
-                    import time
+                    import datetime
+                    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
                     diary_entry = f"【主观情景记忆/私人日记】 {time.strftime('%Y年%m月%d日')} 关于群 {group_id} 的回忆：\n{diary_content}"
                     
                     await self.memory_engine.add_memory(
@@ -482,6 +489,12 @@ class ProactiveTask:
                         session_id=str(group_id),
                         importance=0.95  
                     )
-                    logger.info(f"[Life] 📖 为群 {group_id} 撰写日记完成: {diary_content[:20]}...")
+                    
+                    # 🟢 [新增] 存入 DailyReflection 表供长期调取查阅
+                    plugin = getattr(self.gateway.context, 'astrmai_plugin', None)
+                    if plugin and hasattr(plugin, 'db_service') and hasattr(plugin.db_service, 'save_reflection_async'):
+                        await plugin.db_service.save_reflection_async(date_str, diary_content)
+
+                    logger.info(f"[Life] 📖 为群 {group_id} 撰写日记并生成反思完成: {diary_content[:20]}...")
             except Exception as e:
                 logger.error(f"[Life] 生成群 {group_id} 的日记失败: {e}")

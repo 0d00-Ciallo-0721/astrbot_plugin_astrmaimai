@@ -30,8 +30,6 @@ class ContextEngine:
                            tool_descs: str = "",
                            sys1_thought: str = "") -> str: 
         
-        # [核心修复] 已删除原版在最开头的不完善局部扫描代码
-        
         if retrieve_keys is None:
             retrieve_keys = []
             
@@ -141,7 +139,7 @@ class ContextEngine:
             slang_block = f"群组专属表达模式与黑话参考:\n{slang_patterns}\n"
 
         # ==========================================
-        # 🟢 [修改] 动态上下文热加载 (私聊专属画像注入)
+        # 动态上下文热加载 (私聊专属画像注入)
         # ==========================================
         private_chat_block = ""
         if "FriendMessage" in chat_id and event_messages and not is_fast_mode:
@@ -169,7 +167,54 @@ class ContextEngine:
         if sys1_thought:
             subconscious_block = f"大脑潜意识：\"{sys1_thought}\"\n指南：这是你最真实的直觉。在接下来的回复中，请自然地顺应、延伸或掩饰这种情绪。绝对禁止像复读机一样直接说出你的内心戏。\n"
 
-        # 4. [核心] 组装最终 Prompt (移除 User Block)
+        # ==========================================
+        # 🟢 [新增] 动态主动联想与节点背景注入 
+        # ==========================================
+        proactive_recall_block = ""
+        if event_messages and not is_fast_mode:
+            try:
+                last_msg = event_messages[-1].message_str
+                
+                # 1. 节点背景注入 (基于 Jieba 关键词)
+                try:
+                    import jieba.analyse
+                    keywords = jieba.analyse.extract_tags(last_msg, topK=5)
+                except ImportError:
+                    keywords = []
+                    
+                nodes_context = []
+                if keywords and hasattr(self.db, 'search_nodes_async'):
+                    seen_nodes = set()
+                    for kw in keywords:
+                        nodes = await self.db.search_nodes_async(kw, limit=1, include_description=True)
+                        for node in nodes:
+                            if node.name not in seen_nodes:
+                                nodes_context.append(f"📌 {node.name} ({node.type}): {node.description}")
+                                seen_nodes.add(node.name)
+                
+                if nodes_context:
+                    proactive_recall_block += "\n>>> [记忆节点背景 (对提及实体的已知认知)] <<<\n" + "\n".join(nodes_context) + "\n"
+
+                # 2. 向量记忆主动召回 (基于概率或显式关键词)
+                import random
+                auto_recall_prob = getattr(self.config.memory, 'auto_recall_probability', 0.3)
+                trigger_keywords = ["之前", "记得", "回忆", "想起", "以前", "过去"]
+                hit_keyword = any(kw in last_msg for kw in trigger_keywords)
+                
+                if hit_keyword or random.random() < auto_recall_prob:
+                    plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.summarizer.gateway.context, 'astrmai', None)
+                    if plugin and hasattr(plugin, 'memory_engine'):
+                        recall_res = await plugin.memory_engine.recall(last_msg, session_id=chat_id)
+                        if recall_res and "什么也没想起来" not in recall_res:
+                            trigger_reason = "关键词触发" if hit_keyword else "概率触发"
+                            logger.info(f"[ContextEngine] 💡 主动联想触发 ({trigger_reason})")
+                            proactive_recall_block += f"\n>>> [主动记忆闪回] <<<\n基于当前对话，你脑海中自动浮现了以下往事：\n{recall_res}\n"
+                            
+            except Exception as e:
+                logger.warning(f"[ContextEngine] 主动联想与节点注入失败: {e}")
+
+
+        # 4. [修改] 组装最终 Prompt (加入 proactive_recall_block)
         prompt = f"""核心人格设定：
 {role_block}
 
@@ -183,6 +228,7 @@ class ContextEngine:
 {subconscious_block}
 <CHAT_HISTORY>
 
+{proactive_recall_block}
 <RAG_MEMORY>
 
 [Tools]
@@ -203,9 +249,8 @@ class ContextEngine:
 3. 必须使用中文回复。
 """
         # ==========================================
-        # 🟢 [终极修复] 全局视觉记忆软阻塞与渲染 (修复历史记录失明 & 等待不足)
+        # 全局视觉记忆软阻塞与渲染
         # ==========================================
-        # 在最终生成的 Prompt 中进行全局正则扫描，这样连带 Chat History 中的 picid 也会被处理
         import re
         import json
         import asyncio
@@ -214,7 +259,6 @@ class ContextEngine:
         for picid in set(picids):
             resolved_text = "[一张尚未看清的图片]"
             
-            # 延长软阻塞等待：轮询 15 次，每次 1.0s (最多等 15 秒)
             for _ in range(15):
                 with self.db.get_session() as session:
                     from ..infra.datamodels import VisualMemory
@@ -233,14 +277,11 @@ class ContextEngine:
                                 resolved_text = f"[发了一个表情包，画面是：{mem.description}]"
                         else:
                             resolved_text = f"[发了一张图片，画面是：{mem.description}]"
-                        break # 成功获取，跳出轮询
+                        break 
                 
-                # 如果查不到，休眠 1.0s 后重试
                 await asyncio.sleep(1.0)
                 
-            # 执行全局文本替换
             prompt = prompt.replace(f"[picid:{picid}]", resolved_text)
-        # ==========================================
 
         return prompt.strip()
 

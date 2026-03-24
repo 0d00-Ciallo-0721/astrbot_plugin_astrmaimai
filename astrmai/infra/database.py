@@ -316,7 +316,76 @@ class DatabaseService:
 
         import asyncio
         return await asyncio.to_thread(_sync_db_fallback)
-            
+
+    def update_nodes(self, nodes: List['MemoryNode']):
+        with self.get_session() as session:
+            from sqlmodel import select
+            for node in nodes:
+                statement = select(MemoryNode).where(MemoryNode.name == node.name)
+                existing = session.exec(statement).first()
+                if existing:
+                    existing.type = node.type
+                    existing.description = node.description
+                    existing.last_updated = time.time()
+                    session.add(existing)
+                else:
+                    session.add(node)
+            session.commit()
+
+    def search_nodes(self, query: str, limit: int = 3, include_description: bool = True) -> List['MemoryNode']:
+        with self.get_session() as session:
+            from sqlmodel import select, or_
+            lower_query = f"%{query.lower()}%"
+            # 优先匹配名字，可选匹配描述
+            conditions = [MemoryNode.name.like(lower_query)]
+            if include_description:
+                conditions.append(MemoryNode.description.like(lower_query))
+                
+            statement = select(MemoryNode).where(or_(*conditions)).order_by(MemoryNode.last_updated.desc()).limit(limit)
+            results = session.exec(statement).all()
+            # 跨线程脱水处理
+            return [MemoryNode.model_validate(r.model_dump()) for r in results]
+
+    def save_reflection(self, date: str, reflection: str):
+        with self.get_session() as session:
+            from sqlmodel import select
+            statement = select(DailyReflection).where(DailyReflection.date == date)
+            existing = session.exec(statement).first()
+            if existing:
+                existing.reflection = reflection
+            else:
+                new_ref = DailyReflection(date=date, reflection=reflection)
+                session.add(new_ref)
+            session.commit()
+
+    def get_reflection(self, date: str) -> Optional['DailyReflection']:
+        with self.get_session() as session:
+            from sqlmodel import select
+            statement = select(DailyReflection).where(DailyReflection.date == date)
+            res = session.exec(statement).first()
+            if res:
+                return DailyReflection.model_validate(res.model_dump())
+            return None
+
+    def save_event(self, event: 'MemoryEvent'):
+        with self.get_session() as session:
+            from sqlmodel import select
+            statement = select(MemoryEvent).where(MemoryEvent.event_id == event.event_id)
+            existing = session.exec(statement).first()
+            if existing:
+                existing.narrative = event.narrative
+                existing.emotion = event.emotion
+                existing.importance = event.importance
+                existing.emotional_intensity = event.emotional_intensity
+                existing.reflection = event.reflection
+                existing.tags = event.tags
+                session.add(existing)
+            else:
+                session.add(event)
+            session.commit()
+
+
+
     async def save_jargon_async(self, jargon: Jargon):
         """[新增] 将同步写库操作推入线程池，释放主事件循环，防止高并发假死"""
         import asyncio
@@ -382,3 +451,31 @@ class DatabaseService:
         """[新增] 异步获取聊天状态的兜底兼容接口"""
         import asyncio
         return await asyncio.to_thread(self.get_chat_state, chat_id)    
+    
+    async def update_nodes_async(self, nodes: List['MemoryNode']):
+        """[新增] 异步更新记忆节点"""
+        import asyncio
+        async with self._db_lock:
+            return await asyncio.to_thread(self.update_nodes, nodes)
+
+    async def search_nodes_async(self, query: str, limit: int = 3, include_description: bool = True) -> List['MemoryNode']:
+        """[新增] 异步搜索记忆节点"""
+        import asyncio
+        return await asyncio.to_thread(self.search_nodes, query, limit, include_description)
+
+    async def save_reflection_async(self, date: str, reflection: str):
+        """[新增] 异步保存每日感悟"""
+        import asyncio
+        async with self._db_lock:
+            return await asyncio.to_thread(self.save_reflection, date, reflection)
+
+    async def get_reflection_async(self, date: str) -> Optional['DailyReflection']:
+        """[新增] 异步获取每日感悟"""
+        import asyncio
+        return await asyncio.to_thread(self.get_reflection, date)
+
+    async def save_event_async(self, event: 'MemoryEvent'):
+        """[新增] 异步保存事件"""
+        import asyncio
+        async with self._db_lock:
+            return await asyncio.to_thread(self.save_event, event)

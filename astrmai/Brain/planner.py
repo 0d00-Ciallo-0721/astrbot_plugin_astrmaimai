@@ -133,7 +133,80 @@ class Planner:
             tool_descs=tool_descs,
             sys1_thought=sys1_thought 
         )
-        
+
+        # === [新增修复逻辑: 基于信标的源会话语境溯源拉取] ===
+        # 如果当前是私聊会话
+        if not event.get_group_id():
+            shared_dict = getattr(ctx, "shared_dict", {})
+            jumps = shared_dict.get("astrmai_space_jumps", {})
+            sender_id = str(user_id)
+            
+            if sender_id in jumps:
+                jump_info = jumps[sender_id]
+                import time
+                
+                # 信标有效期 10 分钟
+                if time.time() - jump_info["timestamp"] < 600:
+                    source_group_id = jump_info.get("group_id")
+                    group_context_str = ""
+                    
+                    # 借鉴底层穿透代码，逆向抓取跳出前的群聊历史
+                    if source_group_id and ctx:
+                        try:
+                            conv_mgr = ctx.conversation_manager
+                            # 构造群聊的 UID
+                            uid = f"default:GroupMessage:{source_group_id}"
+                            curr_cid = await conv_mgr.get_curr_conversation_id(uid)
+                            conversation = await conv_mgr.get_conversation(uid, curr_cid)
+                            
+                            import json
+                            # 解析该群的 JSON 历史记录
+                            history = json.loads(conversation.history) if conversation and conversation.history else []
+                            
+                            recent_msgs = []
+                            # 提取最近的 5 条群聊上下文
+                            for msg in history[-5:]:
+                                role = msg.get("role", "")
+                                # 提取文本节点
+                                text_parts = [
+                                    item.get("text", "") 
+                                    for item in (msg.get("content") or []) 
+                                    if isinstance(item, dict) and item.get("type") == "text"
+                                ]
+                                content = " ".join(text_parts) if text_parts else ""
+                                if content:
+                                    # 简易区分用户与自身
+                                    speaker = "群友" if role == "user" else "你"
+                                    recent_msgs.append(f"[{speaker}]: {content}")
+                            
+                            if recent_msgs:
+                                group_context_str = "\n".join(recent_msgs)
+                        except Exception as e:
+                            logger.error(f"🤫 [Planner] 溯源群聊历史失败: {e}")
+
+                    # 构建跨界记忆注入包
+                    sys_inject = (
+                        f"\n\n>>> [!!! 极其重要的跨界前置记忆 !!!] <<<\n"
+                        f"几分钟前，你刚刚在群聊 (群号:{source_group_id}) 中与大家互动，随后跳出来主动给当前用户发了一句私聊：\n"
+                        f"【你的悄悄话原文】：{jump_info['private_message']}\n"
+                    )
+                    
+                    if group_context_str:
+                        sys_inject += f"\n【跳转前的群聊事件回顾 (参考)】：\n{group_context_str}\n"
+                        
+                    sys_inject += (
+                        f"\n用户现在的回复绝对是对你上述行为的回应！请结合群里的前置话题和你的悄悄话，"
+                        f"以私下交流的自然感、亲密感继续往下聊！\n"
+                        f">>> [记忆读取完毕] <<<"
+                    )
+                    
+                    system_prompt += sys_inject
+                    logger.info(f"🤫 [Planner] 已触发跨界语境补偿，成功抓取群聊历史并注入到 {sender_id} 的私聊思考中。")
+                
+                # 阅后即焚，清理信标
+                del jumps[sender_id]
+        # ===============================================
+
         if is_all_mode:
             user_message = event.message_str
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
