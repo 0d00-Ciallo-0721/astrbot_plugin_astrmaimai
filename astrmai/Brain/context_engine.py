@@ -139,7 +139,32 @@ class ContextEngine:
         slang_block = ""
         if slang_patterns and not is_fast_mode:
             slang_block = f"群组专属表达模式与黑话参考:\n{slang_patterns}\n"
-            
+
+        # ==========================================
+        # 🟢 [修改] 动态上下文热加载 (私聊专属画像注入)
+        # ==========================================
+        private_chat_block = ""
+        if "FriendMessage" in chat_id and event_messages and not is_fast_mode:
+            try:
+                user_id = str(event_messages[-1].get_sender_id())
+                profile_data = await self.db.persistence.load_user_profile(user_id)
+                if profile_data:
+                    analysis = profile_data.get("persona_analysis", "暂无深度侧写。")
+                    tags = profile_data.get("tags", [])
+                    tags_str = " / ".join(tags) if tags else "暂无特定标签"
+                    name = profile_data.get("name", "该用户")
+                    
+                    private_chat_block = (
+                        ">>> [私密对话模式激活] <<<\n"
+                        f"你现在正在与用户【{name}】进行一对一私聊，请保持绝对的专注与亲和力。\n\n"
+                        ">>> [用户深度画像检索] <<<\n"
+                        f"【属性】：{tags_str}\n"
+                        f"【深度侧写】：{analysis}\n"
+                        "请基于上述画像，使用最符合对方认知的语境进行交流。\n\n"
+                    )
+            except Exception as e:
+                logger.warning(f"[ContextEngine] 提取私聊用户画像失败: {e}")
+
         subconscious_block = ""
         if sys1_thought:
             subconscious_block = f"大脑潜意识：\"{sys1_thought}\"\n指南：这是你最真实的直觉。在接下来的回复中，请自然地顺应、延伸或掩饰这种情绪。绝对禁止像复读机一样直接说出你的内心戏。\n"
@@ -151,7 +176,7 @@ class ContextEngine:
 {style_block}
 {state_block}
 
-{slang_block}
+{private_chat_block}{slang_block}
 当前你看到的消息：
 <CURRENT_MESSAGES>
 

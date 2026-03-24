@@ -7,7 +7,19 @@ from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
-from .tools.pfc_tools import WaitTool, OmniPerceptionTool, ConstructAtEventTool, ProactivePokeTool, ProactiveMemeTool
+
+# [修改] 统一导入所有系统原生工具与新增的 4 个拟人化微操工具
+from .tools.pfc_tools import (
+    WaitTool, 
+    OmniPerceptionTool, 
+    ConstructAtEventTool, 
+    ProactivePokeTool, 
+    ProactiveMemeTool,
+    MemeResonanceTool,        # 🎭 复读/保持队形
+    TopicHijackTool,          # 🥱 岔开话题
+    SpaceTransitionTool,      # 🤫 悄悄话转私聊
+    RegretAndWithdrawTool     # 🛑 手滑撤回找补
+)
 
 from ..memory.engine import MemoryEngine
 from ..evolution.processor import EvolutionManager
@@ -40,6 +52,7 @@ class Planner:
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
         [修改] 在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
+        增加 4 个新增拟人化工具的挂载
         """
         chat_id = event.unified_msg_origin
         user_id = event.get_sender_id() 
@@ -80,6 +93,7 @@ class Planner:
                 elif hasattr(ctx, "shared_dict"):
                     ctx.shared_dict["disable_rag_injection"] = True
         else:
+        
             tools = [
                 WaitTool(),
                 OmniPerceptionTool(
@@ -91,7 +105,11 @@ class Planner:
                 ),
                 ConstructAtEventTool(db_service=self.context_engine.db),
                 ProactivePokeTool(db_service=self.context_engine.db),
-                ProactiveMemeTool(emotion_mapping=self.reply_engine.config.reply.emotion_mapping)
+                ProactiveMemeTool(emotion_mapping=self.reply_engine.config.reply.emotion_mapping),
+                MemeResonanceTool(),
+                TopicHijackTool(),
+                SpaceTransitionTool(),
+                RegretAndWithdrawTool()
             ]
             if ctx:
                 if is_fast_mode:

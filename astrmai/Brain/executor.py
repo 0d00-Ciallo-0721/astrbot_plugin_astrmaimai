@@ -21,7 +21,7 @@ class ConcurrentExecutor:
         
     # [修改] 在执行成功的两个分支内，调用 evolution_manager.process_bot_reply 闭环反馈
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None):
-        """[修改] 显式安插 👁️‍🗨️【全知视界】探针，并手动闭环记忆处理"""
+        """[修改] 显式安插 👁️‍🗨️【全知视界】探针，手动闭环记忆处理，并拦截 [TERMINAL_YIELD] 硬中断指令"""
         chat_id = event.unified_msg_origin
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
@@ -110,6 +110,19 @@ class ConcurrentExecutor:
 
                         if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
                             logger.info(f"[{chat_id}] 💤 Brain 决定挂起并倾听后续消息 (Wait/Listening)。")
+                            return
+
+                        # 🟢 拦截 [TERMINAL_YIELD] 硬中断
+                        if "[TERMINAL_YIELD]:" in reply_text:
+                            idx = reply_text.find("[TERMINAL_YIELD]:")
+                            terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:"):].strip()
+                            logger.info(f"[{chat_id}] 🛑 触发硬中断 (TERMINAL_YIELD)，大模型被接管，纯文本下发: {terminal_content}")
+                            
+                            # 将终端内容通过 reply_engine 发送，维持拟人化延迟和可能的情绪流转
+                            await self.reply_engine.handle_reply(event, terminal_content, chat_id)
+                            
+                            if hasattr(self.evolution_manager, 'process_bot_reply'):
+                                await self.evolution_manager.process_bot_reply(chat_id, bot_id, terminal_content)
                             return
 
                         await self.reply_engine.handle_reply(event, reply_text, chat_id)
