@@ -81,11 +81,17 @@
         "default": ["/", "!", "！"],
         "hint": "识别系统指令的前缀列表"
       },
-      "enabled_groups": {
-        "description": "启用群聊白名单",
+      "whitelist_ids": {
+        "description": "绝对白名单 (UMO)",
         "type": "list",
         "default": [],
-        "hint": "填写群号。只在这些群聊内生效，为空则全群生效"
+        "hint": "请填写消息平台ID (UMO，如 ff:GroupMessage:123456 或 ff:FriendMessage:123456)。白名单内的目标无条件放行，为空则根据群聊/私聊开关处理。"
+      },
+      "enable_private_chat": {
+        "description": "全局私聊总开关",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后将允许处理私聊消息（非白名单私聊用户也会被处理）。"
       }
     }
   },

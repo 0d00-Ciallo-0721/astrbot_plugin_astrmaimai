@@ -159,6 +159,7 @@ class Judge:
             # =====================================================================
             # 【正常执行 System 1 唤醒大模型判决】
             # =====================================================================
+            # [修改] 增加 TOOL_CALL 意图，支持明确工具调用判断
             prompt = f"""
             你是群聊中的这个角色的潜意识大脑，请完全沉浸于以下设定中：
             [你的核心人设]: {persona_summary if persona_summary else '保持你原本的性格特征'}
@@ -172,9 +173,10 @@ class Judge:
             【思考与决策流】
             1. 意图判决 (action): 
                - REPLY: 包含明确问题，提及你，或【根据历史语境对方正在顺着刚才的话题跟你聊天】，必须立刻回复。
+               - TOOL_CALL: 明确的指令求助（如“查天气”、“写代码”等需要明确调用外部工具的请求）。
                - WAIT: 话似乎没说完（例如“那个..”或半截句子），稍微等等看。
                - IGNORE: 明显的闲聊、无意义刷屏且没叫你、没顺着话题聊，没兴趣理会。
-            2. 潜意识生成 (thought): **仅当 action 为 REPLY 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
+            2. 潜意识生成 (thought): **仅当 action 为 REPLY 或 TOOL_CALL 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
             3. 记忆提取 (retrieve_keys): **仅当 action 为 REPLY 时**才需要判断当前回复需要调用你脑海中的哪部分【人格记忆 (retrieve_keys)】。如果 action 为 WAIT 或 IGNORE，或者只是极简单的日常寒暄，列表请严格保持为空 []。
             
             可选的人格维度 Key:
@@ -191,8 +193,8 @@ class Judge:
             请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
             {{
                 "reason": "极简的判定理由，例如：'有人在提问' 或 '顺着刚才的话题在聊'（限20字内）",
-                "action": "REPLY"|"WAIT"|"IGNORE",
-                "thought": "【仅当 action 为 REPLY 时生成】第一人称的真实内心戏。如果不回复，请严格输出空字符串 \"\"",
+                "action": "REPLY"|"WAIT"|"IGNORE"|"TOOL_CALL",
+                "thought": "【仅当 action 为 REPLY/TOOL_CALL 时生成】第一人称的真实内心戏。如果不回复，请严格输出空字符串 \"\"",
                 "relevance": int(1-10),
                 "necessity": float(1.0-10.0),
                 "retrieve_keys": ["key1"] 
@@ -216,7 +218,7 @@ class Judge:
                 result = await self.gateway.call_judge_task(prompt)
                 
                 plan.action = result.get("action", "IGNORE").upper()
-                if plan.action == "REPLY":
+                if plan.action in ["REPLY", "TOOL_CALL"]:
                     plan.thought = result.get("thought", "")
                 else:
                     plan.thought = ""
@@ -236,8 +238,17 @@ class Judge:
                     keys = []
                 plan.meta["retrieve_keys"] = keys
                 
-                if plan.action not in ["REPLY", "WAIT", "IGNORE"]:
+                # [修改] 校验合法的行动包含 TOOL_CALL
+                if plan.action not in ["REPLY", "WAIT", "IGNORE", "TOOL_CALL"]:
                     plan.action = "IGNORE"
+                
+                # =====================================================================
+                # 🟢 [修改] 私聊特权：无视 Judge 的静默意图，强制兜底覆写
+                # =====================================================================
+                if "FriendMessage" in chat_id and plan.action in ["WAIT", "IGNORE"]:
+                    plan.action = "REPLY"
+                    plan.thought = "私聊模式强制兜底：无论多无聊的消息都必须给予反馈。"
+                    logger.debug(f"[{chat_id}] 🛡️ [私聊特权] 判定为忽略或等待，已强行覆写为 REPLY 以保证绝对专注。")
                     
                 elapsed = time.perf_counter() - start_time
                 reason = result.get("reason", "")

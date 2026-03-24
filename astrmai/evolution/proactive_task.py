@@ -267,11 +267,10 @@ class ProactiveTask:
 
     # [修改] 具体位置：类 ProactiveTask 中
     async def _generate_persona_analysis(self, profile):
-        """[修改] 生成并保存画像，异步读取人设缓存防止阻塞"""
+        """[修改] 生成并保存画像，支持增量更新与标签提取"""
         
         persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
         
-        # [修改点] 异步加载人设缓存
         if hasattr(self.persistence, 'load_persona_cache_async'):
             cache = await self.persistence.load_persona_cache_async()
         else:
@@ -282,27 +281,70 @@ class ProactiveTask:
         
         persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""
 
+        # 提取旧画像和标签
+        old_analysis = getattr(profile, "persona_analysis", "")
+        if not old_analysis:
+            old_analysis = "暂无旧画像"
+            
+        old_tags = getattr(profile, "tags", [])
+        if isinstance(old_tags, list):
+            old_tags_str = ", ".join(old_tags) if old_tags else "暂无标签"
+        else:
+            old_tags_str = str(old_tags)
+
         prompt = f"""{persona_injection}
 请基于用户 "{profile.name}" 与你的历史交互，构建深度人物画像。
-他已经与你互动了 {profile.message_count_for_profiling} 次。
+他近期已经在私聊中与你互动了 {profile.message_count_for_profiling} 次。
+
+【该用户旧的画像】：{old_analysis}
+【该用户旧的标签】：{old_tags_str}
 
 [任务]
-请以“我”（符合你的人设设定）的视角，生成一段 100 字以内的**深度印象侧写**。
-- 重点提取：具体的行为习惯、性格底色、对你的态度。
-- 输出为一段流畅的自然语言文本，像老朋友的私密备注。
-- 不要使用 Markdown 列表。
+请结合以上旧的画像和标签，对该用户进行**增量更新**。
+- 重点提取：具体的行为习惯、性格底色、近期的偏好、对你的态度。
+- 请强制按 JSON 格式输出结果。必须包含 `tags`（字符串数组，提取3-5个偏好标签，如极客、二次元等）和 `analysis`（一段100字以内的深度印象侧写文本）。
 
-(由于当前无法获取全量历史，请基于你对他的一贯印象进行创作)
+严格返回格式示例：
+{{
+    "tags": ["标签1", "标签2"],
+    "analysis": "这里是深度侧写文本..."
+}}
 """
-        analysis = await self.gateway.call_proactive_task(prompt)
-        if analysis:
-            profile.persona_analysis = analysis.strip()
+        result = await self.gateway.call_proactive_task(prompt)
+        if result:
+            import json
+            import re
+            
+            tags = []
+            analysis = ""
+            
+            try:
+                # 尝试解析 JSON
+                match = re.search(r'\{.*\}', result, re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                    tags = data.get("tags", [])
+                    analysis = data.get("analysis", "")
+            except Exception as e:
+                from astrbot.api import logger
+                logger.error(f"[Life] 解析增量画像 JSON 失败: {e}")
+                
+            if not analysis:
+                analysis = result.strip()
+                
+            if analysis:
+                profile.persona_analysis = analysis.strip()
+            if tags:
+                profile.tags = tags
+                
             profile.message_count_for_profiling = 0 
             profile.last_persona_gen_time = time.time()
             profile.is_dirty = True
             
             await self.persistence.save_user_profile(profile)
-            logger.info(f"[Life] ✅ 画像生成完成: {analysis[:20]}...")
+            from astrbot.api import logger
+            logger.info(f"[Life] ✅ 私聊画像增量挖掘完成: {analysis[:20]}... 标签: {tags}")
+
 
     async def _run_profiling_task(self):
         """深度侧写任务：筛选互动频次达标的用户，更新其心理画像"""
@@ -315,12 +357,13 @@ class ProactiveTask:
         for profile in active_profiles:
             # 如果该用户自上次侧写以来的互动次数达到阈值
             if getattr(profile, 'message_count_for_profiling', 0) >= threshold:
-                logger.info(f"[Life] 🕵️ 用户 {profile.name} 互动频次达标，开始进行深度心理侧写...")
+                from astrbot.api import logger
+                logger.info(f"[Life] 🕵️ 用户 {profile.name} 私聊互动频次达标，开始进行增量心理侧写...")
                 try:
                     await self._generate_persona_analysis(profile)
                 except Exception as e:
+                    from astrbot.api import logger
                     logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")
-
 
     async def _loop(self):
         """[修改] 维持后台心跳与任务调度"""

@@ -140,6 +140,15 @@ class AttentionGate:
 
         msg_str = event.message_str
         chat_id = str(event.unified_msg_origin)
+        
+        # ==========================================
+        # [新增] 统一 ID 解析与私聊标志注入
+        # ==========================================
+        parts = chat_id.split(":")
+        platform_type = parts[1] if len(parts) >= 3 else ("GroupMessage" if event.get_group_id() else "FriendMessage")
+        is_private = (platform_type == "FriendMessage")
+        event.set_extra("is_private_chat", is_private)
+        
         sender_id = str(event.get_sender_id())
         self_id = str(event.get_self_id())
         
@@ -193,7 +202,7 @@ class AttentionGate:
         async with session.lock:
             # 【中间组件 1: 消息级节流】
             if not session.is_evaluating:
-                if not is_strong_wakeup:
+                if not is_strong_wakeup and not is_private: # [修改] 赋予私聊跳过信息熵和随机静默的绝对豁免权
                     min_entropy = getattr(self.config.attention, 'throttle_min_entropy', 2)
                     import re
                     pure_text = re.sub(r'[^\w\u4e00-\u9fa5]', '', msg_str) if msg_str else ""
@@ -206,22 +215,23 @@ class AttentionGate:
                         return "IGNORE" 
 
             # 3. 复读机拦截
-            msg_hash = hash(msg_str) if msg_str else hash(str(extracted_images))
-            if not hasattr(session, 'last_hash'):
-                session.last_hash = None
-                session.repeat_count = 0
-            
-            if session.last_hash == msg_hash:
-                session.repeat_count += 1
-                threshold = getattr(self.config.attention, 'repeater_threshold', 3)
-                if session.repeat_count == threshold - 1:
-                    self._fire_background_task(event.send(event.plain_result(msg_str)))
+            if not is_private: # [修改] 赋予私聊跳过复读机校验的绝对豁免权
+                msg_hash = hash(msg_str) if msg_str else hash(str(extracted_images))
+                if not hasattr(session, 'last_hash'):
+                    session.last_hash = None
+                    session.repeat_count = 0
                 
-                if session.repeat_count >= 1:
-                    return "ENGAGED"
-            else:
-                session.last_hash = msg_hash
-                session.repeat_count = 0
+                if session.last_hash == msg_hash:
+                    session.repeat_count += 1
+                    threshold = getattr(self.config.attention, 'repeater_threshold', 3)
+                    if session.repeat_count == threshold - 1:
+                        self._fire_background_task(event.send(event.plain_result(msg_str)))
+                    
+                    if session.repeat_count >= 1:
+                        return "ENGAGED"
+                else:
+                    session.last_hash = msg_hash
+                    session.repeat_count = 0
 
             session.accumulation_pool.append(event)
             event.set_extra("astrmai_timestamp", time.time())
@@ -237,7 +247,6 @@ class AttentionGate:
         logger.info(f"[{chat_id}] 👁️ [普通模式] 开启窗口...")
         self._fire_background_task(self._debounce_and_judge(chat_id, session, self_id))
         return "BUFFERED"
-
     async def _normalize_content_to_str(self, components: Any, depth: int = 0) -> str:
         """
         [新增/完善] 将底层富文本组件规范化为字符串标记 (增强鸭子类型版)

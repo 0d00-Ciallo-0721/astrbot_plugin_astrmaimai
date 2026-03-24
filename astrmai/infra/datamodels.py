@@ -73,7 +73,7 @@ class BrainActionPlan:
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def should_act(self) -> bool:
-        return self.action in ["REPLY", "WAIT", "SUMMARIZE_REPLY"]
+        return self.action in ["REPLY", "WAIT", "SUMMARIZE_REPLY", "TOOL_CALL"]
 
 @dataclass
 class ChatState:
@@ -112,6 +112,10 @@ class UserProfile:
     message_count_for_profiling: int = 0 # 距离上次画像生成后的消息数
     last_persona_gen_time: float = 0.0 # 上次生成时间
     identity: str = "" #身份
+    
+    # [新增] 用户偏好标签，用于存储结构化的画像特征
+    tags: List[str] = field(default_factory=list)
+    
     #运行时字段
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     

@@ -142,7 +142,7 @@ class ReplyEngine:
     ):
         """
         执行回复全流程
-        [修改] 引入参数显式化映射，断绝隐式事件对象属性污染导致的系统级状态丢失
+        [修改] 引入私聊靶向情感结算与私聊互动计数。
         """
         if not raw_text: return
 
@@ -161,10 +161,8 @@ class ReplyEngine:
                 if curr_cid:
                     from astrbot.core.agent.message import UserMessageSegment, AssistantMessageSegment, TextPart
                     
-                    # 💡 获取发送者姓名
                     sender_name = event.get_sender_name() or "群友"
                     
-                    # ✨ 【修改此行】：使用富文本保存长期记忆，保留引用和 At 的上下文
                     rich_text = event.get_extra("astrmai_rich_text", event.message_str)
                     formatted_user_text = f"{sender_name}: {rich_text}"
                     
@@ -179,12 +177,10 @@ class ReplyEngine:
                     logger.debug(f"[{chat_id}] 📝 成功同步对话对（已刻入姓名: {sender_name}）。")
         except Exception as e:
             logger.error(f"[ReplyEngine] 强制同步历史记录失败: {e}")
-        # ===
 
         tag = "neutral"
         force_meme_flag = False
         
-        # 🟢 [彻底修复 Bug 1] 使用 get_extra 读取底层工具注入的 bypass 标签，而非 getattr
         _bypassed_tag = bypassed_tag or event.get_extra("astrmai_bypass_mood_analysis", None)
         _window_events = window_events if window_events is not None else event.get_extra("astrmai_window_events", [])
         _anchor_event = anchor_event or event.get_extra("astrmai_anchor_event", None)
@@ -229,24 +225,43 @@ class ReplyEngine:
             
             logger.debug(f"[Reply] 😃 情绪更新: {tag} ({new_mood:.2f})")
             
-            anchor_text = _anchor_event.message_str.strip() if _anchor_event else ""
-            # [核心修复 Bug 4] 传递 anchor_event 进行精确 ID 匹配
-            history_events = await self._fetch_history(chat_id, anchor_text, anchor_event=_anchor_event)
+            # ==========================================
+            # 🟢 [修改] 靶向情感结算与私聊挖掘计数
+            # ==========================================
+            is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
+            target_user_id = None
             
-            # 🟢 [核心修复] 调用 route 时，显式将当前对话的触发者 ID 作为 fallback_uid 传入
-            target_user_id = AffectionRouter.route(
-                history_events=history_events,
-                window_events=_window_events,
-                trigger_event=event,
-                mood_tag=tag,
-                config=self.config,
-                fallback_uid=user_id
-            )
+            if is_private_chat:
+                target_user_id = str(user_id)
+                logger.debug(f"[ReplyEngine] 🎯 检测到私聊环境，绕过群聊归因，100% 靶向用户 {target_user_id} 结算情绪。")
+                
+                # 仅在私聊环境中进行挖掘计数累加
+                try:
+                    profile = await self.state_engine.get_user_profile(user_id)
+                    async with self.state_engine._get_user_lock(user_id):
+                        profile.message_count_for_profiling += 1
+                        profile.is_dirty = True
+                    if hasattr(self.state_engine.persistence, 'save_user_profile'):
+                        await self.state_engine.persistence.save_user_profile(profile)
+                except Exception as e:
+                    logger.warning(f"[ReplyEngine] 私聊互动计数失败: {e}")
+                    
+            else:
+                anchor_text = _anchor_event.message_str.strip() if _anchor_event else ""
+                history_events = await self._fetch_history(chat_id, anchor_text, anchor_event=_anchor_event)
+                
+                target_user_id = AffectionRouter.route(
+                    history_events=history_events,
+                    window_events=_window_events,
+                    trigger_event=event,
+                    mood_tag=tag,
+                    config=self.config,
+                    fallback_uid=user_id
+                )
 
             if target_user_id:
-                # [修复 Bug 2]: 强制将其转换为字符串，防止引发 StateEngine 字典缓存击穿与双重锁
                 safe_target_uid = str(target_user_id)
-                logger.info(f"[ReplyEngine] 🤝 情绪路由器裁决完毕，准备为核心引导用户 {safe_target_uid} 结算好感度。")
+                logger.info(f"[ReplyEngine] 🤝 准备为核心引导用户 {safe_target_uid} 结算好感度。")
                 
                 if hasattr(self.state_engine, 'calculate_and_update_affection'):
                     await self.state_engine.calculate_and_update_affection(
@@ -272,7 +287,6 @@ class ReplyEngine:
         for i, seg in enumerate(segments):
             chain = MessageChain()
             
-            # 仅在【第一段】回复的最前端，拼接 @ 组件
             if i == 0 and at_targets:
                 for target_id in at_targets:
                     uid = target_id
@@ -284,14 +298,12 @@ class ReplyEngine:
                 
             chain.chain.append(Comp.Plain(seg))
             
-            # 🟢 [彻底修复 Bug 5] 强制统一使用全局 Context 跨越异步生命周期发送消息
             context = getattr(self.state_engine.gateway, 'context', None)
             if context:
                 await context.send_message(event.unified_msg_origin, chain)
             else:
                 logger.error("[ReplyEngine] 🚨 致命错误：Gateway Context 丢失，无法跨越生命周期发送消息！")
             
-            # 拟人化打字延迟
             if i < len(segments) - 1:
                 base_factor = getattr(self.config.reply, 'typing_speed_factor', 0.1)
                 delay = min(2.0, max(0.5, len(seg) * base_factor))
@@ -301,7 +313,6 @@ class ReplyEngine:
         if tag and tag != "neutral":
             final_prob = 100 if force_meme_flag else self.meme_probability
             
-            # 🟢 [核心修复] 透传跨生命周期的 context 给 send_meme
             global_context = getattr(self.state_engine.gateway, 'context', None)
             
             await send_meme(
@@ -309,5 +320,5 @@ class ReplyEngine:
                 emotion_tag=tag, 
                 probability=final_prob, 
                 memes_dir=MEMES_DIR,
-                context=global_context  # 传入全局发信器
+                context=global_context 
             )

@@ -15,7 +15,9 @@ class ProviderConfig(BaseModel):
 class GlobalSettingsConfig(BaseModel):
     debug_mode: bool = Field(default=False)
     command_prefixes: List[str] = Field(default=["/", "!", "！"])
-    enabled_groups: List[str] = Field(default=[])
+    whitelist_ids: List[str] = Field(default=[])
+    # [新增] 全局私聊总开关，默认关闭
+    enable_private_chat: bool = Field(default=False)
 
 class PersonaConfig(BaseModel):
     # [修改] 增加 description 描述，明确 ID 为空时的默认行为

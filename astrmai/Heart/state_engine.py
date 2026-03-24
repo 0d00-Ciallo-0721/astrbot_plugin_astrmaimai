@@ -285,32 +285,17 @@ class StateEngine:
 
     # [新增] 函数位置：astrmai/Heart/state_engine.py -> StateEngine 类下
     async def increment_user_message_count(self, user_id: str):
-        """🟢 [彻底修复 Bug 5] 将高频的实时 DB 更新改为纯内存计数，纳秒级操作无惧并发"""
-        async with self._counter_lock:
-            self._message_counter_buffer[user_id] = self._message_counter_buffer.get(user_id, 0) + 1         
-
+        """
+        🟢 [修改] 废弃此处的全局内存计数池，改为在 ReplyEngine 中仅对私聊进行计数。
+        由于该方法仍然被外部旧版 main.py 调用，故保留空函数以防报错。
+        """
+        pass
     async def flush_message_counters(self):
-        """🟢 [彻底修复 Bug 5] 将积压的内存计数器一次性落盘，大幅降低 SQLite 的并发文件锁争用"""
-        async with self._counter_lock:
-            if not self._message_counter_buffer:
-                return
-            # 深拷贝并清空当前池，不阻塞后续高速消息流的打点
-            batch = self._message_counter_buffer.copy()
-            self._message_counter_buffer.clear()
-        
-        # 将内存增量聚合落盘，实现逻辑上的 executemany
-        for uid, count in batch.items():
-            try:
-                profile = await self.get_user_profile(uid)
-                async with self._get_user_lock(uid):
-                    profile.message_count_for_profiling += count
-                    profile.is_dirty = True
-                    
-                if hasattr(self.persistence, 'save_user_profile'):
-                    await self.persistence.save_user_profile(profile)
-            except Exception as e:
-                logger.error(f"[StateEngine] 无法同步用户 {uid} 的消息统计: {e}")
-
+        """
+        🟢 [修改] 由于废弃了全局内存计数池，此处保持为空逻辑即可。
+        """
+        pass
+    
     async def atomic_update_mood(self, chat_id: str, delta: float = 0.0, absolute_val: float = None) -> float:
         """
         [修改] 严格原子化 Read-Compute-Write 事务，彻底消除 TOCTOU 竞态条件
@@ -333,3 +318,25 @@ class StateEngine:
                 await self.db.save_chat_state(chat_id, state)
                 
             return state.mood
+        
+    async def consume_energy(self, chat_id: str, amount: float = None):
+        # [新增] 拦截：私聊绝对专注，不消耗机器人精力
+        if "FriendMessage" in chat_id:
+            return
+
+        # 接入 Config 默认消耗
+        if amount is None:
+            amount = self.config.energy.cost_per_reply
+            
+        async with self._get_chat_lock(chat_id): 
+            # 🟢 [核心修复 Bug 2] 绝不直接依赖 chat_states 字典快照，必须调用内部的懒加载方法从 DB 或内存安全拉取真实状态
+            state = await self._get_state_inner(chat_id)
+
+            old_energy = state.energy
+            
+            state.energy = max(0.0, old_energy - amount)
+            state.total_replies += 1
+            state.last_reply_time = time.time()
+            state.is_dirty = True
+            
+            logger.debug(f"[{chat_id}] 🔋 能量结算: {old_energy:.2f} -> {state.energy:.2f}")        

@@ -1,6 +1,7 @@
 from typing import Any, Optional
 from pydantic import Field
 from pydantic.dataclasses import dataclass 
+import asyncio
 
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult 

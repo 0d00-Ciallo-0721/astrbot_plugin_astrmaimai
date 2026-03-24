@@ -360,11 +360,29 @@ class AstrMaiPlugin(Star):
         if msg and self._is_framework_command(msg):
             return
 
-        group_id = event.get_group_id()
-        enabled_groups = self.config.global_settings.enabled_groups
-        if enabled_groups and group_id:
-            if str(group_id) not in enabled_groups:
-                return
+        # ==========================================
+        # [修改] 统一 ID 解析器与三级权限路由
+        # ==========================================
+        umo = str(event.unified_msg_origin)
+        parts = umo.split(":")
+        platform_type = parts[1] if len(parts) >= 3 else ("GroupMessage" if event.get_group_id() else "FriendMessage")
+        entity_id = parts[2] if len(parts) >= 3 else str(event.get_group_id() or event.get_sender_id())
+
+        whitelist_ids = getattr(self.config.global_settings, 'whitelist_ids', [])
+        enable_private_chat = getattr(self.config.global_settings, 'enable_private_chat', False)
+        
+        # 1. 绝对白名单放行 (最高优先级)
+        is_whitelisted = (umo in whitelist_ids) or (entity_id in whitelist_ids)
+
+        if not is_whitelisted:
+            # 2. 次高优先级：群聊常规判断
+            if platform_type == "GroupMessage":
+                if whitelist_ids:
+                    return # 白名单不为空且未命中，拦截群聊
+            # 3. 第三优先级：私聊全局开关
+            elif platform_type == "FriendMessage":
+                if not enable_private_chat:
+                    return # 未命中白名单且私聊总开关关闭，拦截私聊
 
         self_id = None
         if hasattr(event.message_obj, 'self_id'):
