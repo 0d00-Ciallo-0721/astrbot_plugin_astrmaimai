@@ -54,21 +54,23 @@ class AstrMaiPlugin(Star):
         self._background_tasks = set() 
         
         # 🟢 [彻底修复 Bug 1] 放弃非法的 weakref，改用强引用字典，彻底杜绝并发锁的幽灵回收与内存穿透
-        # (注: _memory_locks 已被高内聚转移至 summarizer.py)
         self._sys2_locks = {}    
         
-        judge_id = self.config.provider.judge_model or 'Unconfigured'
-        agent_id = self.config.provider.agent_model or 'Unconfigured'
-        emb_id = self.config.provider.embedding_provider_id or ''
+        # 🟢 [核心修复] 适配新的模型池列表 (List[str]) 替换旧单体字符串
+        task_models = getattr(self.config.provider, 'task_models', []) or ['Unconfigured']
+        agent_models = getattr(self.config.provider, 'agent_models', []) or ['Unconfigured']
+        embedding_models = getattr(self.config.provider, 'embedding_models', [])
         
-        logger.info(f"[AstrMai] 🚀 Booting... Judge: {judge_id} | Agent: {agent_id}")
+        # 打印列表中的首选模型以供启动日志确认
+        logger.info(f"[AstrMai] 🚀 Booting... Task(Judge): {task_models[0]} | Agent: {agent_models[0]}")
 
         self.persistence = PersistenceManager()                 
         self.db_service = DatabaseService(self.persistence)     
         self.gateway = GlobalModelGateway(context, self.config) 
         self.event_bus = EventBus()   
         
-        self.memory_engine = MemoryEngine(context, self.gateway, embedding_provider_id=emb_id)
+        # 🟢 [核心修复] 传参改为 embedding_models
+        self.memory_engine = MemoryEngine(context, self.gateway, embedding_models=embedding_models)
 
         self.state_engine = StateEngine(self.persistence, self.gateway, event_bus=self.event_bus)
         self.judge = Judge(self.gateway, self.state_engine)
@@ -82,7 +84,7 @@ class AstrMaiPlugin(Star):
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
         
-        # 🟢 [修改] 显式传入 db_service 给 PromptRefiner，解决图片失忆症
+        # 🟢 显式传入 db_service 给 PromptRefiner，解决图片失忆症
         self.prompt_refiner = PromptRefiner(self.memory_engine, self.db_service, self.config) 
         
         self.system2_planner = Planner(
@@ -116,7 +118,7 @@ class AstrMaiPlugin(Star):
         )        
         
         logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-6 Mounted).")
-        
+
     async def _update_user_stats(self, user_id: str):
         await self.state_engine.increment_user_message_count(user_id)
         
@@ -231,13 +233,26 @@ class AstrMaiPlugin(Star):
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
         '''AstrMai 状态面板'''
+        
+        # 🟢 [核心修复] 将单体模型显示更新为模型池长度/首选模型显示
+        task_models = getattr(self.config.provider, 'task_models', [])
+        agent_models = getattr(self.config.provider, 'agent_models', [])
+        embedding_models = getattr(self.config.provider, 'embedding_models', [])
+        fallback_models = getattr(self.config.provider, 'fallback_models', [])
+        
+        task_str = f"{task_models[0]} (+{len(task_models)-1})" if task_models else "Unconfigured"
+        agent_str = f"{agent_models[0]} (+{len(agent_models)-1})" if agent_models else "Unconfigured"
+        emb_str = f"{embedding_models[0]} (+{len(embedding_models)-1})" if embedding_models else "Unconfigured"
+        fallback_str = f"({len(fallback_models)} models standby)" if fallback_models else "(No fallback)"
+        
         help_text = (
             "🤖 **AstrMai (v1.0.0)**\n"
             "-----------------------\n"
             "🧠 架构状态: Phase 6 (Lifecycle Active)\n"
-            f"🔌 Judge Provider: {self.config.provider.judge_model}\n"
-            f"🔌 Agent Provider: {self.config.provider.agent_model}\n"
-            f"🔌 Emb Provider: {self.config.provider.embedding_provider_id}\n"
+            f"🔌 Task Pool: {task_str}\n"
+            f"🔌 Agent Pool: {agent_str}\n"
+            f"🔌 Emb Pool: {emb_str}\n"
+            f"🛟 Fallback: {fallback_str}\n"
             "💾 SQLite & Faiss RAG: Connected\n"
             "🌀 Subconscious Miner: Running\n"
             "🌱 Proactive Life: Running"
