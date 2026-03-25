@@ -120,8 +120,12 @@ class VisualCortex:
 
 # [修改] 核心处理流程：单通 VLM 识别并入库
     async def process_image_async(self, picid: str, base64_data: str):
+        import tempfile
+        import os
+        temp_file_path = None
+        
         try:
-            # 🟢 [核心修复] 缓存拦截屏障：如果数据库中已经存在该图片，直接跳过识别，杜绝重复消耗 Token
+            # 🟢 [核心修复] 缓存拦截屏障：如果数据库中已经存在该图片，直接跳过识别
             with self.db_service.get_session() as session:
                 if session.get(VisualMemory, picid):
                     logger.info(f"[AstrMai-VisualCortex] ⚡ 命中视觉记忆缓存，跳过重复解析: {picid}")
@@ -135,12 +139,22 @@ class VisualCortex:
                 transformed_b64 = self._transform_gif(base64_data)
                 if transformed_b64:
                     base64_data = transformed_b64
+                    image_bytes = base64.b64decode(base64_data) # 重新获取降维后的字节流
                     image_format = "jpeg"
                 else:
                     logger.warning(f"[AstrMai-VisualCortex] GIF 处理失败，跳过识别: {picid}")
                     return
 
-            image_uri = f"data:image/{image_format};base64,{base64_data}"
+            # ==========================================
+            # 🔪 [核心修改] 拔除 Base64 拼接毒瘤，改为物理落盘
+            # ==========================================
+            # 废弃: image_uri = f"data:image/{image_format};base64,{base64_data}"
+            
+            fd, temp_file_path = tempfile.mkstemp(suffix=f".{image_format}")
+            with os.fdopen(fd, 'wb') as f:
+                f.write(image_bytes)
+                
+            logger.info(f"[AstrMai-VisualCortex] 💾 图片已物理落盘至临时文件: {temp_file_path}")
 
             system_prompt = (
                 "你是一个群聊视觉分析助手。请分析图片内容，并严格使用且仅使用以下 JSON 格式输出结果，不要输出任何 Markdown 标记：\n"
@@ -150,8 +164,9 @@ class VisualCortex:
 
             logger.info(f"[AstrMai-VisualCortex] 🚀 正在异步解析视觉输入: {picid} ({image_format})")
             
+            # 传递纯净的物理文件路径给网关
             result_dict = await self.gateway.call_vision_task(
-                image_data=image_uri,
+                image_data=temp_file_path,
                 prompt="请分析这幅图片/表情包。",
                 system_prompt=system_prompt
             )
@@ -167,7 +182,7 @@ class VisualCortex:
 
             logger.info(f"[AstrMai-VisualCortex] ✅ 解析完成 {picid} | 类型:{img_type} | 描述:{description[:20]}... | 标签:{tags_json_str}")
 
-            # 将同步写库逻辑提取为一个内部函数，并推入 asyncio.to_thread 防止阻塞 Worker
+            # 内部函数闭包处理 DB
             def _save_db():
                 with self.db_service.get_session() as session:
                     import time
@@ -193,3 +208,14 @@ class VisualCortex:
 
         except Exception as e:
             logger.error(f"[AstrMai-VisualCortex] ❌ 处理图片 {picid} 时发生未捕获异常: {e}", exc_info=True)
+            
+        finally:
+            # ==========================================
+            # 🧹 [核心修改] 执行完毕后，安全销毁本地临时文件
+            # ==========================================
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    logger.debug(f"[AstrMai-VisualCortex] 🧹 已安全销毁临时视觉文件: {temp_file_path}")
+                except Exception as e:
+                    logger.error(f"[AstrMai-VisualCortex] ⚠️ 无法删除临时视觉文件 {temp_file_path}: {e}")

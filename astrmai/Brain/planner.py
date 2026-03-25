@@ -53,6 +53,7 @@ class Planner:
         """
         [修改] 在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
         增加 4 个新增拟人化工具的挂载
+        [修改] 阶段三：主脑负载编排，提取直通图片 URL 并注入多模态旁白，传递给 Executor。
         """
         chat_id = event.unified_msg_origin
         user_id = event.get_sender_id() 
@@ -224,9 +225,18 @@ class Planner:
             context=ctx
         )
 
+        # ==========================================
+        # [新增] 阶段三：主脑负载编排 (主脑视觉直通车)
+        # ==========================================
+        direct_vision_urls = event.get_extra("direct_vision_urls", [])
+        if direct_vision_urls:
+            final_prompt += "\n(导演旁白：用户递给了你几张照片，请结合画面内容进行回应。)"
+            logger.info(f"[{chat_id}] 👁️ 已编排主脑直通车负载，携带 {len(direct_vision_urls)} 张图片进入执行器。")
+
         await self.executor.execute(
             event=event,
             system_prompt=final_system_prompt,
             prompt=final_prompt,
-            tools=tools
+            tools=tools,
+            direct_vision_urls=direct_vision_urls # [修改] 传递直通车 URL 到第四阶段
         )

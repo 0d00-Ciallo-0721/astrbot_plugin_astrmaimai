@@ -247,10 +247,12 @@ class AttentionGate:
         logger.info(f"[{chat_id}] 👁️ [普通模式] 开启窗口...")
         self._fire_background_task(self._debounce_and_judge(chat_id, session, self_id))
         return "BUFFERED"
-    async def _normalize_content_to_str(self, components: Any, depth: int = 0) -> str:
+    
+    async def _normalize_content_to_str(self, components: Any, depth: int = 0, event: AstrMessageEvent = None) -> str:
         """
         [新增/完善] 将底层富文本组件规范化为字符串标记 (增强鸭子类型版)
         全面接入几十种富文本组件的解析，并解除对底层硬编码类名的死板依赖。
+        [修改] 新增 event 参数传入，用于捕获主脑直通车的特权标志，并执行异步旁路拦截。
         """
         # [彻底修复 Bug 2] 增加强制深度保护机制，拦截套娃引用栈溢出
         if depth > 3:
@@ -276,23 +278,32 @@ class AttentionGate:
                         if component_type in ["plain", "text"]:
                             outline += i.get("text", "")
                         elif component_type == "image":
-                            # [核心修改] 视觉拦截逻辑 (Dict分支)
-                            import random
-                            import hashlib
-                            prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
-                            if random.random() < prob:
-                                url = i.get("url", "")
-                                base64_data = await self._extract_image_base64_from_url(url) if url else ""
-                                if base64_data:
-                                    pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
-                                    outline += f"[picid:{pic_md5}]"
-                                    if getattr(self, 'visual_cortex', None):
-                                        # [彻底修复 Bug 3] 替换 create_task
-                                        self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                            # ==========================================
+                            # [新增] 阶段二：异步旁路拦截 (主脑视觉直通车) Dict分支
+                            # ==========================================
+                            direct_vision_urls = event.get_extra("direct_vision_urls", []) if event else []
+                            url = i.get("url", "")
+                            
+                            if direct_vision_urls and url in direct_vision_urls:
+                                outline += "[图片]"
+                                logger.debug(f"[AstrMai-Attention] 🛡️ 命中主脑视觉直通车，旁路拦截生效，阻断异步多模态翻译 (URL: {url[:30]}...)")
+                            else:
+                                # [核心修改] 视觉拦截逻辑 (Dict分支)
+                                import random
+                                import hashlib
+                                prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
+                                if random.random() < prob:
+                                    base64_data = await self._extract_image_base64_from_url(url) if url else ""
+                                    if base64_data:
+                                        pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
+                                        outline += f"[picid:{pic_md5}]"
+                                        if getattr(self, 'visual_cortex', None):
+                                            # [彻底修复 Bug 3] 替换 create_task
+                                            self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                                    else:
+                                        outline += "[图片]"
                                 else:
                                     outline += "[图片]"
-                            else:
-                                outline += "[图片]"
                         elif component_type == "at":
                             name = i.get("name", "")
                             qq = i.get("qq", "User")
@@ -317,8 +328,8 @@ class AttentionGate:
                         
                         reply_content = ""
                         if hasattr(i, 'chain') and i.chain:
-                            # [彻底修复 Bug 2] 递归调用时深度 + 1
-                            reply_content = await self._normalize_content_to_str(i.chain, depth + 1)
+                            # [彻底修复 Bug 2] 递归调用时深度 + 1，同时传递 event 参数
+                            reply_content = await self._normalize_content_to_str(i.chain, depth + 1, event)
                         elif hasattr(i, 'message_str') and i.message_str:
                             reply_content = i.message_str
                         elif hasattr(i, 'text') and i.text:
@@ -338,22 +349,32 @@ class AttentionGate:
                     if component_type == "plain" or i.__class__.__name__ == "Plain":
                         outline += getattr(i, 'text', '')
                     elif component_type == "image" or i.__class__.__name__ == "Image":
-                        # [核心修改] 视觉拦截逻辑 (原生组件分支)
-                        import random
-                        import hashlib
-                        prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
-                        if random.random() < prob:
-                            base64_data = await self._extract_image_base64(i)
-                            if base64_data:
-                                pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
-                                outline += f"[picid:{pic_md5}]"
-                                if getattr(self, 'visual_cortex', None):
-                                    # [彻底修复 Bug 3] 替换 create_task
-                                    self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                        # ==========================================
+                        # [新增] 阶段二：异步旁路拦截 (主脑视觉直通车) 原生组件分支
+                        # ==========================================
+                        direct_vision_urls = event.get_extra("direct_vision_urls", []) if event else []
+                        url = getattr(i, 'url', '')
+                        
+                        if direct_vision_urls and url in direct_vision_urls:
+                            outline += "[图片]"
+                            logger.debug(f"[AstrMai-Attention] 🛡️ 命中主脑视觉直通车，旁路拦截生效，阻断异步多模态翻译 (URL: {url[:30]}...)")
+                        else:
+                            # [核心修改] 视觉拦截逻辑 (原生组件分支)
+                            import random
+                            import hashlib
+                            prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
+                            if random.random() < prob:
+                                base64_data = await self._extract_image_base64(i)
+                                if base64_data:
+                                    pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
+                                    outline += f"[picid:{pic_md5}]"
+                                    if getattr(self, 'visual_cortex', None):
+                                        # [彻底修复 Bug 3] 替换 create_task
+                                        self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                                else:
+                                    outline += "[图片]"
                             else:
                                 outline += "[图片]"
-                        else:
-                            outline += "[图片]"
                     elif component_type == "face" or i.__class__.__name__ == "Face":
                         outline += f"[表情:{getattr(i, 'id', getattr(i, 'name', ''))}]"
                     elif component_type == "at" or i.__class__.__name__ == "At":
@@ -484,7 +505,8 @@ class AttentionGate:
 
     async def _format_and_filter_messages(self, events: List[AstrMessageEvent]):
         """
-        [修改] 斗图过滤与同源消息折叠，接入转义层
+        [修改] 斗图过滤与同源消息折叠，接入转义层。
+        [修改] 将 event(e) 参数传递给 _normalize_content_to_str，以激活旁路拦截机制。
         """
         if not events: return "", []
         
@@ -520,8 +542,8 @@ class AttentionGate:
                 raw_content = e.message_str
             else:
                 components = e.message_obj.message if (hasattr(e, "message_obj") and e.message_obj) else e.message_str
-                # [核心修改] 使用 await 等待异步方法返回
-                raw_content = await self._normalize_content_to_str(components)
+                # [核心修改] 使用 await 等待异步方法返回，并传入 event 以激活旁路拦截
+                raw_content = await self._normalize_content_to_str(components, event=e)
                 
             # [核心修改] 执行叙事转义
             content = self._convert_interaction_to_narrative(raw_content, bot_name)
@@ -544,7 +566,7 @@ class AttentionGate:
             grouped_texts.append(f"{curr_sender}：{'，'.join(curr_msgs)}")
 
         return "\n".join(grouped_texts), filtered_events
-
+    
     # [修改] 位置: astrmai/Heart/attention.py -> AttentionGate 类下
     async def _debounce_and_judge(self, chat_id: str, session: SessionContext, self_id: str):
         try:

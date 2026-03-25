@@ -61,10 +61,40 @@ class PreFilters:
         has_payload = False
         image_urls = []
         
+        # ==========================================
+        # [新增] 阶段一：特征探针提取 (主脑视觉直通车)
+        # ==========================================
+        has_at_bot = False
+        reply_image_urls = []
+        bot_id = str(event.get_self_id())
+        # 判断私聊环境 (如果不存在 group_id 则为私聊)
+        is_private = not bool(event.get_group_id())
+
+        def _scan_reply_chain(chain):
+            """递归扫描引用链中的图片"""
+            urls = []
+            if not chain: return urls
+            for c in chain:
+                if isinstance(c, Comp.Image) and getattr(c, 'url', ''):
+                    urls.append(c.url)
+                elif isinstance(c, Comp.Reply) and hasattr(c, 'chain'):
+                    urls.extend(_scan_reply_chain(c.chain))
+            return urls
+
         if event.message_obj and event.message_obj.message:
             for seg in event.message_obj.message:
-                # 忽略艾特和引用组件对纯文本的干扰
-                if isinstance(seg, (Comp.At, Comp.Reply)):
+                # [新增] 探针：检测消息体内是否 @ 了 Bot
+                if isinstance(seg, Comp.At) and str(seg.qq) == bot_id:
+                    has_at_bot = True
+                    
+                # [新增] 探针：检测引用组件，并递归挖掘被引用消息中的图片
+                if isinstance(seg, Comp.Reply):
+                    if hasattr(seg, 'chain'):
+                        reply_image_urls.extend(_scan_reply_chain(seg.chain))
+                    continue # 忽略引用组件对纯文本的干扰
+                    
+                # 忽略艾特对纯文本的干扰
+                if isinstance(seg, Comp.At):
                     continue 
                 
                 # 提取纯文本
@@ -73,17 +103,35 @@ class PreFilters:
                     if text: 
                         clean_text_parts.append(text)
                         
-                # ==========================================
                 # 【核心逻辑】：必须检测 Comp.Image 及其他媒体载荷
-                # 作用：发放“免死金牌”，防止纯图片消息被当成空消息拦截
-                # ==========================================
                 if isinstance(seg, (Comp.Image, Comp.Video, Comp.Record, Comp.File)):
                     has_payload = True
                     
-                # 顺手提取 URL（向下兼容，供持久化足迹表使用）
+                # 顺手提取 URL
                 if isinstance(seg, Comp.Image) and getattr(seg, 'url', ''):
                     image_urls.append(seg.url)
+                    
+        # [新增] 封装着色逻辑：主脑视觉直通车
+        direct_vision_urls = []
         
+        if is_private and image_urls:
+            # 1. is_private: 私聊环境且存在图片
+            direct_vision_urls.extend(image_urls)
+        elif has_at_bot:
+            # 2. is_at_with_image: 群聊环境 + @Bot + 存在图片
+            if image_urls:
+                direct_vision_urls.extend(image_urls)
+            # 3. is_reply_with_image: 群聊环境 + @Bot + 引用历史中存在图片
+            if reply_image_urls:
+                direct_vision_urls.extend(reply_image_urls)
+                
+        # 一旦命中上述条件，进行去重并注入高优先级特权标志
+        if direct_vision_urls:
+            unique_direct_urls = list(dict.fromkeys(direct_vision_urls))
+            event.set_extra("direct_vision_urls", unique_direct_urls)
+            logger.debug(f"[AstrMai-Sensor] 👁️ 捕获主脑直通车视觉特征！提取直通 URL 数: {len(unique_direct_urls)}")
+        # ==========================================
+
         clean_text = " ".join(clean_text_parts).strip().lower()
         
         # 记录提取的图片 URL，供后续模块备份足迹使用
