@@ -7,61 +7,31 @@
         "description": "总模型池 (Fallback Models)",
         "type": "list",
         "default": [],
-        "hint": "备用模型池。当某个专项模型调用失败或未配置时，将依次尝试此列表中的模型"
+        "hint": "备用模型池。当某个模型池调用全部失败或未配置时，将依次尝试此列表中的模型"
       },
-      "judge_model": {
-        "description": "意图与动作快速判决模型",
-        "type": "string",
-        "default": "",
-        "hint": "用于快速意图判断，建议使用快速的小模型",
-        "_special": "select_provider"
+      "agent_models": {
+        "description": "智能体循环核心sys2专属模型池",
+        "type": "list",
+        "default": [],
+        "hint": "用于反思、工具调用与长文本生成，建议使用强逻辑的大模型"
       },
-      "agent_model": {
-        "description": "智能体循环核心生成模型",
-        "type": "string",
-        "default": "",
-        "hint": "用于反思、工具调用与长文本生成，建议使用强逻辑的大模型",
-        "_special": "select_provider"
+      "task_models": {
+        "description": "决策和后台任务模型池",
+        "type": "list",
+        "default": [],
+        "hint": "整合意图判决、情绪分析、数据处理、主动侧写与人设压缩等后台任务"
       },
-      "mood_model": {
-        "description": "情绪值与好感度分析模型",
-        "type": "string",
-        "default": "",
-        "hint": "用于分析文本情绪并闭环更新好感度",
-        "_special": "select_provider"
-      },
-      "data_process_model": {
-        "description": "数据处理与降维挖掘模型",
-        "type": "string",
-        "default": "",
-        "hint": "用于离线记忆结构化、黑话推断提取、语癖提取与对话目标分析",
-        "_special": "select_provider"
-      },
-      "proactive_model": {
-        "description": "主动行为与侧写模型",
-        "type": "string",
-        "default": "",
-        "hint": "用于主动冷场破冰开场白生成及深度用户心理画像侧写",
-        "_special": "select_provider"
-      },
-      "persona_model": {
-        "description": "人格压缩总模型",
-        "type": "string",
-        "default": "",
-        "hint": "用于人设压缩与多维切片",
-        "_special": "select_provider"
-      },
-      "vision_model": {
-         "description": "多模态视觉专属大模型",
-         "type": "string",
-        "_special": "select_provider",
-         "hint": "用于处理图片解析的专属模型 (如 gpt-4o / gemini-1.5-pro)。如果不配置将无法看图。"
+      "vision_models": {
+         "description": "多模态视觉模型池",
+         "type": "list",
+         "default": [],
+         "hint": "用于处理图片解析的专属模型池。如果不配置将无法看图。"
       }, 
-      "embedding_provider_id": {
-        "description": "Embedding 模型提供商 ID",
-        "type": "string",
-        "hint": "请填写 Embedding 模型 ID（如 openai_embedding）。留空则自动兜底。",
-        "default": ""
+      "embedding_models": {
+        "description": "向量化模型池",
+        "type": "list",
+        "default": [],
+        "hint": "请填写 Embedding 模型 ID（如 openai_embedding）。注意：向量化模型只能在此池内循环，不参与总模型池循环兜底。"
       }
     }
   },

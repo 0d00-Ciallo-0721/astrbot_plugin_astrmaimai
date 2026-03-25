@@ -1,16 +1,13 @@
 from pydantic import BaseModel, Field
 from typing import List,Dict
 
+
 class ProviderConfig(BaseModel):
     fallback_models: List[str] = Field(default=[])
-    judge_model: str = Field(default="")
-    agent_model: str = Field(default="")
-    mood_model: str = Field(default="")
-    data_process_model: str = Field(default="")
-    proactive_model: str = Field(default="")
-    persona_model: str = Field(default="")
-    embedding_provider_id: str = Field(default="")
-    vision_model: str = Field(default="", description="多模态视觉专属大模型配置 (如 gpt-4o / gemini-1.5-pro)")
+    agent_models: List[str] = Field(default=[])
+    task_models: List[str] = Field(default=[])
+    vision_models: List[str] = Field(default=[], description="多模态视觉专属模型池 (如 gpt-4o / gemini-1.5-pro)")
+    embedding_models: List[str] = Field(default=[])
 
 class GlobalSettingsConfig(BaseModel):
     debug_mode: bool = Field(default=False)

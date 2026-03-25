@@ -24,15 +24,16 @@ class MemoryEngine:
     统一记忆引擎 (Infrastructure Layer)
     重构版：加入延迟唤醒 (Lazy Load) 机制，彻底解决启动时的 Provider 生命期时序问题。
     """
-    def __init__(self, context, gateway, embedding_provider_id: str = "", config=None):
+    def __init__(self, context, gateway, embedding_models: list = None, config=None):
         self.context = context
         self.gateway = gateway
         self.config = config if config else gateway.config
         
-        if hasattr(self.config, 'provider') and getattr(self.config.provider, 'embedding_provider_id', None):
-            self.embedding_provider_id = self.config.provider.embedding_provider_id
+        # 适配变量名从 embedding_provider_id 改为 embedding_models
+        if hasattr(self.config, 'provider') and getattr(self.config.provider, 'embedding_models', None):
+            self.embedding_models = self.config.provider.embedding_models
         else:
-            self.embedding_provider_id = embedding_provider_id
+            self.embedding_models = embedding_models or []
             
         self.data_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai" / "memory"
         if not os.path.exists(self.data_path):
@@ -50,8 +51,8 @@ class MemoryEngine:
         
         # 🟢 [核心修复 Bug 4] 状态机熔断器相关属性
         self._init_failures = 0           
-        self._next_retry_time = 0.0       
-
+        self._next_retry_time = 0.0  
+        
     async def initialize(self):
         """初始化基础骨架 (跳过模型挂载，转移到运行时)"""
         # 🔑 【修改点】BM25 引擎指向正确的独立插件数据库，而不是全局 data.db
@@ -61,7 +62,7 @@ class MemoryEngine:
         logger.info("[AstrMai] 🧬 记忆模块骨架已装载，等待首次对话时唤醒向量引擎...")
     
     async def _ensure_faiss_initialized(self):
-        """[彻底修复 Bug 4] 引入指数退避熔断器机制 (Circuit Breaker)，防止配置失效导致无限重试拖垮主线程"""
+        """[彻底修复 Bug 4] 引入指数退避熔断器机制 (Circuit Breaker)，并适配向量化模型的按序遍历策略"""
         if self._is_ready: 
             return True
             
@@ -77,17 +78,27 @@ class MemoryEngine:
             
         provider_instance = None
         
-        if self.embedding_provider_id:
-            if hasattr(self.context, 'get_provider_by_id'):
-                provider_instance = self.context.get_provider_by_id(self.embedding_provider_id)
-            if not provider_instance and hasattr(self.context, 'get_provider'):
-                provider_instance = self.context.get_provider(self.embedding_provider_id)
+        # 获取清洗后的模型列表
+        clean_models = [m.strip() for m in self.embedding_models if m and m.strip()]
+        unique_models = list(dict.fromkeys(clean_models))
+        
+        # 由于 FaissVecDB 初始化只能传入一个实例，此处遍历池子寻找第一个能够成功实例化并加载的提供商
+        if unique_models:
+            for model_id in unique_models:
+                if hasattr(self.context, 'get_provider_by_id'):
+                    provider_instance = self.context.get_provider_by_id(model_id)
+                if not provider_instance and hasattr(self.context, 'get_provider'):
+                    provider_instance = self.context.get_provider(model_id)
+                
+                if provider_instance:
+                    break
 
         if not provider_instance:
             self._init_failures += 1
             backoff = min(3600, 30 * (2 ** (self._init_failures - 1)))
             self._next_retry_time = now + backoff
-            logger.error(f"[AstrMai] ❌ 记忆模块唤醒失败: 找不到有效 Embedding 模型 '{self.embedding_provider_id}'。熔断保护 {backoff} 秒。")
+            models_str = ", ".join(unique_models) if unique_models else "未配置"
+            logger.error(f"[AstrMai] ❌ 记忆模块唤醒失败: 找不到有效的 Embedding 模型 [{models_str}]。熔断保护 {backoff} 秒。")
             return False
 
         doc_store_path = str(self.data_path / "docs.db")

@@ -25,39 +25,64 @@ class GlobalModelGateway:
     def __init__(self, context: Context, config: Any):
         self.context = context
         self.config = config
-        # 🟢 [核心清理] 既然废弃了 main.py 中的拦截器，此处不再需要生成 internal_marker 隐身凭证
+        # 🟢 [新增] 状态机：初始化所有模型池的轮询指针 (Cursors)
+        self._cursors = {
+            "fallback": 0,
+            "agent": 0,
+            "task": 0,
+            "vision": 0,
+            "embedding": 0
+        }
+
+    def get_models_for_task(self, pool_name: str, models: List[str]) -> List[str]:
+        """状态轮询调度算法：获取重排后的模型列表并推进游标 (严格复用原文件函数名)"""
+        clean_models = [m.strip() for m in models if m and m.strip()]
+        if not clean_models:
+            return []
+            
+        # 去重且保持原配置顺序
+        unique_models = list(dict.fromkeys(clean_models))
+        
+        # 获取当前池的游标，若超限则归零重置
+        cursor = self._cursors.get(pool_name, 0)
+        if cursor >= len(unique_models):
+            cursor = 0
+            
+        # 数组切片重排，将游标指向的模型放到队列首位
+        rearranged = unique_models[cursor:] + unique_models[:cursor]
+        
+        # 游标步进，为下一次调用做准备
+        self._cursors[pool_name] = (cursor + 1) % len(unique_models)
+        
+        return rearranged
 
     # [新增] 统一列表合成器：获取用于当前任务的模型轮询列表
-    def get_models_for_task(self, specific_model: str) -> List[str]:
-        """优先使用传入的 specific_model，随后附加 fallback_models，去除空值与重复项"""
-        models = []
-        if specific_model and specific_model.strip():
-            models.append(specific_model.strip())
-            
-        fallback_models = getattr(self.config.provider, 'fallback_models', [])
-        if fallback_models:
-            models.extend(fallback_models)
-            
-        # 去重且保持原顺序
-        return list(dict.fromkeys([m for m in models if m]))
-    
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
-    async def _elastic_call(self, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None) -> Union[str, Dict[str, Any]]: 
-        """统一网关底层调用引擎 (异常快速熔断 + 视觉临时文件防泄漏)"""
+    async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
+        """统一网关底层调用引擎 (接入原名函数 get_models_for_task)"""
         
-        # 🟢 [核心清理] 删除了对 internal_marker 的拼装，还系统一个纯净无污染的 Prompt
-        if not models:
-            logger.warning("[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池！")
+        # 1. 尝试主模型池（已根据轮询游标重排）
+        primary_models = self.get_models_for_task(pool_name, models)
+        attempt_queue = primary_models.copy()
+        
+        # 2. 如果允许兜底，主池全挂则尝试总模型池（同样根据总池自己的游标重排）
+        if use_fallback:
+            fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
+            fallback_models = self.get_models_for_task("fallback", fallback_models_raw)
+            attempt_queue += [m for m in fallback_models if m not in attempt_queue]
+
+        if not attempt_queue:
+            logger.warning(f"[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池 (池: {pool_name})！")
             return {} if is_json else ""
             
-        max_retries = self.config.infra.llm_retries
-        backoff_factor = self.config.infra.backoff_factor
+        max_retries = getattr(self.config.infra, 'llm_retries', 2)
+        backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
         last_error = ""
         
-        for model_id in models:
+        for model_id in attempt_queue:
             logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
             for attempt in range(max_retries + 1):
-                temp_files_to_clean = []  # 🔴 登记名单：确保 finally 能清理
+                temp_files_to_clean = []
                 try:
                     # 1. 剥离环境依赖，前置临时文件转换逻辑
                     processed_image_urls = []
@@ -71,7 +96,6 @@ class GlobalModelGateway:
                                     if ext == "jpeg": ext = "jpg"
                                     img_bytes = base64.b64decode(encoded)
 
-                                    # 创建真实的本地临时文件
                                     fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
                                     with os.fdopen(fd, 'wb') as f:
                                         f.write(img_bytes)
@@ -93,7 +117,6 @@ class GlobalModelGateway:
                     current_prompt = prompt
                     
                     if processed_image_urls:
-                        # 兼容 AstrBot 各个版本的底层结构
                         if ImagePart:
                             user_content = []
                             if current_prompt:
@@ -107,7 +130,6 @@ class GlobalModelGateway:
                             contexts.append(UserMessageSegment(content=user_content))
                             current_prompt = "" 
                         else:
-                            # 即使 ImagePart 导入失败，传入的也是合法的短路径临时文件，不会报错
                             llm_kwargs["image_urls"] = processed_image_urls
                             
                     resp = await self.context.llm_generate(
@@ -129,8 +151,8 @@ class GlobalModelGateway:
                         return json.loads(raw_json_str)
                     except json.JSONDecodeError:
                         if "{" not in raw_json_str and "[" not in raw_json_str:
-                            logger.error(f"[AstrMai-Gateway] 🚨 快速熔断：模型 {model_id} 严重幻觉(完全丢失 JSON 结构)，拒绝重试，直接抛弃。")
-                            return {}
+                            logger.error(f"[AstrMai-Gateway] 🚨 快速熔断：模型 {model_id} 严重幻觉，拒绝重试，跳过本模型。")
+                            break 
 
                         if repair_json:
                             try: 
@@ -161,37 +183,27 @@ class GlobalModelGateway:
                             except Exception as e:
                                 logger.error(f"[AstrMai-Gateway] ⚠️ 无法删除临时视觉文件 {temp_path}: {e}")
 
-        logger.error(f"[AstrMai-Gateway] ❌ 所有模型池耗尽，最终异常: {last_error}")
+        logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
         return {} if is_json else ""
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
-        """
-        独立的视觉调用网关。
-        不使用全局的 get_models_for_task()，坚决隔离纯语言的 fallback_models，
-        确保只将图片发送给具备多模态能力的专属视觉模型，防止模型池污染报错。
-        """
-        # 读取专属的视觉模型配置 (需确保用户在 ProviderConfig 中配置了 vision_model)
-        vision_model = getattr(self.config.provider, 'vision_model', '')
-        if not vision_model:
-            logger.error("[AstrMai-Gateway] 🚨 视觉任务失败：未配置专属视觉模型 (vision_model)！请在 config.yaml 中配置。")
+        """多模态视觉任务专用网关"""
+        vision_models = getattr(self.config.provider, 'vision_models', [])
+        if not vision_models:
+            logger.error("[AstrMai-Gateway] 🚨 视觉任务失败：未配置专属视觉模型池 (vision_models)！请在 config.yaml 中配置。")
             return {}
-
-        # 仅投递给专属视觉模型
-        models = [vision_model]
         
-        # 将传入的 Base64/URL 包装为标准列表格式
         image_urls = [image_data] if image_data else None
 
-        # 完美继承 _elastic_call：
-        # 1. 强行开启 is_json=True 确保返回安全字典
-        # 2. 视觉任务耗时较长，施加 0.5 的重试退避惩罚
         return await self._elastic_call(
+            pool_name="vision",
             prompt=prompt, 
             system_prompt=system_prompt, 
-            models=models, 
+            models=vision_models, 
             is_json=True, 
             retry_penalty=0.5, 
-            image_urls=image_urls
+            image_urls=image_urls,
+            use_fallback=False # 隔离总模型池，防止把图片发给不支持视觉的文本 LLM
         )
 
     def _extract_json(self, text: str) -> str:
@@ -217,33 +229,46 @@ class GlobalModelGateway:
         
         # 如果上述方法都失败，则返回原始文本
         return text
-    #[新增] 替换原 call_judge：意图与动作快速判决
+    
+
+    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_judge_task(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
-        models = self.get_models_for_task(self.config.provider.judge_model)
-        return await self._elastic_call(prompt, system_prompt, models, is_json=True)
+        """意图与动作快速判决"""
+        task_models = getattr(self.config.provider, 'task_models', [])
+        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=True)
 
-    # [新增] 情绪值分析与好感度闭环
+    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_mood_task(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
-        models = self.get_models_for_task(self.config.provider.mood_model)
-        return await self._elastic_call(prompt, system_prompt, models, is_json=True)
+        """情绪值分析与好感度闭环"""
+        task_models = getattr(self.config.provider, 'task_models', [])
+        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=True)
 
-    # [新增] 记忆结构化/群组黑话推断/实时对话目标分析
+    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_data_process_task(self, prompt: str, system_prompt: str = "", is_json: bool = False) -> Union[str, Dict[str, Any]]:
-        models = self.get_models_for_task(self.config.provider.data_process_model)
-        # 后台数据处理较慢，带上 0.5 的退避惩罚
-        return await self._elastic_call(prompt, system_prompt, models, is_json=is_json, retry_penalty=0.5)
+        """记忆结构化/群组黑话推断/实时对话目标分析"""
+        task_models = getattr(self.config.provider, 'task_models', [])
+        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=is_json, retry_penalty=0.5)
 
-    # [新增] 主动冷场破冰开场白生成/深度用户画像侧写
+    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_proactive_task(self, prompt: str, system_prompt: str = "") -> str:
-        models = self.get_models_for_task(self.config.provider.proactive_model)
-        # 替换原 call_planner，带上 0.5 的退避惩罚
-        return await self._elastic_call(prompt, system_prompt, models, is_json=False, retry_penalty=0.5)
+        """主动冷场破冰开场白生成/深度用户画像侧写"""
+        task_models = getattr(self.config.provider, 'task_models', [])
+        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=False, retry_penalty=0.5)
 
-    # [新增] 人设压缩与多维切片
+    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_persona_task(self, prompt: str, system_prompt: str = "", is_json: bool = False) -> Union[str, Dict[str, Any]]:
-        models = self.get_models_for_task(self.config.provider.persona_model)
-        return await self._elastic_call(prompt, system_prompt, models, is_json=is_json)
+        """人设压缩与多维切片"""
+        task_models = getattr(self.config.provider, 'task_models', [])
+        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=is_json)
 
-    # [新增] 提供给 Brain/Executor 的原生智能体模型备用列表
+    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     def get_agent_models(self) -> List[str]:
-        return self.get_models_for_task(self.config.provider.agent_model)
+        """提供给 Brain/Executor 的原生智能体模型备用列表 (带轮询顺序)"""
+        agent_models = getattr(self.config.provider, 'agent_models', [])
+        fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
+        
+        # 替换为调用修复名称后的 get_models_for_task
+        primary = self.get_models_for_task("agent", agent_models)
+        fallback = self.get_models_for_task("fallback", fallback_models_raw)
+        
+        return primary + [m for m in fallback if m not in primary]
