@@ -46,6 +46,9 @@ async def send_meme(
         
         image_comp = Comp.Image.fromFileSystem(str(selected.absolute()))
         
+        # [新增] 免疫标记：防止主动发出的表情包触发旁路嗅探
+        event.set_extra("astrmai_is_self_reply", True)
+        
         if context:
             # 🟢 [核心修复] 放弃 .message() 快捷方法，直接向底层的 chain 列表 append 富媒体组件
             chain = MessageChain()

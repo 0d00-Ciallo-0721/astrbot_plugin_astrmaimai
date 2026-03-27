@@ -505,29 +505,28 @@ class AttentionGate:
 
     async def inject_external_event(self, chat_id: str, event_data: dict):
         """
-        [新增] 将外部非原生事件（如旁路嗅探到的其他插件回复）安全地压入倒计时的 2 秒滑动窗口池中。
+        将外部非原生事件安全地压入倒计时的 2 秒滑动窗口池中。
         """
         import time
-        # 获取对应 chat_id 的 SessionContext
         session = await self._get_or_create_session(chat_id)
         
-        # 加锁后将传入的 event_data 压入
         async with session.lock:
-            # 内部构建一个鸭子类型适配器，使 dict 支持 get_extra() 
-            # 完美兼容滑动窗口 _debounce_and_judge 中提取 astrmai_timestamp 的原生防抖逻辑
+            # 🟢 [修复] 增加 message_str 等默认属性，实现 100% 鸭子类型伪装，防止底层逻辑崩溃
             class ExternalEventAdapter(dict):
+                def __init__(self, data):
+                    super().__init__(data)
+                    # 伪装基础属性，即使漏网也不会引发 AttributeError
+                    self.message_str = data.get("content", "") 
+                    
                 def get_extra(self, key, default=None):
                     return self.get(key, default)
             
             adapted_event = ExternalEventAdapter(event_data)
             
-            # 根据防抖逻辑，补充时间戳
             if "astrmai_timestamp" not in adapted_event:
                 adapted_event["astrmai_timestamp"] = time.time()
                 
             session.accumulation_pool.append(adapted_event)
-            
-            # 更新滑动窗口的 last_active_time
             session.last_active_time = time.time()
 
     async def _format_and_filter_messages(self, events: List[AstrMessageEvent]):
@@ -630,8 +629,32 @@ class AttentionGate:
                 if not events_to_process:
                     break 
 
-                logger.info(f"[{chat_id}] 🚪 [窗口关闭] 写入sys1进行评估 (共处理 {len(events_to_process)} 条消息)...")
+                # ==========================================
+                # 📊 核心优化：插件干扰阈值评估 (软熔断)
+                # ==========================================
+                total_msgs = len(events_to_process)
+                
+                # 🟢 [修复] 放弃 isinstance 判断，统一使用 get_extra 来无缝识别注入的外部事件
+                bot_reply_msgs = [e for e in events_to_process if hasattr(e, 'get_extra') and e.get_extra("is_external_bot_reply")]
+                bot_reply_count = len(bot_reply_msgs)
+                
+                # 阈值计算
+                if bot_reply_count > 0:
+                    if bot_reply_count <= (total_msgs / 3):
+                        logger.info(f"[{chat_id}] ⚠️ 检测到插件插话，但处于活跃对话流中 (Bot:{bot_reply_count} / 总:{total_msgs})，判定为聊天背景音，Sys1 继续接管。")
+                    else:
+                        logger.info(f"[{chat_id}] 🛑 插件响应占比过高 (Bot:{bot_reply_count} / 总:{total_msgs})，判定为纯功能交互，Sys1 隐退。")
+                        return # 触发软熔断，直接退出
+                        
+                # 🟢 [修复] 事件提纯：使用 get_extra 精准剔除假事件，只保留纯正的 AstrMessageEvent
+                events_to_process = [e for e in events_to_process if not (hasattr(e, 'get_extra') and e.get_extra("is_external_bot_reply"))]
+                
+                # 提纯后如果空了，直接退出当前结算
+                if not events_to_process:
+                    break
 
+                logger.info(f"[{chat_id}] 🚪 [窗口关闭] 写入sys1进行评估 (共处理 {len(events_to_process)} 条有效消息)...")
+                
                 try:
                     logger.info(f"[{chat_id}] 🔍 [Sys1 追踪] 开始格式化与过滤消息...")
                     combined_text, final_events = await self._format_and_filter_messages(events_to_process)

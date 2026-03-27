@@ -284,6 +284,10 @@ class ReplyEngine:
         at_targets = [action.get("target_id") for action in _pending_actions if action.get("action") == "at"]
         
         from astrbot.api.event import MessageChain
+        
+        # [新增] 免疫标记：防止自身发出的消息触发 main.py 中的旁路嗅探
+        event.set_extra("astrmai_is_self_reply", True)
+        
         for i, seg in enumerate(segments):
             chain = MessageChain()
             
