@@ -35,7 +35,7 @@
       }
     }
   },
-  "global_settings": {
+"global_settings": {
     "type": "object",
     "description": "⚙️ 全局设置 (Global)",
     "items": {
@@ -62,6 +62,18 @@
         "type": "bool",
         "default": false,
         "hint": "开启后将允许处理私聊消息（非白名单私聊用户也会被处理）。"
+      },
+      "admin_ids": {
+        "description": "管理员 QQ 号列表",
+        "type": "list",
+        "default": [],
+        "hint": "填入管理员的 QQ 号，管理员将默认获得私聊特权，并接收系统的错误报错推送。"
+      },
+      "enable_error_interception": {
+        "description": "全局错误拦截与管理员推送",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，系统在崩溃或 API 调用失败时不会把错误发在当前聊天，而是拦截并私发给管理员。"
       }
     }
   },

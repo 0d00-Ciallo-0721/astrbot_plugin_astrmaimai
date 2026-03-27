@@ -438,10 +438,13 @@ class AstrMaiPlugin(Star):
         entity_id = parts[2] if len(parts) >= 3 else str(event.get_group_id() or event.get_sender_id())
 
         whitelist_ids = getattr(self.config.global_settings, 'whitelist_ids', [])
+        admin_ids = getattr(self.config.global_settings, 'admin_ids', [])
         enable_private_chat = getattr(self.config.global_settings, 'enable_private_chat', False)
         
-        # 1. 绝对白名单放行 (最高优先级)
-        is_whitelisted = (umo in whitelist_ids) or (entity_id in whitelist_ids)
+        is_admin = entity_id in admin_ids or sender_id in admin_ids
+        
+        # 1. 绝对白名单放行 (最高优先级)：管理员自带绝对白名单
+        is_whitelisted = (umo in whitelist_ids) or (entity_id in whitelist_ids) or is_admin
 
         if not is_whitelisted:
             # 2. 次高优先级：群聊常规判断
@@ -450,8 +453,8 @@ class AstrMaiPlugin(Star):
                     return # 白名单不为空且未命中，拦截群聊
             # 3. 第三优先级：私聊全局开关
             elif platform_type == "FriendMessage":
-                if not enable_private_chat:
-                    return # 未命中白名单且私聊总开关关闭，拦截私聊
+                if not enable_private_chat and not is_admin:
+                    return # 未命中白名单且私聊总开关关闭，且不是管理员，拦截私聊
 
         self_id = None
         if hasattr(event.message_obj, 'self_id'):
@@ -478,6 +481,71 @@ class AstrMaiPlugin(Star):
         status = await self.attention_gate.process_event(event)
         if status == "ENGAGED":
             event.stop_event()
+
+    @filter.on_decorating_result(priority=90)
+    async def intercept_and_notify_errors(self, event: AstrMessageEvent):
+        """
+        [新增] 全局报错拦截器：拦截 API 错误不发送给用户，并私发给管理员
+        """
+        if not getattr(self.config.global_settings, 'enable_error_interception', True):
+            return
+
+        result = event.get_result()
+        if not result:
+            return
+            
+        message_str = result.get_plain_text()
+        if not message_str:
+            try:
+                reply_text = ""
+                chain = getattr(result, 'chain', None)
+                if chain:
+                    if isinstance(chain, str):
+                        reply_text = chain
+                    elif hasattr(chain, '__iter__'):
+                        for comp in chain:
+                            if hasattr(comp, 'text'):
+                                reply_text += str(comp.text)
+                            elif isinstance(comp, str):
+                                reply_text += comp
+                message_str = reply_text
+            except Exception as e:
+                from astrbot.api import logger
+                logger.warning(f"解析回复链失败: {e}")
+                return
+                
+        if not message_str:
+            return
+            
+        # 定义错误特征库
+        error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '描述失败', '获取模型列表失败', 'api error', 'all chat models failed', 'connection error', 'notfounderror']
+        
+        if any(keyword in message_str.lower() for keyword in error_keywords):
+            from astrbot.api import logger
+            logger.warning(f"[AstrMai-ErrorGuard] 拦截到系统报错，阻止下发: {message_str[:50]}...")
+            
+            # 1. 彻底拦截消息
+            event.set_result(None)
+            event.stop_event()
+            
+            # 2. 组装告警信息
+            chat_id = event.get_group_id() or event.get_sender_id()
+            chat_type = "群聊" if event.get_group_id() else "私聊"
+            user_name = event.get_sender_name() or "未知用户"
+            
+            alert_msg = f"⚠️ [AstrMai 错误告警]\n位置: {chat_type}({chat_id})\n触发者: {user_name}\n详情: {message_str}"
+            
+            # 3. 靶向投递给管理员
+            admin_ids = getattr(self.config.global_settings, 'admin_ids', [])
+            client = getattr(event, 'bot', None)
+            
+            if client and hasattr(client, 'api'):
+                for admin_id in admin_ids:
+                    if str(admin_id).isdigit():
+                        try:
+                            await client.api.call_action('send_private_msg', user_id=int(admin_id), message=alert_msg)
+                        except Exception as e:
+                            logger.error(f"[AstrMai-ErrorGuard] 无法向管理员 {admin_id} 推送告警: {e}")
 
     async def terminate(self):
         """优雅停机协调器 (Graceful Shutdown)"""

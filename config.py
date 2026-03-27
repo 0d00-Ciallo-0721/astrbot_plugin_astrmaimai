@@ -15,6 +15,9 @@ class GlobalSettingsConfig(BaseModel):
     whitelist_ids: List[str] = Field(default=[])
     # [新增] 全局私聊总开关，默认关闭
     enable_private_chat: bool = Field(default=False)
+    # [新增] 管理员配置与错误拦截
+    admin_ids: List[str] = Field(default=[])
+    enable_error_interception: bool = Field(default=True)
 
 class PersonaConfig(BaseModel):
     # [修改] 增加 description 描述，明确 ID 为空时的默认行为
