@@ -142,6 +142,8 @@ class ConcurrentExecutor:
                             continue
                             
                     logger.error(f"[{chat_id}] ❌ 多模态模型池耗尽: {last_error}")
+                    fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+                    await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
                     return # 视觉直通车执行完毕后直接返回，不要再走纯文本的 fallback
                     
                 finally:
@@ -193,6 +195,8 @@ class ConcurrentExecutor:
                         continue
                         
                 logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
+                fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+                await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
             else:
                 tool_set = ToolSet(tools)
                 for provider_id in models:
@@ -244,6 +248,11 @@ class ConcurrentExecutor:
                     except Exception as e:
                         logger.warning(f"[{chat_id}] ⚠️ Agent 模型 {provider_id} 调用异常，尝试切换备用: {e}")
                         continue
+                
+                # [新增] 循环结束，所有模型阵亡，触发终极兜底
+                logger.error(f"[{chat_id}] ❌ 所有 Agent 模型均已耗尽，触发系统兜底回复。")
+                fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+                await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
         finally:
             if hasattr(event, '_is_final_reply_phase'):
                 delattr(event, '_is_final_reply_phase')

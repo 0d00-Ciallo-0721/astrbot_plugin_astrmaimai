@@ -167,11 +167,26 @@ class GlobalModelGateway:
                         
                 except Exception as e:
                     last_error = str(e)
+                    error_str = last_error.lower()
+                    
+                    # 🟢 [新增] 智能快速熔断 (Smart Circuit Breaker)
+                    # 针对确定性的结构错误或限流，拒绝无意义休眠，直接进入轮询的下一个模型
+                    fatal_keywords = [
+                        "无法解析", 
+                        "429", 
+                        "ratelimit", 
+                        "too many requests", 
+                        "invalid_request_error"
+                    ]
+                    
+                    if any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str:
+                        logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性结构异常或限流，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
+                        break # 跳出内层重试循环，立即在 for model_id in attempt_queue 外层循环推进
+
                     logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
                     if attempt < max_retries:
                         import asyncio
-                        await asyncio.sleep((backoff_factor + retry_penalty) ** attempt) 
-                        
+                        await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
                 # 3. 终极物理防泄漏屏障：阅后即焚
                 finally:
                     import os
