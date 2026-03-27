@@ -56,13 +56,41 @@ class PreFilters:
         if event.get_sender_id() == event.get_self_id():
             return False
 
+        # =================================================================
+        # 🚀 [新增] 媒体链接白名单防护层 (AstrBot Parser 兼容补丁)
+        # =================================================================
+        import re # 如果文件顶部已经 import re，这里的可以删除
+        raw_msg = event.message_str or ""
+        url_pattern = r"(?i)\b(?:https?://|www\.)[^\s()<>]+(?:\([\w\d]+\)|([^[:punct:]\s]|/))"
+        urls = re.findall(url_pattern, raw_msg)
+        
+        if urls:
+            # parser 插件支持的所有媒体域名特征库
+            parser_domains = [
+                "acfun.cn", "bilibili.com", "b23.tv", 
+                "douyin.com", "iesdouyin.com", "v.douyin.com",
+                "instagram.com", "instagr.am",
+                "kuaishou.com", "v.kuaishou.com", "chenzhongtech.com",
+                "tiktok.com", "x.com", "twitter.com",
+                "weibo.com", "weibo.cn", "video.weibo.com", "mapp.api.weibo.cn",
+                "xiaohongshu.com", "xhslink.com",
+                "youtube.com", "youtu.be",
+                "163.com", "zhihu.com"
+            ]
+            
+            # 检查文本中是否包含 parser 的特征域名
+            if any(domain in raw_msg.lower() for domain in parser_domains):
+                logger.debug(f"[AstrMai-Sensor] 🛑 检测到媒体解析链接，主动放弃拦截权交予 Parser 插件处理。")
+                return False
+        # =================================================================
+
         # 2. 深度清洗文本与负载检测
         clean_text_parts = []
         has_payload = False
         image_urls = []
         
         # ==========================================
-        # [新增] 阶段一：特征探针提取 (主脑视觉直通车)
+        # 阶段一：特征探针提取 (主脑视觉直通车)
         # ==========================================
         has_at_bot = False
         reply_image_urls = []
@@ -83,11 +111,11 @@ class PreFilters:
 
         if event.message_obj and event.message_obj.message:
             for seg in event.message_obj.message:
-                # [新增] 探针：检测消息体内是否 @ 了 Bot
+                # 探针：检测消息体内是否 @ 了 Bot
                 if isinstance(seg, Comp.At) and str(seg.qq) == bot_id:
                     has_at_bot = True
                     
-                # [新增] 探针：检测引用组件，并递归挖掘被引用消息中的图片
+                # 探针：检测引用组件，并递归挖掘被引用消息中的图片
                 if isinstance(seg, Comp.Reply):
                     if hasattr(seg, 'chain'):
                         reply_image_urls.extend(_scan_reply_chain(seg.chain))
@@ -111,7 +139,7 @@ class PreFilters:
                 if isinstance(seg, Comp.Image) and getattr(seg, 'url', ''):
                     image_urls.append(seg.url)
                     
-        # [新增] 封装着色逻辑：主脑视觉直通车
+        # 封装着色逻辑：主脑视觉直通车
         direct_vision_urls = []
         
         if is_private and image_urls:
@@ -155,7 +183,7 @@ class PreFilters:
             return False
 
         # 5. 昵称点名提权
-        raw_msg = event.message_str or ""
+        # 此处直接使用开头已获取的 raw_msg
         nicknames = self.config.system1.nicknames if hasattr(self.config.system1, 'nicknames') else []
         if nicknames and raw_msg:
             for nickname in nicknames:

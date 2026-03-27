@@ -329,6 +329,60 @@ class AstrMaiPlugin(Star):
         # 6. 判决
         return clean_cmd in registered_cmds
 
+    @filter.on_decorating_result()
+    async def sniff_external_plugin_results(self, event: AstrMessageEvent):
+        """
+        [新增] 旁路嗅探器：截获其他插件即将下发的消息，并将其注入 Sys1 的注意力窗口和 Evolution 进化数据库。
+        """
+        import time
+        import astrbot.api.message_components as Comp
+
+        # 前置防御：排除自身发送的消息
+        if event.get_extra("astrmai_is_self_reply", False):
+            return
+
+        result = event.get_result()
+        if not result or not result.chain:
+            return
+
+        # 提取出其他插件准备发送的纯文本或图片标识
+        reply_text = ""
+        for comp in result.chain:
+            if isinstance(comp, Comp.Plain):
+                reply_text += comp.text
+            elif isinstance(comp, Comp.Image):
+                reply_text += "[图片]"
+
+        if not reply_text:
+            return
+
+        chat_id = event.unified_msg_origin
+        
+        # 安全获取 bot_id
+        bot_id = ""
+        if hasattr(event, 'get_self_id'):
+            try:
+                bot_id = str(event.get_self_id())
+            except:
+                pass
+        if not bot_id:
+            bot_id = getattr(event.message_obj, 'self_id', 'SELF_BOT') if hasattr(event, 'message_obj') and event.message_obj else 'SELF_BOT'
+
+        # 构造注入对象
+        bot_reply_event = {
+            "is_external_bot_reply": True,
+            "content": reply_text,
+            "timestamp": time.time()
+        }
+
+        # 强行塞入滑动窗口
+        if hasattr(self, 'attention_gate') and hasattr(self.attention_gate, 'inject_external_event'):
+            await self.attention_gate.inject_external_event(chat_id, bot_reply_event)
+
+        # 写入进化层
+        if hasattr(self, 'evolution'):
+            await self.evolution.process_bot_reply(chat_id, bot_id, f"(内置插件执行结果): {reply_text}")
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_global_message(self, event: AstrMessageEvent):
         """[入口] 接管所有平台消息，将数据泵入双系统架构与进化层。"""

@@ -503,6 +503,33 @@ class AttentionGate:
         
         return content
 
+    async def inject_external_event(self, chat_id: str, event_data: dict):
+        """
+        [新增] 将外部非原生事件（如旁路嗅探到的其他插件回复）安全地压入倒计时的 2 秒滑动窗口池中。
+        """
+        import time
+        # 获取对应 chat_id 的 SessionContext
+        session = await self._get_or_create_session(chat_id)
+        
+        # 加锁后将传入的 event_data 压入
+        async with session.lock:
+            # 内部构建一个鸭子类型适配器，使 dict 支持 get_extra() 
+            # 完美兼容滑动窗口 _debounce_and_judge 中提取 astrmai_timestamp 的原生防抖逻辑
+            class ExternalEventAdapter(dict):
+                def get_extra(self, key, default=None):
+                    return self.get(key, default)
+            
+            adapted_event = ExternalEventAdapter(event_data)
+            
+            # 根据防抖逻辑，补充时间戳
+            if "astrmai_timestamp" not in adapted_event:
+                adapted_event["astrmai_timestamp"] = time.time()
+                
+            session.accumulation_pool.append(adapted_event)
+            
+            # 更新滑动窗口的 last_active_time
+            session.last_active_time = time.time()
+
     async def _format_and_filter_messages(self, events: List[AstrMessageEvent]):
         """
         [修改] 斗图过滤与同源消息折叠，接入转义层。
