@@ -49,6 +49,7 @@ class Planner:
         
         self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
         
+# [修改] 函数位置：astrmai/Brain/planner.py -> Planner 类下
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
         [修改] 在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
@@ -62,6 +63,13 @@ class Planner:
         retrieve_keys = event.get_extra("retrieve_keys", [])
         if not isinstance(retrieve_keys, list):
             retrieve_keys = []
+            
+        # ==========================================
+        # 🟢 [核心修复] 同步底层引擎的 is_fast_mode 标识
+        # 确保 ContextEngine 和 Refiner 接收到 "CORE_ONLY" 指令并使用压缩人格
+        # ==========================================
+        if event.get_extra("is_fast_mode", False) and "CORE_ONLY" not in retrieve_keys:
+            retrieve_keys.append("CORE_ONLY")
             
         is_all_mode = "ALL" in retrieve_keys
         is_fast_mode = "CORE_ONLY" in retrieve_keys

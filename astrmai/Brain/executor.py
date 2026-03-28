@@ -27,7 +27,6 @@ class ConcurrentExecutor:
         self._global_lock = asyncio.Lock()
         
         
-# [修改] 在执行成功的两个分支内，调用 evolution_manager.process_bot_reply 闭环反馈
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None):
         """[修改] 显式安插 👁️‍🗨️【全知视界】探针，手动闭环记忆处理，并拦截 [TERMINAL_YIELD] 硬中断指令，加入并发熔断防线"""
         chat_id = event.unified_msg_origin
@@ -60,18 +59,19 @@ class ConcurrentExecutor:
                     return
 
                 # ==========================================
-                # 🟢 [核心修复 Bug 3] Agent Max Steps Fix
+                # 🟢 [核心修复] Agent Max Steps Fix
                 # ==========================================
                 is_fast_mode = event.get_extra("is_fast_mode", False)
-                # 极速模式因为必须直接回答，强制 1 步；普通模式强制读取 config 中的 max_steps (至少为 5)
+                
+                # [解除限制] 抹除 `1 if is_fast_mode else` 的硬编码，让快速模式享有同等调用工具的次数
                 config_max_steps = getattr(self.config.agent, 'max_steps', 5)
-                max_steps = 1 if is_fast_mode else max(5, config_max_steps) 
+                max_steps = max(5, config_max_steps) 
                 
                 timeout = 15 if is_fast_mode else self.config.agent.timeout
                 
                 # 🟢 显式打印全知视界探针
                 if getattr(self.config.global_settings, 'debug_mode', True):
-                    task_type = "🧠 [System 2 / 主脑决策]"
+                    task_type = "🧠 [System 2 / 极速主脑决策]" if is_fast_mode else "🧠 [System 2 / 主脑决策]"
                     logger.info(
                         f"\n{'='*70}\n"
                         f"👁️‍🗨️ 【全知视界】 准备发往大模型的 Payload 快照\n"
@@ -247,7 +247,7 @@ class ConcurrentExecutor:
                         last_error = "" 
                         for provider_id in models:
                             try:
-                                # 🟢 [核心修复 Bug 3] Agent Max Steps Fix
+                                # 🟢 [核心修复] Agent Max Steps Fix
                                 # 在传递给底层 tool_loop_agent 之前，明确传递解除了限制的 max_steps，打破只能调用一次就被强制终止的死锁
                                 llm_resp = await self.context.tool_loop_agent(
                                     event=event,
