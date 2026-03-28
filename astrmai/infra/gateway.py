@@ -61,8 +61,9 @@ class GlobalModelGateway:
         return rearranged
 
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
+# [修改] 位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
-        """统一网关底层调用引擎 (接入原名函数 get_models_for_task)"""
+        """统一网关底层调用引擎 (增加 asyncio 硬中断超时防卡死)"""
         
         # 1. 尝试主模型池（已根据轮询游标重排）
         primary_models = self.get_models_for_task(pool_name, models)
@@ -79,23 +80,25 @@ class GlobalModelGateway:
             # [新增] 抛出自定义级联崩溃异常
             raise LLMCascadeFailureException(f"未配置任何可用模型且无备用池 (池: {pool_name})")
             
-        # 🟢 [阶段 2 修复] 降低重试次数的默认值，从 2 降为 1，减少网络不佳时的死等时间
+        # 🟢 降低重试次数的默认值，从 2 降为 1，减少网络不佳时的死等时间
         max_retries = getattr(self.config.infra, 'llm_retries', 1)
         backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
+        
+        # 🟢 [核心修复] 网关级绝对超时时间 (如果 config 没配，默认给 15 秒)
+        timeout_limit = getattr(self.config.infra, 'api_timeout', 15.0)
         last_error = ""
         
         for model_id in attempt_queue:
             logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
             for attempt in range(max_retries + 1):
                 try:
-                    # 🟢 [阶段 3 修复] 停止在本地创建 Temp File 传参，改用 Data URI / URL 直传方案
                     processed_image_urls = image_urls if image_urls else []
 
                     # 2. 构建上下文请求
                     contexts = []
                     llm_kwargs = {}
                     
-                    # [修复 Bug 2]：移除 SystemMessageSegment 的封装，直接作为原生字符串键值对放入字典
+                    # 移除 SystemMessageSegment 的封装，直接作为原生字符串键值对放入字典
                     if system_prompt:
                         llm_kwargs["system_prompt"] = system_prompt
                         
@@ -114,12 +117,20 @@ class GlobalModelGateway:
                         else:
                             llm_kwargs["image_urls"] = processed_image_urls
                             
-                    resp = await self.context.llm_generate(
-                        chat_provider_id=model_id,
-                        prompt=current_prompt if current_prompt else None,
-                        contexts=contexts,
-                        **llm_kwargs
-                    )
+                    import asyncio
+                    # 🟢 [核心修复] 强制包裹超时熔断器，干掉无限等待的僵尸 API
+                    try:
+                        resp = await asyncio.wait_for(
+                            self.context.llm_generate(
+                                chat_provider_id=model_id,
+                                prompt=current_prompt if current_prompt else None,
+                                contexts=contexts,
+                                **llm_kwargs
+                            ),
+                            timeout=timeout_limit
+                        )
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(f"网关硬中断：API 响应超时 ({timeout_limit}s)")
                     
                     content = resp.completion_text
                     if not content or not content.strip():
@@ -151,7 +162,7 @@ class GlobalModelGateway:
                     last_error = str(e)
                     error_str = last_error.lower()
                     
-                    # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker)
+                    # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker) 加上 timeout
                     fatal_keywords = [
                         "无法解析", 
                         "429", 

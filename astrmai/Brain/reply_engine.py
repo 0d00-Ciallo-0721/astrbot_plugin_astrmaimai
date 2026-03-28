@@ -150,7 +150,7 @@ class ReplyEngine:
     ):
         """
         执行回复全流程
-        [修改] 引入私聊靶向情感结算与私聊互动计数。
+        [修改] 彻底解决大模型 API 卡死导致的阻塞问题：优先下发文本回复，后置结算情绪与好感度。
         """
         if not raw_text: return
 
@@ -186,15 +186,54 @@ class ReplyEngine:
         except Exception as e:
             logger.error(f"[ReplyEngine] 强制同步历史记录失败: {e}")
 
+        # =====================================================================
+        # 🟢 [核心架构重构] 步骤 3 提前：先说话！不要让情绪计算阻塞文本的下发
+        # =====================================================================
+        segments = self._segment_reply_content(clean_text)
+        
+        _pending_actions = pending_actions if pending_actions is not None else event.get_extra("astrmai_pending_actions", [])
+        at_targets = [action.get("target_id") for action in _pending_actions if action.get("action") == "at"]
+        
+        from astrbot.api.event import MessageChain
+        
+        # [新增] 免疫标记：防止自身发出的消息触发 main.py 中的旁路嗅探
+        event.set_extra("astrmai_is_self_reply", True)
+        
+        for i, seg in enumerate(segments):
+            chain = MessageChain()
+            
+            if i == 0 and at_targets:
+                for target_id in at_targets:
+                    uid = target_id
+                    if str(target_id).isdigit():
+                        uid = int(target_id)
+                        
+                    chain.chain.append(Comp.At(qq=uid))
+                chain.chain.append(Comp.Plain(" "))
+                
+            chain.chain.append(Comp.Plain(seg))
+            
+            context = getattr(self.state_engine.gateway, 'context', None)
+            if context:
+                await context.send_message(event.unified_msg_origin, chain)
+            else:
+                logger.error("[ReplyEngine] 🚨 致命错误：Gateway Context 丢失，无法跨越生命周期发送消息！")
+            
+            if i < len(segments) - 1:
+                base_factor = getattr(self.config.reply, 'typing_speed_factor', 0.1)
+                delay = min(2.0, max(0.5, len(seg) * base_factor))
+                await asyncio.sleep(delay)
+
+        # =====================================================================
+        # 🟢 步骤 2 滞后：用户已经看到回复了，现在后台慢慢算情绪和好感度
+        # =====================================================================
         tag = "neutral"
         force_meme_flag = False
         
         _bypassed_tag = bypassed_tag or event.get_extra("astrmai_bypass_mood_analysis", None)
         _window_events = window_events if window_events is not None else event.get_extra("astrmai_window_events", [])
         _anchor_event = anchor_event or event.get_extra("astrmai_anchor_event", None)
-        _pending_actions = pending_actions if pending_actions is not None else event.get_extra("astrmai_pending_actions", [])
 
-        # 2. 情绪后处理 (Post-Processing Mood)
         try:
             state = await self.state_engine.get_state(chat_id)
             user_id = event.get_sender_id()
@@ -234,7 +273,7 @@ class ReplyEngine:
             logger.debug(f"[Reply] 😃 情绪更新: {tag} ({new_mood:.2f})")
             
             # ==========================================
-            # 🟢 [修改] 靶向情感结算与私聊挖掘计数
+            # 🟢 靶向情感结算与私聊挖掘计数
             # ==========================================
             is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
             target_user_id = None
@@ -287,41 +326,7 @@ class ReplyEngine:
             logger.warning(f"[Reply] 情绪分析失败: {e}")
             tag = "neutral"
 
-        # 3. 分段发送
-        segments = self._segment_reply_content(clean_text)
-        at_targets = [action.get("target_id") for action in _pending_actions if action.get("action") == "at"]
-        
-        from astrbot.api.event import MessageChain
-        
-        # [新增] 免疫标记：防止自身发出的消息触发 main.py 中的旁路嗅探
-        event.set_extra("astrmai_is_self_reply", True)
-        
-        for i, seg in enumerate(segments):
-            chain = MessageChain()
-            
-            if i == 0 and at_targets:
-                for target_id in at_targets:
-                    uid = target_id
-                    if str(target_id).isdigit():
-                        uid = int(target_id)
-                        
-                    chain.chain.append(Comp.At(qq=uid))
-                chain.chain.append(Comp.Plain(" "))
-                
-            chain.chain.append(Comp.Plain(seg))
-            
-            context = getattr(self.state_engine.gateway, 'context', None)
-            if context:
-                await context.send_message(event.unified_msg_origin, chain)
-            else:
-                logger.error("[ReplyEngine] 🚨 致命错误：Gateway Context 丢失，无法跨越生命周期发送消息！")
-            
-            if i < len(segments) - 1:
-                base_factor = getattr(self.config.reply, 'typing_speed_factor', 0.1)
-                delay = min(2.0, max(0.5, len(seg) * base_factor))
-                await asyncio.sleep(delay)
-
-        # 4. 发送表情包
+        # 4. 发送表情包 (在文本发完、情绪算完之后，作为延时的补充动作发出)
         if tag and tag != "neutral":
             final_prob = 100 if force_meme_flag else self.meme_probability
             
