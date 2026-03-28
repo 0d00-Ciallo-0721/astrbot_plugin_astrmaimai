@@ -28,7 +28,7 @@ class ConcurrentExecutor:
         
         
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None):
-        """[修改] 融合视觉皮层成功逻辑的 VLM 同步降维转述模式，并加入强力的底层 API 崩溃嗅探以激活模型池"""
+        """[修改] 融合视觉皮层成功逻辑的 VLM 同步降维转述模式，并加入强力的底层 API 崩溃嗅探以激活模型池。同时对底层组件执行物理致盲拦截。"""
         chat_id = event.unified_msg_origin
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
@@ -144,6 +144,23 @@ class ConcurrentExecutor:
                             vision_inject = "\n\n(系统旁白：用户刚刚发送了图片，以下是你的视觉神经元解析出的画面剧本：\n" + "\n".join(vision_descriptions) + ")"
                             api_prompt += vision_inject
                             prompt += vision_inject 
+
+                    # ==========================================
+                    # 🟢 [核心修复] 物理致盲：抹除原生事件中的图片组件
+                    # 避免底层框架嗅探到原生图片引发 VLM 二次路由崩溃
+                    # ==========================================
+                    try:
+                        from astrbot.api.message_components import Image as AstrImageComponent
+                        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
+                            original_len = len(event.message_obj.message)
+                            event.message_obj.message = [
+                                comp for comp in event.message_obj.message 
+                                if not isinstance(comp, AstrImageComponent)
+                            ]
+                            if len(event.message_obj.message) < original_len:
+                                logger.debug(f"[{chat_id}] 🧹 已对底层核心执行物理致盲 (剥离 Image 组件)，彻底切断原生 VLM 路由。")
+                    except Exception as e:
+                        logger.warning(f"[{chat_id}] ⚠️ 物理致盲执行失败: {e}")
 
                     # 统一的异常拦截嗅探字典
                     error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '获取模型列表失败', 'api error', 'all chat models fail', 'connection error', 'notfounderror', 'exception:']
