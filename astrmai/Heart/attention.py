@@ -600,7 +600,8 @@ class AttentionGate:
                 import time
                 no_msg_start_time = time.time()
                 last_pool_len = 0
-                debounce_window = getattr(self.config.attention, 'debounce_window', 2.0)
+                # 🟢 [防呆修复] 增加 float 强转，防止用户在配置中输入字符串导致比对报错
+                debounce_window = float(getattr(self.config.attention, 'debounce_window', 2.0))
                 
                 while True:
                     current_pool_len = len(session.accumulation_pool)
@@ -714,9 +715,11 @@ class AttentionGate:
                                 f"携带消息: {len(final_events)}条"
                             )
                             if self.sys2_process:
-                                logger.info(f"[{chat_id}] 🔄 [Sys1 追踪] 开始调用 sys2_process...")
-                                await self.sys2_process(main_event, final_events)
-                                logger.info(f"[{chat_id}] ✅ [Sys1 追踪] sys2_process 调用完成。")
+                                logger.info(f"[{chat_id}] 🔄 [Sys1 追踪] 开始调用 sys2_process (后台异步抛出)...")
+                                # 🟢 [深度修复: 解除 Sys1 阻塞] 将同步的 await 替换为 Fire-and-Forget 的后台任务
+                                # 释放注意力循环的锁，防止长耗时的大模型请求卡死滑动窗口
+                                self._fire_background_task(self.sys2_process(main_event, final_events))
+                                logger.info(f"[{chat_id}] ✅ [Sys1 追踪] sys2_process 已安全抛出至后台。")
                         else:
                             logger.info(f"[{chat_id}] 💤 [窗口结束] Sys1 决定静默不回复 (判定Action: {plan.action})")
                     else:

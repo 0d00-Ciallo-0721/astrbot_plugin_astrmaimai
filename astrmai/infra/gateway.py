@@ -81,7 +81,8 @@ class GlobalModelGateway:
             # [新增] 抛出自定义级联崩溃异常
             raise LLMCascadeFailureException(f"未配置任何可用模型且无备用池 (池: {pool_name})")
             
-        max_retries = getattr(self.config.infra, 'llm_retries', 2)
+        # 🟢 [阶段 2 修复] 降低重试次数的默认值，从 2 降为 1，减少网络不佳时的死等时间
+        max_retries = getattr(self.config.infra, 'llm_retries', 1)
         backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
         last_error = ""
         
@@ -175,18 +176,21 @@ class GlobalModelGateway:
                     last_error = str(e)
                     error_str = last_error.lower()
                     
-                    # 🟢 [新增] 智能快速熔断 (Smart Circuit Breaker)
-                    # 针对确定性的结构错误或限流，拒绝无意义休眠，直接进入轮询的下一个模型
+                    # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker)
+                    # 针对确定性的结构错误、限流、或网络超时，拒绝无意义休眠，直接进入轮询的下一个模型
                     fatal_keywords = [
                         "无法解析", 
                         "429", 
                         "ratelimit", 
                         "too many requests", 
-                        "invalid_request_error"
+                        "invalid_request_error",
+                        "apitimeouterror",   # [新增] 阶段 2：超时特判
+                        "request timed out", # [新增] 阶段 2：超时特判
+                        "timeout"            # [新增] 阶段 2：超时特判
                     ]
                     
                     if any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str:
-                        logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性结构异常或限流，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
+                        logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性异常、限流或超时，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
                         break # 跳出内层重试循环，立即在 for model_id in attempt_queue 外层循环推进
 
                     logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
@@ -205,9 +209,8 @@ class GlobalModelGateway:
                                 logger.error(f"[AstrMai-Gateway] ⚠️ 无法删除临时视觉文件 {temp_path}: {e}")
 
         logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
-        # 🟢 [修改] 之前是返回 {} 或 ""，现在改为向外层抛出自定义异常，由 Phase 1 拦截处理
+        # 向外层抛出自定义异常，由 Phase 1 拦截处理
         raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
-    
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """多模态视觉任务专用网关"""
