@@ -43,6 +43,7 @@ class ConcurrentExecutor:
             
             # 如果当前该群组积压的待处理或正在处理的思考任务数 >= 2，直接丢弃新来的请求防雪崩
             if self._chat_pending_count[chat_id] >= 2:
+                from astrbot.api import logger
                 logger.warning(f"[{chat_id}] 🛑 并发熔断：当前群组排队思考任务过多 ({self._chat_pending_count[chat_id]})，已主动丢弃本次请求！")
                 return
                 
@@ -55,6 +56,7 @@ class ConcurrentExecutor:
             async with chat_lock:
                 models = self.gateway.get_agent_models()
                 if not models:
+                    from astrbot.api import logger
                     logger.error(f"[{chat_id}] Agent 模型未配置且无备用池，无法执行动作。")
                     return
 
@@ -71,6 +73,7 @@ class ConcurrentExecutor:
                 
                 # 🟢 显式打印全知视界探针
                 if getattr(self.config.global_settings, 'debug_mode', True):
+                    from astrbot.api import logger
                     task_type = "🧠 [System 2 / 极速主脑决策]" if is_fast_mode else "🧠 [System 2 / 主脑决策]"
                     logger.info(
                         f"\n{'='*70}\n"
@@ -91,14 +94,13 @@ class ConcurrentExecutor:
                     event._is_final_reply_phase = True 
 
                     # ==========================================
-                    # 🟢 [阶段 3 修复] 统一的上下文封装机制：废弃临时文件，直接传递 Data URI 或 URL
+                    # 🟢 [修复] 统一的上下文封装机制：区分大模型 Payload 与下发组件
                     # ==========================================
-                    # 稳定导入未受重构影响的基类
                     from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
-                    
-                    # 👉 核心升级：废弃所有底层的 ImagePart / ImageUrlPart 尝试
-                    # 直接导入官方推荐的顶层标准化组件，交由框架底层路由处理
-                    from astrbot.api.message_components import Image
+                    try:
+                        from astrbot.core.agent.message import ImagePart
+                    except ImportError:
+                        ImagePart = None
                     
                     contexts = []
                     api_prompt = prompt
@@ -113,14 +115,16 @@ class ConcurrentExecutor:
                             # 当携带多模态内容时，将 prompt 置入 contexts 而非 api_prompt，以规避某些模型的强制 API 校验
                             api_prompt = None 
                             
-                        # 2. 组装多模态视觉对象
+                        # 2. 组装多模态视觉对象 (强制使用 LLM 专用的 ContentPart 对象)
                         for url in direct_vision_urls:
-                            logger.debug(f"[{chat_id}] 👁️ 正在为主脑注入标准化视觉神经元 (Image API): {url[:40]}...")
-                            # 使用顶层组件封装，底层转换器会自动生成 Base64 Data URI 或 ImageURL 结构
-                            # 🚀 [Fix]: 修复底层签名，将 url 赋值给必须的 file 位置参数
-                            user_content.append(Image(file=url))
+                            from astrbot.api import logger
+                            logger.debug(f"[{chat_id}] 👁️ 正在为主脑注入大模型视觉神经元 (ImagePart): {url[:40]}...")
+                            if ImagePart:
+                                user_content.append(ImagePart(url=url))
+                            else:
+                                logger.warning(f"[{chat_id}] 当前 AstrBot 版本不支持 ImagePart，降级忽略视觉注入。")
                             
-                        # 3. 将组装好的富文本列表打包装入 User 消息片
+                        # 3. 将组装好的 ContentPart 列表打包装入 User 消息片
                         if user_content:
                             contexts.append(UserMessageSegment(content=user_content))
                             
@@ -129,8 +133,10 @@ class ConcurrentExecutor:
                     # ==========================================
                     if tools is None or len(tools) == 0:
                         if direct_vision_urls and len(direct_vision_urls) > 0:
+                            from astrbot.api import logger
                             logger.info(f"[{chat_id}] 👁️ 触发主脑视觉直通车！开启多模态 VQA 模式...")
                         else:
+                            from astrbot.api import logger
                             logger.debug(f"[{chat_id}] ⚡ 纯文本模式：降级为纯文本生成器，剥离 Agent 环境...")
                             
                         last_error = ""
@@ -161,14 +167,17 @@ class ConcurrentExecutor:
                                     if plugin and hasattr(plugin, 'memory_engine') and plugin.memory_engine.summarizer:
                                         await plugin.memory_engine.summarizer.pump_memory_reflection(chat_id, prompt, reply_text)
                                 except Exception as mem_e:
+                                    from astrbot.api import logger
                                     logger.debug(f"[{chat_id}] 手动闭环记忆处理失败: {mem_e}")
                                     
                                 return 
                             except Exception as e:
                                 last_error = str(e)
+                                from astrbot.api import logger
                                 logger.warning(f"[{chat_id}] ⚠️ 模型 {provider_id} 调用异常，尝试切换备用: {e}")
                                 continue
                                 
+                        from astrbot.api import logger
                         logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
                         await self._handle_fatal_fallback(event, chat_id, f"模型全部耗尽:\n{last_error}")
 
@@ -177,6 +186,7 @@ class ConcurrentExecutor:
                     # ==========================================
                     else:
                         if direct_vision_urls and len(direct_vision_urls) > 0:
+                            from astrbot.api import logger
                             logger.info(f"[{chat_id}] 👁️ 触发 Agent 多模态循环！图片载荷已通过 Data URI 注入上下文。")
                             
                         tool_set = ToolSet(tools)
@@ -203,12 +213,14 @@ class ConcurrentExecutor:
                                     raise RuntimeError(f"Agent底层由于额度耗尽抛出了异常穿透文本: {reply_text}")
 
                                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
+                                    from astrbot.api import logger
                                     logger.info(f"[{chat_id}] 💤 Brain 决定挂起并倾听后续消息 (Wait/Listening)。")
                                     return
 
                                 if "[TERMINAL_YIELD]:" in reply_text:
                                     idx = reply_text.find("[TERMINAL_YIELD]:")
                                     terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:"):].strip()
+                                    from astrbot.api import logger
                                     logger.info(f"[{chat_id}] 🛑 触发硬中断 (TERMINAL_YIELD)，大模型被接管，纯文本下发: {terminal_content}")
                                     await self.reply_engine.handle_reply(event, terminal_content, chat_id)
                                     if hasattr(self.evolution_manager, 'process_bot_reply'):
@@ -225,19 +237,23 @@ class ConcurrentExecutor:
                                     if plugin and hasattr(plugin, 'memory_engine') and plugin.memory_engine.summarizer:
                                         await plugin.memory_engine.summarizer.pump_memory_reflection(chat_id, prompt, reply_text)
                                 except Exception as mem_e:
+                                    from astrbot.api import logger
                                     logger.debug(f"[{chat_id}] 手动闭环记忆处理失败: {mem_e}")
                                     
                                 return 
                             except Exception as e:
                                 last_error = str(e)
+                                from astrbot.api import logger
                                 logger.warning(f"[{chat_id}] ⚠️ Agent 模型 {provider_id} 调用异常，尝试切换备用: {e}")
                                 continue
                         
+                        from astrbot.api import logger
                         logger.error(f"[{chat_id}] ❌ 所有 Agent 模型均已耗尽，触发系统兜底回复。")
                         await self._handle_fatal_fallback(event, chat_id, last_error if last_error else "Agent模型池全部耗尽。")
 
                 # [新增] 增加全局级的异常捕获，确保绝对的人设隔离
                 except Exception as global_e:
+                    from astrbot.api import logger
                     logger.error(f"[{chat_id}] 💥 Executor 遭遇未捕获的全局级崩溃: {global_e}")
                     await self._handle_fatal_fallback(event, chat_id, f"Executor 核心循环异常:\n{str(global_e)}")
                     
