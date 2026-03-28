@@ -117,7 +117,8 @@ class ConcurrentExecutor:
                         for url in direct_vision_urls:
                             logger.debug(f"[{chat_id}] 👁️ 正在为主脑注入标准化视觉神经元 (Image API): {url[:40]}...")
                             # 使用顶层组件封装，底层转换器会自动生成 Base64 Data URI 或 ImageURL 结构
-                            user_content.append(Image(url=url))
+                            # 🚀 [Fix]: 修复底层签名，将 url 赋值给必须的 file 位置参数
+                            user_content.append(Image(file=url))
                             
                         # 3. 将组装好的富文本列表打包装入 User 消息片
                         if user_content:
