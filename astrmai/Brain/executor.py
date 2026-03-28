@@ -93,22 +93,47 @@ class ConcurrentExecutor:
                     # ==========================================
                     # 🟢 [阶段 3 修复] 统一的上下文封装机制：废弃临时文件，直接传递 Data URI 或 URL
                     # ==========================================
-                    from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart, ImagePart
+                    # 稳定导入未受重构影响的基类
+                    from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
+                    
+                    # ⚠️ 防御性导入：兼容旧版 AstrBot
+                    try:
+                        from astrbot.core.agent.message import ImagePart
+                    except ImportError:
+                        ImagePart = None  # v4.22+ 版本中该类已重构
+                    
+                    # ⚠️ 尝试导入新版 AstrBot 的底层视觉载体 (如果存在)
+                    try:
+                        from astrbot.core.agent.message import ImageUrlPart
+                    except ImportError:
+                        ImageUrlPart = None
                     
                     contexts = []
                     api_prompt = prompt
 
+                    # 如果存在多模态视觉文件提取
                     if direct_vision_urls and len(direct_vision_urls) > 0:
                         user_content = []
                         if prompt:
+                            # 如果有图片，将 prompt 文本置入 contexts 以规避底层 API 强校验
                             user_content.append(TextPart(text=prompt))
-                            api_prompt = None # 如果有图片，将 prompt 文本置入 contexts 以规避底层 API 强校验
+                            api_prompt = None 
                             
                         for url in direct_vision_urls:
-                            user_content.append(ImagePart(url=url))
-                            
-                        contexts.append(UserMessageSegment(content=user_content))
-
+                            if ImagePart:
+                                # 兼容 <= v4.21.x 老版本
+                                user_content.append(ImagePart(url=url))
+                            elif ImageUrlPart:
+                                # 兼容 >= v4.22.x 新版本 Agent 规范
+                                user_content.append(ImageUrlPart(url=url))
+                            else:
+                                # 极端情况兜底：底层既没有 ImagePart 也没有 ImageUrlPart
+                                # 将多模态信息降级为纯文本提示，防止 System 2 脑部崩溃
+                                user_content.append(TextPart(text=f"[图片内容已上传至图床: {url}]"))
+                                logger.warning(f"[{chat_id}] 当前 AstrBot 版本缺失底层视觉组件，多模态视觉流已被降级为 URL 文本。")
+                                
+                        if user_content:
+                            contexts.append(UserMessageSegment(content=user_content))
 
                     # ==========================================
                     # 非 Agent 模式：纯文本 / 纯 VQA 模式
