@@ -320,6 +320,7 @@ class DatabaseService:
     def update_nodes(self, nodes: List['MemoryNode']):
         with self.get_session() as session:
             from sqlmodel import select
+            from .datamodels import MemoryNode  # [修复] 补充缺失的导入
             for node in nodes:
                 statement = select(MemoryNode).where(MemoryNode.name == node.name)
                 existing = session.exec(statement).first()
@@ -335,6 +336,7 @@ class DatabaseService:
     def search_nodes(self, query: str, limit: int = 3, include_description: bool = True) -> List['MemoryNode']:
         with self.get_session() as session:
             from sqlmodel import select, or_
+            from .datamodels import MemoryNode  # [修复] 补充缺失的导入
             lower_query = f"%{query.lower()}%"
             # 优先匹配名字，可选匹配描述
             conditions = [MemoryNode.name.like(lower_query)]
@@ -349,6 +351,7 @@ class DatabaseService:
     def save_reflection(self, date: str, reflection: str):
         with self.get_session() as session:
             from sqlmodel import select
+            from .datamodels import DailyReflection  # [修复] 补充缺失的导入
             statement = select(DailyReflection).where(DailyReflection.date == date)
             existing = session.exec(statement).first()
             if existing:
@@ -358,9 +361,11 @@ class DatabaseService:
                 session.add(new_ref)
             session.commit()
 
+
     def get_reflection(self, date: str) -> Optional['DailyReflection']:
         with self.get_session() as session:
             from sqlmodel import select
+            from .datamodels import DailyReflection  # [修复] 补充缺失的导入
             statement = select(DailyReflection).where(DailyReflection.date == date)
             res = session.exec(statement).first()
             if res:
@@ -370,6 +375,7 @@ class DatabaseService:
     def save_event(self, event: 'MemoryEvent'):
         with self.get_session() as session:
             from sqlmodel import select
+            from .datamodels import MemoryEvent  # [修复] 补充缺失的导入
             statement = select(MemoryEvent).where(MemoryEvent.event_id == event.event_id)
             existing = session.exec(statement).first()
             if existing:
