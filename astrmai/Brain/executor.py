@@ -96,45 +96,33 @@ class ConcurrentExecutor:
                     # 稳定导入未受重构影响的基类
                     from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
                     
-                    # ⚠️ 防御性导入：兼容旧版 AstrBot
-                    try:
-                        from astrbot.core.agent.message import ImagePart
-                    except ImportError:
-                        ImagePart = None  # v4.22+ 版本中该类已重构
-                    
-                    # ⚠️ 尝试导入新版 AstrBot 的底层视觉载体 (如果存在)
-                    try:
-                        from astrbot.core.agent.message import ImageUrlPart
-                    except ImportError:
-                        ImageUrlPart = None
+                    # 👉 核心升级：废弃所有底层的 ImagePart / ImageUrlPart 尝试
+                    # 直接导入官方推荐的顶层标准化组件，交由框架底层路由处理
+                    from astrbot.api.message_components import Image
                     
                     contexts = []
                     api_prompt = prompt
 
-                    # 如果存在多模态视觉文件提取
+                    # 检测是否捕获到了主脑直通车视觉特征 (直连图片 URLs)
                     if direct_vision_urls and len(direct_vision_urls) > 0:
                         user_content = []
+                        
+                        # 1. 组装提示词文本
                         if prompt:
-                            # 如果有图片，将 prompt 文本置入 contexts 以规避底层 API 强校验
                             user_content.append(TextPart(text=prompt))
+                            # 当携带多模态内容时，将 prompt 置入 contexts 而非 api_prompt，以规避某些模型的强制 API 校验
                             api_prompt = None 
                             
+                        # 2. 组装多模态视觉对象
                         for url in direct_vision_urls:
-                            if ImagePart:
-                                # 兼容 <= v4.21.x 老版本
-                                user_content.append(ImagePart(url=url))
-                            elif ImageUrlPart:
-                                # 兼容 >= v4.22.x 新版本 Agent 规范
-                                user_content.append(ImageUrlPart(url=url))
-                            else:
-                                # 极端情况兜底：底层既没有 ImagePart 也没有 ImageUrlPart
-                                # 将多模态信息降级为纯文本提示，防止 System 2 脑部崩溃
-                                user_content.append(TextPart(text=f"[图片内容已上传至图床: {url}]"))
-                                logger.warning(f"[{chat_id}] 当前 AstrBot 版本缺失底层视觉组件，多模态视觉流已被降级为 URL 文本。")
-                                
+                            logger.debug(f"[{chat_id}] 👁️ 正在为主脑注入标准化视觉神经元 (Image API): {url[:40]}...")
+                            # 使用顶层组件封装，底层转换器会自动生成 Base64 Data URI 或 ImageURL 结构
+                            user_content.append(Image(url=url))
+                            
+                        # 3. 将组装好的富文本列表打包装入 User 消息片
                         if user_content:
                             contexts.append(UserMessageSegment(content=user_content))
-
+                            
                     # ==========================================
                     # 非 Agent 模式：纯文本 / 纯 VQA 模式
                     # ==========================================
