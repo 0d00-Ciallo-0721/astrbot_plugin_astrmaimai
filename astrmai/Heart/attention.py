@@ -122,7 +122,6 @@ class AttentionGate:
         [修改] 注意力判断入口，返回枚举态字符串 (ENGAGED, BUFFERED, IGNORE) 
         精准指导 AstrBot 原生底层的 Stop_Event。
         """
-        # 🟢 [核心修复: 幽灵并发去重防线 (Idempotency Barrier)]
         msg_id = getattr(event.message_obj, 'message_id', None) if getattr(event, 'message_obj', None) else None
         if not msg_id:
             msg_timestamp = getattr(event, 'timestamp', '')
@@ -133,7 +132,6 @@ class AttentionGate:
             AttentionGate._global_msg_cache = collections.deque(maxlen=200)
 
         if msg_id in AttentionGate._global_msg_cache:
-            # 静默拦截，不打印过多的无用日志干扰排查
             return "IGNORE" 
             
         AttentionGate._global_msg_cache.append(msg_id)
@@ -141,9 +139,6 @@ class AttentionGate:
         msg_str = event.message_str
         chat_id = str(event.unified_msg_origin)
         
-        # ==========================================
-        # [新增] 统一 ID 解析与私聊标志注入
-        # ==========================================
         parts = chat_id.split(":")
         platform_type = parts[1] if len(parts) >= 3 else ("GroupMessage" if event.get_group_id() else "FriendMessage")
         is_private = (platform_type == "FriendMessage")
@@ -156,7 +151,6 @@ class AttentionGate:
         if msg_str and len(msg_str.strip()) > max_len:
             return "IGNORE" 
             
-        # --- 判断强唤醒特征 ---
         wakeup_words = self.config.system1.wakeup_words if self.config and hasattr(self.config.system1, "wakeup_words") else []
         msg_lower = msg_str.strip().lower() if msg_str else ""
         is_keyword_wakeup = any(msg_lower.startswith(kw.lower()) for kw in wakeup_words) if wakeup_words else False
@@ -165,18 +159,20 @@ class AttentionGate:
         
         is_strong_wakeup = is_at_wakeup or is_keyword_wakeup or is_nickname_wakeup
 
-        # 【Step 0: 快速穿透判定 (直达 Sys2，连窗口都不等)】
         complex_keywords = ["为什么", "怎么", "帮我", "代码", "解释", "写", "什么", "翻译", "分析"]
         is_simple_payload = len(msg_lower) <= 15 and not any(cw in msg_lower for cw in complex_keywords)
 
         if is_strong_wakeup and is_simple_payload:
-            # 🟢 [新增日志] 快速模式追踪
             logger.info(f"[{chat_id}] ⚡ [快速模式] 开启窗口，绕过滑动防抖直达 Sys2！")
             event.set_extra("retrieve_keys", ["CORE_ONLY"])
             event.set_extra("is_fast_mode", True)
             event.set_extra("sys1_thought", "听到召唤，立即响应。")
+            
+            # 🚀 [新增] 快速提取视觉特征，确保穿透模式下主脑也能看见图
+            components = event.message_obj.message if (hasattr(event, "message_obj") and event.message_obj) else event.message_str
+            await self._normalize_content_to_str(components, event=event)
+
             if self.sys2_process:
-                # 🟢 [彻底修复 Bug 3] 将同步阻塞的 await 改为安全的 Fire-and-Forget 后台抛出，保护窗口计时不坍缩
                 self._fire_background_task(self.sys2_process(event, [event]))
             return "ENGAGED"
 
@@ -200,9 +196,8 @@ class AttentionGate:
         session = await self._get_or_create_session(chat_id)
 
         async with session.lock:
-            # 【中间组件 1: 消息级节流】
             if not session.is_evaluating:
-                if not is_strong_wakeup and not is_private: # [修改] 赋予私聊跳过信息熵和随机静默的绝对豁免权
+                if not is_strong_wakeup and not is_private: 
                     min_entropy = getattr(self.config.attention, 'throttle_min_entropy', 2)
                     import re
                     pure_text = re.sub(r'[^\w\u4e00-\u9fa5]', '', msg_str) if msg_str else ""
@@ -214,8 +209,7 @@ class AttentionGate:
                     if random.random() > probability:
                         return "IGNORE" 
 
-            # 3. 复读机拦截
-            if not is_private: # [修改] 赋予私聊跳过复读机校验的绝对豁免权
+            if not is_private: 
                 msg_hash = hash(msg_str) if msg_str else hash(str(extracted_images))
                 if not hasattr(session, 'last_hash'):
                     session.last_hash = None
@@ -237,24 +231,21 @@ class AttentionGate:
             event.set_extra("astrmai_timestamp", time.time())
 
             if session.is_evaluating:
-                # 🟢 [新增日志] 窗口持续追踪
                 logger.info(f"[{chat_id}] ⏳ [窗口持续] 写入消息 -> 累积池 (当前积压: {len(session.accumulation_pool)}条)")
                 return "BUFFERED" 
             
             session.is_evaluating = True
 
-        # 🟢 [新增日志] 普通模式追踪
         logger.info(f"[{chat_id}] 👁️ [普通模式] 开启窗口...")
         self._fire_background_task(self._debounce_and_judge(chat_id, session, self_id))
         return "BUFFERED"
     
     async def _normalize_content_to_str(self, components: Any, depth: int = 0, event: AstrMessageEvent = None) -> str:
         """
-        [新增/完善] 将底层富文本组件规范化为字符串标记 (增强鸭子类型版)
-        全面接入几十种富文本组件的解析，并解除对底层硬编码类名的死板依赖。
-        [修改] 新增 event 参数传入，用于捕获主脑直通车的特权标志，并执行异步旁路拦截。
+        [修改] 视觉盲区模式 (Vision-Blind System 1)：
+        向 System 1 汇报的文本流中遇到图片强行替换为 [图片]。并将真实 URL 存入 event，留给 System 2。
+        同时后台保留多模态记忆解析以完善持久化记忆。
         """
-        # [彻底修复 Bug 2] 增加强制深度保护机制，拦截套娃引用栈溢出
         if depth > 3:
             return "[引用层级过深，已截断]"
             
@@ -267,43 +258,37 @@ class AttentionGate:
         if isinstance(components, list):
             for i in components:
                 try:
-                    # 使用反射与鸭子类型获取组件类型，兼容所有平台适配器
                     component_type = getattr(i, 'type', None)
                     if not component_type:
                         component_type = i.__class__.__name__.lower()
                     
-                    # 1. 兼容普通字典格式 (Dict 格式适配)
                     if isinstance(i, dict):
                         component_type = i.get("type", "unknown").lower()
                         if component_type in ["plain", "text"]:
                             outline += i.get("text", "")
                         elif component_type == "image":
-                            # ==========================================
-                            # [新增] 阶段二：异步旁路拦截 (主脑视觉直通车) Dict分支
-                            # ==========================================
-                            direct_vision_urls = event.get_extra("direct_vision_urls", []) if event else []
-                            url = i.get("url", "")
+                            # 🚀 [主脑直通车] 收集真实 URL 留给 System 2
+                            url = i.get("url", "") or i.get("file", "") or i.get("path", "")
+                            if url and event:
+                                vision_urls = event.get_extra("direct_vision_urls", [])
+                                if url not in vision_urls:
+                                    vision_urls.append(url)
+                                event.set_extra("direct_vision_urls", vision_urls)
                             
-                            if direct_vision_urls and url in direct_vision_urls:
-                                outline += "[图片]"
-                                logger.debug(f"[AstrMai-Attention] 🛡️ 命中主脑视觉直通车，旁路拦截生效，阻断异步多模态翻译 (URL: {url[:30]}...)")
-                            else:
-                                # [核心修改] 视觉拦截逻辑 (Dict分支)
-                                import random
-                                import hashlib
-                                prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
-                                if random.random() < prob:
-                                    base64_data = await self._extract_image_base64_from_url(url) if url else ""
-                                    if base64_data:
-                                        pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
-                                        outline += f"[picid:{pic_md5}]"
-                                        if getattr(self, 'visual_cortex', None):
-                                            # [彻底修复 Bug 3] 替换 create_task
-                                            self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
-                                    else:
-                                        outline += "[图片]"
-                                else:
-                                    outline += "[图片]"
+                            # 🚀 [后台记忆] 触发异步视觉皮层入库（不影响文本流）
+                            import random
+                            import hashlib
+                            prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
+                            if random.random() < prob:
+                                base64_data = await self._extract_image_base64_from_url(url) if url else ""
+                                if base64_data:
+                                    pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
+                                    if getattr(self, 'visual_cortex', None):
+                                        self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                                        
+                            # 🚀 [视觉盲区] 对 System 1 只暴露简单的占位符
+                            outline += "[图片]"
+                            
                         elif component_type == "at":
                             name = i.get("name", "")
                             qq = i.get("qq", "User")
@@ -313,7 +298,6 @@ class AttentionGate:
                             if val: outline += val
                         continue
 
-                    # 2. 特别优化 Reply 组件的处理 (递归解析引用的链式消息)
                     if component_type == "reply" or i.__class__.__name__ == "Reply":
                         sender_id = getattr(i, 'sender_id', '')
                         sender_nickname = getattr(i, 'sender_nickname', '')
@@ -328,7 +312,6 @@ class AttentionGate:
                         
                         reply_content = ""
                         if hasattr(i, 'chain') and i.chain:
-                            # [彻底修复 Bug 2] 递归调用时深度 + 1，同时传递 event 参数
                             reply_content = await self._normalize_content_to_str(i.chain, depth + 1, event)
                         elif hasattr(i, 'message_str') and i.message_str:
                             reply_content = i.message_str
@@ -337,44 +320,37 @@ class AttentionGate:
                         else:
                             reply_content = "[内容不可用]"
                             
-                        # 防止引用过长冲爆上下文限制
                         if len(reply_content) > 150:
                             reply_content = reply_content[:150] + "..."
                         
-                        # 特殊标识符，供给下一步的 _convert_interaction_to_narrative 进行剧本化替换
                         outline += f"「↪ 引用 {sender_info} 的消息：{reply_content}」"
                         continue
                         
-                    # 3. 几十种杂项组件的兜底处理
                     if component_type == "plain" or i.__class__.__name__ == "Plain":
                         outline += getattr(i, 'text', '')
                     elif component_type == "image" or i.__class__.__name__ == "Image":
-                        # ==========================================
-                        # [新增] 阶段二：异步旁路拦截 (主脑视觉直通车) 原生组件分支
-                        # ==========================================
-                        direct_vision_urls = event.get_extra("direct_vision_urls", []) if event else []
-                        url = getattr(i, 'url', '')
+                        # 🚀 [主脑直通车] 收集真实 URL 留给 System 2
+                        url = getattr(i, 'url', '') or getattr(i, 'file', '') or getattr(i, 'path', '')
+                        if url and event:
+                            vision_urls = event.get_extra("direct_vision_urls", [])
+                            if url not in vision_urls:
+                                vision_urls.append(url)
+                            event.set_extra("direct_vision_urls", vision_urls)
                         
-                        if direct_vision_urls and url in direct_vision_urls:
-                            outline += "[图片]"
-                            logger.debug(f"[AstrMai-Attention] 🛡️ 命中主脑视觉直通车，旁路拦截生效，阻断异步多模态翻译 (URL: {url[:30]}...)")
-                        else:
-                            # [核心修改] 视觉拦截逻辑 (原生组件分支)
-                            import random
-                            import hashlib
-                            prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
-                            if random.random() < prob:
-                                base64_data = await self._extract_image_base64(i)
-                                if base64_data:
-                                    pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
-                                    outline += f"[picid:{pic_md5}]"
-                                    if getattr(self, 'visual_cortex', None):
-                                        # [彻底修复 Bug 3] 替换 create_task
-                                        self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
-                                else:
-                                    outline += "[图片]"
-                            else:
-                                outline += "[图片]"
+                        # 🚀 [后台记忆] 触发异步视觉皮层入库（不影响文本流）
+                        import random
+                        import hashlib
+                        prob = getattr(self.config.vision, 'image_recognition_probability', 0.5) if hasattr(self.config, 'vision') else 0.0
+                        if random.random() < prob:
+                            base64_data = await self._extract_image_base64(i)
+                            if base64_data:
+                                pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
+                                if getattr(self, 'visual_cortex', None):
+                                    self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                                    
+                        # 🚀 [视觉盲区] 对 System 1 只暴露简单的占位符
+                        outline += "[图片]"
+                        
                     elif component_type == "face" or i.__class__.__name__ == "Face":
                         outline += f"[表情:{getattr(i, 'id', getattr(i, 'name', ''))}]"
                     elif component_type == "at" or i.__class__.__name__ == "At":
@@ -449,7 +425,7 @@ class AttentionGate:
                                 outline += f"[{component_type}]"
                 except Exception as e:
                     import traceback
-                    # 🟢 [修复] 移除局部的 from astrbot.api import logger 避免作用域污染
+                    from astrbot.api import logger
                     logger.error(f"处理消息组件时出错: {e}")
                     logger.error(f"错误详情: {traceback.format_exc()}")
                     outline += f"[处理失败的消息组件]"
@@ -600,7 +576,6 @@ class AttentionGate:
                 import time
                 no_msg_start_time = time.time()
                 last_pool_len = 0
-                # 🟢 [防呆修复] 增加 float 强转，防止用户在配置中输入字符串导致比对报错
                 debounce_window = float(getattr(self.config.attention, 'debounce_window', 2.0))
                 
                 while True:
@@ -630,30 +605,26 @@ class AttentionGate:
                 if not events_to_process:
                     break 
 
-                # ==========================================
-                # 📊 核心优化：插件干扰阈值评估 (软熔断)
-                # ==========================================
                 total_msgs = len(events_to_process)
                 
-                # 🟢 [修复] 放弃 isinstance 判断，统一使用 get_extra 来无缝识别注入的外部事件
                 bot_reply_msgs = [e for e in events_to_process if hasattr(e, 'get_extra') and e.get_extra("is_external_bot_reply")]
                 bot_reply_count = len(bot_reply_msgs)
                 
-                # 阈值计算
                 if bot_reply_count > 0:
                     if bot_reply_count <= (total_msgs / 3):
+                        from astrbot.api import logger
                         logger.info(f"[{chat_id}] ⚠️ 检测到插件插话，但处于活跃对话流中 (Bot:{bot_reply_count} / 总:{total_msgs})，判定为聊天背景音，Sys1 继续接管。")
                     else:
+                        from astrbot.api import logger
                         logger.info(f"[{chat_id}] 🛑 插件响应占比过高 (Bot:{bot_reply_count} / 总:{total_msgs})，判定为纯功能交互，Sys1 隐退。")
-                        return # 触发软熔断，直接退出
+                        return 
                         
-                # 🟢 [修复] 事件提纯：使用 get_extra 精准剔除假事件，只保留纯正的 AstrMessageEvent
                 events_to_process = [e for e in events_to_process if not (hasattr(e, 'get_extra') and e.get_extra("is_external_bot_reply"))]
                 
-                # 提纯后如果空了，直接退出当前结算
                 if not events_to_process:
                     break
-
+                
+                from astrbot.api import logger
                 logger.info(f"[{chat_id}] 🚪 [窗口关闭] 写入sys1进行评估 (共处理 {len(events_to_process)} 条有效消息)...")
                 
                 try:
@@ -666,6 +637,17 @@ class AttentionGate:
                         main_event = final_events[-1] 
                         main_event.set_extra("astrmai_anchor_event", anchor_event)
                         main_event.set_extra("astrmai_window_events", final_events)
+                        
+                        # 🚀 [全知视界编排] 汇总窗口内的所有图片真实 URL，统一塞给主事件，交由 System 2 接管
+                        all_vision_urls = []
+                        for e in final_events:
+                            urls = e.get_extra("direct_vision_urls", [])
+                            if urls:
+                                all_vision_urls.extend(urls)
+                        
+                        unique_urls = list(dict.fromkeys(all_vision_urls)) # 去重并保持顺序
+                        if unique_urls:
+                            main_event.set_extra("direct_vision_urls", unique_urls)
                         
                         is_wakeup = any(self.sensors.is_wakeup_signal(e, self_id) for e in final_events)
                         is_first_event_wakeup = self.sensors.is_wakeup_signal(final_events[0], self_id) if final_events else False
@@ -684,13 +666,12 @@ class AttentionGate:
 
                         logger.info(f"[{chat_id}] ⚖️ [Sys1 追踪] 移交 Judge 裁决 (强唤醒={is_wakeup}, 携带人设长度={len(sys1_persona)})...")
                         
-                        # 🟢 [核心修复] Sys1 判决盲症修复：将生硬的 picid 替换为 [图片]，防止 Sys1 判为乱码而直接 IGNORE
-                        import re
-                        sys1_eval_text = re.sub(r'\[picid:[a-fA-F0-9]{32}\]', '[图片]', combined_text)
+                        # 🚀 [视觉盲区裁决] Sys1 不再接收任何 picid 或 URL，只接收干净的文本与 [图片] 占位符
+                        sys1_eval_text = combined_text
                         
                         plan = await self.judge.evaluate(
                             chat_id=chat_id, 
-                            message=sys1_eval_text,  # 使用清洗后的文本评估
+                            message=sys1_eval_text,  
                             is_force_wakeup=is_wakeup,
                             persona_summary=sys1_persona,
                             window_events_count=len(final_events),
@@ -701,7 +682,7 @@ class AttentionGate:
                         
                         main_event.set_extra("sys1_thought", plan.thought)
 
-                        if plan.action in ["REPLY", "WAIT"]:
+                        if plan.action in ["REPLY", "WAIT", "TOOL_CALL"]:
                             safe_thought = plan.thought or "无"
                             thought_abbr = safe_thought[:5] + "..." if len(safe_thought) > 5 else safe_thought
                             
@@ -716,8 +697,6 @@ class AttentionGate:
                             )
                             if self.sys2_process:
                                 logger.info(f"[{chat_id}] 🔄 [Sys1 追踪] 开始调用 sys2_process (后台异步抛出)...")
-                                # 🟢 [深度修复: 解除 Sys1 阻塞] 将同步的 await 替换为 Fire-and-Forget 的后台任务
-                                # 释放注意力循环的锁，防止长耗时的大模型请求卡死滑动窗口
                                 self._fire_background_task(self.sys2_process(main_event, final_events))
                                 logger.info(f"[{chat_id}] ✅ [Sys1 追踪] sys2_process 已安全抛出至后台。")
                         else:
@@ -726,19 +705,23 @@ class AttentionGate:
                         logger.info(f"[{chat_id}] 🈳 [Sys1 追踪] 过滤后无有效事件，放弃评估。")
                         
                 except Exception as inner_e:
+                    from astrbot.api import logger
                     logger.error(f"[{chat_id}] ⚠️ 批次消息处理失败，安全拦截防崩溃: {inner_e}", exc_info=True)
 
                 async with session.lock:
                     if not session.accumulation_pool:
                         break
                     else:
+                        from astrbot.api import logger
                         logger.info(f"[{chat_id}] ⚠️ [发现积压消息] 写入sys1，开启新一轮注意力维持...")
 
         except Exception as e:
+            from astrbot.api import logger
             logger.exception(f"Attention Aggregation Critical Error: {e}")
         finally:
             async with session.lock:
                 session.is_evaluating = False
                 session.last_hash = None
                 session.repeat_count = 0
+                from astrbot.api import logger
                 logger.debug(f"[{chat_id}] 🔓 注意力生命周期结束，锁已安全释放。")
