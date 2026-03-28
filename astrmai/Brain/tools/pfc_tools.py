@@ -688,3 +688,189 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
         except Exception as e:
             logger.error(f"🛑 [Regret Tool] 发生底层交互异常: {e}", exc_info=True)
             return f"执行失败：底层平台 API 调用出现异常（{str(e)}）。请正常进行回复。"        
+        
+
+
+# ==========================================
+# 工具 9：贴表情回应工具 (Message Reaction)
+# ==========================================
+@dataclass
+class MessageReactionTool(FunctionTool[AstrAgentContext]):
+    """贴表情回应工具"""
+    name: str = "message_reaction_action"
+    description: str = (
+        "【物理互动动作】当你不想用文字回复，或者觉得对方的消息只需贴一个或多个表情来回应时调用此工具。"
+        "你可以指定贴表情的数量（1到5个），系统会根据你选择的情绪标签，随机挑选相应数量的 QQ 表情贴在对方的消息上。"
+    )
+    
+    parameters: dict = Field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "emotion_type": {
+                "type": "string",
+                "description": "你想表达的情绪类型。请严格从以下标签中选择一个：'agree'(赞同/肯定), 'laugh'(大笑/开心), 'speechless'(无语/汗颜), 'angry'(生气/敲打), 'mock'(吃瓜/狗头/嘲讽), 'love'(比心/爱心), 'refuse'(拒绝/NO)。"
+            },
+            "count": {
+                "type": "integer",
+                "description": "你想贴的表情数量（1 到 5 之间）。数量越大代表你的情绪越强烈！例如极度无语可以填 3 或 4。"
+            }
+        },
+        "required": ["emotion_type"]
+    })
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        emotion_type = kwargs.get("emotion_type", "agree").strip().lower()
+        count = kwargs.get("count", 1)
+        
+        # 1. 数量安全与类型校验
+        try:
+            count = int(count)
+            count = max(1, min(count, 5)) # 限制单次最多连贴 5 个，防风控
+        except (ValueError, TypeError):
+            count = 1
+
+        current_event = context.context.event
+        from astrbot.api import logger
+        import random
+        import asyncio
+        
+        client = getattr(current_event, 'bot', None)
+        if not client or not hasattr(client, 'api'):
+            return "执行失败：底层平台 API 客户端未就绪，无法贴表情。"
+            
+        message_id = getattr(current_event.message_obj, 'message_id', None)
+        if not message_id:
+            return "执行失败：无法提取当前消息的 message_id，无法执行贴表情操作。"
+
+        # 2. 扩充版情绪字典池 (确保每种情绪至少有 5 个以上的候选池以供多重抽样)
+        emoji_pool = {
+            "agree": ["76", "124", "201", "282", "66", "318", "319", "291"],
+            "laugh": ["264", "101", "14", "327", "285", "315", "309", "320"],
+            "speechless": ["287", "284", "232", "262", "272", "288", "286", "313"],
+            "angry": ["326", "38", "310", "304", "266", "292", "308", "314"],
+            "mock": ["179", "144", "271", "269", "293", "273", "306", "274"],
+            "love": ["66", "319", "318", "290", "303", "311", "312", "321"],
+            "refuse": ["123", "322", "289", "316", "265", "294", "295", "323"]
+        }
+        
+        valid_emojis = emoji_pool.get(emotion_type, emoji_pool["agree"])
+        
+        # 3. 无放回抽样去重 (防止连续发送相同 ID 导致底层 Toggle 机制取消了表情)
+        selected_emojis = random.sample(valid_emojis, min(count, len(valid_emojis)))
+
+        # 4. 异步队列执行 (带有休眠延迟的容错穿透)
+        success_count = 0
+        for emoji_id in selected_emojis:
+            try:
+                # 兼容部分魔改端要求 set=True (若 OneBot11 支持)
+                await client.api.call_action('set_msg_emoji_like', message_id=str(message_id), emoji_id=str(emoji_id))
+                success_count += 1
+                await asyncio.sleep(0.3) # 关键延迟，防风控拦截
+            except Exception as e:
+                logger.warning(f"✨ [Message Reaction Tool] 贴单个表情 {emoji_id} 失败: {e}")
+
+        # 5. 结果回传
+        if success_count > 0:
+            logger.info(f"✨ [Message Reaction Tool] AI 意图: '{emotion_type}' | 连贴 {success_count} 个表情 | 目标消息: {message_id}")
+            return (
+                f"[ACTION COMPLETED: 成功在对方消息上连贴了 {success_count} 个代表 '{emotion_type}' 的表情] \n"
+                f"[SYSTEM OVERRIDE]: 物理动作执行成功！请根据你刚刚贴表情的数量激烈程度（数量越多情绪越强），生成一句极其简短的话（如'已赞'、'无语了'），"
+                f"或者如果你觉得无需再多言，请直接原样输出 '[SYSTEM_WAIT_SIGNAL]' 保持高冷。"
+            )
+        else:
+            return "执行失败：底层接口异常，可能是协议端不支持此 API。请直接用文本进行回复。"
+# ==========================================
+# 工具 10：狂点赞工具 (Proactive Like)
+# ==========================================
+@dataclass
+class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
+    """狂点赞工具"""
+    name: str = "proactive_like_action"
+    description: str = (
+        "【物理互动动作】当你觉得某个用户非常棒、对你很好，或者你想主动去对方 QQ 个人资料卡点赞（系统会自动连踩最多 50 次）以示好感时调用此工具。"
+    )
+    db_service: Any = None  # 依赖注入数据库服务用于实体反推
+
+    parameters: dict = Field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "target_name": {
+                "type": "string",
+                "description": "你想点赞的用户的名字。🚨 强烈要求：如果你在上下文中看到该用户名字后带有数字ID（如：张三(123456)），请务必【直接填入纯数字ID】或完整填入【张三(123456)】！如果不填，默认去点赞当前正在跟你对话的用户。"
+            }
+        }
+    })
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        target_name = kwargs.get("target_name", "").strip()
+        current_event = context.context.event
+        astr_ctx = context.context.context
+        from astrbot.api import logger
+        import asyncio
+        
+        # 1. 实体锁定逻辑
+        if not target_name:
+            target_id = str(current_event.get_sender_id())
+            target_name_for_log = current_event.get_sender_name() or "当前用户"
+        else:
+            if not self.db_service:
+                target_id = str(current_event.get_sender_id())
+                target_name_for_log = target_name
+            else:
+                resolver_result = await self.db_service.resolve_entity_spatio_temporal(
+                    target_name=target_name, 
+                    current_event=current_event,
+                    astr_ctx=astr_ctx
+                )
+                if not resolver_result:
+                    return f"[系统反馈] 动作取消：当前环境中无法锁定名为 [{target_name}] 的实体进行点赞。"
+                target_id, _ = resolver_result
+                target_name_for_log = target_name
+
+        # 2. 防护分支
+        self_id = str(current_event.get_self_id())
+        if str(target_id) == self_id:
+            return "[系统警告] 动作取消：你不能给自己点赞！"
+
+        client = getattr(current_event, 'bot', None)
+        if not client or not hasattr(client, 'api'):
+            return "执行失败：底层平台 API 客户端未就绪。"
+
+        # 3. 核心执行与环境感知 (参照 zanwo 逻辑循环满赞)
+        logger.info(f"👍 [Proactive Like Tool] AI 正在为 {target_name_for_log}({target_id}) 执行狂赞风暴！")
+        
+        total_likes = 0
+        error_reply = ""
+        
+        # 尝试循环 5 次，每次 10 赞，打满 50 赞
+        for _ in range(5):
+            try:
+                # 优先使用 AstrBot 推荐的 call_action，兼容底层报错透传
+                await client.api.call_action('send_like', user_id=int(target_id), times=10)
+                total_likes += 10
+                await asyncio.sleep(0.2) # 轻微防抖
+            except Exception as e:
+                # 捕获 NapCat/GoCQHTTP 抛出的 ActionFailed 错误并解析
+                error_message = str(e)
+                if "已达" in error_message or "上限" in error_message:
+                    error_reply = "今日对此人的点赞次数已达上限"
+                elif "权限" in error_message or "空间" in error_message:
+                    error_reply = "对方设置了隐私权限，不允许陌生人点赞"
+                else:
+                    error_reply = f"底层限制或其他风控 ({error_message})"
+                break # 遇错立即终止循环
+
+        # 4. 将极度拟真的物理反馈回传给大脑 (System 2)
+        if total_likes > 0:
+            status_msg = f"成功送出 {total_likes} 个赞" + (f"（随后被系统拦截，原因：{error_reply}）" if error_reply else "")
+            return (
+                f"[ACTION COMPLETED: 物理点赞执行完毕] \n"
+                f"系统反馈：你已经跑到 [{target_name_for_log}] 的 QQ 主页去狂踩了，{status_msg}！\n"
+                f"请立即生成文本回复，骄傲地告诉TA你给TA点了多少个赞。如果后半段被拦截，你可以顺带调侃一下。"
+            )
+        else:
+            return (
+                f"[ACTION FAILED: 物理点赞失败] \n"
+                f"系统反馈：你试图给 [{target_name_for_log}] 点赞，但被无情拒绝！原因：【{error_reply}】。\n"
+                f"请立即生成文本回复，根据被拒绝的原因去抱怨或吐槽对方（例如吐槽对方高冷设了权限，或者说自己今天赞不了了）。"
+            )

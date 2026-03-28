@@ -18,7 +18,9 @@ from .tools.pfc_tools import (
     MemeResonanceTool,        # 🎭 复读/保持队形
     TopicHijackTool,          # 🥱 岔开话题
     SpaceTransitionTool,      # 🤫 悄悄话转私聊
-    RegretAndWithdrawTool     # 🛑 手滑撤回找补
+    RegretAndWithdrawTool,    # 🛑 手滑撤回找补
+    MessageReactionTool,      # ✨ 贴表情回应工具 (新增)
+    ProactiveLikeTool         # 👍 狂点赞工具 (新增)
 )
 
 from ..memory.engine import MemoryEngine
@@ -50,10 +52,11 @@ class Planner:
         self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
         
 # [修改] 函数位置：astrmai/Brain/planner.py -> Planner 类下
+# [修改] 
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
         [修改] 在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
-        增加 4 个新增拟人化工具的挂载
+        增加 6 个新增拟人化工具的挂载
         [修改] 阶段三：主脑负载编排，提取直通图片 URL 并注入多模态旁白，传递给 Executor。
         """
         chat_id = event.unified_msg_origin
@@ -118,7 +121,9 @@ class Planner:
                 MemeResonanceTool(),
                 TopicHijackTool(),
                 SpaceTransitionTool(),
-                RegretAndWithdrawTool()
+                RegretAndWithdrawTool(),
+                MessageReactionTool(),                                  # ✨ [新增] 贴表情回应工具
+                ProactiveLikeTool(db_service=self.context_engine.db)    # 👍 [新增] 狂点赞工具 (注入 db_service 进行实体反推)
             ]
             if ctx:
                 if is_fast_mode:
