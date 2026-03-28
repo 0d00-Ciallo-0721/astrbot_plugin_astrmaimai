@@ -28,7 +28,7 @@ class ConcurrentExecutor:
         
         
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None):
-        """[修改] 融合视觉皮层成功逻辑的 VLM 同步降维转述模式，彻底避开底层组件兼容问题"""
+        """[修改] 融合视觉皮层成功逻辑的 VLM 同步降维转述模式，并加入强力的底层 API 崩溃嗅探以激活模型池"""
         chat_id = event.unified_msg_origin
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
@@ -68,7 +68,7 @@ class ConcurrentExecutor:
                     event._is_final_reply_phase = True 
                     
                     # ==========================================
-                    # 🟢 [核心融合] 复刻 VisualCortex 成功逻辑的同步降维转述
+                    # 🟢 复刻 VisualCortex 成功逻辑的同步降维转述
                     # ==========================================
                     import aiohttp
                     import tempfile
@@ -88,7 +88,6 @@ class ConcurrentExecutor:
                             is_temp = False
                             try:
                                 image_bytes = None
-                                # 1. 下载或读取字节流
                                 if str(url_or_path).startswith("http"):
                                     async with aiohttp.ClientSession() as session:
                                         async with session.get(url_or_path, timeout=15) as resp:
@@ -101,7 +100,6 @@ class ConcurrentExecutor:
                                 elif os.path.exists(url_or_path):
                                     temp_file_path = url_or_path
                                 
-                                # 2. 物理落盘
                                 if image_bytes:
                                     try:
                                         img_format = Image.open(io.BytesIO(image_bytes)).format.lower()
@@ -113,7 +111,6 @@ class ConcurrentExecutor:
                                         f.write(image_bytes)
                                     is_temp = True
 
-                                # 3. 调用网关解析 (完全复刻 visual_cortex 的 Prompt)
                                 if temp_file_path and os.path.exists(temp_file_path):
                                     logger.debug(f"[{chat_id}] 🚀 正在调用 Gateway 同步解析: {temp_file_path}")
                                     system_prompt_vision = (
@@ -143,14 +140,16 @@ class ConcurrentExecutor:
                                     except Exception:
                                         pass
                         
-                        # 4. 组装成纯文本注入 Prompt
                         if vision_descriptions:
                             vision_inject = "\n\n(系统旁白：用户刚刚发送了图片，以下是你的视觉神经元解析出的画面剧本：\n" + "\n".join(vision_descriptions) + ")"
                             api_prompt += vision_inject
                             prompt += vision_inject 
 
+                    # 统一的异常拦截嗅探字典
+                    error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '获取模型列表失败', 'api error', 'all chat models fail', 'connection error', 'notfounderror', 'exception:']
+
                     # ==========================================
-                    # 统一执行阶段 (彻底规避了 ImagePart)
+                    # 非 Agent 模式：纯文本 / 纯 VQA 模式
                     # ==========================================
                     if tools is None or len(tools) == 0:
                         logger.debug(f"[{chat_id}] ⚡ 纯文本模式运行...")
@@ -167,7 +166,8 @@ class ConcurrentExecutor:
                                 if not reply_text:
                                     raise ValueError(f"模型 {provider_id} 生成为空")
                                 
-                                if "Exception:" in reply_text or "请求失败" in reply_text:
+                                # 🟢 异常拦截屏障：如果大模型透传了 API 报错，主动引爆以触发备用模型池
+                                if any(kw in reply_text.lower() for kw in error_keywords):
                                     raise RuntimeError(f"底层模型穿透异常: {reply_text}")
 
                                 await self.reply_engine.handle_reply(event, reply_text, chat_id)
@@ -177,12 +177,15 @@ class ConcurrentExecutor:
                                 return 
                             except Exception as e:
                                 last_error = str(e)
-                                logger.warning(f"[{chat_id}] ⚠️ 模型 {provider_id} 异常: {e}")
+                                logger.warning(f"[{chat_id}] ⚠️ 模型 {provider_id} 异常，正在切换备用模型: {e}")
                                 continue
                                 
                         logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
-                        await self._handle_fatal_fallback(event, chat_id, f"模型耗尽:\n{last_error}")
+                        await self._handle_fatal_fallback(event, chat_id, f"模型全部耗尽:\n{last_error}")
 
+                    # ==========================================
+                    # Agent 工具循环模式
+                    # ==========================================
                     else:
                         logger.debug(f"[{chat_id}] 👁️ 触发 Agent 工具循环运行...")
                         tool_set = ToolSet(tools)
@@ -203,8 +206,9 @@ class ConcurrentExecutor:
                                 if not reply_text:
                                     raise ValueError("回复为空")
                                 
-                                if "Exception:" in reply_text or "请求失败" in reply_text:
-                                    raise RuntimeError(f"底层穿透异常: {reply_text}")
+                                # 🟢 异常拦截屏障：如果大模型透传了 API 报错，主动引爆以触发备用模型池
+                                if any(kw in reply_text.lower() for kw in error_keywords):
+                                    raise RuntimeError(f"底层模型穿透异常: {reply_text}")
 
                                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
                                     return
@@ -224,15 +228,15 @@ class ConcurrentExecutor:
                                 return 
                             except Exception as e:
                                 last_error = str(e)
-                                logger.warning(f"[{chat_id}] ⚠️ Agent {provider_id} 异常: {e}")
+                                logger.warning(f"[{chat_id}] ⚠️ Agent {provider_id} 异常，正在切换备用模型: {e}")
                                 continue
                         
-                        logger.error(f"[{chat_id}] ❌ 所有 Agent 模型耗尽。")
-                        await self._handle_fatal_fallback(event, chat_id, last_error if last_error else "耗尽")
+                        logger.error(f"[{chat_id}] ❌ 所有 Agent 模型均已耗尽。")
+                        await self._handle_fatal_fallback(event, chat_id, last_error if last_error else "Agent 模型池耗尽。")
 
                 except Exception as global_e:
                     from astrbot.api import logger
-                    logger.error(f"[{chat_id}] 💥 Executor 崩溃: {global_e}")
+                    logger.error(f"[{chat_id}] 💥 Executor 核心崩溃: {global_e}")
                     await self._handle_fatal_fallback(event, chat_id, f"核心循环异常:\n{str(global_e)}")
                     
                 finally:
