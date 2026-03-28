@@ -87,31 +87,9 @@ class GlobalModelGateway:
         for model_id in attempt_queue:
             logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
             for attempt in range(max_retries + 1):
-                temp_files_to_clean = []
                 try:
-                    # 1. 剥离环境依赖，前置临时文件转换逻辑
-                    processed_image_urls = []
-                    if image_urls and len(image_urls) > 0:
-                        import tempfile, os, base64
-                        for url in image_urls:
-                            if url.startswith("data:image"):
-                                try:
-                                    header, encoded = url.split(",", 1)
-                                    ext = header.split(";")[0].split("/")[1]
-                                    if ext == "jpeg": ext = "jpg"
-                                    img_bytes = base64.b64decode(encoded)
-
-                                    fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
-                                    with os.fdopen(fd, 'wb') as f:
-                                        f.write(img_bytes)
-
-                                    processed_image_urls.append(temp_path)
-                                    temp_files_to_clean.append(temp_path)
-                                except Exception as e:
-                                    logger.error(f"[AstrMai-Gateway] 临时文件转换失败: {e}")
-                                    processed_image_urls.append(url)
-                            else:
-                                processed_image_urls.append(url)
+                    # 🟢 [阶段 3 修复] 停止在本地创建 Temp File 传参，改用 Data URI / URL 直传方案
+                    processed_image_urls = image_urls if image_urls else []
 
                     # 2. 构建上下文请求
                     contexts = []
@@ -129,11 +107,8 @@ class GlobalModelGateway:
                             if current_prompt:
                                 user_content.append(TextPart(text=current_prompt))
                             for path_or_url in processed_image_urls:
-                                import os
-                                if os.path.exists(path_or_url):
-                                    user_content.append(ImagePart(file=path_or_url))
-                                else:
-                                    user_content.append(ImagePart(url=path_or_url))
+                                # 直接注入完整的 Data URI 或 URL，底层 Adapter 会接管解析
+                                user_content.append(ImagePart(url=path_or_url))
                             contexts.append(UserMessageSegment(content=user_content))
                             current_prompt = "" 
                         else:
@@ -177,39 +152,27 @@ class GlobalModelGateway:
                     error_str = last_error.lower()
                     
                     # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker)
-                    # 针对确定性的结构错误、限流、或网络超时，拒绝无意义休眠，直接进入轮询的下一个模型
                     fatal_keywords = [
                         "无法解析", 
                         "429", 
                         "ratelimit", 
                         "too many requests", 
                         "invalid_request_error",
-                        "apitimeouterror",   # [新增] 阶段 2：超时特判
-                        "request timed out", # [新增] 阶段 2：超时特判
-                        "timeout"            # [新增] 阶段 2：超时特判
+                        "apitimeouterror",
+                        "request timed out",
+                        "timeout"
                     ]
                     
                     if any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str:
                         logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性异常、限流或超时，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
-                        break # 跳出内层重试循环，立即在 for model_id in attempt_queue 外层循环推进
+                        break
 
                     logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
                     if attempt < max_retries:
                         import asyncio
                         await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
-                # 3. 终极物理防泄漏屏障：阅后即焚
-                finally:
-                    import os
-                    for temp_path in temp_files_to_clean:
-                        if os.path.exists(temp_path):
-                            try:
-                                os.remove(temp_path)
-                                logger.debug(f"[AstrMai-Gateway] 🧹 已安全销毁临时视觉文件: {temp_path}")
-                            except Exception as e:
-                                logger.error(f"[AstrMai-Gateway] ⚠️ 无法删除临时视觉文件 {temp_path}: {e}")
 
         logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
-        # 向外层抛出自定义异常，由 Phase 1 拦截处理
         raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:

@@ -449,14 +449,14 @@ class AttentionGate:
                                 outline += f"[{component_type}]"
                 except Exception as e:
                     import traceback
-                    from astrbot.api import logger
+                    # 🟢 [修复] 移除局部的 from astrbot.api import logger 避免作用域污染
                     logger.error(f"处理消息组件时出错: {e}")
                     logger.error(f"错误详情: {traceback.format_exc()}")
                     outline += f"[处理失败的消息组件]"
                     continue
                     
         return outline
-
+    
     def _convert_interaction_to_narrative(self, content: str, bot_name: str) -> str:
         """
         [优化版] 将上方产生的机器结构化技术标记，转换为大模型视角的自然叙述与动作描写
