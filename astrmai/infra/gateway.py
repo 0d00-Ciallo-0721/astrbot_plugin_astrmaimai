@@ -60,8 +60,6 @@ class GlobalModelGateway:
         
         return rearranged
 
-    # [新增] 统一列表合成器：获取用于当前任务的模型轮询列表
-    # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
         """统一网关底层调用引擎 (接入原名函数 get_models_for_task)"""
@@ -117,10 +115,12 @@ class GlobalModelGateway:
 
                     # 2. 构建上下文请求
                     contexts = []
-                    if system_prompt:
-                        contexts.append(SystemMessageSegment(content=[TextPart(text=system_prompt)]))
-                        
                     llm_kwargs = {}
+                    
+                    # [修复 Bug 2]：移除 SystemMessageSegment 的封装，直接作为原生字符串键值对放入字典
+                    if system_prompt:
+                        llm_kwargs["system_prompt"] = system_prompt
+                        
                     current_prompt = prompt
                     
                     if processed_image_urls:

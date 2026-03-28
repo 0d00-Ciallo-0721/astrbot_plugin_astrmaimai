@@ -127,7 +127,8 @@ class ConcurrentExecutor:
                                 else:
                                     processed_image_urls.append(url)
 
-                            contexts = [SystemMessageSegment(content=[TextPart(text=system_prompt)])]
+                            # [修复 Bug 2]：移除 SystemMessageSegment 的字典包装
+                            contexts = []
                             user_content = []
                             
                             if prompt:
@@ -149,6 +150,7 @@ class ConcurrentExecutor:
                                     llm_resp = await self.context.llm_generate(
                                         chat_provider_id=provider_id,
                                         prompt=None,
+                                        system_prompt=system_prompt, # [修复 Bug 2]：作为原生形参直传
                                         contexts=contexts
                                     )
                                     reply_text = getattr(llm_resp, 'completion_text', "")
@@ -195,7 +197,9 @@ class ConcurrentExecutor:
                     elif tools is None or len(tools) == 0:
                         logger.debug(f"[{chat_id}] ⚡ 纯文本模式：降级为纯文本生成器，剥离 Agent 环境...")
                         from astrbot.core.agent.message import SystemMessageSegment, TextPart
-                        contexts = [SystemMessageSegment(content=[TextPart(text=system_prompt)])]
+                        
+                        # [修复 Bug 2]：移除 SystemMessageSegment 的字典包装
+                        contexts = []
                         last_error = ""
                         
                         for provider_id in models:
@@ -203,6 +207,7 @@ class ConcurrentExecutor:
                                 llm_resp = await self.context.llm_generate(
                                     chat_provider_id=provider_id,
                                     prompt=prompt,
+                                    system_prompt=system_prompt, # [修复 Bug 2]：作为原生形参直传
                                     contexts=contexts
                                 )
                                 reply_text = getattr(llm_resp, 'completion_text', "")
