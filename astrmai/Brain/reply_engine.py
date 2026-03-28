@@ -38,13 +38,21 @@ class ReplyEngine:
 
     def _clean_reply_content(self, text: str) -> str:
         """
-        清洗 LLM 输出的幻觉前缀
+        [修改] 清洗 LLM 输出的幻觉前缀，并作为兜底防线拦截底层穿透的报错堆栈
         """
         if not text: return ""
+        
+        # [新增] 致命异常文本拦截层 (Fallback Interception 双重防线)
+        error_keywords = ["Exception:", "All chat models fail", "Traceback", "请求失败", "APITimeoutError"]
+        if any(keyword in text for keyword in error_keywords):
+            logger.warning("[ReplyEngine] 🚨 在清洗阶段拦截到底层报错透传文本，已切断输出流并强制替换为兜底回复！")
+            return getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+
         # 去除 [HH:MM:SS] 时间戳
         text = re.sub(r'^\[.*?\]\s*', '', text)
         # 去除 BotName: 前缀 (简单正则，匹配常见的 名字: 格式)
         text = re.sub(r'(?i)^[a-zA-Z0-9_\u4e00-\u9fa5]+[：:]\s*', '', text)
+        
         return text.strip()
 
     def _segment_reply_content(self, text: str) -> List[str]:

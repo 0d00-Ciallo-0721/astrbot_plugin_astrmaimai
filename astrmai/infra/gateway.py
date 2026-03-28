@@ -17,6 +17,10 @@ try:
 except ImportError:
     repair_json = None
 
+class LLMCascadeFailureException(Exception):
+    """自定义异常：底层模型级联失效（所有模型池均耗尽或超时）"""
+    pass
+
 class GlobalModelGateway:
     """
     统一模型网关 (重构版：增加弹性熔断与指数退避)
@@ -58,6 +62,7 @@ class GlobalModelGateway:
 
     # [新增] 统一列表合成器：获取用于当前任务的模型轮询列表
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
+# [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
         """统一网关底层调用引擎 (接入原名函数 get_models_for_task)"""
         
@@ -73,7 +78,8 @@ class GlobalModelGateway:
 
         if not attempt_queue:
             logger.warning(f"[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池 (池: {pool_name})！")
-            return {} if is_json else ""
+            # [新增] 抛出自定义级联崩溃异常
+            raise LLMCascadeFailureException(f"未配置任何可用模型且无备用池 (池: {pool_name})")
             
         max_retries = getattr(self.config.infra, 'llm_retries', 2)
         backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
@@ -199,7 +205,9 @@ class GlobalModelGateway:
                                 logger.error(f"[AstrMai-Gateway] ⚠️ 无法删除临时视觉文件 {temp_path}: {e}")
 
         logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
-        return {} if is_json else ""
+        # 🟢 [修改] 之前是返回 {} 或 ""，现在改为向外层抛出自定义异常，由 Phase 1 拦截处理
+        raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
+    
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """多模态视觉任务专用网关"""

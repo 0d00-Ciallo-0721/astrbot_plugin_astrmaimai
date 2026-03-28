@@ -19,7 +19,7 @@ class ConcurrentExecutor:
         self.config = config if config else gateway.config
         
         
-    # [修改] 在执行成功的两个分支内，调用 evolution_manager.process_bot_reply 闭环反馈
+# [修改] 在执行成功的两个分支内，调用 evolution_manager.process_bot_reply 闭环反馈
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None):
         """[修改] 显式安插 👁️‍🗨️【全知视界】探针，手动闭环记忆处理，并拦截 [TERMINAL_YIELD] 硬中断指令"""
         chat_id = event.unified_msg_origin
@@ -30,8 +30,14 @@ class ConcurrentExecutor:
             logger.error(f"[{chat_id}] Agent 模型未配置且无备用池，无法执行动作。")
             return
 
+        # ==========================================
+        # 🟢 [核心修复 Bug 3] Agent Max Steps Fix
+        # ==========================================
         is_fast_mode = event.get_extra("is_fast_mode", False)
-        max_steps = 1 if is_fast_mode else self.config.agent.max_steps
+        # 极速模式因为必须直接回答，强制 1 步；普通模式强制读取 config 中的 max_steps (至少为 5)
+        config_max_steps = getattr(self.config.agent, 'max_steps', 5)
+        max_steps = 1 if is_fast_mode else max(5, config_max_steps) 
+        
         timeout = 15 if is_fast_mode else self.config.agent.timeout
         
         # 🟢 显式打印全知视界探针
@@ -42,6 +48,7 @@ class ConcurrentExecutor:
                 f"👁️‍🗨️ 【全知视界】 准备发往大模型的 Payload 快照\n"
                 f"🎯 目标: {chat_id}\n"
                 f"🔖 链路归属: {task_type}\n"
+                f"⚙️ 当前分配最大思考步数: {max_steps}\n" # 加入打印方便排查
                 f"{'='*70}\n"
                 f"👇 【SYSTEM PROMPT (系统设定 & 剧本 & 记忆)】 👇\n"
                 f"{system_prompt}\n"
@@ -55,7 +62,7 @@ class ConcurrentExecutor:
             event._is_final_reply_phase = True 
 
             # ==========================================
-            # [新增] 阶段四：多模态对象组装 (主脑视觉直通车)
+            # 阶段四：多模态对象组装 (主脑视觉直通车)
             # ==========================================
             if direct_vision_urls and len(direct_vision_urls) > 0:
                 logger.info(f"[{chat_id}] 👁️ 触发主脑视觉直通车！绕过 ToolLoop 工具链，开启多模态 VQA 模式...")
@@ -71,7 +78,6 @@ class ConcurrentExecutor:
                 last_error = ""
 
                 try:
-                    # 1. 处理临时文件落盘
                     for url in direct_vision_urls:
                         if url.startswith("data:image"):
                             try:
@@ -92,7 +98,6 @@ class ConcurrentExecutor:
                         else:
                             processed_image_urls.append(url)
 
-                    # 2. 组装多模态 Contexts
                     contexts = [SystemMessageSegment(content=[TextPart(text=system_prompt)])]
                     user_content = []
                     
@@ -110,19 +115,21 @@ class ConcurrentExecutor:
                         
                     contexts.append(UserMessageSegment(content=user_content))
                     
-                    # 3. 发起调用
                     for provider_id in models:
                         try:
-                            # 绕过 tool_loop_agent，直接发起 llm_generate
                             llm_resp = await self.context.llm_generate(
                                 chat_provider_id=provider_id,
-                                prompt=None, # Prompt 已整体打包入 contexts 中
+                                prompt=None,
                                 contexts=contexts
                             )
                             reply_text = getattr(llm_resp, 'completion_text', "")
                             if not reply_text:
                                 raise ValueError(f"多模态模型 {provider_id} 生成的回复为空")
-                                
+                            
+                            # [新增] 拦截透传底层错误
+                            if "Exception:" in reply_text or "All chat models fail" in reply_text or "请求失败" in reply_text:
+                                raise RuntimeError(f"底层视觉模型抛出异常穿透文本: {reply_text}")
+
                             await self.reply_engine.handle_reply(event, reply_text, chat_id)
                             
                             if hasattr(self.evolution_manager, 'process_bot_reply'):
@@ -142,12 +149,10 @@ class ConcurrentExecutor:
                             continue
                             
                     logger.error(f"[{chat_id}] ❌ 多模态模型池耗尽: {last_error}")
-                    fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
-                    await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
-                    return # 视觉直通车执行完毕后直接返回，不要再走纯文本的 fallback
+                    await self._handle_fatal_fallback(event, chat_id, f"多模态模型崩溃:\n{last_error}")
+                    return 
                     
                 finally:
-                    # 4. 安全销毁临时文件
                     for temp_path in temp_files_to_clean:
                         if os.path.exists(temp_path):
                             try:
@@ -156,7 +161,7 @@ class ConcurrentExecutor:
                                 logger.error(f"[{chat_id}] 无法删除临时视觉文件 {temp_path}: {e}")
 
             # ==========================================
-            # 以下为原有逻辑，仅调整了缩进与 if/elif 关系
+            # 纯文本模式 / 降级生成
             # ==========================================
             elif tools is None or len(tools) == 0:
                 logger.debug(f"[{chat_id}] ⚡ 纯文本模式：降级为纯文本生成器，剥离 Agent 环境...")
@@ -174,13 +179,16 @@ class ConcurrentExecutor:
                         reply_text = getattr(llm_resp, 'completion_text', "")
                         if not reply_text:
                             raise ValueError(f"模型 {provider_id} 生成的回复文本为空")
-                            
+                        
+                        # [新增] 拦截透传底层错误
+                        if "Exception:" in reply_text or "All chat models fail" in reply_text or "请求失败" in reply_text:
+                            raise RuntimeError(f"纯文本大模型抛出异常穿透文本: {reply_text}")
+
                         await self.reply_engine.handle_reply(event, reply_text, chat_id)
                         
                         if hasattr(self.evolution_manager, 'process_bot_reply'):
                             await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
                         
-                        # 🟢 手动闭环记忆处理
                         try:
                             plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.gateway.context, 'astrmai', None)
                             if plugin and hasattr(plugin, 'memory_engine') and plugin.memory_engine.summarizer:
@@ -195,38 +203,44 @@ class ConcurrentExecutor:
                         continue
                         
                 logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
-                fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
-                await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
+                await self._handle_fatal_fallback(event, chat_id, f"纯文本模型耗尽:\n{last_error}")
+
+            # ==========================================
+            # Agent 工具循环模式
+            # ==========================================
             else:
                 tool_set = ToolSet(tools)
+                last_error = "" 
                 for provider_id in models:
                     try:
+                        # 🟢 [核心修复 Bug 3] Agent Max Steps Fix
+                        # 在传递给底层 tool_loop_agent 之前，明确传递解除了限制的 max_steps，打破只能调用一次就被强制终止的死锁
                         llm_resp = await self.context.tool_loop_agent(
                             event=event,
                             chat_provider_id=provider_id,
                             prompt=prompt,
                             system_prompt=system_prompt,
                             tools=tool_set,
-                            max_steps=max_steps,
+                            max_steps=max_steps, 
                             tool_call_timeout=timeout
                         )
                         reply_text = getattr(llm_resp, 'completion_text', "")
                         if not reply_text:
                             raise ValueError(f"模型 {provider_id} 生成的回复为空")
+                        
+                        # [新增] 拦截透传底层错误 (这是导致之前日志里死信污染记忆的核心源头)
+                        if "Exception:" in reply_text or "All chat models fail" in reply_text or "请求失败" in reply_text:
+                            raise RuntimeError(f"Agent底层由于额度耗尽抛出了异常穿透文本: {reply_text}")
 
                         if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
                             logger.info(f"[{chat_id}] 💤 Brain 决定挂起并倾听后续消息 (Wait/Listening)。")
                             return
 
-                        # 🟢 拦截 [TERMINAL_YIELD] 硬中断
                         if "[TERMINAL_YIELD]:" in reply_text:
                             idx = reply_text.find("[TERMINAL_YIELD]:")
                             terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:"):].strip()
                             logger.info(f"[{chat_id}] 🛑 触发硬中断 (TERMINAL_YIELD)，大模型被接管，纯文本下发: {terminal_content}")
-                            
-                            # 将终端内容通过 reply_engine 发送，维持拟人化延迟和可能的情绪流转
                             await self.reply_engine.handle_reply(event, terminal_content, chat_id)
-                            
                             if hasattr(self.evolution_manager, 'process_bot_reply'):
                                 await self.evolution_manager.process_bot_reply(chat_id, bot_id, terminal_content)
                             return
@@ -236,7 +250,6 @@ class ConcurrentExecutor:
                         if hasattr(self.evolution_manager, 'process_bot_reply'):
                             await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
 
-                        # 🟢 手动闭环记忆处理
                         try:
                             plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.gateway.context, 'astrmai', None)
                             if plugin and hasattr(plugin, 'memory_engine') and plugin.memory_engine.summarizer:
@@ -246,13 +259,48 @@ class ConcurrentExecutor:
                             
                         return 
                     except Exception as e:
+                        last_error = str(e)
                         logger.warning(f"[{chat_id}] ⚠️ Agent 模型 {provider_id} 调用异常，尝试切换备用: {e}")
                         continue
                 
-                # [新增] 循环结束，所有模型阵亡，触发终极兜底
                 logger.error(f"[{chat_id}] ❌ 所有 Agent 模型均已耗尽，触发系统兜底回复。")
-                fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
-                await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
+                await self._handle_fatal_fallback(event, chat_id, last_error if last_error else "Agent模型池全部耗尽。")
+
+        # [新增] 增加全局级的异常捕获，确保绝对的人设隔离
+        except Exception as global_e:
+            logger.error(f"[{chat_id}] 💥 Executor 遭遇未捕获的全局级崩溃: {global_e}")
+            await self._handle_fatal_fallback(event, chat_id, f"Executor 核心循环异常:\n{str(global_e)}")
+            
         finally:
             if hasattr(event, '_is_final_reply_phase'):
                 delattr(event, '_is_final_reply_phase')
+
+
+    async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str):
+        """[新增] 处理致命崩溃，执行兜底回复与管理员私聊推送"""
+        logger.error(f"[{chat_id}] ❌ 触发系统致命异常拦截，正在下发兜底回复。")
+        fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+        await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
+        
+        # 遍历管理员列表进行静默推送
+        config_global = getattr(self.config, 'global_settings', None)
+        if config_global and getattr(config_global, 'enable_error_interception', True):
+            admin_ids = getattr(config_global, 'admin_ids', [])
+            if not admin_ids:
+                return
+            
+            for admin_id in admin_ids:
+                try:
+                    # 获取当前平台标识，组装跨界私聊 UMO
+                    platform_id = event.unified_msg_origin.split(":")[0] 
+                    admin_umo = f"{platform_id}:FriendMessage:{admin_id}"
+                    
+                    from astrbot.api.event import MessageChain
+                    import astrbot.api.message_components as Comp
+                    
+                    error_report = f"🚨 [AstrMai 异常拦截报告]\n📍 目标: {event.unified_msg_origin}\n⚠️ 错误详情:\n{error_detail}"
+                    chain = MessageChain().message(error_report)
+                    await self.context.send_message(admin_umo, chain)
+                    logger.debug(f"[Executor] 成功向管理员 {admin_id} 推送报错日志。")
+                except Exception as e:
+                    logger.error(f"[Executor] 尝试向管理员 {admin_id} 推送报错时失败: {e}")

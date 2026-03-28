@@ -238,11 +238,22 @@ class EvolutionManager:
 
     async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
         """
-        [核心修复 Bug 2] 主动接收 executor 传来的、真正属于 AI 的生成文本并入库。
+        [修改] 主动接收 executor 传来的、真正属于 AI 的生成文本并入库。
+        增加污点拦截规则，防止报错信息污染潜意识记忆。
         """
         if not reply_text or not reply_text.strip():
             return
             
+        # ==========================================
+        # 🟢 [新增] 污点拦截规则 (Memory Pollution Purification)
+        # ==========================================
+        fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+        error_keywords = ["Exception", "failed", "Traceback", "请求失败", "APITimeoutError", "All chat models fail"]
+        
+        if reply_text.strip() == fallback_msg or any(keyword in reply_text for keyword in error_keywords):
+            logger.warning(f"[Evolution-Processor] 🚨 拦截到受污染的 Bot 回复，已抛弃该条潜意识记忆！内容: {reply_text[:30]}...")
+            return
+
         logger.info(f"[Evolution-Processor] 🧠 正在将真实的 Bot 回复计入潜意识日志: {reply_text[:20]}...")
             
         # 1. 使用异步方法记录真实消息
