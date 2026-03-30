@@ -146,19 +146,18 @@ class ConcurrentExecutor:
                             prompt += vision_inject 
 
                     # ==========================================
-                    # 🟢 [核心修复] 物理致盲：抹除原生事件中的图片组件
-                    # 避免底层框架嗅探到原生图片引发 VLM 二次路由崩溃
+                    # 🟢 [核心修复] 极致物理致盲：彻底抹除原生复杂组件
+                    # 防止 Napcat 传来的特殊组件(如 Reply/Face/空 Plain)被 AstrBot 
+                    # 错误序列化为非法格式 (如缺少 text 字段的 {"type": "text"}) 导致 LLM 400 报错。
                     # ==========================================
                     try:
-                        from astrbot.api.message_components import Image as AstrImageComponent
+                        from astrbot.api.message_components import Plain
                         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
-                            original_len = len(event.message_obj.message)
-                            event.message_obj.message = [
-                                comp for comp in event.message_obj.message 
-                                if not isinstance(comp, AstrImageComponent)
-                            ]
-                            if len(event.message_obj.message) < original_len:
-                                logger.debug(f"[{chat_id}] 🧹 已对底层核心执行物理致盲 (剥离 Image 组件)，彻底切断原生 VLM 路由。")
+                            # 提取安全文本，若为空则提供兜底标识
+                            safe_text = event.message_str.strip() if event.message_str else "[图片/特殊消息]"
+                            # 强制覆写为单一纯文本组件，彻底切断原生多模态路由崩溃可能
+                            event.message_obj.message = [Plain(text=safe_text)]
+                            logger.debug(f"[{chat_id}] 🧹 已对底层核心执行极致物理致盲，剥离所有特殊组件以防 Pydantic 400 崩溃。")
                     except Exception as e:
                         logger.warning(f"[{chat_id}] ⚠️ 物理致盲执行失败: {e}")
 
