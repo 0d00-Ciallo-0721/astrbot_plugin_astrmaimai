@@ -209,7 +209,7 @@ class AttentionGate:
                     if random.random() > probability:
                         return "IGNORE" 
 
-            if not is_private: 
+            if not is_private and not event.get_extra("is_virtual_poke"): 
                 msg_hash = hash(msg_str) if msg_str else hash(str(extracted_images))
                 if not hasattr(session, 'last_hash'):
                     session.last_hash = None
