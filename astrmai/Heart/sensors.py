@@ -55,7 +55,10 @@ class PreFilters:
         # 1. 忽略 Bot 自身发出的消息
         if event.get_sender_id() == event.get_self_id():
             return False
-
+        
+        if event.get_extra("is_virtual_poke"):
+            return True
+        
         # =================================================================
         # 🚀 [新增] 媒体链接白名单防护层 (AstrBot Parser 兼容补丁)
         # =================================================================

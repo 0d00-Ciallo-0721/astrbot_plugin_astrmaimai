@@ -478,18 +478,39 @@ class AstrMaiPlugin(Star):
             
         await self.evolution.record_user_message(event)
         
+        # 执行门控逻辑
         status = await self.attention_gate.process_event(event)
-        if status == "ENGAGED":
-            event.stop_event()
+        
+        # ==========================================
+        # 🟢 [架构级修复] 精准事件阻断逻辑 (解决双重回复且不饿死其他插件)
+        # ==========================================
+        is_direct_call = False
+        
+        # 1. 判定是否为私聊 (私聊必定是直接呼叫)
+        if not event.get_group_id():
+            is_direct_call = True
+        else:
+            # 2. 判定群聊中是否明确 @ 了机器人
+            bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else ""
+            if event.message_obj and event.message_obj.message:
+                for c in event.message_obj.message:
+                    if isinstance(c, Comp.At) and str(c.qq) == bot_id:
+                        is_direct_call = True
+                        break
+
+        # 逻辑判决：
+        # - 剥离暴力截断 event.stop_event()，保护事件监听链不被切断。
+        # - 如果 status == "ENGAGED" (被判定为极速响应)，必然阻断原生 LLM。
+        # - 如果 is_direct_call == True (私聊或明确@)，无论 AstrMai 是在开窗口缓冲还是决定忽略，
+        #   都已经由 AstrMai 全权接管了对话意志，必须抛出幽灵占位符欺骗底层默认 LLM，让其休眠！
+        if status == "ENGAGED" or is_direct_call:
+            yield event.plain_result("[ASTRMAI_GHOST_LOCK]")
 
     @filter.on_decorating_result(priority=90)
     async def intercept_and_notify_errors(self, event: AstrMessageEvent):
         """
-        [新增] 全局报错拦截器：拦截 API 错误不发送给用户，并私发给管理员
+        [修改] 全局拦截器：1. 静默销毁幽灵占位符 2. 拦截 API 错误并私发给管理员
         """
-        if not getattr(self.config.global_settings, 'enable_error_interception', True):
-            return
-
         result = event.get_result()
         if not result:
             return
@@ -515,6 +536,21 @@ class AstrMaiPlugin(Star):
                 return
                 
         if not message_str:
+            return
+
+        # ==========================================
+        # 🟢 [架构级修复] 静默销毁幽灵占位符 (优先拦截)
+        # ==========================================
+        if "[ASTRMAI_GHOST_LOCK]" in message_str:
+            from astrbot.api import logger
+            logger.debug("[AstrMai-Phantom] 👻 捕获到幽灵占位符，已静默销毁，成功欺骗底层框架。")
+            event.set_result(None)  # 清空内容，确保不发送给用户
+            return  # 立即放行结束，防止触发下面的报错告警
+
+        # ==========================================
+        # 检查是否开启了错误拦截 (原逻辑)
+        # ==========================================
+        if not getattr(self.config.global_settings, 'enable_error_interception', True):
             return
             
         # 定义错误特征库
@@ -546,7 +582,7 @@ class AstrMaiPlugin(Star):
                             await client.api.call_action('send_private_msg', user_id=int(admin_id), message=alert_msg)
                         except Exception as e:
                             logger.error(f"[AstrMai-ErrorGuard] 无法向管理员 {admin_id} 推送告警: {e}")
-
+    
     async def terminate(self):
         """优雅停机协调器 (Graceful Shutdown)"""
         logger.info("[AstrMai] 🛑 Terminating processes and unmounting...")
