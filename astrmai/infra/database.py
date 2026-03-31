@@ -391,6 +391,59 @@ class DatabaseService:
             session.commit()
 
 
+    async def save_cron_snapshot(self, snapshot: 'CronSnapshot') -> None:
+        """写入或更新 Cron 任务快照（在 CronAgent 成功创建任务后调用）"""
+        import asyncio
+        from .datamodels import CronSnapshot
+        import time
+        
+        def _sync():
+            with self.get_session() as session:
+                existing = session.get(CronSnapshot, snapshot.job_id)
+                if existing:
+                    existing.is_active = snapshot.is_active
+                    existing.updated_at = time.time()
+                    session.add(existing)
+                else:
+                    snapshot.updated_at = time.time()
+                    session.add(snapshot)
+                session.commit()
+        
+        async with self._db_lock:
+            await asyncio.to_thread(_sync)
+
+    async def get_all_active_cron_snapshots(self) -> list:
+        """获取所有 is_active=True 的快照（开机自愈时使用）"""
+        import asyncio
+        from .datamodels import CronSnapshot
+        from sqlmodel import select
+        
+        def _sync():
+            with self.get_session() as session:
+                stmt = select(CronSnapshot).where(CronSnapshot.is_active == True)
+                results = session.exec(stmt).all()
+                return [CronSnapshot.model_validate(r.model_dump()) for r in results]
+        
+        return await asyncio.to_thread(_sync)
+
+    async def deactivate_cron_snapshot(self, job_id: str) -> None:
+        """注销快照（任务完成或被删除后调用）"""
+        import asyncio
+        from .datamodels import CronSnapshot
+        import time
+        
+        def _sync():
+            with self.get_session() as session:
+                snap = session.get(CronSnapshot, job_id)
+                if snap:
+                    snap.is_active = False
+                    snap.updated_at = time.time()
+                    session.add(snap)
+                    session.commit()
+        
+        async with self._db_lock:
+            await asyncio.to_thread(_sync)
+
 
     async def save_jargon_async(self, jargon: Jargon):
         """[新增] 将同步写库操作推入线程池，释放主事件循环，防止高并发假死"""

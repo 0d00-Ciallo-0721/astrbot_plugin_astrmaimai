@@ -169,3 +169,52 @@ class PersistenceManager:
         """[新增] 异步保存人设摘要缓存"""
         import asyncio
         return await asyncio.to_thread(self.save_persona_cache, cache_data)
+    
+
+
+    async def _init_db(self):
+        """初始化异步高频表 (绕过 SQLModel 开销)"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_states (
+                        chat_id TEXT PRIMARY KEY,
+                        energy REAL,
+                        mood REAL,
+                        group_config TEXT,
+                        last_reset_date TEXT,
+                        total_replies INTEGER,
+                        updated_at REAL
+                    )
+                """)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id TEXT PRIMARY KEY,
+                        name TEXT,
+                        social_score REAL,
+                        last_seen REAL,
+                        persona_analysis TEXT,
+                        group_footprints TEXT,
+                        identity TEXT,
+                        updated_at REAL
+                    )
+                """)
+                # [新增] CronSnapshot 快照表的原生 SQL 兜底建表
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS cronsnapshot (
+                        job_id      TEXT PRIMARY KEY,
+                        name        TEXT DEFAULT '',
+                        cron_expression TEXT,
+                        run_at      REAL,
+                        run_once    INTEGER DEFAULT 0,
+                        target_origin TEXT DEFAULT '',
+                        payload     TEXT DEFAULT '{}',
+                        note        TEXT DEFAULT '',
+                        is_active   INTEGER DEFAULT 1,
+                        created_at  REAL,
+                        updated_at  REAL
+                    )
+                """)
+                await db.commit()
+        except Exception as e:
+            logger.error(f"[AstrMai-Infra] 数据库异步表初始化失败: {e}")

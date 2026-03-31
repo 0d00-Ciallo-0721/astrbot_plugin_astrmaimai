@@ -8,7 +8,7 @@ from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
 
-# [修改] 统一导入所有系统原生工具与新增的 4 个拟人化微操工具
+# 统一导入所有系统原生工具与新增的 4 个拟人化微操工具
 from .tools.pfc_tools import (
     WaitTool, 
     OmniPerceptionTool, 
@@ -39,7 +39,8 @@ class Planner:
                  memory_engine: MemoryEngine,
                  evolution_manager: EvolutionManager,
                  state_engine=None,
-                 prompt_refiner=None  # [新增] 接收注入的 Refiner
+                 prompt_refiner=None,
+                 sys3_router=None  # [新增] 接收注入的 Sys3 Router
                  ):
         self.gateway = gateway
         self.context_engine = context_engine
@@ -47,17 +48,15 @@ class Planner:
         self.evolution_manager = evolution_manager
         self.state_engine = state_engine  
         self.reply_engine = reply_engine 
-        self.prompt_refiner = prompt_refiner # [新增] 挂载 Refiner
+        self.prompt_refiner = prompt_refiner 
+        self.sys3_router = sys3_router  # [新增] 挂载 Sys3 Router
         
         self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
         
-# [修改] 函数位置：astrmai/Brain/planner.py -> Planner 类下
-# [修改] 
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
-        [修改] 在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
-        增加 6 个新增拟人化工具的挂载
-        [修改] 阶段三：主脑负载编排，提取直通图片 URL 并注入多模态旁白，传递给 Executor。
+        在发送给大模型前显式调用 Refiner 进行渲染，实现 100% 的确定性执行
+        阶段三：主脑负载编排，提取直通图片 URL 并注入多模态旁白，传递给 Executor。
         """
         chat_id = event.unified_msg_origin
         user_id = event.get_sender_id() 
@@ -68,7 +67,7 @@ class Planner:
             retrieve_keys = []
             
         # ==========================================
-        # 🟢 [核心修复] 同步底层引擎的 is_fast_mode 标识
+        # 🟢 同步底层引擎的 is_fast_mode 标识
         # 确保 ContextEngine 和 Refiner 接收到 "CORE_ONLY" 指令并使用压缩人格
         # ==========================================
         if event.get_extra("is_fast_mode", False) and "CORE_ONLY" not in retrieve_keys:
@@ -76,6 +75,10 @@ class Planner:
             
         is_all_mode = "ALL" in retrieve_keys
         is_fast_mode = "CORE_ONLY" in retrieve_keys
+        
+        # [Sys3新增] 读取 Sys1 透传的裁决动作
+        judge_action = event.get_extra("judge_action", "REPLY")
+        is_tool_call_mode = (judge_action == "TOOL_CALL") and (self.sys3_router is not None)
         
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
@@ -87,7 +90,6 @@ class Planner:
             window_lines.append(f"[{sender_name}] 说: {rich_text}")
         prompt_content = "\n".join(window_lines)
         
-        import asyncio
         if is_fast_mode:
             slang_context = ""
         else:
@@ -97,6 +99,7 @@ class Planner:
         
         ctx = getattr(self.context_engine, 'context', None)
         
+        # [修改] 重构 tools 选择分支
         if is_all_mode:
             tools = None
             if ctx:
@@ -104,8 +107,35 @@ class Planner:
                     ctx.set("disable_rag_injection", True)
                 elif hasattr(ctx, "shared_dict"):
                     ctx.shared_dict["disable_rag_injection"] = True
+                    
+        elif is_tool_call_mode:
+            # ── [Sys3新增] TOOL_CALL 模式：加载 Sys3 SubAgent 轻量索引 ──
+            sys3_light_tools = (await self.sys3_router.get_light_tools_for_planner()).tools
+            
+            # 保留核心 PFC 拟人工具，去除纯情感/聊天微操工具，专注执行任务
+            task_mode_pfc_tools = [
+                WaitTool(),
+                OmniPerceptionTool(
+                    memory_engine=self.memory_engine,
+                    db_service=self.context_engine.db,
+                    chat_id=chat_id,
+                    current_sender_id=str(user_id) if user_id is not None else "",
+                    current_sender_name=sender_name
+                ),
+            ]
+            
+            tools = task_mode_pfc_tools + sys3_light_tools
+            
+            # TOOL_CALL 模式下关闭 RAG 注入以减少干扰
+            if ctx:
+                if hasattr(ctx, "set"):
+                    ctx.set("disable_rag_injection", True)
+                elif hasattr(ctx, "shared_dict"):
+                    ctx.shared_dict["disable_rag_injection"] = True
+            logger.info(f"[{chat_id}] 🔧 [TOOL_CALL 模式] 加载 Sys3 SubAgent 索引，工具总数: {len(tools)}")
+            
         else:
-        
+            # ── 原有纯聊天模式 ──
             tools = [
                 WaitTool(),
                 OmniPerceptionTool(
@@ -122,8 +152,8 @@ class Planner:
                 TopicHijackTool(),
                 SpaceTransitionTool(),
                 RegretAndWithdrawTool(),
-                MessageReactionTool(),                                  # ✨ [新增] 贴表情回应工具
-                ProactiveLikeTool(db_service=self.context_engine.db)    # 👍 [新增] 狂点赞工具 (注入 db_service 进行实体反推)
+                MessageReactionTool(),                                  
+                ProactiveLikeTool(db_service=self.context_engine.db)    
             ]
             if ctx:
                 if is_fast_mode:
@@ -148,8 +178,7 @@ class Planner:
             sys1_thought=sys1_thought 
         )
 
-        # === [新增修复逻辑: 基于信标的源会话语境溯源拉取] ===
-        # 如果当前是私聊会话
+        # === [基于信标的源会话语境溯源拉取] ===
         if not event.get_group_id():
             shared_dict = getattr(ctx, "shared_dict", {})
             jumps = shared_dict.get("astrmai_space_jumps", {})
@@ -164,24 +193,19 @@ class Planner:
                     source_group_id = jump_info.get("group_id")
                     group_context_str = ""
                     
-                    # 借鉴底层穿透代码，逆向抓取跳出前的群聊历史
                     if source_group_id and ctx:
                         try:
                             conv_mgr = ctx.conversation_manager
-                            # 构造群聊的 UID
                             uid = f"default:GroupMessage:{source_group_id}"
                             curr_cid = await conv_mgr.get_curr_conversation_id(uid)
                             conversation = await conv_mgr.get_conversation(uid, curr_cid)
                             
                             import json
-                            # 解析该群的 JSON 历史记录
                             history = json.loads(conversation.history) if conversation and conversation.history else []
                             
                             recent_msgs = []
-                            # 提取最近的 5 条群聊上下文
                             for msg in history[-5:]:
                                 role = msg.get("role", "")
-                                # 提取文本节点
                                 text_parts = [
                                     item.get("text", "") 
                                     for item in (msg.get("content") or []) 
@@ -189,7 +213,6 @@ class Planner:
                                 ]
                                 content = " ".join(text_parts) if text_parts else ""
                                 if content:
-                                    # 简易区分用户与自身
                                     speaker = "群友" if role == "user" else "你"
                                     recent_msgs.append(f"[{speaker}]: {content}")
                             
@@ -198,7 +221,6 @@ class Planner:
                         except Exception as e:
                             logger.error(f"🤫 [Planner] 溯源群聊历史失败: {e}")
 
-                    # 构建跨界记忆注入包
                     sys_inject = (
                         f"\n\n>>> [!!! 极其重要的跨界前置记忆 !!!] <<<\n"
                         f"几分钟前，你刚刚在群聊 (群号:{source_group_id}) 中与大家互动，随后跳出来主动给当前用户发了一句私聊：\n"
@@ -217,20 +239,26 @@ class Planner:
                     system_prompt += sys_inject
                     logger.info(f"🤫 [Planner] 已触发跨界语境补偿，成功抓取群聊历史并注入到 {sender_id} 的私聊思考中。")
                 
-                # 阅后即焚，清理信标
                 del jumps[sender_id]
         # ===============================================
+
+        # [Sys3新增] 在 final_prompt 渲染前，如果处于工具模式，追加委派提示词
+        if is_tool_call_mode:
+            system_prompt += (
+                "\n\n>>> [工作委派模式] <<<\n"
+                "用户提出了明确的执行性需求。\n"
+                "你现在的首要任务是：调用上方列出的对应子智能体工具来完成任务，而不是直接用文字假装执行。\n"
+                "子智能体会替你真正执行任务并返回结果，你再将结果用你的语气告诉用户。\n"
+                ">>> [委派说明结束] <<<"
+            )
 
         if is_all_mode:
             user_message = event.message_str
             system_prompt += f"\n\n>>> [当前任务核心] 用户刚才发送了消息：“{user_message}”，你必须且只能基于此消息进行回复！ <<<"
-
-        # 🟢 [核心瘦身] 彻底删除了重复的 [物理动作规范] 和 [工具输出约束]，依靠 ContextEngine 中更系统的指南即可。
             
         if is_fast_mode:
             system_prompt += "\n\n>>> [极速穿透模式] 你被强唤醒！请立刻、简短、直接地响应最新呼唤，忽略不必要的长篇大论。 <<<"
         
-        # 🟢 [核心重构] 显式调用 Refiner 进行字符串渲染，直接闭环获得处理后的 Prompt
         final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
             event=event, 
             system_prompt=system_prompt, 
@@ -238,9 +266,6 @@ class Planner:
             context=ctx
         )
 
-        # ==========================================
-        # [新增] 阶段三：主脑负载编排 (主脑视觉直通车)
-        # ==========================================
         direct_vision_urls = event.get_extra("direct_vision_urls", [])
         if direct_vision_urls:
             final_prompt += "\n(导演旁白：用户递给了你几张照片，请结合画面内容进行回应。)"
@@ -251,5 +276,5 @@ class Planner:
             system_prompt=final_system_prompt,
             prompt=final_prompt,
             tools=tools,
-            direct_vision_urls=direct_vision_urls # [修改] 传递直通车 URL 到第四阶段
+            direct_vision_urls=direct_vision_urls 
         )

@@ -42,6 +42,10 @@ from .astrmai.Heart.sensors import PreFilters
 from .astrmai.Heart.attention import AttentionGate
 from .astrmai.Heart.visual_cortex import VisualCortex 
 
+# --- Phase 7: System 3 (Task) ---
+from .astrmai.sys3.router import Sys3Router
+from .astrmai.sys3.cron_guard.heartbeat import CronHeartbeatGuard
+
 @register("astrmai", "Gemini Antigravity", "AstrMai: Dual-Process Architecture Plugin", "1.0.0", "https://github.com/0d00-Ciallo-0721/astrbot_plugin_astrmaimai")
 class AstrMaiPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -87,6 +91,10 @@ class AstrMaiPlugin(Star):
         # 🟢 显式传入 db_service 给 PromptRefiner，解决图片失忆症
         self.prompt_refiner = PromptRefiner(self.memory_engine, self.db_service, self.config) 
         
+        # 🟢 [Sys3新增] 初始化 Sys3 路由与降级版快照守护
+        self.sys3_router = Sys3Router(self.config, context)
+        self.cron_guard = CronHeartbeatGuard(self.db_service, context)
+
         self.system2_planner = Planner(
             context, 
             self.gateway, 
@@ -95,7 +103,8 @@ class AstrMaiPlugin(Star):
             self.memory_engine, 
             self.evolution,
             state_engine=self.state_engine,
-            prompt_refiner=self.prompt_refiner # 注入 Refiner 给 Planner 显式调用
+            prompt_refiner=self.prompt_refiner, # 注入 Refiner 给 Planner 显式调用
+            sys3_router=self.sys3_router # 🟢 [Sys3新增] 注入路由
         )
 
         self.attention_gate = AttentionGate(
@@ -155,6 +164,11 @@ class AstrMaiPlugin(Star):
         self._fire_and_forget(self._memory_gc_task())
         # 拉起数据库批量同步后台任务
         self._fire_and_forget(self._db_sync_task())
+        
+        # 🟢 [Sys3新增] 启动 Sys3 降级版快照清理守护进程
+        await self.cron_guard.reload_all_lost_jobs()
+        self._fire_and_forget(self.cron_guard.run_heartbeat())
+        logger.info("[AstrMai] ⏰ Sys3 CronHeartbeatGuard 已启动。")
 
     async def _db_sync_task(self):
         """数据库微批处理后台任务，增加 CancelledError 保护防死锁"""
@@ -588,6 +602,60 @@ class AstrMaiPlugin(Star):
                         except Exception as e:
                             logger.error(f"[AstrMai-ErrorGuard] 无法向管理员 {admin_id} 推送告警: {e}")
     
+    @filter.command("work")
+    async def enter_sys3_direct(self, event: AstrMessageEvent):
+        """直通 Sys3: 跳过闲聊意图识别，以完整工具集纯任务模式执行"""
+        task_query = event.message_str.replace("/work", "").strip()
+        if not task_query:
+            yield event.plain_result(
+                "❓ 请告诉我需要执行什么任务。\n"
+                "示例：`/work 帮我定一个明天早8点的开会提醒`"
+            )
+            return
+        
+        umo = event.unified_msg_origin
+        chat_id = umo
+        
+        # 获取 Provider ID
+        models = self.gateway.get_agent_models()
+        if not models or models[0] == 'Unconfigured':
+            yield event.plain_result("❌ Agent 模型未配置，无法执行任务。")
+            return
+        provider_id = models[0] 
+        
+        full_tools = await self.sys3_router.get_full_tools_for_direct_entry()
+        
+        # 免疫标记与底层框架兜底幽灵锁
+        event.set_extra("astrmai_is_self_reply", True)  
+        event.call_llm = True  
+        
+        from astrbot.api import logger
+        logger.info(f"[{chat_id}] 🔧 [/work 直通] 进入 Sys3 纯任务模式：{task_query[:50]}...")
+        
+        try:
+            llm_resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=task_query,
+                system_prompt=(
+                    "你是一名专业的任务执行者，技术精湛、执行高效。\n"
+                    "收到任务后，立即调用最合适的工具执行，无需过多解释流程。\n"
+                    "任务完成后，用简洁清晰的语言汇报结果。"
+                ),
+                tools=full_tools,
+                max_steps=30,
+                tool_call_timeout=120
+            )
+            
+            reply = getattr(llm_resp, 'completion_text', None) or "任务执行完毕，但无文字输出。"
+            await self.reply_engine.handle_reply(event, reply, chat_id)
+            
+        except Exception as e:
+            logger.error(f"[{chat_id}] /work 直通 Sys3 异常: {e}")
+            await self.reply_engine.handle_reply(
+                event, f"任务执行中发生错误：{str(e)[:100]}", chat_id
+            )
+
     async def terminate(self):
         """优雅停机协调器 (Graceful Shutdown)"""
         logger.info("[AstrMai] 🛑 Terminating processes and unmounting...")
@@ -598,6 +666,10 @@ class AstrMaiPlugin(Star):
         
         if hasattr(self, 'proactive_task'):
             await self.proactive_task.stop()
+
+        # 🟢 [Sys3新增] 停止 Cron 快照守护
+        if hasattr(self, 'cron_guard'):
+            self.cron_guard.stop()
 
         tasks_to_wait = []
         if hasattr(self, '_background_tasks'):

@@ -194,3 +194,23 @@ class MemoryEvent(SQLModel, table=True):
     reflection: str = Field(default="")
     tags: str = Field(default="[]") # JSON string list
     created_at: float = Field(default_factory=time.time)
+
+class CronSnapshot(SQLModel, table=True):
+    """
+    定时任务快照表 —— 双轨制守护的持久化轨道
+    每次 CronAgent 成功创建定时任务时写入此表；
+    开机自愈时读取此表并与 APScheduler 比对复活任务。
+    """
+    __table_args__ = {"extend_existing": True}
+    
+    job_id: str = Field(primary_key=True, description="APScheduler 任务 ID，全局唯一")
+    name: str = Field(default="", description="任务的人类可读名称")
+    cron_expression: Optional[str] = Field(default=None, description="5段cron表达式，如 '0 9 * * *'")
+    run_at: Optional[float] = Field(default=None, description="一次性执行的 Unix 时间戳")
+    run_once: bool = Field(default=False, description="是否是一次性任务，执行后自动注销")
+    target_origin: str = Field(default="", description="unified_msg_origin，决定结果推送给哪个会话")
+    payload: str = Field(default="{}", description="任务携带的附加 JSON 数据")
+    note: str = Field(default="", description="任务备注（LLM 生成的任务描述）")
+    is_active: bool = Field(default=True, description="是否仍有效（执行后或手动删除后设为 False）")
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)

@@ -681,6 +681,8 @@ class AttentionGate:
                         logger.info(f"[{chat_id}] 📋 [Sys1 追踪] Judge 裁决结果 -> Action: {plan.action} | Thought: {plan.thought}")
                         
                         main_event.set_extra("sys1_thought", plan.thought)
+                        # [Sys3新增] 透传裁决动作供 Planner 区分路由
+                        main_event.set_extra("judge_action", plan.action) 
 
                         if plan.action in ["REPLY", "WAIT", "TOOL_CALL"]:
                             safe_thought = plan.thought or "无"
