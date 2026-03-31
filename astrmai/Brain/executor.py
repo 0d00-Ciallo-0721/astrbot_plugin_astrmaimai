@@ -28,7 +28,7 @@ class ConcurrentExecutor:
         
         
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None):
-        """[修改] 融合视觉皮层成功逻辑的 VLM 同步降维转述模式，并加入强力的底层 API 崩溃嗅探以激活模型池。同时对底层组件执行物理致盲拦截。"""
+        """融合视觉皮层成功逻辑的 VLM 同步降维转述模式，并加入强力的底层 API 崩溃嗅探以激活模型池。"""
         chat_id = event.unified_msg_origin
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
@@ -147,17 +147,22 @@ class ConcurrentExecutor:
 
                     # ==========================================
                     # 🟢 [核心修复] 极致物理致盲：彻底抹除原生复杂组件
-                    # 防止 Napcat 传来的特殊组件(如 Reply/Face/空 Plain)被 AstrBot 
-                    # 错误序列化为非法格式 (如缺少 text 字段的 {"type": "text"}) 导致 LLM 400 报错。
+                    # 彻底阻断 Napcat 特殊组件 (Reply/Face) 引发的 Pydantic 400 崩溃
                     # ==========================================
                     try:
                         from astrbot.api.message_components import Plain
                         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
                             # 提取安全文本，若为空则提供兜底标识
                             safe_text = event.message_str.strip() if event.message_str else "[图片/特殊消息]"
-                            # 强制覆写为单一纯文本组件，彻底切断原生多模态路由崩溃可能
-                            event.message_obj.message = [Plain(text=safe_text)]
-                            logger.debug(f"[{chat_id}] 🧹 已对底层核心执行极致物理致盲，剥离所有特殊组件以防 Pydantic 400 崩溃。")
+                            
+                            # 🟢 必须使用原地 clear 和 append，绝对禁止直接重写 message 属性 (会破坏 AstrBot 序列化基类)
+                            if hasattr(event.message_obj.message, "clear"):
+                                event.message_obj.message.clear()
+                                event.message_obj.message.append(Plain(safe_text))
+                            else:
+                                event.message_obj.message = [Plain(safe_text)]
+                                
+                            logger.debug(f"[{chat_id}] 🧹 已对底层核心执行极致物理致盲，原地剥离所有特殊组件。")
                     except Exception as e:
                         logger.warning(f"[{chat_id}] ⚠️ 物理致盲执行失败: {e}")
 
@@ -268,7 +273,7 @@ class ConcurrentExecutor:
 
 
     async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str):
-        """[新增] 处理致命崩溃，执行兜底回复与管理员私聊推送"""
+        """处理致命崩溃，执行兜底回复与管理员私聊推送"""
         logger.error(f"[{chat_id}] ❌ 触发系统致命异常拦截，正在下发兜底回复。")
         fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
         await self.reply_engine.handle_reply(event, fallback_msg, chat_id)

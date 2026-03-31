@@ -504,6 +504,11 @@ class AstrMaiPlugin(Star):
         # - 如果 is_direct_call == True (私聊或明确@)，无论 AstrMai 是在开窗口缓冲还是决定忽略，
         #   都已经由 AstrMai 全权接管了对话意志，必须抛出幽灵占位符欺骗底层默认 LLM，让其休眠！
         if status == "ENGAGED" or is_direct_call:
+            
+            # 🌟 [核心修复] 投递 call_llm 诱饵，语义级欺骗底层 ProcessStage 的兜底判定
+            # 此操作无损放行下游指令/功能插件，但会直接阻断底层 AstrMainAgent 的双重回复
+            event.call_llm = True 
+            
             yield event.plain_result("[ASTRMAI_GHOST_LOCK]")
 
     @filter.on_decorating_result(priority=90)
