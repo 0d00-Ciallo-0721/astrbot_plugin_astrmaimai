@@ -39,6 +39,7 @@ class MoodManager:
     async def analyze_mood(self, text: str, current_mood: float, user_affection: float = 0.0) -> Tuple[str, float]:
         """
         [修改] 分析情绪时，引入当前用户的好感度 (Affection) 维度，模拟更真实的复合心理状态。
+        同时增强对 AI 异常输出格式的极端容错解析能力。
         """
         if not text or len(text) < 2:
             return "neutral", current_mood
@@ -73,38 +74,78 @@ class MoodManager:
 严格返回 JSON: {{"mood_tag": "string", "mood_value": float}}
 """
         try:
-            # [修改点] 使用专属的情绪分析任务接口
+            # 使用专属的情绪分析任务接口
             result = await self.gateway.call_mood_task(prompt, system_prompt="你是一个具备丰富情感和社交包容度的专业分析师。")
             
-# 安全解析 JSON (增强鲁棒性版)
-            import json
-            import re
-            import ast # [新增] 用于解析单引号脏数据
-            
-            json_str = str(result)
-            match = re.search(r'\{.*\}', json_str, re.DOTALL)
-            if match:
-                json_str = match.group(0)
-            
             data = {}
-            if isinstance(json_str, str):
-                try:
-                    # 1. 优先尝试标准 JSON 解析
-                    data = json.loads(json_str)
-                except json.JSONDecodeError as e:
-                    logger.debug(f"[MoodManager] 标准 JSON 解析失败，尝试容错解析: {e}")
-                    try:
-                        # 2. 容错解析：处理大模型经常发出的单引号字典 {'mood_tag': 'happy'}
-                        data = ast.literal_eval(json_str)
-                    except Exception as fallback_e:
-                        raise ValueError(f"彻底无法解析的脏数据: {json_str}")
+            # 1. 理想情况：网关已经直接返回了字典对象
+            if isinstance(result, dict):
+                data = result
             else:
-                data = json_str
+                import json
+                import re
+                import ast 
                 
+                raw_str = str(result).strip()
+                
+                # 预处理：清洗掉可能存在的 markdown 代码块符号
+                clean_str = re.sub(r'```', '', clean_str)
+
+                parsed_successfully = False
+                
+                # 2. 尝试提取 {} 或 [] 内的结构化内容 (应对带有 "回答是：" 前缀的情况)
+                match = re.search(r'(\{.*\}|\[.*\])', clean_str, re.DOTALL)
+                if match:
+                    json_str = match.group(1)
+                    try:
+                        # 尝试标准 JSON 解析
+                        parsed_data = json.loads(json_str)
+                        # 如果 AI 输出的是 [{...}] 格式，提取列表中的第一个字典
+                        if isinstance(parsed_data, list) and len(parsed_data) > 0 and isinstance(parsed_data[0], dict):
+                            data = parsed_data[0]
+                        elif isinstance(parsed_data, dict):
+                            data = parsed_data
+                        
+                        if data:
+                            parsed_successfully = True
+                    except json.JSONDecodeError as e:
+                        logger.debug(f"[MoodManager] 标准 JSON 解析失败，尝试 AST 容错解析: {e}")
+                        try:
+                            # 尝试 AST 解析 (应对使用了单引号 {'mood_tag': 'happy'} 的脏数据)
+                            eval_data = ast.literal_eval(json_str)
+                            if isinstance(eval_data, list) and len(eval_data) > 0 and isinstance(eval_data[0], dict):
+                                data = eval_data[0]
+                            elif isinstance(eval_data, dict):
+                                data = eval_data
+                                
+                            if data:
+                                parsed_successfully = True
+                        except Exception:
+                            pass
+                
+                # 3. 终极降级防线：正则暴力键值对提取
+                # 应对格式彻底损坏、或者被包裹在圆括号 (mood_tag: happy) 中的情况
+                if not parsed_successfully or ("mood_tag" not in data and "mood_value" not in data):
+                    logger.debug(f"[MoodManager] 结构化解析均失败，启动正则暴力提取: {raw_str[:50]}...")
+                    
+                    # 匹配 mood_tag，支持冒号、等号，以及是否带有引号
+                    tag_match = re.search(r'(?:"|\')?mood_tag(?:"|\')?\s*[:：=]\s*(?:"|\')?([a-zA-Z0-9_]+)(?:"|\')?', clean_str, re.IGNORECASE)
+                    if tag_match:
+                        data["mood_tag"] = tag_match.group(1).lower()
+
+                    # 匹配 mood_value，提取浮点数或整数
+                    val_match = re.search(r'(?:"|\')?mood_value(?:"|\')?\s*[:：=]\s*([-+]?\d*\.?\d+)', clean_str, re.IGNORECASE)
+                    if val_match:
+                        try:
+                            data["mood_value"] = float(val_match.group(1))
+                        except ValueError:
+                            pass
+
+            # 取值并应用兜底默认值
             mood_tag = data.get("mood_tag", "neutral")
             mood_value = float(data.get("mood_value", current_mood))
             
-            # 限幅
+            # 严格限幅
             mood_value = max(-1.0, min(1.0, mood_value))
             return mood_tag, mood_value
             
@@ -122,5 +163,4 @@ class MoodManager:
             elif any(w in fallback_text for w in ["?", "？", "啊", "怎么会", "啥", "什么"]):
                 return "surprise", current_mood
                 
-            # 如果连降级都没命中，强制给个保底情绪概率触发（可选）
-            return "happy", current_mood # 临时测试用：为了验证表情包畅通，如果都匹配不到默认给 happy
+            return "happy", current_mood
