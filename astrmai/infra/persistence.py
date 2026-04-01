@@ -8,7 +8,7 @@ from typing import Dict, List, Any, Optional
 from sqlmodel import SQLModel, create_engine, Session
 from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from .datamodels import ChatState, UserProfile, LastMessageMetadataDB, ExpressionPattern, MessageLog
+from .datamodels import ChatState, UserProfile, LastMessageMetadataDB, ExpressionPattern, MessageLog, CronSnapshot
 
 class PersistenceManager:
     """

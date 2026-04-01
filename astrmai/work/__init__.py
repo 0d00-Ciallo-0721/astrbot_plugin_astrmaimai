@@ -1,2 +1,2 @@
-# astrmai/sys3/__init__.py
-"""AstrMai Sys3 — 任务执行层"""
+# astrmai/work/__init__.py
+"""AstrMai Sys3(Work) — 任务执行层"""

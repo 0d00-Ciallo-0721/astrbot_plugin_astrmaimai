@@ -43,8 +43,8 @@ from .astrmai.Heart.attention import AttentionGate
 from .astrmai.Heart.visual_cortex import VisualCortex 
 
 # --- Phase 7: System 3 (Task) ---
-from .astrmai.sys3.router import Sys3Router
-from .astrmai.sys3.cron_guard.heartbeat import CronHeartbeatGuard
+from .astrmai.work.router import Sys3Router
+from .astrmai.work.cron_guard.heartbeat import CronHeartbeatGuard
 
 @register("astrmai", "Gemini Antigravity", "AstrMai: Dual-Process Architecture Plugin", "1.0.0", "https://github.com/0d00-Ciallo-0721/astrbot_plugin_astrmaimai")
 class AstrMaiPlugin(Star):
@@ -92,7 +92,8 @@ class AstrMaiPlugin(Star):
         self.prompt_refiner = PromptRefiner(self.memory_engine, self.db_service, self.config) 
         
         # 🟢 [Sys3新增] 初始化 Sys3 路由与降级版快照守护
-        self.sys3_router = Sys3Router(self.config, context)
+        # 🟢 [修改] 显式传入 self.db_service 给 Sys3Router 以支撑 CronAgent 的双写需求
+        self.sys3_router = Sys3Router(self.config, context, self.db_service)
         self.cron_guard = CronHeartbeatGuard(self.db_service, context)
 
         self.system2_planner = Planner(
