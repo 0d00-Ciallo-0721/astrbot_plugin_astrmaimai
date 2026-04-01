@@ -396,7 +396,7 @@
       }
     }
   },
-  "vision": {
+"vision": {
     "type": "object",
     "description": "👁️ 多模态视觉皮层 (Vision)",
     "items": {
@@ -409,8 +409,19 @@
       "image_recognition_probability": {
         "description": "图片识别概率",
         "type": "float",
-        "default": 0.5,
-        "hint": "取值 0.0~1.0。用于节约 API Token 成本，未命中概率的图片将被系统直接忽略"
+        "default": 0.5
+      }
+    }
+  },
+  "sys3": {
+    "type": "object",
+    "description": "🛠️ 任务工作流 (Sys3)",
+    "items": {
+      "enable_work_mode": {
+        "description": "启用任务执行模式 (Work)",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后将挂载纯任务执行代理及定时任务自愈功能。若只需日常对话沟通，建议关闭以节省资源。"
       }
     }
   },

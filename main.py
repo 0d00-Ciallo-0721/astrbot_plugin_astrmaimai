@@ -91,10 +91,15 @@ class AstrMaiPlugin(Star):
         # 🟢 显式传入 db_service 给 PromptRefiner，解决图片失忆症
         self.prompt_refiner = PromptRefiner(self.memory_engine, self.db_service, self.config) 
         
-        # 🟢 [Sys3新增] 初始化 Sys3 路由与降级版快照守护
-        # 🟢 [修改] 显式传入 self.db_service 给 Sys3Router 以支撑 CronAgent 的双写需求
-        self.sys3_router = Sys3Router(self.config, context, self.db_service)
-        self.cron_guard = CronHeartbeatGuard(self.db_service, context)
+        # 🟢 [Sys3配置拦截] 根据配置决定是否初始化 Sys3 路由与降级版快照守护
+        if getattr(self.config, 'sys3', None) and getattr(self.config.sys3, 'enable_work_mode', False):
+            self.sys3_router = Sys3Router(self.config, context, self.db_service)
+            self.cron_guard = CronHeartbeatGuard(self.db_service, context)
+            logger.info("[AstrMai] 🚦 Sys3 (Work 阶段) 已根据配置启用。")
+        else:
+            self.sys3_router = None
+            self.cron_guard = None
+            logger.info("[AstrMai] ⏸️ Sys3 (Work 阶段) 已关闭，运行于纯闲聊对话模式。")
 
         self.system2_planner = Planner(
             context, 
@@ -104,8 +109,8 @@ class AstrMaiPlugin(Star):
             self.memory_engine, 
             self.evolution,
             state_engine=self.state_engine,
-            prompt_refiner=self.prompt_refiner, # 注入 Refiner 给 Planner 显式调用
-            sys3_router=self.sys3_router # 🟢 [Sys3新增] 注入路由
+            prompt_refiner=self.prompt_refiner,
+            sys3_router=self.sys3_router 
         )
 
         self.attention_gate = AttentionGate(
@@ -166,10 +171,11 @@ class AstrMaiPlugin(Star):
         # 拉起数据库批量同步后台任务
         self._fire_and_forget(self._db_sync_task())
         
-        # 🟢 [Sys3新增] 启动 Sys3 降级版快照清理守护进程
-        await self.cron_guard.reload_all_lost_jobs()
-        self._fire_and_forget(self.cron_guard.run_heartbeat())
-        logger.info("[AstrMai] ⏰ Sys3 CronHeartbeatGuard 已启动。")
+        # 🟢 [Sys3配置拦截] 仅当 Sys3 启用且存在时，才启动守护进程
+        if getattr(self, 'cron_guard', None):
+            await self.cron_guard.reload_all_lost_jobs()
+            self._fire_and_forget(self.cron_guard.run_heartbeat())
+            logger.info("[AstrMai] ⏰ Sys3 CronHeartbeatGuard 已启动。")
 
     async def _db_sync_task(self):
         """数据库微批处理后台任务，增加 CancelledError 保护防死锁"""
@@ -606,6 +612,12 @@ class AstrMaiPlugin(Star):
     @filter.command("work")
     async def enter_sys3_direct(self, event: AstrMessageEvent):
         """直通 Sys3: 跳过闲聊意图识别，以完整工具集纯任务模式执行"""
+        
+        # 🟢 [Sys3配置拦截] 若未开启任务模式，拦截指令并进行提示
+        if not getattr(self.config, 'sys3', None) or not getattr(self.config.sys3, 'enable_work_mode', False):
+            yield event.plain_result("❌ Sys3 任务工作模式已关闭，请在 WebUI 配置中启用后重试。")
+            return
+            
         task_query = event.message_str.replace("/work", "").strip()
         if not task_query:
             yield event.plain_result(
@@ -668,8 +680,8 @@ class AstrMaiPlugin(Star):
         if hasattr(self, 'proactive_task'):
             await self.proactive_task.stop()
 
-        # 🟢 [Sys3新增] 停止 Cron 快照守护
-        if hasattr(self, 'cron_guard'):
+        # 🟢 [Sys3配置拦截] 仅当 Sys3 启用且存在时，才停止守护进程
+        if getattr(self, 'cron_guard', None):
             self.cron_guard.stop()
 
         tasks_to_wait = []

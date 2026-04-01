@@ -103,6 +103,9 @@ class VisionConfig(BaseModel):
     enable_vision: bool = Field(default=True, description="多模态视觉总开关")
     image_recognition_probability: float = Field(default=0.5, description="图片被送入视觉皮层解析的概率 (0.0~1.0)")
 
+class Sys3Settings(BaseModel):
+    enable_work_mode: bool = Field(default=False, description="是否启用 Sys3 工作任务模式")
+
 class AstrMaiConfig(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     global_settings: GlobalSettingsConfig = Field(default_factory=GlobalSettingsConfig)
@@ -119,3 +122,4 @@ class AstrMaiConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     infra: InfraConfig = Field(default_factory=InfraConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
+    sys3: Sys3Settings = Field(default_factory=Sys3Settings) # 🟢 [新增] 挂载 Sys3 配置
