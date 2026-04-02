@@ -1,5 +1,5 @@
 # astrmai/Brain/executor.py
-from typing import Any, List
+from typing import Any, List, Optional
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.tool import ToolSet
@@ -27,7 +27,7 @@ class ConcurrentExecutor:
         self._global_lock = asyncio.Lock()
         
         
-    async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None):
+    async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None) -> Optional[str]:
         """融合视觉皮层成功逻辑的 VLM 同步降维转述模式，并加入强力的底层 API 崩溃嗅探以激活模型池。"""
         chat_id = event.unified_msg_origin
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
@@ -41,7 +41,7 @@ class ConcurrentExecutor:
             if self._chat_pending_count[chat_id] >= 2:
                 from astrbot.api import logger
                 logger.warning(f"[{chat_id}] 🛑 并发熔断：当前群组排队思考任务过多 ({self._chat_pending_count[chat_id]})，已主动丢弃。")
-                return
+                return None
                 
             self._chat_pending_count[chat_id] += 1
             
@@ -195,7 +195,7 @@ class ConcurrentExecutor:
                                 
                                 if hasattr(self.evolution_manager, 'process_bot_reply'):
                                     await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
-                                return 
+                                return reply_text
                             except Exception as e:
                                 last_error = str(e)
                                 logger.warning(f"[{chat_id}] ⚠️ 模型 {provider_id} 异常，正在切换备用模型: {e}")
@@ -203,6 +203,7 @@ class ConcurrentExecutor:
                                 
                         logger.error(f"[{chat_id}] ❌ 模型池耗尽: {last_error}")
                         await self._handle_fatal_fallback(event, chat_id, f"模型全部耗尽:\n{last_error}")
+                        return None
 
                     # ==========================================
                     # Agent 工具循环模式
@@ -232,7 +233,7 @@ class ConcurrentExecutor:
                                     raise RuntimeError(f"底层模型穿透异常: {reply_text}")
 
                                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
-                                    return
+                                    return None
 
                                 if "[TERMINAL_YIELD]:" in reply_text:
                                     idx = reply_text.find("[TERMINAL_YIELD]:")
@@ -240,13 +241,13 @@ class ConcurrentExecutor:
                                     await self.reply_engine.handle_reply(event, terminal_content, chat_id)
                                     if hasattr(self.evolution_manager, 'process_bot_reply'):
                                         await self.evolution_manager.process_bot_reply(chat_id, bot_id, terminal_content)
-                                    return
+                                    return terminal_content
 
                                 await self.reply_engine.handle_reply(event, reply_text, chat_id)
                                 
                                 if hasattr(self.evolution_manager, 'process_bot_reply'):
                                     await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
-                                return 
+                                return reply_text
                             except Exception as e:
                                 last_error = str(e)
                                 logger.warning(f"[{chat_id}] ⚠️ Agent {provider_id} 异常，正在切换备用模型: {e}")
@@ -254,6 +255,7 @@ class ConcurrentExecutor:
                         
                         logger.error(f"[{chat_id}] ❌ 所有 Agent 模型均已耗尽。")
                         await self._handle_fatal_fallback(event, chat_id, last_error if last_error else "Agent 模型池耗尽。")
+                        return None
 
                 except Exception as global_e:
                     from astrbot.api import logger

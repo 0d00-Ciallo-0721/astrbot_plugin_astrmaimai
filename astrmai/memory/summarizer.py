@@ -1,7 +1,8 @@
 import asyncio
-from typing import Optional
+from typing import Optional, List, Dict
 from astrbot.api import logger
 from .processor import MemoryProcessor
+from .topic_summarizer import TopicSummarizer
 
 class ChatHistorySummarizer:
     """
@@ -23,6 +24,8 @@ class ChatHistorySummarizer:
         
         # 挂载认知处理器
         self.processor = MemoryProcessor(gateway)
+        # Phase 3: 话题图谱概括器
+        self.topic_summarizer = TopicSummarizer(gateway, config)
         
         # 🟢 [新增] 接管原本在 main.py 里的高内聚状态变量，消除在 main 中的松散耦合
         self._session_history_buffer = {}
@@ -93,7 +96,7 @@ class ChatHistorySummarizer:
 
     # 位置: astrmai/memory/summarizer.py -> ChatHistorySummarizer 类下
     async def _periodic_check_loop(self):
-        """[修改] 定期轮询时使用批量提取合并记录"""
+        """[修改] 定期轮询时使用批量提取合并记录 + Phase 7.2 遗忘机制"""
         import asyncio
         while self._running:
             try:
@@ -101,6 +104,12 @@ class ChatHistorySummarizer:
                 active_sessions = list(self._session_history_buffer.keys())
                 for session_id in active_sessions:
                     await self.extract_and_summarize_history(session_id, days=1)
+                
+                # Phase 7.2 遗忘机制：清理低权重垃圾记忆
+                if hasattr(self.engine, 'prune_low_importance'):
+                    threshold = getattr(self.config.memory, 'prune_threshold', 0.2) if self.config else 0.2
+                    await self.engine.prune_low_importance(threshold=threshold)
+                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -113,7 +122,44 @@ class ChatHistorySummarizer:
             
         logger.info(f"[Memory Summarizer] 🧠 启动后台任务: 正在对 Session {session_id} 的历史记录进行多维认知降维...")
 
+        # ==================================================
+        # Gap 4 修复: Phase 3 TopicSummarizer 正式接入流水线
+        # 先进行话题分割，再分别进行认知降维，实现话题级记忆
+        # ==================================================
+        try:
+            topic_segments = await self.topic_summarizer.process_history(
+                session_id=session_id,
+                raw_text=chat_history_text
+            )
+            if topic_segments:
+                logger.info(
+                    f"[Memory Summarizer] 📊 话题分割完成: "
+                    f"Session {session_id} → {len(topic_segments)} 个话题段"
+                )
+                # 对每个话题段分别进行认知处理并存入记忆引擎
+                for seg in topic_segments:
+                    seg_text = seg.get("summary", "")
+                    seg_keywords = seg.get("keywords", [])
+                    seg_importance = seg.get("importance", 0.0)
+                    if seg_text and seg_importance >= 0.2:
+                        topic_content = f"【话题摘要】{seg_text}"
+                        if seg_keywords:
+                            topic_content += f"\n【关键词】{', '.join(seg_keywords[:5])}"
+                        await self.engine.add_memory(
+                            content=topic_content,
+                            session_id=session_id,
+                            importance=min(1.0, seg_importance)
+                        )
+                logger.info(
+                    f"[Memory Summarizer] ✅ 话题级记忆入库完成: "
+                    f"{len([s for s in topic_segments if s.get('importance', 0) >= 0.2])} 条有效话题"
+                )
+        except Exception as e:
+            logger.warning(f"[Memory Summarizer] ⚠️ TopicSummarizer 失败，降级到全局摘要: {e}")
+
+        # 原有全局认知降维（兜底）
         memory_data = await self.processor.process_conversation(chat_history_text)
+
         
         if not isinstance(memory_data, dict):
             logger.warning(f"[Memory Summarizer] ⚠️ Session {session_id} 认知处理返回异常格式，跳过提取。")

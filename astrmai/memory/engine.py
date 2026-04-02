@@ -237,3 +237,24 @@ class MemoryEngine:
             logger.error(f"[Memory] 提取最近记忆片段时发生异常: {e}")
             
         return recent_memories
+
+    async def prune_low_importance(self, threshold: float = 0.2) -> int:
+        """[新增] Phase 7.2 记忆遗忘机制: 物理剪枝重要度极低的陈旧记忆"""
+        if not await self._ensure_faiss_initialized():
+            return 0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # 提取 JSON 元数据中的 importance
+                cursor = await db.execute("""
+                    DELETE FROM documents
+                    WHERE json_extract(metadata, '$.importance') IS NOT NULL
+                      AND CAST(json_extract(metadata, '$.importance') AS REAL) < ?
+                """, (threshold,))
+                await db.commit()
+                deleted_rows = cursor.rowcount
+                if deleted_rows > 0:
+                    logger.info(f"[MemoryEngine] 🗑️ 遗忘机制触发：永久清除 {deleted_rows} 条低重要度 (<{threshold}) 碎片记忆。")
+                return deleted_rows
+        except Exception as e:
+            logger.error(f"[MemoryEngine] 物理剪枝失败: {e}")
+            return 0

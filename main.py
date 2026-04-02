@@ -20,6 +20,7 @@ from .astrmai.infra.event_bus import EventBus
 
 # --- Phase 4: Memory ---
 from .astrmai.memory.engine import MemoryEngine
+from .astrmai.memory.react_retriever import ReActRetriever  # Phase 2
 
 # --- Phase 3: System 2 (Brain) ---
 from .astrmai.Brain.context_engine import ContextEngine
@@ -34,6 +35,7 @@ from .astrmai.Brain.reply_engine import ReplyEngine
 
 # --- Phase 6: Proactive (Life) ---
 from .astrmai.evolution.proactive_task import ProactiveTask  
+from .astrmai.evolution.reflector import ExpressionReflector  # Phase 4
 
 # --- Phase 2: System 1 (Heart) ---
 from .astrmai.Heart.state_engine import StateEngine
@@ -45,6 +47,11 @@ from .astrmai.Heart.visual_cortex import VisualCortex
 # --- Phase 7: System 3 (Task) ---
 from .astrmai.work.router import Sys3Router
 from .astrmai.work.cron_guard.heartbeat import CronHeartbeatGuard
+
+# --- Phase 6.3: Frequency Controller ---
+from .astrmai.Heart.frequency_controller import FrequencyController
+# --- Phase 8.3: Private Chat Manager ---
+from .astrmai.Heart.private_chat_manager import PrivateChatManager
 
 @register("astrmai", "Gemini Antigravity", "AstrMai: Dual-Process Architecture Plugin", "1.0.0", "https://github.com/0d00-Ciallo-0721/astrbot_plugin_astrmaimai")
 class AstrMaiPlugin(Star):
@@ -88,8 +95,21 @@ class AstrMaiPlugin(Star):
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
         
+        # Phase 2: ReAct Agent 记忆检索器
+        self.react_retriever = ReActRetriever(
+            memory_engine=self.memory_engine,
+            db_service=self.db_service,
+            gateway=self.gateway,
+            config=self.config
+        )
+        
         # 🟢 显式传入 db_service 给 PromptRefiner，解决图片失忆症
-        self.prompt_refiner = PromptRefiner(self.memory_engine, self.db_service, self.config) 
+        self.prompt_refiner = PromptRefiner(
+            self.memory_engine, 
+            self.db_service, 
+            self.config,
+            react_retriever=self.react_retriever  # Phase 2 注入
+        ) 
         
         # 🟢 [Sys3配置拦截] 根据配置决定是否初始化 Sys3 路由与降级版快照守护
         if getattr(self.config, 'sys3', None) and getattr(self.config.sys3, 'enable_work_mode', False):
@@ -113,6 +133,11 @@ class AstrMaiPlugin(Star):
             sys3_router=self.sys3_router 
         )
 
+        # Phase 6.3: 发言频率控制器 (必须在 AttentionGate 之前创建)
+        self.frequency_controller = FrequencyController(config=self.config)
+        # Phase 8.3: 私聊专用会话管理器
+        self.private_chat_manager = PrivateChatManager(config=self.config)
+
         self.attention_gate = AttentionGate(
             state_engine=self.state_engine,
             judge=self.judge,
@@ -120,7 +145,15 @@ class AstrMaiPlugin(Star):
             system2_callback=self._system2_entry,
             config=self.config,                          
             persona_summarizer=self.persona_summarizer,  
-            visual_cortex=self.visual_cortex     
+            visual_cortex=self.visual_cortex,
+            frequency_controller=self.frequency_controller  # Phase 6.3 注入
+        )
+        
+        # Phase 4: 表达反思器
+        self.reflector = ExpressionReflector(
+            db_service=self.db_service,
+            gateway=self.gateway,
+            config=self.config
         )
         
         self.proactive_task = ProactiveTask(
@@ -129,10 +162,13 @@ class AstrMaiPlugin(Star):
             gateway=self.gateway,
             persistence=self.persistence,
             memory_engine=self.memory_engine,
+            reflector=self.reflector,  # Phase 4 注入
             config=self.config,
-        )        
-        
-        logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-6 Mounted).")
+        )
+        # Phase 7: 注入 db_service（延迟到 start() 前）
+        self.proactive_task.set_db_service(self.db_service)
+
+        logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-7 Mounted).")
 
     async def _update_user_stats(self, user_id: str):
         await self.state_engine.increment_user_message_count(user_id)
@@ -248,6 +284,16 @@ class AstrMaiPlugin(Star):
                 
                 await self.state_engine.consume_energy(chat_id)
                 await self.system2_planner.plan_and_execute(main_event, queue_events)
+                
+                # Phase 8.3: 私聊回话等待逻辑
+                is_private = main_event.get_extra("is_private_chat", False)
+                if is_private and self.private_chat_manager:
+                    sender_id = str(main_event.get_sender_id())
+                    # 进入等待状态 (释放锁前阻塞，新消息从 AttentionGate 产生打断)
+                    has_reply = await self.private_chat_manager.wait_for_new_message(sender_id)
+                    if not has_reply:
+                        logger.info(f"[{chat_id}] ⏳ 私聊用户长期未回复，会话自然休眠，可触发主动破冰 (后续迭代)")
+                        # TODO: 若允许，这里可以追加 Proactive Poke 的逻辑
             finally:
                 logger.debug(f"[AstrMai] 🛡️ System2 任务链执行完毕，安全退出规划层。")
 

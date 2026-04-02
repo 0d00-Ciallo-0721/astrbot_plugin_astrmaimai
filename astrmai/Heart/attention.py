@@ -20,14 +20,18 @@ class SessionContext:
 
 
 class AttentionGate:
-    def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters, system2_callback, config=None, visual_cortex=None, persona_summarizer=None):
+    def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters,
+                 system2_callback, config=None, visual_cortex=None,
+                 persona_summarizer=None, frequency_controller=None):
         self.state_engine = state_engine
         self.judge = judge
         self.sensors = sensors
         self.sys2_process = system2_callback 
         self.config = config if config else state_engine.config
-        self.visual_cortex = visual_cortex # [新增] 多模态视觉皮层
-        self.persona_summarizer = persona_summarizer # [新增] 挂载人设压缩器
+        self.visual_cortex = visual_cortex
+        self.persona_summarizer = persona_summarizer
+        # Phase 6.3: 发言频率控制器
+        self.frequency_controller = frequency_controller
         
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
@@ -146,6 +150,12 @@ class AttentionGate:
         
         sender_id = str(event.get_sender_id())
         self_id = str(event.get_self_id())
+
+        # Phase 8.3: 通知私聊管理器，打断可能的等待状态
+        if is_private and hasattr(self, 'private_chat_manager') and self.private_chat_manager:
+             self._fire_background_task(
+                 self.private_chat_manager.signal_new_message(user_id=sender_id, message_str=msg_str)
+             )
         
         max_len = getattr(self.config.attention, 'max_message_length', 100)
         if msg_str and len(msg_str.strip()) > max_len:
@@ -205,9 +215,23 @@ class AttentionGate:
                         return "IGNORE" 
                     
                     probability = getattr(self.config.attention, 'throttle_probability', 0.1)
-                    import random
-                    if random.random() > probability:
-                        return "IGNORE" 
+                    # Phase 6.3: 使用 FrequencyController 替代简单随机阈值
+                    if self.frequency_controller:
+                        energy = getattr(chat_state, 'energy', 1.0) if chat_state else 1.0
+                        mood = getattr(chat_state, 'mood', 0.0) if chat_state else 0.0
+                        should_reply = self.frequency_controller.should_reply(
+                            chat_id=chat_id,
+                            is_mentioned=is_strong_wakeup,
+                            energy=energy,
+                            mood=mood,
+                            message_text=msg_str or "",
+                        )
+                        if not should_reply:
+                            return "IGNORE"
+                    else:
+                        import random
+                        if random.random() > probability:
+                            return "IGNORE"
 
             if not is_private and not event.get_extra("is_virtual_poke"): 
                 msg_hash = hash(msg_str) if msg_str else hash(str(extracted_images))

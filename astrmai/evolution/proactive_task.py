@@ -10,6 +10,8 @@ from astrbot.api.event import MessageChain
 from ..Heart.state_engine import StateEngine
 from ..infra.gateway import GlobalModelGateway
 from ..infra.persistence import PersistenceManager
+from ..memory.dream_agent import DreamAgent       # Phase 7
+from ..memory.dream_generator import DreamGenerator  # Phase 7
 
 class ProactiveTask:
     """
@@ -24,14 +26,26 @@ class ProactiveTask:
                  state_engine: StateEngine, 
                  gateway: GlobalModelGateway,
                  persistence: PersistenceManager,
-                 memory_engine = None,  # [新增参数] 注入记忆引擎
+                 memory_engine = None,
+                 reflector = None,  # Phase 4: 表达反思器
                  config=None):
         self.context = context
         self.state_engine = state_engine
         self.gateway = gateway
         self.persistence = persistence
         self.memory_engine = memory_engine
+        self.reflector = reflector  # Phase 4
         self.config = config if config else gateway.config
+        
+        # Phase 7: 梦境系统初始化
+        db_service = getattr(self, '_db_service', None)
+        self.dream_agent = None    # 延迟到 start() 时初始化
+        self.dream_generator = DreamGenerator(gateway, config=self.config)
+        self._last_dream_time = 0
+        if hasattr(self.config, 'life'):
+            self._dream_interval = self.config.life.dream_interval_min * 60
+        else:
+            self._dream_interval = 1800
         
         self._is_running = False
         self._task = None
@@ -44,8 +58,60 @@ class ProactiveTask:
             return
         self._is_running = True
         logger.info("[Life] 🌱 潜意识与生命周期循环已启动...")
-        
+
+        # Phase 7: 延迟初始化 DreamAgent（此时 db_service 应已由 main.py 设置）
+        if self.dream_agent is None and hasattr(self, '_db_service') and self._db_service:
+            self.dream_agent = DreamAgent(
+                gateway=self.gateway,
+                db_service=self._db_service,
+                memory_engine=self.memory_engine,
+                config=self.config
+            )
+            logger.info("[Life] 💤 Dream Agent 已就绪")
+
         self._task = asyncio.create_task(self._loop())
+
+    def set_db_service(self, db_service):
+        """外部注入 db_service（Phase 7 DreamAgent 需要）"""
+        self._db_service = db_service
+        if self._is_running and self.dream_agent is None:
+            self.dream_agent = DreamAgent(
+                gateway=self.gateway,
+                db_service=db_service,
+                memory_engine=self.memory_engine,
+                config=self.config
+            )
+
+    async def _run_dream_task(self):
+        """Phase 7: 执行一次梦境整理循环"""
+        if not self.dream_agent:
+            return
+        try:
+            logger.info("[ProactiveTask] 💤 触发梦境整理...")
+            dream_log = await self.dream_agent.run_dream_cycle()
+            if dream_log:
+                # 生成梦境叙述
+                persona_name = getattr(
+                    getattr(self.config, 'persona', None), 'name', 'Mai'
+                )
+                dream_text = await self.dream_generator.generate(
+                    dream_log=dream_log,
+                    persona_name=persona_name
+                )
+                if dream_text:
+                    logger.info(f"[ProactiveTask] 🌙 梦境叙述生成:\n{dream_text[:100]}...")
+                    # 可选: 将梦境写入记忆引擎作为一条特殊记忆
+                    if self.memory_engine:
+                        try:
+                            await self.memory_engine.add_memory(
+                                content=f"[梦境日记] {dream_text}",
+                                session_id="__dream_diary__",
+                                importance=0.5
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.error(f"[ProactiveTask] 梦境整理任务异常: {e}")
 
     async def stop(self):
         """停止后台循环"""
@@ -53,6 +119,7 @@ class ProactiveTask:
         if self._task:
             self._task.cancel()
             logger.info("[AstrMai-Life] 🛑 生命循环已停止")
+
 
     # [新增]
     def _fire_background_task(self, coro):
@@ -100,6 +167,25 @@ class ProactiveTask:
                 if now - self._last_profile_run > 3600: # 每小时巡检一次侧写
                     await self._run_profiling_task()
                     self._last_profile_run = now
+
+                # 3.5 Phase 4: 表达反思与定期审计
+                enable_exp_mine = getattr(self.config.evolution, 'enable_expression_mining', True) if hasattr(self.config, 'evolution') else True
+                if self.reflector and enable_exp_mine:
+                    for state in self.state_engine.get_active_states():
+                        if state.chat_id:
+                            await self.reflector.reflect_batch(state.chat_id)
+                            await self.reflector.auto_audit(state.chat_id)
+
+                # 3.6 Phase 5: 全局关系衰减 (纯算法，零 LLM)
+                enable_rel_engine = getattr(self.config.evolution, 'enable_relationship_engine', True) if hasattr(self.config, 'evolution') else True
+                if hasattr(self.state_engine, 'relationship_engine') and enable_rel_engine:
+                    self.state_engine.relationship_engine.apply_global_decay()
+
+                # 3.7 Phase 7: 梦境整理调度 (每 30 分钟)
+                now_ts = time.time()
+                if now_ts - self._last_dream_time >= self._dream_interval:
+                    self._last_dream_time = now_ts
+                    asyncio.create_task(self._run_dream_task())
 
                 # 4. 🟢 [核心修复 Bug 2] 午夜记忆日记任务 (凌晨 3-4 点执行)
                 current_time_struct = time.localtime(now)
@@ -265,9 +351,8 @@ class ProactiveTask:
         # [修改点] 调用主动任务专项模型接口 (Phase 4 重构)
         return await self.gateway.call_proactive_task(prompt)
 
-    # [修改] 具体位置：类 ProactiveTask 中
     async def _generate_persona_analysis(self, profile):
-        """[修改] 生成并保存画像，支持增量更新与标签提取"""
+        """[修改] 生成并保存画像，支持增量更新与标签提取 + Phase 8 memory_points"""
         
         persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
         
@@ -292,22 +377,29 @@ class ProactiveTask:
         else:
             old_tags_str = str(old_tags)
 
+        old_memory_points = getattr(profile, "memory_points", [])
+        old_mp_str = "\n".join(old_memory_points) if old_memory_points else "暂无记忆点"
+
         prompt = f"""{persona_injection}
 请基于用户 "{profile.name}" 与你的历史交互，构建深度人物画像。
 他近期已经在私聊中与你互动了 {profile.message_count_for_profiling} 次。
 
 【该用户旧的画像】：{old_analysis}
 【该用户旧的标签】：{old_tags_str}
+【该用户旧的记忆点】：
+{old_mp_str}
 
 [任务]
 请结合以上旧的画像和标签，对该用户进行**增量更新**。
 - 重点提取：具体的行为习惯、性格底色、近期的偏好、对你的态度。
-- 请强制按 JSON 格式输出结果。必须包含 `tags`（字符串数组，提取3-5个偏好标签，如极客、二次元等）和 `analysis`（一段100字以内的深度印象侧写文本）。
+- `memory_points` 字段：提取3-8个具体、可检索的记忆点，格式为 "分类:内容:权重(0.1-1.0)"，例如 "爱好:喜欢打游戏:0.8"
+- 请强制按 JSON 格式输出结果。
 
 严格返回格式示例：
 {{
     "tags": ["标签1", "标签2"],
-    "analysis": "这里是深度侧写文本..."
+    "analysis": "这里是深度侧写文本...",
+    "memory_points": ["爱好:喜欢打游戏:0.8", "口头禅:经常说确实:0.6"]
 }}
 """
         result = await self.gateway.call_proactive_task(prompt)
@@ -317,6 +409,7 @@ class ProactiveTask:
             
             tags = []
             analysis = ""
+            memory_points = []
             
             try:
                 # 尝试解析 JSON
@@ -325,6 +418,7 @@ class ProactiveTask:
                     data = json.loads(match.group(0))
                     tags = data.get("tags", [])
                     analysis = data.get("analysis", "")
+                    memory_points = data.get("memory_points", [])
             except Exception as e:
                 from astrbot.api import logger
                 logger.error(f"[Life] 解析增量画像 JSON 失败: {e}")
@@ -336,6 +430,9 @@ class ProactiveTask:
                 profile.persona_analysis = analysis.strip()
             if tags:
                 profile.tags = tags
+            # Phase 8.2: 更新分类记忆点
+            if memory_points:
+                profile.memory_points = memory_points
                 
             profile.message_count_for_profiling = 0 
             profile.last_persona_gen_time = time.time()
@@ -343,11 +440,64 @@ class ProactiveTask:
             
             await self.persistence.save_user_profile(profile)
             from astrbot.api import logger
-            logger.info(f"[Life] ✅ 私聊画像增量挖掘完成: {analysis[:20]}... 标签: {tags}")
+            logger.info(f"[Life] ✅ 私聊画像增量挖掘完成: {analysis[:20]}... 标签: {tags} 记忆点: {len(memory_points)}条")
 
+    async def _generate_nickname(self, profile) -> None:
+        """
+        Phase 8.1: 取名系统
+        当用户 know_times >= 3 且 is_known=False 时触发，
+        调用 LLM 为用户生成一个个性化的昵称（不超过4字）。
+        """
+        if not profile or profile.is_known:
+            return
+
+        persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
+        if hasattr(self.persistence, 'load_persona_cache_async'):
+            cache = await self.persistence.load_persona_cache_async()
+        else:
+            cache = self.persistence.load_persona_cache()
+        persona_data = cache.get(persona_id, {})
+        summary = persona_data.get("summary", "")
+        persona_injection = f"[你的核心人设]: {summary}\n" if summary else ""
+
+        analysis = getattr(profile, 'persona_analysis', '') or '暂无画像'
+
+        prompt = f"""{persona_injection}
+你需要给一个你认识的朋友起一个昵称。
+
+关于这个人：
+- 原始名字：{profile.name}
+- 画像：{analysis[:200]}
+- 标签：{', '.join(profile.tags) if profile.tags else '无'}
+
+请根据他的性格特点和与你的相处模式，给他起一个符合你人设风格的昵称。
+要求:
+- 最多4个字，可以是谐音/创意组合/叠字等
+- 要有个性，不要太普通
+- 用JSON返回: {{"nickname": "昵称", "reason": "取名原因一句话"}}
+
+直接输出JSON："""
+
+        try:
+            result = await self.gateway.call_proactive_task(prompt)
+            import json, re
+            match = re.search(r'\{.*\}', str(result), re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                nickname = data.get("nickname", "").strip()
+                reason = data.get("reason", "").strip()
+                if nickname:
+                    profile.nickname = nickname
+                    profile.nickname_reason = reason
+                    profile.is_known = True
+                    profile.is_dirty = True
+                    await self.persistence.save_user_profile(profile)
+                    logger.info(f"[Life] 📛 为用户 {profile.name} 取名: {nickname} (因为: {reason})")
+        except Exception as e:
+            logger.error(f"[Life] 取名失败: {e}")
 
     async def _run_profiling_task(self):
-        """深度侧写任务：筛选互动频次达标的用户，更新其心理画像"""
+        """深度侧写任务：筛选互动频次达标的用户，更新其心理画像 + Phase 8 取名"""
         # 获取所有活跃的用户档案
         active_profiles = self.state_engine.get_active_profiles()
         
@@ -355,6 +505,17 @@ class ProactiveTask:
         threshold = getattr(self.config.life, 'profiling_msg_threshold', 200)
         
         for profile in active_profiles:
+            # Phase 8.1: 累积互动次数
+            profile.know_times = getattr(profile, 'know_times', 0) + 1
+
+            # Phase 8.1: 触发取名（互动 >= 3 次且尚未命名）
+            if profile.know_times >= 3 and not getattr(profile, 'is_known', False):
+                logger.info(f"[Life] 🤝 用户 {profile.name} 已互动 {profile.know_times} 次，触发取名系统...")
+                try:
+                    await self._generate_nickname(profile)
+                except Exception as e:
+                    logger.error(f"[Life] 取名任务失败 ({profile.name}): {e}")
+
             # 如果该用户自上次侧写以来的互动次数达到阈值
             if getattr(profile, 'message_count_for_profiling', 0) >= threshold:
                 from astrbot.api import logger
@@ -365,41 +526,6 @@ class ProactiveTask:
                     from astrbot.api import logger
                     logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")
 
-    async def _loop(self):
-        """[修改] 维持后台心跳与任务调度"""
-        while self._is_running:
-            try:
-                # 心跳间隔 60 秒
-                await asyncio.sleep(60)
-                
-                # 1. 执行自然代谢 (Decay)
-                await self._run_decay_task()
-                
-                # 2. 执行主动唤醒 (Wakeup)
-                await self._run_wakeup_task()
-                
-                # 3. 深度侧写任务 (Profiling)
-                now = time.time()
-                if now - self._last_profile_run > 3600: # 每小时巡检一次侧写
-                    await self._run_profiling_task()
-                    self._last_profile_run = now
-
-                # 4. [新增] 午夜记忆日记任务 (凌晨 3-4 点执行)
-                current_time_struct = time.localtime(now)
-                current_hour = current_time_struct.tm_hour
-                current_date = time.strftime("%Y-%m-%d", current_time_struct)
-                
-                if 3 <= current_hour < 4 and self._last_diary_date != current_date:
-                    # 增加睡眠抖动 (Jitter)，打散多群组并发请求，防止熔断
-                    await asyncio.sleep(random.randint(1, 300))
-                    await self._run_daily_diary_task()
-                    self._last_diary_date = current_date
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[ProactiveTask] 循环异常: {e}")
-                await asyncio.sleep(60)
 
     async def _run_daily_diary_task(self):
         """[修改] 午夜记忆日记撰写任务：不仅生成文本日记，还要触发深度的事件结构化、反思生成和节点提取。"""

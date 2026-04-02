@@ -105,7 +105,7 @@ class ChatState:
 class UserProfile:
     """用户画像 (内存对象)"""
     user_id: str = ""   # 用户id
-    name: str = "Unknown"# 用户姓名
+    name: str = "Unknown"# 用户姓名(原始昵称)
     social_score: float = 0.0 #用户好感度
     last_seen: float = 0.0  #上次看见的时间
     persona_analysis: str = "" # 深度心理侧写
@@ -116,11 +116,22 @@ class UserProfile:
     # [新增] 用户偏好标签，用于存储结构化的画像特征
     tags: List[str] = field(default_factory=list)
     
+    # [Phase 8.1] 取名系统 (参考 MaiBot PersonInfoManager.qv_person_name)
+    nickname: str = ""           # Bot 为 TA 起的昵称（个性化，不同于原始昵称）
+    nickname_reason: str = ""    # 取名原因
+    know_times: int = 0          # 互动次数（达阈值时触发取名）
+    is_known: bool = False       # 是否已正式"认识"（取过名）
+
+    # [Phase 8.2] 分类记忆点 (参考 MaiBot Person.memory_points)
+    # 格式: "分类:内容:权重"，例: ["爱好:喜欢打游戏:0.8", "口头禅:经常说'确实':0.6"]
+    memory_points: List[str] = field(default_factory=list)
+
     #运行时字段
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
+
 
 class Jargon(SQLModel, table=True):
     """[新增] 群组黑话与网络用语表"""

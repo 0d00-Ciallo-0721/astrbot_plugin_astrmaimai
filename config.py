@@ -65,6 +65,8 @@ class EvolutionConfig(BaseModel):
     min_mining_context: int = Field(default=10)
     batch_size: int = Field(default=50)
     mining_trigger: int = Field(default=20)
+    enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
+    enable_relationship_engine: bool = Field(default=True, description="启动好感度四维关系图谱推演")
 
 class LifeConfig(BaseModel):
     silence_threshold: int = Field(default=120)
@@ -72,9 +74,11 @@ class LifeConfig(BaseModel):
     wakeup_cost: float = Field(default=0.2)
     wakeup_cooldown: int = Field(default=28800)
     profiling_msg_threshold: int = Field(default=50)
+    dream_interval_min: int = Field(default=30, description="后台触发梦境整理记忆的周期(分钟)")
     
 class ReplyConfig(BaseModel):
     fallback_text: str = Field(default="（陷入了短暂的沉默...）")
+    base_frequency: float = Field(default=0.7, description="算法流基础连发跟进概率")
     segment_min_len: int = Field(default=15)
     no_segment_max_len: int = Field(default=120)
     meme_probability: int = Field(default=60)
@@ -94,6 +98,8 @@ class MemoryConfig(BaseModel):
     cleanup_interval: int = Field(default=3600)
     summary_threshold: int = Field(default=30)
     recall_top_k: int = Field(default=5)
+    enable_react_agent: bool = Field(default=True, description="启用 ReActAgent 多轮记忆检索")
+    prune_threshold: float = Field(default=0.2, description="记忆遗忘被物理剪枝的得分下限")
 
 class InfraConfig(BaseModel):
     llm_retries: int = Field(default=2)
@@ -105,6 +111,9 @@ class VisionConfig(BaseModel):
 
 class Sys3Settings(BaseModel):
     enable_work_mode: bool = Field(default=False, description="是否启用 Sys3 工作任务模式")
+
+class PrivateChatConfig(BaseModel):
+    wait_timeout_sec: int = Field(default=300, description="单次私聊等待反馈强制休眠阈值(秒)")
 
 class AstrMaiConfig(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -123,3 +132,4 @@ class AstrMaiConfig(BaseModel):
     infra: InfraConfig = Field(default_factory=InfraConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
     sys3: Sys3Settings = Field(default_factory=Sys3Settings) # 🟢 [新增] 挂载 Sys3 配置
+    private_chat: PrivateChatConfig = Field(default_factory=PrivateChatConfig)

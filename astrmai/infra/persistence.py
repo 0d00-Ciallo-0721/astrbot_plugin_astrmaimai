@@ -127,26 +127,47 @@ class PersistenceManager:
             cursor = await db.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
             if row:
+                # 训多列名山不同版本字段顺序，用 PRAGMA 获取列名并建立映射
+                cursor2 = await db.execute("PRAGMA table_info(user_profiles)")
+                cols_info = await cursor2.fetchall()
+                col_names = [c[1] for c in cols_info]
+                row_dict = dict(zip(col_names, row))
                 return {
-                    "user_id": row[0],
-                    "name": row[1],
-                    "social_score": row[2],
-                    "last_seen": row[3],
-                    "persona_analysis": row[4],
-                    "group_footprints": json.loads(row[5]) if row[5] else {},
-                    "identity": row[6]
+                    "user_id": row_dict.get("user_id", ""),
+                    "name": row_dict.get("name", "Unknown"),
+                    "social_score": row_dict.get("social_score", 0.0),
+                    "last_seen": row_dict.get("last_seen", 0.0),
+                    "persona_analysis": row_dict.get("persona_analysis", ""),
+                    "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
+                    "identity": row_dict.get("identity", ""),
+                    "tags": json.loads(row_dict.get("tags") or "[]"),
+                    # Phase 8.1: 取名系统
+                    "nickname": row_dict.get("nickname", ""),
+                    "nickname_reason": row_dict.get("nickname_reason", ""),
+                    "know_times": int(row_dict.get("know_times") or 0),
+                    "is_known": bool(row_dict.get("is_known") or False),
+                    # Phase 8.2: 分类记忆点
+                    "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
                 }
         return None
 
-    async def save_user_profile(self, profile: UserProfile):
+    async def save_user_profile(self, profile: 'UserProfile'):
         footprints_json = json.dumps(profile.group_footprints, ensure_ascii=False)
+        tags_json = json.dumps(profile.tags, ensure_ascii=False)
+        memory_points_json = json.dumps(profile.memory_points, ensure_ascii=False)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO user_profiles 
-                (user_id, name, social_score, last_seen, persona_analysis, group_footprints, identity, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (profile.user_id, profile.name, profile.social_score, profile.last_seen, 
-                  profile.persona_analysis, footprints_json, profile.identity, time.time()))
+                (user_id, name, social_score, last_seen, persona_analysis, group_footprints,
+                 identity, tags, nickname, nickname_reason, know_times, is_known,
+                 memory_points, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (profile.user_id, profile.name, profile.social_score, profile.last_seen,
+                  profile.persona_analysis, footprints_json, profile.identity,
+                  tags_json,
+                  profile.nickname, profile.nickname_reason,
+                  profile.know_times, int(profile.is_known),
+                  memory_points_json, time.time()))
             await db.commit()
             
     async def add_last_message_meta(self, chat_id: str, sender_id: str, has_image: bool, image_urls: list):
@@ -196,9 +217,28 @@ class PersistenceManager:
                         persona_analysis TEXT,
                         group_footprints TEXT,
                         identity TEXT,
+                        tags TEXT DEFAULT '[]',
+                        nickname TEXT DEFAULT '',
+                        nickname_reason TEXT DEFAULT '',
+                        know_times INTEGER DEFAULT 0,
+                        is_known INTEGER DEFAULT 0,
+                        memory_points TEXT DEFAULT '[]',
                         updated_at REAL
                     )
                 """)
+                # 兼容旧数据库字段迁移 (ALTER TABLE 内指，已存列失败不中断)
+                for col_def in [
+                    "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
+                    "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
+                    "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'",
+                ]:
+                    try:
+                        await db.execute(col_def)
+                    except Exception:
+                        pass  # 列已存在时忽略
                 # [新增] CronSnapshot 快照表的原生 SQL 兜底建表
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (

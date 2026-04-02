@@ -28,7 +28,11 @@ class ContextEngine:
                            retrieve_keys: List[str] = None,
                            slang_patterns: str = "",
                            tool_descs: str = "",
-                           sys1_thought: str = "") -> str: 
+                           sys1_thought: str = "",
+                           goals_context: str = "",
+                           expression_habits: str = "",
+                           planner_reasoning: str = "",
+                           jargon_explanation: str = "") -> str: 
         
         if retrieve_keys is None:
             retrieve_keys = []
@@ -150,18 +154,39 @@ class ContextEngine:
                     analysis = profile_data.get("persona_analysis", "暂无深度侧写。")
                     tags = profile_data.get("tags", [])
                     tags_str = " / ".join(tags) if tags else "暂无特定标签"
-                    name = profile_data.get("name", "该用户")
+                    raw_name = profile_data.get("name", "该用户")
+                    # Phase 8.1: 优先使用 Bot 取的昵称
+                    nickname = profile_data.get("nickname", "")
+                    display_name = f"{nickname}（{raw_name}）" if nickname else raw_name
+                    
+                    # Phase 8.2: 分类记忆点注入
+                    memory_points = profile_data.get("memory_points", [])
+                    memory_points_block = ""
+                    if memory_points:
+                        mp_lines = []
+                        for mp in memory_points[:6]:  # 最多注入6条
+                            parts = mp.split(":", 2)
+                            if len(parts) >= 2:
+                                category, content = parts[0], parts[1]
+                                mp_lines.append(f"【{category}】{content}")
+                        if mp_lines:
+                            memory_points_block = (
+                                ">>> [关于TA的记忆点] <<<\n"
+                                + "\n".join(mp_lines) + "\n"
+                            )
                     
                     private_chat_block = (
                         ">>> [私密对话模式激活] <<<\n"
-                        f"你现在正在与用户【{name}】进行一对一私聊，请保持绝对的专注与亲和力。\n\n"
+                        f"你现在正在与【{display_name}】进行一对一私聊，请保持绝对的专注与亲和力。\n\n"
                         ">>> [用户深度画像检索] <<<\n"
                         f"【属性】：{tags_str}\n"
                         f"【深度侧写】：{analysis}\n"
+                        f"{memory_points_block}"
                         "请基于上述画像，使用最符合对方认知的语境进行交流。\n\n"
                     )
             except Exception as e:
                 logger.warning(f"[ContextEngine] 提取私聊用户画像失败: {e}")
+
 
         subconscious_block = ""
         if sys1_thought:
@@ -213,16 +238,35 @@ class ContextEngine:
             except Exception as e:
                 logger.warning(f"[ContextEngine] 主动联想与节点注入失败: {e}")
 
+        # Phase 1: 目标上下文注入
+        goals_block = ""
+        if goals_context and not is_fast_mode:
+            goals_block = f"\n[对话目标]\n{goals_context}\n请在回复时自然地推进这些目标，但不要机械地去完成任务。\n"
 
-        # 4. [修改] 组装最终 Prompt (加入 proactive_recall_block)
+        # Phase 6.2A: 表达习惯注入 (ExpressionSelector → ContextEngine)
+        expression_block = ""
+        if expression_habits and not is_fast_mode:
+            expression_block = f"\n[语言习惯参考]\n{expression_habits}\n"
+
+        # Phase 6.2B: Planner 推理意图注入 ("你的想法是")
+        reasoning_block = ""
+        if planner_reasoning and not is_fast_mode:
+            reasoning_block = f"你的想法是：\"{planner_reasoning}\"\n"
+
+        # Phase 6.2C: 黑话解释注入
+        jargon_block = ""
+        if jargon_explanation and not is_fast_mode:
+            jargon_block = f"\n[群内黑话参考]\n{jargon_explanation}\n（已知含义仅供理解，自然使用即可，不要刻意解释）\n"
+
+        # 4. [修改] 组装最终 Prompt (Phase 6: 新增 expression/reasoning/jargon 注入)
         prompt = f"""核心人格设定：
 {role_block}
 
 {style_block}
 {state_block}
-
-{private_chat_block}{slang_block}
-当前你看到的消息：
+{expression_block}
+{private_chat_block}{slang_block}{jargon_block}{goals_block}
+{reasoning_block}当前你看到的消息：
 <CURRENT_MESSAGES>
 
 {subconscious_block}

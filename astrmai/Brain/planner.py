@@ -1,5 +1,6 @@
 # astrmai/Brain/planner.py
-from typing import List
+import random
+from typing import List, Optional
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
 import asyncio
@@ -7,7 +8,9 @@ from ..infra.gateway import GlobalModelGateway
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
-
+from .goal_manager import GoalManager
+from .action_modifier import ActionModifier
+from .expression_selector import ExpressionSelector  # Phase 6.1
 # 统一导入所有系统原生工具与新增的 4 个拟人化微操工具
 from .tools.pfc_tools import (
     WaitTool, 
@@ -36,11 +39,11 @@ class Planner:
                  gateway: GlobalModelGateway, 
                  context_engine: ContextEngine, 
                  reply_engine: ReplyEngine,
-                 memory_engine: MemoryEngine,
-                 evolution_manager: EvolutionManager,
+                 memory_engine: 'MemoryEngine',
+                 evolution_manager: 'EvolutionManager',
                  state_engine=None,
                  prompt_refiner=None,
-                 sys3_router=None  # [新增] 接收注入的 Sys3 Router
+                 sys3_router=None
                  ):
         self.gateway = gateway
         self.context_engine = context_engine
@@ -49,8 +52,19 @@ class Planner:
         self.state_engine = state_engine  
         self.reply_engine = reply_engine 
         self.prompt_refiner = prompt_refiner 
-        self.sys3_router = sys3_router  # [新增] 挂载 Sys3 Router
+        self.sys3_router = sys3_router
+        self.context = context
         
+        # Phase 1: 多目标管理器
+        self.goal_manager = GoalManager(gateway, config=gateway.config)
+        # Phase 5: 动态动作修改器
+        self.action_modifier = ActionModifier(config=gateway.config)
+        # Phase 6.1: 表达习惯选择器
+        self.expression_selector = ExpressionSelector(
+            db=context_engine.db,
+            gateway=gateway,
+            config=gateway.config
+        )
         self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
         
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
@@ -98,6 +112,15 @@ class Planner:
         sys1_thought = event.get_extra("sys1_thought", "")
         
         ctx = getattr(self.context_engine, 'context', None)
+        
+        # Phase 1: 更新多目标并获取目标上下文
+        planner_reasoning = ""  # Phase 6.2B: 每轮决策的意图说明
+        if not is_fast_mode:
+            window_text = "\n".join(window_lines) if window_lines else ""
+            goal_text = await self.goal_manager.analyze_and_update(chat_id, window_text)
+            logger.debug(f"[{chat_id}] 🎯 当前主目标: {goal_text}")
+            # reasoning 初始化为当前目标文本，后续 Executor 可覆写
+            planner_reasoning = goal_text
         
         # [修改] 重构 tools 选择分支
         if is_all_mode:
@@ -167,15 +190,69 @@ class Planner:
                     elif hasattr(ctx, "shared_dict"):
                         ctx.shared_dict["disable_rag_injection"] = False
 
+            # Phase 5: 动态工具过滤 (四维关系驱动)
+            state = None
+            profile = None
+            relationship_vec = None
+            if self.state_engine:
+                try:
+                    state = await self.state_engine.get_state(chat_id)
+                except Exception:
+                    pass
+                if user_id:
+                    try:
+                        profile = await self.state_engine.get_user_profile(str(user_id))
+                    except Exception:
+                        pass
+                    if hasattr(self.state_engine, 'relationship_engine'):
+                        relationship_vec = self.state_engine.relationship_engine.get_or_create(str(user_id))
+            tools = self.action_modifier.modify_tools(tools, state=state, profile=profile, relationship_vec=relationship_vec)
+
+        # Phase 1: 注入多目标上下文
+        goals_context = self.goal_manager.get_goals_context(chat_id)
+        
         tool_descs = "\n".join([f"- {t.name}: {t.description}" for t in tools]) if tools else "无可用工具"
         
+        # Phase 6.1: 表达习惯选择 (ExpressionSelector)
+        expression_habits = ""
+        if not is_fast_mode:
+            recent_text = "\n".join(window_lines[-3:]) if window_lines else ""
+            expression_habits = await self.expression_selector.select(
+                chat_id=chat_id,
+                context_text=recent_text,
+                think_level=0  # 默认快速模式，零 LLM
+            )
+
+        # Phase 6.2C: 黑话注入
+        jargon_explanation = ""
+        if not is_fast_mode:
+            try:
+                jargon_list = await self.context_engine.db.persistence.load_jargon_list(
+                    chat_id, limit=8
+                ) if hasattr(self.context_engine.db, 'persistence') else []
+                if jargon_list:
+                    jargon_lines = [
+                        f"{j.get('text', '')} → {j.get('meaning', '...')} "
+                        f"(场景: {j.get('situation', '?')})"
+                        for j in jargon_list
+                        if j.get('meaning') and j.get('text')
+                    ]
+                    if jargon_lines:
+                        jargon_explanation = "\n".join(jargon_lines)
+            except Exception as e:
+                logger.debug(f"[Planner] 黑话加载失败: {e}")
+
         system_prompt = await self.context_engine.build_prompt(
             chat_id=chat_id, 
             event_messages=event_messages,
             retrieve_keys=retrieve_keys,
             slang_patterns=slang_context,
             tool_descs=tool_descs,
-            sys1_thought=sys1_thought 
+            sys1_thought=sys1_thought,
+            goals_context=goals_context,
+            expression_habits=expression_habits,    # Phase 6.1
+            planner_reasoning=planner_reasoning,    # Phase 6.2B
+            jargon_explanation=jargon_explanation,  # Phase 6.2C
         )
 
         # === [基于信标的源会话语境溯源拉取] ===
@@ -271,10 +348,73 @@ class Planner:
             final_prompt += "\n(导演旁白：用户递给了你几张照片，请结合画面内容进行回应。)"
             logger.info(f"[{chat_id}] 👁️ 已编排主脑直通车负载，携带 {len(direct_vision_urls)} 张图片进入执行器。")
 
-        await self.executor.execute(
+        reply_text = await self.executor.execute(
             event=event,
             system_prompt=final_system_prompt,
             prompt=final_prompt,
             tools=tools,
             direct_vision_urls=direct_vision_urls 
         )
+
+        # ==========================================
+        # Phase 1: Follow-up 连续发言判定
+        # ==========================================
+        if reply_text and not is_fast_mode and not is_all_mode and not is_tool_call_mode:
+            follow_reason = await self._should_follow_up(chat_id, reply_text)
+            if follow_reason:
+                logger.info(f"[{chat_id}] 💬 触发连续发言: {follow_reason}")
+                follow_prompt = (
+                    f"(导演旁白: 你刚刚说了 \"{reply_text[:100]}\"。"
+                    f"现在你想补充一句——{follow_reason}。"
+                    f"请生成一条极其简短的追加消息，像真人追发第二条那样自然。"
+                    f"严禁重复你刚才说过的话！)"
+                )
+                await asyncio.sleep(random.uniform(1.0, 3.5))  # 模拟打字延迟
+                await self.executor.execute(
+                    event=event,
+                    system_prompt=final_system_prompt,
+                    prompt=follow_prompt,
+                    tools=None  # 追加消息不使用工具
+                )
+
+    # ==========================================
+    # Phase 1: Follow-up 连续发言决策器
+    # ==========================================
+
+    async def _should_follow_up(self, chat_id: str, last_reply: str) -> Optional[str]:
+        """
+        在成功回复后，判断是否应该追加第二句话。
+        返回: None (不追加) 或追加的理由文本。
+        """
+        # 精力不足时不追加
+        if self.state_engine:
+            state = self.state_engine.get_state(chat_id)
+            if state and state.energy < 30:
+                return None
+
+        # 概率门控: 约 30% 概率考虑追加
+        if random.random() > 0.30:
+            return None
+
+        prompt = f"""你刚刚回复了: "{last_reply[:200]}"
+
+判断是否需要紧接着追加一句话（像真人追发第二条消息那样）。
+
+合理追加: 想补充细节、想追问、想加一个表情或语气词
+不应追加: 回复已完整、追加会啰嗦、对方话题已结束
+
+返回 JSON: {{"should_follow": true/false, "reason": "原因"}}"""
+
+        try:
+            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            data = result if isinstance(result, dict) else {}
+            if not isinstance(data, dict):
+                import json, re
+                match = re.search(r'\{.*?\}', str(result), re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+            if data.get("should_follow"):
+                return data.get("reason", "补充细节")
+        except Exception as e:
+            logger.debug(f"[Planner] Follow-up 判定异常: {e}")
+        return None

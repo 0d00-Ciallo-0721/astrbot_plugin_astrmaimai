@@ -8,6 +8,7 @@ from ..infra.persistence import PersistenceManager
 from ..infra.datamodels import ChatState, UserProfile
 from ..infra.gateway import GlobalModelGateway
 from .mood_manager import MoodManager
+from .relationship_engine import RelationshipEngine, RelationshipEvent
 
 class StateEngine:
     """
@@ -36,6 +37,9 @@ class StateEngine:
         self._pool_lock_mutex = threading.Lock()
         
         self.event_bus = event_bus
+
+        # Phase 5: 多维度关系引擎
+        self.relationship_engine = RelationshipEngine(config=self.config)
 
         # 初始化内存微批处理计数器池与互斥锁
         self._message_counter_buffer = {}
@@ -211,46 +215,52 @@ class StateEngine:
             state.is_dirty = True
             logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 情绪平复 -> {state.mood:.2f}")
 
-
-    async def calculate_and_update_affection(self, user_id: str, group_id: str, mood_tag: str, intensity: float = 1.0):
-        """[修正] 修复好感度静默流局 Bug 与字典错配问题"""
-        # 1. 在锁外安全地进行懒加载与数据库读取
+    async def calculate_and_update_affection(self, user_id: str, group_id: str, mood_tag: str, intensity: float = 1.0, message_text: str = ""):
+        """
+        [Phase 5 重写] 使用多维度关系引擎替代旧的简单加减法。
+        纯算法驱动，零 LLM 消耗。
+        """
+        # 1. 懒加载用户画像
         profile = await self.get_user_profile(user_id)
+        old_score = profile.social_score
         
-        is_changed = False
-        delta = 0.0
-        old_score = 0.0
+        # 2. 纯算法交互类型检测
+        event_type = RelationshipEvent.NORMAL_CHAT
+        if message_text:
+            event_type = self.relationship_engine.classify_interaction_type(message_text)
         
-        # 2. 进入轻量级临界区，仅执行数值结算
+        # 3. 调用多维度关系引擎处理事件
+        new_score = self.relationship_engine.process_event(
+            user_id=user_id,
+            event_type=event_type,
+            intensity=intensity,
+            mood_tag=mood_tag
+        )
+        
+        # 4. 同步回写 social_score 到 UserProfile (向后兼容)
         async with self._get_user_lock(user_id):
-            # [修复 Bug 1] 完全对齐 config.py 的 emotion_mapping 输出域
-            affection_deltas = {
-                "happy": 2.0,
-                "surprise": 1.0,
-                "curious": 0.5,
-                "neutral": 0.0,
-                "sad": -1.0,
-                "angry": -2.0
-            }
-            
-            delta = affection_deltas.get(mood_tag, 0.0) * intensity
-            old_score = profile.social_score
-            
-            if delta != 0.0:
-                # 应用变化并限制在 -100 到 100 之间
-                profile.social_score = max(-100.0, min(100.0, profile.social_score + delta))
-                if old_score != profile.social_score:
-                    profile.is_dirty = True
-                    is_changed = True
-
-        # 3. 在锁外安全地触发事件总线广播
-        if is_changed:
-            logger.info(f"[StateEngine] 💗 好感度更新: 用户 {user_id} 在群 {group_id} 的好感度 {old_score:.1f} -> {profile.social_score:.1f} (Δ{delta:.1f})")
+            profile.social_score = new_score
+            profile.last_seen = time.time()
+            profile.is_dirty = True
+        
+        # 5. 事件总线广播
+        if abs(new_score - old_score) > 0.1:
+            logger.info(
+                f"[StateEngine] 💗 好感度更新: 用户 {user_id} | "
+                f"{old_score:.1f} → {new_score:.1f} (Δ{new_score - old_score:+.2f})"
+            )
             if hasattr(self.event_bus, 'trigger_affection_change'):
                 await self.event_bus.trigger_affection_change()
         else:
-            # 增加兜底日志，让开发者知道程序活得好好的，只是因为权重问题没变动
-            logger.debug(f"[StateEngine] ⚖️ 好感度结算完成: 用户 {user_id} 当前情绪标签 ({mood_tag}) 无明显波动权重或已达阈值，数值维持 {old_score:.1f}。")
+            vec = self.relationship_engine.get_or_create(user_id)
+            logger.debug(
+                f"[StateEngine] ⚖️ 好感度结算: 用户 {user_id} | "
+                f"情绪: {mood_tag} | 事件: {event_type} | "
+                f"trust:{vec.trust:.1f} fam:{vec.familiarity:.1f} "
+                f"emo:{vec.emotion_bond:.1f} resp:{vec.respect:.1f} | "
+                f"综合: {new_score:.1f}"
+            )
+
 
             
     async def should_drop_by_energy(self, chat_id: str, msg_count: int) -> bool:

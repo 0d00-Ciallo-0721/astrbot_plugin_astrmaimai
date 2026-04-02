@@ -16,10 +16,11 @@ class PromptRefiner:
 # 文件位置: astrmai/Brain/prompt_refiner.py
 # 标注: 修改 __init__ 和 refine_prompt
 
-    def __init__(self, memory_engine, db_service=None, config=None):
+    def __init__(self, memory_engine, db_service=None, config=None, react_retriever=None):
         self.memory_engine = memory_engine
-        self.db_service = db_service # 🟢 [新增] 直接接收数据库服务
+        self.db_service = db_service
         self.config = config
+        self.react_retriever = react_retriever  # Phase 2: ReAct Agent 记忆检索器
 
     async def refine_prompt(self, event: AstrMessageEvent, system_prompt: str, prompt: str, context) -> tuple[str, str]:
         # 1. 状态校验与污染清理
@@ -39,11 +40,32 @@ class PromptRefiner:
         injection = ""
         current_query = event.message_str
         import html
-        if not disable_rag and self.memory_engine and current_query and not is_fast_mode:
-            memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
-            if memory_text and "什么也没想起来" not in memory_text:
-                safe_memory_text = html.escape(memory_text)
-                injection = f"<injected_memory>\n记忆涌现（记忆模块）：基于当前话题，你回忆起了以下事情：\n{safe_memory_text}\n</injected_memory>\n"
+        if not disable_rag and current_query and not is_fast_mode:
+            # Phase 2: 优先使用 ReAct Agent 检索（如可用且没有被配置关闭），否则回退到单次 recall
+            react_result = ""
+            enable_react = True
+            if self.config and hasattr(self.config, 'memory'):
+                enable_react = self.config.memory.enable_react_agent
+                
+            if self.react_retriever and enable_react:
+                try:
+                    react_result = await self.react_retriever.retrieve(
+                        query=current_query,
+                        chat_id=chat_id,
+                        chat_context=prompt,
+                        sender_name=event.get_sender_name() or ""
+                    )
+                except Exception as e:
+                    logger.debug(f"[PromptRefiner] ReAct 检索异常，回退到单次 recall: {e}")
+
+            if react_result:
+                safe_text = html.escape(react_result)
+                injection = f"<injected_memory>\n{safe_text}\n</injected_memory>\n"
+            elif self.memory_engine:
+                memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
+                if memory_text and "什么也没想起来" not in memory_text:
+                    safe_memory_text = html.escape(memory_text)
+                    injection = f"<injected_memory>\n记忆涌现（记忆模块）：基于当前话题，你回忆起了以下事情：\n{safe_memory_text}\n</injected_memory>\n"
 
         # 3. 底层历史拉取与剧本化格式转换
         history_script = "无近期历史记录。"

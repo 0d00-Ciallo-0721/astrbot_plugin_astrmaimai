@@ -4,7 +4,7 @@ from astrbot.api.event import AstrMessageEvent
 from ..infra.database import DatabaseService
 from ..infra.gateway import GlobalModelGateway
 from .miner import ExpressionMiner
-from typing import List
+from typing import Dict, List
 
 class EvolutionManager:
     """
@@ -187,11 +187,8 @@ class EvolutionManager:
                     except json.JSONDecodeError:
                         pass # 捕获异常，平滑坠落到兜底分支
             
-            # 👇【新增】在此处插入成功结果日志
-            logger.info(f"[Evolution-Processor] ✅ 会话目标分析完成: {goal_result}")
-            # 👆【新增结束】
-            
-            return goal_result
+            # 平滑兜底：所有上面的 if/elif 分支都已在内部 return，到这里说明拆包全部失败
+            return "陪伴用户，提供有趣且连贯的对话"
             
         except Exception as e:
             # 👇【修改】完善异常日志
