@@ -4,6 +4,7 @@ import asyncio
 from typing import Dict, Any,List,Union
 from astrbot.api import logger
 from astrbot.api.star import Context
+from .model_router import ModelRouter
 
 # [修改] 引入 AstrBot 标准消息片段类，并添加防崩溃动态导入 (兼容 v4.12 - v4.18+)
 from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
@@ -23,87 +24,60 @@ class LLMCascadeFailureException(Exception):
 
 class GlobalModelGateway:
     """
-    统一模型网关 (重构版：增加弹性熔断与指数退避)
-    已彻底接入 Pydantic AstrMaiConfig 对象。
+    统一模型网关 (重构版)
+    调度决策委托给独立的 ModelRouter，本类专注于 API 协议适配与消息编排。
     """
     def __init__(self, context: Context, config: Any):
         self.context = context
         self.config = config
-        # 🟢 [新增] 状态机：初始化所有模型池的轮询指针 (Cursors)
-        self._cursors = {
-            "fallback": 0,
-            "agent": 0,
-            "task": 0,
-            "vision": 0,
-            "embedding": 0
-        }
-        # 🟢 [新增 3.3] 全局并发速率限制器 (防止后台任务雪崩 429)
+        # 智能模型路由器（健康分 + 冷却隔离 + 轮询均衡）
+        self.router = ModelRouter()
+        # 全局并发速率限制器
         max_concurrent = getattr(config.infra, 'max_concurrent_llm_calls', 3) if hasattr(config, 'infra') else 3
         self._global_semaphore = asyncio.Semaphore(max_concurrent)
         logger.info(f"[Gateway] 🛡️ 全局速率限制器已启动，最大并发: {max_concurrent}")
 
     def get_models_for_task(self, pool_name: str, models: List[str]) -> List[str]:
-        """状态轮询调度算法：获取重排后的模型列表并推进游标 (严格复用原文件函数名)"""
-        clean_models = [m.strip() for m in models if m and m.strip()]
-        if not clean_models:
-            return []
-            
-        # 去重且保持原配置顺序
-        unique_models = list(dict.fromkeys(clean_models))
-        
-        # 获取当前池的游标，若超限则归零重置
-        cursor = self._cursors.get(pool_name, 0)
-        if cursor >= len(unique_models):
-            cursor = 0
-            
-        # 数组切片重排，将游标指向的模型放到队列首位
-        rearranged = unique_models[cursor:] + unique_models[:cursor]
-        
-        # 游标步进，为下一次调用做准备
-        self._cursors[pool_name] = (cursor + 1) % len(unique_models)
-        
-        return rearranged
+        """兼容接口: 委托给 ModelRouter（保留签名以兼容外部调用）"""
+        return self.router.get_ranked_models(pool_name, models)
 
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
 # [修改] 位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
-        """统一网关底层调用引擎 (增加全局信号量限流 + asyncio 硬中断超时防卡死)"""
+        """统一网关底层调用引擎 (ModelRouter 智能调度 + 全局信号量限流 + 超时熔断)"""
         
-        # 🟢 [3.3] 全局速率门控：超量请求在此排队等待
+        # 全局速率门控
         async with self._global_semaphore:
-            # 1. 尝试主模型池（已根据轮询游标重排）
-            primary_models = self.get_models_for_task(pool_name, models)
+            # 1. 通过 ModelRouter 获取按健康度排序的主模型队列
+            primary_models = self.router.get_ranked_models(pool_name, models)
             attempt_queue = primary_models.copy()
             
-            # 2. 如果允许兜底，主池全挂则尝试总模型池（同样根据总池自己的游标重排）
+            # 2. 兜底池追加
             if use_fallback:
                 fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
-                fallback_models = self.get_models_for_task("fallback", fallback_models_raw)
+                fallback_models = self.router.get_ranked_models("fallback", fallback_models_raw)
                 attempt_queue += [m for m in fallback_models if m not in attempt_queue]
 
             if not attempt_queue:
-                logger.warning(f"[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池 (池: {pool_name})！")
+                logger.warning(f"[Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池 (池: {pool_name})！")
                 raise LLMCascadeFailureException(f"未配置任何可用模型且无备用池 (池: {pool_name})")
                 
-            # 🟢 降低重试次数的默认值，从 2 降为 1，减少网络不佳时的死等时间
             max_retries = getattr(self.config.infra, 'llm_retries', 1)
             backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
-            
-            # 🟢 [核心修复] 网关级绝对超时时间 (如果 config 没配，默认给 15 秒)
             timeout_limit = getattr(self.config.infra, 'api_timeout', 15.0)
             last_error = ""
             
             for model_id in attempt_queue:
-                logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
+                # 判断当前模型属于哪个池（用于上报）
+                report_pool = pool_name if model_id in primary_models else "fallback"
+                
+                logger.debug(f"[Gateway] 🔄 尝试模型: {model_id} (池: {report_pool}, JSON: {is_json})")
                 for attempt in range(max_retries + 1):
                     try:
                         processed_image_urls = image_urls if image_urls else []
-
-                        # 2. 构建上下文请求
                         contexts = []
                         llm_kwargs = {}
                         
-                        # 移除 SystemMessageSegment 的封装，直接作为原生字符串键值对放入字典
                         if system_prompt:
                             llm_kwargs["system_prompt"] = system_prompt
                             
@@ -115,14 +89,13 @@ class GlobalModelGateway:
                                 if current_prompt:
                                     user_content.append(TextPart(text=current_prompt))
                                 for path_or_url in processed_image_urls:
-                                    # 直接注入完整的 Data URI 或 URL，底层 Adapter 会接管解析
                                     user_content.append(ImagePart(url=path_or_url))
                                 contexts.append(UserMessageSegment(content=user_content))
                                 current_prompt = "" 
                             else:
                                 llm_kwargs["image_urls"] = processed_image_urls
                                 
-                        # 🟢 [核心修复] 强制包裹超时熔断器，干掉无限等待的僵尸 API
+                        # 超时熔断
                         try:
                             resp = await asyncio.wait_for(
                                 self.context.llm_generate(
@@ -139,6 +112,9 @@ class GlobalModelGateway:
                         content = resp.completion_text
                         if not content or not content.strip():
                             raise ValueError("响应为空")
+                        
+                        # ✅ 调用成功 → 上报健康
+                        self.router.report_success(report_pool, model_id)
                             
                         if not is_json:
                             return content.strip() 
@@ -148,7 +124,8 @@ class GlobalModelGateway:
                             return json.loads(raw_json_str)
                         except json.JSONDecodeError:
                             if "{" not in raw_json_str and "[" not in raw_json_str:
-                                logger.error(f"[AstrMai-Gateway] 🚨 快速熔断：模型 {model_id} 严重幻觉，拒绝重试，跳过本模型。")
+                                logger.error(f"[Gateway] 🚨 模型 {model_id} 严重幻觉，跳过。")
+                                self.router.report_failure(report_pool, model_id, is_fatal=False)
                                 break 
 
                             if repair_json:
@@ -166,27 +143,27 @@ class GlobalModelGateway:
                         last_error = str(e)
                         error_str = last_error.lower()
                         
-                        # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker) 加上 timeout
+                        # 致命错误关键词检测
                         fatal_keywords = [
-                            "无法解析", 
-                            "429", 
-                            "ratelimit", 
-                            "too many requests", 
-                            "invalid_request_error",
-                            "apitimeouterror",
-                            "request timed out",
-                            "timeout"
+                            "429", "ratelimit", "too many requests", 
+                            "invalid_request_error", "apitimeouterror",
+                            "request timed out", "timeout"
                         ]
                         
-                        if any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str:
-                            logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性异常、限流或超时，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
+                        is_fatal = any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str
+                        
+                        # ❌ 调用失败 → 上报故障
+                        self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
+                        
+                        if is_fatal:
+                            logger.error(f"[Gateway] 🚨 模型 {model_id} 致命错误，冷却隔离并跳过: {last_error[:100]}")
                             break
 
-                        logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
+                        logger.warning(f"[Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
                         if attempt < max_retries:
                             await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
 
-            logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
+            logger.error(f"[Gateway] ❌ 所有模型池均已耗尽，最终异常: {last_error}")
             raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
@@ -266,12 +243,11 @@ class GlobalModelGateway:
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     def get_agent_models(self) -> List[str]:
-        """提供给 Brain/Executor 的原生智能体模型备用列表 (带轮询顺序)"""
+        """提供给 Brain/Executor 的原生智能体模型备用列表 (按健康度排序)"""
         agent_models = getattr(self.config.provider, 'agent_models', [])
         fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
         
-        # 替换为调用修复名称后的 get_models_for_task
-        primary = self.get_models_for_task("agent", agent_models)
-        fallback = self.get_models_for_task("fallback", fallback_models_raw)
+        primary = self.router.get_ranked_models("agent", agent_models)
+        fallback = self.router.get_ranked_models("fallback", fallback_models_raw)
         
         return primary + [m for m in fallback if m not in primary]

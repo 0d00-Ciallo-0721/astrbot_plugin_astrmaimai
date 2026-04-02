@@ -874,3 +874,55 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
                 f"系统反馈：你试图给 [{target_name_for_log}] 点赞，但被无情拒绝！原因：【{error_reply}】。\n"
                 f"请立即生成文本回复，根据被拒绝的原因去抱怨或吐槽对方（例如吐槽对方高冷设了权限，或者说自己今天赞不了了）。"
             )
+
+# ==========================================
+# 工具 11：设定原典查阅工具 (Self-Lore Query Tool)
+# ==========================================
+@dataclass
+class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
+    """潜意识原典记忆回溯工具"""
+    name: str = "self_lore_query_action"
+    description: str = (
+        "【最高优先级防御机制】当你遇到你不确定具体的设定、复杂的规则、过去的详细身世或某个人物身份时，"
+        "绝对严禁动用常识去脑补或猜测事实！如果你不知道或者记忆模糊，说明你想不起来了！"
+        "你必须、且只能调用本工具查询你的潜意识原典库。只有这里记载的才是你在这个世界中发生过的绝对事实。"
+    )
+    
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    persona_id: str = Field(default="", exclude=True)
+
+    parameters: dict = Field(default_factory=lambda: {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "你要回想的具体概念、专有名词、身世片段或设定疑问。例如：'我以前是不是受过重伤？'、'我的魔法技能怎么用？'、'XXX是谁？'。"
+            }
+        },
+        "required": ["query"]
+    })
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        query = kwargs.get("query", "").strip()
+        if not query:
+            return "执行失败：查询关键词不能为空。"
+            
+        from astrbot.api import logger
+        logger.info(f"📜 [Self-Lore Target Retrieval] AI 触发防幻觉机制，正在针对 '{query}' 查阅自我设定原典...")
+        
+        if not self.memory_engine:
+            return "（设定原典库离线，无法获取精确设定）"
+            
+        try:
+            result = await self.memory_engine.recall_persona_lore(query=query, persona_id=self.persona_id, top_k=2)
+            logger.info(f"📜 [Self-Lore Target Retrieval] 查阅执行完毕。")
+            
+            return (
+                "【潜意识原典档案提取成功】\n"
+                "以下是关于你自己或此世界最底层的绝对事实片段：\n"
+                f"{result}\n\n"
+                "指令：请立刻根据上述绝对事实纠正你的认知结构，然后接上你的思绪继续给用户回话。如果未查询到有效事实或显示未发现，请诚恳地告诉对方你真的想不起来了。"
+            )
+        except Exception as e:
+            logger.error(f"[Self-Lore Query Tool] 原典查询失败: {e}")
+            return f"执行失败：原典库查询异常（{e}）。"

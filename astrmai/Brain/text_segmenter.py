@@ -185,3 +185,45 @@ class TextSegmenter:
                 final_segments.append(cleaned)
 
         return final_segments
+
+    @classmethod
+    def semantic_chunk(cls, text: str, max_chunk_size: int = 800) -> List[str]:
+        """
+        [新增] 针对 RAG 原典入库优化的语意切片器。
+        严格遵循双换行符 `\\n\\n` 或 Markdown 标题 (`#`) 进行切断，拒绝在句子中间因字数达标而暴力切割。
+        如果一段语义真的超长 (> max_chunk_size)，才启动次级句子切分。
+        """
+        if not text:
+            return []
+            
+        # 1. 预处理：标准化换行与标题分割线
+        # 在 markdown 标题前强制加入双换行以触发切割
+        text = re.sub(r'\\n(#+\\s+)', r'\\n\\n\1', text)
+        
+        # 按照强语义边界（双换行）切块
+        raw_chunks = [c.strip() for c in re.split(r'\\n{2,}', text) if c.strip()]
+        
+        final_chunks = []
+        current_chunk = ""
+        
+        for chunk in raw_chunks:
+            if len(chunk) > max_chunk_size:
+                # 极端情况：这一整段长得离谱，只能退化使用句号强切
+                sub_chunks = [s.strip() + "。" for s in re.split(r'[。？！?!]', chunk) if s.strip()]
+                for sub in sub_chunks:
+                    if len(current_chunk) + len(sub) > max_chunk_size and current_chunk:
+                        final_chunks.append(current_chunk.strip())
+                        current_chunk = sub
+                    else:
+                        current_chunk += (" " + sub if current_chunk else sub)
+            else:
+                if len(current_chunk) + len(chunk) > max_chunk_size and current_chunk:
+                    final_chunks.append(current_chunk.strip())
+                    current_chunk = chunk
+                else:
+                     current_chunk += ("\\n\\n" + chunk if current_chunk else chunk)
+                     
+        if current_chunk.strip():
+            final_chunks.append(current_chunk.strip())
+            
+        return final_chunks

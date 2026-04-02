@@ -147,6 +147,58 @@ class MemoryEngine:
         }
         await self.retriever.add_memory(content, metadata)
 
+    async def clear_persona_lore(self, persona_id: str = None) -> int:
+        """[新增] Phase 8: 清除旧版原典，避免因更新设定导致新旧人格数据并在带来的精神分裂"""
+        if not await self._ensure_faiss_initialized(): return 0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                query = "DELETE FROM documents WHERE json_extract(metadata, '$.session_id') = '__self_lore__'"
+                params = []
+                if persona_id:
+                    query += " AND json_extract(metadata, '$.persona_id') = ?"
+                    params.append(persona_id)
+                cursor = await db.execute(query, params)
+                await db.commit()
+                deleted = cursor.rowcount
+                logger.info(f"[MemoryEngine] 🧹 成功清洗 {deleted} 条旧版原典碎片 (Persona: {persona_id})。")
+                return deleted
+        except Exception as e:
+            logger.error(f"[MemoryEngine] 清洗旧版原典失败: {e}")
+            return 0
+
+    async def add_persona_lore(self, content: str, persona_id: str = None):
+        """[新增] Phase 8: 将长文本原典进行语义切块并注入隔离区"""
+        if not await self._ensure_faiss_initialized(): return
+        
+        from ..Brain.text_segmenter import TextSegmenter
+        chunks = TextSegmenter.semantic_chunk(content, max_chunk_size=800)
+        
+        logger.info(f"[MemoryEngine] 📥 正在将原点设定切割为 {len(chunks)} 个高保真语义切片存入潜意识原典库...")
+        for i, chunk in enumerate(chunks):
+            metadata = {
+                "session_id": "__self_lore__",
+                "persona_id": persona_id,
+                "chunk_index": i,
+                "importance": 1.0,  # 配合衰减豁免实现永生
+                "create_time": time.time(),
+                "last_access_time": time.time()
+            }
+            await self.retriever.add_memory(chunk, metadata)
+
+    async def recall_persona_lore(self, query: str, persona_id: str = None, top_k: int = 3) -> str:
+        """[新增] Phase 8: 精准靶向原典隔离区的检索"""
+        if not await self._ensure_faiss_initialized(): 
+            return "（设定原典库离线）"
+            
+        results = await self.retriever.search(query, k=top_k, session_id="__self_lore__", persona_id=persona_id)
+        
+        valid_results = [r for r in results if getattr(r, 'score', 1.0) >= 0.05]
+        if not valid_results:
+            return "（潜意识原典库中未发现相关事实）"
+            
+        all_results = [f"[绝对事实]: {r.content}" for r in valid_results]
+        return "\n".join(all_results)
+
     async def recall(self, query: str, session_id: str = None, persona_id: str = None) -> str:
         # 拦截校验：确保模型已挂载
         if not await self._ensure_faiss_initialized(): 
@@ -188,8 +240,9 @@ class MemoryEngine:
                             COALESCE(json_extract(metadata, '$.importance'), 0.5) * ?, 4
                         ))
                     )
-                    WHERE json_extract(metadata, '$.importance') IS NOT NULL
-                       OR metadata LIKE '%"importance"%'
+                    WHERE (json_extract(metadata, '$.importance') IS NOT NULL
+                       OR metadata LIKE '%"importance"%')
+                      AND COALESCE(json_extract(metadata, '$.session_id'), '') != '__self_lore__'
                 """, (decay_factor,))
                 await db.commit()
                 return cursor.rowcount

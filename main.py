@@ -92,7 +92,7 @@ class AstrMaiPlugin(Star):
         self.reply_engine = ReplyEngine(self.state_engine, self.state_engine.mood_manager)
         self.evolution = EvolutionManager(self.db_service, self.gateway)
 
-        self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway)
+        self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway, memory_engine=self.memory_engine)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
         
         # Phase 2: ReAct Agent 记忆检索器

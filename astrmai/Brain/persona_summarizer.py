@@ -12,10 +12,11 @@ class PersonaSummarizer:
     人设摘要/压缩管理器 (System 2)
     职责: 将冗长的 System Prompt 压缩为高密度的核心特征与风格指南，减少 Token 消耗。
     """
-    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None):
+    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None, memory_engine=None):
         self.persistence = persistence
         self.gateway = gateway
         self.config = config if config else gateway.config
+        self.memory_engine = memory_engine
         # 加载持久化缓存
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁
@@ -127,6 +128,20 @@ class PersonaSummarizer:
         采用顺序 await 执行以保护 LLM API 并发配额，完成后自动更新挂起状态。
         """
         logger.info(f"[PersonaSummarizer] 🚀 开始后台静默提取 [{cache_key}] 的全维度人格切片...")
+        
+        # ==========================================
+        # 🟢 [Phase 8] 触发原典清洗与向量化重铸
+        # ==========================================
+        try:
+            if getattr(self, 'memory_engine', None):
+                logger.info(f"[PersonaSummarizer] 🧹 检测到人设重建，准备清空旧版并重铸 {cache_key} 的潜意识原典...")
+                await self.memory_engine.clear_persona_lore(cache_key)
+                await self.memory_engine.add_persona_lore(original_prompt, cache_key)
+            else:
+                logger.warning("[PersonaSummarizer] ⚠️ 未能找到 memory_engine (未注入)，跳过原典入库。")
+        except Exception as e:
+            logger.error(f"[PersonaSummarizer] ⚠️ 潜意识原典重铸失败 (防宕机隔离): {e}")
+
         try:
             shards = {}
             # 顺序调用 8 大维度切片提取 (依赖下方的具体子函数)

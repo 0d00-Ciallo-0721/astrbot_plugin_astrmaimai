@@ -22,8 +22,9 @@ from .tools.pfc_tools import (
     TopicHijackTool,          # 🥱 岔开话题
     SpaceTransitionTool,      # 🤫 悄悄话转私聊
     RegretAndWithdrawTool,    # 🛑 手滑撤回找补
-    MessageReactionTool,      # ✨ 贴表情回应工具 (新增)
-    ProactiveLikeTool         # 👍 狂点赞工具 (新增)
+    MessageReactionTool,      # ✨ 贴表情回应工具
+    ProactiveLikeTool,        # 👍 狂点赞工具
+    SelfLoreQueryTool         # 📜 [Phase 8] 原典潜意识防幻觉查阅工具
 )
 
 from ..memory.engine import MemoryEngine
@@ -136,6 +137,7 @@ class Planner:
             sys3_light_tools = (await self.sys3_router.get_light_tools_for_planner()).tools
             
             # 保留核心 PFC 拟人工具，去除纯情感/聊天微操工具，专注执行任务
+            target_persona_id = getattr(self.gateway.config.persona, 'persona_id', "") if hasattr(self.gateway.config, 'persona') else ""
             task_mode_pfc_tools = [
                 WaitTool(),
                 OmniPerceptionTool(
@@ -145,6 +147,7 @@ class Planner:
                     current_sender_id=str(user_id) if user_id is not None else "",
                     current_sender_name=sender_name
                 ),
+                SelfLoreQueryTool(memory_engine=self.memory_engine, persona_id=target_persona_id)
             ]
             
             tools = task_mode_pfc_tools + sys3_light_tools
@@ -159,8 +162,10 @@ class Planner:
             
         else:
             # ── 原有纯聊天模式 ──
+            target_persona_id = getattr(self.gateway.config.persona, 'persona_id', "") if hasattr(self.gateway.config, 'persona') else ""
             tools = [
                 WaitTool(),
+                SelfLoreQueryTool(memory_engine=self.memory_engine, persona_id=target_persona_id),
                 OmniPerceptionTool(
                     memory_engine=self.memory_engine,
                     db_service=self.context_engine.db,
