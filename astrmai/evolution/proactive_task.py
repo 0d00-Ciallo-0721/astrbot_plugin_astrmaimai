@@ -51,6 +51,8 @@ class ProactiveTask:
         self._task = None
         self._last_profile_run = 0
         self._last_diary_date = ""
+        # 🟢 [3.1] 后台任务全局信号量：限制后台 LLM 任务并发数，防止梦境+日记+侧写同时触发导致 429
+        self._bg_semaphore = asyncio.Semaphore(2)
 
     async def start(self):
         """[修改] 启动多维后台主动任务循环 (心跳机制)"""
@@ -86,32 +88,34 @@ class ProactiveTask:
         """Phase 7: 执行一次梦境整理循环"""
         if not self.dream_agent:
             return
-        try:
-            logger.info("[ProactiveTask] 💤 触发梦境整理...")
-            dream_log = await self.dream_agent.run_dream_cycle()
-            if dream_log:
-                # 生成梦境叙述
-                persona_name = getattr(
-                    getattr(self.config, 'persona', None), 'name', 'Mai'
-                )
-                dream_text = await self.dream_generator.generate(
-                    dream_log=dream_log,
-                    persona_name=persona_name
-                )
-                if dream_text:
-                    logger.info(f"[ProactiveTask] 🌙 梦境叙述生成:\n{dream_text[:100]}...")
-                    # 可选: 将梦境写入记忆引擎作为一条特殊记忆
-                    if self.memory_engine:
-                        try:
-                            await self.memory_engine.add_memory(
-                                content=f"[梦境日记] {dream_text}",
-                                session_id="__dream_diary__",
-                                importance=0.5
-                            )
-                        except Exception:
-                            pass
-        except Exception as e:
-            logger.error(f"[ProactiveTask] 梦境整理任务异常: {e}")
+        # 🟢 [3.1] 后台信号量限流
+        async with self._bg_semaphore:
+            try:
+                logger.info("[ProactiveTask] 💤 触发梦境整理...")
+                dream_log = await self.dream_agent.run_dream_cycle()
+                if dream_log:
+                    # 生成梦境叙述
+                    persona_name = getattr(
+                        getattr(self.config, 'persona', None), 'name', 'Mai'
+                    )
+                    dream_text = await self.dream_generator.generate(
+                        dream_log=dream_log,
+                        persona_name=persona_name
+                    )
+                    if dream_text:
+                        logger.info(f"[ProactiveTask] 🌙 梦境叙述生成:\n{dream_text[:100]}...")
+                        # 可选: 将梦境写入记忆引擎作为一条特殊记忆
+                        if self.memory_engine:
+                            try:
+                                await self.memory_engine.add_memory(
+                                    content=f"[梦境日记] {dream_text}",
+                                    session_id="__dream_diary__",
+                                    importance=0.5
+                                )
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.error(f"[ProactiveTask] 梦境整理任务异常: {e}")
 
     async def stop(self):
         """停止后台循环"""
@@ -498,93 +502,95 @@ class ProactiveTask:
 
     async def _run_profiling_task(self):
         """深度侧写任务：筛选互动频次达标的用户，更新其心理画像 + Phase 8 取名"""
-        # 获取所有活跃的用户档案
-        active_profiles = self.state_engine.get_active_profiles()
-        
-        # 从配置中获取侧写触发阈值，默认设为 50 条消息
-        threshold = getattr(self.config.life, 'profiling_msg_threshold', 200)
-        
-        for profile in active_profiles:
-            # Phase 8.1: 累积互动次数
-            profile.know_times = getattr(profile, 'know_times', 0) + 1
+        # 🟢 [3.1] 后台信号量限流
+        async with self._bg_semaphore:
+            # 获取所有活跃的用户档案
+            active_profiles = self.state_engine.get_active_profiles()
+            
+            # 从配置中获取侧写触发阈值，默认设为 50 条消息
+            threshold = getattr(self.config.life, 'profiling_msg_threshold', 200)
+            
+            for profile in active_profiles:
+                # Phase 8.1: 累积互动次数
+                profile.know_times = getattr(profile, 'know_times', 0) + 1
 
-            # Phase 8.1: 触发取名（互动 >= 3 次且尚未命名）
-            if profile.know_times >= 3 and not getattr(profile, 'is_known', False):
-                logger.info(f"[Life] 🤝 用户 {profile.name} 已互动 {profile.know_times} 次，触发取名系统...")
-                try:
-                    await self._generate_nickname(profile)
-                except Exception as e:
-                    logger.error(f"[Life] 取名任务失败 ({profile.name}): {e}")
+                # Phase 8.1: 触发取名（互动 >= 3 次且尚未命名）
+                if profile.know_times >= 3 and not getattr(profile, 'is_known', False):
+                    logger.info(f"[Life] 🤝 用户 {profile.name} 已互动 {profile.know_times} 次，触发取名系统...")
+                    try:
+                        await self._generate_nickname(profile)
+                    except Exception as e:
+                        logger.error(f"[Life] 取名任务失败 ({profile.name}): {e}")
 
-            # 如果该用户自上次侧写以来的互动次数达到阈值
-            if getattr(profile, 'message_count_for_profiling', 0) >= threshold:
-                from astrbot.api import logger
-                logger.info(f"[Life] 🕵️ 用户 {profile.name} 私聊互动频次达标，开始进行增量心理侧写...")
-                try:
-                    await self._generate_persona_analysis(profile)
-                except Exception as e:
-                    from astrbot.api import logger
-                    logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")
+                # 如果该用户自上次侧写以来的互动次数达到阈值
+                if getattr(profile, 'message_count_for_profiling', 0) >= threshold:
+                    logger.info(f"[Life] 🕵️ 用户 {profile.name} 私聊互动频次达标，开始进行增量心理侧写...")
+                    try:
+                        await self._generate_persona_analysis(profile)
+                    except Exception as e:
+                        logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")
 
 
     async def _run_daily_diary_task(self):
         """[修改] 午夜记忆日记撰写任务：不仅生成文本日记，还要触发深度的事件结构化、反思生成和节点提取。"""
-        logger.info("[Life] 🌙 夜深了，机器大脑开始为各个群聊撰写每日内部日记并进行深度记忆归档...")
-        active_states = self.state_engine.get_active_states()
-        
-        from ..infra.database import DatabaseService
-        db = DatabaseService(self.persistence)
-        
-        persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
-        
-        if hasattr(self.persistence, 'load_persona_cache_async'):
-            cache = await self.persistence.load_persona_cache_async()
-        else:
-            cache = self.persistence.load_persona_cache()
+        # 🟢 [3.1] 后台信号量限流
+        async with self._bg_semaphore:
+            logger.info("[Life] 🌙 夜深了，机器大脑开始为各个群聊撰写每日内部日记并进行深度记忆归档...")
+            active_states = self.state_engine.get_active_states()
             
-        persona_data = cache.get(persona_id, {})
-        summary = persona_data.get("summary", "")
-        persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""
-        
-        for state in active_states:
-            group_id = state.chat_id
-            if not group_id: continue
+            from ..infra.database import DatabaseService
+            db = DatabaseService(self.persistence)
             
-            # 🟢 1. 挂接自动触发系统：启动群组历史记忆批量回溯与节点提取
-            if self.memory_engine and hasattr(self.memory_engine, 'summarizer'):
-                logger.info(f"[Life] 启动群 {group_id} 的长对话历史回溯与多维节点打点...")
-                if hasattr(self.memory_engine.summarizer, 'extract_and_summarize_history'):
-                    await self.memory_engine.summarizer.extract_and_summarize_history(group_id, days=1)
+            persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
+            
+            if hasattr(self.persistence, 'load_persona_cache_async'):
+                cache = await self.persistence.load_persona_cache_async()
+            else:
+                cache = self.persistence.load_persona_cache()
+                
+            persona_data = cache.get(persona_id, {})
+            summary = persona_data.get("summary", "")
+            persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""
+            
+            for state in active_states:
+                group_id = state.chat_id
+                if not group_id: continue
+                
+                # 🟢 1. 挂接自动触发系统
+                if self.memory_engine and hasattr(self.memory_engine, 'summarizer'):
+                    logger.info(f"[Life] 启动群 {group_id} 的长对话历史回溯与多维节点打点...")
+                    if hasattr(self.memory_engine.summarizer, 'extract_and_summarize_history'):
+                        await self.memory_engine.summarizer.extract_and_summarize_history(group_id, days=1)
 
-            # 🟢 2. 生成文本日记和每日自由感悟
-            recent_memories = []
-            if self.memory_engine and hasattr(self.memory_engine, 'get_recent_memories'):
-                recent_memories = await self.memory_engine.get_recent_memories(group_id, hours=24)
+                # 🟢 2. 生成文本日记和每日自由感悟
+                recent_memories = []
+                if self.memory_engine and hasattr(self.memory_engine, 'get_recent_memories'):
+                    recent_memories = await self.memory_engine.get_recent_memories(group_id, hours=24)
+                    
+                recent_jargons = []
+                if hasattr(db, 'get_recent_jargons_async'):
+                    recent_jargons = await db.get_recent_jargons_async(group_id, hours=24)
+                elif hasattr(db, 'get_recent_jargons'):
+                    recent_jargons = db.get_recent_jargons(group_id, hours=24)
+                    
+                mood_val = state.mood
+                energy_val = state.energy
                 
-            recent_jargons = []
-            if hasattr(db, 'get_recent_jargons_async'):
-                recent_jargons = await db.get_recent_jargons_async(group_id, hours=24)
-            elif hasattr(db, 'get_recent_jargons'):
-                recent_jargons = db.get_recent_jargons(group_id, hours=24)
+                if not recent_memories and not recent_jargons and abs(mood_val) < 0.2:
+                    logger.debug(f"[Life] 📖 群 {group_id} 今天非常安静且情绪平稳，跳过日记撰写。")
+                    continue
+                    
+                memory_context = "\n".join([f"- {m}" for m in recent_memories]) if recent_memories else "无特别事实发生。"
+                jargon_context = "\n".join([f"- {j.content} (含义: {j.meaning})" for j in recent_jargons]) if recent_jargons else "无新学词汇。"
                 
-            mood_val = state.mood
-            energy_val = state.energy
-            
-            if not recent_memories and not recent_jargons and abs(mood_val) < 0.2:
-                logger.debug(f"[Life] 📖 群 {group_id} 今天非常安静且情绪平稳，跳过日记撰写。")
-                continue
-                
-            memory_context = "\n".join([f"- {m}" for m in recent_memories]) if recent_memories else "无特别事实发生。"
-            jargon_context = "\n".join([f"- {j.content} (含义: {j.meaning})" for j in recent_jargons]) if recent_jargons else "无新学词汇。"
-            
-            import time
-            prompt = f"""你现在进入了深度睡眠的“潜意识反思模式”。
-今天是 {time.strftime("%Y年%m月%d日")}。夜深人静，你需要静下心来，写一篇属于你自己的“内部私人日记”。
+                import time
+                prompt = f"""你现在进入了深度睡眠的"潜意识反思模式"。
+今天是 {time.strftime("%Y年%m月%d日")}。夜深人静，你需要静下心来，写一篇属于你自己的"内部私人日记"。
 你正在回顾群聊【{group_id}】今天发生的事情。
 
 {persona_injection}
 
-以下是你脑海中提取出的今天关于这个群的“记忆残片”和“新知识”：
+以下是你脑海中提取出的今天关于这个群的"记忆残片"和"新知识"：
 【今日事实记忆】：
 {memory_context}
 
@@ -595,32 +601,33 @@ class ProactiveTask:
 当前心情指数为 {mood_val:.2f} (-1.0 到 1.0)。精力剩余 {energy_val:.2f}。
 
 [日记撰写要求]
-1. 视角：必须以第一人称（“我”）的语气撰写，完全沉浸于你的人设。
+1. 视角：必须以第一人称（"我"）的语气撰写，完全沉浸于你的人设。
 2. 内容结构：
    - 概括：今天在这个群里，我都经历了什么？（把零散的事实串联起来）
    - 沉淀：今天我有什么新收获？（比如新黑话，或者对某些群友的新看法）
-   - 情绪：结合今天发生的事和入睡前的心情指数，解释一下“我为什么会有这种心情”。
+   - 情绪：结合今天发生的事和入睡前的心情指数，解释一下"我为什么会有这种心情"。
 3. 格式：纯文本内心独白，分段落，150字到300字左右。绝对不要使用 Markdown 列表，要像真正的人类日记一样自然连贯。
 """
-            try:
-                diary_content = await self.gateway.call_proactive_task(prompt)
-                
-                if diary_content and self.memory_engine:
-                    import datetime
-                    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-                    diary_entry = f"【主观情景记忆/私人日记】 {time.strftime('%Y年%m月%d日')} 关于群 {group_id} 的回忆：\n{diary_content}"
+                try:
+                    diary_content = await self.gateway.call_proactive_task(prompt)
                     
-                    await self.memory_engine.add_memory(
-                        content=diary_entry,
-                        session_id=str(group_id),
-                        importance=0.95  
-                    )
-                    
-                    # 🟢 [新增] 存入 DailyReflection 表供长期调取查阅
-                    plugin = getattr(self.gateway.context, 'astrmai_plugin', None)
-                    if plugin and hasattr(plugin, 'db_service') and hasattr(plugin.db_service, 'save_reflection_async'):
-                        await plugin.db_service.save_reflection_async(date_str, diary_content)
+                    if diary_content and self.memory_engine:
+                        import datetime
+                        date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                        diary_entry = f"【主观情景记忆/私人日记】 {time.strftime('%Y年%m月%d日')} 关于群 {group_id} 的回忆：\n{diary_content}"
+                        
+                        await self.memory_engine.add_memory(
+                            content=diary_entry,
+                            session_id=str(group_id),
+                            importance=0.95  
+                        )
+                        
+                        # 🟢 [新增] 存入 DailyReflection 表供长期调取查阅
+                        plugin = getattr(self.gateway.context, 'astrmai_plugin', None)
+                        if plugin and hasattr(plugin, 'db_service') and hasattr(plugin.db_service, 'save_reflection_async'):
+                            await plugin.db_service.save_reflection_async(date_str, diary_content)
 
-                    logger.info(f"[Life] 📖 为群 {group_id} 撰写日记并生成反思完成: {diary_content[:20]}...")
-            except Exception as e:
-                logger.error(f"[Life] 生成群 {group_id} 的日记失败: {e}")
+                        logger.info(f"[Life] 📖 为群 {group_id} 撰写日记并生成反思完成: {diary_content[:20]}...")
+                except Exception as e:
+                    logger.error(f"[Life] 生成群 {group_id} 的日记失败: {e}")
+

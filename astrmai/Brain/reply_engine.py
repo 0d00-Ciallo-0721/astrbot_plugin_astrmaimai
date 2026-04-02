@@ -251,26 +251,10 @@ class ReplyEngine:
                 force_meme_flag = True
                 
             else:
-                if hasattr(self.state_engine, 'get_user_profile'):
-                    profile = await self.state_engine.get_user_profile(user_id)
-                    user_affection = getattr(profile, 'social_score', 0.0) if profile else 0.0
-                else:
-                    user_affection = 0.0
-                
-                if hasattr(self.mood_manager, 'analyze_mood'):
-                    (tag, new_mood) = await self.mood_manager.analyze_mood(
-                        text=clean_text, 
-                        current_mood=state.mood,
-                        user_affection=user_affection
-                    )
-                elif hasattr(self.mood_manager, 'analyze_text_mood'):
-                    (tag, new_mood) = await self.mood_manager.analyze_text_mood(clean_text, state.mood)
-                else:
-                    new_mood = state.mood
-                    
-                await self.state_engine.atomic_update_mood(chat_id, absolute_val=new_mood)
+                # 🟢 MoodManager 调用已废除，情绪变化由 Judge 在前置阶段完成，这里仅简单衰减情绪
+                new_mood = await self.state_engine.atomic_update_mood(chat_id, delta=0.0) # 触发内部的 decay
             
-            logger.debug(f"[Reply] 😃 情绪更新: {tag} ({new_mood:.2f})")
+            logger.debug(f"[Reply] 😃 情绪衰减更新: ({new_mood:.2f})")
             
             # ==========================================
             # 🟢 靶向情感结算与私聊挖掘计数

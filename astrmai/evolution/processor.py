@@ -156,24 +156,26 @@ class EvolutionManager:
 
     async def analyze_and_get_goal(self, chat_id: str, recent_messages: str) -> str:
         """
-        目标分析器 (Reference: pfc.py GoalAnalyzer)
+        目标分析器 (混合模式重构版)
         动态分析当前的短期对话意图或目标。
-        [修改] 添加深度类型防御，安全降级 JSON 破损的情况
+        Token 优化: Prompt 极限压缩 (~50字) + 输入截断 (200字)
         """
-
-        logger.info(f"[Evolution-Processor] 🎯 启动后台任务: 开始分析会话目标 (chat_id: {chat_id})...")
+        # 输入为空则直接返回默认值（零 Token）
+        if not recent_messages or not recent_messages.strip():
+            return "陪伴用户，提供有趣且连贯的对话"
         
-        prompt = f"""
-        作为对话意图分析器，请根据最近的对话上下文，用一句话（不超过20个字）总结当前对话的核心目标或主要话题。
-        对话上下文:
-        {recent_messages}
-
-        严格返回 JSON 格式: {{"goal": "string"}}
-        """
+        # 截断输入，最多 200 字（降低 input token）
+        trimmed = recent_messages.strip()[:200]
+        
+        # 极短 Prompt（~50 字，原版 ~120 字）
+        prompt = f"""根据对话总结当前核心话题(≤15字):
+{trimmed}
+JSON: {{"goal": "string"}}"""
+        
         try:
             result = await self.miner.gateway.call_data_process_task(prompt=prompt, is_json=True)
             
-            # 🟢 防御：多层级安全拆包
+            # 安全拆包
             if isinstance(result, dict):
                 return str(result.get("goal", "陪伴用户，提供有趣且连贯的对话"))
             elif isinstance(result, str):
@@ -185,15 +187,12 @@ class EvolutionManager:
                         if isinstance(data, dict):
                             return str(data.get("goal", "陪伴用户，提供有趣且连贯的对话"))
                     except json.JSONDecodeError:
-                        pass # 捕获异常，平滑坠落到兜底分支
+                        pass
             
-            # 平滑兜底：所有上面的 if/elif 分支都已在内部 return，到这里说明拆包全部失败
             return "陪伴用户，提供有趣且连贯的对话"
             
         except Exception as e:
-            # 👇【修改】完善异常日志
             logger.error(f"[Evolution-Processor] ❌ 目标分析异常: {e}")
-            # 👆【修改结束】
             return "陪伴用户，提供有趣且连贯的对话"
 
 

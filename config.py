@@ -104,6 +104,8 @@ class MemoryConfig(BaseModel):
 class InfraConfig(BaseModel):
     llm_retries: int = Field(default=2)
     backoff_factor: float = Field(default=1.5)
+    api_timeout: float = Field(default=15.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
+    max_concurrent_llm_calls: int = Field(default=3, description="全局 LLM 并发请求上限，防止后台任务雪崩导致 429")
 
 class VisionConfig(BaseModel):
     enable_vision: bool = Field(default=True, description="多模态视觉总开关")

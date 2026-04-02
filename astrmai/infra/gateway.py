@@ -37,6 +37,10 @@ class GlobalModelGateway:
             "vision": 0,
             "embedding": 0
         }
+        # 🟢 [新增 3.3] 全局并发速率限制器 (防止后台任务雪崩 429)
+        max_concurrent = getattr(config.infra, 'max_concurrent_llm_calls', 3) if hasattr(config, 'infra') else 3
+        self._global_semaphore = asyncio.Semaphore(max_concurrent)
+        logger.info(f"[Gateway] 🛡️ 全局速率限制器已启动，最大并发: {max_concurrent}")
 
     def get_models_for_task(self, pool_name: str, models: List[str]) -> List[str]:
         """状态轮询调度算法：获取重排后的模型列表并推进游标 (严格复用原文件函数名)"""
@@ -63,128 +67,127 @@ class GlobalModelGateway:
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
 # [修改] 位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
-        """统一网关底层调用引擎 (增加 asyncio 硬中断超时防卡死)"""
+        """统一网关底层调用引擎 (增加全局信号量限流 + asyncio 硬中断超时防卡死)"""
         
-        # 1. 尝试主模型池（已根据轮询游标重排）
-        primary_models = self.get_models_for_task(pool_name, models)
-        attempt_queue = primary_models.copy()
-        
-        # 2. 如果允许兜底，主池全挂则尝试总模型池（同样根据总池自己的游标重排）
-        if use_fallback:
-            fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
-            fallback_models = self.get_models_for_task("fallback", fallback_models_raw)
-            attempt_queue += [m for m in fallback_models if m not in attempt_queue]
-
-        if not attempt_queue:
-            logger.warning(f"[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池 (池: {pool_name})！")
-            # [新增] 抛出自定义级联崩溃异常
-            raise LLMCascadeFailureException(f"未配置任何可用模型且无备用池 (池: {pool_name})")
+        # 🟢 [3.3] 全局速率门控：超量请求在此排队等待
+        async with self._global_semaphore:
+            # 1. 尝试主模型池（已根据轮询游标重排）
+            primary_models = self.get_models_for_task(pool_name, models)
+            attempt_queue = primary_models.copy()
             
-        # 🟢 降低重试次数的默认值，从 2 降为 1，减少网络不佳时的死等时间
-        max_retries = getattr(self.config.infra, 'llm_retries', 1)
-        backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
-        
-        # 🟢 [核心修复] 网关级绝对超时时间 (如果 config 没配，默认给 15 秒)
-        timeout_limit = getattr(self.config.infra, 'api_timeout', 15.0)
-        last_error = ""
-        
-        for model_id in attempt_queue:
-            logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
-            for attempt in range(max_retries + 1):
-                try:
-                    processed_image_urls = image_urls if image_urls else []
+            # 2. 如果允许兜底，主池全挂则尝试总模型池（同样根据总池自己的游标重排）
+            if use_fallback:
+                fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
+                fallback_models = self.get_models_for_task("fallback", fallback_models_raw)
+                attempt_queue += [m for m in fallback_models if m not in attempt_queue]
 
-                    # 2. 构建上下文请求
-                    contexts = []
-                    llm_kwargs = {}
-                    
-                    # 移除 SystemMessageSegment 的封装，直接作为原生字符串键值对放入字典
-                    if system_prompt:
-                        llm_kwargs["system_prompt"] = system_prompt
+            if not attempt_queue:
+                logger.warning(f"[AstrMai-Gateway] 🚨 任务执行失败：未配置任何可用模型且无备用池 (池: {pool_name})！")
+                raise LLMCascadeFailureException(f"未配置任何可用模型且无备用池 (池: {pool_name})")
+                
+            # 🟢 降低重试次数的默认值，从 2 降为 1，减少网络不佳时的死等时间
+            max_retries = getattr(self.config.infra, 'llm_retries', 1)
+            backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
+            
+            # 🟢 [核心修复] 网关级绝对超时时间 (如果 config 没配，默认给 15 秒)
+            timeout_limit = getattr(self.config.infra, 'api_timeout', 15.0)
+            last_error = ""
+            
+            for model_id in attempt_queue:
+                logger.debug(f"[AstrMai-Gateway] 🔄 尝试调用模型: {model_id} (JSON模式: {is_json})")
+                for attempt in range(max_retries + 1):
+                    try:
+                        processed_image_urls = image_urls if image_urls else []
+
+                        # 2. 构建上下文请求
+                        contexts = []
+                        llm_kwargs = {}
                         
-                    current_prompt = prompt
-                    
-                    if processed_image_urls:
-                        if ImagePart:
-                            user_content = []
-                            if current_prompt:
-                                user_content.append(TextPart(text=current_prompt))
-                            for path_or_url in processed_image_urls:
-                                # 直接注入完整的 Data URI 或 URL，底层 Adapter 会接管解析
-                                user_content.append(ImagePart(url=path_or_url))
-                            contexts.append(UserMessageSegment(content=user_content))
-                            current_prompt = "" 
-                        else:
-                            llm_kwargs["image_urls"] = processed_image_urls
+                        # 移除 SystemMessageSegment 的封装，直接作为原生字符串键值对放入字典
+                        if system_prompt:
+                            llm_kwargs["system_prompt"] = system_prompt
                             
-                    import asyncio
-                    # 🟢 [核心修复] 强制包裹超时熔断器，干掉无限等待的僵尸 API
-                    try:
-                        resp = await asyncio.wait_for(
-                            self.context.llm_generate(
-                                chat_provider_id=model_id,
-                                prompt=current_prompt if current_prompt else None,
-                                contexts=contexts,
-                                **llm_kwargs
-                            ),
-                            timeout=timeout_limit
-                        )
-                    except asyncio.TimeoutError:
-                        raise TimeoutError(f"网关硬中断：API 响应超时 ({timeout_limit}s)")
-                    
-                    content = resp.completion_text
-                    if not content or not content.strip():
-                        raise ValueError("响应为空")
+                        current_prompt = prompt
                         
-                    if not is_json:
-                        return content.strip() 
+                        if processed_image_urls:
+                            if ImagePart:
+                                user_content = []
+                                if current_prompt:
+                                    user_content.append(TextPart(text=current_prompt))
+                                for path_or_url in processed_image_urls:
+                                    # 直接注入完整的 Data URI 或 URL，底层 Adapter 会接管解析
+                                    user_content.append(ImagePart(url=path_or_url))
+                                contexts.append(UserMessageSegment(content=user_content))
+                                current_prompt = "" 
+                            else:
+                                llm_kwargs["image_urls"] = processed_image_urls
+                                
+                        # 🟢 [核心修复] 强制包裹超时熔断器，干掉无限等待的僵尸 API
+                        try:
+                            resp = await asyncio.wait_for(
+                                self.context.llm_generate(
+                                    chat_provider_id=model_id,
+                                    prompt=current_prompt if current_prompt else None,
+                                    contexts=contexts,
+                                    **llm_kwargs
+                                ),
+                                timeout=timeout_limit
+                            )
+                        except asyncio.TimeoutError:
+                            raise TimeoutError(f"网关硬中断：API 响应超时 ({timeout_limit}s)")
                         
-                    raw_json_str = self._extract_json(content)
-                    try:
-                        return json.loads(raw_json_str)
-                    except json.JSONDecodeError:
-                        if "{" not in raw_json_str and "[" not in raw_json_str:
-                            logger.error(f"[AstrMai-Gateway] 🚨 快速熔断：模型 {model_id} 严重幻觉，拒绝重试，跳过本模型。")
-                            break 
+                        content = resp.completion_text
+                        if not content or not content.strip():
+                            raise ValueError("响应为空")
+                            
+                        if not is_json:
+                            return content.strip() 
+                            
+                        raw_json_str = self._extract_json(content)
+                        try:
+                            return json.loads(raw_json_str)
+                        except json.JSONDecodeError:
+                            if "{" not in raw_json_str and "[" not in raw_json_str:
+                                logger.error(f"[AstrMai-Gateway] 🚨 快速熔断：模型 {model_id} 严重幻觉，拒绝重试，跳过本模型。")
+                                break 
 
-                        if repair_json:
-                            try: 
-                                repaired = repair_json(raw_json_str, return_objects=False)
-                                if repaired and isinstance(repaired, str):
-                                    return json.loads(repaired)
-                                elif repaired and isinstance(repaired, (dict, list)):
-                                    return repaired
-                            except json.JSONDecodeError:
-                                pass 
-                        raise ValueError(f"JSON 损坏且无法修复: {raw_json_str[:50]}...")
+                            if repair_json:
+                                try: 
+                                    repaired = repair_json(raw_json_str, return_objects=False)
+                                    if repaired and isinstance(repaired, str):
+                                        return json.loads(repaired)
+                                    elif repaired and isinstance(repaired, (dict, list)):
+                                        return repaired
+                                except json.JSONDecodeError:
+                                    pass 
+                            raise ValueError(f"JSON 损坏且无法修复: {raw_json_str[:50]}...")
+                            
+                    except Exception as e:
+                        last_error = str(e)
+                        error_str = last_error.lower()
                         
-                except Exception as e:
-                    last_error = str(e)
-                    error_str = last_error.lower()
-                    
-                    # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker) 加上 timeout
-                    fatal_keywords = [
-                        "无法解析", 
-                        "429", 
-                        "ratelimit", 
-                        "too many requests", 
-                        "invalid_request_error",
-                        "apitimeouterror",
-                        "request timed out",
-                        "timeout"
-                    ]
-                    
-                    if any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str:
-                        logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性异常、限流或超时，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
-                        break
+                        # 🟢 [修改] 智能快速熔断 (Smart Circuit Breaker) 加上 timeout
+                        fatal_keywords = [
+                            "无法解析", 
+                            "429", 
+                            "ratelimit", 
+                            "too many requests", 
+                            "invalid_request_error",
+                            "apitimeouterror",
+                            "request timed out",
+                            "timeout"
+                        ]
+                        
+                        if any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str:
+                            logger.error(f"[AstrMai-Gateway] 🚨 触发快速熔断：检测到确定性异常、限流或超时，放弃本模型重试，立刻推进轮询队列！异常: {last_error[:100]}...")
+                            break
 
-                    logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
-                    if attempt < max_retries:
-                        import asyncio
-                        await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
+                        logger.warning(f"[AstrMai-Gateway] ⚠️ 模型 {model_id} 失败 (Try {attempt+1}/{max_retries+1}): {e}")
+                        if attempt < max_retries:
+                            await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
 
-        logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
-        raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
+            logger.error(f"[AstrMai-Gateway] ❌ 所有模型池(主池+兜底池)均已耗尽，最终异常: {last_error}")
+            raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """多模态视觉任务专用网关"""

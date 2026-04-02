@@ -53,7 +53,8 @@ class PromptRefiner:
                         query=current_query,
                         chat_id=chat_id,
                         chat_context=prompt,
-                        sender_name=event.get_sender_name() or ""
+                        sender_name=event.get_sender_name() or "",
+                        retrieve_keys=retrieve_keys
                     )
                 except Exception as e:
                     logger.debug(f"[PromptRefiner] ReAct 检索异常，回退到单次 recall: {e}")
@@ -160,16 +161,16 @@ class PromptRefiner:
             picids = set(re.findall(r'\[picid:([a-fA-F0-9]{32})\]', text))
             if not picids: return text
             
-            # 🟢 [核心修复 Bug 2] 直接使用类实例挂载的 db_service
             for picid in picids:
                 resolved_text = "[一张尚未看清的图片]"
                 if self.db_service:
-                    for _ in range(15): 
+                    # 🟢 [重构] 单次即时查询，消除 15s 轮询阻塞
+                    try:
                         with self.db_service.get_session() as session:
                             from ..infra.datamodels import VisualMemory
                             import json
                             mem = session.get(VisualMemory, picid)
-                            if mem:
+                            if mem and mem.description:
                                 try:
                                     tags = json.loads(mem.emotion_tags)
                                     tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
@@ -177,9 +178,11 @@ class PromptRefiner:
                                     tags_str = ""
                                 if mem.type == "emoji":
                                     resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]" if tags_str else f"[发了一张图片，画面是：{mem.description}]"
-                                break
-                        import asyncio
-                        await asyncio.sleep(1.0)
+                                else:
+                                    resolved_text = f"[发了一张图片，画面是：{mem.description}]"
+                    except Exception as e:
+                        from astrbot.api import logger
+                        logger.debug(f"[PromptRefiner] 视觉记忆查询失败 {picid}: {e}")
                 else:
                     from astrbot.api import logger
                     logger.warning(f"[PromptRefiner] ⚠️ db_service 未挂载，无法解析图片 ID: {picid}")

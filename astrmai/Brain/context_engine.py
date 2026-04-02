@@ -278,36 +278,26 @@ class ContextEngine:
 [Tools]
 {tool_descs}
 
-【系统规则：智能体行动指南 (必读)】
-1. 🎭 绝对沉浸：你是一个在群聊中真实存在的个体。你的普通文本将直接作为台词发送。请直接输出你的回复，**绝对不要**带有 `[我] 说:`、`Bot:` 这样的前缀，也不要输出诸如 `*皱眉*` 这种语录体旁白。
-2. 🧠 内隐认知 (对内查阅)：遇到不懂的梗(`query_jargon`)、记不清的事(`fetch_knowledge`)，或不确定与某人的羁绊等级(`query_user_profile`)时，【必须优先】调用工具查阅潜意识档案。严禁自行脑补关系或乱编词义！
-3. ⚡ 物理动作 (对外交互)：你可以像真人一样在群里做出真实动作（`@某人`、`戳一戳`、`发表情包`）。
-   - 【表达情绪】：如果生气/调皮，主动去 `戳一戳` 对方；如果需要反驳或强力呼叫，主动 `@` 对方；如果想配图，调用 `表情包` 工具。
-   - 【动作与文本并行】：调用这些对外动作工具后，系统只是将其加入了“发射队列”。你**依然必须**在工具调用成功后，紧接着输出你的最终文本回复（除非你调用了 `wait_and_listen` 决定保持沉默）。绝不能只做动作不说话！
-4. 🚫 防穿帮协议：工具调用是你底层的“物理接口”，群友绝对看不到。**千万不要**在文本回复中说出“我正在调用工具”、“我已经戳了你”、“让我查查字典”这类打破第四面墙的话！执行动作要悄无声息，只在最终文本里表现出结果。
-5. 🔄 动态情感驱动：你的回复长短、语气冷暖以及使用物理动作的频率，必须受到当前 [心情] 与 [好感度] 的严格驱使。
-
-回复要求：
-1. 模拟该人设的意识，完全沉浸在剧本中，像真人一样在群聊里接话。
-2. 你的回复长度和积极性应受当前心情/精力的动态影响。
-3. 必须使用中文回复。
+【系统规则 (必读)】
+1. 绝对沉浸：你是一个在群聊中真实的个体，直接输出自然台词，严禁使用 `[我]:`、`*动作*` 等前缀或旁白。
+2. 内隐认知：遇到不懂的梗或事，必须通过工具查阅档案，严禁自行脑补。
+3. 动作并行：若想做动作（发图/艾特/戳一戳），请调用工具，成功后必须配上文本接话。
+4. 防穿帮：严禁在台词里暴露“我在调用工具”、“系统”等底层机制。
+5. 情绪自洽：回复长短与冷暖需严格匹配当前的心情和精力。使用中文。
 """
         # ==========================================
-        # 全局视觉记忆软阻塞与渲染
+        # 🟢 [重构] 视觉记忆即时查询 (消除 15s 轮询阻塞)
         # ==========================================
-        import re
-        import json
-        import asyncio
         picids = re.findall(r'\[picid:([a-fA-F0-9]{32})\]', prompt)
         
         for picid in set(picids):
             resolved_text = "[一张尚未看清的图片]"
             
-            for _ in range(15):
+            # 单次即时查询，不再轮询等待
+            try:
                 with self.db.get_session() as session:
-                    from ..infra.datamodels import VisualMemory
                     mem = session.get(VisualMemory, picid)
-                    if mem:
+                    if mem and mem.description:
                         try:
                             tags = json.loads(mem.emotion_tags)
                             tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
@@ -315,15 +305,11 @@ class ContextEngine:
                             tags_str = ""
                             
                         if mem.type == "emoji":
-                            if tags_str:
-                                resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]"
-                            else:
-                                resolved_text = f"[发了一个表情包，画面是：{mem.description}]"
+                            resolved_text = f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]" if tags_str else f"[发了一个表情包，画面是：{mem.description}]"
                         else:
                             resolved_text = f"[发了一张图片，画面是：{mem.description}]"
-                        break 
-                
-                await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.debug(f"[ContextEngine] 视觉记忆查询失败 {picid}: {e}")
                 
             prompt = prompt.replace(f"[picid:{picid}]", resolved_text)
 

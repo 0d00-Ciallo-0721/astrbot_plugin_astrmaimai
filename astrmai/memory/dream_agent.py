@@ -35,9 +35,7 @@ from ..infra.database import DatabaseService
 
 
 class DreamAgent:
-    """梦境整理 Agent"""
-
-    MAX_ITERATIONS = 5
+    MAX_ITERATIONS = 2
     TIMEOUT_SEC = 90.0
     MIN_EVENTS_TO_DREAM = 5  # 至少有这么多记忆才触发整理
 

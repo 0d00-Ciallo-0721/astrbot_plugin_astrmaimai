@@ -383,37 +383,46 @@ class Planner:
 
     async def _should_follow_up(self, chat_id: str, last_reply: str) -> Optional[str]:
         """
-        在成功回复后，判断是否应该追加第二句话。
-        返回: None (不追加) 或追加的理由文本。
+        混合模式 Follow-up 决策器:
+        第一层: 算法预筛 (零成本快速排除 ~85% 的情况)
+        第二层: 极短 LLM 精判 (仅对通过预筛的 ~15% 情况调用)
         """
+        # ===== 算法预筛层 (零 Token) =====
+        
         # 精力不足时不追加
         if self.state_engine:
             state = self.state_engine.get_state(chat_id)
-            if state and state.energy < 30:
+            if state and state.energy < 0.3:
                 return None
 
-        # 概率门控: 约 30% 概率考虑追加
-        if random.random() > 0.30:
+        clean_reply = last_reply.strip()
+        # 回复太短不追（已经够简洁了）
+        if len(clean_reply) < 15:
+            return None
+            
+        # 以问号结尾 = 已经在追问了，不再追
+        if clean_reply.endswith("？") or clean_reply.endswith("?"):
             return None
 
-        prompt = f"""你刚刚回复了: "{last_reply[:200]}"
+        # 概率门控: 约 20% 概率才进入 LLM 精判（大幅降低调用频率）
+        if random.random() > 0.20:
+            return None
 
-判断是否需要紧接着追加一句话（像真人追发第二条消息那样）。
-
-合理追加: 想补充细节、想追问、想加一个表情或语气词
-不应追加: 回复已完整、追加会啰嗦、对方话题已结束
-
-返回 JSON: {{"should_follow": true/false, "reason": "原因"}}"""
+        # ===== LLM 精判层 (极短 Prompt) =====
+        # 只截取回复前 100 字，prompt 总计 ~60 字
+        prompt = f"""你刚回复:"{clean_reply[:100]}"
+需要紧接着追发第二句吗？(补充/追问/表情/吐槽)
+JSON: {{"follow": true/false, "reason": "原因"}}"""
 
         try:
+            import re, json
             result = await self.gateway.call_data_process_task(prompt, is_json=True)
             data = result if isinstance(result, dict) else {}
             if not isinstance(data, dict):
-                import json, re
                 match = re.search(r'\{.*?\}', str(result), re.DOTALL)
                 if match:
                     data = json.loads(match.group(0))
-            if data.get("should_follow"):
+            if data.get("follow") or data.get("should_follow"):
                 return data.get("reason", "补充细节")
         except Exception as e:
             logger.debug(f"[Planner] Follow-up 判定异常: {e}")

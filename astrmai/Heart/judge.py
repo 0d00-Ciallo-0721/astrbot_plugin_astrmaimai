@@ -125,8 +125,8 @@ class Judge:
 
             history_context = ""
             try:
-                # [核心对齐点] 改为读取 attention 配置中的 bg_pool_size，默认 20 条
-                history_limit = getattr(self.config.attention, 'bg_pool_size', 20)
+                # 🟢 [降本] Judge 只需要极简的上下文窗口来判定意图，8 条足矣
+                history_limit = 8
                 
                 history_records = []
                 persistence = getattr(self.state_engine, "persistence", None)
@@ -138,8 +138,7 @@ class Judge:
                         history_records = await persistence.get_chat_history(chat_id, limit=history_limit)
                         
                 if history_records:
-                    # 动态提示当前获取的历史条数
-                    history_context = f"【历史对话语境 (前 {len(history_records)} 条)】\n"
+                    history_context = f"【近期对话 ({len(history_records)} 条)】\n"
                     for record in history_records:
                         if isinstance(record, dict):
                             sender = record.get("sender_name") or record.get("role") or "User"
@@ -148,10 +147,10 @@ class Judge:
                             sender = getattr(record, "sender_name", getattr(record, "role", "User"))
                             raw_content = getattr(record, "content", getattr(record, "message", ""))
                             
-                        # 🟢 调用扁平化解析器，剔除机器代码
+                        # 🟢 扁平化 + 截断，每条最多 60 字符
                         clean_content = _flatten_content(raw_content)
                         if clean_content:
-                            history_context += f"{sender}: {clean_content}\n"
+                            history_context += f"{sender}: {clean_content[:60]}\n"
                     history_context += "\n"
             except Exception as e:
                 logger.debug(f"[{chat_id}] ⚠️ 提取 Sys1 历史上下文失败，安全回落: {e}")
@@ -190,6 +189,9 @@ class Judge:
             - secrets (深层秘密)
             - ALL (完整降临)
             
+            并且，请评估【上述近期对话】对你产生的【情绪影响】。
+            可用情绪标签 (mood_tag)：happy(积极/开心), sad(悲伤/遗憾), angry(生气/抱怨), neutral(平静/客观), curious(好奇/困惑), surprise(惊讶)
+            
             请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
             {{
                 "reason": "极简的判定理由，例如：'有人在提问' 或 '顺着刚才的话题在聊'（限20字内）",
@@ -197,8 +199,11 @@ class Judge:
                 "thought": "【仅当 action 为 REPLY/TOOL_CALL 时生成】第一人称的真实内心戏。如果不回复，请严格输出空字符串 \"\"",
                 "relevance": int(1-10),
                 "necessity": float(1.0-10.0),
-                "retrieve_keys": ["key1"] 
+                "retrieve_keys": ["key1"],
+                "mood_tag": "happy/sad/angry/neutral/curious/surprise",
+                "mood_delta": 0.0
             }}
+            说明：mood_delta 为情绪变化值（范围 -0.5 到 0.5）。受到夸奖/喜爱时为正数，受到辱骂/指责时为负数，平常对话为 0.0。
             """
             
             plan = BrainActionPlan()
@@ -241,6 +246,17 @@ class Judge:
                 # [修改] 校验合法的行动包含 TOOL_CALL
                 if plan.action not in ["REPLY", "WAIT", "IGNORE", "TOOL_CALL"]:
                     plan.action = "IGNORE"
+                
+                # 🟢 [新增] 应用情绪变化
+                mood_tag = result.get("mood_tag", "neutral")
+                try:
+                    mood_delta = float(result.get("mood_delta", 0.0))
+                except (ValueError, TypeError):
+                    mood_delta = 0.0
+                    
+                if mood_delta != 0.0:
+                    new_mood = await self.state_engine.atomic_update_mood(chat_id, delta=mood_delta)
+                    logger.debug(f"[{chat_id}] 😃 接收消息后情绪更新: {mood_tag} (变动 {mood_delta:+.2f} -> {new_mood:.2f})")
                 
                 # =====================================================================
                 # 🟢 [修改] 私聊特权：无视 Judge 的静默意图，强制兜底覆写

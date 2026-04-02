@@ -44,7 +44,8 @@ class ReActRetriever:
 
     async def retrieve(
         self, query: str, chat_id: str,
-        chat_context: str = "", sender_name: str = ""
+        chat_context: str = "", sender_name: str = "",
+        retrieve_keys: list = None
     ) -> str:
         """
         主入口: 基于对话上下文进行 ReAct 记忆检索。
@@ -58,10 +59,18 @@ class ReActRetriever:
         if enable and hasattr(enable, 'enable_react_agent') and not enable.enable_react_agent:
             return ""
 
-        # 阶段一: 问题生成
-        question = await self._generate_question(query, chat_context, sender_name)
-        if not question:
-            return ""
+        # 阶段一: 问题生成 (如果传入了 retrieve_keys 则直接跳过 LLM 抽提)
+        if retrieve_keys:
+            # 过滤掉特殊的 ALL 或 CORE_ONLY 标签
+            valid_keys = [k for k in retrieve_keys if k not in ["ALL", "CORE_ONLY"]]
+            if valid_keys:
+                question = f"{query} (请重点检索关于这些维度的档案：{', '.join(valid_keys)})"
+            else:
+                question = query
+        else:
+            question = await self._generate_question(query, chat_context, sender_name)
+            if not question:
+                return ""
 
         logger.info(f"[ReAct] 🧠 生成检索问题: {question}")
 

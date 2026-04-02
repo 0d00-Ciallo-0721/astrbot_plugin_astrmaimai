@@ -440,6 +440,18 @@
         "description": "📈 指数退避补偿倍率",
         "type": "float",
         "default": 1.5
+      },
+      "api_timeout": {
+        "description": "⏱️ 网关级绝对超时熔断 (秒)",
+        "type": "float",
+        "default": 15.0,
+        "hint": "单次 API 请求超过此时长将被强制中断，防止僵尸连接卡死事件循环。"
+      },
+      "max_concurrent_llm_calls": {
+        "description": "🛡️ 全局 LLM 并发请求上限",
+        "type": "int",
+        "default": 3,
+        "hint": "同一时刻最多允许向 API 发送的并发请求数。调低可有效防止后台任务雪崩导致 429 限流。"
       }
     }
   }

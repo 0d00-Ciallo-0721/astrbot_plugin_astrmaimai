@@ -147,28 +147,34 @@ class ExpressionMiner:
             if not isinstance(jargon_candidates, list):
                 jargon_candidates = []
             
+            # 🟢 [核心降频] 截断过多候选词，批量推断
+            jargon_candidates = [item for item in jargon_candidates if isinstance(item, dict) and item.get("jargon") and item.get("raw_context")]
+            jargon_candidates = jargon_candidates[:5]  # 硬上限限制
+
             jargons = []
             import time
             
-            for item in jargon_candidates:
-                # 🟢 防御：严格检查 item 必须是字典
-                if isinstance(item, dict):
-                    word = item.get("jargon")
-                    raw_context = item.get("raw_context")
-                    if word and raw_context:
-                        # 步骤 2 & 3: 三步推断法解析含义
-                        inferred_data = await self._infer_jargon_meaning(str(word), str(raw_context))
+            if jargon_candidates:
+                inferred_batch = await self._infer_jargons_batch(jargon_candidates)
+                for i, item in enumerate(jargon_candidates):
+                    if i < len(inferred_batch):
+                        inferred_data = inferred_batch[i]
+                        if not isinstance(inferred_data, dict):
+                            inferred_data = {}
+                    else:
+                        inferred_data = {}
                         
-                        jargons.append(Jargon(
-                            content=str(word),
-                            raw_content=str(raw_context),
-                            meaning=inferred_data.get("meaning", ""),
-                            is_jargon=inferred_data.get("is_jargon", False),
-                            is_complete=inferred_data.get("is_complete", False),
-                            group_id=group_id,
-                            created_at=time.time(),
-                            updated_at=time.time()
-                        ))
+                    jargons.append(Jargon(
+                        content=str(item.get("jargon")),
+                        raw_content=str(item.get("raw_context")),
+                        meaning=str(inferred_data.get("meaning", "")),
+                        is_jargon=bool(inferred_data.get("is_jargon", False)),
+                        is_complete=bool(inferred_data.get("is_complete", False)),
+                        group_id=group_id,
+                        created_at=time.time(),
+                        updated_at=time.time()
+                    ))
+            
             # 👇【新增】在此处插入成功结果日志
             logger.info(f"[Evolution-Miner] ✅ 黑话挖掘完成: 群组 {group_id} 成功提取 {len(jargons)} 条特殊词汇。")
             # 👆【新增结束】
@@ -181,60 +187,56 @@ class ExpressionMiner:
             return []
 
 
-    async def _infer_jargon_meaning(self, jargon_word: str, raw_context: str) -> dict:
+    async def _infer_jargons_batch(self, jargon_candidates: List[dict]) -> List[dict]:
         """
-        [修改] 核心三步推断法 (融合上下文与基础词义)
-        防御性编程：重构类型判断与 JSON 提取逻辑，彻底消除 JSONDecodeError
+        [修改] 批量推断法 (融合上下文与基础词义)，消除 N 次长级联 API 调用
         """
-        logger.info(f"[Evolution-Miner] 🔍 正在调用 LLM 推断词汇含义: '{jargon_word}' ...")
+        logger.info(f"[Evolution-Miner] 🔍 正在批量调用 LLM 推断 {len(jargon_candidates)} 个词汇含义...")
+
+        items_str = "\n".join(
+            f"{i+1}. 词: {w['jargon']} | 上下文: {w['raw_context']}"
+            for i, w in enumerate(jargon_candidates)
+        )
 
         infer_prompt = f"""
-**待推断词条**: {jargon_word}
-**出现的上下文**: {raw_context}
-
-请执行黑话推断分析：
+请为以下词汇逐一执行推断分析：
 1. 分析它在上下文中的实际意图。
 2. 结合常规网络用语知识，补全它的具体含义。
-3. 最终核对：它是否是一个真正的“黑话”或“特殊用语”？
+3. 它是否是一个真正的“黑话”或“特殊用语”？
 
-以 JSON 格式输出：
-{{
-  "meaning": "详细含义说明（包含使用场景、具体解释）",
-  "is_jargon": true/false (是否确认为黑话),
-  "is_complete": true/false (信息是否足够推断出明确含义)
-}}
+待推断词条：
+{items_str}
+
+严格返回 JSON 数组，顺序必须与给出的一致：
+[
+  {{
+    "meaning": "详细含义说明（包含使用场景、具体解释）",
+    "is_jargon": true/false (是否确认为黑话),
+    "is_complete": true/false (信息是否足够推断出明确含义)
+  }}
+]
 """
         try:
             result = await self.gateway.call_data_process_task(prompt=infer_prompt, is_json=True)
             
-            # 🟢 [核心修复] 深度防御：严禁使用 str(dict) 导致单引号污染，只在确认为 string 时才进行正则提取
-            data = {}
-            if isinstance(result, dict):
+            data = []
+            if isinstance(result, list):
                 data = result
             elif isinstance(result, str):
                 import re
                 import json
-                match = re.search(r'\{.*\}', result, re.DOTALL)
+                match = re.search(r'\[.*\]', result, re.DOTALL)
                 if match:
                     try:
                         data = json.loads(match.group(0))
                     except json.JSONDecodeError:
-                        data = {}
-            
-            # 🟢 [核心修复] 安全寻址，哪怕大模型完全漏发某个 key，也能平滑降级
-            meaning = str(data.get("meaning", "")) if data.get("meaning") else ""
-            is_jargon = bool(data.get("is_jargon", False))
-            is_complete = bool(data.get("is_complete", False))
-            
-            logger.info(f"[Evolution-Miner] 💡 '{jargon_word}' 推断完毕 -> 确认为黑话: {is_jargon} | 含义: {meaning[:30]}...")
-            # 👆【新增结束】
-            return {
-                "meaning": meaning,
-                "is_jargon": is_jargon,
-                "is_complete": is_complete
-            }
-            
+                        data = []
+                        
+            if not isinstance(data, list):
+                data = []
+                
+            return data
         except Exception as e:
             logger.debug(f"[Evolution] 黑话推断解析失败: {e}")
             
-        return {"meaning": "", "is_jargon": False, "is_complete": False}
+        return []
