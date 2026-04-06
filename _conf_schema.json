@@ -88,23 +88,27 @@
       }
     }
   },
-  "system1": {
+"system1": {
     "type": "object",
-    "description": "❤️ 浅层心智触发器 (System 1)",
+    "description": "🧠 直觉系统 (System 1: Fast/Instinct)",
     "items": {
       "wakeup_words": {
-        "description": "🔔 强触碰唤醒词字典",
+        "description": "🔔 强唤醒词列表 (匹配开头)",
         "type": "list",
-        "default": [],
-        "hint": "一旦聊天内容含有目标词汇，将直接击穿精力限制强行开口。"
+        "default": []
       },
       "nicknames": {
-        "description": "📛 点名表征字词 (Bot Nicknames)",
+        "description": "🏷️ 自身称呼列表",
         "type": "list",
         "default": []
       },
       "extra_command_list": {
-        "description": "⛔ 手动指令黑名单隔离区",
+        "description": "⚡ 免判定直接触发工具的指令",
+        "type": "list",
+        "default": []
+      },
+      "keyword_reactions": {
+        "description": "💡 关键词心理反应规则 (格式: '关键词:反应描述'，例 '原神:你是重度玩家，听到这个会很兴奋')",
         "type": "list",
         "default": []
       }

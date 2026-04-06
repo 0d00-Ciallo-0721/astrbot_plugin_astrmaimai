@@ -142,9 +142,7 @@ class ContextEngine:
         if slang_patterns and not is_fast_mode:
             slang_block = f"群组专属表达模式与黑话参考:\n{slang_patterns}\n"
 
-        # ==========================================
         # 动态上下文热加载 (私聊专属画像注入)
-        # ==========================================
         private_chat_block = ""
         if "FriendMessage" in chat_id and event_messages and not is_fast_mode:
             try:
@@ -155,16 +153,14 @@ class ContextEngine:
                     tags = profile_data.get("tags", [])
                     tags_str = " / ".join(tags) if tags else "暂无特定标签"
                     raw_name = profile_data.get("name", "该用户")
-                    # Phase 8.1: 优先使用 Bot 取的昵称
                     nickname = profile_data.get("nickname", "")
                     display_name = f"{nickname}（{raw_name}）" if nickname else raw_name
                     
-                    # Phase 8.2: 分类记忆点注入
                     memory_points = profile_data.get("memory_points", [])
                     memory_points_block = ""
                     if memory_points:
                         mp_lines = []
-                        for mp in memory_points[:6]:  # 最多注入6条
+                        for mp in memory_points[:6]:  
                             parts = mp.split(":", 2)
                             if len(parts) >= 2:
                                 category, content = parts[0], parts[1]
@@ -187,20 +183,24 @@ class ContextEngine:
             except Exception as e:
                 logger.warning(f"[ContextEngine] 提取私聊用户画像失败: {e}")
 
-
-        subconscious_block = ""
+        # 统一内部独白 (Inner Voice)
+        inner_voice_block = ""
+        parts = []
         if sys1_thought:
-            subconscious_block = f"大脑潜意识：\"{sys1_thought}\"\n指南：这是你最真实的直觉。在接下来的回复中，请自然地顺应、延伸或掩饰这种情绪。绝对禁止像复读机一样直接说出你的内心戏。\n"
+            parts.append(f"【你此刻的直觉】{sys1_thought}")
+        if goals_context and not is_fast_mode:
+            parts.append(f"【你的对话目标】{goals_context}")
+        if planner_reasoning and not is_fast_mode:
+            parts.append(f"【你的想法】{planner_reasoning}")
+        if parts:
+            inner_voice_block = "\n".join(parts) + "\n（自然地顺应这些内心活动，绝对不要直接说出来。）\n"
 
-        # ==========================================
-        # 🟢 [新增] 动态主动联想与节点背景注入 
-        # ==========================================
+        # 动态主动联想与节点背景注入 
         proactive_recall_block = ""
         if event_messages and not is_fast_mode:
             try:
                 last_msg = event_messages[-1].message_str
                 
-                # 1. 节点背景注入 (基于 Jieba 关键词)
                 try:
                     import jieba.analyse
                     keywords = jieba.analyse.extract_tags(last_msg, topK=5)
@@ -220,7 +220,6 @@ class ContextEngine:
                 if nodes_context:
                     proactive_recall_block += "\n>>> [记忆节点背景 (对提及实体的已知认知)] <<<\n" + "\n".join(nodes_context) + "\n"
 
-                # 2. 向量记忆主动召回 (基于概率或显式关键词)
                 import random
                 auto_recall_prob = getattr(self.config.memory, 'auto_recall_probability', 0.3)
                 trigger_keywords = ["之前", "记得", "回忆", "想起", "以前", "过去"]
@@ -238,38 +237,44 @@ class ContextEngine:
             except Exception as e:
                 logger.warning(f"[ContextEngine] 主动联想与节点注入失败: {e}")
 
-        # Phase 1: 目标上下文注入
-        goals_block = ""
-        if goals_context and not is_fast_mode:
-            goals_block = f"\n[对话目标]\n{goals_context}\n请在回复时自然地推进这些目标，但不要机械地去完成任务。\n"
-
-        # Phase 6.2A: 表达习惯注入 (ExpressionSelector → ContextEngine)
+        # 表达习惯注入
         expression_block = ""
         if expression_habits and not is_fast_mode:
             expression_block = f"\n[语言习惯参考]\n{expression_habits}\n"
 
-        # Phase 6.2B: Planner 推理意图注入 ("你的想法是")
-        reasoning_block = ""
-        if planner_reasoning and not is_fast_mode:
-            reasoning_block = f"你的想法是：\"{planner_reasoning}\"\n"
-
-        # Phase 6.2C: 黑话解释注入
+        # 黑话解释注入
         jargon_block = ""
         if jargon_explanation and not is_fast_mode:
             jargon_block = f"\n[群内黑话参考]\n{jargon_explanation}\n（已知含义仅供理解，自然使用即可，不要刻意解释）\n"
 
-        # 4. [修改] 组装最终 Prompt (Phase 6: 新增 expression/reasoning/jargon 注入)
+        # ==========================================
+        # 🟢 [新增 P1-T3] 多级回复风格随机化
+        # ==========================================
+        REPLY_STYLES = [
+            "给出日常且简短的回复。像真人发消息一样自然。",
+            "用稍微长一点的句子回复，可以展开聊聊。",
+            "用一个极短的句子或者一个词回复，惜字如金。",
+            "用一句话回复，但在末尾抛出一个反问或追问。",
+            "像在吐槽一样回复，带点调侃和幽默感。",
+        ]
+        REPLY_STYLE_WEIGHTS = [0.45, 0.20, 0.15, 0.10, 0.10]
+        
+        reply_style = REPLY_STYLES[0]
+        if not is_fast_mode:
+            import random
+            reply_style = random.choices(REPLY_STYLES, weights=REPLY_STYLE_WEIGHTS, k=1)[0]
+
+        # 4. 组装最终 Prompt
         prompt = f"""核心人格设定：
 {role_block}
 
 {style_block}
 {state_block}
 {expression_block}
-{private_chat_block}{slang_block}{jargon_block}{goals_block}
-{reasoning_block}当前你看到的消息：
+{private_chat_block}{slang_block}{jargon_block}
+{inner_voice_block}当前你看到的消息：
 <CURRENT_MESSAGES>
 
-{subconscious_block}
 <CHAT_HISTORY>
 
 {proactive_recall_block}
@@ -284,16 +289,14 @@ class ContextEngine:
 3. 动作并行：若想做动作（发图/艾特/戳一戳），请调用工具，成功后必须配上文本接话。
 4. 防穿帮：严禁在台词里暴露“我在调用工具”、“系统”等底层机制。
 5. 情绪自洽：回复长短与冷暖需严格匹配当前的心情和精力。使用中文。
+6. 回复指令：{reply_style}
 """
-        # ==========================================
-        # 🟢 [重构] 视觉记忆即时查询 (消除 15s 轮询阻塞)
-        # ==========================================
+        # 视觉记忆即时查询
         picids = re.findall(r'\[picid:([a-fA-F0-9]{32})\]', prompt)
         
         for picid in set(picids):
             resolved_text = "[一张尚未看清的图片]"
             
-            # 单次即时查询，不再轮询等待
             try:
                 with self.db.get_session() as session:
                     mem = session.get(VisualMemory, picid)

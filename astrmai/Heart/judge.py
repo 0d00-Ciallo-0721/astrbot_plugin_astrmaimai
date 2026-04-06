@@ -19,6 +19,39 @@ class Judge:
         # [新增] Sys1 专属群组级思考锁，防止同一群重入
         self.active_sys1_groups = set()
 
+# ==========================================
+    # [新增 P1-T1] 动态行为修饰器
+    # ==========================================
+    def _build_dynamic_actions(self, state, message: str, window_events_count: int) -> str:
+        """
+        动态行为修饰器：根据状态 + 概率 + 关键词条件，
+        构建当前可用的动作列表文本，注入 Judge Prompt。
+        """
+        import random
+        actions = [
+            "REPLY: 需要立刻回复（包含问题、提及你、或顺着话题聊）",
+            "WAIT: 话似乎没说完，稍微等等看",
+            "IGNORE: 没兴趣理会的闲聊或刷屏",
+        ]
+        
+        # TOOL_CALL: 仅当消息含有任务性关键词时激活
+        task_keywords = ["帮我", "查", "写", "翻译", "分析", "搜索", "提醒"]
+        if any(kw in message for kw in task_keywords):
+            actions.append("TOOL_CALL: 明确的指令求助，需要调用外部工具")
+        
+        # FETCH_KNOWLEDGE: 20% 概率随机激活 或 消息含问号时必定激活
+        if "?" in message or "？" in message or random.random() < 0.20:
+            actions.append("FETCH_KNOWLEDGE: 你突然想去翻翻记忆/知识库确认一下（灵光一闪）")
+        
+        # RETHINK_GOAL: 窗口内事件 >= 5 条时以 30% 概率激活
+        if window_events_count >= 5 and random.random() < 0.30:
+            actions.append("RETHINK_GOAL: 聊了一阵子了，你想重新审视一下自己的对话目标")
+            
+        return "\n".join(f"- {a}" for a in actions)
+
+    # ==========================================
+    # [修改 P1-T1, P1-T2] 主判决函数
+    # ==========================================
     async def evaluate(self, chat_id: str, message: str, is_force_wakeup: bool, persona_summary: str = "", window_events_count: int = 1, is_first_event_wakeup: bool = False) -> BrainActionPlan:
         """
         输出结构化的 BrainActionPlan，融合了 HeartFlow 的评分机制和 3 态决策。
@@ -94,10 +127,9 @@ class Judge:
                     return BrainActionPlan(action="IGNORE", thought="好累...不想说话...", necessity=0.0)
 
             # =====================================================================
-            # 🟢 【架构级升级】: 提取与 System 2 对齐的历史记忆
+            # 【架构级升级】: 提取与 System 2 对齐的历史记忆
             # =====================================================================
             def _flatten_content(raw_val: any) -> str:
-                """内部防御性解析器：将底层 JSON 格式的消息组件数组降维成纯文字剧本"""
                 if not raw_val: return ""
                 if isinstance(raw_val, str):
                     try:
@@ -105,7 +137,7 @@ class Judge:
                         if isinstance(parsed, list): raw_val = parsed
                         else: return raw_val
                     except Exception:
-                        return raw_val # 普通纯文本直接返回
+                        return raw_val 
                 
                 if isinstance(raw_val, list):
                     text_parts = []
@@ -125,9 +157,7 @@ class Judge:
 
             history_context = ""
             try:
-                # 🟢 [降本] Judge 只需要极简的上下文窗口来判定意图，8 条足矣
                 history_limit = 8
-                
                 history_records = []
                 persistence = getattr(self.state_engine, "persistence", None)
                 
@@ -147,7 +177,6 @@ class Judge:
                             sender = getattr(record, "sender_name", getattr(record, "role", "User"))
                             raw_content = getattr(record, "content", getattr(record, "message", ""))
                             
-                        # 🟢 扁平化 + 截断，每条最多 60 字符
                         clean_content = _flatten_content(raw_content)
                         if clean_content:
                             history_context += f"{sender}: {clean_content[:60]}\n"
@@ -156,13 +185,33 @@ class Judge:
                 logger.debug(f"[{chat_id}] ⚠️ 提取 Sys1 历史上下文失败，安全回落: {e}")
 
             # =====================================================================
+            # 🟢 [新增 P1-T2] 关键词反应注入
+            # =====================================================================
+            keyword_reaction_block = ""
+            kw_reactions = getattr(self.config.system1, 'keyword_reactions', [])
+            if kw_reactions:
+                matched = []
+                for rule in kw_reactions:
+                    parts = rule.split(":", 1) if ":" in rule else rule.split("：", 1)
+                    if len(parts) == 2:
+                        kw, reaction = parts[0].strip(), parts[1].strip()
+                        if kw.lower() in msg_lower:
+                            matched.append(reaction)
+                if matched:
+                    keyword_reaction_block = "\n【关键词触发的特殊心理状态】\n" + "\n".join(f"- {r}" for r in matched) + "\n"
+
+            # =====================================================================
+            # 🟢 [新增 P1-T1] 动态可用动作构建
+            # =====================================================================
+            available_actions = self._build_dynamic_actions(state, message, window_events_count)
+
+            # =====================================================================
             # 【正常执行 System 1 唤醒大模型判决】
             # =====================================================================
-            # [修改] 增加 TOOL_CALL 意图，支持明确工具调用判断
             prompt = f"""
             你是群聊中的这个角色的潜意识大脑，请完全沉浸于以下设定中：
             [你的核心人设]: {persona_summary if persona_summary else '保持你原本的性格特征'}
-
+            {keyword_reaction_block}
             当前群聊情绪: {state.mood:.2f} (-1.0 到 1.0)。
             
             {history_context}
@@ -170,12 +219,11 @@ class Judge:
             {message}
             
             【思考与决策流】
-            1. 意图判决 (action): 
-               - REPLY: 包含明确问题，提及你，或【根据历史语境对方正在顺着刚才的话题跟你聊天】，必须立刻回复。
-               - TOOL_CALL: 明确的指令求助（如“查天气”、“写代码”等需要明确调用外部工具的请求）。
-               - WAIT: 话似乎没说完（例如“那个..”或半截句子），稍微等等看。
-               - IGNORE: 明显的闲聊、无意义刷屏且没叫你、没顺着话题聊，没兴趣理会。
-            2. 潜意识生成 (thought): **仅当 action 为 REPLY 或 TOOL_CALL 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
+            1. 意图判决 (action): 请从以下【当前可用动作】中选择一个：
+            {available_actions}
+            
+            2. 潜意识生成 (thought): **仅当 action 为 REPLY、TOOL_CALL、FETCH_KNOWLEDGE 或 RETHINK_GOAL 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
+            
             3. 记忆提取 (retrieve_keys): **仅当 action 为 REPLY 时**才需要判断当前回复需要调用你脑海中的哪部分【人格记忆 (retrieve_keys)】。如果 action 为 WAIT 或 IGNORE，或者只是极简单的日常寒暄，列表请严格保持为空 []。
             
             可选的人格维度 Key:
@@ -195,8 +243,8 @@ class Judge:
             请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
             {{
                 "reason": "极简的判定理由，例如：'有人在提问' 或 '顺着刚才的话题在聊'（限20字内）",
-                "action": "REPLY"|"WAIT"|"IGNORE"|"TOOL_CALL",
-                "thought": "【仅当 action 为 REPLY/TOOL_CALL 时生成】第一人称的真实内心戏。如果不回复，请严格输出空字符串 \"\"",
+                "action": "REPLY"|"WAIT"|"IGNORE"|"TOOL_CALL"|"FETCH_KNOWLEDGE"|"RETHINK_GOAL",
+                "thought": "【仅当 action 选中需要回复的类型时生成】第一人称的真实内心戏。不回复请严格输出空字符串 \"\"",
                 "relevance": int(1-10),
                 "necessity": float(1.0-10.0),
                 "retrieve_keys": ["key1"],
@@ -208,9 +256,6 @@ class Judge:
             
             plan = BrainActionPlan()
             try:
-                # =====================================================================
-                # 🟢 [新增] System 1 终极上下文核验探针
-                # =====================================================================
                 if getattr(self.config.global_settings, 'debug_mode', True):
                     logger.info(
                         f"\n{'='*60}\n"
@@ -223,7 +268,7 @@ class Judge:
                 result = await self.gateway.call_judge_task(prompt)
                 
                 plan.action = result.get("action", "IGNORE").upper()
-                if plan.action in ["REPLY", "TOOL_CALL"]:
+                if plan.action in ["REPLY", "TOOL_CALL", "FETCH_KNOWLEDGE", "RETHINK_GOAL"]:
                     plan.thought = result.get("thought", "")
                 else:
                     plan.thought = ""
@@ -243,11 +288,19 @@ class Judge:
                     keys = []
                 plan.meta["retrieve_keys"] = keys
                 
-                # [修改] 校验合法的行动包含 TOOL_CALL
-                if plan.action not in ["REPLY", "WAIT", "IGNORE", "TOOL_CALL"]:
+                # 🟢 [修改 P1-T1] 校验扩展的合法动作并执行降级处理
+                valid_actions = ["REPLY", "WAIT", "IGNORE", "TOOL_CALL", "FETCH_KNOWLEDGE", "RETHINK_GOAL"]
+                if plan.action not in valid_actions:
                     plan.action = "IGNORE"
                 
-                # 🟢 [新增] 应用情绪变化
+                # 动作降级 (保护下游 Planner 路由不被破坏)
+                if plan.action == "FETCH_KNOWLEDGE":
+                    plan.action = "REPLY"
+                    plan.meta["retrieve_keys"] = plan.meta.get("retrieve_keys", []) or ["ALL"]
+                elif plan.action == "RETHINK_GOAL":
+                    plan.action = "REPLY"
+                    plan.meta["force_rethink_goal"] = True
+
                 mood_tag = result.get("mood_tag", "neutral")
                 try:
                     mood_delta = float(result.get("mood_delta", 0.0))
@@ -258,9 +311,6 @@ class Judge:
                     new_mood = await self.state_engine.atomic_update_mood(chat_id, delta=mood_delta)
                     logger.debug(f"[{chat_id}] 😃 接收消息后情绪更新: {mood_tag} (变动 {mood_delta:+.2f} -> {new_mood:.2f})")
                 
-                # =====================================================================
-                # 🟢 [修改] 私聊特权：无视 Judge 的静默意图，强制兜底覆写
-                # =====================================================================
                 if "FriendMessage" in chat_id and plan.action in ["WAIT", "IGNORE"]:
                     plan.action = "REPLY"
                     plan.thought = "私聊模式强制兜底：无论多无聊的消息都必须给予反馈。"

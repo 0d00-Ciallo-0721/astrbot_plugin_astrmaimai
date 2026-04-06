@@ -356,7 +356,7 @@ class ProactiveTask:
         return await self.gateway.call_proactive_task(prompt)
 
     async def _generate_persona_analysis(self, profile):
-        """[修改] 生成并保存画像，支持增量更新与标签提取 + Phase 8 memory_points"""
+        """[修改] 生成并保存画像，支持增量更新与标签提取，并强制输出 JSON"""
         
         persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
         
@@ -394,17 +394,16 @@ class ProactiveTask:
 {old_mp_str}
 
 [任务]
-请结合以上旧的画像和标签，对该用户进行**增量更新**。
-- 重点提取：具体的行为习惯、性格底色、近期的偏好、对你的态度。
-- `memory_points` 字段：提取3-8个具体、可检索的记忆点，格式为 "分类:内容:权重(0.1-1.0)"，例如 "爱好:喜欢打游戏:0.8"
-- 请强制按 JSON 格式输出结果。
+请结合以上旧的资料，对该用户进行**增量更新**。
+请以 JSON 格式输出用户画像，包含三部分：
+1. "tags": 标签数组 (最多5个)
+2. "summary": 一段 100 字以内的深度侧写总体印象
+3. "memory_points": 分类记忆点数组，格式:
+   [{{"category": "爱好", "content": "喜欢打原神", "weight": 0.8}}, ...]
+   可用分类：爱好、性格、习惯、经历、关系、技能、其他
+   每个分类最多 3 条，weight 范围 0.0~1.0
 
-严格返回格式示例：
-{{
-    "tags": ["标签1", "标签2"],
-    "analysis": "这里是深度侧写文本...",
-    "memory_points": ["爱好:喜欢打游戏:0.8", "口头禅:经常说确实:0.6"]
-}}
+严格返回 JSON: {{"tags": ["..."], "summary": "...", "memory_points": [...]}}
 """
         result = await self.gateway.call_proactive_task(prompt)
         if result:
@@ -421,11 +420,17 @@ class ProactiveTask:
                 if match:
                     data = json.loads(match.group(0))
                     tags = data.get("tags", [])
-                    analysis = data.get("analysis", "")
-                    memory_points = data.get("memory_points", [])
+                    analysis = data.get("summary", data.get("analysis", ""))
+                    
+                    # 结构化解析 memory_points
+                    raw_points = data.get("memory_points", [])
+                    memory_points = [
+                        f"{mp.get('category', '其他')}:{mp.get('content', '')}:{mp.get('weight', 0.5)}"
+                        for mp in raw_points if isinstance(mp, dict) and mp.get('content')
+                    ]
             except Exception as e:
                 from astrbot.api import logger
-                logger.error(f"[Life] 解析增量画像 JSON 失败: {e}")
+                logger.error(f"[Life] 解析增量画像 JSON 失败，回落文本提取: {e}")
                 
             if not analysis:
                 analysis = result.strip()
@@ -434,7 +439,6 @@ class ProactiveTask:
                 profile.persona_analysis = analysis.strip()
             if tags:
                 profile.tags = tags
-            # Phase 8.2: 更新分类记忆点
             if memory_points:
                 profile.memory_points = memory_points
                 
@@ -444,15 +448,15 @@ class ProactiveTask:
             
             await self.persistence.save_user_profile(profile)
             from astrbot.api import logger
-            logger.info(f"[Life] ✅ 私聊画像增量挖掘完成: {analysis[:20]}... 标签: {tags} 记忆点: {len(memory_points)}条")
+            logger.info(f"[Life] ✅ 画像结构化挖掘完成: {analysis[:20]}... 标签: {tags} 记忆点: {len(memory_points)}条")
 
     async def _generate_nickname(self, profile) -> None:
         """
-        Phase 8.1: 取名系统
+        Phase 8.1 / P2-T2: 取名系统
         当用户 know_times >= 3 且 is_known=False 时触发，
-        调用 LLM 为用户生成一个个性化的昵称（不超过4字）。
+        调用 LLM 为用户生成一个个性化的昵称。
         """
-        if not profile or profile.is_known:
+        if not profile or getattr(profile, 'is_known', False):
             return
 
         persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
@@ -474,11 +478,11 @@ class ProactiveTask:
 - 画像：{analysis[:200]}
 - 标签：{', '.join(profile.tags) if profile.tags else '无'}
 
-请根据他的性格特点和与你的相处模式，给他起一个符合你人设风格的昵称。
+请根据他的性格特点和与你的相处模式，给他起一个符合你人设风格的称呼。
 要求:
-- 最多4个字，可以是谐音/创意组合/叠字等
-- 要有个性，不要太普通
-- 用JSON返回: {{"nickname": "昵称", "reason": "取名原因一句话"}}
+- 最多 6 个字，可以是亲切的简称、调侃、或昵称
+- 这个称呼应该体现你对 TA 的第一印象
+- 用JSON返回: {{"nickname": "你取的昵称", "reason": "取这个名字的理由(20字以内)"}}
 
 直接输出JSON："""
 
@@ -501,20 +505,16 @@ class ProactiveTask:
             logger.error(f"[Life] 取名失败: {e}")
 
     async def _run_profiling_task(self):
-        """深度侧写任务：筛选互动频次达标的用户，更新其心理画像 + Phase 8 取名"""
-        # 🟢 [3.1] 后台信号量限流
+        """深度侧写任务：筛选互动频次达标的用户，更新其心理画像 + 取名系统触发"""
         async with self._bg_semaphore:
-            # 获取所有活跃的用户档案
             active_profiles = self.state_engine.get_active_profiles()
-            
-            # 从配置中获取侧写触发阈值，默认设为 50 条消息
             threshold = getattr(self.config.life, 'profiling_msg_threshold', 200)
             
             for profile in active_profiles:
-                # Phase 8.1: 累积互动次数
+                # 递增见面/互动次数
                 profile.know_times = getattr(profile, 'know_times', 0) + 1
 
-                # Phase 8.1: 触发取名（互动 >= 3 次且尚未命名）
+                # 触发取名（互动 >= 3 次且尚未命名）
                 if profile.know_times >= 3 and not getattr(profile, 'is_known', False):
                     logger.info(f"[Life] 🤝 用户 {profile.name} 已互动 {profile.know_times} 次，触发取名系统...")
                     try:
@@ -524,13 +524,12 @@ class ProactiveTask:
 
                 # 如果该用户自上次侧写以来的互动次数达到阈值
                 if getattr(profile, 'message_count_for_profiling', 0) >= threshold:
-                    logger.info(f"[Life] 🕵️ 用户 {profile.name} 私聊互动频次达标，开始进行增量心理侧写...")
+                    logger.info(f"[Life] 🕵️ 用户 {profile.name} 私聊互动频次达标，开始进行结构化增量心理侧写...")
                     try:
                         await self._generate_persona_analysis(profile)
                     except Exception as e:
                         logger.error(f"[Life] 侧写生成失败 ({profile.name}): {e}")
-
-
+    
     async def _run_daily_diary_task(self):
         """[修改] 午夜记忆日记撰写任务：不仅生成文本日记，还要触发深度的事件结构化、反思生成和节点提取。"""
         # 🟢 [3.1] 后台信号量限流

@@ -311,3 +311,53 @@ class MemoryEngine:
         except Exception as e:
             logger.error(f"[MemoryEngine] 物理剪枝失败: {e}")
             return 0
+
+    @staticmethod
+    def _compute_text_similarity(text_a: str, text_b: str) -> float:
+        """基于字符 n-gram 的 Jaccard 相似度"""
+        def ngrams(text, n=2):
+            return set(text[i:i+n] for i in range(len(text)-n+1))
+        a = ngrams(text_a)
+        b = ngrams(text_b)
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
+    # ==========================================
+    # [新增 P2-T3] 话题合并去重专用存储方法
+    # ==========================================
+    async def store_topic_results(self, topic_results: list, session_id: str, persona_id: str = None):
+        """将生成的话题摘要写入记忆库，包含相似话题的合并追加逻辑，避免碎片化"""
+        if not await self._ensure_faiss_initialized():
+            return
+            
+        for topic_result in topic_results:
+            summary = topic_result.get("summary", "")
+            keywords = topic_result.get("topic_keywords", [])
+            if not summary or summary == "话题内容较短":
+                continue
+                
+            # 合并检查: 在向量库中检索相似话题 (top_k=1)
+            existing_results = await self.retriever.search(summary, k=1, session_id=session_id, persona_id=persona_id)
+            
+            merged = False
+            if existing_results:
+                existing_doc = existing_results[0]
+                existing_text = existing_doc.content
+                
+                # 相似度达到阈值 (0.85) 则合并
+                if self._compute_text_similarity(summary, existing_text) > 0.85:
+                    # 合并模式: 追加新信息到已有记忆
+                    merged_summary = f"{existing_text}\n补充: {summary}"
+                    # 防止无限增长，最多保留 2 倍原长度
+                    if len(merged_summary) > len(existing_text) * 2:
+                        merged_summary = merged_summary[:len(existing_text) * 2] + "..."
+                        
+                    # 重新作为新记忆存入 (旧记忆会经自然衰减或可选择覆盖)
+                    await self.add_memory(merged_summary, session_id=session_id, persona_id=persona_id, importance=0.85)
+                    logger.info(f"[MemoryEngine] 🔗 话题合并: '{summary[:20]}...' 追加到已有相似记忆中")
+                    merged = True
+                    
+            if not merged:
+                # 新建模式
+                await self.add_memory(summary, session_id=session_id, persona_id=persona_id, importance=0.8)    

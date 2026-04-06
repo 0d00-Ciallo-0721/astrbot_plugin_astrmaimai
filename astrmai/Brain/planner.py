@@ -83,7 +83,6 @@ class Planner:
             
         # ==========================================
         # 🟢 同步底层引擎的 is_fast_mode 标识
-        # 确保 ContextEngine 和 Refiner 接收到 "CORE_ONLY" 指令并使用压缩人格
         # ==========================================
         if event.get_extra("is_fast_mode", False) and "CORE_ONLY" not in retrieve_keys:
             retrieve_keys.append("CORE_ONLY")
@@ -105,23 +104,55 @@ class Planner:
             window_lines.append(f"[{sender_name}] 说: {rich_text}")
         prompt_content = "\n".join(window_lines)
         
-        if is_fast_mode:
-            slang_context = ""
-        else:
-            slang_context = await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id) 
-            
         sys1_thought = event.get_extra("sys1_thought", "")
         
         ctx = getattr(self.context_engine, 'context', None)
         
-        # Phase 1: 更新多目标并获取目标上下文
-        planner_reasoning = ""  # Phase 6.2B: 每轮决策的意图说明
+        # ==========================================
+        # 🟢 [修改 P0-T2] Planner 上下文组装并行化
+        # ==========================================
         if not is_fast_mode:
-            window_text = "\n".join(window_lines) if window_lines else ""
-            goal_text = await self.goal_manager.analyze_and_update(chat_id, window_text)
-            logger.debug(f"[{chat_id}] 🎯 当前主目标: {goal_text}")
-            # reasoning 初始化为当前目标文本，后续 Executor 可覆写
+            async def _load_slang():
+                return await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id)
+            
+            async def _load_goals():
+                window_text = "\n".join(window_lines) if window_lines else ""
+                res = await self.goal_manager.analyze_and_update(chat_id, window_text)
+                logger.debug(f"[{chat_id}] 🎯 当前主目标: {res}")
+                return res
+            
+            async def _load_expressions():
+                recent_text = "\n".join(window_lines[-3:]) if window_lines else ""
+                return await self.expression_selector.select(
+                    chat_id=chat_id, context_text=recent_text, think_level=0
+                )
+            
+            async def _load_jargons():
+                try:
+                    jargon_list = await self.context_engine.db.persistence.load_jargon_list(
+                        chat_id, limit=8
+                    ) if hasattr(self.context_engine.db, 'persistence') else []
+                    if jargon_list:
+                        lines = [
+                            f"{j.get('text', '')} → {j.get('meaning', '...')} (场景: {j.get('situation', '?')})"
+                            for j in jargon_list if j.get('meaning') and j.get('text')
+                        ]
+                        return "\n".join(lines) if lines else ""
+                except Exception as e:
+                    logger.debug(f"[Planner] 黑话加载失败: {e}")
+                return ""
+
+            # 并行执行无数据依赖的 I/O 密集型操作
+            slang_context, goal_text, expression_habits, jargon_explanation = await asyncio.gather(
+                _load_slang(), _load_goals(), _load_expressions(), _load_jargons()
+            )
             planner_reasoning = goal_text
+        else:
+            slang_context = ""
+            goal_text = ""
+            expression_habits = ""
+            jargon_explanation = ""
+            planner_reasoning = ""
         
         # [修改] 重构 tools 选择分支
         if is_all_mode:
@@ -136,7 +167,6 @@ class Planner:
             # ── [Sys3新增] TOOL_CALL 模式：加载 Sys3 SubAgent 轻量索引 ──
             sys3_light_tools = (await self.sys3_router.get_light_tools_for_planner()).tools
             
-            # 保留核心 PFC 拟人工具，去除纯情感/聊天微操工具，专注执行任务
             target_persona_id = getattr(self.gateway.config.persona, 'persona_id', "") if hasattr(self.gateway.config, 'persona') else ""
             task_mode_pfc_tools = [
                 WaitTool(),
@@ -152,7 +182,6 @@ class Planner:
             
             tools = task_mode_pfc_tools + sys3_light_tools
             
-            # TOOL_CALL 模式下关闭 RAG 注入以减少干扰
             if ctx:
                 if hasattr(ctx, "set"):
                     ctx.set("disable_rag_injection", True)
@@ -213,39 +242,10 @@ class Planner:
                         relationship_vec = self.state_engine.relationship_engine.get_or_create(str(user_id))
             tools = self.action_modifier.modify_tools(tools, state=state, profile=profile, relationship_vec=relationship_vec)
 
-        # Phase 1: 注入多目标上下文
+        # 确保 goals_context 在 gather 之后正确获取
         goals_context = self.goal_manager.get_goals_context(chat_id)
         
         tool_descs = "\n".join([f"- {t.name}: {t.description}" for t in tools]) if tools else "无可用工具"
-        
-        # Phase 6.1: 表达习惯选择 (ExpressionSelector)
-        expression_habits = ""
-        if not is_fast_mode:
-            recent_text = "\n".join(window_lines[-3:]) if window_lines else ""
-            expression_habits = await self.expression_selector.select(
-                chat_id=chat_id,
-                context_text=recent_text,
-                think_level=0  # 默认快速模式，零 LLM
-            )
-
-        # Phase 6.2C: 黑话注入
-        jargon_explanation = ""
-        if not is_fast_mode:
-            try:
-                jargon_list = await self.context_engine.db.persistence.load_jargon_list(
-                    chat_id, limit=8
-                ) if hasattr(self.context_engine.db, 'persistence') else []
-                if jargon_list:
-                    jargon_lines = [
-                        f"{j.get('text', '')} → {j.get('meaning', '...')} "
-                        f"(场景: {j.get('situation', '?')})"
-                        for j in jargon_list
-                        if j.get('meaning') and j.get('text')
-                    ]
-                    if jargon_lines:
-                        jargon_explanation = "\n".join(jargon_lines)
-            except Exception as e:
-                logger.debug(f"[Planner] 黑话加载失败: {e}")
 
         system_prompt = await self.context_engine.build_prompt(
             chat_id=chat_id, 
@@ -324,7 +324,6 @@ class Planner:
                 del jumps[sender_id]
         # ===============================================
 
-        # [Sys3新增] 在 final_prompt 渲染前，如果处于工具模式，追加委派提示词
         if is_tool_call_mode:
             system_prompt += (
                 "\n\n>>> [工作委派模式] <<<\n"

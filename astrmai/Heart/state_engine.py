@@ -189,31 +189,52 @@ class StateEngine:
 
     def apply_natural_decay(self, state: ChatState):
         """
-        [Phase 6] 自然状态衰减 (Metabolism)
+        [修改 P3-T1] 情绪衰减漂移 (惰性计算算法)
+        将基于固定频率的定时计算，升级为基于真实时间差的惰性数学流逝计算 (Lazy Evaluation)。
         """
         now = time.time()
+        is_dirty = False
+        
         minutes_silent = 999
-        if state.last_reply_time != 0:
+        if getattr(state, 'last_reply_time', 0) != 0:
             minutes_silent = (now - state.last_reply_time) / 60
         
-        # 2. 精力恢复 (Energy Recovery) 接入 Config
-        if minutes_silent > self.config.energy.recovery_silence_min and state.energy < 0.8:
+        # 1. 惰性精力恢复 (Energy Recovery)
+        recovery_min = getattr(self.config.energy, 'recovery_silence_min', 60)
+        if minutes_silent > recovery_min and state.energy < 0.8:
             state.energy = min(0.8, state.energy + 0.1)
-            state.is_dirty = True
-            logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 精力恢复 -> {state.energy:.2f}")
+            is_dirty = True
+            logger.debug(f"[{state.chat_id}] 🌙 惰性计算: 发现冷场，精力恢复 -> {state.energy:.2f}")
 
-        # 3. 情绪平复 (Mood Decay) 接入 Config
-        if now - state.last_passive_decay_time > self.config.mood.decay_interval:
+        # 2. 惰性情绪漂移 (Mood Drift) - 核心纯算法逻辑
+        last_decay = getattr(state, 'last_passive_decay_time', 0)
+        if last_decay == 0:
             state.last_passive_decay_time = now
-            decay_rate = self.config.mood.decay_rate 
+            last_decay = now
             
+        decay_interval = getattr(self.config.mood, 'decay_interval', 3600)
+        decay_rate = getattr(self.config.mood, 'decay_rate', 0.05)
+        
+        elapsed = now - last_decay
+        if elapsed >= decay_interval and decay_interval > 0:
+            # 纯数学计算：一口气结算经过的所有衰减周期
+            decay_steps = int(elapsed / decay_interval)
+            total_decay = decay_steps * decay_rate
+            
+            old_mood = state.mood
             if state.mood > 0:
-                state.mood = max(0.0, state.mood - decay_rate)
+                state.mood = max(0.0, state.mood - total_decay)
             elif state.mood < 0:
-                state.mood = min(0.0, state.mood + decay_rate)
+                state.mood = min(0.0, state.mood + total_decay)
             
+            if old_mood != state.mood:
+                # 补齐时间戳（保留未能整除的时间残差，防止精度流失）
+                state.last_passive_decay_time += decay_steps * decay_interval
+                is_dirty = True
+                logger.debug(f"[{state.chat_id}] 🍂 情绪漂移: 经历了 {decay_steps} 个代谢周期，向中立回落 {old_mood:.2f} -> {state.mood:.2f}")
+
+        if is_dirty:
             state.is_dirty = True
-            logger.debug(f"[{state.chat_id}] 🌙 自然代谢: 情绪平复 -> {state.mood:.2f}")
 
     async def calculate_and_update_affection(self, user_id: str, group_id: str, mood_tag: str, intensity: float = 1.0, message_text: str = ""):
         """
@@ -308,12 +329,17 @@ class StateEngine:
     
     async def atomic_update_mood(self, chat_id: str, delta: float = 0.0, absolute_val: float = None) -> float:
         """
-        [修改] 严格原子化 Read-Compute-Write 事务，彻底消除 TOCTOU 竞态条件
+        [修改 P3-T1] 严格原子化 Read-Compute-Write 事务。
+        核心逻辑：在施加新情绪前，强制执行一次惰性漂移结算，确保基准值是受时间衰减后的绝对真实值。
         """
         async with self._get_chat_lock(chat_id):
-            # 🟢 [核心修复 Bug 3] 进入锁内后，绝不能轻信外面的快照引用，必须当场获取最新内存！
+            # 1. 🟢 [核心修复 Bug 3] 当场获取最新内存！
             state = await self._get_state_inner(chat_id)
             
+            # 2. 🟢 [新增 P3-T1] 在更新前，先执行一次惰性自然代谢计算
+            self.apply_natural_decay(state)
+            
+            # 3. 施加本次的情绪波动
             if absolute_val is not None:
                 state.mood = max(-1.0, min(1.0, absolute_val))
             else:
@@ -321,7 +347,7 @@ class StateEngine:
                 
             state.is_dirty = True
             
-            # 兼容底层落盘
+            # 4. 兼容底层落盘
             if hasattr(self, 'persistence'):
                 await self.persistence.save_chat_state(chat_id, state)
             elif hasattr(self, 'db'):

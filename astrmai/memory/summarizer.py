@@ -136,27 +136,40 @@ class ChatHistorySummarizer:
                     f"[Memory Summarizer] 📊 话题分割完成: "
                     f"Session {session_id} → {len(topic_segments)} 个话题段"
                 )
-                # 对每个话题段分别进行认知处理并存入记忆引擎
-                for seg in topic_segments:
-                    seg_text = seg.get("summary", "")
-                    seg_keywords = seg.get("keywords", [])
-                    seg_importance = seg.get("importance", 0.0)
-                    if seg_text and seg_importance >= 0.2:
-                        topic_content = f"【话题摘要】{seg_text}"
-                        if seg_keywords:
-                            topic_content += f"\n【关键词】{', '.join(seg_keywords[:5])}"
-                        await self.engine.add_memory(
-                            content=topic_content,
-                            session_id=session_id,
-                            importance=min(1.0, seg_importance)
-                        )
+                
+                # ==========================================
+                # 🟢 [修改 P2-T3] 调用 engine 的话题合并去重写入方法
+                # 替代原有的 for 循环逐个无脑 add_memory
+                # ==========================================
+                if hasattr(self.engine, 'store_topic_results'):
+                    await self.engine.store_topic_results(
+                        topic_results=topic_segments, 
+                        session_id=session_id,
+                        persona_id=persona_id
+                    )
+                else:
+                    # 兼容性降级，防止报错
+                    for seg in topic_segments:
+                        seg_text = seg.get("summary", "")
+                        seg_keywords = seg.get("topic_keywords", [])
+                        seg_importance = seg.get("importance", 0.0)
+                        if seg_text and seg_importance >= 0.2:
+                            topic_content = f"【话题摘要】{seg_text}"
+                            if seg_keywords:
+                                topic_content += f"\n【关键词】{', '.join(seg_keywords[:5])}"
+                            await self.engine.add_memory(
+                                content=topic_content,
+                                session_id=session_id,
+                                importance=min(1.0, seg_importance)
+                            )
+                            
                 logger.info(
                     f"[Memory Summarizer] ✅ 话题级记忆入库完成: "
                     f"{len([s for s in topic_segments if s.get('importance', 0) >= 0.2])} 条有效话题"
                 )
         except Exception as e:
             logger.warning(f"[Memory Summarizer] ⚠️ TopicSummarizer 失败，降级到全局摘要: {e}")
-
+            
         # 原有全局认知降维（兜底）
         memory_data = await self.processor.process_conversation(chat_history_text)
 

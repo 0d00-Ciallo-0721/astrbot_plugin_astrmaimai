@@ -33,8 +33,12 @@ class PerformanceConfig(BaseModel):
 class System1Config(BaseModel):
     wakeup_words: List[str] = Field(default=[])
     nicknames: List[str] = Field(default=[])
-    # [新增] 额外指令黑名单，用于手动兜底隔离
     extra_command_list: List[str] = Field(default=[])
+    # [新增 P1-T2] 关键词反应规则
+    keyword_reactions: List[str] = Field(
+        default=[],
+        description="关键词反应规则列表，格式: '关键词:反应描述'，例如 '原神:你是原神重度玩家，听到这个词会特别兴奋'"
+    )
 
 class AttentionConfig(BaseModel):
     debounce_window: float = Field(default=2.0)
