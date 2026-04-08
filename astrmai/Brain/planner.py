@@ -1,10 +1,11 @@
-# astrmai/Brain/planner.py
+﻿# astrmai/Brain/planner.py
 import random
 from typing import List, Optional
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
 import asyncio
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
@@ -35,6 +36,12 @@ class Planner:
     认知总控 (System 2)
     职责: 统筹编排 System 2。将聚合的消息与环境状态拼装，定义原生工具栈，然后下发给 Executor 驱动智能体循环。
     """
+    FOLLOW_UP_SYSTEM_PROMPT = (
+        "你是追加发言判定器。"
+        "你只判断是否需要紧接着再发一句短消息。"
+        "严格返回 JSON: {\"follow\": true/false, \"reason\": \"原因\"}。"
+    )
+
     def __init__(self, 
                  context, 
                  gateway: GlobalModelGateway, 
@@ -247,21 +254,21 @@ class Planner:
 
         # 确保 goals_context 在 gather 之后正确获取
         goals_context = self.goal_manager.get_goals_context(chat_id)
-        
-        tool_descs = "\n".join([f"- {t.name}: {t.description}" for t in tools]) if tools else "无可用工具"
+        tool_descs = ""
 
         system_prompt = await self.context_engine.build_prompt(
             chat_id=chat_id, 
             event_messages=event_messages,
             retrieve_keys=retrieve_keys,
             slang_patterns=slang_context,
-            tool_descs=tool_descs,
             sys1_thought=sys1_thought,
             goals_context=goals_context,
             expression_habits=expression_habits,    # Phase 6.1
             planner_reasoning=planner_reasoning,    # Phase 6.2B
             jargon_explanation=jargon_explanation,  # Phase 6.2C
         )
+        event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
+        event.set_extra("astrmai_use_lane_history", True)
 
         # === [基于信标的源会话语境溯源拉取] ===
         if not event.get_group_id():
@@ -423,7 +430,13 @@ JSON: {{"follow": true/false, "reason": "原因"}}"""
 
         try:
             import re, json
-            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                system_prompt=self.FOLLOW_UP_SYSTEM_PROMPT,
+                is_json=True,
+                lane_key=LaneKey(subsystem="sys2", task_family="followup", scope_id=chat_id),
+                base_origin=chat_id,
+            )
             data = result if isinstance(result, dict) else {}
             if not isinstance(data, dict):
                 match = re.search(r'\{.*?\}', str(result), re.DOTALL)

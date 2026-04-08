@@ -1,10 +1,12 @@
 import json
 import re
 import asyncio
-from typing import Dict, Any,List,Union
+from typing import Dict, Any, List, Union, Optional
 from astrbot.api import logger
 from astrbot.api.star import Context
 from .model_router import ModelRouter
+from .lane_manager import LaneKey, LaneManager
+from .provider_capabilities import infer_provider_capabilities
 
 # [修改] 引入 AstrBot 标准消息片段类，并添加防崩溃动态导入 (兼容 v4.12 - v4.18+)
 from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
@@ -30,6 +32,7 @@ class GlobalModelGateway:
     def __init__(self, context: Context, config: Any):
         self.context = context
         self.config = config
+        self.lane_manager: Optional[LaneManager] = None
         # 智能模型路由器（健康分 + 冷却隔离 + 轮询均衡）
         self.router = ModelRouter()
         # 全局并发速率限制器
@@ -41,9 +44,57 @@ class GlobalModelGateway:
         """兼容接口: 委托给 ModelRouter（保留签名以兼容外部调用）"""
         return self.router.get_ranked_models(pool_name, models)
 
+    def set_lane_manager(self, lane_manager: LaneManager) -> None:
+        self.lane_manager = lane_manager
+
+    def _read_usage_field(self, usage: Any, *names: str) -> int:
+        if usage is None:
+            return 0
+        for name in names:
+            value = getattr(usage, name, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(name)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    def _extract_usage(self, resp: Any) -> Dict[str, int]:
+        usage = getattr(resp, "usage", None)
+        input_tokens = self._read_usage_field(usage, "input", "input_tokens", "prompt_tokens")
+        input_cached = self._read_usage_field(usage, "input_cached", "cached_tokens")
+        output_tokens = self._read_usage_field(usage, "output", "output_tokens", "completion_tokens")
+        return {
+            "input_tokens": input_tokens,
+            "input_cached": input_cached,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+
+    def _log_usage(self, pool_name: str, model_id: str, usage: Dict[str, int], debug_meta: Optional[Dict[str, Any]] = None) -> None:
+        debug_meta = debug_meta or {}
+        input_tokens = usage.get("input_tokens", 0)
+        input_cached = usage.get("input_cached", 0)
+        cache_rate = (input_cached / input_tokens) if input_tokens else 0.0
+        logger.info(
+            "[GatewayUsage] pool=%s model=%s provider=%s lane_key=%s conversation_id=%s prefix_hash=%s input_tokens=%s input_cached=%s output_tokens=%s cache_rate=%.4f",
+            pool_name,
+            model_id,
+            debug_meta.get("provider", model_id),
+            debug_meta.get("lane_key", ""),
+            debug_meta.get("conversation_id", ""),
+            debug_meta.get("prefix_hash", ""),
+            input_tokens,
+            input_cached,
+            usage.get("output_tokens", 0),
+            cache_rate,
+        )
+
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
 # [修改] 位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
-    async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True) -> Union[str, Dict[str, Any]]: 
+    async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True, contexts: Optional[List[Any]] = None, debug_meta: Optional[Dict[str, Any]] = None, request_kwargs: Optional[Dict[str, Any]] = None) -> Union[str, Dict[str, Any]]:
         """统一网关底层调用引擎 (ModelRouter 智能调度 + 全局信号量限流 + 超时熔断)"""
         
         # 全局速率门控
@@ -75,8 +126,8 @@ class GlobalModelGateway:
                 for attempt in range(max_retries + 1):
                     try:
                         processed_image_urls = image_urls if image_urls else []
-                        contexts = []
-                        llm_kwargs = {}
+                        request_contexts = list(contexts or [])
+                        llm_kwargs = dict(request_kwargs or {})
                         
                         if system_prompt:
                             llm_kwargs["system_prompt"] = system_prompt
@@ -90,7 +141,7 @@ class GlobalModelGateway:
                                     user_content.append(TextPart(text=current_prompt))
                                 for path_or_url in processed_image_urls:
                                     user_content.append(ImagePart(url=path_or_url))
-                                contexts.append(UserMessageSegment(content=user_content))
+                                request_contexts.append(UserMessageSegment(content=user_content))
                                 current_prompt = "" 
                             else:
                                 llm_kwargs["image_urls"] = processed_image_urls
@@ -101,7 +152,7 @@ class GlobalModelGateway:
                                 self.context.llm_generate(
                                     chat_provider_id=model_id,
                                     prompt=current_prompt if current_prompt else None,
-                                    contexts=contexts,
+                                    contexts=request_contexts,
                                     **llm_kwargs
                                 ),
                                 timeout=timeout_limit
@@ -115,7 +166,9 @@ class GlobalModelGateway:
                         
                         # ✅ 调用成功 → 上报健康
                         self.router.report_success(report_pool, model_id)
-                            
+                        usage = self._extract_usage(resp)
+                        self._log_usage(report_pool, model_id, usage, debug_meta)
+
                         if not is_json:
                             return content.strip() 
                             
@@ -166,7 +219,7 @@ class GlobalModelGateway:
             logger.error(f"[Gateway] ❌ 所有模型池均已耗尽，最终异常: {last_error}")
             raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
     
-    async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
+    async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "", lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> Dict[str, Any]:
         """多模态视觉任务专用网关"""
         vision_models = getattr(self.config.provider, 'vision_models', [])
         if not vision_models:
@@ -174,6 +227,21 @@ class GlobalModelGateway:
             return {}
         
         image_urls = [image_data] if image_data else None
+
+        if lane_key and self.lane_manager:
+            return await self.chat_in_lane(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=vision_models,
+                is_json=True,
+                retry_penalty=0.5,
+                image_urls=image_urls,
+                use_fallback=False,
+                prefix_hash=prefix_hash,
+                persona_id=persona_id,
+            )
 
         return await self._elastic_call(
             pool_name="vision",
@@ -209,6 +277,179 @@ class GlobalModelGateway:
         
         # 如果上述方法都失败，则返回原始文本
         return text
+
+    async def chat_in_lane(
+        self,
+        lane_key: LaneKey,
+        base_origin: str,
+        prompt: str,
+        system_prompt: str,
+        models: List[str],
+        is_json: bool = False,
+        retry_penalty: float = 0.0,
+        image_urls: List[str] = None,
+        use_fallback: bool = True,
+        prefix_hash: str = "",
+        persona_id: str = "",
+    ) -> Union[str, Dict[str, Any]]:
+        if not self.lane_manager:
+            return await self._elastic_call(
+                pool_name=lane_key.task_family,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=models,
+                is_json=is_json,
+                retry_penalty=retry_penalty,
+                image_urls=image_urls,
+                use_fallback=use_fallback,
+            )
+
+        primary_models = self.router.get_ranked_models(lane_key.task_family, models)
+        model_hint = primary_models[0] if primary_models else ""
+        capabilities = infer_provider_capabilities(model_hint)
+        lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            prefix_hash=prefix_hash,
+            model_id=model_hint,
+            persona_id=persona_id,
+        )
+        debug_meta = {
+            "lane_key": lane_key.as_log_key(),
+            "conversation_id": conversation_id,
+            "prefix_hash": prefix_hash,
+            "provider": capabilities.provider_family,
+        }
+        request_kwargs: Dict[str, Any] = {}
+        if capabilities.supports_remote_session:
+            request_kwargs["session_id"] = self.lane_manager.get_remote_session_id(lane_umo, capabilities.provider_family)
+        if capabilities.supports_cache_control:
+            request_kwargs["cache_control"] = {"type": "ephemeral"}
+        result = await self._elastic_call(
+            pool_name=lane_key.task_family,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            models=models,
+            is_json=is_json,
+            retry_penalty=retry_penalty,
+            image_urls=image_urls,
+            use_fallback=use_fallback,
+            contexts=history,
+            debug_meta=debug_meta,
+            request_kwargs=request_kwargs,
+        )
+        assistant_content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        await self.lane_manager.append_exchange(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            user_content=prompt,
+            assistant_content=assistant_content,
+            prefix_hash=prefix_hash,
+            model_id=model_hint,
+            persona_id=persona_id,
+        )
+        return result
+
+    async def tool_chat_in_lane(
+        self,
+        lane_key: LaneKey,
+        base_origin: str,
+        event: Any,
+        prompt: str,
+        system_prompt: str,
+        tools: Any,
+        models: List[str],
+        max_steps: int,
+        timeout: int,
+        prefix_hash: str = "",
+        persona_id: str = "",
+    ) -> str:
+        if not self.lane_manager:
+            raise LLMCascadeFailureException("lane manager 未初始化，无法执行 tool_chat_in_lane")
+
+        primary_models = self.router.get_ranked_models(lane_key.task_family, models)
+        attempt_queue = primary_models.copy()
+        fallback_models_raw = getattr(self.config.provider, 'fallback_models', [])
+        fallback_models = self.router.get_ranked_models("fallback", fallback_models_raw)
+        attempt_queue += [m for m in fallback_models if m not in attempt_queue]
+        if not attempt_queue:
+            raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
+
+        lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            prefix_hash=prefix_hash,
+            model_id=attempt_queue[0],
+            persona_id=persona_id,
+        )
+        last_error = ""
+        for model_id in attempt_queue:
+            report_pool = lane_key.task_family if model_id in primary_models else "fallback"
+            capabilities = infer_provider_capabilities(model_id)
+            try:
+                tool_kwargs: Dict[str, Any] = {}
+                if capabilities.supports_remote_session:
+                    tool_kwargs["session_id"] = self.lane_manager.get_remote_session_id(lane_umo, capabilities.provider_family)
+                if capabilities.supports_cache_control:
+                    tool_kwargs["cache_control"] = {"type": "ephemeral"}
+                llm_resp = await asyncio.wait_for(
+                    self.context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=model_id,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        contexts=history,
+                        tools=tools,
+                        max_steps=max_steps,
+                        tool_call_timeout=timeout,
+                        **tool_kwargs,
+                    ),
+                    timeout=getattr(self.config.infra, 'api_timeout', 15.0),
+                )
+                reply_text = getattr(llm_resp, "completion_text", "")
+                if not reply_text:
+                    raise ValueError("回复为空")
+                self.router.report_success(report_pool, model_id)
+                usage = self._extract_usage(llm_resp)
+                self._log_usage(
+                    report_pool,
+                    model_id,
+                    usage,
+                    {
+                        "lane_key": lane_key.as_log_key(),
+                        "conversation_id": conversation_id,
+                        "prefix_hash": prefix_hash,
+                        "provider": capabilities.provider_family,
+                    },
+                )
+                await self.lane_manager.append_exchange(
+                    lane_key=lane_key,
+                    base_origin=base_origin,
+                    user_content=prompt,
+                    assistant_content=reply_text,
+                    token_usage=usage.get("total_tokens", 0),
+                    prefix_hash=prefix_hash,
+                    model_id=model_id,
+                    persona_id=persona_id,
+                )
+                return reply_text
+            except Exception as e:
+                last_error = str(e)
+                error_str = last_error.lower()
+                fatal_keywords = [
+                    "429", "ratelimit", "too many requests",
+                    "invalid_request_error", "apitimeouterror",
+                    "request timed out", "timeout",
+                ]
+                is_fatal = any(kw in error_str for kw in fatal_keywords) or "content=none" in error_str
+                self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
+                if is_fatal:
+                    logger.error(f"[Gateway] 模型 {model_id} tool_loop 致命错误，跳过: {last_error[:100]}")
+                else:
+                    logger.warning(f"[Gateway] tool_loop 模型 {model_id} 失败，切换后备: {e}")
+                continue
+
+        raise LLMCascadeFailureException(f"tool_loop 模型池耗尽: {last_error}")
     
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
@@ -224,21 +465,60 @@ class GlobalModelGateway:
         return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=True)
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
-    async def call_data_process_task(self, prompt: str, system_prompt: str = "", is_json: bool = False) -> Union[str, Dict[str, Any]]:
+    async def call_data_process_task(self, prompt: str, system_prompt: str = "", is_json: bool = False, lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> Union[str, Dict[str, Any]]:
         """记忆结构化/群组黑话推断/实时对话目标分析"""
         task_models = getattr(self.config.provider, 'task_models', [])
+        if lane_key:
+            return await self.chat_in_lane(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=task_models,
+                is_json=is_json,
+                retry_penalty=0.5,
+                use_fallback=True,
+                prefix_hash=prefix_hash,
+                persona_id=persona_id,
+            )
         return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=is_json, retry_penalty=0.5)
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
-    async def call_proactive_task(self, prompt: str, system_prompt: str = "") -> str:
+    async def call_proactive_task(self, prompt: str, system_prompt: str = "", lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> str:
         """主动冷场破冰开场白生成/深度用户画像侧写"""
         task_models = getattr(self.config.provider, 'task_models', [])
+        if lane_key:
+            return await self.chat_in_lane(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=task_models,
+                is_json=False,
+                retry_penalty=0.5,
+                use_fallback=True,
+                prefix_hash=prefix_hash,
+                persona_id=persona_id,
+            )
         return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=False, retry_penalty=0.5)
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
-    async def call_persona_task(self, prompt: str, system_prompt: str = "", is_json: bool = False) -> Union[str, Dict[str, Any]]:
+    async def call_persona_task(self, prompt: str, system_prompt: str = "", is_json: bool = False, lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> Union[str, Dict[str, Any]]:
         """人设压缩与多维切片"""
         task_models = getattr(self.config.provider, 'task_models', [])
+        if lane_key:
+            return await self.chat_in_lane(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=task_models,
+                is_json=is_json,
+                retry_penalty=0.0,
+                use_fallback=True,
+                prefix_hash=prefix_hash,
+                persona_id=persona_id,
+            )
         return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=is_json)
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下

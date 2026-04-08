@@ -6,6 +6,7 @@ from typing import Dict, Any, Tuple
 from astrbot.api import logger
 from ..infra.persistence import PersistenceManager
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 
 class PersonaSummarizer:
     """
@@ -26,6 +27,27 @@ class PersonaSummarizer:
     def _compute_hash(self, text: str) -> str:
         """计算人设内容的 Hash 值，用于缓存 Key"""
         return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+    def _persona_lane_key(self, cache_key: str) -> LaneKey:
+        return LaneKey(subsystem="sys2", task_family="persona", scope_id=cache_key, scope_kind="global")
+
+    async def _call_persona_lane(
+        self,
+        prompt: str,
+        cache_key: str,
+        system_prompt: str = "",
+        is_json: bool = False,
+        prefix_hash: str = "",
+    ):
+        return await self.gateway.call_persona_task(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            is_json=is_json,
+            lane_key=self._persona_lane_key(cache_key),
+            base_origin="",
+            prefix_hash=prefix_hash or self._compute_hash(system_prompt or prompt[:400]),
+            persona_id=cache_key,
+        )
 
     async def get_summary(self, original_prompt: str, persona_id: str = "", session_id: str = "global") -> Dict[str, Any]:
         """
@@ -83,7 +105,7 @@ class PersonaSummarizer:
             # ==========================================
             # 🟢 阶段一：单独执行核心身份提取 -> 写入 JSON
             # ==========================================
-            summary = await self._summarize_core_identity_with_retry(original_prompt)
+            summary = await self._summarize_core_identity_with_retry(original_prompt, cache_key)
             
             new_cache_data = {
                 "summary": summary,
@@ -104,7 +126,7 @@ class PersonaSummarizer:
             # ==========================================
             # 🟢 阶段二：单独执行语言风格提取 -> 更新 JSON
             # ==========================================
-            style = await self._summarize_style_with_retry(original_prompt)
+            style = await self._summarize_style_with_retry(original_prompt, cache_key)
             
             # 更新字典并第二次保存
             self.cache[cache_key]["style"] = style
@@ -145,14 +167,14 @@ class PersonaSummarizer:
         try:
             shards = {}
             # 顺序调用 8 大维度切片提取 (依赖下方的具体子函数)
-            shards["logic_style"] = await self._summarize_logic_style(original_prompt)
-            shards["speech_style"] = await self._summarize_speech_style(original_prompt)
-            shards["world_view"] = await self._summarize_world_view(original_prompt)
-            shards["timeline"] = await self._summarize_timeline(original_prompt)
-            shards["relations"] = await self._summarize_relations(original_prompt)
-            shards["skills"] = await self._summarize_skills(original_prompt)
-            shards["values"] = await self._summarize_values(original_prompt)
-            shards["secrets"] = await self._summarize_secrets(original_prompt)
+            shards["logic_style"] = await self._summarize_logic_style(original_prompt, cache_key)
+            shards["speech_style"] = await self._summarize_speech_style(original_prompt, cache_key)
+            shards["world_view"] = await self._summarize_world_view(original_prompt, cache_key)
+            shards["timeline"] = await self._summarize_timeline(original_prompt, cache_key)
+            shards["relations"] = await self._summarize_relations(original_prompt, cache_key)
+            shards["skills"] = await self._summarize_skills(original_prompt, cache_key)
+            shards["values"] = await self._summarize_values(original_prompt, cache_key)
+            shards["secrets"] = await self._summarize_secrets(original_prompt, cache_key)
 
             # 获取原子锁，安全写回内存并解除失忆状态
             async with self._lock:
@@ -178,7 +200,7 @@ class PersonaSummarizer:
             self.pending_tasks.pop(cache_key, None)
 
 # [修改] 替换 call_judge 为 call_persona_task
-    async def _summarize_core_identity_with_retry(self, original_prompt: str, max_retries: int = 3) -> str:
+    async def _summarize_core_identity_with_retry(self, original_prompt: str, cache_key: str, max_retries: int = 3) -> str:
         """核心身份提取：带重试机制与智能正则兜底"""
         logger.info(f"[PersonaSummarizer] 🧠 正在提取核心身份骨架 (最大重试: {max_retries}次)...")
         prompt = f"""
@@ -200,7 +222,7 @@ class PersonaSummarizer:
 """
         for attempt in range(max_retries):
             try:
-                res = await self.gateway.call_persona_task(prompt, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=False)
+                res = await self._call_persona_lane(prompt, cache_key, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=False)
                 if res and len(str(res).strip()) > 10:
                     return str(res).strip()
                 logger.warning(f"[PersonaSummarizer] ⚠️ 核心身份提取结果过短，准备重试 ({attempt+1}/{max_retries})")
@@ -219,7 +241,7 @@ class PersonaSummarizer:
         fallback_text = match.group(0).strip()[:150] if match else original_prompt[:150]
         return f"[系统降级提取] {fallback_text}...\n(注：角色记忆正在缓慢恢复中)"
 
-    async def _summarize_style_with_retry(self, original_prompt: str, max_retries: int = 3) -> str:
+    async def _summarize_style_with_retry(self, original_prompt: str, cache_key: str, max_retries: int = 3) -> str:
         """语言风格提取：带重试机制与安全兜底"""
         logger.info(f"[PersonaSummarizer] 🗣️ 正在提取语言风格与排版规范 (最大重试: {max_retries}次)...")
         prompt = f"""
@@ -243,7 +265,7 @@ class PersonaSummarizer:
 """
         for attempt in range(max_retries):
             try:
-                res = await self.gateway.call_persona_task(prompt, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=False)
+                res = await self._call_persona_lane(prompt, cache_key, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=False)
                 if res and len(str(res).strip()) > 5:
                     return str(res).strip()
             except Exception as e:
@@ -255,7 +277,7 @@ class PersonaSummarizer:
         return "保持自然、简短的对话风格，拒绝使用AI助手的机械回复格式，严禁长篇大论，贴合人设原本的语气。"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_logic_style(self, original_prompt: str) -> str:
+    async def _summarize_logic_style(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 性格逻辑 (logic_style)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【性格逻辑】维度的深度切片。
@@ -281,12 +303,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_speech_style(self, original_prompt: str) -> str:
+    async def _summarize_speech_style(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 语言风格 (speech_style)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【语言风格】维度的深度切片。
@@ -312,12 +334,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_world_view(self, original_prompt: str) -> str:
+    async def _summarize_world_view(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 世界观 (world_view)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【世界观】维度的深度切片。
@@ -338,12 +360,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_timeline(self, original_prompt: str) -> str:
+    async def _summarize_timeline(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 生平经历 (timeline)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【生平经历】维度的深度切片。
@@ -364,12 +386,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_relations(self, original_prompt: str) -> str:
+    async def _summarize_relations(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 人际关系 (relations)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【人际关系】维度的深度切片。
@@ -390,12 +412,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_skills(self, original_prompt: str) -> str:
+    async def _summarize_skills(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 技能能力 (skills)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【技能能力】维度的深度切片。
@@ -414,12 +436,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_values(self, original_prompt: str) -> str:
+    async def _summarize_values(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 价值观 (values)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【价值观】维度的深度切片。
@@ -439,12 +461,12 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_secrets(self, original_prompt: str) -> str:
+    async def _summarize_secrets(self, original_prompt: str, cache_key: str) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 深层秘密 (secrets)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【深层秘密】维度的深度切片。
@@ -465,6 +487,6 @@ class PersonaSummarizer:
 {original_prompt}
 """
         try:
-            return await self.gateway.call_persona_task(prompt, is_json=False)
+            return await self._call_persona_lane(prompt, cache_key, is_json=False)
         except Exception:
             return "无"

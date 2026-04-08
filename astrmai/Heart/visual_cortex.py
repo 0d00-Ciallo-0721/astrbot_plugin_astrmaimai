@@ -9,6 +9,7 @@ from typing import Optional
 from PIL import Image
 from astrbot.api import logger
 from ..infra.datamodels import VisualMemory
+from ..infra.lane_manager import LaneKey
 
 class VisualCortex:
     """
@@ -119,7 +120,7 @@ class VisualCortex:
             return None
 
 # [修改] 核心处理流程：单通 VLM 识别并入库
-    async def process_image_async(self, picid: str, base64_data: str):
+    async def process_image_async(self, picid: str, base64_data: str, scope_id: str = "global"):
         import tempfile
         import os
         temp_file_path = None
@@ -168,7 +169,8 @@ class VisualCortex:
             result_dict = await self.gateway.call_vision_task(
                 image_data=temp_file_path,
                 prompt="请分析这幅图片/表情包。",
-                system_prompt=system_prompt
+                system_prompt=system_prompt,
+                lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=scope_id or "global")
             )
 
             if not result_dict:

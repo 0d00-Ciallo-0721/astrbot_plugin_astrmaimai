@@ -16,6 +16,7 @@ import asyncio
 import time
 from typing import List, Optional, Dict
 from astrbot.api import logger
+from ..infra.lane_manager import LaneKey
 
 
 class ExpressionReflector:
@@ -83,7 +84,12 @@ class ExpressionReflector:
 返回 JSON 数组: [{{"index": 1, "score": 8, "feedback": "简评"}}]"""
 
         try:
-            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=group_id, scope_kind="global"),
+                base_origin="",
+            )
             scores = self._parse_scores(result)
 
             for score_item in scores:

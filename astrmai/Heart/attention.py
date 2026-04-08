@@ -310,7 +310,13 @@ class AttentionGate:
                                 if base64_data:
                                     pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
                                     if getattr(self, 'visual_cortex', None):
-                                        self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                                        self._fire_background_task(
+                                            self.visual_cortex.process_image_async(
+                                                pic_md5,
+                                                base64_data,
+                                                event.unified_msg_origin,
+                                            )
+                                        )
                                         
                             # 🚀 [视觉盲区] 对 System 1 只暴露简单的占位符
                             outline += "[图片]"
@@ -372,11 +378,19 @@ class AttentionGate:
                             if base64_data:
                                 pic_md5 = hashlib.md5(base64_data.encode('utf-8')).hexdigest()
                                 if getattr(self, 'visual_cortex', None):
-                                    self._fire_background_task(self.visual_cortex.process_image_async(pic_md5, base64_data))
+                                    self._fire_background_task(
+                                        self.visual_cortex.process_image_async(
+                                            pic_md5,
+                                            base64_data,
+                                            event.unified_msg_origin,
+                                        )
+                                    )
                                     
                         # 🚀 [视觉盲区] 对 System 1 只暴露简单的占位符
                         outline += "[图片]"
                         
+                        outline += "[鍥剧墖]"
+
                     elif component_type == "face" or i.__class__.__name__ == "Face":
                         outline += f"[表情:{getattr(i, 'id', getattr(i, 'name', ''))}]"
                     elif component_type == "at" or i.__class__.__name__ == "At":

@@ -9,6 +9,7 @@ from astrbot.api.event import MessageChain
 
 from ..Heart.state_engine import StateEngine
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 from ..infra.persistence import PersistenceManager
 from ..memory.dream_agent import DreamAgent       # Phase 7
 from ..memory.dream_generator import DreamGenerator  # Phase 7
@@ -53,6 +54,15 @@ class ProactiveTask:
         self._last_diary_date = ""
         # 🟢 [3.1] 后台任务全局信号量：限制后台 LLM 任务并发数，防止梦境+日记+侧写同时触发导致 429
         self._bg_semaphore = asyncio.Semaphore(2)
+
+    async def _call_background_lane(self, task_family: str, scope_id: str, prompt: str, system_prompt: str = "") -> str:
+        return await self.gateway.call_proactive_task(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            lane_key=LaneKey(subsystem="bg", task_family=task_family, scope_id=scope_id or "global", scope_kind="global"),
+            base_origin="",
+            persona_id=getattr(self.config.persona, "persona_id", "") or "global",
+        )
 
     async def start(self):
         """[修改] 启动多维后台主动任务循环 (心跳机制)"""
@@ -100,7 +110,8 @@ class ProactiveTask:
                     )
                     dream_text = await self.dream_generator.generate(
                         dream_log=dream_log,
-                        persona_name=persona_name
+                        persona_name=persona_name,
+                        session_id=getattr(self.dream_agent, "_last_session_id", "global"),
                     )
                     if dream_text:
                         logger.info(f"[ProactiveTask] 🌙 梦境叙述生成:\n{dream_text[:100]}...")
@@ -353,7 +364,7 @@ class ProactiveTask:
 直接输出内容，不要带引号。
 """
         # [修改点] 调用主动任务专项模型接口 (Phase 4 重构)
-        return await self.gateway.call_proactive_task(prompt)
+        return await self._call_background_lane("proactive", chat_id, prompt)
 
     async def _generate_persona_analysis(self, profile):
         """[修改] 生成并保存画像，支持增量更新与标签提取，并强制输出 JSON"""
@@ -405,7 +416,7 @@ class ProactiveTask:
 
 严格返回 JSON: {{"tags": ["..."], "summary": "...", "memory_points": [...]}}
 """
-        result = await self.gateway.call_proactive_task(prompt)
+        result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
         if result:
             import json
             import re
@@ -487,7 +498,7 @@ class ProactiveTask:
 直接输出JSON："""
 
         try:
-            result = await self.gateway.call_proactive_task(prompt)
+            result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
             import json, re
             match = re.search(r'\{.*\}', str(result), re.DOTALL)
             if match:
@@ -608,7 +619,7 @@ class ProactiveTask:
 3. 格式：纯文本内心独白，分段落，150字到300字左右。绝对不要使用 Markdown 列表，要像真正的人类日记一样自然连贯。
 """
                 try:
-                    diary_content = await self.gateway.call_proactive_task(prompt)
+                    diary_content = await self._call_background_lane("memory", str(group_id), prompt)
                     
                     if diary_content and self.memory_engine:
                         import datetime

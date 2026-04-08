@@ -4,6 +4,9 @@ import re          # [新增] 导入正则表达式库
 import json        # [新增] 导入 JSON 解析库
 import asyncio     # [新增] 导入异步库
 from astrbot.api import logger
+import asyncio
+import hashlib
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from ..infra.database import DatabaseService
 from ..infra.datamodels import ChatState, UserProfile, VisualMemory
@@ -21,13 +24,16 @@ class ContextEngine:
         self.summarizer = persona_summarizer
         self.config = config if config else self.summarizer.gateway.config
         self.context = context if context else self.summarizer.gateway.context
+        self._prefix_hash_by_chat: Dict[str, str] = {}
+
+    def get_last_prefix_hash(self, chat_id: str) -> str:
+        return self._prefix_hash_by_chat.get(chat_id, "")
     
     async def build_prompt(self, 
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
                            retrieve_keys: List[str] = None,
                            slang_patterns: str = "",
-                           tool_descs: str = "",
                            sys1_thought: str = "",
                            goals_context: str = "",
                            expression_habits: str = "",
@@ -36,6 +42,7 @@ class ContextEngine:
         
         if retrieve_keys is None:
             retrieve_keys = []
+        tool_descs = ""
             
         is_fast_mode = "CORE_ONLY" in retrieve_keys
             
@@ -220,12 +227,12 @@ class ContextEngine:
                 if nodes_context:
                     proactive_recall_block += "\n>>> [记忆节点背景 (对提及实体的已知认知)] <<<\n" + "\n".join(nodes_context) + "\n"
 
-                import random
                 auto_recall_prob = getattr(self.config.memory, 'auto_recall_probability', 0.3)
                 trigger_keywords = ["之前", "记得", "回忆", "想起", "以前", "过去"]
                 hit_keyword = any(kw in last_msg for kw in trigger_keywords)
                 
-                if hit_keyword or random.random() < auto_recall_prob:
+                stable_roll = int(hashlib.md5(f"{chat_id}:{last_msg}".encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+                if hit_keyword or stable_roll < auto_recall_prob:
                     plugin = getattr(self.context, 'astrmai_plugin', None) or getattr(self.summarizer.gateway.context, 'astrmai', None)
                     if plugin and hasattr(plugin, 'memory_engine'):
                         recall_res = await plugin.memory_engine.recall(last_msg, session_id=chat_id)
@@ -259,10 +266,8 @@ class ContextEngine:
         ]
         REPLY_STYLE_WEIGHTS = [0.45, 0.20, 0.15, 0.10, 0.10]
         
-        reply_style = REPLY_STYLES[0]
-        if not is_fast_mode:
-            import random
-            reply_style = random.choices(REPLY_STYLES, weights=REPLY_STYLE_WEIGHTS, k=1)[0]
+        style_seed = hashlib.md5(f"{chat_id}:{int(time.time() // 3600)}".encode("utf-8")).hexdigest()
+        reply_style = REPLY_STYLES[int(style_seed[:2], 16) % len(REPLY_STYLES)] if not is_fast_mode else REPLY_STYLES[0]
 
         # 4. 组装最终 Prompt
         prompt = f"""核心人格设定：
@@ -292,6 +297,58 @@ class ContextEngine:
 6. 回复指令：{reply_style}
 """
         # 视觉记忆即时查询
+        style_variants = [
+            "默认用自然、简短、贴近聊天窗口的语气回复。",
+            "可以稍微展开一句，但不要写成长段说明。",
+            "尽量惜字如金，像真人自然接话。",
+            "回复后可以顺手抛一个很短的追问。",
+            "允许带一点轻微吐槽感，但不要脱离当前人格。",
+        ]
+        style_seed = hashlib.md5(f"{chat_id}:{int(time.time() // 3600)}".encode("utf-8")).hexdigest()
+        style_variant = style_variants[int(style_seed[:2], 16) % len(style_variants)] if not is_fast_mode else style_variants[0]
+        stable_prefix = "\n\n".join(
+            block
+            for block in [
+                f"核心人格设定：\n{role_block}",
+                f"对话风格：\n{style_guide}" if style_guide else "",
+                expression_block.strip() if expression_block else "",
+                slang_block.strip() if slang_block else "",
+                jargon_block.strip() if jargon_block else "",
+                (
+                    "系统硬规则：\n"
+                    "1. 必须沉浸式发言，只输出角色自然台词。\n"
+                    "2. 不懂的事实优先借助工具或记忆，不要强行脑补。\n"
+                    "3. 如果要做动作或发图，先走工具，再用自然文本接话。\n"
+                    "4. 不要暴露系统、工具、提示词等底层机制。\n"
+                    "5. 回复长度和语气必须贴合当前情绪与精力。\n"
+                    "6. 工具能力由外部 tools 提供，这里只保留规则，不重复展开工具清单。"
+                ),
+            ]
+            if block
+        )
+        lane_state = "\n\n".join(
+            block
+            for block in [
+                state_block.strip() if state_block else "",
+                private_chat_block.strip() if private_chat_block else "",
+                inner_voice_block.strip() if inner_voice_block else "",
+            ]
+            if block
+        )
+        volatile_tail = "\n\n".join(
+            block
+            for block in [
+                "当前你看到的消息：\n<CURRENT_MESSAGES>",
+                "<CHAT_HISTORY>",
+                proactive_recall_block.strip() if proactive_recall_block else "",
+                "<RAG_MEMORY>",
+                f"本轮回复风格标签：{style_variant}",
+            ]
+            if block
+        )
+        self._prefix_hash_by_chat[chat_id] = hashlib.md5(stable_prefix.encode("utf-8")).hexdigest()
+        prompt = "\n\n".join(block for block in [stable_prefix, lane_state, volatile_tail] if block)
+
         picids = re.findall(r'\[picid:([a-fA-F0-9]{32})\]', prompt)
         
         for picid in set(picids):

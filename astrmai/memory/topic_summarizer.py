@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from astrbot.api import logger
+from ..infra.lane_manager import LaneKey
 
 
 @dataclass
@@ -324,7 +325,12 @@ class TopicSummarizer:
 ["话题1摘要", "话题2摘要", ...]"""
 
         try:
-            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=session_id or "global", scope_kind="global"),
+                base_origin="",
+            )
             summaries = self._parse_summaries(result, len(segments))
             return summaries
         except Exception as e:

@@ -4,6 +4,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.tool import ToolSet
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 from .reply_engine import ReplyEngine 
 
 class ConcurrentExecutor:
@@ -77,9 +78,10 @@ class ConcurrentExecutor:
                     from PIL import Image
                     from astrbot.api import logger
                     
-                    contexts = []
                     api_prompt = prompt
                     vision_descriptions = []
+                    prefix_hash = event.get_extra("astrmai_prefix_hash", "")
+                    dialog_lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id)
 
                     if direct_vision_urls and len(direct_vision_urls) > 0:
                         logger.info(f"[{chat_id}] 👁️ 触发主脑视觉直通车 (执行物理落盘与 VLM 转述)...")
@@ -121,7 +123,9 @@ class ConcurrentExecutor:
                                     result_dict = await self.gateway.call_vision_task(
                                         image_data=temp_file_path,
                                         prompt="请详细分析这幅图片或表情包的内容。",
-                                        system_prompt=system_prompt_vision
+                                        system_prompt=system_prompt_vision,
+                                        lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=chat_id),
+                                        base_origin=chat_id,
                                     )
                                     
                                     if result_dict:
@@ -177,13 +181,15 @@ class ConcurrentExecutor:
                         last_error = ""
                         for provider_id in models:
                             try:
-                                llm_resp = await self.context.llm_generate(
-                                    chat_provider_id=provider_id,
+                                reply_text = await self.gateway.chat_in_lane(
+                                    lane_key=dialog_lane_key,
+                                    base_origin=chat_id,
                                     prompt=api_prompt,
-                                    system_prompt=system_prompt, 
-                                    contexts=contexts
+                                    system_prompt=system_prompt,
+                                    models=[provider_id],
+                                    prefix_hash=prefix_hash,
+                                    use_fallback=False,
                                 )
-                                reply_text = getattr(llm_resp, 'completion_text', "")
                                 if not reply_text:
                                     raise ValueError(f"模型 {provider_id} 生成为空")
                                 
@@ -214,17 +220,18 @@ class ConcurrentExecutor:
                         last_error = "" 
                         for provider_id in models:
                             try:
-                                llm_resp = await self.context.tool_loop_agent(
+                                reply_text = await self.gateway.tool_chat_in_lane(
+                                    lane_key=dialog_lane_key,
+                                    base_origin=chat_id,
                                     event=event,
-                                    chat_provider_id=provider_id,
                                     prompt=api_prompt,
                                     system_prompt=system_prompt,
-                                    contexts=contexts, 
                                     tools=tool_set,
-                                    max_steps=max_steps, 
-                                    tool_call_timeout=timeout
+                                    models=[provider_id],
+                                    max_steps=max_steps,
+                                    timeout=timeout,
+                                    prefix_hash=prefix_hash,
                                 )
-                                reply_text = getattr(llm_resp, 'completion_text', "")
                                 if not reply_text:
                                     raise ValueError("回复为空")
                                 

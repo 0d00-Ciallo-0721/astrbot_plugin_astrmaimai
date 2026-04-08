@@ -21,6 +21,7 @@ from astrbot.api import logger
 from ..infra.database import DatabaseService
 from ..infra.datamodels import ExpressionPattern
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 
 
 class ExpressionSelector:
@@ -35,6 +36,7 @@ class ExpressionSelector:
     FAST_SELECT_LIMIT = 5
     # think_level=1 时候选池大小
     DEEP_CANDIDATE_LIMIT = 10
+    EXPRESSION_SYSTEM_PROMPT = "浣犳槸琛ㄨ揪椋庢牸鍖归厤鍣紝闇€瑕佷粠鍊欓€夎〃杈句腑鎸戦€夊綋鍓嶈澧冩渶鑷劧鐨勫嚑鏉°€?"
 
     def __init__(self, db: DatabaseService, gateway: GlobalModelGateway, config=None):
         self.db = db
@@ -123,11 +125,11 @@ class ExpressionSelector:
         if len(candidates) <= 3 or not context_text:
             return self._format_habits(candidates[:3])
 
-        selected = await self._llm_pick_best(candidates, context_text)
+        selected = await self._llm_pick_best(chat_id, candidates, context_text)
         return self._format_habits(selected)
 
     async def _llm_pick_best(
-        self, candidates: List[ExpressionPattern], context_text: str
+        self, chat_id: str, candidates: List[ExpressionPattern], context_text: str
     ) -> List[ExpressionPattern]:
         """
         用 1 次 LLM 从候选中选出最符合当前语境的表达习惯。
@@ -146,7 +148,13 @@ class ExpressionSelector:
 请从以上候选中，选出最适合当前语境、最自然、最有个性的 3 条（用序号回答，用逗号分隔，例如：1,3,5）："""
 
         try:
-            result = await self.gateway.call_data_process_task(prompt, is_json=False)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                system_prompt=self.EXPRESSION_SYSTEM_PROMPT,
+                is_json=False,
+                lane_key=LaneKey(subsystem="sys2", task_family="expression", scope_id=chat_id),
+                base_origin=chat_id,
+            )
             result_str = str(result).strip()
 
             # 解析序号

@@ -16,6 +16,7 @@ from .config import AstrMaiConfig
 from .astrmai.infra.persistence import PersistenceManager
 from .astrmai.infra.database import DatabaseService
 from .astrmai.infra.gateway import GlobalModelGateway
+from .astrmai.infra.lane_manager import LaneManager
 from .astrmai.infra.event_bus import EventBus 
 
 # --- Phase 4: Memory ---
@@ -78,6 +79,8 @@ class AstrMaiPlugin(Star):
         self.persistence = PersistenceManager()                 
         self.db_service = DatabaseService(self.persistence)     
         self.gateway = GlobalModelGateway(context, self.config) 
+        self.lane_manager = LaneManager(context.conversation_manager, config=self.config)
+        self.gateway.set_lane_manager(self.lane_manager)
         self.event_bus = EventBus()   
         
         # 🟢 [核心修复] 传参改为 embedding_models

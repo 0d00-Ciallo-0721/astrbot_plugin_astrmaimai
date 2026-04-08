@@ -16,6 +16,7 @@ import re
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from astrbot.api import logger
+from ..infra.lane_manager import LaneKey
 
 
 @dataclass
@@ -41,6 +42,7 @@ class GoalManager:
 
     MAX_GOALS = 3
     SIMILARITY_MERGE_THRESHOLD = 0.6
+    GOAL_SYSTEM_PROMPT = "浣犳槸瀵硅瘽鐩爣绠＄悊鍣紝璐熻矗鎻愬彇褰撳墠鏈€鏍稿績鐨勭煭鏈熷璇濈洰鏍囥€?"
 
     def __init__(self, gateway, config=None):
         self.gateway = gateway
@@ -108,7 +110,11 @@ class GoalManager:
 
             try:
                 result = await self.gateway.call_data_process_task(
-                    prompt=prompt, is_json=True
+                    prompt=prompt,
+                    system_prompt=self.GOAL_SYSTEM_PROMPT,
+                    is_json=True,
+                    lane_key=LaneKey(subsystem="sys2", task_family="goal", scope_id=chat_id),
+                    base_origin=chat_id,
                 )
                 new_goals = self._parse_goals(result)
 

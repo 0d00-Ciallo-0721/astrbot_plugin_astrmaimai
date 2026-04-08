@@ -32,6 +32,7 @@ from typing import Optional, List, Dict, Any
 from astrbot.api import logger
 from ..infra.gateway import GlobalModelGateway
 from ..infra.database import DatabaseService
+from ..infra.lane_manager import LaneKey
 
 
 class DreamAgent:
@@ -81,6 +82,7 @@ class DreamAgent:
             return None
 
         logger.info(f"[DreamAgent] 💤 开始梦境整理 → session: {session_id}")
+        self._last_session_id = session_id
 
         # 2. 获取整理起点（随机抽取一批事件摘要）
         seed_events = await self._get_seed_events(session_id)
@@ -121,6 +123,8 @@ class DreamAgent:
                 response = await self.gateway.call_data_process_task(
                     prompt=json.dumps(messages, ensure_ascii=False),
                     is_json=True,
+                    lane_key=LaneKey(subsystem="bg", task_family="dream", scope_id=session_id or "global", scope_kind="global"),
+                    base_origin="",
                 )
             except Exception as e:
                 logger.error(f"[DreamAgent] LLM 调用失败: {e}")

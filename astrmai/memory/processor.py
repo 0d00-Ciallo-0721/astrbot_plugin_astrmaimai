@@ -2,6 +2,7 @@ import json
 import re
 from typing import Any, Dict, List
 from astrbot.api import logger
+from ..infra.lane_manager import LaneKey
 
 class MemoryProcessor:
     """
@@ -56,7 +57,7 @@ JSON 格式要求：
 """
 
     # 位置: astrmai/memory/processor.py -> MemoryProcessor 类下
-    async def process_conversation(self, chat_history_text: str) -> Dict[str, Any]:
+    async def process_conversation(self, chat_history_text: str, session_id: str = "global") -> Dict[str, Any]:
         """[修改] 将对话文本处理为结构化记忆，分为事件与感想提取、节点提取两个阶段"""
         if not chat_history_text or not chat_history_text.strip():
             return self._get_default_structured_data()
@@ -65,7 +66,12 @@ JSON 格式要求：
         
         try:
             # 阶段一：提取事件与感想
-            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=session_id or "global", scope_kind="global"),
+                base_origin="",
+            )
             
             data1 = {}
             if isinstance(result, dict) and "summary" in result:
@@ -79,7 +85,12 @@ JSON 格式要求：
             if validated_data.get("key_facts"):
                 facts_text = "\n".join(validated_data["key_facts"])
                 node_prompt = self.node_prompt_template.replace("{facts}", facts_text)
-                node_result = await self.gateway.call_data_process_task(node_prompt, is_json=True)
+                node_result = await self.gateway.call_data_process_task(
+                    node_prompt,
+                    is_json=True,
+                    lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=session_id or "global", scope_kind="global"),
+                    base_origin="",
+                )
                 
                 node_data = {}
                 if isinstance(node_result, dict):

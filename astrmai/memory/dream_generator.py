@@ -12,6 +12,7 @@ import random
 from typing import Optional
 from astrbot.api import logger
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 
 
 class DreamGenerator:
@@ -33,7 +34,8 @@ class DreamGenerator:
         self,
         dream_log: str,
         style: Optional[str] = None,
-        persona_name: str = "Mai"
+        persona_name: str = "Mai",
+        session_id: str = "global"
     ) -> str:
         """
         将梦境整理日志转化为指定风格的诗意梦境叙述。
@@ -74,7 +76,9 @@ class DreamGenerator:
             result = await self.gateway.call_data_process_task(
                 prompt=prompt,
                 is_json=False,
-                system_prompt="你是一个善于幻想与创作的写作助手，擅长用诗意的语言描述梦境。"
+                system_prompt="你是一个善于幻想与创作的写作助手，擅长用诗意的语言描述梦境。",
+                lane_key=LaneKey(subsystem="bg", task_family="dream", scope_id=session_id or "global", scope_kind="global"),
+                base_origin="",
             )
             dream_text = str(result).strip()
             if dream_text:

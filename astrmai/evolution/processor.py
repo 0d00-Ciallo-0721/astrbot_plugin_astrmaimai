@@ -1,5 +1,6 @@
 import asyncio
 from astrbot.api import logger
+from ..infra.lane_manager import LaneKey
 from astrbot.api.event import AstrMessageEvent
 from ..infra.database import DatabaseService
 from ..infra.gateway import GlobalModelGateway
@@ -173,7 +174,12 @@ class EvolutionManager:
 JSON: {{"goal": "string"}}"""
         
         try:
-            result = await self.miner.gateway.call_data_process_task(prompt=prompt, is_json=True)
+            result = await self.miner.gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="sys2", task_family="goal", scope_id=chat_id),
+                base_origin=chat_id,
+            )
             
             # 安全拆包
             if isinstance(result, dict):

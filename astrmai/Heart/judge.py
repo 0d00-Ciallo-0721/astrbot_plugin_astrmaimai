@@ -1,10 +1,23 @@
-# astrmai/Heart/judge.py
+﻿# astrmai/Heart/judge.py
 from ..infra.gateway import GlobalModelGateway
+from ..infra.lane_manager import LaneKey
 from .state_engine import StateEngine
 import time
 import json
 from astrbot.api import logger
 from ..infra.datamodels import BrainActionPlan
+
+
+JUDGE_STABLE_PREFIX = """
+你是 AstrMai 的 System1 Judge。
+你的职责不是直接聊天，而是快速判断当前消息最适合采取的动作。
+必须严格输出 JSON，不要输出额外说明。
+规则：
+1. 优先判断是否需要立即回复、等待、忽略，或进入工具/知识/目标重想路径。
+2. 只有在确实需要回复类动作时，thought 才允许非空。
+3. retrieve_keys 只在 REPLY 类动作下使用，否则必须为空数组。
+4. 不要编造系统、工具、模型等底层信息。
+"""
 
 
 class Judge:
@@ -27,7 +40,6 @@ class Judge:
         动态行为修饰器：根据状态 + 概率 + 关键词条件，
         构建当前可用的动作列表文本，注入 Judge Prompt。
         """
-        import random
         actions = [
             "REPLY: 需要立刻回复（包含问题、提及你、或顺着话题聊）",
             "WAIT: 话似乎没说完，稍微等等看",
@@ -40,11 +52,11 @@ class Judge:
             actions.append("TOOL_CALL: 明确的指令求助，需要调用外部工具")
         
         # FETCH_KNOWLEDGE: 20% 概率随机激活 或 消息含问号时必定激活
-        if "?" in message or "？" in message or random.random() < 0.20:
+        if "?" in message or "？" in message or any(kw in message for kw in ["为什么", "怎么", "啥", "什么", "解释", "查", "搜索", "资料"]):
             actions.append("FETCH_KNOWLEDGE: 你突然想去翻翻记忆/知识库确认一下（灵光一闪）")
         
         # RETHINK_GOAL: 窗口内事件 >= 5 条时以 30% 概率激活
-        if window_events_count >= 5 and random.random() < 0.30:
+        if window_events_count >= 5:
             actions.append("RETHINK_GOAL: 聊了一阵子了，你想重新审视一下自己的对话目标")
             
         return "\n".join(f"- {a}" for a in actions)
@@ -265,7 +277,17 @@ class Judge:
                         f"{'='*60}"
                     )
 
-                result = await self.gateway.call_judge_task(prompt)
+                lane_key = LaneKey(subsystem="sys1", task_family="judge", scope_id=chat_id)
+                task_models = getattr(self.config.provider, 'task_models', [])
+                result = await self.gateway.chat_in_lane(
+                    lane_key=lane_key,
+                    base_origin=chat_id,
+                    prompt=prompt,
+                    system_prompt=JUDGE_STABLE_PREFIX,
+                    models=task_models,
+                    is_json=True,
+                    use_fallback=False,
+                )
                 
                 plan.action = result.get("action", "IGNORE").upper()
                 if plan.action in ["REPLY", "TOOL_CALL", "FETCH_KNOWLEDGE", "RETHINK_GOAL"]:

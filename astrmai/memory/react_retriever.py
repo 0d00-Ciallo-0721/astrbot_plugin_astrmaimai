@@ -20,6 +20,7 @@ import json
 import re
 from typing import Dict, List, Optional, Any
 from astrbot.api import logger
+from ..infra.lane_manager import LaneKey
 
 
 class ReActRetriever:
@@ -41,6 +42,9 @@ class ReActRetriever:
             "query_nodes": self._tool_query_nodes,
             "found_answer": None,  # 特殊终止工具
         }
+
+    def _retrieval_lane(self, chat_id: str) -> LaneKey:
+        return LaneKey(subsystem="sys2", task_family="retrieval", scope_id=chat_id)
 
     async def retrieve(
         self, query: str, chat_id: str,
@@ -164,7 +168,12 @@ class ReActRetriever:
 返回 JSON: {{"need_search": true/false, "question": "问题文本 (如不需要则留空)"}}"""
 
         try:
-            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=self._retrieval_lane(chat_id),
+                base_origin=chat_id,
+            )
             data = self._safe_parse_json(result)
             if data.get("need_search") and data.get("question"):
                 return str(data["question"])
@@ -210,7 +219,12 @@ class ReActRetriever:
 严格返回 JSON: {{"thinking": "思考内容", "tool": "工具名", "args": {{"参数名": "参数值"}}}}"""
 
         try:
-            result = await self.gateway.call_data_process_task(prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=self._retrieval_lane(chat_id),
+                base_origin=chat_id,
+            )
             return self._safe_parse_json(result)
         except Exception as e:
             logger.debug(f"[ReAct] ReAct step 失败: {e}")

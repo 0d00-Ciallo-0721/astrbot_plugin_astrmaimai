@@ -208,7 +208,13 @@ class ChatHistorySummarizer:
             logger.warning(f"[Memory Summarizer] ⚠️ TopicSummarizer 失败，降级到全局摘要: {e}")
             
         # 原有全局认知降维（兜底）
-        memory_data = await self.processor.process_conversation(chat_history_text)
+        try:
+            memory_data = await self.processor.process_conversation(
+                chat_history_text,
+                session_id=session_id,
+            )
+        except TypeError:
+            memory_data = await self.processor.process_conversation(chat_history_text)
 
         
         if not isinstance(memory_data, dict):

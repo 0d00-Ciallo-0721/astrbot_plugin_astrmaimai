@@ -5,6 +5,7 @@ from astrbot.api import logger
 from ..infra.database import ExpressionPattern, MessageLog
 from ..infra.gateway import GlobalModelGateway
 from ..infra.datamodels import ExpressionPattern, MessageLog, Jargon
+from ..infra.lane_manager import LaneKey
 
 class ExpressionMiner:
     """
@@ -15,6 +16,9 @@ class ExpressionMiner:
     def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
         self.config = config if config else gateway.config
+
+    def _reflect_lane(self, group_id: str) -> LaneKey:
+        return LaneKey(subsystem="bg", task_family="reflect", scope_id=group_id or "global", scope_kind="global")
 
     async def mine(self, group_id: str, messages: List[MessageLog]) -> List[ExpressionPattern]:
         """
@@ -47,7 +51,12 @@ class ExpressionMiner:
 """
         try:
             # [修改点] 调用数据处理接口，深度防御数据类型异常
-            raw_result = await self.gateway.call_data_process_task(prompt=prompt, is_json=True)
+            raw_result = await self.gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=self._reflect_lane(group_id),
+                base_origin="",
+            )
             
             patterns_data = []
             if isinstance(raw_result, list):
@@ -135,7 +144,12 @@ class ExpressionMiner:
 """
         try:
             # [修改点] 深度防御数据类型异常
-            raw_result = await self.gateway.call_data_process_task(prompt=extract_prompt, is_json=True)
+            raw_result = await self.gateway.call_data_process_task(
+                prompt=extract_prompt,
+                is_json=True,
+                lane_key=self._reflect_lane(group_id),
+                base_origin="",
+            )
             
             jargon_candidates = []
             if isinstance(raw_result, list):
@@ -155,7 +169,7 @@ class ExpressionMiner:
             import time
             
             if jargon_candidates:
-                inferred_batch = await self._infer_jargons_batch(jargon_candidates)
+                inferred_batch = await self._infer_jargons_batch(group_id, jargon_candidates)
                 for i, item in enumerate(jargon_candidates):
                     if i < len(inferred_batch):
                         inferred_data = inferred_batch[i]
@@ -187,7 +201,7 @@ class ExpressionMiner:
             return []
 
 
-    async def _infer_jargons_batch(self, jargon_candidates: List[dict]) -> List[dict]:
+    async def _infer_jargons_batch(self, group_id: str, jargon_candidates: List[dict]) -> List[dict]:
         """
         [修改] 批量推断法 (融合上下文与基础词义)，消除 N 次长级联 API 调用
         """
@@ -217,7 +231,12 @@ class ExpressionMiner:
 ]
 """
         try:
-            result = await self.gateway.call_data_process_task(prompt=infer_prompt, is_json=True)
+            result = await self.gateway.call_data_process_task(
+                prompt=infer_prompt,
+                is_json=True,
+                lane_key=self._reflect_lane(group_id),
+                base_origin="",
+            )
             
             data = []
             if isinstance(result, list):
