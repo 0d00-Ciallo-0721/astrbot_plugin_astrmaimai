@@ -197,6 +197,7 @@ class MemoryEvent(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     event_id: str = Field(index=True, unique=True)
+    session_id: str = Field(default="", index=True)
     date: str = Field(index=True)
     narrative: str = Field(default="")
     emotion: str = Field(default="")

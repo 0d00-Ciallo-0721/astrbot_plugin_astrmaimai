@@ -35,8 +35,10 @@ from ..infra.database import DatabaseService
 
 
 class DreamAgent:
-    MAX_ITERATIONS = 2
+    MAX_ITERATIONS = 5
     TIMEOUT_SEC = 90.0
+    SEED_QUERY_LIMIT = 10
+    SEED_SAMPLE_SIZE = 5
     MIN_EVENTS_TO_DREAM = 5  # 至少有这么多记忆才触发整理
 
     # 工具名称
@@ -289,21 +291,53 @@ class DreamAgent:
         except Exception as e:
             logger.warning(f"[DreamAgent] 更新事件失败: {e}")
 
+    @staticmethod
+    def _serialize_seed_event(event) -> Dict[str, Any]:
+        return {
+            "event_id": event.event_id,
+            "narrative": event.narrative,
+            "emotion": event.emotion,
+            "importance": event.importance,
+        }
+
+    def _load_session_events(self, session, session_id: str):
+        from ..infra.datamodels import MemoryEvent
+        from sqlmodel import select, desc
+
+        stmt = (
+            select(MemoryEvent)
+            .where(MemoryEvent.session_id == session_id)
+            .order_by(desc(MemoryEvent.created_at))
+            .limit(self.SEED_QUERY_LIMIT)
+        )
+        events = session.exec(stmt).all()
+        if events:
+            return events
+
+        stmt = (
+            select(MemoryEvent)
+            .where(MemoryEvent.date == session_id)
+            .order_by(desc(MemoryEvent.created_at))
+            .limit(self.SEED_QUERY_LIMIT)
+        )
+        return session.exec(stmt).all()
+
     async def _pick_random_session(self) -> Optional[str]:
         """随机选择有足够记忆的 session"""
         from ..infra.datamodels import MemoryEvent
-        from sqlmodel import select, func
+        from sqlmodel import select
         try:
             def _query():
                 with self.db.get_session() as session:
-                    # 按 date 分组，统计各 session 的记忆数
-                    stmt = (
-                        select(MemoryEvent.date)
-                        .group_by(MemoryEvent.date)
-                        .having(func.count(MemoryEvent.id) >= self.MIN_EVENTS_TO_DREAM)
-                    )
-                    results = session.exec(stmt).all()
-                    return results
+                    stmt = select(MemoryEvent.session_id, MemoryEvent.date)
+                    rows = session.exec(stmt).all()
+                    buckets = {}
+                    for session_key, date_key in rows:
+                        bucket_key = session_key or date_key
+                        if not bucket_key:
+                            continue
+                        buckets[bucket_key] = buckets.get(bucket_key, 0) + 1
+                    return [key for key, count in buckets.items() if count >= self.MIN_EVENTS_TO_DREAM]
             sessions = await asyncio.to_thread(_query)
             if sessions:
                 return random.choice(sessions)
@@ -312,26 +346,15 @@ class DreamAgent:
         return None
 
     async def _get_seed_events(self, session_id: str) -> List[Dict]:
-        """获取指定 session 的随机种子记忆"""
-        from ..infra.datamodels import MemoryEvent
-        from sqlmodel import select
         try:
             def _query():
                 with self.db.get_session() as session:
-                    stmt = select(MemoryEvent).where(
-                        MemoryEvent.date == session_id
-                    ).limit(10)
-                    events = session.exec(stmt).all()
-                    return [
-                        {"event_id": e.event_id, "narrative": e.narrative,
-                         "emotion": e.emotion, "importance": e.importance}
-                        for e in events
-                    ]
+                    events = self._load_session_events(session, session_id)
+                    return [self._serialize_seed_event(event) for event in events]
             events = await asyncio.to_thread(_query)
-            # 随机抽取 5 条
-            return random.sample(events, min(5, len(events))) if events else []
+            return random.sample(events, min(self.SEED_SAMPLE_SIZE, len(events))) if events else []
         except Exception as e:
-            logger.warning(f"[DreamAgent] 获取种子记忆失败: {e}")
+            logger.warning(f"[DreamAgent] 鑾峰彇绉嶅瓙璁板繂澶辫触: {e}")
             return []
 
     @staticmethod

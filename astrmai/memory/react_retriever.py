@@ -237,21 +237,33 @@ class ReActRetriever:
         if not self.db_service or not name:
             return "档案模块离线或姓名为空"
         try:
-            # 尝试通过 persistence 加载用户画像
-            if hasattr(self.db_service, 'persistence'):
-                profiles = self.db_service.persistence.load_all_user_profiles()
-                for uid, data in profiles.items():
-                    if isinstance(data, dict):
-                        pname = data.get("name", "")
-                        if name.lower() in pname.lower() or pname.lower() in name.lower():
-                            analysis = data.get("persona_analysis", "暂无")
-                            tags = data.get("tags", [])
-                            score = data.get("social_score", 0)
-                            return (
-                                f"姓名: {pname}, 好感度: {score}, "
-                                f"标签: {', '.join(tags) if tags else '无'}, "
-                                f"侧写: {analysis}"
-                            )
+            profiles = {}
+            persistence = getattr(self.db_service, "persistence", None)
+            if persistence and hasattr(persistence, "load_all_user_profiles"):
+                profiles = persistence.load_all_user_profiles() or {}
+
+            query_name = name.strip().lower()
+            for uid, data in profiles.items():
+                if not isinstance(data, dict):
+                    continue
+                profile_name = str(data.get("name", "") or "").strip()
+                nickname = str(data.get("nickname", "") or "").strip()
+                candidates = [candidate for candidate in (profile_name, nickname) if candidate]
+                if not any(query_name in candidate.lower() or candidate.lower() in query_name for candidate in candidates):
+                    continue
+
+                analysis = data.get("persona_analysis", "暂无")
+                tags = data.get("tags", [])
+                score = data.get("social_score", 0)
+                if profile_name and nickname and nickname != profile_name:
+                    display_name = f"{profile_name} ({nickname})"
+                else:
+                    display_name = nickname or profile_name or uid
+                return (
+                    f"姓名: {display_name}, 好感度: {score}, "
+                    f"标签: {', '.join(tags) if tags else '无'}, "
+                    f"侧写: {analysis}"
+                )
             return f"未找到关于 '{name}' 的档案"
         except Exception as e:
             logger.debug(f"[ReAct] query_person 异常: {e}")

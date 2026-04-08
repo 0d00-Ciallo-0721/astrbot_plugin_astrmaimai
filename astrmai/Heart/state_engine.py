@@ -140,24 +140,6 @@ class StateEngine:
         final_mood = await self.atomic_update_mood(chat_id, delta=delta)
         return tag, final_mood
     
-    async def consume_energy(self, chat_id: str, amount: float = None):
-        # 接入 Config 默认消耗
-        if amount is None:
-            amount = self.config.energy.cost_per_reply
-            
-        async with self._get_chat_lock(chat_id): 
-            # 🟢 [核心修复 Bug 2] 绝不直接依赖 chat_states 字典快照，必须调用内部的懒加载方法从 DB 或内存安全拉取真实状态
-            state = await self._get_state_inner(chat_id)
-
-            old_energy = state.energy
-            
-            state.energy = max(0.0, old_energy - amount)
-            state.total_replies += 1
-            state.last_reply_time = time.time()
-            state.is_dirty = True
-            
-            logger.debug(f"[{chat_id}] 🔋 能量结算: {old_energy:.2f} -> {state.energy:.2f}")
-
     async def update_social_score_from_fact(self, user_id: str, impact_score: float):
         """[New] 基于交互事实的动态好感度闭环"""
         if not user_id: return

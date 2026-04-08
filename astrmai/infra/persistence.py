@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import aiosqlite
+import sqlite3
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from sqlmodel import SQLModel, create_engine, Session
@@ -32,18 +33,26 @@ class PersistenceManager:
         SQLModel.metadata.create_all(self.engine)
         
         # 异步初始化表结构
-        asyncio.create_task(self._init_db())
+        self._init_task = None
+        self._schedule_init_db()
         logger.info(f"[AstrMai-Infra] 💾 Database connected & mounted at {self.db_path}")
 
     def get_session(self) -> Session:
         """提供给 Memory 和 Evolution 的兼容接口"""
         return Session(self.engine)
 
-    async def _init_db(self):
-        """初始化异步高频表 (绕过 SQLModel 开销)"""
+    def _schedule_init_db(self):
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("""
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._init_db_sync()
+            return
+        self._init_task = loop.create_task(self._init_db())
+
+    def _init_db_sync(self):
+        try:
+            with sqlite3.connect(self.db_path) as db:
+                db.execute("""
                     CREATE TABLE IF NOT EXISTS chat_states (
                         chat_id TEXT PRIMARY KEY,
                         energy REAL,
@@ -54,7 +63,7 @@ class PersistenceManager:
                         updated_at REAL
                     )
                 """)
-                await db.execute("""
+                db.execute("""
                     CREATE TABLE IF NOT EXISTS user_profiles (
                         user_id TEXT PRIMARY KEY,
                         name TEXT,
@@ -63,12 +72,53 @@ class PersistenceManager:
                         persona_analysis TEXT,
                         group_footprints TEXT,
                         identity TEXT,
+                        tags TEXT DEFAULT '[]',
+                        nickname TEXT DEFAULT '',
+                        nickname_reason TEXT DEFAULT '',
+                        know_times INTEGER DEFAULT 0,
+                        is_known INTEGER DEFAULT 0,
+                        memory_points TEXT DEFAULT '[]',
                         updated_at REAL
                     )
                 """)
-                await db.commit()
+                for col_def in [
+                    "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
+                    "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
+                    "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'",
+                ]:
+                    try:
+                        db.execute(col_def)
+                    except Exception:
+                        pass
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS cronsnapshot (
+                        job_id      TEXT PRIMARY KEY,
+                        name        TEXT DEFAULT '',
+                        cron_expression TEXT,
+                        run_at      REAL,
+                        run_once    INTEGER DEFAULT 0,
+                        target_origin TEXT DEFAULT '',
+                        payload     TEXT DEFAULT '{}',
+                        note        TEXT DEFAULT '',
+                        is_active   INTEGER DEFAULT 1,
+                        created_at  REAL,
+                        updated_at  REAL
+                    )
+                """)
+                try:
+                    db.execute("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''")
+                except Exception:
+                    pass
+                db.execute("""
+                    CREATE INDEX IF NOT EXISTS ix_memoryevent_session_id
+                    ON memoryevent (session_id)
+                """)
+                db.commit()
         except Exception as e:
-            logger.error(f"[AstrMai-Infra] 数据库异步表初始化失败: {e}")
+            logger.error(f"[AstrMai-Infra] 鏁版嵁搴撳悓姝ヨ〃鍒濆鍖栧け璐? {e}")
 
     # ==========================================
     # Cache I/O (Persona Summarizer)
@@ -150,6 +200,37 @@ class PersistenceManager:
                     "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
                 }
         return None
+
+    def load_all_user_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """同步读取全部用户画像，供旧的人物检索接口兼容使用。"""
+        profiles: Dict[str, Dict[str, Any]] = {}
+        with sqlite3.connect(self.db_path) as conn:
+            row_cursor = conn.execute("SELECT * FROM user_profiles")
+            rows = row_cursor.fetchall()
+            cols_cursor = conn.execute("PRAGMA table_info(user_profiles)")
+            col_names = [col[1] for col in cols_cursor.fetchall()]
+
+        for row in rows:
+            row_dict = dict(zip(col_names, row))
+            user_id = row_dict.get("user_id", "")
+            if not user_id:
+                continue
+            profiles[user_id] = {
+                "user_id": user_id,
+                "name": row_dict.get("name", "Unknown"),
+                "social_score": row_dict.get("social_score", 0.0),
+                "last_seen": row_dict.get("last_seen", 0.0),
+                "persona_analysis": row_dict.get("persona_analysis", ""),
+                "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
+                "identity": row_dict.get("identity", ""),
+                "tags": json.loads(row_dict.get("tags") or "[]"),
+                "nickname": row_dict.get("nickname", ""),
+                "nickname_reason": row_dict.get("nickname_reason", ""),
+                "know_times": int(row_dict.get("know_times") or 0),
+                "is_known": bool(row_dict.get("is_known") or False),
+                "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
+            }
+        return profiles
 
     async def save_user_profile(self, profile: 'UserProfile'):
         footprints_json = json.dumps(profile.group_footprints, ensure_ascii=False)
@@ -254,6 +335,14 @@ class PersistenceManager:
                         created_at  REAL,
                         updated_at  REAL
                     )
+                """)
+                try:
+                    await db.execute("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''")
+                except Exception:
+                    pass
+                await db.execute("""
+                    CREATE INDEX IF NOT EXISTS ix_memoryevent_session_id
+                    ON memoryevent (session_id)
                 """)
                 await db.commit()
         except Exception as e:

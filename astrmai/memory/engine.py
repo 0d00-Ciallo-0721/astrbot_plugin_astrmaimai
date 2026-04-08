@@ -199,12 +199,12 @@ class MemoryEngine:
         all_results = [f"[绝对事实]: {r.content}" for r in valid_results]
         return "\n".join(all_results)
 
-    async def recall(self, query: str, session_id: str = None, persona_id: str = None) -> str:
+    async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None) -> str:
         # 拦截校验：确保模型已挂载
         if not await self._ensure_faiss_initialized(): 
             return "（记忆模块离线）"
         
-        recall_top_k = getattr(self.config.memory, 'recall_top_k', 5)
+        recall_top_k = top_k if top_k is not None else getattr(self.config.memory, 'recall_top_k', 5)
         results = await self.retriever.search(query, k=recall_top_k, session_id=session_id, persona_id=persona_id)
         
         # [修改] 增加低权重衰减防线，过滤掉因长期未调用导致 score 过低的残余记忆

@@ -379,6 +379,7 @@ class DatabaseService:
             statement = select(MemoryEvent).where(MemoryEvent.event_id == event.event_id)
             existing = session.exec(statement).first()
             if existing:
+                existing.session_id = getattr(event, "session_id", "") or existing.session_id
                 existing.narrative = event.narrative
                 existing.emotion = event.emotion
                 existing.importance = event.importance
@@ -445,12 +446,6 @@ class DatabaseService:
             await asyncio.to_thread(_sync)
 
 
-    async def save_jargon_async(self, jargon: Jargon):
-        """[新增] 将同步写库操作推入线程池，释放主事件循环，防止高并发假死"""
-        import asyncio
-        async with self._db_lock:
-            return await asyncio.to_thread(self.save_jargon, jargon)            
-    
     async def add_message_log_async(self, group_id: str, sender_id: str, sender_name: str, content: str):
         """[新增] 异步记录消息，防止高频聊天阻塞事件循环"""
         import asyncio
@@ -467,7 +462,7 @@ class DatabaseService:
         """[新增] 异步保存表达模式"""
         import asyncio
         async with self._db_lock:
-                return await asyncio.to_thread(self.save_pattern, pattern)
+            return await asyncio.to_thread(self.save_pattern, pattern)
         
     async def save_jargon_async(self, jargon: Jargon):
         """[新增] 将同步写库操作推入线程池，释放主事件循环"""

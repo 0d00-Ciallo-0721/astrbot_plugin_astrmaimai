@@ -250,6 +250,7 @@ class ChatHistorySummarizer:
             event_id = f"evt_{date_str.replace('-', '')}_{uuid.uuid4().hex[:8]}"
             event = MemoryEvent(
                 event_id=event_id,
+                session_id=str(session_id),
                 date=date_str,
                 narrative="\n".join(valid_facts),
                 emotion=sentiment,
