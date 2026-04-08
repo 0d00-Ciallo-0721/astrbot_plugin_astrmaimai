@@ -133,7 +133,16 @@ class StateEngine:
         current_state = await self.get_state(chat_id)
         snapshot_mood = current_state.mood
         
-        tag, new_value = await self.mood_manager.analyze_mood(text, snapshot_mood, chat_id=chat_id)
+        try:
+            tag, new_value = await self.mood_manager.analyze_mood(
+                text,
+                snapshot_mood,
+                chat_id=chat_id,
+            )
+        except TypeError:
+            # Backward compatibility for older MoodManager implementations or test doubles
+            # that still expose analyze_mood(text, current_mood, user_affection=...).
+            tag, new_value = await self.mood_manager.analyze_mood(text, snapshot_mood)
         delta = new_value - snapshot_mood
         
         # 2. 运算结束后，下发增量给严格的锁内原子方法

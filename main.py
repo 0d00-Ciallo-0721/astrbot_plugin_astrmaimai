@@ -1,9 +1,9 @@
-import asyncio
+﻿import asyncio
 import re
-import copy  # 用于深拷贝 (修复 Bug 1)
-import time  # 用于时间戳节流 (修复 Bug 2)
-import astrbot.api.message_components as Comp  # 提升至全局导入 (修复 Bug 3)
-import contextvars # 用于导入上下文变量相关库
+import copy  # 鐢ㄤ簬娣辨嫹璐?(淇 Bug 1)
+import time  # 鐢ㄤ簬鏃堕棿鎴宠妭娴?(淇 Bug 2)
+import astrbot.api.message_components as Comp  # 鎻愬崌鑷冲叏灞€瀵煎叆 (淇 Bug 3)
+import contextvars # 鐢ㄤ簬瀵煎叆涓婁笅鏂囧彉閲忕浉鍏冲簱
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
@@ -16,7 +16,7 @@ from .config import AstrMaiConfig
 from .astrmai.infra.persistence import PersistenceManager
 from .astrmai.infra.database import DatabaseService
 from .astrmai.infra.gateway import GlobalModelGateway
-from .astrmai.infra.lane_manager import LaneManager
+from .astrmai.infra.lane_manager import LaneKey, LaneManager
 from .astrmai.infra.event_bus import EventBus 
 
 # --- Phase 4: Memory ---
@@ -65,16 +65,16 @@ class AstrMaiPlugin(Star):
         
         self._background_tasks = set() 
         
-        # 🟢 [彻底修复 Bug 1] 放弃非法的 weakref，改用强引用字典，彻底杜绝并发锁的幽灵回收与内存穿透
+        # 馃煝 [褰诲簳淇 Bug 1] 鏀惧純闈炴硶鐨?weakref锛屾敼鐢ㄥ己寮曠敤瀛楀吀锛屽交搴曟潨缁濆苟鍙戦攣鐨勫菇鐏靛洖鏀朵笌鍐呭瓨绌块€?
         self._sys2_locks = {}    
         
-        # 🟢 [核心修复] 适配新的模型池列表 (List[str]) 替换旧单体字符串
+        # 馃煝 [鏍稿績淇] 閫傞厤鏂扮殑妯″瀷姹犲垪琛?(List[str]) 鏇挎崲鏃у崟浣撳瓧绗︿覆
         task_models = getattr(self.config.provider, 'task_models', []) or ['Unconfigured']
         agent_models = getattr(self.config.provider, 'agent_models', []) or ['Unconfigured']
         embedding_models = getattr(self.config.provider, 'embedding_models', [])
         
-        # 打印列表中的首选模型以供启动日志确认
-        logger.info(f"[AstrMai] 🚀 Booting... Task(Judge): {task_models[0]} | Agent: {agent_models[0]}")
+        # 鎵撳嵃鍒楄〃涓殑棣栭€夋ā鍨嬩互渚涘惎鍔ㄦ棩蹇楃‘璁?
+        logger.info(f"[AstrMai] 馃殌 Booting... Task(Judge): {task_models[0]} | Agent: {agent_models[0]}")
 
         self.persistence = PersistenceManager()                 
         self.db_service = DatabaseService(self.persistence)     
@@ -83,7 +83,7 @@ class AstrMaiPlugin(Star):
         self.gateway.set_lane_manager(self.lane_manager)
         self.event_bus = EventBus()   
         
-        # 🟢 [核心修复] 传参改为 embedding_models
+        # 馃煝 [鏍稿績淇] 浼犲弬鏀逛负 embedding_models
         self.memory_engine = MemoryEngine(context, self.gateway, embedding_models=embedding_models)
 
         self.state_engine = StateEngine(self.persistence, self.gateway, event_bus=self.event_bus)
@@ -98,7 +98,7 @@ class AstrMaiPlugin(Star):
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway, memory_engine=self.memory_engine)
         self.context_engine = ContextEngine(self.db_service, self.persona_summarizer)
         
-        # Phase 2: ReAct Agent 记忆检索器
+        # Phase 2: ReAct Agent 璁板繂妫€绱㈠櫒
         self.react_retriever = ReActRetriever(
             memory_engine=self.memory_engine,
             db_service=self.db_service,
@@ -106,23 +106,23 @@ class AstrMaiPlugin(Star):
             config=self.config
         )
         
-        # 🟢 显式传入 db_service 给 PromptRefiner，解决图片失忆症
+        # 馃煝 鏄惧紡浼犲叆 db_service 缁?PromptRefiner锛岃В鍐冲浘鐗囧け蹇嗙棁
         self.prompt_refiner = PromptRefiner(
             self.memory_engine, 
             self.db_service, 
             self.config,
-            react_retriever=self.react_retriever  # Phase 2 注入
+            react_retriever=self.react_retriever  # Phase 2 娉ㄥ叆
         ) 
         
-        # 🟢 [Sys3配置拦截] 根据配置决定是否初始化 Sys3 路由与降级版快照守护
+        # 馃煝 [Sys3閰嶇疆鎷︽埅] 鏍规嵁閰嶇疆鍐冲畾鏄惁鍒濆鍖?Sys3 璺敱涓庨檷绾х増蹇収瀹堟姢
         if getattr(self.config, 'sys3', None) and getattr(self.config.sys3, 'enable_work_mode', False):
             self.sys3_router = Sys3Router(self.config, context, self.db_service)
             self.cron_guard = CronHeartbeatGuard(self.db_service, context)
-            logger.info("[AstrMai] 🚦 Sys3 (Work 阶段) 已根据配置启用。")
+            logger.info("[AstrMai] Sys3 (Work) enabled by config.")
         else:
             self.sys3_router = None
             self.cron_guard = None
-            logger.info("[AstrMai] ⏸️ Sys3 (Work 阶段) 已关闭，运行于纯闲聊对话模式。")
+            logger.info("[AstrMai] Sys3 (Work) disabled; running in chat-only mode.")
 
         self.system2_planner = Planner(
             context, 
@@ -136,9 +136,9 @@ class AstrMaiPlugin(Star):
             sys3_router=self.sys3_router 
         )
 
-        # Phase 6.3: 发言频率控制器 (必须在 AttentionGate 之前创建)
+        # Phase 6.3: 鍙戣█棰戠巼鎺у埗鍣?(蹇呴』鍦?AttentionGate 涔嬪墠鍒涘缓)
         self.frequency_controller = FrequencyController(config=self.config)
-        # Phase 8.3: 私聊专用会话管理器
+        # Phase 8.3: 绉佽亰涓撶敤浼氳瘽绠＄悊鍣?
         self.private_chat_manager = PrivateChatManager(config=self.config)
 
         self.attention_gate = AttentionGate(
@@ -149,11 +149,11 @@ class AstrMaiPlugin(Star):
             config=self.config,                          
             persona_summarizer=self.persona_summarizer,  
             visual_cortex=self.visual_cortex,
-            frequency_controller=self.frequency_controller,  # Phase 6.3 注入
+            frequency_controller=self.frequency_controller,  # Phase 6.3 娉ㄥ叆
             private_chat_manager=self.private_chat_manager
         )
         
-        # Phase 4: 表达反思器
+        # Phase 4: 琛ㄨ揪鍙嶆€濆櫒
         self.reflector = ExpressionReflector(
             db_service=self.db_service,
             gateway=self.gateway,
@@ -166,30 +166,30 @@ class AstrMaiPlugin(Star):
             gateway=self.gateway,
             persistence=self.persistence,
             memory_engine=self.memory_engine,
-            reflector=self.reflector,  # Phase 4 注入
+            reflector=self.reflector,  # Phase 4 娉ㄥ叆
             config=self.config,
         )
-        # Phase 7: 注入 db_service（延迟到 start() 前）
+        # Phase 7: 娉ㄥ叆 db_service锛堝欢杩熷埌 start() 鍓嶏級
         self.proactive_task.set_db_service(self.db_service)
 
-        logger.info("[AstrMai] ✅ Full Dual-Process Architecture Ready (Phases 1-7 Mounted).")
+        logger.info("[AstrMai] 鉁?Full Dual-Process Architecture Ready (Phases 1-7 Mounted).")
 
     async def _update_user_stats(self, user_id: str):
         await self.state_engine.increment_user_message_count(user_id)
         
     def _fire_and_forget(self, coro):
-        """[新增] 安全触发后台任务的通用封装，防止被 GC 和吞噬异常"""
+        """Wrap background tasks so they are retained and errors are surfaced."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
 
     def _handle_task_result(self, task: asyncio.Task):
-        """[新增] 处理后台任务完成后的清理与异常捕获"""
+        """Handle background task completion and log failures."""
         self._background_tasks.discard(task)
         try:
             exc = task.exception()
             if exc:
-                logger.error(f"[AstrMai-Background] 后台任务异常: {exc}", exc_info=exc)
+                logger.error(f"[AstrMai-Background] 鍚庡彴浠诲姟寮傚父: {exc}", exc_info=exc)
         except asyncio.CancelledError:
             pass       
     
@@ -199,74 +199,76 @@ class AstrMaiPlugin(Star):
 
     @filter.on_astrbot_loaded()
     async def on_program_start(self):
-        logger.info("[AstrMai] 🏁 AstrBot Loaded. Starting System Initialization...")
-        logger.info("[AstrMai] 🧠 Initializing Memory Engine...")
+        logger.info("[AstrMai] 馃弫 AstrBot Loaded. Starting System Initialization...")
+        logger.info("[AstrMai] 馃 Initializing Memory Engine...")
         await self._init_memory()
         init_meme_storage()        
         await self.sensors._load_foreign_commands()
         await self.proactive_task.start()
         self.visual_cortex.start()
-        # 拉起内存后台代谢任务
+        # 鎷夎捣鍐呭瓨鍚庡彴浠ｈ阿浠诲姟
         self._fire_and_forget(self._memory_gc_task())
-        # 拉起数据库批量同步后台任务
+        # 鎷夎捣鏁版嵁搴撴壒閲忓悓姝ュ悗鍙颁换鍔?
         self._fire_and_forget(self._db_sync_task())
         
-        # 🟢 [Sys3配置拦截] 仅当 Sys3 启用且存在时，才启动守护进程
+        # 馃煝 [Sys3閰嶇疆鎷︽埅] 浠呭綋 Sys3 鍚敤涓斿瓨鍦ㄦ椂锛屾墠鍚姩瀹堟姢杩涚▼
         if getattr(self, 'cron_guard', None):
             await self.cron_guard.reload_all_lost_jobs()
             self._fire_and_forget(self.cron_guard.run_heartbeat())
-            logger.info("[AstrMai] ⏰ Sys3 CronHeartbeatGuard 已启动。")
+            logger.info("[AstrMai] Sys3 CronHeartbeatGuard started.")
 
     async def _db_sync_task(self):
-        """数据库微批处理后台任务，增加 CancelledError 保护防死锁"""
+        """Flush database-related background state on a fixed interval."""
         while getattr(self, '_is_running', True):
             try:
-                await asyncio.sleep(15)  # 每 15 秒同步一次
+                await asyncio.sleep(15)  # 姣?15 绉掑悓姝ヤ竴娆?
                 if hasattr(self.state_engine, 'flush_message_counters'):
                     await self.state_engine.flush_message_counters()
             except asyncio.CancelledError:
-                logger.info("[AstrMai-DB-Sync] 🛑 收到终止信号，执行最后一次事务提交释放锁...")
+                logger.info("[AstrMai-DB-Sync] 馃洃 鏀跺埌缁堟淇″彿锛屾墽琛屾渶鍚庝竴娆′簨鍔℃彁浜ら噴鏀鹃攣...")
                 if hasattr(self.state_engine, 'flush_message_counters'):
                     await self.state_engine.flush_message_counters()
                 raise
             except Exception as e:
-                logger.error(f"[AstrMai-DB-Sync] 🚨 数据库批量同步任务异常: {e}")
+                logger.error(f"[AstrMai-DB-Sync] 馃毃 鏁版嵁搴撴壒閲忓悓姝ヤ换鍔″紓甯? {e}")
 
     async def _memory_gc_task(self):
-        """[重构] 扩大 GC 范围，彻底消除 TOCTOU 竞态条件，移除已被抽离的旧 Hook 缓存逻辑"""
+        """[閲嶆瀯] 鎵╁ぇ GC 鑼冨洿锛屽交搴曟秷闄?TOCTOU 绔炴€佹潯浠讹紝绉婚櫎宸茶鎶界鐨勬棫 Hook 缂撳瓨閫昏緫"""
         while getattr(self, '_is_running', True):
             try:
-                await asyncio.sleep(3600)  # 每小时执行一次
+                await asyncio.sleep(3600)  # 姣忓皬鏃舵墽琛屼竴娆?
                 now = time.time()
                 
-                # 1. 识别并安全回收 Attention 层由于群活跃度下降遗留的僵尸池
+                # 1. 璇嗗埆骞跺畨鍏ㄥ洖鏀?Attention 灞傜敱浜庣兢娲昏穬搴︿笅闄嶉仐鐣欑殑鍍靛案姹?
                 attention_stale_count = 0
                 if hasattr(self, 'attention_gate') and hasattr(self.attention_gate, 'focus_pools'):
                     async with self.attention_gate._pool_lock:
                         for c_id, ctx in list(self.attention_gate.focus_pools.items()):
                             if now - ctx.last_active_time > 86400:
                                 async with ctx.lock:
-                                    if now - ctx.last_active_time > 86400:  # 二次校验
+                                    if now - ctx.last_active_time > 86400:  # 浜屾鏍￠獙
                                         self.attention_gate.focus_pools.pop(c_id, None)
                                         attention_stale_count += 1
                                         
-                # 2. 安全回收没有任何协程等待或持有的空闲系统锁，防止强引用导致的长期内存膨胀
+                # 2. 瀹夊叏鍥炴敹娌℃湁浠讳綍鍗忕▼绛夊緟鎴栨寔鏈夌殑绌洪棽绯荤粺閿侊紝闃叉寮哄紩鐢ㄥ鑷寸殑闀挎湡鍐呭瓨鑶ㄨ儉
                 lock_cleaned = 0
                 for l_id, lck in list(self._sys2_locks.items()):
-                    if not lck.locked(): # 如果当前锁未被任何任务获取
+                    if not lck.locked(): # 濡傛灉褰撳墠閿佹湭琚换浣曚换鍔¤幏鍙?
                         self._sys2_locks.pop(l_id, None)
                         lock_cleaned += 1
                     
                 if attention_stale_count > 0 or lock_cleaned > 0:
-                    logger.info(f"[AstrMai-GC] 🧹 成功回收 {attention_stale_count} 个注意力残留内存, 以及 {lock_cleaned} 把空闲互斥锁。")
+                    logger.info(
+                        f"[AstrMai-GC] cleaned {attention_stale_count} stale focus pools and {lock_cleaned} idle locks."
+                    )
             except asyncio.CancelledError:
-                logger.info("[AstrMai-GC] 🛑 内存 GC 任务收到终止信号，安全退出...")
+                logger.info("[AstrMai-GC] 馃洃 鍐呭瓨 GC 浠诲姟鏀跺埌缁堟淇″彿锛屽畨鍏ㄩ€€鍑?..")
                 raise
             except Exception as e:
-                logger.error(f"[AstrMai-GC] 🚨 内存 GC 任务发生异常: {e}")
+                logger.error(f"[AstrMai-GC] 馃毃 鍐呭瓨 GC 浠诲姟鍙戠敓寮傚父: {e}")
 
     def _get_sys2_lock(self, chat_id: str) -> asyncio.Lock:
-        """安全获取 System 2 会话级防并发互斥锁"""
+        """Get the per-chat System 2 lock safely."""
         lock = self._sys2_locks.get(chat_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -277,7 +279,7 @@ class AstrMaiPlugin(Star):
         chat_id = main_event.unified_msg_origin
         lock = self._get_sys2_lock(chat_id)
         
-        logger.debug(f"[{chat_id}] 🧠 System 2 请求已注册，正在排队等待进入主执行队列...")
+        logger.debug(f"[{chat_id}] 馃 System 2 璇锋眰宸叉敞鍐岋紝姝ｅ湪鎺掗槦绛夊緟杩涘叆涓绘墽琛岄槦鍒?..")
             
         async with lock:
             try:
@@ -289,23 +291,23 @@ class AstrMaiPlugin(Star):
                 await self.state_engine.consume_energy(chat_id)
                 await self.system2_planner.plan_and_execute(main_event, queue_events)
                 
-                # Phase 8.3: 私聊回话等待逻辑
+                # Phase 8.3: 绉佽亰鍥炶瘽绛夊緟閫昏緫
                 is_private = main_event.get_extra("is_private_chat", False)
                 if is_private and self.private_chat_manager:
                     sender_id = str(main_event.get_sender_id())
-                    # 进入等待状态 (释放锁前阻塞，新消息从 AttentionGate 产生打断)
+                    # 杩涘叆绛夊緟鐘舵€?(閲婃斁閿佸墠闃诲锛屾柊娑堟伅浠?AttentionGate 浜х敓鎵撴柇)
                     has_reply = await self.private_chat_manager.wait_for_new_message(sender_id)
                     if not has_reply:
-                        logger.info(f"[{chat_id}] ⏳ 私聊用户长期未回复，会话自然休眠，可触发主动破冰 (后续迭代)")
-                        # TODO: 若允许，这里可以追加 Proactive Poke 的逻辑
+                        logger.info(f"[{chat_id}] 鈴?绉佽亰鐢ㄦ埛闀挎湡鏈洖澶嶏紝浼氳瘽鑷劧浼戠湢锛屽彲瑙﹀彂涓诲姩鐮村啺 (鍚庣画杩唬)")
+                        # TODO: 鑻ュ厑璁革紝杩欓噷鍙互杩藉姞 Proactive Poke 鐨勯€昏緫
             finally:
-                logger.debug(f"[AstrMai] 🛡️ System2 任务链执行完毕，安全退出规划层。")
+                logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")
 
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
-        '''AstrMai 状态面板'''
+        """Show AstrMai status and help information."""
         
-        # 🟢 [核心修复] 将单体模型显示更新为模型池长度/首选模型显示
+        # 馃煝 [鏍稿績淇] 灏嗗崟浣撴ā鍨嬫樉绀烘洿鏂颁负妯″瀷姹犻暱搴?棣栭€夋ā鍨嬫樉绀?
         task_models = getattr(self.config.provider, 'task_models', [])
         agent_models = getattr(self.config.provider, 'agent_models', [])
         embedding_models = getattr(self.config.provider, 'embedding_models', [])
@@ -317,34 +319,34 @@ class AstrMaiPlugin(Star):
         fallback_str = f"({len(fallback_models)} models standby)" if fallback_models else "(No fallback)"
         
         help_text = (
-            "🤖 **AstrMai (v1.0.0)**\n"
+            "馃 **AstrMai (v1.0.0)**\n"
             "-----------------------\n"
-            "🧠 架构状态: Phase 6 (Lifecycle Active)\n"
-            f"🔌 Task Pool: {task_str}\n"
-            f"🔌 Agent Pool: {agent_str}\n"
-            f"🔌 Emb Pool: {emb_str}\n"
-            f"🛟 Fallback: {fallback_str}\n"
-            "💾 SQLite & Faiss RAG: Connected\n"
-            "🌀 Subconscious Miner: Running\n"
-            "🌱 Proactive Life: Running"
+            "馃 鏋舵瀯鐘舵€? Phase 6 (Lifecycle Active)\n"
+            f"馃攲 Task Pool: {task_str}\n"
+            f"馃攲 Agent Pool: {agent_str}\n"
+            f"馃攲 Emb Pool: {emb_str}\n"
+            f"馃洘 Fallback: {fallback_str}\n"
+            "馃捑 SQLite & Faiss RAG: Connected\n"
+            "馃寑 Subconscious Miner: Running\n"
+            "馃尡 Proactive Life: Running"
         )
         yield event.plain_result(help_text)
 
     # ==========================================
-    # 📡 核心事件流处理 (Event Routing)
+    # 馃摗 鏍稿績浜嬩欢娴佸鐞?(Event Routing)
     # ==========================================
 
     def _is_framework_command(self, msg: str) -> bool:
-        """实时探测并解析当前消息是否命中 AstrBot 底层注册的指令。"""
+        """Detect whether the incoming text is an AstrBot framework command."""
         if not msg:
             return False
             
-        # 1. 清洗零宽字符
+        # 1. 娓呮礂闆跺瀛楃
         clean_text = msg.replace('\u200b', '').strip()
         if not clean_text:
             return False
             
-        # 2. 剥离可能的前缀 (支持自定义前缀与默认斜杠，且免疫 "/ 指令" 的空格干扰)
+        # 2. 鍓ョ鍙兘鐨勫墠缂€ (鏀寔鑷畾涔夊墠缂€涓庨粯璁ゆ枩鏉狅紝涓斿厤鐤?"/ 鎸囦护" 鐨勭┖鏍煎共鎵?
         prefixes = getattr(self.config.global_settings, 'command_prefixes', [])
         if not prefixes:
             prefixes = ["/"]
@@ -360,15 +362,15 @@ class AstrMaiPlugin(Star):
         if not clean_text:
             return False
             
-        # 3. 获取真正的首词
+        # 3. 鑾峰彇鐪熸鐨勯璇?
         clean_cmd = clean_text.split()[0].lower()
         
-        # 4. 构建实时指令池
+        # 4. 鏋勫缓瀹炴椂鎸囦护姹?
         registered_cmds = {"help", "plugin", "restart", "reload", "stop", "start", "list", "provider"}
         
         try:
             from astrbot.core.star.command_management import _collect_descriptors
-            # 实时从热加载的 Handler 注册表中抓取全部描述符
+            # 瀹炴椂浠庣儹鍔犺浇鐨?Handler 娉ㄥ唽琛ㄤ腑鎶撳彇鍏ㄩ儴鎻忚堪绗?
             descriptors = _collect_descriptors(include_sub_commands=True)
             
             for desc in descriptors:
@@ -381,7 +383,7 @@ class AstrMaiPlugin(Star):
                         
         except Exception as e:
             from astrbot.api import logger
-            logger.debug(f"[AstrMai-Filter] 内存态穿透失败，尝试降级: {e}")
+            logger.debug(f"[AstrMai-Filter] 鍐呭瓨鎬佺┛閫忓け璐ワ紝灏濊瘯闄嶇骇: {e}")
             try:
                 cmd_mgr = getattr(self.context, 'command_manager', None)
                 if cmd_mgr and hasattr(cmd_mgr, 'commands'):
@@ -389,7 +391,7 @@ class AstrMaiPlugin(Star):
             except Exception:
                 pass
 
-        # 5. 融合 config 中用户手动配置的额外指令兜底黑名单
+        # 5. 铻嶅悎 config 涓敤鎴锋墜鍔ㄩ厤缃殑棰濆鎸囦护鍏滃簳榛戝悕鍗?
         try:
             extra_cmds = getattr(self.config.system1, 'extra_command_list', [])
             if extra_cmds:
@@ -397,18 +399,18 @@ class AstrMaiPlugin(Star):
         except Exception:
             pass
             
-        # 6. 判决
+        # 6. 鍒ゅ喅
         return clean_cmd in registered_cmds
 
     @filter.on_decorating_result()
     async def sniff_external_plugin_results(self, event: AstrMessageEvent):
         """
-        [新增] 旁路嗅探器：截获其他插件即将下发的消息，并将其注入 Sys1 的注意力窗口和 Evolution 进化数据库。
+        [鏂板] 鏃佽矾鍡呮帰鍣細鎴幏鍏朵粬鎻掍欢鍗冲皢涓嬪彂鐨勬秷鎭紝骞跺皢鍏舵敞鍏?Sys1 鐨勬敞鎰忓姏绐楀彛鍜?Evolution 杩涘寲鏁版嵁搴撱€?
         """
         import time
         import astrbot.api.message_components as Comp
 
-        # 前置防御：排除自身发送的消息
+        # 鍓嶇疆闃插尽锛氭帓闄よ嚜韬彂閫佺殑娑堟伅
         if event.get_extra("astrmai_is_self_reply", False):
             return
 
@@ -416,20 +418,20 @@ class AstrMaiPlugin(Star):
         if not result or not result.chain:
             return
 
-        # 提取出其他插件准备发送的纯文本或图片标识
+        # 鎻愬彇鍑哄叾浠栨彃浠跺噯澶囧彂閫佺殑绾枃鏈垨鍥剧墖鏍囪瘑
         reply_text = ""
         for comp in result.chain:
             if isinstance(comp, Comp.Plain):
                 reply_text += comp.text
             elif isinstance(comp, Comp.Image):
-                reply_text += "[图片]"
+                reply_text += "[鍥剧墖]"
 
         if not reply_text:
             return
 
         chat_id = event.unified_msg_origin
         
-        # 安全获取 bot_id
+        # 瀹夊叏鑾峰彇 bot_id
         bot_id = ""
         if hasattr(event, 'get_self_id'):
             try:
@@ -439,24 +441,24 @@ class AstrMaiPlugin(Star):
         if not bot_id:
             bot_id = getattr(event.message_obj, 'self_id', 'SELF_BOT') if hasattr(event, 'message_obj') and event.message_obj else 'SELF_BOT'
 
-        # 构造注入对象
+        # 鏋勯€犳敞鍏ュ璞?
         bot_reply_event = {
             "is_external_bot_reply": True,
             "content": reply_text,
             "timestamp": time.time()
         }
 
-        # 强行塞入滑动窗口
+        # 寮鸿濉炲叆婊戝姩绐楀彛
         if hasattr(self, 'attention_gate') and hasattr(self.attention_gate, 'inject_external_event'):
             await self.attention_gate.inject_external_event(chat_id, bot_reply_event)
 
-        # 写入进化层
+        # 鍐欏叆杩涘寲灞?
         if hasattr(self, 'evolution'):
-            await self.evolution.process_bot_reply(chat_id, bot_id, f"(内置插件执行结果): {reply_text}")
+            await self.evolution.process_bot_reply(chat_id, bot_id, f"(鍐呯疆鎻掍欢鎵ц缁撴灉): {reply_text}")
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_global_message(self, event: AstrMessageEvent):
-        """[入口] 接管所有平台消息，将数据泵入双系统架构与进化层。"""
+        """Main event entry for all inbound platform messages."""
         import sys
         import time
         import threading
@@ -482,7 +484,7 @@ class AstrMaiPlugin(Star):
                 sys._astrmai_global_debounce_cache.pop(k, None)
                 
             if fingerprint in sys._astrmai_global_debounce_cache:
-                logger.warning(f"[AstrMai-Sensor] 🛡️ 极速防抖生效！拦截 AstrBot 框架双发/分身消息: {msg_str[:15]}")
+                logger.warning(f"[AstrMai-Sensor] 馃洝锔?鏋侀€熼槻鎶栫敓鏁堬紒鎷︽埅 AstrBot 妗嗘灦鍙屽彂/鍒嗚韩娑堟伅: {msg_str[:15]}")
                 return 
                 
             sys._astrmai_global_debounce_cache[fingerprint] = now
@@ -496,12 +498,12 @@ class AstrMaiPlugin(Star):
 
         msg = event.message_str.strip() if event.message_str else ""
         
-        # 无状态指令感知放行系统
+        # 鏃犵姸鎬佹寚浠ゆ劅鐭ユ斁琛岀郴缁?
         if msg and self._is_framework_command(msg):
             return
 
         # ==========================================
-        # [修改] 统一 ID 解析器与三级权限路由
+        # [淇敼] 缁熶竴 ID 瑙ｆ瀽鍣ㄤ笌涓夌骇鏉冮檺璺敱
         # ==========================================
         umo = str(event.unified_msg_origin)
         parts = umo.split(":")
@@ -514,18 +516,18 @@ class AstrMaiPlugin(Star):
         
         is_admin = entity_id in admin_ids or sender_id in admin_ids
         
-        # 1. 绝对白名单放行 (最高优先级)：管理员自带绝对白名单
+        # 1. 缁濆鐧藉悕鍗曟斁琛?(鏈€楂樹紭鍏堢骇)锛氱鐞嗗憳鑷甫缁濆鐧藉悕鍗?
         is_whitelisted = (umo in whitelist_ids) or (entity_id in whitelist_ids) or is_admin
 
         if not is_whitelisted:
-            # 2. 次高优先级：群聊常规判断
+            # 2. 娆￠珮浼樺厛绾э細缇よ亰甯歌鍒ゆ柇
             if platform_type == "GroupMessage":
                 if whitelist_ids:
-                    return # 白名单不为空且未命中，拦截群聊
-            # 3. 第三优先级：私聊全局开关
+                    return # 鐧藉悕鍗曚笉涓虹┖涓旀湭鍛戒腑锛屾嫤鎴兢鑱?
+            # 3. 绗笁浼樺厛绾э細绉佽亰鍏ㄥ眬寮€鍏?
             elif platform_type == "FriendMessage":
                 if not enable_private_chat and not is_admin:
-                    return # 未命中白名单且私聊总开关关闭，且不是管理员，拦截私聊
+                    return # 鏈懡涓櫧鍚嶅崟涓旂鑱婃€诲紑鍏冲叧闂紝涓斾笉鏄鐞嗗憳锛屾嫤鎴鑱?
 
         self_id = None
         if hasattr(event.message_obj, 'self_id'):
@@ -541,7 +543,7 @@ class AstrMaiPlugin(Star):
         sender_name = event.get_sender_name()
         
         if self.config.global_settings.debug_mode:
-            logger.info(f"[AstrMai-Sensor] 📡 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
+            logger.info(f"[AstrMai-Sensor] 馃摗 鏀跺埌娑堟伅 | 鍙戦€佽€? {sender_name} | 鍐呭: {msg_str[:20]}...")
         
         user_id = event.get_sender_id()
         if user_id:
@@ -549,19 +551,19 @@ class AstrMaiPlugin(Star):
             
         await self.evolution.record_user_message(event)
         
-        # 执行门控逻辑
+        # 鎵ц闂ㄦ帶閫昏緫
         status = await self.attention_gate.process_event(event)
         
         # ==========================================
-        # 🟢 [架构级修复] 精准事件阻断逻辑 (解决双重回复且不饿死其他插件)
+        # 馃煝 [鏋舵瀯绾т慨澶峕 绮惧噯浜嬩欢闃绘柇閫昏緫 (瑙ｅ喅鍙岄噸鍥炲涓斾笉楗挎鍏朵粬鎻掍欢)
         # ==========================================
         is_direct_call = False
         
-        # 1. 判定是否为私聊 (私聊必定是直接呼叫)
+        # 1. 鍒ゅ畾鏄惁涓虹鑱?(绉佽亰蹇呭畾鏄洿鎺ュ懠鍙?
         if not event.get_group_id():
             is_direct_call = True
         else:
-            # 2. 判定群聊中是否明确 @ 了机器人
+            # 2. 鍒ゅ畾缇よ亰涓槸鍚︽槑纭?@ 浜嗘満鍣ㄤ汉
             bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else ""
             if event.message_obj and event.message_obj.message:
                 for c in event.message_obj.message:
@@ -569,15 +571,15 @@ class AstrMaiPlugin(Star):
                         is_direct_call = True
                         break
 
-        # 逻辑判决：
-        # - 剥离暴力截断 event.stop_event()，保护事件监听链不被切断。
-        # - 如果 status == "ENGAGED" (被判定为极速响应)，必然阻断原生 LLM。
-        # - 如果 is_direct_call == True (私聊或明确@)，无论 AstrMai 是在开窗口缓冲还是决定忽略，
-        #   都已经由 AstrMai 全权接管了对话意志，必须抛出幽灵占位符欺骗底层默认 LLM，让其休眠！
+        # 閫昏緫鍒ゅ喅锛?
+        # - 鍓ョ鏆村姏鎴柇 event.stop_event()锛屼繚鎶や簨浠剁洃鍚摼涓嶈鍒囨柇銆?
+        # - 濡傛灉 status == "ENGAGED" (琚垽瀹氫负鏋侀€熷搷搴?锛屽繀鐒堕樆鏂師鐢?LLM銆?
+        # - 濡傛灉 is_direct_call == True (绉佽亰鎴栨槑纭瓳)锛屾棤璁?AstrMai 鏄湪寮€绐楀彛缂撳啿杩樻槸鍐冲畾蹇界暐锛?
+        #   閮藉凡缁忕敱 AstrMai 鍏ㄦ潈鎺ョ浜嗗璇濇剰蹇楋紝蹇呴』鎶涘嚭骞界伒鍗犱綅绗︽楠楀簳灞傞粯璁?LLM锛岃鍏朵紤鐪狅紒
         if status == "ENGAGED" or is_direct_call:
             
-            # 🌟 [核心修复] 投递 call_llm 诱饵，语义级欺骗底层 ProcessStage 的兜底判定
-            # 此操作无损放行下游指令/功能插件，但会直接阻断底层 AstrMainAgent 的双重回复
+            # 馃専 [鏍稿績淇] 鎶曢€?call_llm 璇遍サ锛岃涔夌骇娆洪獥搴曞眰 ProcessStage 鐨勫厹搴曞垽瀹?
+            # 姝ゆ搷浣滄棤鎹熸斁琛屼笅娓告寚浠?鍔熻兘鎻掍欢锛屼絾浼氱洿鎺ラ樆鏂簳灞?AstrMainAgent 鐨勫弻閲嶅洖澶?
             event.call_llm = True 
             
             yield event.plain_result("[ASTRMAI_GHOST_LOCK]")
@@ -585,7 +587,7 @@ class AstrMaiPlugin(Star):
     @filter.on_decorating_result(priority=90)
     async def intercept_and_notify_errors(self, event: AstrMessageEvent):
         """
-        [修改] 全局拦截器：1. 静默销毁幽灵占位符 2. 拦截 API 错误并私发给管理员
+        [淇敼] 鍏ㄥ眬鎷︽埅鍣細1. 闈欓粯閿€姣佸菇鐏靛崰浣嶇 2. 鎷︽埅 API 閿欒骞剁鍙戠粰绠＄悊鍛?
         """
         result = event.get_result()
         if not result:
@@ -608,46 +610,46 @@ class AstrMaiPlugin(Star):
                 message_str = reply_text
             except Exception as e:
                 from astrbot.api import logger
-                logger.warning(f"解析回复链失败: {e}")
+                logger.warning(f"瑙ｆ瀽鍥炲閾惧け璐? {e}")
                 return
                 
         if not message_str:
             return
 
         # ==========================================
-        # 🟢 [架构级修复] 静默销毁幽灵占位符 (优先拦截)
+        # 馃煝 [鏋舵瀯绾т慨澶峕 闈欓粯閿€姣佸菇鐏靛崰浣嶇 (浼樺厛鎷︽埅)
         # ==========================================
         if "[ASTRMAI_GHOST_LOCK]" in message_str:
             from astrbot.api import logger
-            logger.debug("[AstrMai-Phantom] 👻 捕获到幽灵占位符，已静默销毁，成功欺骗底层框架。")
-            event.set_result(None)  # 清空内容，确保不发送给用户
-            return  # 立即放行结束，防止触发下面的报错告警
+            logger.debug("[AstrMai-Phantom] ghost placeholder intercepted and dropped silently.")
+            event.set_result(None)  # 娓呯┖鍐呭锛岀‘淇濅笉鍙戦€佺粰鐢ㄦ埛
+            return  # 绔嬪嵆鏀捐缁撴潫锛岄槻姝㈣Е鍙戜笅闈㈢殑鎶ラ敊鍛婅
 
         # ==========================================
-        # 检查是否开启了错误拦截 (原逻辑)
+        # 妫€鏌ユ槸鍚﹀紑鍚簡閿欒鎷︽埅 (鍘熼€昏緫)
         # ==========================================
         if not getattr(self.config.global_settings, 'enable_error_interception', True):
             return
             
-        # 定义错误特征库
-        error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '描述失败', '获取模型列表失败', 'api error', 'all chat models failed', 'connection error', 'notfounderror']
+        # 瀹氫箟閿欒鐗瑰緛搴?
+        error_keywords = ['璇锋眰澶辫触', '閿欒绫诲瀷', '閿欒淇℃伅', '璋冪敤澶辫触', '澶勭悊澶辫触', '鎻忚堪澶辫触', '鑾峰彇妯″瀷鍒楄〃澶辫触', 'api error', 'all chat models failed', 'connection error', 'notfounderror']
         
         if any(keyword in message_str.lower() for keyword in error_keywords):
             from astrbot.api import logger
-            logger.warning(f"[AstrMai-ErrorGuard] 拦截到系统报错，阻止下发: {message_str[:50]}...")
+            logger.warning(f"[AstrMai-ErrorGuard] 鎷︽埅鍒扮郴缁熸姤閿欙紝闃绘涓嬪彂: {message_str[:50]}...")
             
-            # 1. 彻底拦截消息
+            # 1. 褰诲簳鎷︽埅娑堟伅
             event.set_result(None)
             event.stop_event()
             
-            # 2. 组装告警信息
+            # 2. 缁勮鍛婅淇℃伅
             chat_id = event.get_group_id() or event.get_sender_id()
-            chat_type = "群聊" if event.get_group_id() else "私聊"
-            user_name = event.get_sender_name() or "未知用户"
+            chat_type = "缇よ亰" if event.get_group_id() else "绉佽亰"
+            user_name = event.get_sender_name() or "鏈煡鐢ㄦ埛"
             
-            alert_msg = f"⚠️ [AstrMai 错误告警]\n位置: {chat_type}({chat_id})\n触发者: {user_name}\n详情: {message_str}"
+            alert_msg = f"鈿狅笍 [AstrMai 閿欒鍛婅]\n浣嶇疆: {chat_type}({chat_id})\n瑙﹀彂鑰? {user_name}\n璇︽儏: {message_str}"
             
-            # 3. 靶向投递给管理员
+            # 3. 闈跺悜鎶曢€掔粰绠＄悊鍛?
             admin_ids = getattr(self.config.global_settings, 'admin_ids', [])
             client = getattr(event, 'bot', None)
             
@@ -657,71 +659,71 @@ class AstrMaiPlugin(Star):
                         try:
                             await client.api.call_action('send_private_msg', user_id=int(admin_id), message=alert_msg)
                         except Exception as e:
-                            logger.error(f"[AstrMai-ErrorGuard] 无法向管理员 {admin_id} 推送告警: {e}")
+                            logger.error(f"[AstrMai-ErrorGuard] 鏃犳硶鍚戠鐞嗗憳 {admin_id} 鎺ㄩ€佸憡璀? {e}")
     
     @filter.command("work")
     async def enter_sys3_direct(self, event: AstrMessageEvent):
-        """直通 Sys3: 跳过闲聊意图识别，以完整工具集纯任务模式执行"""
+        """Enter Sys3 direct task mode and execute with the full toolset."""
         
-        # 🟢 [Sys3配置拦截] 若未开启任务模式，拦截指令并进行提示
+        # 馃煝 [Sys3閰嶇疆鎷︽埅] 鑻ユ湭寮€鍚换鍔℃ā寮忥紝鎷︽埅鎸囦护骞惰繘琛屾彁绀?
         if not getattr(self.config, 'sys3', None) or not getattr(self.config.sys3, 'enable_work_mode', False):
-            yield event.plain_result("❌ Sys3 任务工作模式已关闭，请在 WebUI 配置中启用后重试。")
+            yield event.plain_result("Sys3 work mode is disabled. Please enable it in WebUI first.")
             return
             
         task_query = event.message_str.replace("/work", "").strip()
         if not task_query:
             yield event.plain_result(
-                "❓ 请告诉我需要执行什么任务。\n"
-                "示例：`/work 帮我定一个明天早8点的开会提醒`"
+                "鉂?璇峰憡璇夋垜闇€瑕佹墽琛屼粈涔堜换鍔°€俓n"
+                "绀轰緥锛歚/work 甯垜瀹氫竴涓槑澶╂棭8鐐圭殑寮€浼氭彁閱抈"
             )
             return
         
         umo = event.unified_msg_origin
         chat_id = umo
         
-        # 获取 Provider ID
+        # 鑾峰彇 Provider ID
         models = self.gateway.get_agent_models()
         if not models or models[0] == 'Unconfigured':
-            yield event.plain_result("❌ Agent 模型未配置，无法执行任务。")
+            yield event.plain_result("Agent model is not configured, so the task cannot run.")
             return
-        provider_id = models[0] 
-        
         full_tools = await self.sys3_router.get_full_tools_for_direct_entry()
         
-        # 免疫标记与底层框架兜底幽灵锁
+        # 鍏嶇柅鏍囪涓庡簳灞傛鏋跺厹搴曞菇鐏甸攣
         event.set_extra("astrmai_is_self_reply", True)  
         event.call_llm = True  
         
         from astrbot.api import logger
-        logger.info(f"[{chat_id}] 🔧 [/work 直通] 进入 Sys3 纯任务模式：{task_query[:50]}...")
+        logger.info(f"[{chat_id}] 馃敡 [/work 鐩撮€歖 杩涘叆 Sys3 绾换鍔℃ā寮忥細{task_query[:50]}...")
         
         try:
-            llm_resp = await self.context.tool_loop_agent(
+            reply = await self.gateway.tool_chat_in_lane(
+                lane_key=LaneKey(subsystem="sys3", task_family="direct", scope_id=chat_id),
+                base_origin=chat_id,
                 event=event,
-                chat_provider_id=provider_id,
                 prompt=task_query,
                 system_prompt=(
-                    "你是一名专业的任务执行者，技术精湛、执行高效。\n"
-                    "收到任务后，立即调用最合适的工具执行，无需过多解释流程。\n"
-                    "任务完成后，用简洁清晰的语言汇报结果。"
+                    "You are a task execution specialist with strong tool-using ability.\n"
+                    "When a task arrives, call the most suitable tools directly and avoid unnecessary narration.\n"
+                    "After the task is complete, report the result clearly and concisely."
                 ),
                 tools=full_tools,
+                models=models,
                 max_steps=30,
-                tool_call_timeout=120
+                timeout=120,
+                persona_id=getattr(self.config.persona, "persona_id", "") or "astrmai",
             )
             
-            reply = getattr(llm_resp, 'completion_text', None) or "任务执行完毕，但无文字输出。"
             await self.reply_engine.handle_reply(event, reply, chat_id)
             
         except Exception as e:
-            logger.error(f"[{chat_id}] /work 直通 Sys3 异常: {e}")
+            logger.error(f"[{chat_id}] /work 鐩撮€?Sys3 寮傚父: {e}")
             await self.reply_engine.handle_reply(
-                event, f"任务执行中发生错误：{str(e)[:100]}", chat_id
+                event, f"浠诲姟鎵ц涓彂鐢熼敊璇細{str(e)[:100]}", chat_id
             )
 
     async def terminate(self):
-        """优雅停机协调器 (Graceful Shutdown)"""
-        logger.info("[AstrMai] 🛑 Terminating processes and unmounting...")
+        """浼橀泤鍋滄満鍗忚皟鍣?(Graceful Shutdown)"""
+        logger.info("[AstrMai] 馃洃 Terminating processes and unmounting...")
         self._is_running = False 
         
         if hasattr(self, 'memory_engine') and self.memory_engine.summarizer:
@@ -730,7 +732,7 @@ class AstrMaiPlugin(Star):
         if hasattr(self, 'proactive_task'):
             await self.proactive_task.stop()
 
-        # 🟢 [Sys3配置拦截] 仅当 Sys3 启用且存在时，才停止守护进程
+        # 馃煝 [Sys3閰嶇疆鎷︽埅] 浠呭綋 Sys3 鍚敤涓斿瓨鍦ㄦ椂锛屾墠鍋滄瀹堟姢杩涚▼
         if getattr(self, 'cron_guard', None):
             self.cron_guard.stop()
 
@@ -751,14 +753,14 @@ class AstrMaiPlugin(Star):
             self.visual_cortex.stop()             
         
         if tasks_to_wait:
-            logger.info(f"[AstrMai] ⏳ 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
-            # 广播取消信号，激活 CancelledError 捕获快照
+            logger.info(f"[AstrMai] 鈴?姝ｅ湪绛夊緟 {len(tasks_to_wait)} 涓悗鍙板崗绋嬪畨鍏ㄧ粨鏉?..")
+            # 骞挎挱鍙栨秷淇″彿锛屾縺娲?CancelledError 鎹曡幏蹇収
             for task in tasks_to_wait:
                 if not task.done():
                     task.cancel()
             
             done, pending = await asyncio.wait(tasks_to_wait, timeout=3.0)
             if pending:
-                logger.warning(f"[AstrMai] ⚠️ 仍有 {len(pending)} 个任务未能优雅退出，已强行终止。")
+                logger.warning(f"[AstrMai] {len(pending)} background tasks did not exit gracefully before timeout.")
             else:
-                logger.info("[AstrMai] ✅ 所有后台任务已安全清理完毕，防死锁保护生效。")
+                logger.info("[AstrMai] all background tasks were cleaned up safely.")

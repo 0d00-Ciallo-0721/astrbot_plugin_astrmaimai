@@ -49,6 +49,7 @@ class LaneManager:
         ("sys2", "expression"): LanePolicy(store_mode="structured", max_raw_turns=4),
         ("sys2", "persona"): LanePolicy(store_mode="structured", max_raw_turns=4),
         ("sys2", "retrieval"): LanePolicy(store_mode="structured", max_raw_turns=4),
+        ("sys3", "direct"): LanePolicy(store_mode="full", max_raw_turns=8),
         ("bg", "memory"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
         ("bg", "dream"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
         ("bg", "reflect"): LanePolicy(store_mode="summary_only", max_raw_turns=3),

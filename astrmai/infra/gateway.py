@@ -1,6 +1,7 @@
 import json
 import re
 import asyncio
+from typing import Callable
 from typing import Dict, Any, List, Union, Optional
 from astrbot.api import logger
 from astrbot.api.star import Context
@@ -94,7 +95,7 @@ class GlobalModelGateway:
 
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
 # [修改] 位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
-    async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True, contexts: Optional[List[Any]] = None, debug_meta: Optional[Dict[str, Any]] = None, request_kwargs: Optional[Dict[str, Any]] = None) -> Union[str, Dict[str, Any]]:
+    async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True, contexts: Optional[List[Any]] = None, debug_meta: Optional[Dict[str, Any]] = None, request_kwargs: Optional[Dict[str, Any]] = None, request_kwargs_factory: Optional[Callable[[str], Dict[str, Any]]] = None) -> Union[str, Dict[str, Any]]:
         """统一网关底层调用引擎 (ModelRouter 智能调度 + 全局信号量限流 + 超时熔断)"""
         
         # 全局速率门控
@@ -128,6 +129,9 @@ class GlobalModelGateway:
                         processed_image_urls = image_urls if image_urls else []
                         request_contexts = list(contexts or [])
                         llm_kwargs = dict(request_kwargs or {})
+                        if request_kwargs_factory:
+                            dynamic_kwargs = request_kwargs_factory(model_id) or {}
+                            llm_kwargs.update(dynamic_kwargs)
                         
                         if system_prompt:
                             llm_kwargs["system_prompt"] = system_prompt
@@ -167,7 +171,9 @@ class GlobalModelGateway:
                         # ✅ 调用成功 → 上报健康
                         self.router.report_success(report_pool, model_id)
                         usage = self._extract_usage(resp)
-                        self._log_usage(report_pool, model_id, usage, debug_meta)
+                        log_meta = dict(debug_meta or {})
+                        log_meta["provider"] = infer_provider_capabilities(model_id).provider_family
+                        self._log_usage(report_pool, model_id, usage, log_meta)
 
                         if not is_json:
                             return content.strip() 
@@ -306,7 +312,6 @@ class GlobalModelGateway:
 
         primary_models = self.router.get_ranked_models(lane_key.task_family, models)
         model_hint = primary_models[0] if primary_models else ""
-        capabilities = infer_provider_capabilities(model_hint)
         lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
             lane_key=lane_key,
             base_origin=base_origin,
@@ -318,13 +323,19 @@ class GlobalModelGateway:
             "lane_key": lane_key.as_log_key(),
             "conversation_id": conversation_id,
             "prefix_hash": prefix_hash,
-            "provider": capabilities.provider_family,
         }
-        request_kwargs: Dict[str, Any] = {}
-        if capabilities.supports_remote_session:
-            request_kwargs["session_id"] = self.lane_manager.get_remote_session_id(lane_umo, capabilities.provider_family)
-        if capabilities.supports_cache_control:
-            request_kwargs["cache_control"] = {"type": "ephemeral"}
+        def _lane_request_kwargs(actual_model: str) -> Dict[str, Any]:
+            capabilities = infer_provider_capabilities(actual_model)
+            kwargs: Dict[str, Any] = {}
+            if capabilities.supports_remote_session:
+                kwargs["session_id"] = self.lane_manager.get_remote_session_id(
+                    lane_umo,
+                    capabilities.provider_family,
+                )
+            if capabilities.supports_cache_control:
+                kwargs["cache_control"] = {"type": "ephemeral"}
+            return kwargs
+
         result = await self._elastic_call(
             pool_name=lane_key.task_family,
             prompt=prompt,
@@ -336,7 +347,7 @@ class GlobalModelGateway:
             use_fallback=use_fallback,
             contexts=history,
             debug_meta=debug_meta,
-            request_kwargs=request_kwargs,
+            request_kwargs_factory=_lane_request_kwargs,
         )
         assistant_content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         await self.lane_manager.append_exchange(

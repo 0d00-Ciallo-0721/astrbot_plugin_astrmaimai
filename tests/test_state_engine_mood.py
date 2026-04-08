@@ -73,9 +73,10 @@ class StateEngineMoodTests(unittest.TestCase):
         async def _get_state(chat_id):
             return SimpleNamespace(mood=0.2)
 
-        async def _analyze_mood(text, current_mood, user_affection=0.0):
+        async def _analyze_mood(text, current_mood, user_affection=0.0, chat_id=None):
             observed["text"] = text
             observed["current_mood"] = current_mood
+            observed["chat_id"] = chat_id
             return "happy", 0.6
 
         async def _atomic_update(chat_id, delta=0.0):
@@ -91,8 +92,39 @@ class StateEngineMoodTests(unittest.TestCase):
         self.assertEqual(tag, "happy")
         self.assertEqual(final_mood, 0.6)
         self.assertEqual(observed["text"], "hello")
+        self.assertEqual(observed["chat_id"], "chat-1")
         self.assertAlmostEqual(observed["current_mood"], 0.2)
         self.assertAlmostEqual(observed["delta"], 0.4)
+
+    def test_update_mood_falls_back_for_legacy_mood_manager_signature(self):
+        gateway = SimpleNamespace(config=SimpleNamespace(reply=SimpleNamespace(emotion_mapping=[])))
+        engine = self.state_mod.StateEngine(SimpleNamespace(), gateway)
+
+        observed = {}
+
+        async def _get_state(chat_id):
+            return SimpleNamespace(mood=-0.1)
+
+        async def _legacy_analyze_mood(text, current_mood, user_affection=0.0):
+            observed["text"] = text
+            observed["current_mood"] = current_mood
+            return "neutral", 0.0
+
+        async def _atomic_update(chat_id, delta=0.0):
+            observed["delta"] = delta
+            return -0.1 + delta
+
+        engine.get_state = _get_state
+        engine.mood_manager.analyze_mood = _legacy_analyze_mood
+        engine.atomic_update_mood = _atomic_update
+
+        tag, final_mood = asyncio.run(engine.update_mood("chat-legacy", "legacy hello"))
+
+        self.assertEqual(tag, "neutral")
+        self.assertEqual(final_mood, 0.0)
+        self.assertEqual(observed["text"], "legacy hello")
+        self.assertAlmostEqual(observed["current_mood"], -0.1)
+        self.assertAlmostEqual(observed["delta"], 0.1)
 
 
 if __name__ == "__main__":
