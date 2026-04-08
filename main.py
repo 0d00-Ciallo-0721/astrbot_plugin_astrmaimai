@@ -44,6 +44,7 @@ from .astrmai.Heart.judge import Judge
 from .astrmai.Heart.sensors import PreFilters
 from .astrmai.Heart.attention import AttentionGate
 from .astrmai.Heart.visual_cortex import VisualCortex 
+from .astrmai.Heart.group_reply_wait_manager import GroupReplyWaitManager
 
 # --- Phase 7: System 3 (Task) ---
 from .astrmai.work.router import Sys3Router
@@ -140,6 +141,7 @@ class AstrMaiPlugin(Star):
         self.frequency_controller = FrequencyController(config=self.config)
         # Phase 8.3: 绉佽亰涓撶敤浼氳瘽绠＄悊鍣?
         self.private_chat_manager = PrivateChatManager(config=self.config)
+        self.group_reply_wait_manager = GroupReplyWaitManager()
 
         self.attention_gate = AttentionGate(
             state_engine=self.state_engine,
@@ -288,18 +290,25 @@ class AstrMaiPlugin(Star):
                 else:
                     queue_events = [main_event]
                 
+                main_event.set_extra("astrmai_reply_sent", False)
+                main_event.set_extra("astrmai_wait_targets", [])
+                main_event.set_extra("astrmai_wait_target_name", "")
+
                 await self.state_engine.consume_energy(chat_id)
                 await self.system2_planner.plan_and_execute(main_event, queue_events)
+                reply_sent = bool(main_event.get_extra("astrmai_reply_sent", False))
                 
                 # Phase 8.3: 绉佽亰鍥炶瘽绛夊緟閫昏緫
                 is_private = main_event.get_extra("is_private_chat", False)
-                if is_private and self.private_chat_manager:
+                if reply_sent and is_private and self.private_chat_manager:
                     sender_id = str(main_event.get_sender_id())
                     # 杩涘叆绛夊緟鐘舵€?(閲婃斁閿佸墠闃诲锛屾柊娑堟伅浠?AttentionGate 浜х敓鎵撴柇)
                     has_reply = await self.private_chat_manager.wait_for_new_message(sender_id)
                     if not has_reply:
                         logger.info(f"[{chat_id}] 鈴?绉佽亰鐢ㄦ埛闀挎湡鏈洖澶嶏紝浼氳瘽鑷劧浼戠湢锛屽彲瑙﹀彂涓诲姩鐮村啺 (鍚庣画杩唬)")
                         # TODO: 鑻ュ厑璁革紝杩欓噷鍙互杩藉姞 Proactive Poke 鐨勯€昏緫
+                elif reply_sent and main_event.get_group_id() and self.group_reply_wait_manager:
+                    self.group_reply_wait_manager.register_from_reply_event(main_event)
             finally:
                 logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")
 
@@ -540,6 +549,10 @@ class AstrMaiPlugin(Star):
         if str(event.get_sender_id()) == self_id:
             return
 
+        group_wait_result = "NONE"
+        if event.get_group_id() and self.group_reply_wait_manager:
+            group_wait_result = self.group_reply_wait_manager.handle_incoming_message(event)
+
         sender_name = event.get_sender_name()
         
         if self.config.global_settings.debug_mode:
@@ -570,6 +583,17 @@ class AstrMaiPlugin(Star):
                     if isinstance(c, Comp.At) and str(c.qq) == bot_id:
                         is_direct_call = True
                         break
+
+        if (
+            event.get_group_id()
+            and self.group_reply_wait_manager
+            and group_wait_result != "RESUME"
+            and status in {"ENGAGED", "BUFFERED"}
+        ):
+            self.group_reply_wait_manager.cancel_wait(
+                event.unified_msg_origin,
+                reason=f"interrupted_by_{status.lower()}",
+            )
 
         # 閫昏緫鍒ゅ喅锛?
         # - 鍓ョ鏆村姏鎴柇 event.stop_event()锛屼繚鎶や簨浠剁洃鍚摼涓嶈鍒囨柇銆?

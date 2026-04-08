@@ -193,6 +193,21 @@ class ReplyEngine:
         
         _pending_actions = pending_actions if pending_actions is not None else event.get_extra("astrmai_pending_actions", [])
         at_targets = [action.get("target_id") for action in _pending_actions if action.get("action") == "at"]
+        if at_targets:
+            at_target_names = [
+                str(action.get("target_name"))
+                for action in _pending_actions
+                if action.get("action") == "at" and action.get("target_name")
+            ]
+            existing_targets = [str(t) for t in (event.get_extra("astrmai_wait_targets", []) or []) if t]
+            merged_targets = existing_targets[:]
+            for target_id in at_targets:
+                target_str = str(target_id)
+                if target_str and target_str not in merged_targets:
+                    merged_targets.append(target_str)
+            event.set_extra("astrmai_wait_targets", merged_targets)
+            if at_target_names:
+                event.set_extra("astrmai_wait_target_name", at_target_names[0])
         
         from astrbot.api.event import MessageChain
         
@@ -216,6 +231,9 @@ class ReplyEngine:
             context = getattr(self.state_engine.gateway, 'context', None)
             if context:
                 await context.send_message(event.unified_msg_origin, chain)
+                if not event.get_extra("astrmai_reply_sent", False):
+                    event.set_extra("astrmai_reply_sent", True)
+                    event.set_extra("astrmai_last_reply_text", clean_text)
             else:
                 logger.error("[ReplyEngine] 🚨 致命错误：Gateway Context 丢失，无法跨越生命周期发送消息！")
             

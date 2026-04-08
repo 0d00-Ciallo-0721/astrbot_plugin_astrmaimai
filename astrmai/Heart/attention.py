@@ -158,6 +158,20 @@ class AttentionGate:
              self._fire_background_task(
                  self.private_chat_manager.signal_new_message(user_id=sender_id, message_str=msg_str)
              )
+
+        if event.get_extra("astrmai_force_engage", False):
+            logger.info(f"[{chat_id}] 🔁 [Wait Resume] target user replied, force-engaging System2.")
+            event.set_extra("retrieve_keys", ["CORE_ONLY"])
+            event.set_extra("is_fast_mode", True)
+            event.set_extra(
+                "sys1_thought",
+                event.get_extra("astrmai_wait_resume_thought", "对方接上了你刚才的话题，立即继续回应。")
+            )
+            components = event.message_obj.message if (hasattr(event, "message_obj") and event.message_obj) else event.message_str
+            await self._normalize_content_to_str(components, event=event)
+            if self.sys2_process:
+                self._fire_background_task(self.sys2_process(event, [event]))
+            return "ENGAGED"
         
         max_len = getattr(self.config.attention, 'max_message_length', 100)
         if msg_str and len(msg_str.strip()) > max_len:
@@ -170,6 +184,8 @@ class AttentionGate:
         is_nickname_wakeup = event.get_extra("astrmai_bonus_score", 0.0) >= 1.0
         
         is_strong_wakeup = is_at_wakeup or is_keyword_wakeup or is_nickname_wakeup
+        if not is_private:
+            event.set_extra("astrmai_group_direct_wakeup", is_strong_wakeup)
 
         complex_keywords = ["为什么", "怎么", "帮我", "代码", "解释", "写", "什么", "翻译", "分析"]
         is_simple_payload = len(msg_lower) <= 15 and not any(cw in msg_lower for cw in complex_keywords)

@@ -124,6 +124,12 @@
         "default": 0.7,
         "hint": "在无 LLM 干预的降级频控器下，决定是否跟从连发的基础概率阈值 (0.0~1.0)。"
       },
+      "follow_up_probability": {
+        "description": "💬 AI 首轮回复后追发第二句的概率",
+        "type": "float",
+        "default": 0.2,
+        "hint": "控制 follow-up 连发判定的概率门控。0.0 表示全关闭，1.0 表示每次都可进入 LLM 精判。"
+      },
       "fallback_text": {
         "description": "🤐 全线崩溃兜底独白",
         "type": "string",

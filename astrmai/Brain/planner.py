@@ -418,8 +418,15 @@ class Planner:
         if clean_reply.endswith("？") or clean_reply.endswith("?"):
             return None
 
-        # 概率门控: 约 20% 概率才进入 LLM 精判（大幅降低调用频率）
-        if random.random() > 0.20:
+        # 概率门控: 仅在命中配置概率后才进入 LLM 精判
+        reply_cfg = getattr(self.gateway.config, "reply", None)
+        follow_up_probability = getattr(reply_cfg, "follow_up_probability", 0.20)
+        try:
+            follow_up_probability = float(follow_up_probability)
+        except (TypeError, ValueError):
+            follow_up_probability = 0.20
+        follow_up_probability = max(0.0, min(1.0, follow_up_probability))
+        if follow_up_probability <= 0.0 or random.random() > follow_up_probability:
             return None
 
         # ===== LLM 精判层 (极短 Prompt) =====

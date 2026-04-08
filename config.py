@@ -83,6 +83,7 @@ class LifeConfig(BaseModel):
 class ReplyConfig(BaseModel):
     fallback_text: str = Field(default="（陷入了短暂的沉默...）")
     base_frequency: float = Field(default=0.7, description="算法流基础连发跟进概率")
+    follow_up_probability: float = Field(default=0.2, description="AI 在首轮回复后继续追发一句的概率门控 (0.0~1.0)")
     segment_min_len: int = Field(default=15)
     no_segment_max_len: int = Field(default=120)
     meme_probability: int = Field(default=60)

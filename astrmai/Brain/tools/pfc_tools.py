@@ -247,6 +247,7 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
         pending_actions.append({
             "action": "at",
             "target_id": target_id,
+            "target_name": target_name,
             "group_id": group_id
         })
         current_event.set_extra("astrmai_pending_actions", pending_actions)
