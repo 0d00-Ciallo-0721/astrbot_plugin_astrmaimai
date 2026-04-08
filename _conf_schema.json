@@ -337,7 +337,7 @@
       "profiling_msg_threshold": {
         "description": "🗂️ 人物行为侧写刻画信标堆积",
         "type": "int",
-        "default": 200
+        "default": 50
       }
     }
   },

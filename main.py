@@ -146,7 +146,8 @@ class AstrMaiPlugin(Star):
             config=self.config,                          
             persona_summarizer=self.persona_summarizer,  
             visual_cortex=self.visual_cortex,
-            frequency_controller=self.frequency_controller  # Phase 6.3 注入
+            frequency_controller=self.frequency_controller,  # Phase 6.3 注入
+            private_chat_manager=self.private_chat_manager
         )
         
         # Phase 4: 表达反思器

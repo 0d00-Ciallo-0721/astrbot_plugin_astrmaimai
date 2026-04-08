@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Optional, List, Dict
 from astrbot.api import logger
 from .processor import MemoryProcessor
@@ -32,6 +33,31 @@ class ChatHistorySummarizer:
         self._memory_locks = {}
         self._background_tasks = set()
 
+    def _build_topic_messages(self, chat_history_text: str) -> List[Dict]:
+        messages = []
+        for index, raw_line in enumerate(chat_history_text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = re.match(r"^\[(?P<time>[^\]]+)\]\s*(?P<sender>[^:]+):\s*(?P<content>.*)$", line)
+            if match:
+                sender = match.group("sender").strip()
+                content = match.group("content").strip()
+            else:
+                sender = "unknown"
+                content = line
+
+            if content:
+                messages.append(
+                    {
+                        "sender": sender,
+                        "content": content,
+                        "timestamp": float(index),
+                    }
+                )
+        return messages
+
     async def start(self):
         """启动后台定期检查循环"""
         if self._running:
@@ -61,7 +87,7 @@ class ChatHistorySummarizer:
             
             cutoff_time = time.time() - (days * 86400)
             
-            async def fetch_logs():
+            def fetch_logs_sync():
                 with db.get_session() as session:
                     statement = select(MessageLog).where(
                         MessageLog.group_id == session_id,
@@ -71,12 +97,13 @@ class ChatHistorySummarizer:
                     return [MessageLog.model_validate(r.model_dump()) for r in results]
                     
             import asyncio
-            logs = await asyncio.to_thread(fetch_logs)
+            logs = await asyncio.to_thread(fetch_logs_sync)
             if not logs:
                 return
                 
             history_lines = []
-            for log in logs:
+            topic_messages = []
+            for index, log in enumerate(logs):
                 content = log.content
                 if not content: continue
                 # 避免单条数据过长冲毁上下文
@@ -85,11 +112,18 @@ class ChatHistorySummarizer:
                     
                 time_str = time.strftime("%H:%M:%S", time.localtime(log.timestamp))
                 history_lines.append(f"[{time_str}] {log.sender_name}: {content}")
+                topic_messages.append(
+                    {
+                        "sender": log.sender_name,
+                        "content": content,
+                        "timestamp": log.timestamp if log.timestamp is not None else float(index),
+                    }
+                )
                 
             full_history = "\n".join(history_lines)
             
             if full_history:
-                await self.summarize_session(session_id, full_history)
+                await self.summarize_session(session_id, full_history, messages=topic_messages)
                 
         except Exception as e:
             logger.error(f"[Memory Summarizer] 批量历史提取异常: {e}", exc_info=True)
@@ -115,7 +149,7 @@ class ChatHistorySummarizer:
             except Exception as e:
                 logger.error(f"[Memory Summarizer] 后台循环异常: {e}")
 
-    async def summarize_session(self, session_id: str, chat_history_text: str, persona_id: Optional[str] = None):
+    async def summarize_session(self, session_id: str, chat_history_text: str, persona_id: Optional[str] = None, messages: Optional[List[Dict]] = None):
         """[修改] 核心记忆提炼流水线，保存反思和记忆节点到多表数据库"""
         if not chat_history_text.strip():
             return
@@ -127,10 +161,13 @@ class ChatHistorySummarizer:
         # 先进行话题分割，再分别进行认知降维，实现话题级记忆
         # ==================================================
         try:
-            topic_segments = await self.topic_summarizer.process_history(
-                session_id=session_id,
-                raw_text=chat_history_text
-            )
+            topic_messages = messages or self._build_topic_messages(chat_history_text)
+            topic_segments = []
+            if topic_messages:
+                topic_segments = await self.topic_summarizer.process_history(
+                    messages=topic_messages,
+                    session_id=session_id
+                )
             if topic_segments:
                 logger.info(
                     f"[Memory Summarizer] 📊 话题分割完成: "

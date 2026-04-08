@@ -1,5 +1,7 @@
+import ast
 import json
-from typing import Tuple  # <--- 新增这一行
+import re
+from typing import Tuple
 from astrbot.api import logger
 from ..infra.gateway import GlobalModelGateway
 
@@ -82,14 +84,10 @@ class MoodManager:
             if isinstance(result, dict):
                 data = result
             else:
-                import json
-                import re
-                import ast 
-                
                 raw_str = str(result).strip()
                 
                 # 预处理：清洗掉可能存在的 markdown 代码块符号
-                clean_str = re.sub(r'```', '', clean_str)
+                clean_str = re.sub(r'```(?:json)?', '', raw_str, flags=re.IGNORECASE).strip()
 
                 parsed_successfully = False
                 
@@ -163,4 +161,7 @@ class MoodManager:
             elif any(w in fallback_text for w in ["?", "？", "啊", "怎么会", "啥", "什么"]):
                 return "surprise", current_mood
                 
-            return "happy", current_mood
+            return "neutral", current_mood
+
+    async def analyze_text_mood(self, text: str, current_mood: float, user_affection: float = 0.0) -> Tuple[str, float]:
+        return await self.analyze_mood(text, current_mood, user_affection=user_affection)

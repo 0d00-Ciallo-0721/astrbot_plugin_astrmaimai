@@ -22,7 +22,8 @@ class SessionContext:
 class AttentionGate:
     def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters,
                  system2_callback, config=None, visual_cortex=None,
-                 persona_summarizer=None, frequency_controller=None):
+                 persona_summarizer=None, frequency_controller=None,
+                 private_chat_manager=None):
         self.state_engine = state_engine
         self.judge = judge
         self.sensors = sensors
@@ -32,6 +33,7 @@ class AttentionGate:
         self.persona_summarizer = persona_summarizer
         # Phase 6.3: 发言频率控制器
         self.frequency_controller = frequency_controller
+        self.private_chat_manager = private_chat_manager
         
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
@@ -152,7 +154,7 @@ class AttentionGate:
         self_id = str(event.get_self_id())
 
         # Phase 8.3: 通知私聊管理器，打断可能的等待状态
-        if is_private and hasattr(self, 'private_chat_manager') and self.private_chat_manager:
+        if is_private and self.private_chat_manager:
              self._fire_background_task(
                  self.private_chat_manager.signal_new_message(user_id=sender_id, message_str=msg_str)
              )

@@ -1,9 +1,9 @@
 import time
 import sqlite3
 import json
-from typing import List, Optional
+from typing import Dict, List, Optional
 from sqlmodel import Session, select, desc
-from .datamodels import ExpressionPattern, MessageLog, ChatState, Jargon, SocialRelation
+from .datamodels import ExpressionPattern, MessageLog, ChatState, Jargon, SocialRelation, UserProfile
 from .persistence import PersistenceManager
 import asyncio
 from astrbot.api.event import AstrMessageEvent
@@ -173,6 +173,80 @@ class DatabaseService:
             results = session.exec(statement).all()
             # 🟢 [深层修复 Bug 2] 跨线程脱水
             return [Jargon.model_validate(r.model_dump()) for r in results]
+
+    def get_jargon(self, group_id: str, word: str) -> Optional[str]:
+        if not group_id or not word:
+            return None
+
+        with self.get_session() as session:
+            statement = select(Jargon).where(
+                Jargon.group_id == group_id,
+                Jargon.content == word
+            ).order_by(desc(Jargon.updated_at))
+            result = session.exec(statement).first()
+            if result and result.meaning:
+                return result.meaning
+        return None
+
+    def search_jargons(self, keyword: str, limit: int = 3) -> List[Jargon]:
+        if not keyword:
+            return []
+
+        keyword_lower = keyword.lower()
+        with self.get_session() as session:
+            statement = select(Jargon).order_by(desc(Jargon.updated_at))
+            results = session.exec(statement).all()
+            matches = []
+            for item in results:
+                content = (item.content or "").lower()
+                meaning = (item.meaning or "").lower()
+                if keyword_lower in content or keyword_lower in meaning:
+                    matches.append(Jargon.model_validate(item.model_dump()))
+                if len(matches) >= limit:
+                    break
+            return matches
+
+    def get_profile_by_name(self, name: str) -> Optional[UserProfile]:
+        if not name:
+            return None
+
+        profiles = self.persistence.load_all_user_profiles()
+
+        for profile_data in profiles.values():
+            if profile_data.get("name") == name:
+                return UserProfile(**profile_data)
+
+        for profile_data in profiles.values():
+            if profile_data.get("nickname") == name:
+                return UserProfile(**profile_data)
+
+        return None
+
+    def delete_pattern(self, pattern_id: Optional[int]):
+        if not pattern_id:
+            return
+
+        with self.get_session() as session:
+            pattern = session.get(ExpressionPattern, pattern_id)
+            if pattern:
+                session.delete(pattern)
+                session.commit()
+
+    def adjust_pattern_weight(self, group_id: str, situation: str, expression: str, delta: float):
+        with self.get_session() as session:
+            statement = select(ExpressionPattern).where(
+                ExpressionPattern.group_id == group_id,
+                ExpressionPattern.situation == situation,
+                ExpressionPattern.expression == expression
+            )
+            pattern = session.exec(statement).first()
+            if not pattern:
+                return
+
+            pattern.weight = max(0.0, min(2.0, pattern.weight + delta))
+            pattern.last_active_time = time.time()
+            session.add(pattern)
+            session.commit()
 
     def update_social_relation(self, group_id: str, from_user: str, to_user: str, relation_type: str, strength_delta: float):
         """[新增] 更新成员间的互动图谱强度"""
@@ -489,6 +563,29 @@ class DatabaseService:
         """[新增] 异步获取群组黑话，供 ContextEngine 组装 Prompt 使用"""
         import asyncio
         return await asyncio.to_thread(self.get_jargons, group_id, limit, only_confirmed)
+
+    async def load_jargon_list(self, group_id: str, limit: int = 20) -> List[Dict[str, str]]:
+        items = await self.get_jargons_async(group_id, limit=limit, only_confirmed=True)
+        return [
+            {
+                "text": item.content,
+                "meaning": item.meaning,
+                "situation": "",
+            }
+            for item in items
+            if item.content and item.meaning
+        ]
+
+    async def adjust_pattern_weight_async(self, group_id: str, situation: str, expression: str, delta: float):
+        import asyncio
+        async with self._db_lock:
+            return await asyncio.to_thread(
+                self.adjust_pattern_weight,
+                group_id,
+                situation,
+                expression,
+                delta,
+            )
 
     async def update_social_relation_async(self, group_id: str, from_user: str, to_user: str, relation_type: str, strength_delta: float):
         """[新增] 异步更新成员互动图谱"""
