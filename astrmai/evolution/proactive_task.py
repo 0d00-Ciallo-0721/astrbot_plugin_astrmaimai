@@ -36,6 +36,8 @@ class ProactiveTask:
         self.persistence = persistence
         self.memory_engine = memory_engine
         self.reflector = reflector  # Phase 4
+        self.auto_check_task = None
+        self.reflect_tracker = None
         self.config = config if config else gateway.config
         
         # Phase 7: 梦境系统初始化
@@ -128,6 +130,110 @@ class ProactiveTask:
             except Exception as e:
                 logger.error(f"[ProactiveTask] 梦境整理任务异常: {e}")
 
+    def _within_dream_time_range(self) -> bool:
+        time_ranges = getattr(self.config.life, "dream_time_ranges", []) if hasattr(self.config, "life") else []
+        if not time_ranges:
+            return True
+        current = time.localtime()
+        current_minutes = current.tm_hour * 60 + current.tm_min
+        for item in time_ranges:
+            if not isinstance(item, str) or "-" not in item:
+                continue
+            start_raw, end_raw = item.split("-", 1)
+            try:
+                start_hour, start_min = [int(part) for part in start_raw.split(":", 1)]
+                end_hour, end_min = [int(part) for part in end_raw.split(":", 1)]
+            except ValueError:
+                continue
+            start_minutes = start_hour * 60 + start_min
+            end_minutes = end_hour * 60 + end_min
+            if start_minutes <= end_minutes:
+                if start_minutes <= current_minutes <= end_minutes:
+                    return True
+            else:
+                if current_minutes >= start_minutes or current_minutes <= end_minutes:
+                    return True
+        return False
+
+    async def _dispatch_review_requests(self):
+        if not self.reflect_tracker:
+            return
+        requests = await self.reflect_tracker.get_unsent_requests()
+        for item in requests:
+            try:
+                chain = MessageChain().message(item["question"])
+                await self.context.send_message(item["group_id"], chain)
+            except Exception as exc:
+                logger.warning(f"[Life] 发送表达审核请求失败: {exc}")
+
+    async def _run_dream_task(self):
+        if not self.dream_agent:
+            return
+        min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
+        self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
+        async with self._bg_semaphore:
+            try:
+                logger.info("[ProactiveTask] 触发梦境整理...")
+                dream_log = await self.dream_agent.run_dream_cycle()
+                if not dream_log:
+                    return
+
+                session_id = getattr(self.dream_agent, "_last_session_id", "global")
+                persona_name = getattr(getattr(self.config, 'persona', None), 'name', 'Mai')
+                dream_text = await self.dream_generator.generate(
+                    dream_log=dream_log,
+                    persona_name=persona_name,
+                    session_id=session_id,
+                )
+                maintenance = self.dream_generator.build_maintenance_result(dream_log, session_id=session_id)
+
+                if dream_text and self.memory_engine:
+                    try:
+                        await self.memory_engine.add_memory(
+                            content=f"[梦境日记] {dream_text}",
+                            session_id="__dream_diary__",
+                            importance=0.5,
+                        )
+                        await self.memory_engine.add_memory(
+                            content=f"[dream_maintenance] {maintenance['summary']}",
+                            session_id=str(session_id),
+                            importance=0.65,
+                        )
+                    except Exception as exc:
+                        logger.debug(f"[ProactiveTask] 梦境结果写回记忆失败: {exc}")
+
+                if getattr(self, "_db_service", None) and hasattr(self._db_service, "save_event_async"):
+                    try:
+                        from ..infra.datamodels import MemoryEvent
+                        import uuid
+                        import json
+                        date_str = time.strftime("%Y-%m-%d")
+                        event = MemoryEvent(
+                            event_id=f"dream_{uuid.uuid4().hex[:10]}",
+                            session_id=str(session_id),
+                            date=date_str,
+                            narrative=maintenance["summary"],
+                            emotion="dream",
+                            importance=7,
+                            emotional_intensity=4,
+                            reflection=dream_text[:400] if dream_text else "",
+                            memory_kind="dream",
+                            source_layer="dream",
+                            tags=json.dumps(maintenance.get("tags", []), ensure_ascii=False),
+                        )
+                        await self._db_service.save_event_async(event)
+                    except Exception as exc:
+                        logger.debug(f"[ProactiveTask] 梦境事件写回失败: {exc}")
+
+                if dream_text and getattr(self.config.life, "dream_visible", False):
+                    target = getattr(self.config.life, "dream_send_target", "") or session_id
+                    try:
+                        await self.context.send_message(target, MessageChain().message(dream_text))
+                    except Exception as exc:
+                        logger.warning(f"[ProactiveTask] 梦境推送失败: {exc}")
+            except Exception as e:
+                logger.error(f"[ProactiveTask] 梦境整理任务异常: {e}")
+
     async def stop(self):
         """停止后台循环"""
         self._is_running = False
@@ -190,6 +296,10 @@ class ProactiveTask:
                         if state.chat_id:
                             await self.reflector.reflect_batch(state.chat_id)
                             await self.reflector.auto_audit(state.chat_id)
+                            if self.auto_check_task:
+                                await self.auto_check_task.run_once(state.chat_id)
+                    if self.reflect_tracker:
+                        await self._dispatch_review_requests()
 
                 # 3.6 Phase 5: 全局关系衰减 (纯算法，零 LLM)
                 enable_rel_engine = getattr(self.config.evolution, 'enable_relationship_engine', True) if hasattr(self.config, 'evolution') else True
@@ -198,7 +308,7 @@ class ProactiveTask:
 
                 # 3.7 Phase 7: 梦境整理调度 (每 30 分钟)
                 now_ts = time.time()
-                if now_ts - self._last_dream_time >= self._dream_interval:
+                if now_ts - self._last_dream_time >= self._dream_interval and self._within_dream_time_range():
                     self._last_dream_time = now_ts
                     asyncio.create_task(self._run_dream_task())
 
@@ -460,6 +570,120 @@ class ProactiveTask:
             await self.persistence.save_user_profile(profile)
             from astrbot.api import logger
             logger.info(f"[Life] ✅ 画像结构化挖掘完成: {analysis[:20]}... 标签: {tags} 记忆点: {len(memory_points)}条")
+
+    @staticmethod
+    def _categorize_memory_points(memory_points):
+        buckets = {
+            "identity_points": [],
+            "preference_points": [],
+            "relationship_points": [],
+            "speech_style_points": [],
+        }
+        if not isinstance(memory_points, list):
+            return buckets
+        for raw_point in memory_points:
+            if not isinstance(raw_point, str):
+                continue
+            parts = raw_point.split(":", 2)
+            category = parts[0] if parts else "其他"
+            content = parts[1] if len(parts) > 1 else raw_point
+            normalized = f"{category}:{content}".strip()
+            if not normalized:
+                continue
+            if category in {"身份", "经历", "技能"}:
+                buckets["identity_points"].append(normalized)
+            elif category in {"爱好", "偏好"}:
+                buckets["preference_points"].append(normalized)
+            elif category in {"关系", "互动"}:
+                buckets["relationship_points"].append(normalized)
+            else:
+                buckets["speech_style_points"].append(normalized)
+        for key, values in buckets.items():
+            buckets[key] = values[:6]
+        return buckets
+
+    async def _generate_persona_analysis(self, profile):
+        persona_id = getattr(self.config.persona, 'persona_id', "") or "global"
+        if hasattr(self.persistence, 'load_persona_cache_async'):
+            cache = await self.persistence.load_persona_cache_async()
+        else:
+            cache = self.persistence.load_persona_cache()
+
+        persona_data = cache.get(persona_id, {})
+        summary = persona_data.get("summary", "")
+        persona_injection = f"\n[你的人设摘要]: {summary}\n" if summary else ""
+
+        old_analysis = getattr(profile, "persona_analysis", "") or "暂无旧画像"
+        old_tags = getattr(profile, "tags", [])
+        old_tags_str = ", ".join(old_tags) if isinstance(old_tags, list) and old_tags else "暂无标签"
+        old_memory_points = getattr(profile, "memory_points", [])
+        old_mp_str = "\n".join(old_memory_points) if old_memory_points else "暂无记忆点"
+
+        prompt = f"""{persona_injection}
+请基于用户“{profile.name}”与你的历史互动，做增量人物画像更新。
+他近期已互动 {profile.message_count_for_profiling} 次。
+
+【旧画像】{old_analysis}
+【旧标签】{old_tags_str}
+【旧记忆点】
+{old_mp_str}
+
+请严格返回 JSON:
+{{
+  "tags": ["标签1", "标签2"],
+  "summary": "100字以内的整体印象",
+  "memory_points": [
+    {{"category": "爱好", "content": "喜欢xxx", "weight": 0.8}}
+  ]
+}}
+"""
+        result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
+        if not result:
+            return
+
+        import json
+        import re
+
+        tags = []
+        analysis = ""
+        memory_points = []
+        try:
+            match = re.search(r"\{.*\}", result, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                tags = data.get("tags", [])
+                analysis = data.get("summary", data.get("analysis", ""))
+                raw_points = data.get("memory_points", [])
+                memory_points = [
+                    f"{mp.get('category', '其他')}:{mp.get('content', '')}:{mp.get('weight', 0.5)}"
+                    for mp in raw_points if isinstance(mp, dict) and mp.get('content')
+                ]
+        except Exception as exc:
+            logger.error(f"[Life] 解析增量画像 JSON 失败: {exc}")
+
+        if not analysis:
+            analysis = str(result).strip()
+
+        if analysis:
+            profile.persona_analysis = analysis.strip()
+        if tags:
+            profile.tags = tags
+        if memory_points:
+            profile.memory_points = memory_points
+            categorized = self._categorize_memory_points(memory_points)
+            profile.identity_points = categorized["identity_points"]
+            profile.preference_points = categorized["preference_points"]
+            profile.relationship_points = categorized["relationship_points"]
+            profile.speech_style_points = categorized["speech_style_points"]
+
+        profile.message_count_for_profiling = 0
+        profile.last_persona_gen_time = time.time()
+        profile.is_dirty = True
+        await self.persistence.save_user_profile(profile)
+        logger.info(
+            f"[Life] 画像结构化挖掘完成: {analysis[:20]}... "
+            f"标签={len(tags)} 记忆点={len(memory_points)}"
+        )
 
     async def _generate_nickname(self, profile) -> None:
         """

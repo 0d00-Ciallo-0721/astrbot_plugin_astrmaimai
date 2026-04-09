@@ -78,6 +78,10 @@ class PersistenceManager:
                         know_times INTEGER DEFAULT 0,
                         is_known INTEGER DEFAULT 0,
                         memory_points TEXT DEFAULT '[]',
+                        identity_points TEXT DEFAULT '[]',
+                        preference_points TEXT DEFAULT '[]',
+                        relationship_points TEXT DEFAULT '[]',
+                        speech_style_points TEXT DEFAULT '[]',
                         updated_at REAL
                     )
                 """)
@@ -88,6 +92,29 @@ class PersistenceManager:
                     "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN identity_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'",
+                ]:
+                    try:
+                        db.execute(col_def)
+                    except Exception:
+                        pass
+                for col_def in [
+                    "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'",
+                    "ALTER TABLE expressionpattern ADD COLUMN count INTEGER DEFAULT 1",
+                    "ALTER TABLE expressionpattern ADD COLUMN checked INTEGER DEFAULT 0",
+                    "ALTER TABLE expressionpattern ADD COLUMN rejected INTEGER DEFAULT 0",
+                    "ALTER TABLE expressionpattern ADD COLUMN modified_by TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN source TEXT DEFAULT 'learning'",
+                    "ALTER TABLE expressionpattern ADD COLUMN shared_scope TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN think_level INTEGER DEFAULT 0",
+                    "ALTER TABLE expressionpattern ADD COLUMN review_status TEXT DEFAULT 'pending'",
+                    "ALTER TABLE expressionpattern ADD COLUMN review_reason TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN review_suggestion TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN last_review_time REAL DEFAULT 0",
                 ]:
                     try:
                         db.execute(col_def)
@@ -196,6 +223,10 @@ class PersistenceManager:
                     "nickname_reason": row_dict.get("nickname_reason", ""),
                     "know_times": int(row_dict.get("know_times") or 0),
                     "is_known": bool(row_dict.get("is_known") or False),
+                    "identity_points": json.loads(row_dict.get("identity_points") or "[]"),
+                    "preference_points": json.loads(row_dict.get("preference_points") or "[]"),
+                    "relationship_points": json.loads(row_dict.get("relationship_points") or "[]"),
+                    "speech_style_points": json.loads(row_dict.get("speech_style_points") or "[]"),
                     # Phase 8.2: 分类记忆点
                     "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
                 }
@@ -229,6 +260,10 @@ class PersistenceManager:
                 "know_times": int(row_dict.get("know_times") or 0),
                 "is_known": bool(row_dict.get("is_known") or False),
                 "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
+                "identity_points": json.loads(row_dict.get("identity_points") or "[]"),
+                "preference_points": json.loads(row_dict.get("preference_points") or "[]"),
+                "relationship_points": json.loads(row_dict.get("relationship_points") or "[]"),
+                "speech_style_points": json.loads(row_dict.get("speech_style_points") or "[]"),
             }
         return profiles
 
@@ -236,19 +271,25 @@ class PersistenceManager:
         footprints_json = json.dumps(profile.group_footprints, ensure_ascii=False)
         tags_json = json.dumps(profile.tags, ensure_ascii=False)
         memory_points_json = json.dumps(profile.memory_points, ensure_ascii=False)
+        identity_points_json = json.dumps(getattr(profile, "identity_points", []), ensure_ascii=False)
+        preference_points_json = json.dumps(getattr(profile, "preference_points", []), ensure_ascii=False)
+        relationship_points_json = json.dumps(getattr(profile, "relationship_points", []), ensure_ascii=False)
+        speech_style_points_json = json.dumps(getattr(profile, "speech_style_points", []), ensure_ascii=False)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO user_profiles 
                 (user_id, name, social_score, last_seen, persona_analysis, group_footprints,
                  identity, tags, nickname, nickname_reason, know_times, is_known,
-                 memory_points, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 memory_points, identity_points, preference_points, relationship_points,
+                 speech_style_points, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (profile.user_id, profile.name, profile.social_score, profile.last_seen,
                   profile.persona_analysis, footprints_json, profile.identity,
                   tags_json,
                   profile.nickname, profile.nickname_reason,
                   profile.know_times, int(profile.is_known),
-                  memory_points_json, time.time()))
+                  memory_points_json, identity_points_json, preference_points_json,
+                  relationship_points_json, speech_style_points_json, time.time()))
             await db.commit()
             
     async def add_last_message_meta(self, chat_id: str, sender_id: str, has_image: bool, image_urls: list):
@@ -304,6 +345,10 @@ class PersistenceManager:
                         know_times INTEGER DEFAULT 0,
                         is_known INTEGER DEFAULT 0,
                         memory_points TEXT DEFAULT '[]',
+                        identity_points TEXT DEFAULT '[]',
+                        preference_points TEXT DEFAULT '[]',
+                        relationship_points TEXT DEFAULT '[]',
+                        speech_style_points TEXT DEFAULT '[]',
                         updated_at REAL
                     )
                 """)
@@ -315,12 +360,35 @@ class PersistenceManager:
                     "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN identity_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'",
                 ]:
                     try:
                         await db.execute(col_def)
                     except Exception:
                         pass  # 列已存在时忽略
                 # [新增] CronSnapshot 快照表的原生 SQL 兜底建表
+                for col_def in [
+                    "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'",
+                    "ALTER TABLE expressionpattern ADD COLUMN count INTEGER DEFAULT 1",
+                    "ALTER TABLE expressionpattern ADD COLUMN checked INTEGER DEFAULT 0",
+                    "ALTER TABLE expressionpattern ADD COLUMN rejected INTEGER DEFAULT 0",
+                    "ALTER TABLE expressionpattern ADD COLUMN modified_by TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN source TEXT DEFAULT 'learning'",
+                    "ALTER TABLE expressionpattern ADD COLUMN shared_scope TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN think_level INTEGER DEFAULT 0",
+                    "ALTER TABLE expressionpattern ADD COLUMN review_status TEXT DEFAULT 'pending'",
+                    "ALTER TABLE expressionpattern ADD COLUMN review_reason TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN review_suggestion TEXT DEFAULT ''",
+                    "ALTER TABLE expressionpattern ADD COLUMN last_review_time REAL DEFAULT 0",
+                ]:
+                    try:
+                        await db.execute(col_def)
+                    except Exception:
+                        pass
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,

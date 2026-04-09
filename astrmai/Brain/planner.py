@@ -130,8 +130,12 @@ class Planner:
             
             async def _load_expressions():
                 recent_text = "\n".join(window_lines[-3:]) if window_lines else ""
+                think_level = 1 if len(recent_text) >= 40 and len(window_lines) >= 2 else 0
                 return await self.expression_selector.select(
-                    chat_id=chat_id, context_text=recent_text, think_level=0
+                    chat_id=chat_id,
+                    context_text=recent_text,
+                    think_level=think_level,
+                    shared_scope=chat_id,
                 )
             
             async def _load_jargons():

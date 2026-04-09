@@ -1,10 +1,12 @@
 import asyncio
+import json
 from astrbot.api import logger
 from ..infra.lane_manager import LaneKey
 from astrbot.api.event import AstrMessageEvent
 from ..infra.database import DatabaseService
 from ..infra.gateway import GlobalModelGateway
 from .miner import ExpressionMiner
+from .message_recorder import MessageRecorder
 from typing import Dict, List
 
 class EvolutionManager:
@@ -19,6 +21,15 @@ class EvolutionManager:
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.miner = ExpressionMiner(gateway, self.config)
+        self.recorder = MessageRecorder(
+            window_seconds=getattr(self.config.evolution, "mining_window_sec", 60),
+            min_messages=getattr(
+                self.config.evolution,
+                "mining_window_min_messages",
+                getattr(self.config.evolution, "mining_trigger", 20),
+            ),
+            cooldown_seconds=getattr(self.config.evolution, "mining_cooldown_sec", 60),
+        )
         # [核心修复 Bug 4] 废除会导致全局排队阻塞的单实例锁，重构为群组级分片哈希锁
         self._mining_locks: Dict[str, asyncio.Lock] = {}
         self._lock_mutex = asyncio.Lock()
@@ -77,6 +88,7 @@ class EvolutionManager:
             )
         else:
             self.db.add_message_log(group_id=event.unified_msg_origin, sender_id=str(bot_id), sender_name="SELF", content=processed_content)
+        self.recorder.record(event.unified_msg_origin)
         
         # 4. 🟢 [核心修复 Bug 1] 触发后台挖掘任务，使用安全托管池代替裸奔的 create_task
         self._fire_background_task(self._try_trigger_mining(event.unified_msg_origin))
@@ -101,7 +113,8 @@ class EvolutionManager:
                 sender_name=event.get_sender_name(), 
                 content=rich_text # ✨ 【修改此行】
             )
-            
+        self.recorder.record(event.unified_msg_origin)
+
     async def process_logs_and_mine(self, group_id: str, logs: List['MessageLog']):
         """
         [修正] 使用群组级细粒度锁进行二次校验，极大解放多群并发挖掘吞吐量
@@ -205,7 +218,15 @@ JSON: {{"goal": "string"}}"""
     def get_active_patterns(self, chat_id: str, limit: int = 5) -> str:
         """此方法由于是旧版同步签名且可能被其他同步代码调用，建议保持现状，但在调用方侧应尽量重构。
         (如果 ContextEngine 中需要，应当在 ContextEngine 里 await db.get_patterns_async，然后自行格式化)"""
-        patterns = self.db.get_patterns(chat_id, limit)
+        patterns = self.db.get_patterns(
+            chat_id,
+            limit,
+            True,
+            False,
+            chat_id,
+            1,
+            "approved",
+        )
         if not patterns:
             return "暂无特殊语言风格记录。"
         
@@ -270,4 +291,138 @@ JSON: {{"goal": "string"}}"""
             self.db.add_message_log(group_id=chat_id, sender_id=bot_id, sender_name="SELF", content=reply_text)
         
         # 2. 触发后台挖掘任务
+        self._fire_background_task(self._try_trigger_mining(chat_id))
+
+    async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):
+        bot_id = getattr(event.message_obj, 'self_id', 'SELF_BOT')
+        if hasattr(event, 'bot') and getattr(event, 'bot', None):
+            bot_id = getattr(event.bot, 'self_id', bot_id)
+
+        processed_content = event.message_str
+        if is_command:
+            processed_content = f"(系统指令执行结果): {event.message_str}"
+
+        if hasattr(self.db, 'add_message_log_async'):
+            await self.db.add_message_log_async(
+                group_id=event.unified_msg_origin,
+                sender_id=str(bot_id),
+                sender_name="SELF",
+                content=processed_content,
+            )
+        else:
+            self.db.add_message_log(
+                group_id=event.unified_msg_origin,
+                sender_id=str(bot_id),
+                sender_name="SELF",
+                content=processed_content,
+            )
+        self.recorder.record(event.unified_msg_origin)
+        self._fire_background_task(self._try_trigger_mining(event.unified_msg_origin))
+
+    async def record_user_message(self, event: AstrMessageEvent):
+        rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+        if hasattr(self.db, 'add_message_log_async'):
+            await self.db.add_message_log_async(
+                group_id=event.unified_msg_origin,
+                sender_id=event.get_sender_id(),
+                sender_name=event.get_sender_name(),
+                content=rich_text,
+            )
+        else:
+            self.db.add_message_log(
+                group_id=event.unified_msg_origin,
+                sender_id=event.get_sender_id(),
+                sender_name=event.get_sender_name(),
+                content=rich_text,
+            )
+        self.recorder.record(event.unified_msg_origin)
+
+    async def process_logs_and_mine(self, group_id: str, logs: List['MessageLog']):
+        if not logs:
+            return
+
+        group_lock = await self._get_mining_lock(group_id)
+        async with group_lock:
+            try:
+                if hasattr(self.db, 'get_unprocessed_logs_async'):
+                    current_unprocessed = await self.db.get_unprocessed_logs_async(group_id, limit=999)
+                else:
+                    current_unprocessed = self.db.get_unprocessed_logs(group_id, limit=999)
+
+                current_unprocessed_ids = {l.id for l in current_unprocessed}
+                filtered_logs = [log for log in logs if getattr(log, "id", None) in current_unprocessed_ids]
+                if not filtered_logs:
+                    logger.debug(f"[Evolution] 已有其他协程消费群 {group_id} 的日志快照，跳过重复挖掘")
+                    return
+
+                bundle = await self.miner.mine_bundle(group_id, filtered_logs)
+                patterns = bundle.get("patterns", [])
+                for pattern in patterns:
+                    if hasattr(self.db, 'save_pattern_async'):
+                        await self.db.save_pattern_async(pattern)
+                    else:
+                        self.db.save_pattern(pattern)
+
+                if hasattr(self.db, 'save_jargon_async'):
+                    for jargon in bundle.get("jargons", []):
+                        await self.db.save_jargon_async(jargon)
+                        if jargon.is_jargon and jargon.is_complete:
+                            from ..infra.event_bus import EventBus
+                            EventBus().trigger_knowledge_update()
+
+                log_ids = [log.id for log in filtered_logs if getattr(log, "id", None) is not None]
+                if log_ids:
+                    if hasattr(self.db, 'mark_logs_processed_async'):
+                        await self.db.mark_logs_processed_async(log_ids)
+                    else:
+                        self.db.mark_logs_processed(log_ids)
+                self.recorder.clear(group_id)
+                logger.info(
+                    f"[Evolution] 联合挖掘完成: {group_id} -> patterns={len(patterns)}, "
+                    f"jargons={len(bundle.get('jargons', []))}, logs={len(filtered_logs)}"
+                )
+            except Exception as e:
+                logger.error(f"[Evolution] 联合挖掘任务执行失败: {e}", exc_info=True)
+
+    async def _try_trigger_mining(self, group_id: str):
+        try:
+            if hasattr(self.db, 'get_unprocessed_logs_async'):
+                unprocessed_logs = await self.db.get_unprocessed_logs_async(group_id, limit=100)
+            else:
+                unprocessed_logs = self.db.get_unprocessed_logs(group_id, limit=100)
+
+            threshold = getattr(self.config.evolution, 'mining_trigger', 20)
+            if len(unprocessed_logs) < threshold:
+                logger.debug(f"[Evolution] 群组 {group_id} 当前日志数 {len(unprocessed_logs)}，未达阈值 {threshold}")
+                return
+
+            if not self.recorder.record(group_id):
+                logger.debug(f"[Evolution] 群组 {group_id} 日志已达阈值，但 recorder 时间窗/冷却未满足")
+                return
+
+            logger.info(f"[Evolution] 群组 {group_id} 达到时间窗触发条件，启动联合挖掘")
+            await self.process_logs_and_mine(group_id, unprocessed_logs)
+        except Exception as e:
+            logger.error(f"[Evolution] _try_trigger_mining 异常: {e}", exc_info=True)
+
+    async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
+        if not reply_text or not reply_text.strip():
+            return
+
+        fallback_msg = getattr(self.config.reply, 'fallback_text', "（陷入了短暂的沉默...）")
+        error_keywords = ["Exception", "failed", "Traceback", "请求失败", "APITimeoutError", "All chat models fail"]
+        if reply_text.strip() == fallback_msg or any(keyword in reply_text for keyword in error_keywords):
+            logger.warning(f"[Evolution-Processor] 拦截到污染 Bot 回复，已跳过入库: {reply_text[:30]}...")
+            return
+
+        if hasattr(self.db, 'add_message_log_async'):
+            await self.db.add_message_log_async(
+                group_id=chat_id,
+                sender_id=bot_id,
+                sender_name="SELF",
+                content=reply_text,
+            )
+        else:
+            self.db.add_message_log(group_id=chat_id, sender_id=bot_id, sender_name="SELF", content=reply_text)
+        self.recorder.record(chat_id)
         self._fire_background_task(self._try_trigger_mining(chat_id))

@@ -307,6 +307,34 @@
         "description": "💥 后台自动触发模因挖掘底限",
         "type": "int",
         "default": 20
+      },
+      "mining_window_sec": {
+        "description": "⏱️ 学习时间窗长度 (秒)",
+        "type": "int",
+        "default": 60,
+        "hint": "在这个时间窗内累计足够消息才会触发表达/黑话学习。"
+      },
+      "mining_window_min_messages": {
+        "description": "🧮 单窗最少消息数",
+        "type": "int",
+        "default": 20,
+        "hint": "避免低活跃聊天产生噪声学习。"
+      },
+      "mining_cooldown_sec": {
+        "description": "🧊 学习冷却时间 (秒)",
+        "type": "int",
+        "default": 60,
+        "hint": "同一会话在冷却结束前不会重复触发新一轮学习。"
+      },
+      "review_batch_size": {
+        "description": "🧪 每轮自动审核批次",
+        "type": "int",
+        "default": 10
+      },
+      "review_min_count": {
+        "description": "📈 进入审核的最小命中次数",
+        "type": "int",
+        "default": 2
       }
     }
   },
@@ -319,6 +347,28 @@
         "type": "int",
         "default": 30,
         "hint": "在这段无人打扰的待机期内，系统将偷偷整理自己脑波产生碎片反思日记。"
+      },
+      "dream_time_ranges": {
+        "description": "🕰️ 允许进入 dream 的时间段",
+        "type": "list",
+        "default": [],
+        "hint": "格式如 01:00-05:00，可填写多个时间段。留空表示任意时段都允许 dream。"
+      },
+      "min_memory_events_to_dream": {
+        "description": "🧠 触发 dream 的最低记忆事件数",
+        "type": "int",
+        "default": 5
+      },
+      "dream_visible": {
+        "description": "🌙 是否主动发送梦境文本",
+        "type": "bool",
+        "default": false
+      },
+      "dream_send_target": {
+        "description": "📮 梦境文本发送目标",
+        "type": "string",
+        "default": "",
+        "hint": "留空则默认发回当前 dream session；填写后可定向发送。"
       },
       "silence_threshold": {
         "description": "❄️ 环境绝对冷寂冰点 (分钟)",

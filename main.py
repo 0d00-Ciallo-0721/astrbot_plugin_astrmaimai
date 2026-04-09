@@ -37,6 +37,9 @@ from .astrmai.Brain.reply_engine import ReplyEngine
 # --- Phase 6: Proactive (Life) ---
 from .astrmai.evolution.proactive_task import ProactiveTask  
 from .astrmai.evolution.reflector import ExpressionReflector  # Phase 4
+from .astrmai.evolution.expression_auto_check_task import ExpressionAutoCheckTask
+from .astrmai.evolution.reflect_tracker import ReflectTracker
+from .astrmai.evolution.review_service import ExpressionReviewService
 
 # --- Phase 2: System 1 (Heart) ---
 from .astrmai.Heart.state_engine import StateEngine
@@ -161,6 +164,18 @@ class AstrMaiPlugin(Star):
             gateway=self.gateway,
             config=self.config
         )
+        self.reflect_tracker = ReflectTracker(
+            db_service=self.db_service,
+            gateway=self.gateway,
+            config=self.config,
+        )
+        self.review_service = ExpressionReviewService(self.db_service)
+        self.auto_check_task = ExpressionAutoCheckTask(
+            db_service=self.db_service,
+            gateway=self.gateway,
+            tracker=self.reflect_tracker,
+            config=self.config,
+        )
         
         self.proactive_task = ProactiveTask(
             context=context,
@@ -171,10 +186,38 @@ class AstrMaiPlugin(Star):
             reflector=self.reflector,  # Phase 4 娉ㄥ叆
             config=self.config,
         )
+        self.proactive_task.auto_check_task = self.auto_check_task
+        self.proactive_task.reflect_tracker = self.reflect_tracker
         # Phase 7: 娉ㄥ叆 db_service锛堝欢杩熷埌 start() 鍓嶏級
         self.proactive_task.set_db_service(self.db_service)
 
         logger.info("[AstrMai] 鉁?Full Dual-Process Architecture Ready (Phases 1-7 Mounted).")
+
+    async def list_pending_expression_reviews(self, group_id: str = "", limit: int = 50):
+        return await self.review_service.list_pending_reviews(group_id=group_id or None, limit=limit)
+
+    async def get_expression_review_detail(self, pattern_id: int):
+        return await self.review_service.get_review_detail(pattern_id)
+
+    async def submit_expression_review(
+        self,
+        pattern_id: int,
+        decision: str,
+        reviewer_id: str,
+        replacement_expression: str = "",
+        style: str = "",
+        reason: str = "",
+        weight_delta: float = 0.0,
+    ):
+        return await self.review_service.submit_review(
+            pattern_id=pattern_id,
+            decision=decision,
+            reviewer_id=reviewer_id,
+            replacement_expression=replacement_expression,
+            style=style or None,
+            reason=reason,
+            weight_delta=weight_delta,
+        )
 
     async def _update_user_stats(self, user_id: str):
         await self.state_engine.increment_user_message_count(user_id)
@@ -561,6 +604,12 @@ class AstrMaiPlugin(Star):
         user_id = event.get_sender_id()
         if user_id:
             self._fire_and_forget(self._update_user_stats(user_id))
+
+        if hasattr(self, "reflect_tracker") and self.reflect_tracker:
+            review_feedback = await self.reflect_tracker.try_consume_feedback(event)
+            if review_feedback:
+                yield event.plain_result(review_feedback)
+                return
             
         await self.evolution.record_user_message(event)
         

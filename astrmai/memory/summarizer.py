@@ -300,6 +300,8 @@ class ChatHistorySummarizer:
                 importance=int(importance * 10),
                 emotional_intensity=int(importance * 10),
                 reflection=reflection,
+                memory_kind="topic" if valid_topics else "fact",
+                source_layer="topic" if valid_topics else "fact",
                 tags=json.dumps(valid_topics)
             )
             

@@ -27,6 +27,19 @@ class ExpressionPattern(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     situation: str = Field(index=True)  
     expression: str                     
+    style: str = Field(default="")
+    content_list: str = Field(default="[]")
+    count: int = Field(default=1)
+    checked: bool = Field(default=False, index=True)
+    rejected: bool = Field(default=False, index=True)
+    modified_by: str = Field(default="")
+    source: str = Field(default="learning")
+    shared_scope: str = Field(default="")
+    think_level: int = Field(default=0)
+    review_status: str = Field(default="pending", index=True)
+    review_reason: str = Field(default="")
+    review_suggestion: str = Field(default="")
+    last_review_time: float = Field(default=0.0)
     weight: float = Field(default=1.0)  
     last_active_time: float = Field(default_factory=time.time)
     create_time: float = Field(default_factory=time.time)
@@ -124,7 +137,11 @@ class UserProfile:
 
     # [Phase 8.2] 分类记忆点 (参考 MaiBot Person.memory_points)
     # 格式: "分类:内容:权重"，例: ["爱好:喜欢打游戏:0.8", "口头禅:经常说'确实':0.6"]
-    memory_points: List[str] = field(default_factory=list)
+    memory_points: List[Any] = field(default_factory=list)
+    identity_points: List[str] = field(default_factory=list)
+    preference_points: List[str] = field(default_factory=list)
+    relationship_points: List[str] = field(default_factory=list)
+    speech_style_points: List[str] = field(default_factory=list)
 
     #运行时字段
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -204,8 +221,26 @@ class MemoryEvent(SQLModel, table=True):
     importance: int = Field(default=5)
     emotional_intensity: int = Field(default=5)
     reflection: str = Field(default="")
+    memory_kind: str = Field(default="event", index=True)
+    source_layer: str = Field(default="fact", index=True)
     tags: str = Field(default="[]") # JSON string list
     created_at: float = Field(default_factory=time.time)
+
+class MemoryRetrievalTrace(SQLModel, table=True):
+    """[鏂板] 璁板繂妫€绱㈣建杩硅〃"""
+    __table_args__ = {"extend_existing": True}
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trace_id: str = Field(index=True, unique=True)
+    chat_id: str = Field(index=True)
+    sender_name: str = Field(default="")
+    query: str = Field(default="")
+    planner_question: str = Field(default="")
+    tool_calls: str = Field(default="[]")
+    selected_memory_ids: str = Field(default="[]")
+    final_answer: str = Field(default="")
+    source_layers: str = Field(default="[]")
+    confidence: float = Field(default=0.0)
+    created_at: float = Field(default_factory=time.time, index=True)
 
 class CronSnapshot(SQLModel, table=True):
     """

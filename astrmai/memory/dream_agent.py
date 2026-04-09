@@ -49,6 +49,8 @@ class DreamAgent:
         "merge_memories":   "将多条冗余记忆合并为一条精华记忆，参数: {event_ids: [str], new_narrative: str}",
         "update_memory":    "重写/精简某条记忆内容，参数: {event_id: str, new_narrative: str}",
         "delete_memory":    "删除噪声或过时记忆，参数: {event_id: str, reason: str}",
+        "search_jargon":    "读取当前会话相关黑话词条，参数: {query: str='', limit: int=5}",
+        "suggest_jargon_review": "提出黑话治理建议（只读，不直接修改词库），参数: {words: [str], reason: str}",
         "finish_dream":     "结束本次整理循环，参数: {summary: str}",
     }
 
@@ -178,6 +180,10 @@ class DreamAgent:
                 return await self._tool_update(params)
             elif tool_name == "delete_memory":
                 return await self._tool_delete(params)
+            elif tool_name == "search_jargon":
+                return await self._tool_search_jargon(params, session_id)
+            elif tool_name == "suggest_jargon_review":
+                return await self._tool_suggest_jargon_review(params)
             elif tool_name == "finish_dream":
                 return "整理循环结束"
             else:
@@ -248,6 +254,41 @@ class DreamAgent:
             return f"已删除记忆 {event_id} (原因: {reason})"
         except Exception as e:
             return f"删除失败: {e}"
+
+    async def _tool_search_jargon(self, params: Dict, session_id: str) -> str:
+        query = str(params.get("query", "") or "").strip()
+        limit = int(params.get("limit", 5) or 5)
+        if not self.db:
+            return "黑话词库不可用"
+        try:
+            if query and hasattr(self.db, "search_jargons"):
+                items = self.db.search_jargons(query, limit=limit)
+            elif hasattr(self.db, "get_jargons"):
+                items = self.db.get_jargons(session_id, limit=limit, only_confirmed=True)
+            else:
+                items = []
+            if not items:
+                return "未找到相关黑话"
+            lines = []
+            for item in items[:limit]:
+                text = getattr(item, "content", "")
+                meaning = getattr(item, "meaning", "")
+                count = getattr(item, "count", 0)
+                if text:
+                    lines.append(f"{text}: {meaning or '含义待补全'} (频次:{count})")
+            return "\n".join(lines) if lines else "未找到相关黑话"
+        except Exception as exc:
+            return f"黑话检索失败: {exc}"
+
+    async def _tool_suggest_jargon_review(self, params: Dict) -> str:
+        words = params.get("words", []) or []
+        reason = str(params.get("reason", "") or "疑似低价值或含义漂移")
+        if not isinstance(words, list):
+            words = [str(words)]
+        normalized = [str(word).strip() for word in words if str(word).strip()]
+        if not normalized:
+            return "未提供需要建议复核的黑话"
+        return "建议复核黑话: " + "、".join(normalized[:6]) + f" | 原因: {reason}"
 
     # ==========================================
     # DB 辅助

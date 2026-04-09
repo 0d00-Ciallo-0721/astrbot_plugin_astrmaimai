@@ -109,3 +109,49 @@ class DreamGenerator:
     def get_random_style(self) -> str:
         """获取随机风格名称"""
         return random.choice(self.DREAM_STYLES)
+
+    @staticmethod
+    def build_maintenance_result(dream_log: str, session_id: str = "global") -> dict:
+        actions = []
+        tags = []
+        merge_actions = []
+        delete_actions = []
+        update_actions = []
+        jargon_suggestions = []
+        for line in str(dream_log).splitlines():
+            normalized = line.strip()
+            if not normalized:
+                continue
+            if normalized.startswith("[行动]"):
+                actions.append(normalized)
+                if "merge" in normalized:
+                    tags.append("merge")
+                    merge_actions.append(normalized)
+                elif "delete" in normalized:
+                    tags.append("delete")
+                    delete_actions.append(normalized)
+                elif "update" in normalized:
+                    tags.append("update")
+                    update_actions.append(normalized)
+                elif "search" in normalized:
+                    tags.append("search")
+                elif "suggest_jargon_review" in normalized:
+                    tags.append("jargon_review")
+                    jargon_suggestions.append(normalized)
+        action_count = len(actions)
+        summary = (
+            f"session={session_id} 的 dream maintenance 完成，共执行 {action_count} 次维护动作。"
+            if action_count
+            else f"session={session_id} 的 dream maintenance 完成，本轮未产生显式维护动作。"
+        )
+        return {
+            "session_id": session_id,
+            "summary": summary,
+            "actions": actions[:12],
+            "consolidation_summary": merge_actions[:4],
+            "memory_merge_result": merge_actions[-1] if merge_actions else "",
+            "deletion_rationale": delete_actions[:4],
+            "update_actions": update_actions[:4],
+            "jargon_suggestions": jargon_suggestions[:4],
+            "tags": sorted(set(tags)),
+        }

@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 import re          # [新增] 导入正则表达式库
 import json        # [新增] 导入 JSON 解析库
 import asyncio     # [新增] 导入异步库
+import time
 from astrbot.api import logger
 import asyncio
 import hashlib
@@ -177,6 +178,25 @@ class ContextEngine:
                                 ">>> [关于TA的记忆点] <<<\n"
                                 + "\n".join(mp_lines) + "\n"
                             )
+
+                    structured_lines = []
+                    category_map = [
+                        ("identity_points", "身份画像"),
+                        ("preference_points", "偏好画像"),
+                        ("relationship_points", "关系画像"),
+                        ("speech_style_points", "表达画像"),
+                    ]
+                    for key, label in category_map:
+                        values = profile_data.get(key, [])
+                        if isinstance(values, list) and values:
+                            structured_lines.append(f"【{label}】" + "；".join(str(v) for v in values[:4]))
+                    structured_profile_block = ""
+                    if structured_lines:
+                        structured_profile_block = (
+                            ">>> [结构化人物记忆] <<<\n"
+                            + "\n".join(structured_lines)
+                            + "\n"
+                        )
                     
                     private_chat_block = (
                         ">>> [私密对话模式激活] <<<\n"
@@ -184,6 +204,7 @@ class ContextEngine:
                         ">>> [用户深度画像检索] <<<\n"
                         f"【属性】：{tags_str}\n"
                         f"【深度侧写】：{analysis}\n"
+                        f"{structured_profile_block}"
                         f"{memory_points_block}"
                         "请基于上述画像，使用最符合对方认知的语境进行交流。\n\n"
                     )

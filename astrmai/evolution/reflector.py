@@ -123,7 +123,13 @@ class ExpressionReflector:
         self._last_audit_time = now
 
         try:
-            patterns = self.db.get_patterns(group_id, limit=200)
+            patterns = self.db.get_patterns(
+                group_id,
+                limit=200,
+                only_checked=True,
+                include_rejected=False,
+                review_status="approved",
+            )
             if len(patterns) < 10:
                 return
 
@@ -131,8 +137,15 @@ class ExpressionReflector:
             low_weight_count = 0
             for p in patterns:
                 weight = getattr(p, 'weight', 1.0)
-                if weight < self.WEIGHT_FLOOR and hasattr(self.db, 'delete_pattern'):
-                    self.db.delete_pattern(p.id if hasattr(p, 'id') else None)
+                if weight < self.WEIGHT_FLOOR and hasattr(self.db, 'update_pattern_review'):
+                    self.db.update_pattern_review(
+                        getattr(p, "id", 0),
+                        checked=False,
+                        rejected=True,
+                        modified_by="ai",
+                        review_status="rejected",
+                        weight_delta=-0.2,
+                    )
                     low_weight_count += 1
 
             # 2. 相似度去重
@@ -160,8 +173,15 @@ class ExpressionReflector:
             dup_count = 0
             for p in remaining:
                 if id(p) in to_remove_ids:
-                    if hasattr(self.db, 'delete_pattern') and hasattr(p, 'id'):
-                        self.db.delete_pattern(p.id)
+                    if hasattr(self.db, 'update_pattern_review') and hasattr(p, 'id'):
+                        self.db.update_pattern_review(
+                            p.id,
+                            checked=False,
+                            rejected=True,
+                            modified_by="ai",
+                            review_status="rejected",
+                            weight_delta=-0.2,
+                        )
                         dup_count += 1
 
             total_cleaned = low_weight_count + dup_count

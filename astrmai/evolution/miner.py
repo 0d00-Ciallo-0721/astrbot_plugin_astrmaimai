@@ -259,3 +259,117 @@ class ExpressionMiner:
             logger.debug(f"[Evolution] 黑话推断解析失败: {e}")
             
         return []
+
+    def _build_joint_prompt(self, context_str: str) -> str:
+        return f"""
+{context_str}
+
+请同时完成两项抽取：
+1. expressions：用户的“情境 -> 表达习惯”
+2. jargons：聊天中反复出现的黑话、简称、梗词和它们的含义
+
+严格返回 JSON：
+{{
+  "expressions": [
+    {{
+      "situation": "什么情境下会这样说",
+      "expression": "常见表达",
+      "style": "风格标签",
+      "content_samples": ["原句1", "原句2"],
+      "think_level": 0
+    }}
+  ],
+  "jargons": [
+    {{
+      "content": "词条",
+      "raw_content": "上下文原句",
+      "meaning": "词义解释",
+      "is_jargon": true,
+      "is_complete": true
+    }}
+  ]
+}}
+"""
+
+    def _build_pattern(self, group_id: str, item: Dict[str, Any]) -> ExpressionPattern:
+        samples = item.get("content_samples", [])
+        if not isinstance(samples, list):
+            samples = []
+        return ExpressionPattern(
+            situation=str(item.get("situation", "")).strip(),
+            expression=str(item.get("expression", "")).strip(),
+            style=str(item.get("style", "")).strip(),
+            content_list=json.dumps([str(sample).strip() for sample in samples if str(sample).strip()][:8], ensure_ascii=False),
+            count=max(len(samples), 1),
+            checked=False,
+            rejected=False,
+            modified_by="ai",
+            source="joint_mining",
+            shared_scope=str(item.get("shared_scope", "")).strip(),
+            think_level=int(item.get("think_level", 0) or 0),
+            review_status="pending",
+            weight=1.0,
+            last_active_time=time.time(),
+            create_time=time.time(),
+            group_id=group_id,
+        )
+
+    def _build_jargon(self, group_id: str, item: Dict[str, Any]) -> Jargon:
+        return Jargon(
+            content=str(item.get("content", "")).strip(),
+            raw_content=str(item.get("raw_content", "")).strip(),
+            meaning=str(item.get("meaning", "")).strip(),
+            is_jargon=bool(item.get("is_jargon", False)),
+            is_complete=bool(item.get("is_complete", False)),
+            group_id=group_id,
+            created_at=time.time(),
+            updated_at=time.time(),
+        )
+
+    async def mine_bundle(self, group_id: str, messages: List[MessageLog]) -> Dict[str, List[Any]]:
+        min_mining_context = getattr(self.config.evolution, "min_mining_context", 10)
+        if len(messages) < min_mining_context:
+            return {"patterns": [], "jargons": []}
+
+        context_str = self._build_context(messages)
+        if not context_str.strip():
+            return {"patterns": [], "jargons": []}
+
+        result = await self.gateway.call_data_process_task(
+            prompt=self._build_joint_prompt(context_str),
+            is_json=True,
+            lane_key=self._reflect_lane(group_id),
+            base_origin="",
+        )
+        if isinstance(result, str):
+            parsed = self._parse_json(result)
+            result = parsed if isinstance(parsed, dict) else {}
+        if not isinstance(result, dict):
+            result = {}
+
+        patterns: List[ExpressionPattern] = []
+        for item in result.get("expressions", []):
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("situation", "")).strip() or not str(item.get("expression", "")).strip():
+                continue
+            patterns.append(self._build_pattern(group_id, item))
+
+        jargons: List[Jargon] = []
+        for item in result.get("jargons", []):
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("content", "")).strip() or not str(item.get("raw_content", "")).strip():
+                continue
+            jargons.append(self._build_jargon(group_id, item))
+
+        logger.info(f"[Evolution-Miner] 联合抽取完成: {group_id} -> expressions={len(patterns)}, jargons={len(jargons)}")
+        return {"patterns": patterns, "jargons": jargons}
+
+    async def mine(self, group_id: str, messages: List[MessageLog]) -> List[ExpressionPattern]:
+        bundle = await self.mine_bundle(group_id, messages)
+        return bundle.get("patterns", [])
+
+    async def mine_jargons(self, group_id: str, messages: List[MessageLog]) -> List[Jargon]:
+        bundle = await self.mine_bundle(group_id, messages)
+        return bundle.get("jargons", [])

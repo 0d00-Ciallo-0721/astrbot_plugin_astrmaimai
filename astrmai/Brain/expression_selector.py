@@ -189,3 +189,85 @@ class ExpressionSelector:
         result = "\n".join(lines)
         logger.debug(f"[ExpressionSelector] 💬 注入 {len(patterns)} 条表达习惯")
         return result
+
+    async def select(
+        self,
+        chat_id: str,
+        context_text: str = "",
+        think_level: int = 0,
+        shared_scope: Optional[str] = None,
+    ) -> str:
+        try:
+            if think_level <= 0:
+                return await self._fast_select(chat_id, shared_scope=shared_scope, think_level=think_level)
+            return await self._deep_select(
+                chat_id,
+                context_text,
+                shared_scope=shared_scope,
+                think_level=think_level,
+            )
+        except Exception as e:
+            logger.warning(f"[ExpressionSelector] 选择表达习惯失败: {e}")
+            return ""
+
+    async def _fast_select(self, chat_id: str, shared_scope: Optional[str] = None, think_level: int = 0) -> str:
+        patterns = await asyncio.to_thread(
+            self.db.get_patterns,
+            chat_id,
+            20,
+            True,
+            False,
+            shared_scope,
+            think_level,
+            "approved",
+        )
+        if not patterns:
+            return ""
+        return self._format_habits(patterns[: min(self.FAST_SELECT_LIMIT, len(patterns))])
+
+    async def _deep_select(
+        self,
+        chat_id: str,
+        context_text: str,
+        shared_scope: Optional[str] = None,
+        think_level: int = 1,
+    ) -> str:
+        top_patterns = await asyncio.to_thread(
+            self.db.get_patterns,
+            chat_id,
+            5,
+            True,
+            False,
+            shared_scope,
+            think_level,
+            "approved",
+        )
+        all_patterns = await asyncio.to_thread(
+            self.db.get_patterns,
+            chat_id,
+            50,
+            True,
+            False,
+            shared_scope,
+            think_level,
+            "approved",
+        )
+        if not top_patterns and not all_patterns:
+            return ""
+
+        seen = set()
+        candidates = []
+        for pattern in [*top_patterns, *all_patterns]:
+            key = (pattern.situation, pattern.expression)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(pattern)
+            if len(candidates) >= self.DEEP_CANDIDATE_LIMIT:
+                break
+
+        if len(candidates) <= 3 or not context_text:
+            return self._format_habits(candidates[:3])
+
+        selected = await self._llm_pick_best(chat_id, candidates, context_text)
+        return self._format_habits(selected)

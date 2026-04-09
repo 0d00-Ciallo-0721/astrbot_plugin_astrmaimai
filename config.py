@@ -69,6 +69,11 @@ class EvolutionConfig(BaseModel):
     min_mining_context: int = Field(default=10)
     batch_size: int = Field(default=50)
     mining_trigger: int = Field(default=20)
+    mining_window_sec: int = Field(default=60, description="学习触发的时间窗长度(秒)")
+    mining_window_min_messages: int = Field(default=20, description="单个时间窗内触发学习所需的最少消息数")
+    mining_cooldown_sec: int = Field(default=60, description="同一会话两次学习触发之间的冷却时间(秒)")
+    review_batch_size: int = Field(default=10, description="每轮自动审核表达条目的最大数量")
+    review_min_count: int = Field(default=2, description="表达进入自动审核前所需的最少命中次数")
     enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
     enable_relationship_engine: bool = Field(default=True, description="启动好感度四维关系图谱推演")
 
@@ -79,6 +84,10 @@ class LifeConfig(BaseModel):
     wakeup_cooldown: int = Field(default=28800)
     profiling_msg_threshold: int = Field(default=50)
     dream_interval_min: int = Field(default=30, description="后台触发梦境整理记忆的周期(分钟)")
+    dream_time_ranges: List[str] = Field(default_factory=list, description="允许触发 dream 的时间段列表，格式 HH:MM-HH:MM")
+    min_memory_events_to_dream: int = Field(default=5, description="进入 dream 整理前需要的最少长期记忆事件数")
+    dream_visible: bool = Field(default=False, description="是否将梦境文本主动发送给指定会话")
+    dream_send_target: str = Field(default="", description="梦境可见时的目标会话 ID，留空则发送回当前 dream session")
     
 class ReplyConfig(BaseModel):
     fallback_text: str = Field(default="（陷入了短暂的沉默...）")

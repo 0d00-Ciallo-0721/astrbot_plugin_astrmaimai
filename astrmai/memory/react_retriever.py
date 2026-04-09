@@ -269,15 +269,28 @@ class ReActRetriever:
                 analysis = data.get("persona_analysis", "暂无")
                 tags = data.get("tags", [])
                 score = data.get("social_score", 0)
+                identity_points = data.get("identity_points", []) or []
+                preference_points = data.get("preference_points", []) or []
+                relationship_points = data.get("relationship_points", []) or []
+                speech_style_points = data.get("speech_style_points", []) or []
                 if profile_name and nickname and nickname != profile_name:
                     display_name = f"{profile_name} ({nickname})"
                 else:
                     display_name = nickname or profile_name or uid
-                return (
+                sections = [
                     f"姓名: {display_name}, 好感度: {score}, "
                     f"标签: {', '.join(tags) if tags else '无'}, "
                     f"侧写: {analysis}"
-                )
+                ]
+                if identity_points:
+                    sections.append(f"身份记忆: {'；'.join(identity_points[:3])}")
+                if preference_points:
+                    sections.append(f"偏好记忆: {'；'.join(preference_points[:3])}")
+                if relationship_points:
+                    sections.append(f"关系记忆: {'；'.join(relationship_points[:3])}")
+                if speech_style_points:
+                    sections.append(f"说话风格: {'；'.join(speech_style_points[:3])}")
+                return "\n".join(sections)
             return f"未找到关于 '{name}' 的档案"
         except Exception as e:
             logger.debug(f"[ReAct] query_person 异常: {e}")
@@ -337,3 +350,207 @@ class ReActRetriever:
                 except json.JSONDecodeError:
                     pass
         return {}
+
+    async def _save_trace(
+        self,
+        chat_id: str,
+        sender_name: str,
+        query: str,
+        planner_question: str,
+        collected_info: List[Dict[str, str]],
+        final_answer: str,
+    ):
+        if not self.db_service or not hasattr(self.db_service, "save_retrieval_trace_async"):
+            return
+        try:
+            import uuid
+            from ..infra.datamodels import MemoryRetrievalTrace
+
+            selected_memory_ids = []
+            source_layers = []
+            for item in collected_info:
+                tool_name = str(item.get("tool", ""))
+                if tool_name:
+                    source_layers.append(tool_name.replace("query_", ""))
+                result_text = str(item.get("result", ""))
+                selected_memory_ids.extend(re.findall(r"evt_[a-zA-Z0-9_]+", result_text))
+
+            trace = MemoryRetrievalTrace(
+                trace_id=f"trace_{uuid.uuid4().hex[:12]}",
+                chat_id=chat_id,
+                sender_name=sender_name,
+                query=query,
+                planner_question=planner_question,
+                tool_calls=json.dumps(collected_info, ensure_ascii=False),
+                selected_memory_ids=json.dumps(sorted(set(selected_memory_ids)), ensure_ascii=False),
+                final_answer=final_answer[:800],
+                source_layers=json.dumps(sorted(set(source_layers)), ensure_ascii=False),
+                confidence=0.8 if final_answer else 0.0,
+            )
+            await self.db_service.save_retrieval_trace_async(trace)
+        except Exception as exc:
+            logger.debug(f"[ReAct] 保存检索轨迹失败: {exc}")
+
+    @staticmethod
+    def _format_trace_meta(collected_info: List[Dict[str, str]]) -> tuple[List[str], str]:
+        layers = sorted(
+            {
+                str(item.get("tool", "")).replace("query_", "")
+                for item in collected_info
+                if item.get("tool")
+            }
+        )
+        if not layers:
+            return [], "低"
+
+        layer_alias = {
+            "memory": "长期记忆",
+            "person": "人物记忆",
+            "jargon": "黑话记忆",
+            "nodes": "节点记忆",
+        }
+        readable_layers = [layer_alias.get(layer, layer) for layer in layers]
+        if len(layers) >= 3:
+            confidence = "高"
+        elif len(layers) == 2:
+            confidence = "中"
+        else:
+            confidence = "中"
+        return readable_layers, confidence
+
+    async def retrieve(
+        self, query: str, chat_id: str,
+        chat_context: str = "", sender_name: str = "",
+        retrieve_keys: list = None
+    ) -> str:
+        if not self.gateway:
+            return ""
+
+        enable = getattr(self.config, 'memory', None)
+        if enable and hasattr(enable, 'enable_react_agent') and not enable.enable_react_agent:
+            return ""
+
+        if retrieve_keys:
+            valid_keys = [k for k in retrieve_keys if k not in ["ALL", "CORE_ONLY"]]
+            question = f"{query} (请优先回忆这些维度：{', '.join(valid_keys)})" if valid_keys else query
+        else:
+            question = await self._generate_question(query, chat_id, chat_context, sender_name)
+            if not question:
+                return ""
+
+        collected_info: List[Dict[str, str]] = []
+        final_answer = ""
+        for iteration in range(self.MAX_ITERATIONS):
+            action = await self._react_step(question, chat_id, collected_info, is_last_round=(iteration == self.MAX_ITERATIONS - 1))
+            if not action:
+                break
+            tool_name = action.get("tool", "")
+            tool_args = action.get("args", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+
+            if tool_name == "found_answer":
+                answer = str(tool_args.get("answer", "")).strip()
+                if answer:
+                    final_answer = f"记忆检索结果: {answer}"
+                break
+
+            tool_func = self._tools.get(tool_name)
+            if tool_func:
+                try:
+                    result = await tool_func(chat_id=chat_id, **tool_args)
+                except Exception as exc:
+                    result = f"工具调用失败: {exc}"
+                collected_info.append(
+                    {
+                        "tool": tool_name,
+                        "query": json.dumps(tool_args, ensure_ascii=False),
+                        "result": result or "未找到相关信息",
+                    }
+                )
+
+        if not final_answer and collected_info:
+            summary = "\n".join(f"- [{c['tool']}] {c['result'][:200]}" for c in collected_info)
+            final_answer = f"记忆检索参考(信息可能不完整):\n{summary}"
+
+        if final_answer and collected_info:
+            readable_layers, confidence = self._format_trace_meta(collected_info)
+            if readable_layers:
+                memory_types = "、".join(readable_layers)
+                meta_block = (
+                    "\n[记忆元信息]\n"
+                    f"- 记忆类型: {memory_types}\n"
+                    f"- 来源层: {', '.join(readable_layers)}\n"
+                    f"- 置信度: {confidence}"
+                )
+                if "[记忆元信息]" not in final_answer:
+                    final_answer = f"{final_answer}{meta_block}"
+
+        await self._save_trace(
+            chat_id=chat_id,
+            sender_name=sender_name,
+            query=query,
+            planner_question=question,
+            collected_info=collected_info,
+            final_answer=final_answer,
+        )
+        return final_answer
+
+    async def _generate_question(
+        self, query: str, chat_id: str, chat_context: str, sender_name: str
+    ) -> Optional[str]:
+        prompt = f"""你正在参与聊天。分析以下内容，判断是否需要从记忆中检索信息。
+聊天上下文:
+{chat_context[-1500:]}
+
+当前消息 ({sender_name}): {query}
+
+如果需要回忆，请返回一个最关键的检索问题；否则返回 need_search=false。
+返回 JSON: {{"need_search": true/false, "question": "问题文本"}}"""
+        try:
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=self._retrieval_lane(chat_id),
+                base_origin=chat_id,
+            )
+            data = self._safe_parse_json(result)
+            if data.get("need_search") and data.get("question"):
+                return str(data["question"])
+        except Exception as exc:
+            logger.debug(f"[ReAct] 生成检索问题失败: {exc}")
+        return None
+
+    async def _react_step(
+        self, question: str, chat_id: str, collected_info: List[Dict],
+        is_last_round: bool = False
+    ) -> Optional[Dict]:
+        info_text = "暂无已收集信息。" if not collected_info else "\n".join(
+            f"[{c['tool']}] 查询: {c['query']} -> 结果: {c['result'][:300]}" for c in collected_info
+        )
+        force_end = "\n这是最后一轮，你必须调用 found_answer 给出最终答案。" if is_last_round else ""
+        prompt = f"""当前问题: {question}
+
+已收集信息:
+{info_text}
+
+可用工具:
+- query_memory(query)
+- query_person(name)
+- query_jargon(word)
+- query_nodes(keyword)
+- found_answer(answer)
+{force_end}
+
+严格返回 JSON: {{"thinking":"...", "tool":"...", "args":{{}}}}"""
+        try:
+            result = await self.gateway.call_data_process_task(
+                prompt,
+                is_json=True,
+                lane_key=self._retrieval_lane(chat_id),
+                base_origin=chat_id,
+            )
+            return self._safe_parse_json(result)
+        except Exception as exc:
+            logger.debug(f"[ReAct] ReAct step 失败: {exc}")
+        return None
