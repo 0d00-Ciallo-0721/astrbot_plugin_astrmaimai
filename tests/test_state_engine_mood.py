@@ -35,6 +35,8 @@ class StateEngineMoodTests(unittest.TestCase):
         _install_astrbot_stubs(self.temp_dir.name)
         _install_gateway_stub()
         _install_heart_package_stubs()
+        sys.modules.pop("astrmai.infra.datamodels", None)
+        sys.modules.pop("astrmai.infra.persistence", None)
         sys.modules.pop("astrmai.Heart", None)
         sys.modules.pop("astrmai.Heart.mood_manager", None)
         sys.modules.pop("astrmai.Heart.state_engine", None)

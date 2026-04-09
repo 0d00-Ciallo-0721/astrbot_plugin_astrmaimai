@@ -28,7 +28,12 @@ class PromptRefiner:
         if disable_rag or is_fast_mode:
             return ""
 
-        current_query = event.message_str
+        current_query = str(
+            event.get_extra("astrmai_focus_message_text", "")
+            or event.get_extra("astrmai_raw_user_text", "")
+            or event.message_str
+            or ""
+        ).strip()
         if not current_query:
             return ""
 
@@ -118,6 +123,14 @@ class PromptRefiner:
         retrieve_keys = event.get_extra("retrieve_keys", [])
         recent_transcript = str(event.get_extra("astrmai_recent_transcript", "") or "").strip()
         raw_user_text = str(event.get_extra("astrmai_raw_user_text", prompt) or prompt).strip()
+        focus_thread_text = str(event.get_extra("astrmai_focus_thread_text", "") or "").strip()
+        background_window_text = str(
+            event.get_extra("astrmai_ambient_background_text", "")
+            or event.get_extra("astrmai_background_window_text", "")
+            or ""
+        ).strip()
+        focus_reason = str(event.get_extra("astrmai_focus_reason", "") or "").strip()
+        focus_thread_reason = str(event.get_extra("astrmai_focus_thread_reason", "") or focus_reason).strip()
         near_context_priority = bool(event.get_extra("astrmai_near_context_priority", False))
         use_lane_history = bool(event.get_extra("astrmai_use_lane_history", False))
         is_fast_mode = "CORE_ONLY" in retrieve_keys
@@ -131,7 +144,17 @@ class PromptRefiner:
         )
 
         history_block = recent_transcript or "（暂无最近对话记录）"
-        current_block = raw_user_text or prompt
+        focus_block = focus_thread_text or raw_user_text or prompt
+        if background_window_text and near_context_priority:
+            background_lines = [line for line in background_window_text.splitlines() if line.strip()]
+            background_window_text = "\n".join(background_lines[-1:])
+
+        current_sections = []
+        if focus_block:
+            current_sections.append(f"[本轮主线程（优先围绕它回答）]\n{focus_block}")
+        if background_window_text:
+            current_sections.append(f"[环境背景，仅供参考]\n{background_window_text}")
+        current_block = "\n\n".join(current_sections) if current_sections else (focus_block or prompt)
 
         final_system_prompt = re.sub(
             r"<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}",
@@ -150,8 +173,13 @@ class PromptRefiner:
         )
         final_system_prompt = await self._resolve_visual_memory(final_system_prompt)
 
-        visual_current_block = await self._resolve_visual_memory(current_block)
-        prompt_lines = [visual_current_block]
+        visual_focus_block = await self._resolve_visual_memory(focus_block)
+        prompt_lines = []
+        if visual_focus_block:
+            prompt_lines.append(f"[本轮主线程（优先围绕它回答）]\n{visual_focus_block}")
+        if background_window_text:
+            visual_background_block = await self._resolve_visual_memory(background_window_text)
+            prompt_lines.append(f"[环境背景，仅供参考]\n{visual_background_block}")
         if not is_fast_mode:
             prompt_lines.append("请直接接住上一轮语义继续说，不要重启话题。")
         final_prompt = "\n\n".join(line for line in prompt_lines if line).strip()
@@ -159,8 +187,12 @@ class PromptRefiner:
         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
             logger.debug(
                 f"[{event.unified_msg_origin}] PromptRefiner preview "
-                f"raw_user_text={current_block[:120]!r} "
+                f"raw_user_text={raw_user_text[:120]!r} "
+                f"focus_thread={focus_block[:160]!r} "
+                f"background={background_window_text[:120]!r} "
                 f"recent_transcript={history_block[:160]!r} "
+                f"focus_reason={focus_reason!r} "
+                f"focus_thread_reason={focus_thread_reason!r} "
                 f"near_context_priority={near_context_priority}"
             )
 

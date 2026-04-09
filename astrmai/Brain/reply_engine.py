@@ -250,7 +250,9 @@ class ReplyEngine:
         
         _bypassed_tag = bypassed_tag or event.get_extra("astrmai_bypass_mood_analysis", None)
         _window_events = window_events if window_events is not None else event.get_extra("astrmai_window_events", [])
-        _anchor_event = anchor_event or event.get_extra("astrmai_anchor_event", None)
+        _thread_root_event = event.get_extra("astrmai_focus_thread_root_event", None)
+        _focus_event = event.get_extra("astrmai_focus_event", None)
+        _anchor_event = anchor_event or _thread_root_event or _focus_event or event.get_extra("astrmai_anchor_event", None)
 
         try:
             state = await self.state_engine.get_state(chat_id)
@@ -297,6 +299,12 @@ class ReplyEngine:
                     
             else:
                 anchor_text = _anchor_event.message_str.strip() if _anchor_event else ""
+                if getattr(getattr(self.config, 'global_settings', None), 'debug_mode', False):
+                    logger.debug(
+                        f"[ReplyEngine] focus_anchor={anchor_text[:120]!r} "
+                        f"focus_reason={event.get_extra('astrmai_focus_reason', '')!r} "
+                        f"root_reason={event.get_extra('astrmai_focus_thread_root_reason', '')!r}"
+                    )
                 history_events = await self._fetch_history(chat_id, anchor_text, anchor_event=_anchor_event)
                 
                 target_user_id = AffectionRouter.route(

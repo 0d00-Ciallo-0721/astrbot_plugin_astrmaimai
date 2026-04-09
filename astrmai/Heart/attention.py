@@ -1,6 +1,7 @@
 import asyncio
+import re
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass, field
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
@@ -17,6 +18,25 @@ class SessionContext:
     accumulation_pool: List[Any] = field(default_factory=list)
     is_evaluating: bool = False
     last_active_time: float = field(default_factory=time.time) # [新增] 用于惰性 GC 追踪生命周期
+
+
+@dataclass
+class NormalizedEvent:
+    event: AstrMessageEvent
+    sender_id: str
+    sender_name: str
+    text: str
+    rich_text: str
+    timestamp: float
+    is_self: bool
+    is_reply_to_bot: bool
+    is_at_bot: bool
+    is_direct_wakeup: bool
+    is_near_context_query: bool
+    reply_target_sender_id: str = ""
+    reply_target_sender_name: str = ""
+    token_set: Set[str] = field(default_factory=set)
+    index: int = 0
 
 
 class AttentionGate:
@@ -89,6 +109,345 @@ class AttentionGate:
             # [新增] 每次获取时刷新活跃时间戳
             self.focus_pools[chat_id].last_active_time = time.time()
             return self.focus_pools[chat_id]
+
+    def _is_direct_wakeup_event(self, event: AstrMessageEvent, self_id: str) -> bool:
+        if not event:
+            return False
+        if event.get_extra("astrmai_group_direct_wakeup", False):
+            return True
+        if event.get_extra("astrmai_bonus_score", 0.0) >= 1.0:
+            return True
+        try:
+            return bool(self.sensors.is_wakeup_signal(event, self_id))
+        except Exception:
+            return False
+
+    def _is_at_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
+        if not event or not getattr(event, "message_obj", None) or not getattr(event.message_obj, "message", None):
+            return False
+        for component in event.message_obj.message:
+            component_type = getattr(component, "type", component.__class__.__name__).lower()
+            if component_type != "at":
+                continue
+            target = str(getattr(component, "qq", "") or getattr(component, "target", "") or "")
+            if target and target == str(self_id):
+                return True
+        return False
+
+    def _is_reply_to_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
+        if not event or not getattr(event, "message_obj", None) or not getattr(event.message_obj, "message", None):
+            return False
+
+        bot_names = []
+        if hasattr(self.config, "system1") and getattr(self.config.system1, "nicknames", None):
+            bot_names = [str(name).strip() for name in self.config.system1.nicknames if str(name).strip()]
+
+        for component in event.message_obj.message:
+            component_type = getattr(component, "type", component.__class__.__name__).lower()
+            if component_type != "reply":
+                continue
+            reply_sender_id = str(getattr(component, "sender_id", "") or "")
+            reply_sender_name = str(
+                getattr(component, "sender_nickname", "")
+                or getattr(component, "sender_name", "")
+                or ""
+            ).strip()
+            if reply_sender_id and reply_sender_id == str(self_id):
+                return True
+            if reply_sender_name and reply_sender_name in bot_names:
+                return True
+        return False
+
+    @staticmethod
+    def _is_near_context_query_text(message_text: str) -> bool:
+        if not isinstance(message_text, str):
+            return False
+        normalized = message_text.strip()
+        if not normalized:
+            return False
+        trigger_phrases = [
+            "为什么", "哪里", "什么意思", "你刚刚", "刚刚说", "这个", "那个",
+            "上一个", "上一句", "不是这个", "为啥", "咋", "啥意思", "不可以",
+        ]
+        return any(phrase in normalized for phrase in trigger_phrases)
+
+    @staticmethod
+    def _tokenize_text(text: str) -> Set[str]:
+        if not isinstance(text, str):
+            return set()
+        normalized = re.sub(r"\[[^\]]+\]", " ", text.lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if not normalized:
+            return set()
+
+        tokens: Set[str] = set(re.findall(r"[a-z0-9_]{2,}", normalized))
+        for chunk in re.findall(r"[\u4e00-\u9fff]+", normalized):
+            if len(chunk) <= 4:
+                tokens.add(chunk)
+            else:
+                tokens.add(chunk)
+                tokens.update(chunk[idx:idx + 2] for idx in range(len(chunk) - 1))
+        return {token for token in tokens if token}
+
+    def _extract_reply_target(self, event: AstrMessageEvent) -> tuple[str, str]:
+        if not event or not getattr(event, "message_obj", None) or not getattr(event.message_obj, "message", None):
+            return "", ""
+
+        for component in event.message_obj.message:
+            component_type = getattr(component, "type", component.__class__.__name__).lower()
+            if component_type != "reply":
+                continue
+            target_id = str(getattr(component, "sender_id", "") or "")
+            target_name = str(
+                getattr(component, "sender_nickname", "")
+                or getattr(component, "sender_name", "")
+                or ""
+            ).strip()
+            return target_id, target_name
+        return "", ""
+
+    def _build_normalized_events(self, events: List[AstrMessageEvent], self_id: str) -> List[NormalizedEvent]:
+        normalized_events: List[NormalizedEvent] = []
+        for index, event in enumerate(events):
+            sender_id = str(event.get_sender_id())
+            sender_name = event.get_sender_name() or "群友/用户"
+            rich_text = str(event.get_extra("astrmai_rich_text", event.message_str) or "")
+            text = str(event.message_str or rich_text or "")
+            reply_target_sender_id, reply_target_sender_name = self._extract_reply_target(event)
+            is_at_bot = self._is_at_bot_event(event, self_id)
+
+            normalized_events.append(
+                NormalizedEvent(
+                    event=event,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    text=text,
+                    rich_text=rich_text,
+                    timestamp=float(event.get_extra("astrmai_timestamp", getattr(event, "timestamp", 0.0)) or 0.0),
+                    is_self=sender_id == str(self_id),
+                    is_reply_to_bot=self._is_reply_to_bot_event(event, self_id),
+                    is_at_bot=is_at_bot,
+                    is_direct_wakeup=self._is_direct_wakeup_event(event, self_id),
+                    is_near_context_query=self._is_near_context_query_text(text or rich_text),
+                    reply_target_sender_id=reply_target_sender_id,
+                    reply_target_sender_name=reply_target_sender_name,
+                    token_set=self._tokenize_text(rich_text or text),
+                    index=index,
+                )
+            )
+        return normalized_events
+
+    def _score_focus_candidate(
+        self,
+        candidate: NormalizedEvent,
+        normalized_events: List[NormalizedEvent],
+    ) -> tuple[int, str]:
+        if candidate.is_self:
+            return -10_000, "self_message"
+
+        score = 20
+        reason = "latest_user_message"
+        attention_config = getattr(self.config, "attention", None)
+        same_speaker_window = int(getattr(getattr(self.config, "attention", None), "thread_same_speaker_followup_sec", 8) or 8)
+        reply_priority_enabled = bool(getattr(attention_config, "thread_reply_priority_enabled", True))
+
+        if candidate.is_reply_to_bot and reply_priority_enabled:
+            score += 1000
+            reason = "reply_to_bot"
+        elif candidate.is_at_bot and reply_priority_enabled:
+            score += 800
+            reason = "at_bot"
+        elif candidate.is_direct_wakeup and reply_priority_enabled:
+            score += 700
+            reason = "direct_wakeup"
+        elif candidate.is_near_context_query:
+            score += 350
+            reason = "near_context_followup"
+
+        for previous in reversed(normalized_events[:candidate.index]):
+            if previous.is_self:
+                continue
+            if previous.sender_id != candidate.sender_id:
+                break
+            if candidate.timestamp and previous.timestamp and (candidate.timestamp - previous.timestamp) > same_speaker_window:
+                break
+            score += 120
+            if reason == "latest_user_message":
+                reason = "same_sender_followup"
+            break
+
+        recency_bonus = max(0, 90 - max(0, len(normalized_events) - candidate.index - 1) * 30)
+        score += recency_bonus
+        return score, reason
+
+    def _select_focus_event(self, events: List[AstrMessageEvent], self_id: str):
+        if not events:
+            return None, [], "empty"
+
+        attention_config = getattr(self.config, "attention", None)
+        if not bool(getattr(attention_config, "focus_thread_enabled", True)):
+            candidates = [event for event in events if str(event.get_sender_id()) != str(self_id)]
+            if not candidates:
+                focus_event = events[-1]
+                return focus_event, [event for event in events if event is not focus_event], "fallback_last_event"
+            for event in reversed(candidates):
+                if self._is_reply_to_bot_event(event, self_id):
+                    return event, [item for item in events if item is not event], "reply_to_bot"
+            for event in reversed(candidates):
+                if self._is_direct_wakeup_event(event, self_id):
+                    return event, [item for item in events if item is not event], "direct_wakeup"
+            focus_event = candidates[-1]
+            return focus_event, [item for item in events if item is not focus_event], "fallback_last_event"
+
+        normalized_events = self._build_normalized_events(events, self_id)
+        candidates = [candidate for candidate in normalized_events if not candidate.is_self]
+        if not candidates:
+            focus_event = events[-1]
+            return focus_event, [event for event in events if event is not focus_event], "fallback_last_event"
+
+        best_candidate = max(
+            candidates,
+            key=lambda candidate: (
+                self._score_focus_candidate(candidate, normalized_events)[0],
+                candidate.index,
+            ),
+        )
+        focus_reason = self._score_focus_candidate(best_candidate, normalized_events)[1]
+        focus_event = best_candidate.event
+        return focus_event, [item for item in events if item is not focus_event], focus_reason
+
+    def _resolve_thread_root(
+        self,
+        focus_candidate: NormalizedEvent,
+        normalized_events: List[NormalizedEvent],
+    ) -> tuple[Optional[NormalizedEvent], str]:
+        if focus_candidate.reply_target_sender_id or focus_candidate.reply_target_sender_name:
+            for previous in reversed(normalized_events[:focus_candidate.index]):
+                if focus_candidate.reply_target_sender_id and previous.sender_id == focus_candidate.reply_target_sender_id:
+                    return previous, "explicit_reply_target"
+                if focus_candidate.reply_target_sender_name and previous.sender_name == focus_candidate.reply_target_sender_name:
+                    return previous, "explicit_reply_target"
+            return None, "explicit_reply_target"
+
+        same_speaker_window = int(getattr(getattr(self.config, "attention", None), "thread_same_speaker_followup_sec", 8) or 8)
+        if focus_candidate.is_near_context_query:
+            return None, "recent_assistant_turn"
+
+        for previous in reversed(normalized_events[:focus_candidate.index]):
+            if previous.is_self:
+                continue
+            if previous.sender_id != focus_candidate.sender_id:
+                break
+            if focus_candidate.timestamp and previous.timestamp and (focus_candidate.timestamp - previous.timestamp) > same_speaker_window:
+                break
+            return previous, "same_sender_chain"
+        return focus_candidate, "self_root"
+
+    def _score_thread_relation(
+        self,
+        candidate: NormalizedEvent,
+        focus_candidate: NormalizedEvent,
+        root_candidate: Optional[NormalizedEvent],
+    ) -> int:
+        if candidate.event is focus_candidate.event:
+            return 10_000
+        if root_candidate and candidate.event is root_candidate.event:
+            return 9_000
+
+        score = 0
+        shared_tokens = set()
+        if candidate.token_set:
+            shared_tokens |= candidate.token_set & focus_candidate.token_set
+            if root_candidate:
+                shared_tokens |= candidate.token_set & root_candidate.token_set
+
+        if root_candidate and candidate.reply_target_sender_id:
+            if candidate.reply_target_sender_id == root_candidate.sender_id:
+                score += 100
+            elif focus_candidate.reply_target_sender_id and candidate.reply_target_sender_id == focus_candidate.reply_target_sender_id:
+                score += 85
+        if candidate.sender_id == focus_candidate.sender_id and candidate.index < focus_candidate.index:
+            same_speaker_window = int(getattr(getattr(self.config, "attention", None), "thread_same_speaker_followup_sec", 8) or 8)
+            if not candidate.timestamp or not focus_candidate.timestamp or (focus_candidate.timestamp - candidate.timestamp) <= same_speaker_window:
+                score += 40
+        if shared_tokens:
+            score += 25
+        if candidate.is_near_context_query and abs(candidate.index - focus_candidate.index) <= 1:
+            score += 25
+        if abs(candidate.index - focus_candidate.index) <= 1:
+            score += 15
+        return score
+
+    def _build_focus_thread(
+        self,
+        focus_candidate: NormalizedEvent,
+        root_candidate: Optional[NormalizedEvent],
+        normalized_events: List[NormalizedEvent],
+    ) -> dict:
+        core_events: List[AstrMessageEvent] = []
+        related_events: List[AstrMessageEvent] = []
+        ambient_events: List[AstrMessageEvent] = []
+        attention_config = getattr(self.config, "attention", None)
+        thread_enabled = bool(getattr(attention_config, "focus_thread_enabled", True))
+        core_limit = int(getattr(attention_config, "focus_thread_core_max_messages", 4) or 4)
+        related_limit = int(getattr(attention_config, "focus_thread_related_max_messages", 3) or 3)
+        ambient_limit = int(getattr(attention_config, "ambient_background_max_messages", 2) or 2)
+
+        def _append_unique(container: List[AstrMessageEvent], event: AstrMessageEvent, limit: Optional[int] = None):
+            if event in container:
+                return
+            if limit is not None and len(container) >= limit:
+                return
+            container.append(event)
+
+        _append_unique(core_events, focus_candidate.event, core_limit)
+        if root_candidate and root_candidate.event is not focus_candidate.event:
+            _append_unique(core_events, root_candidate.event, core_limit)
+
+        if not thread_enabled:
+            for candidate in normalized_events:
+                if candidate.event is focus_candidate.event:
+                    continue
+                _append_unique(ambient_events, candidate.event, ambient_limit)
+            return {
+                "focus_event": focus_candidate.event,
+                "root_event": root_candidate.event if root_candidate else None,
+                "core_events": core_events,
+                "related_events": related_events,
+                "ambient_events": ambient_events,
+            }
+
+        scored_candidates = []
+        for candidate in normalized_events:
+            if candidate.event in core_events:
+                continue
+            relation_score = self._score_thread_relation(candidate, focus_candidate, root_candidate)
+            scored_candidates.append((relation_score, candidate))
+
+        for relation_score, candidate in sorted(scored_candidates, key=lambda item: (item[0], item[1].index), reverse=True):
+            if relation_score >= 70:
+                _append_unique(core_events, candidate.event, core_limit)
+            elif relation_score >= 35:
+                _append_unique(related_events, candidate.event, related_limit)
+            elif relation_score >= 0:
+                _append_unique(ambient_events, candidate.event, ambient_limit)
+
+        for candidate in normalized_events:
+            if candidate.event in core_events or candidate.event in related_events or candidate.event in ambient_events:
+                continue
+            _append_unique(ambient_events, candidate.event, ambient_limit)
+
+        core_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
+        related_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
+        ambient_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
+
+        return {
+            "focus_event": focus_candidate.event,
+            "root_event": root_candidate.event if root_candidate else None,
+            "core_events": core_events,
+            "related_events": related_events,
+            "ambient_events": ambient_events,
+        }
 
     def _is_image_only(self, event: AstrMessageEvent) -> bool:
         """判断是否为纯图片消息"""
@@ -689,10 +1048,50 @@ class AttentionGate:
                     logger.info(f"[{chat_id}] 🔍 [Sys1 追踪] 消息格式化完毕。最终文本: '{combined_text[:50]}...' (有效事件数: {len(final_events)})")
                     
                     if final_events:
-                        anchor_event = final_events[0]
-                        main_event = final_events[-1] 
-                        main_event.set_extra("astrmai_anchor_event", anchor_event)
+                        normalized_events = self._build_normalized_events(final_events, self_id)
+                        focus_event, background_events, focus_reason = self._select_focus_event(final_events, self_id)
+                        main_event = focus_event or final_events[-1]
+                        focus_candidate = next(
+                            (candidate for candidate in normalized_events if candidate.event is main_event),
+                            normalized_events[-1],
+                        )
+                        root_candidate, root_reason = self._resolve_thread_root(focus_candidate, normalized_events)
+                        focus_thread = self._build_focus_thread(focus_candidate, root_candidate, normalized_events)
+                        thread_core_events = [candidate for candidate in focus_thread["core_events"] if candidate is not main_event]
+                        thread_related_events = [candidate for candidate in focus_thread["related_events"] if candidate is not main_event]
+                        ambient_events = [candidate for candidate in focus_thread["ambient_events"] if candidate is not main_event]
+                        ordered_sys2_events = ambient_events + thread_related_events + thread_core_events + [main_event]
+                        deduped_sys2_events = []
+                        for ordered_event in ordered_sys2_events:
+                            if ordered_event not in deduped_sys2_events:
+                                deduped_sys2_events.append(ordered_event)
+                        ordered_sys2_events = deduped_sys2_events
+                        focus_rich_text = main_event.get_extra("astrmai_rich_text", main_event.message_str)
+                        focus_sender_name = main_event.get_sender_name() or "群友/用户"
+
+                        main_event.set_extra("astrmai_focus_event", main_event)
+                        main_event.set_extra("astrmai_focus_reason", focus_reason)
+                        main_event.set_extra("astrmai_focus_message_text", f"[{focus_sender_name}] 说: {focus_rich_text}")
+                        main_event.set_extra("astrmai_focus_sender_id", str(main_event.get_sender_id()))
+                        main_event.set_extra("astrmai_focus_sender_name", focus_sender_name)
+                        main_event.set_extra("astrmai_background_events", background_events)
+                        main_event.set_extra("astrmai_focus_thread_root_event", focus_thread["root_event"])
+                        main_event.set_extra("astrmai_focus_thread_root_reason", root_reason)
+                        main_event.set_extra("astrmai_focus_thread_core_events", focus_thread["core_events"])
+                        main_event.set_extra("astrmai_focus_thread_related_events", focus_thread["related_events"])
+                        main_event.set_extra("astrmai_focus_thread_ambient_events", focus_thread["ambient_events"])
+                        main_event.set_extra("astrmai_focus_thread_reason", focus_reason)
+                        main_event.set_extra("astrmai_anchor_event", main_event)
                         main_event.set_extra("astrmai_window_events", final_events)
+                        if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
+                            logger.debug(
+                                f"[{chat_id}] focus_reason={focus_reason!r} "
+                                f"root_reason={root_reason!r} "
+                                f"focus_message_preview={focus_rich_text[:120]!r} "
+                                f"thread_core_count={len(focus_thread['core_events'])} "
+                                f"thread_related_count={len(focus_thread['related_events'])} "
+                                f"ambient_count={len(focus_thread['ambient_events'])}"
+                            )
                         
                         # 🚀 [全知视界编排] 汇总窗口内的所有图片真实 URL，统一塞给主事件，交由 System 2 接管
                         all_vision_urls = []
@@ -706,7 +1105,7 @@ class AttentionGate:
                             main_event.set_extra("direct_vision_urls", unique_urls)
                         
                         is_wakeup = any(self.sensors.is_wakeup_signal(e, self_id) for e in final_events)
-                        is_first_event_wakeup = self.sensors.is_wakeup_signal(final_events[0], self_id) if final_events else False
+                        is_first_event_wakeup = self._is_direct_wakeup_event(main_event, self_id)
                         
                         sys1_persona = "保持你原本的性格特征"
                         
@@ -755,7 +1154,7 @@ class AttentionGate:
                             )
                             if self.sys2_process:
                                 logger.info(f"[{chat_id}] 🔄 [Sys1 追踪] 开始调用 sys2_process (后台异步抛出)...")
-                                self._fire_background_task(self.sys2_process(main_event, final_events))
+                                self._fire_background_task(self.sys2_process(main_event, ordered_sys2_events))
                                 logger.info(f"[{chat_id}] ✅ [Sys1 追踪] sys2_process 已安全抛出至后台。")
                         else:
                             logger.info(f"[{chat_id}] 💤 [窗口结束] Sys1 决定静默不回复 (判定Action: {plan.action})")

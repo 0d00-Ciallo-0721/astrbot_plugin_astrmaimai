@@ -88,6 +88,42 @@ class Planner:
         ]
         return any(phrase in normalized for phrase in trigger_phrases)
 
+    @staticmethod
+    def _render_event_line(message_event: AstrMessageEvent) -> str:
+        speaker_name = message_event.get_sender_name() or "群友/用户"
+        rich_text = message_event.get_extra("astrmai_rich_text", message_event.message_str)
+        return f"[{speaker_name}] 说: {rich_text}"
+
+    def _build_focus_thread_text(
+        self,
+        focus_message_text: str,
+        root_event: Optional[AstrMessageEvent],
+        focus_event: AstrMessageEvent,
+        core_events: List[AstrMessageEvent],
+        related_events: List[AstrMessageEvent],
+    ) -> str:
+        sections = [f"[本轮必须优先回应的消息]\n{focus_message_text}"]
+
+        direct_context_lines = []
+        if root_event and root_event is not focus_event:
+            direct_context_lines.append(self._render_event_line(root_event))
+
+        for candidate in core_events:
+            if candidate is focus_event or candidate is root_event:
+                continue
+            direct_context_lines.append(self._render_event_line(candidate))
+        if direct_context_lines:
+            sections.append("[与焦点直接相关的上下文]\n" + "\n".join(direct_context_lines))
+
+        related_lines = [self._render_event_line(candidate) for candidate in related_events if candidate is not focus_event]
+        if related_lines:
+            sections.append("[同线程补充消息]\n" + "\n".join(related_lines))
+
+        return "\n\n".join(section for section in sections if section)
+
+    def _build_ambient_background_text(self, ambient_events: List[AstrMessageEvent]) -> str:
+        return "\n".join(self._render_event_line(message_event) for message_event in ambient_events)
+
     async def _get_recent_dialogue_transcript(self, chat_id: str) -> str:
         lane_manager = getattr(self.gateway, "lane_manager", None)
         if not lane_manager:
@@ -130,13 +166,27 @@ class Planner:
         
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
-            
-        window_lines = []
-        for m in event_messages:
-            sender_name = m.get_sender_name() or "群友/用户"
-            rich_text = m.get_extra("astrmai_rich_text", m.message_str)
-            window_lines.append(f"[{sender_name}] 说: {rich_text}")
-        raw_window_text = "\n".join(window_lines)
+
+        focus_event = event.get_extra("astrmai_focus_event", event)
+        background_events = event.get_extra("astrmai_background_events", []) or []
+        thread_core_events = event.get_extra("astrmai_focus_thread_core_events", []) or []
+        thread_related_events = event.get_extra("astrmai_focus_thread_related_events", []) or []
+        ambient_events = event.get_extra("astrmai_focus_thread_ambient_events", []) or background_events
+        thread_root_event = event.get_extra("astrmai_focus_thread_root_event", None)
+        context_events = [candidate for candidate in ambient_events + thread_related_events + thread_core_events if candidate is not focus_event]
+        context_events.append(focus_event)
+
+        window_lines = [self._render_event_line(message_event) for message_event in context_events]
+        focus_message_text = event.get_extra("astrmai_focus_message_text", "") or self._render_event_line(focus_event)
+        focus_thread_text = self._build_focus_thread_text(
+            focus_message_text=focus_message_text,
+            root_event=thread_root_event,
+            focus_event=focus_event,
+            core_events=thread_core_events,
+            related_events=thread_related_events,
+        )
+        background_window_text = self._build_ambient_background_text(ambient_events)
+        raw_window_text = focus_message_text
         recent_transcript = await self._get_recent_dialogue_transcript(chat_id)
         last_assistant_reply = ""
         if recent_transcript:
@@ -149,17 +199,25 @@ class Planner:
                 if line.startswith(f"{bot_name}:") or line.startswith("Bot:"):
                     last_assistant_reply = line.split(":", 1)[1].strip()
                     break
+        prompt_sections = []
         if last_assistant_reply:
-            prompt_content = f"[上一轮你的回复] {last_assistant_reply}\n---\n{raw_window_text}"
-        else:
-            prompt_content = raw_window_text
-        event.set_extra("astrmai_raw_user_text", raw_window_text)
+            prompt_sections.append(f"[上一轮你的回复] {last_assistant_reply}")
+        prompt_sections.append(f"[本轮主线程（优先围绕它回答）]\n{focus_thread_text}")
+        if background_window_text:
+            prompt_sections.append(f"[环境背景消息，仅供参考]\n{background_window_text}")
+        prompt_content = "\n\n".join(section for section in prompt_sections if section)
+        event.set_extra("astrmai_raw_user_text", focus_message_text)
+        event.set_extra("astrmai_background_window_text", background_window_text)
+        event.set_extra("astrmai_focus_thread_text", focus_thread_text)
+        event.set_extra("astrmai_ambient_background_text", background_window_text)
         event.set_extra("astrmai_recent_transcript", recent_transcript)
-        near_context_priority = self._is_near_context_query(event.message_str or raw_window_text)
+        near_context_priority = self._is_near_context_query(focus_message_text or event.message_str or raw_window_text)
         event.set_extra("astrmai_near_context_priority", near_context_priority)
         if getattr(getattr(self.gateway.config, "global_settings", None), "debug_mode", False):
             logger.debug(
-                f"[{chat_id}] planner raw_user_text={raw_window_text[:160]!r} "
+                f"[{chat_id}] planner raw_user_text={focus_message_text[:160]!r} "
+                f"focus_thread={focus_thread_text[:160]!r} "
+                f"background={background_window_text[:160]!r} "
                 f"recent_transcript={recent_transcript[:160]!r} "
                 f"near_context_priority={near_context_priority}"
             )
@@ -176,13 +234,13 @@ class Planner:
                 return await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id)
             
             async def _load_goals():
-                window_text = "\n".join(window_lines) if window_lines else ""
+                window_text = prompt_content or ("\n".join(window_lines) if window_lines else "")
                 res = await self.goal_manager.analyze_and_update(chat_id, window_text)
                 logger.debug(f"[{chat_id}] 🎯 当前主目标: {res}")
                 return res
             
             async def _load_expressions():
-                recent_text = "\n".join(window_lines[-3:]) if window_lines else ""
+                recent_text = prompt_content or ("\n".join(window_lines[-3:]) if window_lines else "")
                 think_level = 1 if len(recent_text) >= 40 and len(window_lines) >= 2 else 0
                 return await self.expression_selector.select(
                     chat_id=chat_id,
@@ -315,7 +373,7 @@ class Planner:
 
         system_prompt = await self.context_engine.build_prompt(
             chat_id=chat_id, 
-            event_messages=event_messages,
+            event_messages=context_events,
             retrieve_keys=retrieve_keys,
             slang_patterns=slang_context,
             sys1_thought=sys1_thought,
