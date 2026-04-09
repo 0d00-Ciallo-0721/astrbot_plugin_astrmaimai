@@ -338,6 +338,10 @@ class AstrMaiPlugin(Star):
                 main_event.set_extra("astrmai_wait_target_name", "")
 
                 await self.state_engine.consume_energy(chat_id)
+                await self.lane_manager.ensure_lane(
+                    lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
+                    base_origin=chat_id,
+                )
                 await self.system2_planner.plan_and_execute(main_event, queue_events)
                 reply_sent = bool(main_event.get_extra("astrmai_reply_sent", False))
                 

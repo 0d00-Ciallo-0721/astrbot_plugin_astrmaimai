@@ -297,6 +297,7 @@ class GlobalModelGateway:
         use_fallback: bool = True,
         prefix_hash: str = "",
         persona_id: str = "",
+        raw_user_text: str = "",
     ) -> Union[str, Dict[str, Any]]:
         if not self.lane_manager:
             return await self._elastic_call(
@@ -350,15 +351,27 @@ class GlobalModelGateway:
             request_kwargs_factory=_lane_request_kwargs,
         )
         assistant_content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        lane_user_content = raw_user_text or prompt
         await self.lane_manager.append_exchange(
             lane_key=lane_key,
             base_origin=base_origin,
-            user_content=prompt,
+            user_content=lane_user_content,
             assistant_content=assistant_content,
             prefix_hash=prefix_hash,
             model_id=model_hint,
             persona_id=persona_id,
         )
+        if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
+            history_tail = []
+            if history:
+                for item in history[-4:]:
+                    if isinstance(item, dict):
+                        history_tail.append(str(item.get("role", "")))
+            logger.debug(
+                f"[Gateway] lane={lane_key.as_log_key()} "
+                f"raw_user_text={lane_user_content[:120]!r} "
+                f"history_roles_tail={history_tail}"
+            )
         return result
 
     async def tool_chat_in_lane(
@@ -374,6 +387,7 @@ class GlobalModelGateway:
         timeout: int,
         prefix_hash: str = "",
         persona_id: str = "",
+        raw_user_text: str = "",
     ) -> str:
         if not self.lane_manager:
             raise LLMCascadeFailureException("lane manager 未初始化，无法执行 tool_chat_in_lane")
@@ -436,13 +450,24 @@ class GlobalModelGateway:
                 await self.lane_manager.append_exchange(
                     lane_key=lane_key,
                     base_origin=base_origin,
-                    user_content=prompt,
+                    user_content=raw_user_text or prompt,
                     assistant_content=reply_text,
                     token_usage=usage.get("total_tokens", 0),
                     prefix_hash=prefix_hash,
                     model_id=model_id,
                     persona_id=persona_id,
                 )
+                if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
+                    history_tail = []
+                    if history:
+                        for item in history[-4:]:
+                            if isinstance(item, dict):
+                                history_tail.append(str(item.get("role", "")))
+                    logger.debug(
+                        f"[Gateway] tool-lane={lane_key.as_log_key()} "
+                        f"raw_user_text={(raw_user_text or prompt)[:120]!r} "
+                        f"history_roles_tail={history_tail}"
+                    )
                 return reply_text
             except Exception as e:
                 last_error = str(e)

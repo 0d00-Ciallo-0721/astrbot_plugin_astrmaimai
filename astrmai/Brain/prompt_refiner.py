@@ -23,6 +23,8 @@ class PromptRefiner:
         is_fast_mode: bool,
         retrieve_keys: list[str],
     ) -> str:
+        if event.get_extra("astrmai_near_context_priority", False):
+            return ""
         if disable_rag or is_fast_mode:
             return ""
 
@@ -55,10 +57,10 @@ class PromptRefiner:
             return ""
 
         memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
-        if memory_text and "浠€涔堜篃娌℃兂璧锋潵" not in memory_text:
+        if memory_text and "什么也没想起来" not in memory_text:
             return (
                 "<injected_memory>\n"
-                "记忆涌现：基于当前话题，你回想起了以下内容：\n"
+                "记忆浮现：基于当前话题，你想起了以下内容：\n"
                 f"{html.escape(memory_text)}\n"
                 "</injected_memory>\n"
             )
@@ -114,13 +116,11 @@ class PromptRefiner:
             disable_rag = context.shared_dict.get("disable_rag_injection", False)
 
         retrieve_keys = event.get_extra("retrieve_keys", [])
+        recent_transcript = str(event.get_extra("astrmai_recent_transcript", "") or "").strip()
+        raw_user_text = str(event.get_extra("astrmai_raw_user_text", prompt) or prompt).strip()
+        near_context_priority = bool(event.get_extra("astrmai_near_context_priority", False))
+        use_lane_history = bool(event.get_extra("astrmai_use_lane_history", False))
         is_fast_mode = "CORE_ONLY" in retrieve_keys
-        use_lane_history = event.get_extra("astrmai_use_lane_history", False)
-        history_note = (
-            "历史上下文已由 lane 会话提供，请专注当前消息和本轮注入内容。"
-            if use_lane_history
-            else "不再展开长历史剧本，只保留当前消息和本轮记忆注入。"
-        )
 
         injection = await self._build_memory_injection(
             event=event,
@@ -130,19 +130,17 @@ class PromptRefiner:
             retrieve_keys=retrieve_keys,
         )
 
+        history_block = recent_transcript or "（暂无最近对话记录）"
+        current_block = raw_user_text or prompt
+
         final_system_prompt = re.sub(
             r"<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}",
-            f"群聊历史消息：\n{history_note}",
+            f"最近真实对话：\n{history_block}",
             system_prompt,
         )
         final_system_prompt = re.sub(
-            r"当前你看到的消息：\s*(<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\})",
-            "",
-            final_system_prompt,
-        )
-        final_system_prompt = re.sub(
             r"<CURRENT_MESSAGES>|\{CURRENT_MSG_PLACEHOLDER\}",
-            "",
+            current_block,
             final_system_prompt,
         )
         final_system_prompt = re.sub(
@@ -152,20 +150,23 @@ class PromptRefiner:
         )
         final_system_prompt = await self._resolve_visual_memory(final_system_prompt)
 
-        original_content = await self._resolve_visual_memory(prompt)
-        if is_fast_mode:
-            director_voice = "【极速唤醒】请保持回复简短、直接、自然。"
-        else:
-            director_voice = "【动作提示】如需工具先走工具，否则直接以角色的自然台词接话。"
+        visual_current_block = await self._resolve_visual_memory(current_block)
+        prompt_lines = [visual_current_block]
+        if not is_fast_mode:
+            prompt_lines.append("请直接接住上一轮语义继续说，不要重启话题。")
+        final_prompt = "\n\n".join(line for line in prompt_lines if line).strip()
 
-        final_prompt = (
-            "（导演旁白：请仔细阅读设定和前面的剧本。"
-            "这是当前你看到的最新消息：\n"
-            f"{original_content}\n\n>> {director_voice}）"
-        )
+        if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
+            logger.debug(
+                f"[{event.unified_msg_origin}] PromptRefiner preview "
+                f"raw_user_text={current_block[:120]!r} "
+                f"recent_transcript={history_block[:160]!r} "
+                f"near_context_priority={near_context_priority}"
+            )
 
         logger.info(
-            f"[{event.unified_msg_origin}] PromptRefiner lightweight ready "
-            f"(lane_history={use_lane_history}, inject_memory={'yes' if injection else 'no'})"
+            f"[{event.unified_msg_origin}] PromptRefiner ready "
+            f"(lane_history={use_lane_history}, inject_memory={'yes' if injection else 'no'}, "
+            f"near_context_priority={near_context_priority}, recent_transcript={'yes' if recent_transcript else 'no'})"
         )
         return final_system_prompt, final_prompt

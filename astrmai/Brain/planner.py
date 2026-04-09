@@ -74,6 +74,33 @@ class Planner:
             config=gateway.config
         )
         self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
+
+    @staticmethod
+    def _is_near_context_query(message_text: str) -> bool:
+        if not isinstance(message_text, str):
+            return False
+        normalized = message_text.strip()
+        if not normalized:
+            return False
+        trigger_phrases = [
+            "为什么", "哪里", "什么意思", "你刚刚", "刚刚说", "这个", "那个",
+            "上一个", "上一句", "不是这个", "为啥", "咋", "啥意思", "不可以",
+        ]
+        return any(phrase in normalized for phrase in trigger_phrases)
+
+    async def _get_recent_dialogue_transcript(self, chat_id: str) -> str:
+        lane_manager = getattr(self.gateway, "lane_manager", None)
+        if not lane_manager:
+            return ""
+        try:
+            return await lane_manager.get_recent_transcript(
+                lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
+                base_origin=chat_id,
+                max_turns=4,
+            )
+        except Exception as exc:
+            logger.debug(f"[{chat_id}] recent transcript load failed: {exc}")
+            return ""
         
     async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
         """
@@ -109,7 +136,33 @@ class Planner:
             sender_name = m.get_sender_name() or "群友/用户"
             rich_text = m.get_extra("astrmai_rich_text", m.message_str)
             window_lines.append(f"[{sender_name}] 说: {rich_text}")
-        prompt_content = "\n".join(window_lines)
+        raw_window_text = "\n".join(window_lines)
+        recent_transcript = await self._get_recent_dialogue_transcript(chat_id)
+        last_assistant_reply = ""
+        if recent_transcript:
+            transcript_lines = [line.strip() for line in recent_transcript.splitlines() if line.strip()]
+            bot_name = "Bot"
+            nicknames = getattr(getattr(self.gateway.config, "system1", None), "nicknames", [])
+            if isinstance(nicknames, list) and nicknames:
+                bot_name = str(nicknames[0]).strip() or bot_name
+            for line in reversed(transcript_lines):
+                if line.startswith(f"{bot_name}:") or line.startswith("Bot:"):
+                    last_assistant_reply = line.split(":", 1)[1].strip()
+                    break
+        if last_assistant_reply:
+            prompt_content = f"[上一轮你的回复] {last_assistant_reply}\n---\n{raw_window_text}"
+        else:
+            prompt_content = raw_window_text
+        event.set_extra("astrmai_raw_user_text", raw_window_text)
+        event.set_extra("astrmai_recent_transcript", recent_transcript)
+        near_context_priority = self._is_near_context_query(event.message_str or raw_window_text)
+        event.set_extra("astrmai_near_context_priority", near_context_priority)
+        if getattr(getattr(self.gateway.config, "global_settings", None), "debug_mode", False):
+            logger.debug(
+                f"[{chat_id}] planner raw_user_text={raw_window_text[:160]!r} "
+                f"recent_transcript={recent_transcript[:160]!r} "
+                f"near_context_priority={near_context_priority}"
+            )
         
         sys1_thought = event.get_extra("sys1_thought", "")
         
@@ -270,6 +323,7 @@ class Planner:
             expression_habits=expression_habits,    # Phase 6.1
             planner_reasoning=planner_reasoning,    # Phase 6.2B
             jargon_explanation=jargon_explanation,  # Phase 6.2C
+            near_context_priority=near_context_priority,
         )
         event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
         event.set_extra("astrmai_use_lane_history", True)

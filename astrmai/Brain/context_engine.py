@@ -39,7 +39,8 @@ class ContextEngine:
                            goals_context: str = "",
                            expression_habits: str = "",
                            planner_reasoning: str = "",
-                           jargon_explanation: str = "") -> str: 
+                           jargon_explanation: str = "",
+                           near_context_priority: bool = False) -> str:
         
         if retrieve_keys is None:
             retrieve_keys = []
@@ -147,7 +148,7 @@ class ContextEngine:
         state_block = self._build_state_block(state)
             
         slang_block = ""
-        if slang_patterns and not is_fast_mode:
+        if slang_patterns and not is_fast_mode and not near_context_priority:
             slang_block = f"群组专属表达模式与黑话参考:\n{slang_patterns}\n"
 
         # 动态上下文热加载 (私聊专属画像注入)
@@ -225,7 +226,7 @@ class ContextEngine:
 
         # 动态主动联想与节点背景注入 
         proactive_recall_block = ""
-        if event_messages and not is_fast_mode:
+        if event_messages and not is_fast_mode and not near_context_priority:
             try:
                 last_msg = event_messages[-1].message_str
                 
@@ -267,12 +268,12 @@ class ContextEngine:
 
         # 表达习惯注入
         expression_block = ""
-        if expression_habits and not is_fast_mode:
+        if expression_habits and not is_fast_mode and not near_context_priority:
             expression_block = f"\n[语言习惯参考]\n{expression_habits}\n"
 
         # 黑话解释注入
         jargon_block = ""
-        if jargon_explanation and not is_fast_mode:
+        if jargon_explanation and not is_fast_mode and not near_context_priority:
             jargon_block = f"\n[群内黑话参考]\n{jargon_explanation}\n（已知含义仅供理解，自然使用即可，不要刻意解释）\n"
 
         # ==========================================
@@ -332,9 +333,6 @@ class ContextEngine:
             for block in [
                 f"核心人格设定：\n{role_block}",
                 f"对话风格：\n{style_guide}" if style_guide else "",
-                expression_block.strip() if expression_block else "",
-                slang_block.strip() if slang_block else "",
-                jargon_block.strip() if jargon_block else "",
                 (
                     "系统硬规则：\n"
                     "1. 必须沉浸式发言，只输出角色自然台词。\n"
@@ -353,6 +351,9 @@ class ContextEngine:
                 state_block.strip() if state_block else "",
                 private_chat_block.strip() if private_chat_block else "",
                 inner_voice_block.strip() if inner_voice_block else "",
+                expression_block.strip() if expression_block else "",
+                slang_block.strip() if slang_block else "",
+                jargon_block.strip() if jargon_block else "",
             ]
             if block
         )

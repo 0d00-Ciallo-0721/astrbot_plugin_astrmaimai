@@ -1,5 +1,5 @@
-import json
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -35,7 +35,7 @@ class LaneManager:
     AstrMai lane 会话编排层。
     历史真源始终落在 AstrBot ConversationManager，自身只负责：
     1. lane UMO 映射
-    2. 历史裁剪策略
+    2. 历史裁剪与清洗策略
     3. 运行时 rotation 元信息
     """
 
@@ -99,7 +99,6 @@ class LaneManager:
             [
                 meta.get("prompt_version") != prompt_version,
                 meta.get("prefix_hash") != prefix_hash,
-                meta.get("model_id") != model_id,
                 meta.get("persona_id") != persona_id,
             ]
         )
@@ -134,8 +133,55 @@ class LaneManager:
             if len(summary_lines) >= 8:
                 break
         if not summary_lines:
-            return "[RollingSummary] 无可压缩的历史摘要。"
+            return "[RollingSummary] No usable history."
         return "[RollingSummary]\n" + "\n".join(summary_lines)
+
+    def _extract_dialogue_from_meta_prompt(self, content: str) -> str:
+        text = self._stringify_content(content)
+        if not text:
+            return ""
+        patterns = [
+            r"这是当前你看到的最新消息[:：]?\s*(.+?)(?:\n\n>>|\)$)",
+            r"当前你看到的最新消息[:：]?\s*(.+?)(?:\n\n>>|\)$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                extracted = match.group(1).strip()
+                if extracted:
+                    return extracted
+        if any(marker in text for marker in ("导演旁白", "动作提示", "请仔细阅读设定和前面的剧本")):
+            return ""
+        return text
+
+    def _sanitize_dialog_message(self, message: dict) -> Optional[dict]:
+        role = str(message.get("role", "")).strip()
+        content = message.get("content", "")
+        if role != "user":
+            normalized = self._stringify_content(content)
+            if not normalized:
+                return None
+            return {"role": role, "content": normalized}
+        cleaned = self._extract_dialogue_from_meta_prompt(content)
+        if not cleaned:
+            return None
+        return {"role": role, "content": cleaned}
+
+    def _sanitize_dialog_history(self, history: List[dict]) -> tuple[List[dict], bool]:
+        sanitized: List[dict] = []
+        changed = False
+        for message in history:
+            if not isinstance(message, dict):
+                changed = True
+                continue
+            normalized = self._sanitize_dialog_message(message)
+            if normalized is None:
+                changed = True
+                continue
+            if normalized != message:
+                changed = True
+            sanitized.append(normalized)
+        return sanitized, changed
 
     def _compact_history(self, normalized: List[dict], lane_key: LaneKey, policy: LanePolicy) -> List[dict]:
         if not normalized:
@@ -145,7 +191,7 @@ class LaneManager:
             kept = normalized[-max(policy.max_raw_turns, 1):]
             if len(normalized) > len(kept):
                 summary = {"role": "assistant", "content": self._build_rolling_summary(normalized[:-len(kept)])}
-                return [summary, *kept][- (policy.max_raw_turns + 1):]
+                return [summary, *kept][-(policy.max_raw_turns + 1):]
             return kept
 
         if (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
@@ -173,6 +219,8 @@ class LaneManager:
             if role == "system":
                 continue
             normalized.append(dict(message))
+        if (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+            normalized, _ = self._sanitize_dialog_history(normalized)
         return self._compact_history(normalized, lane_key, policy)
 
     def _load_history(self, conversation: Any) -> List[dict]:
@@ -183,7 +231,7 @@ class LaneManager:
             try:
                 parsed = json.loads(raw_history)
             except json.JSONDecodeError:
-                logger.warning("[LaneManager] lane history JSON 解析失败，回退为空历史。")
+                logger.warning("[LaneManager] Failed to parse lane history JSON; fallback to empty history.")
                 return []
         else:
             parsed = raw_history
@@ -204,7 +252,17 @@ class LaneManager:
         async with lane_lock:
             conversation_id = await self.conversation_manager.get_curr_conversation_id(lane_umo)
             rotate = False
+            old_history: List[dict] = []
             if conversation_id:
+                try:
+                    old_conversation = await self.conversation_manager.get_conversation(
+                        lane_umo,
+                        conversation_id,
+                        create_if_not_exists=False,
+                    )
+                    old_history = self._load_history(old_conversation)
+                except Exception:
+                    old_history = []
                 rotate = self._should_rotate(
                     lane_umo=lane_umo,
                     prompt_version=lane_key.prompt_version,
@@ -212,19 +270,41 @@ class LaneManager:
                     model_id=model_id,
                     persona_id=persona_id,
                 )
+
             if not conversation_id or rotate:
                 conversation_id = await self.conversation_manager.new_conversation(
                     unified_msg_origin=lane_umo,
                     title=self._build_title(lane_key),
                     persona_id=persona_id or None,
                 )
+                if rotate and old_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+                    await self.save_lane_history(
+                        lane_key=lane_key,
+                        lane_umo=lane_umo,
+                        conversation_id=conversation_id,
+                        history=[{"role": "assistant", "content": self._build_rolling_summary(old_history)}],
+                        prefix_hash=prefix_hash,
+                        model_id=model_id,
+                        persona_id=persona_id,
+                    )
 
             conversation = await self.conversation_manager.get_conversation(
                 lane_umo,
                 conversation_id,
                 create_if_not_exists=True,
             )
-            history = self._normalize_history(self._load_history(conversation), lane_key)
+            loaded_history = self._load_history(conversation)
+            history = self._normalize_history(loaded_history, lane_key)
+            if loaded_history != history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+                await self.conversation_manager.update_conversation(
+                    unified_msg_origin=lane_umo,
+                    conversation_id=conversation_id,
+                    history=history,
+                    title=self._build_title(lane_key),
+                    persona_id=persona_id or None,
+                    token_usage=None,
+                )
+
             self._runtime_meta[lane_umo] = {
                 "conversation_id": conversation_id,
                 "prompt_version": lane_key.prompt_version,
@@ -299,3 +379,44 @@ class LaneManager:
             model_id=model_id,
             persona_id=persona_id,
         )
+
+    async def get_recent_transcript(
+        self,
+        lane_key: LaneKey,
+        base_origin: Optional[str],
+        max_turns: int = 4,
+    ) -> str:
+        lane_umo, _conversation_id, history, _ = await self.ensure_lane(
+            lane_key=lane_key,
+            base_origin=base_origin,
+        )
+        if not history:
+            return ""
+
+        recent_messages = history[-max(max_turns * 2, 2):]
+        bot_name = "Bot"
+        if getattr(getattr(self.config, "system1", None), "nicknames", None):
+            nicknames = getattr(self.config.system1, "nicknames", [])
+            if isinstance(nicknames, list) and nicknames:
+                bot_name = str(nicknames[0]).strip() or bot_name
+
+        lines: List[str] = []
+        for message in recent_messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).strip()
+            content = self._stringify_content(message.get("content", ""))
+            if not content:
+                continue
+            if role == "assistant":
+                lines.append(f"{bot_name}: {content[:180]}")
+            elif role == "user":
+                if content.startswith("[") and "说:" in content:
+                    lines.append(content[:180])
+                else:
+                    lines.append(f"用户: {content[:180]}")
+
+        transcript = "\n".join(lines)
+        if getattr(getattr(self.config, "global_settings", None), "debug_mode", False) and transcript:
+            logger.debug(f"[LaneManager] recent transcript for {lane_umo}: {transcript[:200]!r}")
+        return transcript

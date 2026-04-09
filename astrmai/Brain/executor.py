@@ -81,6 +81,7 @@ class ConcurrentExecutor:
                     api_prompt = prompt
                     vision_descriptions = []
                     prefix_hash = event.get_extra("astrmai_prefix_hash", "")
+                    raw_user_text = event.get_extra("astrmai_raw_user_text", "")
                     dialog_lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id)
 
                     if direct_vision_urls and len(direct_vision_urls) > 0:
@@ -189,6 +190,7 @@ class ConcurrentExecutor:
                                     models=[provider_id],
                                     prefix_hash=prefix_hash,
                                     use_fallback=False,
+                                    raw_user_text=raw_user_text,
                                 )
                                 if not reply_text:
                                     raise ValueError(f"模型 {provider_id} 生成为空")
@@ -231,6 +233,7 @@ class ConcurrentExecutor:
                                     max_steps=max_steps,
                                     timeout=timeout,
                                     prefix_hash=prefix_hash,
+                                    raw_user_text=raw_user_text,
                                 )
                                 if not reply_text:
                                     raise ValueError("回复为空")
