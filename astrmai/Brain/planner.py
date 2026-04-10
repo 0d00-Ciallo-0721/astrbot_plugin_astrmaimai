@@ -102,7 +102,7 @@ class Planner:
         core_events: List[AstrMessageEvent],
         related_events: List[AstrMessageEvent],
     ) -> str:
-        sections = [f"[本轮必须优先回应的消息]\n{focus_message_text}"]
+        sections = [f"本轮优先回应消息：\n{focus_message_text}"]
 
         direct_context_lines = []
         if root_event and root_event is not focus_event:
@@ -113,11 +113,11 @@ class Planner:
                 continue
             direct_context_lines.append(self._render_event_line(candidate))
         if direct_context_lines:
-            sections.append("[与焦点直接相关的上下文]\n" + "\n".join(direct_context_lines))
+            sections.append("相关上下文：\n" + "\n".join(direct_context_lines))
 
         related_lines = [self._render_event_line(candidate) for candidate in related_events if candidate is not focus_event]
         if related_lines:
-            sections.append("[同线程补充消息]\n" + "\n".join(related_lines))
+            sections.append("同线程补充：\n" + "\n".join(related_lines))
 
         return "\n\n".join(section for section in sections if section)
 
@@ -201,10 +201,10 @@ class Planner:
                     break
         prompt_sections = []
         if last_assistant_reply:
-            prompt_sections.append(f"[上一轮你的回复] {last_assistant_reply}")
-        prompt_sections.append(f"[本轮主线程（优先围绕它回答）]\n{focus_thread_text}")
+            prompt_sections.append(f"上一轮你的回复：{last_assistant_reply}")
+        prompt_sections.append(f"本轮主线程（优先围绕它回答）：\n{focus_thread_text}")
         if background_window_text:
-            prompt_sections.append(f"[环境背景消息，仅供参考]\n{background_window_text}")
+            prompt_sections.append(f"环境背景消息，仅供参考：\n{background_window_text}")
         prompt_content = "\n\n".join(section for section in prompt_sections if section)
         event.set_extra("astrmai_raw_user_text", focus_message_text)
         event.set_extra("astrmai_background_window_text", background_window_text)

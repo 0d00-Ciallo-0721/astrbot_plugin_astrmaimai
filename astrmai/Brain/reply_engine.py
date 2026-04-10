@@ -5,6 +5,8 @@ from typing import List
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent
+from ..Heart.affection_router import AffectionRouter
+from ..infra.output_guard import is_sendable_segment, sanitize_visible_reply_text
 # [阶段四新增] 引入情绪归因路由器
 from ..Heart.affection_router import AffectionRouter
 # 引入依赖模块
@@ -40,7 +42,13 @@ class ReplyEngine:
         """
         [修改] 清洗 LLM 输出的幻觉前缀，并作为兜底防线拦截底层穿透的报错堆栈
         """
-        if not text: return ""
+        if not text:
+            return ""
+        fallback_text = getattr(self.config.reply, "fallback_text", "（陷入了短暂的沉默...）")
+        cleaned = sanitize_visible_reply_text(text, fallback_text=fallback_text)
+        if cleaned != str(text).strip():
+            logger.warning("[ReplyEngine] 已清洗或拦截异常回复文本，避免透传给用户。")
+        return cleaned
         
         # [新增] 致命异常文本拦截层 (Fallback Interception 双重防线)
         error_keywords = ["Exception:", "All chat models fail", "Traceback", "请求失败", "APITimeoutError"]
@@ -189,7 +197,13 @@ class ReplyEngine:
         # =====================================================================
         # 🟢 [核心架构重构] 步骤 3 提前：先说话！不要让情绪计算阻塞文本的下发
         # =====================================================================
-        segments = self._segment_reply_content(clean_text)
+        segments = [
+            segment
+            for segment in self._segment_reply_content(clean_text)
+            if is_sendable_segment(segment)
+        ]
+        if not segments:
+            return
         
         _pending_actions = pending_actions if pending_actions is not None else event.get_extra("astrmai_pending_actions", [])
         at_targets = [action.get("target_id") for action in _pending_actions if action.get("action") == "at"]

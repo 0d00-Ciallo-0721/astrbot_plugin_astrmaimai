@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
+from .output_guard import is_safe_visible_text, sanitize_visible_reply_text
 
 
 @dataclass(frozen=True)
@@ -133,8 +134,8 @@ class LaneManager:
             if len(summary_lines) >= 8:
                 break
         if not summary_lines:
-            return "[RollingSummary] No usable history."
-        return "[RollingSummary]\n" + "\n".join(summary_lines)
+            return "较早对话摘要：暂无可用内容。"
+        return "较早对话摘要：\n" + "\n".join(summary_lines)
 
     def _extract_dialogue_from_meta_prompt(self, content: str) -> str:
         text = self._stringify_content(content)
@@ -158,11 +159,13 @@ class LaneManager:
         role = str(message.get("role", "")).strip()
         content = message.get("content", "")
         if role != "user":
-            normalized = self._stringify_content(content)
+            normalized = sanitize_visible_reply_text(self._stringify_content(content), fallback_text="")
             if not normalized:
                 return None
             return {"role": role, "content": normalized}
         cleaned = self._extract_dialogue_from_meta_prompt(content)
+        if cleaned and not is_safe_visible_text(cleaned):
+            return None
         if not cleaned:
             return None
         return {"role": role, "content": cleaned}
@@ -409,8 +412,13 @@ class LaneManager:
             if not content:
                 continue
             if role == "assistant":
+                content = sanitize_visible_reply_text(content, fallback_text="")
+                if not content:
+                    continue
                 lines.append(f"{bot_name}: {content[:180]}")
             elif role == "user":
+                if not is_safe_visible_text(content):
+                    continue
                 if content.startswith("[") and "说:" in content:
                     lines.append(content[:180])
                 else:

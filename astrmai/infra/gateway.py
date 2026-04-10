@@ -7,6 +7,7 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 from .model_router import ModelRouter
 from .lane_manager import LaneKey, LaneManager
+from .output_guard import looks_like_provider_failure_text, sanitize_visible_reply_text
 from .provider_capabilities import infer_provider_capabilities
 
 # [修改] 引入 AstrBot 标准消息片段类，并添加防崩溃动态导入 (兼容 v4.12 - v4.18+)
@@ -167,6 +168,8 @@ class GlobalModelGateway:
                         content = resp.completion_text
                         if not content or not content.strip():
                             raise ValueError("响应为空")
+                        if looks_like_provider_failure_text(content):
+                            raise ValueError("模型返回了原始失败载荷")
                         
                         # ✅ 调用成功 → 上报健康
                         self.router.report_success(report_pool, model_id)
@@ -351,16 +354,19 @@ class GlobalModelGateway:
             request_kwargs_factory=_lane_request_kwargs,
         )
         assistant_content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        if isinstance(assistant_content, str):
+            assistant_content = sanitize_visible_reply_text(assistant_content, fallback_text="")
         lane_user_content = raw_user_text or prompt
-        await self.lane_manager.append_exchange(
-            lane_key=lane_key,
-            base_origin=base_origin,
-            user_content=lane_user_content,
-            assistant_content=assistant_content,
-            prefix_hash=prefix_hash,
-            model_id=model_hint,
-            persona_id=persona_id,
-        )
+        if assistant_content:
+            await self.lane_manager.append_exchange(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                user_content=lane_user_content,
+                assistant_content=assistant_content,
+                prefix_hash=prefix_hash,
+                model_id=model_hint,
+                persona_id=persona_id,
+            )
         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
             history_tail = []
             if history:
@@ -447,16 +453,18 @@ class GlobalModelGateway:
                         "provider": capabilities.provider_family,
                     },
                 )
-                await self.lane_manager.append_exchange(
-                    lane_key=lane_key,
-                    base_origin=base_origin,
-                    user_content=raw_user_text or prompt,
-                    assistant_content=reply_text,
-                    token_usage=usage.get("total_tokens", 0),
-                    prefix_hash=prefix_hash,
-                    model_id=model_id,
-                    persona_id=persona_id,
-                )
+                clean_assistant_text = sanitize_visible_reply_text(reply_text, fallback_text="")
+                if clean_assistant_text:
+                    await self.lane_manager.append_exchange(
+                        lane_key=lane_key,
+                        base_origin=base_origin,
+                        user_content=raw_user_text or prompt,
+                        assistant_content=clean_assistant_text,
+                        token_usage=usage.get("total_tokens", 0),
+                        prefix_hash=prefix_hash,
+                        model_id=model_id,
+                        persona_id=persona_id,
+                    )
                 if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
                     history_tail = []
                     if history:
