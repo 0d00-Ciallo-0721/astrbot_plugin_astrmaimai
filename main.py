@@ -191,7 +191,7 @@ class AstrMaiPlugin(Star):
         # Phase 7: 娉ㄥ叆 db_service锛堝欢杩熷埌 start() 鍓嶏級
         self.proactive_task.set_db_service(self.db_service)
 
-        logger.info("[AstrMai] 鉁?Full Dual-Process Architecture Ready (Phases 1-7 Mounted).")
+        logger.info("[AstrMai] ✅ 双进程主架构已就绪（Phase 1-7 已挂载）。")
 
     async def list_pending_expression_reviews(self, group_id: str = "", limit: int = 50):
         return await self.review_service.list_pending_reviews(group_id=group_id or None, limit=limit)
@@ -275,10 +275,10 @@ class AstrMaiPlugin(Star):
                     await self.state_engine.flush_message_counters()
                 raise
             except Exception as e:
-                logger.error(f"[AstrMai-DB-Sync] 馃毃 鏁版嵁搴撴壒閲忓悓姝ヤ换鍔″紓甯? {e}")
+                logger.error(f"[AstrMai-DB-Sync] 🚨 数据库批量同步任务异常: {e}")
 
     async def _memory_gc_task(self):
-        """[閲嶆瀯] 鎵╁ぇ GC 鑼冨洿锛屽交搴曟秷闄?TOCTOU 绔炴€佹潯浠讹紝绉婚櫎宸茶鎶界鐨勬棫 Hook 缂撳瓨閫昏緫"""
+        """扩展 GC 范围，清理失活焦点池和空闲锁，避免残留缓存长期堆积。"""
         while getattr(self, '_is_running', True):
             try:
                 await asyncio.sleep(3600)  # 姣忓皬鏃舵墽琛屼竴娆?
@@ -307,7 +307,7 @@ class AstrMaiPlugin(Star):
                         f"[AstrMai-GC] cleaned {attention_stale_count} stale focus pools and {lock_cleaned} idle locks."
                     )
             except asyncio.CancelledError:
-                logger.info("[AstrMai-GC] 馃洃 鍐呭瓨 GC 浠诲姟鏀跺埌缁堟淇″彿锛屽畨鍏ㄩ€€鍑?..")
+                logger.info("[AstrMai-GC] 📴 内存 GC 任务收到终止信号，正在安全退出...")
                 raise
             except Exception as e:
                 logger.error(f"[AstrMai-GC] 馃毃 鍐呭瓨 GC 浠诲姟鍙戠敓寮傚父: {e}")
@@ -324,7 +324,7 @@ class AstrMaiPlugin(Star):
         chat_id = main_event.unified_msg_origin
         lock = self._get_sys2_lock(chat_id)
         
-        logger.debug(f"[{chat_id}] 馃 System 2 璇锋眰宸叉敞鍐岋紝姝ｅ湪鎺掗槦绛夊緟杩涘叆涓绘墽琛岄槦鍒?..")
+        logger.debug(f"[{chat_id}] 🧠 System 2 请求已登记，正在排队等待进入主执行队列...")
             
         async with lock:
             try:
@@ -352,7 +352,7 @@ class AstrMaiPlugin(Star):
                     # 杩涘叆绛夊緟鐘舵€?(閲婃斁閿佸墠闃诲锛屾柊娑堟伅浠?AttentionGate 浜х敓鎵撴柇)
                     has_reply = await self.private_chat_manager.wait_for_new_message(sender_id)
                     if not has_reply:
-                        logger.info(f"[{chat_id}] 鈴?绉佽亰鐢ㄦ埛闀挎湡鏈洖澶嶏紝浼氳瘽鑷劧浼戠湢锛屽彲瑙﹀彂涓诲姩鐮村啺 (鍚庣画杩唬)")
+                        logger.info(f"[{chat_id}] 💤 私聊用户长时间未回复，会话已自然休眠，后续可触发主动破冰。")
                         # TODO: 鑻ュ厑璁革紝杩欓噷鍙互杩藉姞 Proactive Poke 鐨勯€昏緫
                 elif reply_sent and main_event.get_group_id() and self.group_reply_wait_manager:
                     self.group_reply_wait_manager.register_from_reply_event(main_event)
@@ -375,16 +375,16 @@ class AstrMaiPlugin(Star):
         fallback_str = f"({len(fallback_models)} models standby)" if fallback_models else "(No fallback)"
         
         help_text = (
-            "馃 **AstrMai (v1.0.0)**\n"
+            "✨ **AstrMai (v1.0.0)**\n"
             "-----------------------\n"
-            "馃 鏋舵瀯鐘舵€? Phase 6 (Lifecycle Active)\n"
-            f"馃攲 Task Pool: {task_str}\n"
-            f"馃攲 Agent Pool: {agent_str}\n"
-            f"馃攲 Emb Pool: {emb_str}\n"
-            f"馃洘 Fallback: {fallback_str}\n"
-            "馃捑 SQLite & Faiss RAG: Connected\n"
-            "馃寑 Subconscious Miner: Running\n"
-            "馃尡 Proactive Life: Running"
+            "🧠 架构状态：Phase 6 (Lifecycle Active)\n"
+            f"🔲 Task Pool: {task_str}\n"
+            f"🔲 Agent Pool: {agent_str}\n"
+            f"🔲 Emb Pool: {emb_str}\n"
+            f"🛟 Fallback: {fallback_str}\n"
+            "💾 SQLite & Faiss RAG: Connected\n"
+            "🧬 Subconscious Miner: Running\n"
+            "🌱 Proactive Life: Running"
         )
         yield event.plain_result(help_text)
 
@@ -461,7 +461,7 @@ class AstrMaiPlugin(Star):
     @filter.on_decorating_result()
     async def sniff_external_plugin_results(self, event: AstrMessageEvent):
         """
-        [鏂板] 鏃佽矾鍡呮帰鍣細鎴幏鍏朵粬鎻掍欢鍗冲皢涓嬪彂鐨勬秷鎭紝骞跺皢鍏舵敞鍏?Sys1 鐨勬敞鎰忓姏绐楀彛鍜?Evolution 杩涘寲鏁版嵁搴撱€?
+        旁路嗅探器：截获其他插件即将下发的消息，并将其注入 Sys1 注意力窗口和 Evolution 数据流。
         """
         import time
         import astrbot.api.message_components as Comp
@@ -540,7 +540,7 @@ class AstrMaiPlugin(Star):
                 sys._astrmai_global_debounce_cache.pop(k, None)
                 
             if fingerprint in sys._astrmai_global_debounce_cache:
-                logger.warning(f"[AstrMai-Sensor] 馃洝锔?鏋侀€熼槻鎶栫敓鏁堬紒鎷︽埅 AstrBot 妗嗘灦鍙屽彂/鍒嗚韩娑堟伅: {msg_str[:15]}")
+                logger.warning(f"[AstrMai-Sensor] ⚠️ 极速防抖生效，已拦截 AstrBot 框架双发/分身消息: {msg_str[:15]}")
                 return 
                 
             sys._astrmai_global_debounce_cache[fingerprint] = now
@@ -603,7 +603,7 @@ class AstrMaiPlugin(Star):
         sender_name = event.get_sender_name()
         
         if self.config.global_settings.debug_mode:
-            logger.info(f"[AstrMai-Sensor] 馃摗 鏀跺埌娑堟伅 | 鍙戦€佽€? {sender_name} | 鍐呭: {msg_str[:20]}...")
+            logger.info(f"[AstrMai-Sensor] 📨 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
         
         user_id = event.get_sender_id()
         if user_id:
@@ -664,7 +664,7 @@ class AstrMaiPlugin(Star):
     @filter.on_decorating_result(priority=90)
     async def intercept_and_notify_errors(self, event: AstrMessageEvent):
         """
-        [淇敼] 鍏ㄥ眬鎷︽埅鍣細1. 闈欓粯閿€姣佸菇鐏靛崰浣嶇 2. 鎷︽埅 API 閿欒骞剁鍙戠粰绠＄悊鍛?
+        全局拦截器：1. 静默销毁幽灵占位符 2. 拦截 API 错误并私发给管理员。
         """
         result = event.get_result()
         if not result:
@@ -687,7 +687,7 @@ class AstrMaiPlugin(Star):
                 message_str = reply_text
             except Exception as e:
                 from astrbot.api import logger
-                logger.warning(f"瑙ｆ瀽鍥炲閾惧け璐? {e}")
+                logger.warning(f"解析回复链失败: {e}")
                 return
                 
         if not message_str:
@@ -709,11 +709,11 @@ class AstrMaiPlugin(Star):
             return
             
         # 瀹氫箟閿欒鐗瑰緛搴?
-        error_keywords = ['璇锋眰澶辫触', '閿欒绫诲瀷', '閿欒淇℃伅', '璋冪敤澶辫触', '澶勭悊澶辫触', '鎻忚堪澶辫触', '鑾峰彇妯″瀷鍒楄〃澶辫触', 'api error', 'all chat models failed', 'connection error', 'notfounderror']
+        error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '描述失败', '获取模型列表失败', 'api error', 'all chat models failed', 'connection error', 'notfounderror']
         
         if any(keyword in message_str.lower() for keyword in error_keywords):
             from astrbot.api import logger
-            logger.warning(f"[AstrMai-ErrorGuard] 鎷︽埅鍒扮郴缁熸姤閿欙紝闃绘涓嬪彂: {message_str[:50]}...")
+            logger.warning(f"[AstrMai-ErrorGuard] 拦截到系统报错，已阻止下发: {message_str[:50]}...")
             
             # 1. 褰诲簳鎷︽埅娑堟伅
             event.set_result(None)
@@ -721,10 +721,10 @@ class AstrMaiPlugin(Star):
             
             # 2. 缁勮鍛婅淇℃伅
             chat_id = event.get_group_id() or event.get_sender_id()
-            chat_type = "缇よ亰" if event.get_group_id() else "绉佽亰"
-            user_name = event.get_sender_name() or "鏈煡鐢ㄦ埛"
+            chat_type = "群聊" if event.get_group_id() else "私聊"
+            user_name = event.get_sender_name() or "未知用户"
             
-            alert_msg = f"鈿狅笍 [AstrMai 閿欒鍛婅]\n浣嶇疆: {chat_type}({chat_id})\n瑙﹀彂鑰? {user_name}\n璇︽儏: {message_str}"
+            alert_msg = f"🚨 [AstrMai 错误告警]\n位置: {chat_type}({chat_id})\n触发者: {user_name}\n详情: {message_str}"
             
             # 3. 闈跺悜鎶曢€掔粰绠＄悊鍛?
             admin_ids = getattr(self.config.global_settings, 'admin_ids', [])
@@ -736,7 +736,7 @@ class AstrMaiPlugin(Star):
                         try:
                             await client.api.call_action('send_private_msg', user_id=int(admin_id), message=alert_msg)
                         except Exception as e:
-                            logger.error(f"[AstrMai-ErrorGuard] 鏃犳硶鍚戠鐞嗗憳 {admin_id} 鎺ㄩ€佸憡璀? {e}")
+                            logger.error(f"[AstrMai-ErrorGuard] 无法向管理员 {admin_id} 推送告警: {e}")
     
     @filter.command("work")
     async def enter_sys3_direct(self, event: AstrMessageEvent):
@@ -750,8 +750,8 @@ class AstrMaiPlugin(Star):
         task_query = event.message_str.replace("/work", "").strip()
         if not task_query:
             yield event.plain_result(
-                "鉂?璇峰憡璇夋垜闇€瑕佹墽琛屼粈涔堜换鍔°€俓n"
-                "绀轰緥锛歚/work 甯垜瀹氫竴涓槑澶╂棭8鐐圭殑寮€浼氭彁閱抈"
+                "❌ 请告诉我需要执行什么任务。\n"
+                "示例：/work 帮我定一个明天早上8点的开会提醒"
             )
             return
         
@@ -770,7 +770,7 @@ class AstrMaiPlugin(Star):
         event.call_llm = True  
         
         from astrbot.api import logger
-        logger.info(f"[{chat_id}] 馃敡 [/work 鐩撮€歖 杩涘叆 Sys3 绾换鍔℃ā寮忥細{task_query[:50]}...")
+        logger.info(f"[{chat_id}] 🔧 [/work 直连] 进入 Sys3 纯任务模式：{task_query[:50]}...")
         
         try:
             reply = await self.gateway.tool_chat_in_lane(
@@ -793,14 +793,14 @@ class AstrMaiPlugin(Star):
             await self.reply_engine.handle_reply(event, reply, chat_id)
             
         except Exception as e:
-            logger.error(f"[{chat_id}] /work 鐩撮€?Sys3 寮傚父: {e}")
+            logger.error(f"[{chat_id}] /work 直连 Sys3 异常: {e}")
             await self.reply_engine.handle_reply(
-                event, f"浠诲姟鎵ц涓彂鐢熼敊璇細{str(e)[:100]}", chat_id
+                event, f"任务执行中发生错误：{str(e)[:100]}", chat_id
             )
 
     async def terminate(self):
-        """浼橀泤鍋滄満鍗忚皟鍣?(Graceful Shutdown)"""
-        logger.info("[AstrMai] 馃洃 Terminating processes and unmounting...")
+        """优雅停机协调器 (Graceful Shutdown)"""
+        logger.info("[AstrMai] 📴 正在终止进程并卸载资源...")
         self._is_running = False 
         
         if hasattr(self, 'memory_engine') and self.memory_engine.summarizer:
@@ -830,7 +830,7 @@ class AstrMaiPlugin(Star):
             self.visual_cortex.stop()             
         
         if tasks_to_wait:
-            logger.info(f"[AstrMai] 鈴?姝ｅ湪绛夊緟 {len(tasks_to_wait)} 涓悗鍙板崗绋嬪畨鍏ㄧ粨鏉?..")
+            logger.info(f"[AstrMai] ⏳ 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
             # 骞挎挱鍙栨秷淇″彿锛屾縺娲?CancelledError 鎹曡幏蹇収
             for task in tasks_to_wait:
                 if not task.done():

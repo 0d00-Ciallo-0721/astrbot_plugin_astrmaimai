@@ -207,33 +207,33 @@
         "hint": "防止恶意的超长提示词注射或刷屏废话占用昂贵 Token 行动点。"
       },
       "focus_thread_enabled": {
-        "description": "馃 鍚敤 Focus Thread 涓荤嚎绋嬮€夋嫨",
+        "description": "🧵 启用 Focus Thread 主线程选择",
         "type": "bool",
         "default": true,
-        "hint": "寮€鍚悗浼氬湪绐楀彛鍐呬紭鍏堟壘鍑虹湡姝ｈ鍥炵殑涓荤嚎绋嬶紝鑰屼笉鏄畝鍗曞洖鏈€鍚庝竴鏉℃秷鎭€?"
+        "hint": "开启后会在窗口内优先找出真正该回复的主线程，而不是简单回复最后一条消息。"
       },
       "focus_thread_core_max_messages": {
-        "description": "馃彯 涓荤嚎绋嬫牳蹇冩秷鎭渶澶氭潯鏁?",
+        "description": "🎯 主线程核心消息最大条数",
         "type": "int",
         "default": 4
       },
       "focus_thread_related_max_messages": {
-        "description": "馃 涓荤嚎绋嬭ˉ鍏呮秷鎭渶澶氭潯鏁?",
+        "description": "🧩 主线程相关补充消息最大条数",
         "type": "int",
         "default": 3
       },
       "ambient_background_max_messages": {
-        "description": "馃尶 鐜鑳屾櫙娑堟伅鏈€澶氭潯鏁?",
+        "description": "🌫️ 环境背景消息最大条数",
         "type": "int",
         "default": 2
       },
       "thread_same_speaker_followup_sec": {
-        "description": "鈱?鍚屼竴鐢ㄦ埛杩炵画琛ュ厖瑙嗕负鍚岀嚎绋嬬殑鏃堕棿绐楀彛",
+        "description": "⌛ 同一用户连续补充仍视为同线程的时间窗口（秒）",
         "type": "int",
         "default": 8
       },
       "thread_reply_priority_enabled": {
-        "description": "馃攣 鍥炲/@/鍞ら啋 bot 娑堟伅鏄惁鍏锋湁鏈€楂樹紭鍏堢骇",
+        "description": "🔣 回复/@/唤醒 bot 消息是否拥有最高优先级",
         "type": "bool",
         "default": true
       },

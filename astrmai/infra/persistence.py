@@ -145,7 +145,7 @@ class PersistenceManager:
                 """)
                 db.commit()
         except Exception as e:
-            logger.error(f"[AstrMai-Infra] 鏁版嵁搴撳悓姝ヨ〃鍒濆鍖栧け璐? {e}")
+            logger.error(f"[AstrMai-Infra] 数据库同步表初始化失败: {e}")
 
     # ==========================================
     # Cache I/O (Persona Summarizer)

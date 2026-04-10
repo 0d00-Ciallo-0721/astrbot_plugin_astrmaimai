@@ -48,12 +48,12 @@ class AttentionConfig(BaseModel):
     throttle_min_entropy: int = Field(default=2)
     repeater_threshold: int = Field(default=3)
     max_message_length: int = Field(default=100)
-    focus_thread_enabled: bool = Field(default=True, description="鍚敤 Focus Thread 绠楁硶锛屽湪绐楀彛鍐呴€夋嫨涓荤嚎绋嬩綔涓烘湰杞富鍥炲簲鐩爣")
-    focus_thread_core_max_messages: int = Field(default=4, description="Focus Thread 涓婚棶棰樻牳蹇冩秷鎭殑鏈€澶氭暟閲?")
-    focus_thread_related_max_messages: int = Field(default=3, description="Focus Thread 鐩稿叧琛ュ厖娑堟伅鐨勬渶澶氭暟閲?")
-    ambient_background_max_messages: int = Field(default=2, description="鐜鑳屾櫙娑堟伅鐨勬渶澶氭敞鍏ユ潯鏁?")
-    thread_same_speaker_followup_sec: int = Field(default=8, description="鍚屼竴鐢ㄦ埛杩炵画琛ュ厖娑堟伅浠嶈涓哄悓涓€绾跨▼鐨勬椂闂寸獥鍙?(绉?)")
-    thread_reply_priority_enabled: bool = Field(default=True, description="鏄惁璁╁洖澶?/@/鍞ら啋 bot 鐨勬秷鎭綔涓?Focus Thread 鐨勬渶楂樹紭鍏堢骇")
+    focus_thread_enabled: bool = Field(default=True, description="启用 Focus Thread 算法，在窗口内选择主线程作为本轮回复目标")
+    focus_thread_core_max_messages: int = Field(default=4, description="Focus Thread 核心消息的最大条数")
+    focus_thread_related_max_messages: int = Field(default=3, description="Focus Thread 相关补充消息的最大条数")
+    ambient_background_max_messages: int = Field(default=2, description="环境背景消息的最大注入条数")
+    thread_same_speaker_followup_sec: int = Field(default=8, description="同一用户连续补充消息仍视为同一线程的时间窗口（秒）")
+    thread_reply_priority_enabled: bool = Field(default=True, description="是否让回复/@/唤醒 bot 的消息拥有 Focus Thread 的最高优先级")
     
     # === [新增] 情绪归因启发式算法超参数 ===
     affection_weights: Dict[str, float] = Field(default={"trigger": 20.0, "window": 50.0, "history": 30.0})

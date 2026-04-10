@@ -42,7 +42,7 @@ class GoalManager:
 
     MAX_GOALS = 3
     SIMILARITY_MERGE_THRESHOLD = 0.6
-    GOAL_SYSTEM_PROMPT = "浣犳槸瀵硅瘽鐩爣绠＄悊鍣紝璐熻矗鎻愬彇褰撳墠鏈€鏍稿績鐨勭煭鏈熷璇濈洰鏍囥€?"
+    GOAL_SYSTEM_PROMPT = "你是对话目标管理器，负责提取当前最核心的短期对话目标。"
 
     def __init__(self, gateway, config=None):
         self.gateway = gateway

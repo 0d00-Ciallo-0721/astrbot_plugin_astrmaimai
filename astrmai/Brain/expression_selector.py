@@ -36,7 +36,7 @@ class ExpressionSelector:
     FAST_SELECT_LIMIT = 5
     # think_level=1 时候选池大小
     DEEP_CANDIDATE_LIMIT = 10
-    EXPRESSION_SYSTEM_PROMPT = "浣犳槸琛ㄨ揪椋庢牸鍖归厤鍣紝闇€瑕佷粠鍊欓€夎〃杈句腑鎸戦€夊綋鍓嶈澧冩渶鑷劧鐨勫嚑鏉°€?"
+    EXPRESSION_SYSTEM_PROMPT = "你是表达风格匹配器，需要从候选表达中挑选当前语境最自然、最贴切的几条。"
 
     def __init__(self, db: DatabaseService, gateway: GlobalModelGateway, config=None):
         self.db = db
