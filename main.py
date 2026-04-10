@@ -480,7 +480,7 @@ class AstrMaiPlugin(Star):
             if isinstance(comp, Comp.Plain):
                 reply_text += comp.text
             elif isinstance(comp, Comp.Image):
-                reply_text += "[鍥剧墖]"
+                reply_text += "[图片]"
 
         if not reply_text:
             return

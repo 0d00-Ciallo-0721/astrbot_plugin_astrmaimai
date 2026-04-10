@@ -35,6 +35,9 @@ class NormalizedEvent:
     is_near_context_query: bool
     reply_target_sender_id: str = ""
     reply_target_sender_name: str = ""
+    image_urls: List[str] = field(default_factory=list)
+    has_direct_vision: bool = False
+    is_image_only: bool = False
     token_set: Set[str] = field(default_factory=set)
     index: int = 0
 
@@ -213,6 +216,13 @@ class AttentionGate:
             sender_name = event.get_sender_name() or "群友/用户"
             rich_text = str(event.get_extra("astrmai_rich_text", event.message_str) or "")
             text = str(event.message_str or rich_text or "")
+            image_urls = list(
+                dict.fromkeys(
+                    list(event.get_extra("direct_vision_urls", []) or [])
+                    + list(event.get_extra("extracted_image_urls", []) or [])
+                )
+            )
+            token_set = self._tokenize_text(rich_text or text)
             reply_target_sender_id, reply_target_sender_name = self._extract_reply_target(event)
             is_at_bot = self._is_at_bot_event(event, self_id)
 
@@ -231,7 +241,10 @@ class AttentionGate:
                     is_near_context_query=self._is_near_context_query_text(text or rich_text),
                     reply_target_sender_id=reply_target_sender_id,
                     reply_target_sender_name=reply_target_sender_name,
-                    token_set=self._tokenize_text(rich_text or text),
+                    image_urls=image_urls,
+                    has_direct_vision=bool(event.get_extra("direct_vision_urls", []) or []),
+                    is_image_only=bool(image_urls and not token_set),
+                    token_set=token_set,
                     index=index,
                 )
             )
@@ -260,6 +273,9 @@ class AttentionGate:
         elif candidate.is_direct_wakeup and reply_priority_enabled:
             score += 700
             reason = "direct_wakeup"
+        elif candidate.has_direct_vision:
+            score += 500
+            reason = "direct_vision_request"
         elif candidate.is_near_context_query:
             score += 350
             reason = "near_context_followup"
@@ -370,6 +386,11 @@ class AttentionGate:
             same_speaker_window = int(getattr(getattr(self.config, "attention", None), "thread_same_speaker_followup_sec", 8) or 8)
             if not candidate.timestamp or not focus_candidate.timestamp or (focus_candidate.timestamp - candidate.timestamp) <= same_speaker_window:
                 score += 40
+        if candidate.image_urls and focus_candidate.image_urls:
+            if candidate.sender_id == focus_candidate.sender_id:
+                score += 35
+            if candidate.has_direct_vision and focus_candidate.has_direct_vision:
+                score += 25
         if shared_tokens:
             score += 25
         if candidate.is_near_context_query and abs(candidate.index - focus_candidate.index) <= 1:
@@ -575,6 +596,10 @@ class AttentionGate:
         chat_state = await self.state_engine.get_state(chat_id)
         
         extracted_images = event.get_extra("extracted_image_urls") or []
+        direct_vision_urls = event.get_extra("direct_vision_urls") or []
+        if extracted_images and not direct_vision_urls and not is_private and not is_strong_wakeup:
+            logger.debug(f"[{chat_id}] passive group image share ignored by attention gate.")
+            return "IGNORE"
         if extracted_images:
             await self.state_engine.persistence.add_last_message_meta(
                 chat_id, sender_id, True, extracted_images
@@ -763,8 +788,6 @@ class AttentionGate:
                                     
                         # 🚀 [视觉盲区] 对 System 1 只暴露简单的占位符
                         outline += "[图片]"
-                        
-                        outline += "[鍥剧墖]"
 
                     elif component_type == "face" or i.__class__.__name__ == "Face":
                         outline += f"[表情:{getattr(i, 'id', getattr(i, 'name', ''))}]"
@@ -1095,7 +1118,11 @@ class AttentionGate:
                         
                         # 🚀 [全知视界编排] 汇总窗口内的所有图片真实 URL，统一塞给主事件，交由 System 2 接管
                         all_vision_urls = []
-                        for e in final_events:
+                        thread_vision_events = (
+                            list(focus_thread["core_events"])
+                            + list(focus_thread["related_events"])
+                        )
+                        for e in thread_vision_events:
                             urls = e.get_extra("direct_vision_urls", [])
                             if urls:
                                 all_vision_urls.extend(urls)

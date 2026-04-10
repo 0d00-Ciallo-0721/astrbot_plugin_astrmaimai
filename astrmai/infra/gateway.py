@@ -7,7 +7,11 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 from .model_router import ModelRouter
 from .lane_manager import LaneKey, LaneManager
-from .output_guard import looks_like_provider_failure_text, sanitize_visible_reply_text
+from .output_guard import (
+    is_safe_visible_text,
+    looks_like_provider_failure_text,
+    sanitize_visible_reply_text,
+)
 from .provider_capabilities import infer_provider_capabilities
 
 # [修改] 引入 AstrBot 标准消息片段类，并添加防崩溃动态导入 (兼容 v4.12 - v4.18+)
@@ -140,16 +144,7 @@ class GlobalModelGateway:
                         current_prompt = prompt
                         
                         if processed_image_urls:
-                            if ImagePart:
-                                user_content = []
-                                if current_prompt:
-                                    user_content.append(TextPart(text=current_prompt))
-                                for path_or_url in processed_image_urls:
-                                    user_content.append(ImagePart(url=path_or_url))
-                                request_contexts.append(UserMessageSegment(content=user_content))
-                                current_prompt = "" 
-                            else:
-                                llm_kwargs["image_urls"] = processed_image_urls
+                            llm_kwargs["image_urls"] = processed_image_urls
                                 
                         # 超时熔断
                         try:
@@ -170,6 +165,10 @@ class GlobalModelGateway:
                             raise ValueError("响应为空")
                         if looks_like_provider_failure_text(content):
                             raise ValueError("模型返回了原始失败载荷")
+                        if not is_json:
+                            content = sanitize_visible_reply_text(content, fallback_text="")
+                            if not content:
+                                raise ValueError("模型返回了不可展示的非自然语言文本")
                         
                         # ✅ 调用成功 → 上报健康
                         self.router.report_success(report_pool, model_id)
@@ -179,7 +178,7 @@ class GlobalModelGateway:
                         self._log_usage(report_pool, model_id, usage, log_meta)
 
                         if not is_json:
-                            return content.strip() 
+                            return content.strip()
                             
                         raw_json_str = self._extract_json(content)
                         try:
@@ -357,7 +356,7 @@ class GlobalModelGateway:
         if isinstance(assistant_content, str):
             assistant_content = sanitize_visible_reply_text(assistant_content, fallback_text="")
         lane_user_content = raw_user_text or prompt
-        if assistant_content:
+        if assistant_content and is_safe_visible_text(assistant_content):
             await self.lane_manager.append_exchange(
                 lane_key=lane_key,
                 base_origin=base_origin,
@@ -454,7 +453,7 @@ class GlobalModelGateway:
                     },
                 )
                 clean_assistant_text = sanitize_visible_reply_text(reply_text, fallback_text="")
-                if clean_assistant_text:
+                if clean_assistant_text and is_safe_visible_text(clean_assistant_text):
                     await self.lane_manager.append_exchange(
                         lane_key=lane_key,
                         base_origin=base_origin,

@@ -7,10 +7,11 @@ PROVIDER_FAILURE_MARKERS = (
     "request_id",
     "request id",
     "status code",
-    "http 状态码",
     "http status",
+    "http 状态码",
     "json 响应",
     "完整 api 响应",
+    "完整api响应",
     "usagemetadata",
     "prompttokencount",
     "totaltokencount",
@@ -22,7 +23,6 @@ PROVIDER_FAILURE_MARKERS = (
     "安全限制",
     "内容可能已被过滤",
     "被安全过滤器拦截",
-    "模型没有生成任何内容",
     "没有生成任何文本",
     "没有生成任何内容",
     "没有生成有效回复",
@@ -33,19 +33,30 @@ PROVIDER_FAILURE_MARKERS = (
 
 PROMPT_SCAFFOLD_MARKERS = (
     "[rollingsummary]",
-    "[本轮主线程",
-    "本轮主线程（优先围绕它回答）",
-    "[本轮必须优先回应的消息",
+    "较早对话摘要",
+    "最近真实对话",
+    "最近几轮对话",
+    "本轮主线程",
+    "请优先接住这条对话线索并回答",
+    "优先处理这条消息",
     "本轮优先回应消息",
-    "[与焦点直接相关的上下文",
-    "相关上下文：",
-    "[同线程补充消息",
-    "同线程补充：",
-    "[环境背景",
-    "环境背景，仅供参考：",
-    "环境背景消息，仅供参考：",
-    "[上一轮你的回复",
-    "上一轮你的回复：",
+    "相关上下文",
+    "和它直接相关的上下文",
+    "同线程补充",
+    "环境背景",
+    "其他背景只作参考，不必逐条回应",
+    "背景消息，仅供参考",
+    "上一轮你的回复",
+    "你上一句刚说过",
+    "你的想法",
+    "你的对话目标",
+    "你此刻的直觉",
+    "此刻你的直觉：",
+    "这一轮你想达成：",
+    "你脑海里闪过的想法：",
+    "当前心情:",
+    "当前状态：",
+    "请顺着刚才的话继续回应，不要另起话题",
 )
 
 TOOL_PROTOCOL_MARKERS = (
@@ -55,13 +66,27 @@ TOOL_PROTOCOL_MARKERS = (
     "请调用 wait_and_listen",
 )
 
+MOJIBAKE_MARKERS = (
+    "鍥剧墖",
+    "鏈疆",
+    "鐜",
+    "浣犵殑鎯虫硶",
+    "瀵硅瘽鐩爣",
+    "褰撳墠蹇冩儏",
+)
+
 ROLE_PREFIX_RE = re.compile(r"^(user|assistant|system)\s*:\s*", re.IGNORECASE)
 TIME_PREFIX_RE = re.compile(r"^\[[0-2]?\d:[0-5]\d(?::[0-5]\d)?\]\s*")
 PUNCT_FRAGMENT_RE = re.compile(r"^[\s'\"`{}\[\]():,._-]+$")
 REQUEST_ID_LINE_RE = re.compile(r"^\(?\s*request[_\s-]*id\s*[:：]", re.IGNORECASE)
 STATUS_LINE_RE = re.compile(r"^\(?\s*(http\s*)?status\s*code\s*[:：]", re.IGNORECASE)
 HTTP_STATUS_CN_RE = re.compile(r"^http\s*状态码\s*[:：]", re.IGNORECASE)
-SAFETY_JSON_RE = re.compile(r"(finishreason|usagemetadata|prompttokencount|totaltokencount|safety_ratings)", re.IGNORECASE)
+SAFETY_JSON_RE = re.compile(
+    r"(finishreason|usagemetadata|prompttokencount|totaltokencount|safety_ratings)",
+    re.IGNORECASE,
+)
+JSON_FRAGMENT_RE = re.compile(r"^[\[\{].*[\}\]]$", re.DOTALL)
+SINGLE_LATIN_FRAGMENT_RE = re.compile(r"^[A-Za-z]$")
 
 
 def normalize_guard_text(text: str) -> str:
@@ -87,14 +112,13 @@ def looks_like_provider_failure_text(text: str) -> bool:
         return True
     if SAFETY_JSON_RE.search(lowered):
         return True
-    if normalized.startswith("{") or normalized.startswith("["):
+    if JSON_FRAGMENT_RE.match(normalized):
         try:
             parsed = json.loads(normalized)
         except Exception:
             parsed = None
-        if isinstance(parsed, dict):
-            if any(key in parsed for key in ("candidates", "usageMetadata", "usage_metadata")):
-                return True
+        if isinstance(parsed, dict) and any(key in parsed for key in ("candidates", "usageMetadata", "usage_metadata")):
+            return True
         if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
             if any(key in parsed[0] for key in ("finishReason", "safetyRatings", "usageMetadata")):
                 return True
@@ -107,6 +131,8 @@ def looks_like_prompt_scaffold_text(text: str) -> bool:
         return False
     lowered = normalized.lower()
     if any(marker in lowered for marker in PROMPT_SCAFFOLD_MARKERS):
+        return True
+    if any(marker.lower() in lowered for marker in MOJIBAKE_MARKERS):
         return True
     return bool(ROLE_PREFIX_RE.match(normalized))
 
@@ -127,9 +153,11 @@ def is_noise_line(line: str) -> bool:
         return True
     if STATUS_LINE_RE.match(stripped) or HTTP_STATUS_CN_RE.match(stripped):
         return True
-    if stripped in {"A", "All", "'}", "\"}", "}", "]"}:
+    if stripped in {"A", "a", "All", "'}", "\"}", "}", "]"}:
         return True
     if PUNCT_FRAGMENT_RE.match(stripped):
+        return True
+    if SINGLE_LATIN_FRAGMENT_RE.match(stripped):
         return True
     if looks_like_provider_failure_text(stripped):
         return True
@@ -146,6 +174,9 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "") -> str:
     normalized = normalize_guard_text(text)
     if not normalized:
         return ""
+    if looks_like_provider_failure_text(normalized) or looks_like_tool_protocol_text(normalized):
+        return fallback_text.strip()
+
     lines: List[str] = []
     for raw_line in normalized.splitlines():
         raw_cleaned = TIME_PREFIX_RE.sub("", raw_line.strip())
@@ -156,12 +187,14 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "") -> str:
         if is_noise_line(cleaned):
             continue
         lines.append(cleaned)
+
     candidate = "\n".join(line for line in lines if line).strip()
     if candidate:
         if looks_like_provider_failure_text(candidate) or looks_like_tool_protocol_text(candidate):
             return fallback_text.strip()
         return candidate
-    if looks_like_provider_failure_text(normalized) or looks_like_tool_protocol_text(normalized):
+
+    if looks_like_prompt_scaffold_text(normalized):
         return fallback_text.strip()
     return ""
 

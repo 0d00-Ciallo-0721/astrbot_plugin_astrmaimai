@@ -151,14 +151,14 @@ class PromptRefiner:
 
         current_sections = []
         if focus_block:
-            current_sections.append(f"本轮主线程（优先围绕它回答）：\n{focus_block}")
+            current_sections.append(f"请优先接住这条对话线索并回答：\n{focus_block}")
         if background_window_text:
-            current_sections.append(f"环境背景，仅供参考：\n{background_window_text}")
+            current_sections.append(f"其他背景只作参考，不必逐条回应：\n{background_window_text}")
         current_block = "\n\n".join(current_sections) if current_sections else (focus_block or prompt)
 
         final_system_prompt = re.sub(
             r"<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}",
-            f"最近真实对话：\n{history_block}",
+            f"最近几轮对话：\n{history_block}",
             system_prompt,
         )
         final_system_prompt = re.sub(
@@ -176,12 +176,12 @@ class PromptRefiner:
         visual_focus_block = await self._resolve_visual_memory(focus_block)
         prompt_lines = []
         if visual_focus_block:
-            prompt_lines.append(f"本轮主线程（优先围绕它回答）：\n{visual_focus_block}")
+            prompt_lines.append(f"请优先接住这条对话线索并回答：\n{visual_focus_block}")
         if background_window_text:
             visual_background_block = await self._resolve_visual_memory(background_window_text)
-            prompt_lines.append(f"环境背景，仅供参考：\n{visual_background_block}")
+            prompt_lines.append(f"其他背景只作参考，不必逐条回应：\n{visual_background_block}")
         if not is_fast_mode:
-            prompt_lines.append("请直接接住上一轮语义继续说，不要重启话题。")
+            prompt_lines.append("请顺着刚才的话继续回应，不要另起话题。")
         final_prompt = "\n\n".join(line for line in prompt_lines if line).strip()
 
         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):

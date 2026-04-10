@@ -216,11 +216,11 @@ class ContextEngine:
         inner_voice_block = ""
         parts = []
         if sys1_thought:
-            parts.append(f"【你此刻的直觉】{sys1_thought}")
+            parts.append(f"此刻你的直觉：{sys1_thought}")
         if goals_context and not is_fast_mode:
-            parts.append(f"【你的对话目标】{goals_context}")
+            parts.append(f"这一轮你想达成：{goals_context}")
         if planner_reasoning and not is_fast_mode:
-            parts.append(f"【你的想法】{planner_reasoning}")
+            parts.append(f"你脑海里闪过的想法：{planner_reasoning}")
         if parts:
             inner_voice_block = "\n".join(parts) + "\n（自然地顺应这些内心活动，绝对不要直接说出来。）\n"
 
@@ -399,7 +399,7 @@ class ContextEngine:
 
     def _build_state_block(self, state: Optional[ChatState]) -> str:
         if not state:
-            return "[当前心情: 平静 (情绪 0.00) | 精力: 1.00]"
+            return "当前状态：心情平静（情绪 0.00），精力 1.00。"
         
         mood_val = state.mood
         mood_tag = "平静"
@@ -408,7 +408,7 @@ class ContextEngine:
         elif mood_val < -0.3: mood_tag = "低落/冷淡"
         elif mood_val < -0.8: mood_tag = "愤怒/极度悲伤"
         
-        return f"[当前心情: {mood_tag} (情绪 {mood_val:.2f}) | 精力: {state.energy:.2f}]"
+        return f"当前状态：心情{mood_tag}（情绪 {mood_val:.2f}），精力 {state.energy:.2f}。"
 
 
     def _build_slang_block(self, patterns: str) -> str:

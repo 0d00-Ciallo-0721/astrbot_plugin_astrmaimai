@@ -161,6 +161,11 @@ class PreFilters:
             unique_direct_urls = list(dict.fromkeys(direct_vision_urls))
             event.set_extra("direct_vision_urls", unique_direct_urls)
             logger.debug(f"[AstrMai-Sensor] 👁️ 捕获主脑直通车视觉特征！提取直通 URL 数: {len(unique_direct_urls)}")
+        event.set_extra("astrmai_is_direct_vision_request", bool(direct_vision_urls))
+        event.set_extra(
+            "astrmai_is_passive_image_share",
+            bool(image_urls) and not bool(direct_vision_urls) and not is_private and not has_at_bot,
+        )
         # ==========================================
 
         clean_text = " ".join(clean_text_parts).strip().lower()

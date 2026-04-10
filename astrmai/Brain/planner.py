@@ -201,10 +201,10 @@ class Planner:
                     break
         prompt_sections = []
         if last_assistant_reply:
-            prompt_sections.append(f"上一轮你的回复：{last_assistant_reply}")
-        prompt_sections.append(f"本轮主线程（优先围绕它回答）：\n{focus_thread_text}")
+            prompt_sections.append(f"你上一句刚说过：{last_assistant_reply}")
+        prompt_sections.append(f"请优先接住这条对话线索并回答：\n{focus_thread_text}")
         if background_window_text:
-            prompt_sections.append(f"环境背景消息，仅供参考：\n{background_window_text}")
+            prompt_sections.append(f"其他背景只作参考，不必逐条回应：\n{background_window_text}")
         prompt_content = "\n\n".join(section for section in prompt_sections if section)
         event.set_extra("astrmai_raw_user_text", focus_message_text)
         event.set_extra("astrmai_background_window_text", background_window_text)
