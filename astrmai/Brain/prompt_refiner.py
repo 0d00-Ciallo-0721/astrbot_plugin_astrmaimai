@@ -4,6 +4,8 @@ import re
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from ..infra.legacy_compat import read_legacy_prompt_envelope
+from ..infra.runtime_contracts import PromptEnvelope
 
 
 class PromptRefiner:
@@ -19,22 +21,34 @@ class PromptRefiner:
         self,
         event: AstrMessageEvent,
         prompt: str,
-        disable_rag: bool,
-        is_fast_mode: bool,
-        retrieve_keys: list[str],
+        prompt_envelope: PromptEnvelope | None = None,
+        disable_rag: bool = False,
+        is_fast_mode: bool = False,
+        retrieve_keys: list[str] | None = None,
     ) -> str:
-        if event.get_extra("astrmai_near_context_priority", False):
+        retrieve_keys = retrieve_keys or []
+        if isinstance(prompt_envelope, PromptEnvelope):
+            if prompt_envelope.near_context_priority:
+                return ""
+            current_query = str(
+                prompt_envelope.raw_user_text
+                or prompt_envelope.focus_thread_text
+                or prompt
+                or event.message_str
+                or ""
+            ).strip()
+        else:
+            if event.get_extra("astrmai_near_context_priority", False):
+                return ""
+            current_query = str(
+                event.get_extra("astrmai_focus_message_text", "")
+                or event.get_extra("astrmai_raw_user_text", "")
+                or event.message_str
+                or ""
+            ).strip()
+        if not current_query:
             return ""
         if disable_rag or is_fast_mode:
-            return ""
-
-        current_query = str(
-            event.get_extra("astrmai_focus_message_text", "")
-            or event.get_extra("astrmai_raw_user_text", "")
-            or event.message_str
-            or ""
-        ).strip()
-        if not current_query:
             return ""
 
         chat_id = event.unified_msg_origin
@@ -121,23 +135,31 @@ class PromptRefiner:
             disable_rag = context.shared_dict.get("disable_rag_injection", False)
 
         retrieve_keys = event.get_extra("retrieve_keys", [])
-        recent_transcript = str(event.get_extra("astrmai_recent_transcript", "") or "").strip()
-        raw_user_text = str(event.get_extra("astrmai_raw_user_text", prompt) or prompt).strip()
-        focus_thread_text = str(event.get_extra("astrmai_focus_thread_text", "") or "").strip()
-        background_window_text = str(
-            event.get_extra("astrmai_ambient_background_text", "")
-            or event.get_extra("astrmai_background_window_text", "")
-            or ""
-        ).strip()
-        focus_reason = str(event.get_extra("astrmai_focus_reason", "") or "").strip()
-        focus_thread_reason = str(event.get_extra("astrmai_focus_thread_reason", "") or focus_reason).strip()
-        near_context_priority = bool(event.get_extra("astrmai_near_context_priority", False))
+        prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
+        if isinstance(prompt_envelope, PromptEnvelope):
+            recent_transcript = prompt_envelope.recent_transcript.strip()
+            raw_user_text = (prompt_envelope.raw_user_text or prompt).strip()
+            focus_thread_text = prompt_envelope.focus_thread_text.strip()
+            background_window_text = prompt_envelope.ambient_background_text.strip()
+            focus_reason = prompt_envelope.focus_reason.strip()
+            focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
+            near_context_priority = bool(prompt_envelope.near_context_priority)
+        else:
+            prompt_envelope = read_legacy_prompt_envelope(event, prompt=prompt)
+            recent_transcript = prompt_envelope.recent_transcript.strip()
+            raw_user_text = prompt_envelope.raw_user_text.strip()
+            focus_thread_text = prompt_envelope.focus_thread_text.strip()
+            background_window_text = prompt_envelope.ambient_background_text.strip()
+            focus_reason = prompt_envelope.focus_reason.strip()
+            focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
+            near_context_priority = bool(prompt_envelope.near_context_priority)
         use_lane_history = bool(event.get_extra("astrmai_use_lane_history", False))
         is_fast_mode = "CORE_ONLY" in retrieve_keys
 
         injection = await self._build_memory_injection(
             event=event,
             prompt=prompt,
+            prompt_envelope=prompt_envelope if isinstance(prompt_envelope, PromptEnvelope) else None,
             disable_rag=disable_rag,
             is_fast_mode=is_fast_mode,
             retrieve_keys=retrieve_keys,
@@ -149,12 +171,17 @@ class PromptRefiner:
             background_lines = [line for line in background_window_text.splitlines() if line.strip()]
             background_window_text = "\n".join(background_lines[-1:])
 
-        current_sections = []
-        if focus_block:
-            current_sections.append(f"请优先接住这条对话线索并回答：\n{focus_block}")
-        if background_window_text:
-            current_sections.append(f"其他背景只作参考，不必逐条回应：\n{background_window_text}")
-        current_block = "\n\n".join(current_sections) if current_sections else (focus_block or prompt)
+        if isinstance(prompt_envelope, PromptEnvelope):
+            prompt_envelope.ambient_background_text = background_window_text
+            prompt_envelope.near_context_priority = near_context_priority
+            current_block = prompt_envelope.current_block() or (focus_block or prompt)
+        else:
+            current_sections = []
+            if focus_block:
+                current_sections.append(f"请优先接住这条对话线索并回答：\n{focus_block}")
+            if background_window_text:
+                current_sections.append(f"其他背景只作参考，不必逐条回应：\n{background_window_text}")
+            current_block = "\n\n".join(current_sections) if current_sections else (focus_block or prompt)
 
         final_system_prompt = re.sub(
             r"<CHAT_HISTORY>|\{HISTORY_PLACEHOLDER\}",

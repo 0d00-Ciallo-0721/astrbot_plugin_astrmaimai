@@ -12,7 +12,9 @@ from .output_guard import (
     looks_like_provider_failure_text,
     sanitize_visible_reply_text,
 )
+from .runtime_contracts import FailureKind, LLMCallResult, VisibleReplyArtifact
 from .provider_capabilities import infer_provider_capabilities
+from .trace_runtime import preview_text
 
 # [修改] 引入 AstrBot 标准消息片段类，并添加防崩溃动态导入 (兼容 v4.12 - v4.18+)
 from astrbot.core.agent.message import SystemMessageSegment, UserMessageSegment, TextPart
@@ -98,6 +100,196 @@ class GlobalModelGateway:
             cache_rate,
         )
 
+    def _build_success_result(
+        self,
+        *,
+        text: str = "",
+        parsed_json: Any = None,
+        model_id: str = "",
+        usage: Optional[Dict[str, int]] = None,
+    ) -> LLMCallResult:
+        capabilities = infer_provider_capabilities(model_id) if model_id else None
+        return LLMCallResult(
+            ok=True,
+            text=text,
+            parsed_json=parsed_json,
+            model_id=model_id,
+            provider_family=getattr(capabilities, "provider_family", ""),
+            usage=usage or {},
+            raw_completion=text,
+        )
+
+    def _build_failure_result(
+        self,
+        *,
+        error_kind: FailureKind,
+        error_message: str,
+        model_id: str = "",
+        raw_completion: str = "",
+    ) -> LLMCallResult:
+        capabilities = infer_provider_capabilities(model_id) if model_id else None
+        return LLMCallResult(
+            ok=False,
+            error_kind=error_kind,
+            error_message=error_message,
+            model_id=model_id,
+            provider_family=getattr(capabilities, "provider_family", ""),
+            raw_completion=raw_completion,
+        )
+
+    async def _elastic_call_result(
+        self,
+        pool_name: str,
+        prompt: str,
+        system_prompt: str,
+        models: List[str],
+        is_json: bool = False,
+        retry_penalty: float = 0.0,
+        image_urls: List[str] = None,
+        use_fallback: bool = True,
+        contexts: Optional[List[Any]] = None,
+        debug_meta: Optional[Dict[str, Any]] = None,
+        request_kwargs: Optional[Dict[str, Any]] = None,
+        request_kwargs_factory: Optional[Callable[[str], Dict[str, Any]]] = None,
+    ) -> LLMCallResult:
+        """结构化网关主接口：内部调用只返回 LLMCallResult。"""
+
+        async with self._global_semaphore:
+            primary_models = self.router.get_ranked_models(pool_name, models)
+            attempt_queue = primary_models.copy()
+            if use_fallback:
+                fallback_models_raw = getattr(self.config.provider, "fallback_models", [])
+                fallback_models = self.router.get_ranked_models("fallback", fallback_models_raw)
+                attempt_queue += [m for m in fallback_models if m not in attempt_queue]
+
+            if not attempt_queue:
+                raise LLMCascadeFailureException(f"未配置可用模型池: {pool_name}")
+
+            max_retries = getattr(self.config.infra, "llm_retries", 1)
+            backoff_factor = getattr(self.config.infra, "backoff_factor", 1.5)
+            timeout_limit = getattr(self.config.infra, "api_timeout", 15.0)
+            last_result = self._build_failure_result(
+                error_kind=FailureKind.UNKNOWN,
+                error_message="model queue not started",
+            )
+
+            for model_id in attempt_queue:
+                report_pool = pool_name if model_id in primary_models else "fallback"
+                logger.debug(f"[Gateway] try model={model_id} pool={report_pool} json={is_json}")
+                for attempt in range(max_retries + 1):
+                    try:
+                        processed_image_urls = list(image_urls or [])
+                        request_contexts = list(contexts or [])
+                        llm_kwargs = dict(request_kwargs or {})
+                        if request_kwargs_factory:
+                            llm_kwargs.update(request_kwargs_factory(model_id) or {})
+                        if system_prompt:
+                            llm_kwargs["system_prompt"] = system_prompt
+                        if processed_image_urls:
+                            llm_kwargs["image_urls"] = processed_image_urls
+
+                        try:
+                            resp = await asyncio.wait_for(
+                                self.context.llm_generate(
+                                    chat_provider_id=model_id,
+                                    prompt=prompt if prompt else None,
+                                    contexts=request_contexts,
+                                    **llm_kwargs,
+                                ),
+                                timeout=timeout_limit,
+                            )
+                        except asyncio.TimeoutError:
+                            raise TimeoutError(f"api timeout ({timeout_limit}s)")
+
+                        content = getattr(resp, "completion_text", "") or ""
+                        if not content.strip():
+                            raise ValueError("empty_response")
+                        if looks_like_provider_failure_text(content):
+                            raise ValueError("provider_failure_text")
+
+                        usage = self._extract_usage(resp)
+                        log_meta = dict(debug_meta or {})
+                        log_meta["provider"] = infer_provider_capabilities(model_id).provider_family
+
+                        if is_json:
+                            raw_json_str = self._extract_json(content)
+                            parsed_json: Any = None
+                            try:
+                                parsed_json = json.loads(raw_json_str)
+                            except json.JSONDecodeError:
+                                if repair_json:
+                                    try:
+                                        repaired = repair_json(raw_json_str, return_objects=False)
+                                        if isinstance(repaired, str):
+                                            parsed_json = json.loads(repaired)
+                                        elif isinstance(repaired, (dict, list)):
+                                            parsed_json = repaired
+                                    except json.JSONDecodeError:
+                                        parsed_json = None
+                                if parsed_json is None:
+                                    raise ValueError(f"json_decode_error: {raw_json_str[:120]}")
+
+                            self.router.report_success(report_pool, model_id)
+                            self._log_usage(report_pool, model_id, usage, log_meta)
+                            return self._build_success_result(
+                                text=str(content).strip(),
+                                parsed_json=parsed_json,
+                                model_id=model_id,
+                                usage=usage,
+                            )
+
+                        safe_text = sanitize_visible_reply_text(content, fallback_text="")
+                        if not safe_text:
+                            raise ValueError("unsafe_or_empty_text")
+
+                        self.router.report_success(report_pool, model_id)
+                        self._log_usage(report_pool, model_id, usage, log_meta)
+                        return self._build_success_result(
+                            text=safe_text.strip(),
+                            model_id=model_id,
+                            usage=usage,
+                        )
+                    except Exception as e:
+                        last_error = str(e)
+                        lowered = last_error.lower()
+                        if "empty_response" in lowered:
+                            failure_kind = FailureKind.EMPTY_RESPONSE
+                        elif "provider_failure_text" in lowered:
+                            failure_kind = FailureKind.PROVIDER_FAILURE_TEXT
+                        elif "json" in lowered:
+                            failure_kind = FailureKind.JSON_DECODE_ERROR
+                        elif "timeout" in lowered:
+                            failure_kind = FailureKind.TIMEOUT
+                        elif "payload" in lowered or "validation error" in lowered:
+                            failure_kind = FailureKind.BAD_PAYLOAD
+                        else:
+                            failure_kind = FailureKind.UNKNOWN
+                        last_result = self._build_failure_result(
+                            error_kind=failure_kind,
+                            error_message=last_error,
+                            model_id=model_id,
+                        )
+
+                        fatal_keywords = [
+                            "429",
+                            "ratelimit",
+                            "too many requests",
+                            "invalid_request_error",
+                            "apitimeouterror",
+                            "request timed out",
+                            "timeout",
+                        ]
+                        is_fatal = any(kw in lowered for kw in fatal_keywords) or "content=none" in lowered
+                        self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
+                        if is_fatal:
+                            logger.error(f"[Gateway] fatal model failure {model_id}: {last_error[:120]}")
+                            break
+                        logger.warning(f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {e}")
+                        if attempt < max_retries:
+                            await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
+
+            raise LLMCascadeFailureException(f"所有模型均失败: {last_result.error_message}")
+
 # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
 # [修改] 位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def _elastic_call(self, pool_name: str, prompt: str, system_prompt: str, models: List[str], is_json: bool = False, retry_penalty: float = 0.0, image_urls: List[str] = None, use_fallback: bool = True, contexts: Optional[List[Any]] = None, debug_meta: Optional[Dict[str, Any]] = None, request_kwargs: Optional[Dict[str, Any]] = None, request_kwargs_factory: Optional[Callable[[str], Dict[str, Any]]] = None) -> Union[str, Dict[str, Any]]:
@@ -122,7 +314,10 @@ class GlobalModelGateway:
             max_retries = getattr(self.config.infra, 'llm_retries', 1)
             backoff_factor = getattr(self.config.infra, 'backoff_factor', 1.5)
             timeout_limit = getattr(self.config.infra, 'api_timeout', 15.0)
-            last_error = ""
+            last_result = self._build_failure_result(
+                error_kind=FailureKind.UNKNOWN,
+                error_message="model queue not started",
+            )
             
             for model_id in attempt_queue:
                 # 判断当前模型属于哪个池（用于上报）
@@ -173,16 +368,22 @@ class GlobalModelGateway:
                         # ✅ 调用成功 → 上报健康
                         self.router.report_success(report_pool, model_id)
                         usage = self._extract_usage(resp)
+                        result = self._build_success_result(
+                            text=content.strip(),
+                            model_id=model_id,
+                            usage=usage,
+                        )
                         log_meta = dict(debug_meta or {})
                         log_meta["provider"] = infer_provider_capabilities(model_id).provider_family
                         self._log_usage(report_pool, model_id, usage, log_meta)
 
                         if not is_json:
-                            return content.strip()
+                            return result.text
                             
                         raw_json_str = self._extract_json(content)
                         try:
-                            return json.loads(raw_json_str)
+                            result.parsed_json = json.loads(raw_json_str)
+                            return result.parsed_json
                         except json.JSONDecodeError:
                             if "{" not in raw_json_str and "[" not in raw_json_str:
                                 logger.error(f"[Gateway] 🚨 模型 {model_id} 严重幻觉，跳过。")
@@ -193,9 +394,11 @@ class GlobalModelGateway:
                                 try: 
                                     repaired = repair_json(raw_json_str, return_objects=False)
                                     if repaired and isinstance(repaired, str):
-                                        return json.loads(repaired)
+                                        result.parsed_json = json.loads(repaired)
+                                        return result.parsed_json
                                     elif repaired and isinstance(repaired, (dict, list)):
-                                        return repaired
+                                        result.parsed_json = repaired
+                                        return result.parsed_json
                                 except json.JSONDecodeError:
                                     pass 
                             raise ValueError(f"JSON 损坏且无法修复: {raw_json_str[:50]}...")
@@ -203,6 +406,23 @@ class GlobalModelGateway:
                     except Exception as e:
                         last_error = str(e)
                         error_str = last_error.lower()
+                        failure_kind = FailureKind.UNKNOWN
+                        if "响应为空" in last_error:
+                            failure_kind = FailureKind.EMPTY_RESPONSE
+                        elif "原始失败载荷" in last_error:
+                            failure_kind = FailureKind.PROVIDER_FAILURE_TEXT
+                        elif "json" in error_str:
+                            failure_kind = FailureKind.JSON_DECODE_ERROR
+                        elif "timeout" in error_str:
+                            failure_kind = FailureKind.TIMEOUT
+                        elif "payload" in error_str or "validation error" in error_str:
+                            failure_kind = FailureKind.BAD_PAYLOAD
+                        last_result = self._build_failure_result(
+                            error_kind=failure_kind,
+                            error_message=last_error,
+                            model_id=model_id,
+                            raw_completion="",
+                        )
                         
                         # 致命错误关键词检测
                         fatal_keywords = [
@@ -224,8 +444,8 @@ class GlobalModelGateway:
                         if attempt < max_retries:
                             await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
 
-            logger.error(f"[Gateway] ❌ 所有模型池均已耗尽，最终异常: {last_error}")
-            raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_error}")
+            logger.error(f"[Gateway] ❌ 所有模型池均已耗尽，最终异常: {last_result.error_message}")
+            raise LLMCascadeFailureException(f"所有模型池均已耗尽，发生级联失效。最终异常: {last_result.error_message}")
     
     async def call_vision_task(self, image_data: str, prompt: str, system_prompt: str = "", lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> Dict[str, Any]:
         """多模态视觉任务专用网关"""
@@ -237,7 +457,7 @@ class GlobalModelGateway:
         image_urls = [image_data] if image_data else None
 
         if lane_key and self.lane_manager:
-            return await self.chat_in_lane(
+            result = await self.chat_in_lane_result(
                 lane_key=lane_key,
                 base_origin=base_origin,
                 prompt=prompt,
@@ -250,8 +470,9 @@ class GlobalModelGateway:
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
             )
+            return result.parsed_json or {}
 
-        return await self._elastic_call(
+        result = await self._elastic_call_result(
             pool_name="vision",
             prompt=prompt, 
             system_prompt=system_prompt, 
@@ -261,6 +482,8 @@ class GlobalModelGateway:
             image_urls=image_urls,
             use_fallback=False # 隔离总模型池，防止把图片发给不支持视觉的文本 LLM
         )
+
+        return result.parsed_json or {}
 
     def _extract_json(self, text: str) -> str:
         text = text.strip()
@@ -301,8 +524,39 @@ class GlobalModelGateway:
         persona_id: str = "",
         raw_user_text: str = "",
     ) -> Union[str, Dict[str, Any]]:
+        result = await self.chat_in_lane_result(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            models=models,
+            is_json=is_json,
+            retry_penalty=retry_penalty,
+            image_urls=image_urls,
+            use_fallback=use_fallback,
+            prefix_hash=prefix_hash,
+            persona_id=persona_id,
+            raw_user_text=raw_user_text,
+        )
+        return result.parsed_json if is_json else result.text
+
+    async def chat_in_lane_result(
+        self,
+        lane_key: LaneKey,
+        base_origin: str,
+        prompt: str,
+        system_prompt: str,
+        models: List[str],
+        is_json: bool = False,
+        retry_penalty: float = 0.0,
+        image_urls: List[str] = None,
+        use_fallback: bool = True,
+        prefix_hash: str = "",
+        persona_id: str = "",
+        raw_user_text: str = "",
+    ) -> LLMCallResult:
         if not self.lane_manager:
-            return await self._elastic_call(
+            result = await self._elastic_call_result(
                 pool_name=lane_key.task_family,
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -312,6 +566,7 @@ class GlobalModelGateway:
                 image_urls=image_urls,
                 use_fallback=use_fallback,
             )
+            return result
 
         primary_models = self.router.get_ranked_models(lane_key.task_family, models)
         model_hint = primary_models[0] if primary_models else ""
@@ -339,7 +594,7 @@ class GlobalModelGateway:
                 kwargs["cache_control"] = {"type": "ephemeral"}
             return kwargs
 
-        result = await self._elastic_call(
+        result = await self._elastic_call_result(
             pool_name=lane_key.task_family,
             prompt=prompt,
             system_prompt=system_prompt,
@@ -352,20 +607,29 @@ class GlobalModelGateway:
             debug_meta=debug_meta,
             request_kwargs_factory=_lane_request_kwargs,
         )
-        assistant_content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-        if isinstance(assistant_content, str):
-            assistant_content = sanitize_visible_reply_text(assistant_content, fallback_text="")
+        if not result.model_id:
+            result.model_id = model_hint
+        assistant_content = (
+            json.dumps(result.parsed_json, ensure_ascii=False)
+            if is_json
+            else result.text
+        )
         lane_user_content = raw_user_text or prompt
-        if assistant_content and is_safe_visible_text(assistant_content):
-            await self.lane_manager.append_exchange(
-                lane_key=lane_key,
-                base_origin=base_origin,
-                user_content=lane_user_content,
-                assistant_content=assistant_content,
-                prefix_hash=prefix_hash,
-                model_id=model_hint,
-                persona_id=persona_id,
-            )
+        artifact = VisibleReplyArtifact(
+            visible_text=result.text,
+            segments=[result.text] if result.text else [],
+            persistable_text=assistant_content if isinstance(assistant_content, str) else "",
+            blocked_reason="" if (assistant_content and is_safe_visible_text(assistant_content)) else "unsafe_or_empty_assistant",
+        )
+        await self.lane_manager.append_visible_reply_artifact(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            raw_user_text=lane_user_content,
+            artifact=artifact,
+            prefix_hash=prefix_hash,
+            model_id=model_hint,
+            persona_id=persona_id,
+        )
         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
             history_tail = []
             if history:
@@ -373,8 +637,8 @@ class GlobalModelGateway:
                     if isinstance(item, dict):
                         history_tail.append(str(item.get("role", "")))
             logger.debug(
-                f"[Gateway] lane={lane_key.as_log_key()} "
-                f"raw_user_text={lane_user_content[:120]!r} "
+                f"[Gateway] trace={debug_meta.get('trace_id', '')} lane={lane_key.as_log_key()} "
+                f"raw_user_text={preview_text(lane_user_content, 120)!r} "
                 f"history_roles_tail={history_tail}"
             )
         return result
@@ -394,6 +658,37 @@ class GlobalModelGateway:
         persona_id: str = "",
         raw_user_text: str = "",
     ) -> str:
+        result = await self.tool_chat_in_lane_result(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            event=event,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            tools=tools,
+            models=models,
+            max_steps=max_steps,
+            timeout=timeout,
+            prefix_hash=prefix_hash,
+            persona_id=persona_id,
+            raw_user_text=raw_user_text,
+        )
+        return result.text
+
+    async def tool_chat_in_lane_result(
+        self,
+        lane_key: LaneKey,
+        base_origin: str,
+        event: Any,
+        prompt: str,
+        system_prompt: str,
+        tools: Any,
+        models: List[str],
+        max_steps: int,
+        timeout: int,
+        prefix_hash: str = "",
+        persona_id: str = "",
+        raw_user_text: str = "",
+    ) -> LLMCallResult:
         if not self.lane_manager:
             raise LLMCascadeFailureException("lane manager 未初始化，无法执行 tool_chat_in_lane")
 
@@ -452,18 +747,27 @@ class GlobalModelGateway:
                         "provider": capabilities.provider_family,
                     },
                 )
-                clean_assistant_text = sanitize_visible_reply_text(reply_text, fallback_text="")
-                if clean_assistant_text and is_safe_visible_text(clean_assistant_text):
-                    await self.lane_manager.append_exchange(
-                        lane_key=lane_key,
-                        base_origin=base_origin,
-                        user_content=raw_user_text or prompt,
-                        assistant_content=clean_assistant_text,
-                        token_usage=usage.get("total_tokens", 0),
-                        prefix_hash=prefix_hash,
-                        model_id=model_id,
-                        persona_id=persona_id,
-                    )
+                result = self._build_success_result(
+                    text=sanitize_visible_reply_text(reply_text, fallback_text=""),
+                    model_id=model_id,
+                    usage=usage,
+                )
+                artifact = VisibleReplyArtifact(
+                    visible_text=result.text,
+                    segments=[result.text] if result.text else [],
+                    persistable_text=result.text,
+                    blocked_reason="" if result.text and is_safe_visible_text(result.text) else "unsafe_or_empty_assistant",
+                )
+                await self.lane_manager.append_visible_reply_artifact(
+                    lane_key=lane_key,
+                    base_origin=base_origin,
+                    raw_user_text=raw_user_text or prompt,
+                    artifact=artifact,
+                    token_usage=usage.get("total_tokens", 0),
+                    prefix_hash=prefix_hash,
+                    model_id=model_id,
+                    persona_id=persona_id,
+                )
                 if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
                     history_tail = []
                     if history:
@@ -471,11 +775,11 @@ class GlobalModelGateway:
                             if isinstance(item, dict):
                                 history_tail.append(str(item.get("role", "")))
                     logger.debug(
-                        f"[Gateway] tool-lane={lane_key.as_log_key()} "
-                        f"raw_user_text={(raw_user_text or prompt)[:120]!r} "
+                        f"[Gateway] trace={getattr(event, 'get_extra', lambda *_: '')('astrmai_trace_id', '')} tool-lane={lane_key.as_log_key()} "
+                        f"raw_user_text={preview_text(raw_user_text or prompt, 120)!r} "
                         f"history_roles_tail={history_tail}"
                     )
-                return reply_text
+                return result
             except Exception as e:
                 last_error = str(e)
                 error_str = last_error.lower()
@@ -499,20 +803,22 @@ class GlobalModelGateway:
     async def call_judge_task(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """意图与动作快速判决"""
         task_models = getattr(self.config.provider, 'task_models', [])
-        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=True)
+        result = await self._elastic_call_result("task", prompt, system_prompt, task_models, is_json=True)
+        return result.parsed_json or {}
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_mood_task(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """情绪值分析与好感度闭环"""
         task_models = getattr(self.config.provider, 'task_models', [])
-        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=True)
+        result = await self._elastic_call_result("task", prompt, system_prompt, task_models, is_json=True)
+        return result.parsed_json or {}
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_data_process_task(self, prompt: str, system_prompt: str = "", is_json: bool = False, lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> Union[str, Dict[str, Any]]:
         """记忆结构化/群组黑话推断/实时对话目标分析"""
         task_models = getattr(self.config.provider, 'task_models', [])
         if lane_key:
-            return await self.chat_in_lane(
+            result = await self.chat_in_lane_result(
                 lane_key=lane_key,
                 base_origin=base_origin,
                 prompt=prompt,
@@ -524,14 +830,16 @@ class GlobalModelGateway:
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
             )
-        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=is_json, retry_penalty=0.5)
+            return result.parsed_json if is_json else result.text
+        result = await self._elastic_call_result("task", prompt, system_prompt, task_models, is_json=is_json, retry_penalty=0.5)
+        return result.parsed_json if is_json else result.text
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_proactive_task(self, prompt: str, system_prompt: str = "", lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> str:
         """主动冷场破冰开场白生成/深度用户画像侧写"""
         task_models = getattr(self.config.provider, 'task_models', [])
         if lane_key:
-            return await self.chat_in_lane(
+            result = await self.chat_in_lane_result(
                 lane_key=lane_key,
                 base_origin=base_origin,
                 prompt=prompt,
@@ -543,14 +851,16 @@ class GlobalModelGateway:
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
             )
-        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=False, retry_penalty=0.5)
+            return result.text
+        result = await self._elastic_call_result("task", prompt, system_prompt, task_models, is_json=False, retry_penalty=0.5)
+        return result.text
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     async def call_persona_task(self, prompt: str, system_prompt: str = "", is_json: bool = False, lane_key: Optional[LaneKey] = None, base_origin: str = "", prefix_hash: str = "", persona_id: str = "") -> Union[str, Dict[str, Any]]:
         """人设压缩与多维切片"""
         task_models = getattr(self.config.provider, 'task_models', [])
         if lane_key:
-            return await self.chat_in_lane(
+            result = await self.chat_in_lane_result(
                 lane_key=lane_key,
                 base_origin=base_origin,
                 prompt=prompt,
@@ -562,7 +872,9 @@ class GlobalModelGateway:
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
             )
-        return await self._elastic_call("task", prompt, system_prompt, task_models, is_json=is_json)
+            return result.parsed_json if is_json else result.text
+        result = await self._elastic_call_result("task", prompt, system_prompt, task_models, is_json=is_json)
+        return result.parsed_json if is_json else result.text
 
     # [修改] 函数位置：astrmai/infra/gateway.py -> GlobalModelGateway 类下
     def get_agent_models(self) -> List[str]:

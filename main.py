@@ -18,6 +18,8 @@ from .astrmai.infra.database import DatabaseService
 from .astrmai.infra.gateway import GlobalModelGateway
 from .astrmai.infra.lane_manager import LaneKey, LaneManager
 from .astrmai.infra.event_bus import EventBus 
+from .astrmai.infra.chat_runtime_coordinator import ChatRuntimeCoordinator
+from .astrmai.infra.host_bridge import HostBridge
 
 # --- Phase 4: Memory ---
 from .astrmai.memory.engine import MemoryEngine
@@ -68,9 +70,8 @@ class AstrMaiPlugin(Star):
         self.config = AstrMaiConfig(**(config or {}))
         
         self._background_tasks = set() 
-        
-        # 馃煝 [褰诲簳淇 Bug 1] 鏀惧純闈炴硶鐨?weakref锛屾敼鐢ㄥ己寮曠敤瀛楀吀锛屽交搴曟潨缁濆苟鍙戦攣鐨勫菇鐏靛洖鏀朵笌鍐呭瓨绌块€?
-        self._sys2_locks = {}    
+        self.runtime_coordinator = ChatRuntimeCoordinator()
+        self.host_bridge = HostBridge()
         
         # 馃煝 [鏍稿績淇] 閫傞厤鏂扮殑妯″瀷姹犲垪琛?(List[str]) 鏇挎崲鏃у崟浣撳瓧绗︿覆
         task_models = getattr(self.config.provider, 'task_models', []) or ['Unconfigured']
@@ -137,7 +138,8 @@ class AstrMaiPlugin(Star):
             self.evolution,
             state_engine=self.state_engine,
             prompt_refiner=self.prompt_refiner,
-            sys3_router=self.sys3_router 
+            sys3_router=self.sys3_router,
+            runtime_coordinator=self.runtime_coordinator,
         )
 
         # Phase 6.3: 鍙戣█棰戠巼鎺у埗鍣?(蹇呴』鍦?AttentionGate 涔嬪墠鍒涘缓)
@@ -295,34 +297,21 @@ class AstrMaiPlugin(Star):
                                         self.attention_gate.focus_pools.pop(c_id, None)
                                         attention_stale_count += 1
                                         
-                # 2. 瀹夊叏鍥炴敹娌℃湁浠讳綍鍗忕▼绛夊緟鎴栨寔鏈夌殑绌洪棽绯荤粺閿侊紝闃叉寮哄紩鐢ㄥ鑷寸殑闀挎湡鍐呭瓨鑶ㄨ儉
-                lock_cleaned = 0
-                for l_id, lck in list(self._sys2_locks.items()):
-                    if not lck.locked(): # 濡傛灉褰撳墠閿佹湭琚换浣曚换鍔¤幏鍙?
-                        self._sys2_locks.pop(l_id, None)
-                        lock_cleaned += 1
-                    
-                if attention_stale_count > 0 or lock_cleaned > 0:
-                    logger.info(
-                        f"[AstrMai-GC] cleaned {attention_stale_count} stale focus pools and {lock_cleaned} idle locks."
-                    )
+                if attention_stale_count > 0:
+                    logger.info(f"[AstrMai-GC] cleaned {attention_stale_count} stale focus pools.")
             except asyncio.CancelledError:
                 logger.info("[AstrMai-GC] 📴 内存 GC 任务收到终止信号，正在安全退出...")
                 raise
             except Exception as e:
                 logger.error(f"[AstrMai-GC] 馃毃 鍐呭瓨 GC 浠诲姟鍙戠敓寮傚父: {e}")
 
-    def _get_sys2_lock(self, chat_id: str) -> asyncio.Lock:
+    async def _get_sys2_lock(self, chat_id: str) -> asyncio.Lock:
         """Get the per-chat System 2 lock safely."""
-        lock = self._sys2_locks.get(chat_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._sys2_locks[chat_id] = lock
-        return lock
+        return await self.runtime_coordinator.get_sys2_lock(chat_id)
 
     async def _system2_entry(self, main_event: AstrMessageEvent, events_to_process: list = None): 
         chat_id = main_event.unified_msg_origin
-        lock = self._get_sys2_lock(chat_id)
+        lock = await self._get_sys2_lock(chat_id)
         
         logger.debug(f"[{chat_id}] 🧠 System 2 请求已登记，正在排队等待进入主执行队列...")
             
@@ -344,6 +333,12 @@ class AstrMaiPlugin(Star):
                 )
                 await self.system2_planner.plan_and_execute(main_event, queue_events)
                 reply_sent = bool(main_event.get_extra("astrmai_reply_sent", False))
+                if getattr(self, "runtime_coordinator", None):
+                    await self.runtime_coordinator.update_wait_targets(
+                        chat_id,
+                        list(main_event.get_extra("astrmai_wait_targets", []) or []),
+                        str(main_event.get_extra("astrmai_wait_target_name", "") or ""),
+                    )
                 
                 # Phase 8.3: 绉佽亰鍥炶瘽绛夊緟閫昏緫
                 is_private = main_event.get_extra("is_private_chat", False)
@@ -657,9 +652,8 @@ class AstrMaiPlugin(Star):
             
             # 馃専 [鏍稿績淇] 鎶曢€?call_llm 璇遍サ锛岃涔夌骇娆洪獥搴曞眰 ProcessStage 鐨勫厹搴曞垽瀹?
             # 姝ゆ搷浣滄棤鎹熸斁琛屼笅娓告寚浠?鍔熻兘鎻掍欢锛屼絾浼氱洿鎺ラ樆鏂簳灞?AstrMainAgent 鐨勫弻閲嶅洖澶?
-            event.call_llm = True 
-            
-            yield event.plain_result("[ASTRMAI_GHOST_LOCK]")
+            ghost_message = self.host_bridge.suppress_default_llm(event)
+            yield event.plain_result(ghost_message)
 
     @filter.on_decorating_result(priority=90)
     async def intercept_and_notify_errors(self, event: AstrMessageEvent):
@@ -696,7 +690,7 @@ class AstrMaiPlugin(Star):
         # ==========================================
         # 馃煝 [鏋舵瀯绾т慨澶峕 闈欓粯閿€姣佸菇鐏靛崰浣嶇 (浼樺厛鎷︽埅)
         # ==========================================
-        if "[ASTRMAI_GHOST_LOCK]" in message_str:
+        if self.host_bridge.is_ghost_sentinel(message_str):
             from astrbot.api import logger
             logger.debug("[AstrMai-Phantom] ghost placeholder intercepted and dropped silently.")
             event.set_result(None)  # 娓呯┖鍐呭锛岀‘淇濅笉鍙戦€佺粰鐢ㄦ埛
@@ -709,9 +703,10 @@ class AstrMaiPlugin(Star):
             return
             
         # 瀹氫箟閿欒鐗瑰緛搴?
-        error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '描述失败', '获取模型列表失败', 'api error', 'all chat models failed', 'connection error', 'notfounderror']
-        
-        if any(keyword in message_str.lower() for keyword in error_keywords):
+        if self.host_bridge.should_intercept_error(
+            message_str,
+            enabled=getattr(self.config.global_settings, 'enable_error_interception', True),
+        ):
             from astrbot.api import logger
             logger.warning(f"[AstrMai-ErrorGuard] 拦截到系统报错，已阻止下发: {message_str[:50]}...")
             
@@ -720,18 +715,14 @@ class AstrMaiPlugin(Star):
             event.stop_event()
             
             # 2. 缁勮鍛婅淇℃伅
-            chat_id = event.get_group_id() or event.get_sender_id()
-            chat_type = "群聊" if event.get_group_id() else "私聊"
-            user_name = event.get_sender_name() or "未知用户"
-            
-            alert_msg = f"🚨 [AstrMai 错误告警]\n位置: {chat_type}({chat_id})\n触发者: {user_name}\n详情: {message_str}"
+            alert_msg = self.host_bridge.build_admin_alert(event, message_str)
             
             # 3. 闈跺悜鎶曢€掔粰绠＄悊鍛?
             admin_ids = getattr(self.config.global_settings, 'admin_ids', [])
             client = getattr(event, 'bot', None)
             
             if client and hasattr(client, 'api'):
-                for admin_id in admin_ids:
+                for admin_id in self.host_bridge.admin_targets(admin_ids):
                     if str(admin_id).isdigit():
                         try:
                             await client.api.call_action('send_private_msg', user_id=int(admin_id), message=alert_msg)
@@ -773,7 +764,7 @@ class AstrMaiPlugin(Star):
         logger.info(f"[{chat_id}] 🔧 [/work 直连] 进入 Sys3 纯任务模式：{task_query[:50]}...")
         
         try:
-            reply = await self.gateway.tool_chat_in_lane(
+            result = await self.gateway.tool_chat_in_lane_result(
                 lane_key=LaneKey(subsystem="sys3", task_family="direct", scope_id=chat_id),
                 base_origin=chat_id,
                 event=event,
@@ -789,7 +780,7 @@ class AstrMaiPlugin(Star):
                 timeout=120,
                 persona_id=getattr(self.config.persona, "persona_id", "") or "astrmai",
             )
-            
+            reply = result.text
             await self.reply_engine.handle_reply(event, reply, chat_id)
             
         except Exception as e:

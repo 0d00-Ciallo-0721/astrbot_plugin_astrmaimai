@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
 from .output_guard import is_safe_visible_text, sanitize_visible_reply_text
+from .runtime_contracts import VisibleReplyArtifact
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,23 @@ class LaneManager:
         if not cleaned:
             return None
         return {"role": role, "content": cleaned}
+
+    def build_history_turn(self, role: str, content: Any) -> Optional[dict]:
+        normalized_role = str(role or "").strip()
+        if normalized_role == "assistant":
+            sanitized = sanitize_visible_reply_text(self._stringify_content(content), fallback_text="")
+            if not sanitized:
+                return None
+            return {"role": normalized_role, "content": sanitized}
+        if normalized_role == "user":
+            sanitized = self._extract_dialogue_from_meta_prompt(content)
+            if not sanitized or not is_safe_visible_text(sanitized):
+                return None
+            return {"role": normalized_role, "content": sanitized}
+        sanitized = self._stringify_content(content)
+        if not sanitized:
+            return None
+        return {"role": normalized_role, "content": sanitized}
 
     def _sanitize_dialog_history(self, history: List[dict]) -> tuple[List[dict], bool]:
         sanitized: List[dict] = []
@@ -370,8 +388,12 @@ class LaneManager:
             model_id=model_id,
             persona_id=persona_id,
         )
-        history.append({"role": "user", "content": user_content})
-        history.append({"role": "assistant", "content": assistant_content})
+        user_turn = self.build_history_turn("user", user_content)
+        assistant_turn = self.build_history_turn("assistant", assistant_content)
+        if user_turn:
+            history.append(user_turn)
+        if assistant_turn:
+            history.append(assistant_turn)
         return await self.save_lane_history(
             lane_key=lane_key,
             lane_umo=lane_umo,
@@ -382,6 +404,48 @@ class LaneManager:
             model_id=model_id,
             persona_id=persona_id,
         )
+
+    async def append_visible_reply_artifact(
+        self,
+        lane_key: LaneKey,
+        base_origin: Optional[str],
+        raw_user_text: Any,
+        artifact: VisibleReplyArtifact,
+        token_usage: Optional[int] = None,
+        prefix_hash: str = "",
+        model_id: str = "",
+        persona_id: str = "",
+    ) -> List[dict]:
+        if artifact.blocked or not artifact.persistable_text:
+            lane_umo, conversation_id, history, _ = await self.ensure_lane(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                prefix_hash=prefix_hash,
+                model_id=model_id,
+                persona_id=persona_id,
+            )
+            return history
+        return await self.append_exchange(
+            lane_key=lane_key,
+            base_origin=base_origin,
+            user_content=raw_user_text,
+            assistant_content=artifact.persistable_text,
+            token_usage=token_usage,
+            prefix_hash=prefix_hash,
+            model_id=model_id,
+            persona_id=persona_id,
+        )
+
+    async def get_lane_history(
+        self,
+        lane_key: LaneKey,
+        base_origin: Optional[str],
+    ) -> List[dict]:
+        _lane_umo, _conversation_id, history, _ = await self.ensure_lane(
+            lane_key=lane_key,
+            base_origin=base_origin,
+        )
+        return list(history)
 
     async def get_recent_transcript(
         self,

@@ -5,11 +5,14 @@ from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass, field
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
+from ..infra.trace_runtime import new_trace_id, preview_text
+from ..infra.legacy_compat import emit_legacy_focus_thread_extras
 
 from .state_engine import StateEngine
 from .judge import Judge
 from .sensors import PreFilters
 from astrbot.api.message_components import Image, Plain, At, Face # 导入 AstrBot 的底层消息组件
+from ..infra.runtime_contracts import FocusThreadContext, VisionBundle
 
 @dataclass
 class SessionContext:
@@ -404,7 +407,7 @@ class AttentionGate:
         focus_candidate: NormalizedEvent,
         root_candidate: Optional[NormalizedEvent],
         normalized_events: List[NormalizedEvent],
-    ) -> dict:
+    ) -> FocusThreadContext:
         core_events: List[AstrMessageEvent] = []
         related_events: List[AstrMessageEvent] = []
         ambient_events: List[AstrMessageEvent] = []
@@ -430,13 +433,25 @@ class AttentionGate:
                 if candidate.event is focus_candidate.event:
                     continue
                 _append_unique(ambient_events, candidate.event, ambient_limit)
-            return {
-                "focus_event": focus_candidate.event,
-                "root_event": root_candidate.event if root_candidate else None,
-                "core_events": core_events,
-                "related_events": related_events,
-                "ambient_events": ambient_events,
-            }
+            return FocusThreadContext(
+                focus_event=focus_candidate.event,
+                root_event=root_candidate.event if root_candidate else None,
+                core_events=core_events,
+                related_events=related_events,
+                ambient_events=ambient_events,
+                focus_reason="",
+                root_reason="",
+                focus_message_text="",
+                focus_sender_id=focus_candidate.sender_id,
+                focus_sender_name=focus_candidate.sender_name,
+                vision_bundle=VisionBundle(
+                    image_urls=focus_candidate.image_urls[:],
+                    direct_image_urls=focus_candidate.image_urls[:] if focus_candidate.has_direct_vision else [],
+                    is_direct_request=focus_candidate.has_direct_vision,
+                    is_image_only=focus_candidate.is_image_only,
+                    source="focus_thread",
+                ),
+            )
 
         scored_candidates = []
         for candidate in normalized_events:
@@ -462,13 +477,25 @@ class AttentionGate:
         related_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
         ambient_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
 
-        return {
-            "focus_event": focus_candidate.event,
-            "root_event": root_candidate.event if root_candidate else None,
-            "core_events": core_events,
-            "related_events": related_events,
-            "ambient_events": ambient_events,
-        }
+        return FocusThreadContext(
+            focus_event=focus_candidate.event,
+            root_event=root_candidate.event if root_candidate else None,
+            core_events=core_events,
+            related_events=related_events,
+            ambient_events=ambient_events,
+            focus_reason="",
+            root_reason="",
+            focus_message_text="",
+            focus_sender_id=focus_candidate.sender_id,
+            focus_sender_name=focus_candidate.sender_name,
+            vision_bundle=VisionBundle(
+                image_urls=focus_candidate.image_urls[:],
+                direct_image_urls=focus_candidate.image_urls[:] if focus_candidate.has_direct_vision else [],
+                is_direct_request=focus_candidate.has_direct_vision,
+                is_image_only=focus_candidate.is_image_only,
+                source="focus_thread",
+            ),
+        )
 
     def _is_image_only(self, event: AstrMessageEvent) -> bool:
         """判断是否为纯图片消息"""
@@ -532,6 +559,8 @@ class AttentionGate:
         
         sender_id = str(event.get_sender_id())
         self_id = str(event.get_self_id())
+        if not event.get_extra("astrmai_trace_id", ""):
+            event.set_extra("astrmai_trace_id", new_trace_id())
 
         # Phase 8.3: 通知私聊管理器，打断可能的等待状态
         if is_private and self.private_chat_manager:
@@ -1080,9 +1109,11 @@ class AttentionGate:
                         )
                         root_candidate, root_reason = self._resolve_thread_root(focus_candidate, normalized_events)
                         focus_thread = self._build_focus_thread(focus_candidate, root_candidate, normalized_events)
-                        thread_core_events = [candidate for candidate in focus_thread["core_events"] if candidate is not main_event]
-                        thread_related_events = [candidate for candidate in focus_thread["related_events"] if candidate is not main_event]
-                        ambient_events = [candidate for candidate in focus_thread["ambient_events"] if candidate is not main_event]
+                        focus_thread.focus_reason = focus_reason
+                        focus_thread.root_reason = root_reason
+                        thread_core_events = [candidate for candidate in focus_thread.core_events if candidate is not main_event]
+                        thread_related_events = [candidate for candidate in focus_thread.related_events if candidate is not main_event]
+                        ambient_events = [candidate for candidate in focus_thread.ambient_events if candidate is not main_event]
                         ordered_sys2_events = ambient_events + thread_related_events + thread_core_events + [main_event]
                         deduped_sys2_events = []
                         for ordered_event in ordered_sys2_events:
@@ -1091,36 +1122,31 @@ class AttentionGate:
                         ordered_sys2_events = deduped_sys2_events
                         focus_rich_text = main_event.get_extra("astrmai_rich_text", main_event.message_str)
                         focus_sender_name = main_event.get_sender_name() or "群友/用户"
+                        focus_message_text = f"[{focus_sender_name}] 说: {focus_rich_text}"
+                        focus_thread.focus_message_text = focus_message_text
 
-                        main_event.set_extra("astrmai_focus_event", main_event)
-                        main_event.set_extra("astrmai_focus_reason", focus_reason)
-                        main_event.set_extra("astrmai_focus_message_text", f"[{focus_sender_name}] 说: {focus_rich_text}")
-                        main_event.set_extra("astrmai_focus_sender_id", str(main_event.get_sender_id()))
-                        main_event.set_extra("astrmai_focus_sender_name", focus_sender_name)
-                        main_event.set_extra("astrmai_background_events", background_events)
-                        main_event.set_extra("astrmai_focus_thread_root_event", focus_thread["root_event"])
-                        main_event.set_extra("astrmai_focus_thread_root_reason", root_reason)
-                        main_event.set_extra("astrmai_focus_thread_core_events", focus_thread["core_events"])
-                        main_event.set_extra("astrmai_focus_thread_related_events", focus_thread["related_events"])
-                        main_event.set_extra("astrmai_focus_thread_ambient_events", focus_thread["ambient_events"])
-                        main_event.set_extra("astrmai_focus_thread_reason", focus_reason)
-                        main_event.set_extra("astrmai_anchor_event", main_event)
-                        main_event.set_extra("astrmai_window_events", final_events)
+                        main_event.set_extra("astrmai_focus_thread_context", focus_thread)
+                        emit_legacy_focus_thread_extras(
+                            main_event,
+                            focus_thread,
+                            window_events=final_events,
+                        )
                         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
                             logger.debug(
-                                f"[{chat_id}] focus_reason={focus_reason!r} "
+                                f"[{chat_id}] trace={main_event.get_extra('astrmai_trace_id', '')} "
+                                f"focus_reason={focus_reason!r} "
                                 f"root_reason={root_reason!r} "
-                                f"focus_message_preview={focus_rich_text[:120]!r} "
-                                f"thread_core_count={len(focus_thread['core_events'])} "
-                                f"thread_related_count={len(focus_thread['related_events'])} "
-                                f"ambient_count={len(focus_thread['ambient_events'])}"
+                                f"focus_message_preview={preview_text(focus_rich_text, 120)!r} "
+                                f"thread_core_count={len(focus_thread.core_events)} "
+                                f"thread_related_count={len(focus_thread.related_events)} "
+                                f"ambient_count={len(focus_thread.ambient_events)}"
                             )
                         
                         # 🚀 [全知视界编排] 汇总窗口内的所有图片真实 URL，统一塞给主事件，交由 System 2 接管
                         all_vision_urls = []
                         thread_vision_events = (
-                            list(focus_thread["core_events"])
-                            + list(focus_thread["related_events"])
+                            list(focus_thread.core_events)
+                            + list(focus_thread.related_events)
                         )
                         for e in thread_vision_events:
                             urls = e.get_extra("direct_vision_urls", [])
@@ -1130,6 +1156,13 @@ class AttentionGate:
                         unique_urls = list(dict.fromkeys(all_vision_urls)) # 去重并保持顺序
                         if unique_urls:
                             main_event.set_extra("direct_vision_urls", unique_urls)
+                            focus_thread.vision_bundle = VisionBundle(
+                                image_urls=unique_urls[:],
+                                direct_image_urls=unique_urls[:],
+                                is_direct_request=bool(unique_urls),
+                                is_image_only=focus_candidate.is_image_only,
+                                source="focus_thread",
+                            )
                         
                         is_wakeup = any(self.sensors.is_wakeup_signal(e, self_id) for e in final_events)
                         is_first_event_wakeup = self._is_direct_wakeup_event(main_event, self_id)

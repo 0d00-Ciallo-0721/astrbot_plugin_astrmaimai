@@ -11,6 +11,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from ..infra.database import DatabaseService
 from ..infra.datamodels import ChatState, UserProfile, VisualMemory
+from ..infra.runtime_contracts import PromptEnvelope
 from .persona_summarizer import PersonaSummarizer
 
 class ContextEngine:
@@ -33,6 +34,7 @@ class ContextEngine:
     async def build_prompt(self, 
                            chat_id: str, 
                            event_messages: List[AstrMessageEvent],
+                           prompt_envelope: Optional[PromptEnvelope] = None,
                            retrieve_keys: List[str] = None,
                            slang_patterns: str = "",
                            sys1_thought: str = "",
@@ -41,6 +43,8 @@ class ContextEngine:
                            planner_reasoning: str = "",
                            jargon_explanation: str = "",
                            near_context_priority: bool = False) -> str:
+        if isinstance(prompt_envelope, PromptEnvelope):
+            near_context_priority = bool(prompt_envelope.near_context_priority)
         
         if retrieve_keys is None:
             retrieve_keys = []

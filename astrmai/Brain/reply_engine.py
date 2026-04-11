@@ -3,10 +3,29 @@ import asyncio
 import random
 from typing import List
 from astrbot.api import logger
-import astrbot.api.message_components as Comp
+try:
+    import astrbot.api.message_components as Comp
+except ImportError:  # pragma: no cover - 测试桩环境降级
+    class _CompatAt:
+        def __init__(self, qq=None):
+            self.qq = qq
+
+    class _CompatPlain:
+        def __init__(self, text=""):
+            self.text = text
+
+    class _CompatComp:
+        At = _CompatAt
+        Plain = _CompatPlain
+
+    Comp = _CompatComp()
 from astrbot.api.event import AstrMessageEvent
 from ..Heart.affection_router import AffectionRouter
+from ..infra.lane_manager import LaneKey
+from ..infra.legacy_compat import emit_legacy_reply_runtime_extras
 from ..infra.output_guard import is_sendable_segment, sanitize_visible_reply_text
+from ..infra.runtime_contracts import VisibleReplyArtifact
+from ..infra.trace_runtime import preview_text
 # [阶段四新增] 引入情绪归因路由器
 from ..Heart.affection_router import AffectionRouter
 # 引入依赖模块
@@ -76,76 +95,78 @@ class ReplyEngine:
         # 直接调用外置的智能状态机分段器，其内部已经妥善处理了片段粘连、标点吞噬和换行符逃逸
         return self.segmenter.segment(text)
 
-    async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
-        """
-        [终极修复版] 历史记录获取：完全适配底层的 Dict 与 List 多模态数据结构，放弃无效的 message_id。
-        """
-        history_list = []
-        fetch_count = getattr(self.config.attention, 'bg_pool_size', 20) if self.config else 20
-        
-        try:
-            context = getattr(self.state_engine.gateway, 'context', None)
-            if not context: return []
-            
-            conv_mgr = context.conversation_manager
-            curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
-            conversation = await conv_mgr.get_conversation(chat_id, curr_cid)
-            
-            if conversation and hasattr(conversation, "history") and conversation.history:
-                raw_history = list(conversation.history)
-                cutoff_idx = -1
-                found_anchor = False
-                
-                # 预清洗锚点文本
-                clean_anchor = re.sub(r'\s+', '', anchor_text) if anchor_text else ""
+    def _build_visible_reply_artifact(self, text: str) -> VisibleReplyArtifact:
+        clean_text = self._clean_reply_content(text)
+        if not clean_text:
+            return VisibleReplyArtifact(
+                visible_text="",
+                segments=[],
+                persistable_text="",
+                blocked_reason="empty_or_blocked_reply",
+            )
 
-                # 逆序检索：提取 dict -> content (list) -> type=="text" 结构
+        segments = [
+            segment
+            for segment in self._segment_reply_content(clean_text)
+            if is_sendable_segment(segment)
+        ]
+        if not segments:
+            return VisibleReplyArtifact(
+                visible_text="",
+                segments=[],
+                persistable_text="",
+                blocked_reason="no_sendable_segments",
+            )
+
+        visible_text = "\n".join(segments).strip()
+        return VisibleReplyArtifact(
+            visible_text=visible_text,
+            segments=segments,
+            persistable_text=visible_text,
+            metadata={"segment_count": len(segments)},
+        )
+
+    async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
+        """??? lane ?????????????????? conversation ???"""
+        fetch_count = getattr(self.config.attention, "bg_pool_size", 20) if self.config else 20
+        lane_manager = getattr(getattr(self.state_engine, "gateway", None), "lane_manager", None)
+        if lane_manager is None:
+            return []
+        try:
+            raw_history = await lane_manager.get_lane_history(
+                lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
+                base_origin=chat_id,
+            )
+            clean_anchor = re.sub(r"\s+", "", anchor_text or "")
+            if clean_anchor:
+                cutoff_idx = -1
                 for i in range(len(raw_history) - 1, -1, -1):
                     msg_data = raw_history[i]
-                    content = ""
-                    
-                    # 兼容可能存在的字符串序列化
-                    if isinstance(msg_data, str):
-                        import json
-                        try:
-                            msg_data = json.loads(msg_data)
-                        except Exception:
-                            pass
-
-                    # 💥 精准打击你提取出的 JSON 结构
-                    if isinstance(msg_data, dict):
-                        c = msg_data.get('content', '')
-                        if isinstance(c, str):
-                            content = c
-                        elif isinstance(c, list):
-                            content = "".join([part.get("text", "") for part in c if isinstance(part, dict) and "text" in part])
-                    elif hasattr(msg_data, 'content'):
-                        c = getattr(msg_data, 'content', '')
-                        if isinstance(c, str):
-                            content = c
-                        elif isinstance(c, list):
-                            content = "".join([getattr(part, "text", "") for part in c if hasattr(part, "text")])
-                    
-                    # 子串强匹配 (无视空格和换行)
-                    if content and clean_anchor and clean_anchor in re.sub(r'\s+', '', content):
+                    if not isinstance(msg_data, dict):
+                        continue
+                    content = str(msg_data.get("content", "") or "").strip()
+                    if content and clean_anchor in re.sub(r"\s+", "", content):
                         cutoff_idx = i
-                        found_anchor = True
                         break
-                            
-                if found_anchor:
+                if cutoff_idx >= 0:
                     start_idx = max(0, cutoff_idx - fetch_count)
-                    history_list = raw_history[start_idx:cutoff_idx + 1]
-                    logger.debug(f"[ReplyEngine] 锚点匹配成功！精确截取最后 {len(history_list)} 条记忆。")
-                else:
-                    logger.debug(f"[ReplyEngine] 文本匹配未命中，启动“即时切片”模式补偿提取。")
-                    history_list = raw_history[-fetch_count:]
-                
+                    return raw_history[start_idx:cutoff_idx + 1]
+            return raw_history[-fetch_count:]
         except Exception as e:
-            logger.warning(f"[ReplyEngine] 历史记录拉取异常: {e}")
-            
-        return history_list
+            logger.warning(f"[ReplyEngine] ?? lane ????: {e}")
+            return []
 
-    # [修改] 函数位置：astrmai/Brain/reply_engine.py -> ReplyEngine 类下
+    async def _sync_native_history_mirror(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        """??????????????????? conversation ???"""
+        return
+
+    # [?修改] 函数位置：astrmai/Brain/reply_engine.py -> ReplyEngine 类下
     async def handle_reply(
         self, 
         event: AstrMessageEvent, 
@@ -162,48 +183,33 @@ class ReplyEngine:
         """
         if not raw_text: return
 
-        # 1. 清洗
-        clean_text = self._clean_reply_content(raw_text)
-        if not clean_text: return
+        artifact = self._build_visible_reply_artifact(raw_text)
+        if artifact.blocked:
+            logger.debug(f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} reply blocked: {artifact.blocked_reason}")
+            return
+        clean_text = artifact.persistable_text
+        logger.debug(
+            f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} "
+            f"reply artifact segments={len(artifact.segments)} visible={preview_text(artifact.visible_text, 120)!r}"
+        )
 
         # =====================================================================
         # 🟢 [核心修复] 强行同步至 AstrBot 原生历史记录（打破永久失忆魔咒）
         # =====================================================================
-        try:
-            context = getattr(self.state_engine.gateway, 'context', None)
-            if context:
-                conv_mgr = context.conversation_manager
-                curr_cid = await conv_mgr.get_curr_conversation_id(chat_id)
-                if curr_cid:
-                    from astrbot.core.agent.message import UserMessageSegment, AssistantMessageSegment, TextPart
-                    
-                    sender_name = event.get_sender_name() or "群友"
-                    
-                    rich_text = event.get_extra("astrmai_rich_text", event.message_str)
-                    formatted_user_text = f"{sender_name}: {rich_text}"
-                    
-                    user_msg = UserMessageSegment(content=[TextPart(text=formatted_user_text)])
-                    ast_msg = AssistantMessageSegment(content=[TextPart(text=clean_text)])
-                    
-                    await conv_mgr.add_message_pair(
-                        cid=curr_cid,
-                        user_message=user_msg,
-                        assistant_message=ast_msg
-                    )
-                    logger.debug(f"[{chat_id}] 📝 成功同步对话对（已刻入姓名: {sender_name}）。")
-        except Exception as e:
-            logger.error(f"[ReplyEngine] 强制同步历史记录失败: {e}")
+        sender_name = event.get_sender_name() or "群友"
+        rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+        formatted_user_text = f"{sender_name}: {rich_text}"
+        await self._sync_native_history_mirror(
+            event=event,
+            chat_id=chat_id,
+            user_text=formatted_user_text,
+            assistant_text=artifact.persistable_text,
+        )
 
         # =====================================================================
         # 🟢 [核心架构重构] 步骤 3 提前：先说话！不要让情绪计算阻塞文本的下发
         # =====================================================================
-        segments = [
-            segment
-            for segment in self._segment_reply_content(clean_text)
-            if is_sendable_segment(segment)
-        ]
-        if not segments:
-            return
+        segments = artifact.segments
         
         _pending_actions = pending_actions if pending_actions is not None else event.get_extra("astrmai_pending_actions", [])
         at_targets = [action.get("target_id") for action in _pending_actions if action.get("action") == "at"]
@@ -219,14 +225,16 @@ class ReplyEngine:
                 target_str = str(target_id)
                 if target_str and target_str not in merged_targets:
                     merged_targets.append(target_str)
-            event.set_extra("astrmai_wait_targets", merged_targets)
-            if at_target_names:
-                event.set_extra("astrmai_wait_target_name", at_target_names[0])
+            emit_legacy_reply_runtime_extras(
+                event,
+                wait_targets=merged_targets,
+                wait_target_name=at_target_names[0] if at_target_names else "",
+            )
         
         from astrbot.api.event import MessageChain
         
         # [新增] 免疫标记：防止自身发出的消息触发 main.py 中的旁路嗅探
-        event.set_extra("astrmai_is_self_reply", True)
+        emit_legacy_reply_runtime_extras(event, artifact=artifact, is_self_reply=True)
         
         for i, seg in enumerate(segments):
             chain = MessageChain()
@@ -246,8 +254,7 @@ class ReplyEngine:
             if context:
                 await context.send_message(event.unified_msg_origin, chain)
                 if not event.get_extra("astrmai_reply_sent", False):
-                    event.set_extra("astrmai_reply_sent", True)
-                    event.set_extra("astrmai_last_reply_text", clean_text)
+                    emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
             else:
                 logger.error("[ReplyEngine] 🚨 致命错误：Gateway Context 丢失，无法跨越生命周期发送消息！")
             

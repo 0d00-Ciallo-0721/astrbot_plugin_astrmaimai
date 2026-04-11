@@ -6,6 +6,12 @@ from astrbot.api import logger
 import asyncio
 from ..infra.gateway import GlobalModelGateway
 from ..infra.lane_manager import LaneKey
+from ..infra.legacy_compat import (
+    emit_legacy_prompt_envelope_extras,
+    read_legacy_focus_thread_context,
+)
+from ..infra.runtime_contracts import FocusThreadContext, PromptEnvelope
+from ..infra.trace_runtime import preview_text
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
 from .reply_engine import ReplyEngine
@@ -51,7 +57,8 @@ class Planner:
                  evolution_manager: 'EvolutionManager',
                  state_engine=None,
                  prompt_refiner=None,
-                 sys3_router=None
+                 sys3_router=None,
+                 runtime_coordinator=None,
                  ):
         self.gateway = gateway
         self.context_engine = context_engine
@@ -62,6 +69,7 @@ class Planner:
         self.prompt_refiner = prompt_refiner 
         self.sys3_router = sys3_router
         self.context = context
+        self.runtime_coordinator = runtime_coordinator
         
         # Phase 1: 多目标管理器
         self.goal_manager = GoalManager(gateway, config=gateway.config)
@@ -73,7 +81,14 @@ class Planner:
             gateway=gateway,
             config=gateway.config
         )
-        self.executor = ConcurrentExecutor(context, gateway, reply_engine, evolution_manager, config=gateway.config)
+        self.executor = ConcurrentExecutor(
+            context,
+            gateway,
+            reply_engine,
+            evolution_manager,
+            config=gateway.config,
+            runtime_coordinator=runtime_coordinator,
+        )
 
     @staticmethod
     def _is_near_context_query(message_text: str) -> bool:
@@ -124,6 +139,33 @@ class Planner:
     def _build_ambient_background_text(self, ambient_events: List[AstrMessageEvent]) -> str:
         return "\n".join(self._render_event_line(message_event) for message_event in ambient_events)
 
+    def _coerce_focus_thread_context(self, event: AstrMessageEvent) -> FocusThreadContext:
+        focus_context = event.get_extra("astrmai_focus_thread_context", None)
+        if isinstance(focus_context, FocusThreadContext):
+            return focus_context
+        return read_legacy_focus_thread_context(event, default_event=event)
+
+    def _build_prompt_envelope(
+        self,
+        focus_context: FocusThreadContext,
+        focus_message_text: str,
+        focus_thread_text: str,
+        background_window_text: str,
+        recent_transcript: str,
+        last_assistant_reply: str,
+        near_context_priority: bool,
+    ) -> PromptEnvelope:
+        return PromptEnvelope(
+            raw_user_text=focus_message_text,
+            recent_transcript=recent_transcript,
+            last_assistant_reply=last_assistant_reply,
+            focus_thread_text=focus_thread_text,
+            ambient_background_text=background_window_text,
+            focus_reason=focus_context.focus_reason,
+            focus_thread_reason=focus_context.root_reason or focus_context.focus_reason,
+            near_context_priority=near_context_priority,
+        )
+
     async def _get_recent_dialogue_transcript(self, chat_id: str) -> str:
         lane_manager = getattr(self.gateway, "lane_manager", None)
         if not lane_manager:
@@ -167,17 +209,18 @@ class Planner:
         if is_all_mode and len(event_messages) > 3:
             event_messages = event_messages[-3:]
 
-        focus_event = event.get_extra("astrmai_focus_event", event)
-        background_events = event.get_extra("astrmai_background_events", []) or []
-        thread_core_events = event.get_extra("astrmai_focus_thread_core_events", []) or []
-        thread_related_events = event.get_extra("astrmai_focus_thread_related_events", []) or []
-        ambient_events = event.get_extra("astrmai_focus_thread_ambient_events", []) or background_events
-        thread_root_event = event.get_extra("astrmai_focus_thread_root_event", None)
+        focus_context = self._coerce_focus_thread_context(event)
+        focus_event = focus_context.focus_event or event
+        background_events = list(focus_context.ambient_events or [])
+        thread_core_events = list(focus_context.core_events or [])
+        thread_related_events = list(focus_context.related_events or [])
+        ambient_events = list(focus_context.ambient_events or background_events)
+        thread_root_event = focus_context.root_event
         context_events = [candidate for candidate in ambient_events + thread_related_events + thread_core_events if candidate is not focus_event]
         context_events.append(focus_event)
 
         window_lines = [self._render_event_line(message_event) for message_event in context_events]
-        focus_message_text = event.get_extra("astrmai_focus_message_text", "") or self._render_event_line(focus_event)
+        focus_message_text = focus_context.focus_message_text or self._render_event_line(focus_event)
         focus_thread_text = self._build_focus_thread_text(
             focus_message_text=focus_message_text,
             root_event=thread_root_event,
@@ -199,26 +242,27 @@ class Planner:
                 if line.startswith(f"{bot_name}:") or line.startswith("Bot:"):
                     last_assistant_reply = line.split(":", 1)[1].strip()
                     break
-        prompt_sections = []
-        if last_assistant_reply:
-            prompt_sections.append(f"你上一句刚说过：{last_assistant_reply}")
-        prompt_sections.append(f"请优先接住这条对话线索并回答：\n{focus_thread_text}")
-        if background_window_text:
-            prompt_sections.append(f"其他背景只作参考，不必逐条回应：\n{background_window_text}")
-        prompt_content = "\n\n".join(section for section in prompt_sections if section)
-        event.set_extra("astrmai_raw_user_text", focus_message_text)
-        event.set_extra("astrmai_background_window_text", background_window_text)
-        event.set_extra("astrmai_focus_thread_text", focus_thread_text)
-        event.set_extra("astrmai_ambient_background_text", background_window_text)
-        event.set_extra("astrmai_recent_transcript", recent_transcript)
+        prompt_envelope = self._build_prompt_envelope(
+            focus_context=focus_context,
+            focus_message_text=focus_message_text,
+            focus_thread_text=focus_thread_text,
+            background_window_text=background_window_text,
+            recent_transcript=recent_transcript,
+            last_assistant_reply=last_assistant_reply,
+            near_context_priority=False,
+        )
+        prompt_content = prompt_envelope.planner_prompt()
         near_context_priority = self._is_near_context_query(focus_message_text or event.message_str or raw_window_text)
-        event.set_extra("astrmai_near_context_priority", near_context_priority)
+        prompt_envelope.near_context_priority = near_context_priority
+        event.set_extra("astrmai_focus_thread_context", focus_context)
+        emit_legacy_prompt_envelope_extras(event, prompt_envelope, use_lane_history=True)
         if getattr(getattr(self.gateway.config, "global_settings", None), "debug_mode", False):
             logger.debug(
-                f"[{chat_id}] planner raw_user_text={focus_message_text[:160]!r} "
-                f"focus_thread={focus_thread_text[:160]!r} "
-                f"background={background_window_text[:160]!r} "
-                f"recent_transcript={recent_transcript[:160]!r} "
+                f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} "
+                f"planner raw_user_text={preview_text(focus_message_text, 160)!r} "
+                f"focus_thread={preview_text(focus_thread_text, 160)!r} "
+                f"background={preview_text(background_window_text, 160)!r} "
+                f"recent_transcript={preview_text(recent_transcript, 160)!r} "
                 f"near_context_priority={near_context_priority}"
             )
         
@@ -234,13 +278,13 @@ class Planner:
                 return await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id)
             
             async def _load_goals():
-                window_text = prompt_content or ("\n".join(window_lines) if window_lines else "")
+                window_text = prompt_envelope.planner_prompt() or ("\n".join(window_lines) if window_lines else "")
                 res = await self.goal_manager.analyze_and_update(chat_id, window_text)
                 logger.debug(f"[{chat_id}] 🎯 当前主目标: {res}")
                 return res
             
             async def _load_expressions():
-                recent_text = prompt_content or ("\n".join(window_lines[-3:]) if window_lines else "")
+                recent_text = prompt_envelope.planner_prompt() or ("\n".join(window_lines[-3:]) if window_lines else "")
                 think_level = 1 if len(recent_text) >= 40 and len(window_lines) >= 2 else 0
                 return await self.expression_selector.select(
                     chat_id=chat_id,
@@ -374,6 +418,7 @@ class Planner:
         system_prompt = await self.context_engine.build_prompt(
             chat_id=chat_id, 
             event_messages=context_events,
+            prompt_envelope=prompt_envelope,
             retrieve_keys=retrieve_keys,
             slang_patterns=slang_context,
             sys1_thought=sys1_thought,
@@ -384,7 +429,6 @@ class Planner:
             near_context_priority=near_context_priority,
         )
         event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
-        event.set_extra("astrmai_use_lane_history", True)
 
         # === [基于信标的源会话语境溯源拉取] ===
         if not event.get_group_id():
@@ -469,11 +513,16 @@ class Planner:
         final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
             event=event, 
             system_prompt=system_prompt, 
-            prompt=prompt_content, 
+            prompt=prompt_envelope.planner_prompt(),
             context=ctx
         )
 
-        direct_vision_urls = event.get_extra("direct_vision_urls", [])
+        direct_vision_urls = list(
+            dict.fromkeys(
+                list(focus_context.vision_bundle.direct_image_urls or [])
+                or list(focus_context.vision_bundle.image_urls or [])
+            )
+        )
         if direct_vision_urls:
             final_prompt += "\n(导演旁白：用户递给了你几张照片，请结合画面内容进行回应。)"
             logger.info(f"[{chat_id}] 👁️ 已编排主脑直通车负载，携带 {len(direct_vision_urls)} 张图片进入执行器。")

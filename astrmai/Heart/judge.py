@@ -279,7 +279,7 @@ class Judge:
 
                 lane_key = LaneKey(subsystem="sys1", task_family="judge", scope_id=chat_id)
                 task_models = getattr(self.config.provider, 'task_models', [])
-                result = await self.gateway.chat_in_lane(
+                llm_result = await self.gateway.chat_in_lane_result(
                     lane_key=lane_key,
                     base_origin=chat_id,
                     prompt=prompt,
@@ -288,6 +288,7 @@ class Judge:
                     is_json=True,
                     use_fallback=False,
                 )
+                result = llm_result.parsed_json or {}
                 
                 plan.action = result.get("action", "IGNORE").upper()
                 if plan.action in ["REPLY", "TOOL_CALL", "FETCH_KNOWLEDGE", "RETHINK_GOAL"]:

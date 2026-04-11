@@ -63,7 +63,7 @@ class MoodManager:
 
         try:
             if chat_id and getattr(self.gateway, "lane_manager", None):
-                result = await self.gateway.chat_in_lane(
+                llm_result = await self.gateway.chat_in_lane_result(
                     lane_key=LaneKey(subsystem="sys1", task_family="mood", scope_id=chat_id),
                     base_origin=chat_id,
                     prompt=prompt,
@@ -72,6 +72,7 @@ class MoodManager:
                     is_json=True,
                     use_fallback=False,
                 )
+                result = llm_result.parsed_json or {}
             else:
                 result = await self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT)
 

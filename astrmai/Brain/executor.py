@@ -2,9 +2,22 @@
 from typing import Any, List, Optional
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.core.agent.tool import ToolSet
+try:
+    from astrbot.api.message_components import Plain
+except ImportError:  # pragma: no cover - 测试桩环境降级
+    class Plain:  # type: ignore[override]
+        def __init__(self, text: str):
+            self.text = text
+try:
+    from astrbot.core.agent.tool import ToolSet
+except ImportError:  # pragma: no cover - 测试桩环境降级
+    class ToolSet:  # type: ignore[override]
+        def __init__(self, tools):
+            self.tools = tools
+import copy
 from ..infra.gateway import GlobalModelGateway
 from ..infra.lane_manager import LaneKey
+from ..infra.runtime_contracts import FocusThreadContext, PromptEnvelope, VisionBundle
 from .reply_engine import ReplyEngine 
 
 class ConcurrentExecutor:
@@ -12,12 +25,13 @@ class ConcurrentExecutor:
     智能体执行器 (System 2)
     使用 AstrBot 原生 tool_loop_agent 替代原有手写 Action Loop。
     """
-    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine, evolution_manager, config=None):
+    def __init__(self, context, gateway: GlobalModelGateway, reply_engine: ReplyEngine, evolution_manager, config=None, runtime_coordinator=None):
         self.context = context
         self.gateway = gateway
         self.reply_engine = reply_engine
         self.evolution_manager = evolution_manager  # 挂载进化管理器
         self.config = config if config else gateway.config
+        self.runtime_coordinator = runtime_coordinator
         
         # ==========================================
         # 🟢 [新增] 阶段 3：增强型并发状态检查所需变量
@@ -26,6 +40,40 @@ class ConcurrentExecutor:
         self._chat_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
+
+    def _build_vision_bundle(self, event: AstrMessageEvent, direct_vision_urls: Optional[List[str]]) -> VisionBundle:
+        focus_context = event.get_extra("astrmai_focus_thread_context", None)
+        if isinstance(focus_context, FocusThreadContext):
+            bundle = focus_context.vision_bundle
+            image_urls = list(dict.fromkeys(list(bundle.image_urls or []) + list(direct_vision_urls or [])))
+            direct_urls = list(dict.fromkeys(list(bundle.direct_image_urls or []) + list(direct_vision_urls or [])))
+            return VisionBundle(
+                image_urls=image_urls,
+                direct_image_urls=direct_urls,
+                is_direct_request=bundle.is_direct_request or bool(direct_urls),
+                is_image_only=bundle.is_image_only,
+                source=bundle.source or "focus_thread",
+            )
+        urls = list(dict.fromkeys(list(direct_vision_urls or [])))
+        return VisionBundle(
+            image_urls=urls,
+            direct_image_urls=urls[:],
+            is_direct_request=bool(urls),
+            is_image_only=bool(urls and not (event.message_str or "").strip()),
+            source="event_extra",
+        )
+
+    def _build_sanitized_execution_event(self, event: AstrMessageEvent, vision_bundle: VisionBundle) -> AstrMessageEvent:
+        try:
+            sanitized_event = copy.copy(event)
+            if hasattr(event, "message_obj") and event.message_obj:
+                sanitized_message_obj = copy.copy(event.message_obj)
+                safe_text = event.message_str.strip() if event.message_str else ("[图片/特殊消息]" if vision_bundle.image_urls else "[特殊消息]")
+                sanitized_message_obj.message = [Plain(safe_text)]
+                sanitized_event.message_obj = sanitized_message_obj
+            return sanitized_event
+        except Exception:
+            return event
         
         
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None) -> Optional[str]:
@@ -33,20 +81,28 @@ class ConcurrentExecutor:
         chat_id = event.unified_msg_origin
         bot_id = str(event.get_self_id()) if hasattr(event, 'get_self_id') else "SELF_BOT"
         
-        import asyncio
-        async with self._global_lock:
-            if chat_id not in self._chat_locks:
-                self._chat_locks[chat_id] = asyncio.Lock()
-                self._chat_pending_count[chat_id] = 0
-            
-            if self._chat_pending_count[chat_id] >= 2:
+        using_runtime_coordinator = self.runtime_coordinator is not None
+        if using_runtime_coordinator:
+            chat_lock = await self.runtime_coordinator.try_acquire_executor(chat_id, max_pending=2)
+            if chat_lock is None:
                 from astrbot.api import logger
-                logger.warning(f"[{chat_id}] 🛑 并发熔断：当前群组排队思考任务过多 ({self._chat_pending_count[chat_id]})，已主动丢弃。")
+                logger.warning(f"[{chat_id}] 🛑 并发熔断：当前群组排队思考任务过多，已主动丢弃。")
                 return None
+        else:
+            import asyncio
+            async with self._global_lock:
+                if chat_id not in self._chat_locks:
+                    self._chat_locks[chat_id] = asyncio.Lock()
+                    self._chat_pending_count[chat_id] = 0
                 
-            self._chat_pending_count[chat_id] += 1
-            
-        chat_lock = self._chat_locks[chat_id]
+                if self._chat_pending_count[chat_id] >= 2:
+                    from astrbot.api import logger
+                    logger.warning(f"[{chat_id}] 🛑 并发熔断：当前群组排队思考任务过多 ({self._chat_pending_count[chat_id]})，已主动丢弃。")
+                    return None
+
+                self._chat_pending_count[chat_id] += 1
+
+            chat_lock = self._chat_locks[chat_id]
         
         try:
             async with chat_lock:
@@ -81,12 +137,18 @@ class ConcurrentExecutor:
                     api_prompt = prompt
                     vision_descriptions = []
                     prefix_hash = event.get_extra("astrmai_prefix_hash", "")
-                    raw_user_text = event.get_extra("astrmai_raw_user_text", "")
+                    prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
+                    raw_user_text = (
+                        prompt_envelope.raw_user_text
+                        if isinstance(prompt_envelope, PromptEnvelope)
+                        else event.get_extra("astrmai_raw_user_text", "")
+                    )
                     dialog_lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id)
 
-                    if direct_vision_urls and len(direct_vision_urls) > 0:
+                    vision_bundle = self._build_vision_bundle(event, direct_vision_urls)
+                    if vision_bundle.direct_image_urls and len(vision_bundle.direct_image_urls) > 0:
                         logger.info(f"[{chat_id}] 👁️ 触发主脑视觉直通车 (执行物理落盘与 VLM 转述)...")
-                        for url_or_path in direct_vision_urls:
+                        for url_or_path in vision_bundle.direct_image_urls:
                             temp_file_path = None
                             is_temp = False
                             try:
@@ -150,26 +212,7 @@ class ConcurrentExecutor:
                             api_prompt += vision_inject
                             prompt += vision_inject 
 
-                    # ==========================================
-                    # 🟢 [核心修复] 极致物理致盲：彻底抹除原生复杂组件
-                    # 彻底阻断 Napcat 特殊组件 (Reply/Face) 引发的 Pydantic 400 崩溃
-                    # ==========================================
-                    try:
-                        from astrbot.api.message_components import Plain
-                        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
-                            # 提取安全文本，若为空则提供兜底标识
-                            safe_text = event.message_str.strip() if event.message_str else "[图片/特殊消息]"
-                            
-                            # 🟢 必须使用原地 clear 和 append，绝对禁止直接重写 message 属性 (会破坏 AstrBot 序列化基类)
-                            if hasattr(event.message_obj.message, "clear"):
-                                event.message_obj.message.clear()
-                                event.message_obj.message.append(Plain(safe_text))
-                            else:
-                                event.message_obj.message = [Plain(safe_text)]
-                                
-                            logger.debug(f"[{chat_id}] 🧹 已对底层核心执行极致物理致盲，原地剥离所有特殊组件。")
-                    except Exception as e:
-                        logger.warning(f"[{chat_id}] ⚠️ 物理致盲执行失败: {e}")
+                    execution_event = self._build_sanitized_execution_event(event, vision_bundle)
 
                     # 统一的异常拦截嗅探字典
                     error_keywords = ['请求失败', '错误类型', '错误信息', '调用失败', '处理失败', '获取模型列表失败', 'api error', 'all chat models fail', 'connection error', 'notfounderror', 'exception:']
@@ -182,7 +225,7 @@ class ConcurrentExecutor:
                         last_error = ""
                         for provider_id in models:
                             try:
-                                reply_text = await self.gateway.chat_in_lane(
+                                result = await self.gateway.chat_in_lane_result(
                                     lane_key=dialog_lane_key,
                                     base_origin=chat_id,
                                     prompt=api_prompt,
@@ -192,6 +235,7 @@ class ConcurrentExecutor:
                                     use_fallback=False,
                                     raw_user_text=raw_user_text,
                                 )
+                                reply_text = result.text
                                 if not reply_text:
                                     raise ValueError(f"模型 {provider_id} 生成为空")
                                 
@@ -222,10 +266,10 @@ class ConcurrentExecutor:
                         last_error = "" 
                         for provider_id in models:
                             try:
-                                reply_text = await self.gateway.tool_chat_in_lane(
+                                result = await self.gateway.tool_chat_in_lane_result(
                                     lane_key=dialog_lane_key,
                                     base_origin=chat_id,
-                                    event=event,
+                                    event=execution_event,
                                     prompt=api_prompt,
                                     system_prompt=system_prompt,
                                     tools=tool_set,
@@ -235,6 +279,7 @@ class ConcurrentExecutor:
                                     prefix_hash=prefix_hash,
                                     raw_user_text=raw_user_text,
                                 )
+                                reply_text = result.text
                                 if not reply_text:
                                     raise ValueError("回复为空")
                                 
@@ -277,11 +322,14 @@ class ConcurrentExecutor:
                         delattr(event, '_is_final_reply_phase')
 
         finally:
-            async with self._global_lock:
-                self._chat_pending_count[chat_id] -= 1
-                if self._chat_pending_count[chat_id] == 0:
-                    self._chat_locks.pop(chat_id, None)
-                    self._chat_pending_count.pop(chat_id, None)
+            if using_runtime_coordinator:
+                await self.runtime_coordinator.release_executor(chat_id)
+            else:
+                async with self._global_lock:
+                    self._chat_pending_count[chat_id] -= 1
+                    if self._chat_pending_count[chat_id] == 0:
+                        self._chat_locks.pop(chat_id, None)
+                        self._chat_pending_count.pop(chat_id, None)
 
 
     async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str):
