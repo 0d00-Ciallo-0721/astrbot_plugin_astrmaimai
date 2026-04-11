@@ -11,6 +11,33 @@ from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .datamodels import ChatState, UserProfile, LastMessageMetadataDB, ExpressionPattern, MessageLog, CronSnapshot
 
+
+def _dedupe_sqlmodel_metadata_indexes() -> None:
+    """清理热重载后重复挂到 metadata 上的同名索引。"""
+    for table in SQLModel.metadata.tables.values():
+        indexes = list(table.indexes)
+        if len(indexes) <= 1:
+            continue
+
+        seen_signatures = set()
+        deduped_indexes = []
+        changed = False
+        for index in indexes:
+            signature = (
+                index.name,
+                bool(index.unique),
+                tuple(column.name for column in index.columns),
+            )
+            if signature in seen_signatures:
+                changed = True
+                continue
+            seen_signatures.add(signature)
+            deduped_indexes.append(index)
+
+        if changed:
+            table.indexes.clear()
+            table.indexes.update(deduped_indexes)
+
 class PersistenceManager:
     """
     底层持久化管理器
@@ -30,6 +57,7 @@ class PersistenceManager:
         
         # 兼容旧逻辑的同步 Engine (用于 Vector Store 等)
         self.engine = create_engine(self.db_url)
+        _dedupe_sqlmodel_metadata_indexes()
         SQLModel.metadata.create_all(self.engine)
         
         # 异步初始化表结构

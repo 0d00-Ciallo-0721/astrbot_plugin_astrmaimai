@@ -121,6 +121,23 @@ class PersistenceRegressionTests(unittest.TestCase):
 
         self.assertIn("session_id", cols)
 
+    def test_reload_datamodels_does_not_duplicate_indexes_on_create_all(self):
+        datamodels_mod = importlib.import_module("astrmai.infra.datamodels")
+        datamodels_mod = importlib.reload(datamodels_mod)
+
+        table = datamodels_mod.SQLModel.metadata.tables["memoryretrievaltrace"]
+        before_names = sorted(index.name for index in table.indexes)
+        self.assertGreater(before_names.count("ix_memoryretrievaltrace_trace_id"), 1)
+
+        manager = self.persistence_mod.PersistenceManager()
+        self.managers.append(manager)
+
+        table = datamodels_mod.SQLModel.metadata.tables["memoryretrievaltrace"]
+        after_names = sorted(index.name for index in table.indexes)
+        self.assertEqual(after_names.count("ix_memoryretrievaltrace_trace_id"), 1)
+        self.assertEqual(after_names.count("ix_memoryretrievaltrace_chat_id"), 1)
+        self.assertEqual(after_names.count("ix_memoryretrievaltrace_created_at"), 1)
+
     def test_load_all_user_profiles_returns_structured_profile_fields(self):
         manager = self.persistence_mod.PersistenceManager()
         self.managers.append(manager)
