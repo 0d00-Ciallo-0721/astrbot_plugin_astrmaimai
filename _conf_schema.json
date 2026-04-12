@@ -125,43 +125,49 @@
     "description": "回复风格与发送行为",
     "items": {
       "base_frequency": {
-        "description": "默认接话积极度",
+        "description": "普通聊天时的接话积极度",
         "type": "float",
         "default": 0.7,
-        "hint": "值越高，Bot 越倾向于参与对话；值越低，则更克制。"
+        "hint": "值越高，Bot 越愿意主动接话、顺着聊下去；值越低，Bot 会更克制，更少插话。"
       },
       "follow_up_probability": {
-        "description": "追加一句的概率",
+        "description": "回复后再补一句的概率",
         "type": "float",
         "default": 0.2,
-        "hint": "控制 Bot 回完一句后，是否会自然地再补一句。0 表示几乎不追发，1 表示经常追发。"
+        "hint": "控制 Bot 回完第一句后，是否会再自然补一句。0 表示几乎不会补，1 表示经常会补。"
+      },
+      "stale_reply_max_age_sec": {
+        "description": "聊天回复的最长有效时长（秒）",
+        "type": "float",
+        "default": 0.0,
+        "hint": "超过这个时间还没发出去的回复，会被当作过期回复处理，避免晚到后突然回错话题。填 0 表示自动根据系统超时设置推导。"
       },
       "fallback_text": {
         "description": "兜底回复文本",
         "type": "string",
         "default": "（陷入了短暂的沉默...）",
-        "hint": "当整条回复链都失败时，会使用这句作为最后兜底。"
+        "hint": "当模型调用失败、回复被拦截，或者整条回复链没有产出可发送内容时，会发送这句兜底文本。"
       },
       "segment_min_len": {
-        "description": "分段发送的最短长度",
+        "description": "允许拆分发送的最短长度",
         "type": "int",
         "default": 15,
-        "hint": "太短的内容不会被继续拆成多条发送。"
+        "hint": "内容太短时，不会再拆成多条发送，避免一句话被切得太碎。"
       },
       "no_segment_max_len": {
-        "description": "禁止继续拆分的长度上限",
+        "description": "优先整条发送的长度上限",
         "type": "int",
         "default": 120,
-        "hint": "当文本不超过这个长度时，会尽量作为一条完整消息发送。"
+        "hint": "当回复不超过这个长度时，会尽量一次性整条发出，而不是拆成多条。"
       },
       "meme_probability": {
-        "description": "发送表情包的概率（%）",
+        "description": "附带表情包的概率（%）",
         "type": "int",
         "default": 60,
-        "hint": "值越高，Bot 越容易在合适的时候搭配表情包。"
+        "hint": "值越高，Bot 越容易在合适的场景顺手带一个表情包。不是每次都会发，只是更容易触发。"
       },
       "emotion_mapping": {
-        "description": "情绪到表情包目录的映射",
+        "description": "情绪与表情包文件夹的对应关系",
         "type": "list",
         "default": [
           "happy: 积极、开心、感谢",
@@ -171,13 +177,13 @@
           "curious: 好奇、提问、困惑",
           "surprise: 惊讶、意外"
         ],
-        "hint": "左边是情绪标签，右边是对应的表情包文件夹名称。请确保文件夹名称与实际资源一致。"
+        "hint": "左边是系统识别到的情绪标签，右边是要使用的表情包文件夹名。请保证文件夹名称和实际资源目录一致。"
       },
       "typing_speed_factor": {
-        "description": "拟人化打字延迟系数",
+        "description": "模拟打字等待强度",
         "type": "float",
         "default": 0.1,
-        "hint": "值越大，发送前的模拟打字等待越明显。"
+        "hint": "值越大，发送前的等待感越明显，看起来更像在慢慢打字；值越小，回复会更利落。"
       }
     }
   },

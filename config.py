@@ -96,12 +96,13 @@ class LifeConfig(BaseModel):
     dream_send_target: str = Field(default="", description="梦境可见时的目标会话 ID，留空则发送回当前 dream session")
     
 class ReplyConfig(BaseModel):
-    fallback_text: str = Field(default="（陷入了短暂的沉默...）")
-    base_frequency: float = Field(default=0.7, description="算法流基础连发跟进概率")
-    follow_up_probability: float = Field(default=0.2, description="AI 在首轮回复后继续追发一句的概率门控 (0.0~1.0)")
-    segment_min_len: int = Field(default=15)
-    no_segment_max_len: int = Field(default=120)
-    meme_probability: int = Field(default=60)
+    fallback_text: str = Field(default="（陷入了短暂的沉默...）", description="当回复流程整体失败时使用的兜底文本")
+    base_frequency: float = Field(default=0.7, description="Bot 在普通场景下主动接话的积极程度")
+    follow_up_probability: float = Field(default=0.2, description="首条回复发出后，继续自然补一句的概率 (0.0~1.0)")
+    stale_reply_max_age_sec: float = Field(default=0.0, description="允许聊天回复保留时效性的最长秒数；0 表示自动按系统超时推导")
+    segment_min_len: int = Field(default=15, description="允许拆成多条发送前，单条内容至少要达到的长度")
+    no_segment_max_len: int = Field(default=120, description="不超过这个长度时，尽量作为一条完整消息发出")
+    meme_probability: int = Field(default=60, description="在适合的场景下附带表情包的概率百分比")
     # [新增] 对齐 _conf_schema.json 中的 reply 节点
     emotion_mapping: List[str] = Field(default=[
         "happy: 积极、开心、感谢",
@@ -111,7 +112,7 @@ class ReplyConfig(BaseModel):
         "curious: 好奇、提问、困惑",
         "surprise: 惊讶、意外"
     ])
-    typing_speed_factor: float = Field(default=0.1)
+    typing_speed_factor: float = Field(default=0.1, description="模拟打字等待的强度系数，越大看起来越像在慢慢打字")
 
 class MemoryConfig(BaseModel):
     time_decay_rate: float = Field(default=0.01)
