@@ -16,6 +16,22 @@ class FailureKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ReplyMode(str, Enum):
+    PLAYFUL_INTERACTION = "playful_interaction"
+    EMOTIONAL_SUPPORT = "emotional_support"
+    DIRECT_QUESTION = "direct_question"
+    CASUAL_FOLLOWUP = "casual_followup"
+    IMAGE_REACTION = "image_reaction"
+    LATE_RECONNECT = "late_reconnect"
+    AMBIENT_IGNORE = "ambient_ignore"
+
+
+class FreshnessState(str, Enum):
+    FRESH = "fresh"
+    STALE_BUT_SALVAGEABLE = "stale_but_salvageable"
+    EXPIRED = "expired"
+
+
 @dataclass
 class VisionBundle:
     image_urls: List[str] = field(default_factory=list)
@@ -23,6 +39,16 @@ class VisionBundle:
     is_direct_request: bool = False
     is_image_only: bool = False
     source: str = ""
+
+
+@dataclass
+class ReplyFreshnessBudget:
+    state: FreshnessState = FreshnessState.FRESH
+    created_at: float = 0.0
+    max_age_seconds: float = 0.0
+    salvage_window_seconds: float = 0.0
+    latest_activity_ts: float = 0.0
+    stale_reason: str = ""
 
 
 @dataclass
@@ -37,6 +63,10 @@ class FocusThreadContext:
     focus_message_text: str = ""
     focus_sender_id: str = ""
     focus_sender_name: str = ""
+    reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP
+    social_state: str = ""
+    thread_signature: str = ""
+    freshness_budget: ReplyFreshnessBudget = field(default_factory=ReplyFreshnessBudget)
     vision_bundle: VisionBundle = field(default_factory=VisionBundle)
 
     def all_thread_events(self) -> List[Any]:
@@ -64,6 +94,10 @@ class PromptEnvelope:
     focus_reason: str = ""
     focus_thread_reason: str = ""
     near_context_priority: bool = False
+    reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP
+    social_state: str = ""
+    freshness_state: FreshnessState = FreshnessState.FRESH
+    thread_signature: str = ""
     state_block: str = ""
     memory_block: str = ""
     guidance_lines: List[str] = field(default_factory=list)
@@ -92,6 +126,16 @@ class PromptEnvelope:
 
 
 @dataclass
+class SocialTranscriptTurn:
+    speaker_name: str
+    target_name: str = ""
+    turn_type: str = "message"
+    content: str = ""
+    relative_time: str = ""
+    reply_mode_hint: str = ""
+
+
+@dataclass
 class LLMCallResult:
     ok: bool
     text: str = ""
@@ -111,7 +155,19 @@ class VisibleReplyArtifact:
     persistable_text: str
     blocked_reason: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    sent: bool = False
 
     @property
     def blocked(self) -> bool:
         return not self.visible_text or bool(self.blocked_reason)
+
+
+@dataclass
+class OutboundPolicy:
+    should_send: bool = True
+    freshness_state: FreshnessState = FreshnessState.FRESH
+    length_class: str = "normal"
+    segment_strategy: str = "default"
+    late_rewrite_allowed: bool = False
+    send_delay_profile: str = "default"
+    blocked_reason: str = ""

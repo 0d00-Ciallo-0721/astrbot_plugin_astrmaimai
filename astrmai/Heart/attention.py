@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import re
 import time
 from typing import List, Dict, Any, Optional, Set
@@ -11,6 +12,13 @@ from ..infra.legacy_compat import emit_legacy_focus_thread_extras
 from .state_engine import StateEngine
 from .judge import Judge
 from .sensors import PreFilters
+from ..infra.runtime_contracts import (
+    FocusThreadContext,
+    FreshnessState,
+    ReplyFreshnessBudget,
+    ReplyMode,
+    VisionBundle,
+)
 from astrbot.api.message_components import Image, Plain, At, Face # 导入 AstrBot 的底层消息组件
 from ..infra.runtime_contracts import FocusThreadContext, VisionBundle
 
@@ -49,7 +57,7 @@ class AttentionGate:
     def __init__(self, state_engine: StateEngine, judge: Judge, sensors: PreFilters,
                  system2_callback, config=None, visual_cortex=None,
                  persona_summarizer=None, frequency_controller=None,
-                 private_chat_manager=None):
+                 private_chat_manager=None, runtime_coordinator=None):
         self.state_engine = state_engine
         self.judge = judge
         self.sensors = sensors
@@ -60,6 +68,7 @@ class AttentionGate:
         # Phase 6.3: 发言频率控制器
         self.frequency_controller = frequency_controller
         self.private_chat_manager = private_chat_manager
+        self.runtime_coordinator = runtime_coordinator
         
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
@@ -402,6 +411,81 @@ class AttentionGate:
             score += 15
         return score
 
+    @staticmethod
+    def _question_like(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        question_keywords = ("?", "？", "为什么", "怎么", "啥", "什么", "吗", "是不是", "能不能", "可不可以")
+        return any(keyword in normalized for keyword in question_keywords)
+
+    @staticmethod
+    def _emotion_like(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        emotional_keywords = (
+            "难受", "焦虑", "害怕", "不舒服", "委屈", "难过", "崩溃", "emo", "痛", "累", "好困", "想哭",
+            "呜", "呜呜", "抱抱", "安慰", "救救", "不想活", "烦", "烦死", "想死",
+        )
+        return any(keyword in normalized for keyword in emotional_keywords)
+
+    def _infer_reply_mode(
+        self,
+        focus_candidate: NormalizedEvent,
+        root_candidate: Optional[NormalizedEvent],
+        normalized_events: List[NormalizedEvent],
+    ) -> ReplyMode:
+        del normalized_events
+        interaction_kind = str(focus_candidate.event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
+        text = focus_candidate.rich_text or focus_candidate.text
+        if interaction_kind:
+            return ReplyMode.PLAYFUL_INTERACTION
+        if focus_candidate.image_urls:
+            if focus_candidate.has_direct_vision or focus_candidate.is_at_bot or focus_candidate.is_reply_to_bot:
+                return ReplyMode.IMAGE_REACTION
+            return ReplyMode.AMBIENT_IGNORE
+        if self._emotion_like(text):
+            return ReplyMode.EMOTIONAL_SUPPORT
+        if self._question_like(text):
+            return ReplyMode.DIRECT_QUESTION
+        if focus_candidate.is_direct_wakeup or focus_candidate.is_at_bot or focus_candidate.is_reply_to_bot:
+            return ReplyMode.CASUAL_FOLLOWUP
+        if root_candidate and root_candidate.event is not focus_candidate.event:
+            return ReplyMode.CASUAL_FOLLOWUP
+        return ReplyMode.CASUAL_FOLLOWUP
+
+    @staticmethod
+    def _derive_social_state(reply_mode: ReplyMode) -> str:
+        mapping = {
+            ReplyMode.PLAYFUL_INTERACTION: "playful_present",
+            ReplyMode.EMOTIONAL_SUPPORT: "gentle_support",
+            ReplyMode.DIRECT_QUESTION: "direct_answering",
+            ReplyMode.CASUAL_FOLLOWUP: "casual_presence",
+            ReplyMode.IMAGE_REACTION: "light_visual_reaction",
+            ReplyMode.LATE_RECONNECT: "late_reconnect",
+            ReplyMode.AMBIENT_IGNORE: "ambient_background",
+        }
+        return mapping.get(reply_mode, "casual_presence")
+
+    def _build_thread_signature(
+        self,
+        focus_candidate: NormalizedEvent,
+        root_candidate: Optional[NormalizedEvent],
+        reply_mode: ReplyMode,
+    ) -> str:
+        root = root_candidate or focus_candidate
+        basis = "|".join(
+            [
+                str(reply_mode.value),
+                str(root.sender_id or ""),
+                str(root.reply_target_sender_id or ""),
+                str(focus_candidate.sender_id or ""),
+                hashlib.md5(str(root.rich_text or root.text or "").encode("utf-8")).hexdigest()[:10],
+            ]
+        )
+        return basis
+
     def _build_focus_thread(
         self,
         focus_candidate: NormalizedEvent,
@@ -427,6 +511,13 @@ class AttentionGate:
         _append_unique(core_events, focus_candidate.event, core_limit)
         if root_candidate and root_candidate.event is not focus_candidate.event:
             _append_unique(core_events, root_candidate.event, core_limit)
+        reply_mode = self._infer_reply_mode(focus_candidate, root_candidate, normalized_events)
+        social_state = self._derive_social_state(reply_mode)
+        thread_signature = self._build_thread_signature(focus_candidate, root_candidate, reply_mode)
+        freshness_budget = ReplyFreshnessBudget(
+            state=FreshnessState.FRESH,
+            created_at=float(focus_candidate.timestamp or 0.0),
+        )
 
         if not thread_enabled:
             for candidate in normalized_events:
@@ -444,6 +535,10 @@ class AttentionGate:
                 focus_message_text="",
                 focus_sender_id=focus_candidate.sender_id,
                 focus_sender_name=focus_candidate.sender_name,
+                reply_mode=reply_mode,
+                social_state=social_state,
+                thread_signature=thread_signature,
+                freshness_budget=freshness_budget,
                 vision_bundle=VisionBundle(
                     image_urls=focus_candidate.image_urls[:],
                     direct_image_urls=focus_candidate.image_urls[:] if focus_candidate.has_direct_vision else [],
@@ -488,6 +583,10 @@ class AttentionGate:
             focus_message_text="",
             focus_sender_id=focus_candidate.sender_id,
             focus_sender_name=focus_candidate.sender_name,
+            reply_mode=reply_mode,
+            social_state=social_state,
+            thread_signature=thread_signature,
+            freshness_budget=freshness_budget,
             vision_bundle=VisionBundle(
                 image_urls=focus_candidate.image_urls[:],
                 direct_image_urls=focus_candidate.image_urls[:] if focus_candidate.has_direct_vision else [],
@@ -683,7 +782,16 @@ class AttentionGate:
                     session.repeat_count = 0
 
             session.accumulation_pool.append(event)
-            event.set_extra("astrmai_timestamp", time.time())
+            event_timestamp = time.time()
+            event.set_extra("astrmai_timestamp", event_timestamp)
+            if self.runtime_coordinator:
+                await self.runtime_coordinator.mark_activity(
+                    chat_id,
+                    event_timestamp,
+                    sender_id=str(sender_id),
+                    sender_name=str(event.get_sender_name() or sender_id),
+                    preview=preview_text(str(event.message_str or ""), 80),
+                )
 
             if session.is_evaluating:
                 logger.info(f"[{chat_id}] ⏳ [窗口持续] 写入消息 -> 累积池 (当前积压: {len(session.accumulation_pool)}条)")
@@ -900,12 +1008,54 @@ class AttentionGate:
                     
         return outline
     
-    def _convert_interaction_to_narrative(self, content: str, bot_name: str) -> str:
+    def _format_interaction_participant(self, name: str, user_id: str, bot_name: str, self_id: str = "") -> str:
+        safe_id = str(user_id or "").strip()
+        safe_name = str(name or "").strip()
+        if safe_id and self_id and safe_id == str(self_id):
+            safe_name = safe_name or bot_name or "你"
+        if not safe_name:
+            safe_name = f"群友{safe_id[-4:]}" if safe_id else "群友"
+        if safe_id and safe_id not in safe_name:
+            return f"{safe_name}({safe_id})"
+        return safe_name
+
+    def _render_structured_interaction(self, event: AstrMessageEvent, bot_name: str) -> str:
+        kind = str(event.get_extra("astrmai_interaction_kind", "") or "").lower()
+        if kind != "poke":
+            return ""
+
+        self_id = str(event.get_self_id() or "")
+        actor_label = self._format_interaction_participant(
+            event.get_extra("astrmai_interaction_actor_display_name", event.get_extra("astrmai_interaction_actor_name", "")),
+            event.get_extra("astrmai_interaction_actor_id", ""),
+            bot_name,
+            self_id=self_id,
+        )
+        relative_age_label = str(event.get_extra("astrmai_interaction_relative_age_label", "") or "").strip()
+        target_is_bot = bool(event.get_extra("astrmai_interaction_target_is_bot", False))
+        if target_is_bot:
+            time_prefix = f"{relative_age_label}，" if relative_age_label else ""
+            return f"[互动事件：{time_prefix}{actor_label} 对你发起了一次“戳一戳”，伸出手指轻轻碰了碰你的脸颊]"
+
+        target_label = self._format_interaction_participant(
+            event.get_extra("astrmai_interaction_target_display_name", event.get_extra("astrmai_interaction_target_name", "")),
+            event.get_extra("astrmai_interaction_target_id", ""),
+            bot_name,
+            self_id=self_id,
+        )
+        time_prefix = f"{relative_age_label}，" if relative_age_label else ""
+        return f"[互动事件：{time_prefix}{actor_label} 对 {target_label} 发起了一次“戳一戳”，伸出手指轻轻碰了碰对方]"
+
+    def _convert_interaction_to_narrative(self, content: str, bot_name: str, event: AstrMessageEvent = None) -> str:
         """
         [优化版] 将上方产生的机器结构化技术标记，转换为大模型视角的自然叙述与动作描写
         """
         import re
         if not content: return ""
+
+        structured_interaction = self._render_structured_interaction(event, bot_name) if event else ""
+        if structured_interaction:
+            content = structured_interaction
 
         # 1. 戳一戳虚拟事件翻译 (Interaction: A -> B)
         def poke_repl(match):
@@ -1005,6 +1155,13 @@ class AttentionGate:
         # 2. 同源聚合与画面感转义阶段
         for e in filtered_events:
             sender = e.get_sender_name()
+            if e.get_extra("astrmai_interaction_kind") == "poke":
+                sender = self._format_interaction_participant(
+                    e.get_extra("astrmai_interaction_actor_name", sender),
+                    e.get_extra("astrmai_interaction_actor_id", e.get_sender_id()),
+                    bot_name,
+                    self_id=str(e.get_self_id() or ""),
+                )
             
             # [核心修改] 区分虚拟事件与普通消息组件提取
             if e.get_extra("is_virtual_poke"):
@@ -1015,7 +1172,7 @@ class AttentionGate:
                 raw_content = await self._normalize_content_to_str(components, event=e)
                 
             # [核心修改] 执行叙事转义
-            content = self._convert_interaction_to_narrative(raw_content, bot_name)
+            content = self._convert_interaction_to_narrative(raw_content, bot_name, event=e)
             
             e.set_extra("astrmai_rich_text", content)
             

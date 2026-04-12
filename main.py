@@ -97,7 +97,11 @@ class AstrMaiPlugin(Star):
 
         self.visual_cortex = VisualCortex(self.gateway, self.db_service) 
 
-        self.reply_engine = ReplyEngine(self.state_engine, self.state_engine.mood_manager)
+        self.reply_engine = ReplyEngine(
+            self.state_engine,
+            self.state_engine.mood_manager,
+            runtime_coordinator=self.runtime_coordinator,
+        )
         self.evolution = EvolutionManager(self.db_service, self.gateway)
 
         self.persona_summarizer = PersonaSummarizer(self.persistence, self.gateway, memory_engine=self.memory_engine)
@@ -157,7 +161,8 @@ class AstrMaiPlugin(Star):
             persona_summarizer=self.persona_summarizer,  
             visual_cortex=self.visual_cortex,
             frequency_controller=self.frequency_controller,  # Phase 6.3 娉ㄥ叆
-            private_chat_manager=self.private_chat_manager
+            private_chat_manager=self.private_chat_manager,
+            runtime_coordinator=self.runtime_coordinator,
         )
         
         # Phase 4: 琛ㄨ揪鍙嶆€濆櫒

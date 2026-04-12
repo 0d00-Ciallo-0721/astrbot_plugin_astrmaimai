@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
 from .output_guard import is_safe_visible_text, sanitize_visible_reply_text
-from .runtime_contracts import VisibleReplyArtifact
+from .runtime_contracts import SocialTranscriptTurn, VisibleReplyArtifact
 
 
 @dataclass(frozen=True)
@@ -171,6 +171,20 @@ class LaneManager:
             return None
         return {"role": role, "content": cleaned}
 
+    @staticmethod
+    def _looks_like_social_rendered_line(content: str) -> bool:
+        normalized = str(content or "").strip()
+        if not normalized:
+            return False
+        return (
+            normalized.startswith("[")
+            or "说:" in normalized
+            or "说：" in normalized
+            or "发了一张" in normalized
+            or "刚刚" in normalized
+            or "戳了戳" in normalized
+        )
+
     def build_history_turn(self, role: str, content: Any) -> Optional[dict]:
         normalized_role = str(role or "").strip()
         if normalized_role == "assistant":
@@ -187,6 +201,18 @@ class LaneManager:
         if not sanitized:
             return None
         return {"role": normalized_role, "content": sanitized}
+
+    @staticmethod
+    def _render_social_transcript_turn(turn: SocialTranscriptTurn, bot_name: str) -> str:
+        if turn.turn_type == "assistant":
+            speaker = turn.speaker_name or bot_name
+            return f"{speaker}: {turn.content[:180]}"
+        if turn.content.startswith("["):
+            return turn.content[:180]
+        speaker = turn.speaker_name or "用户"
+        if turn.target_name:
+            return f"{speaker}对{turn.target_name}说: {turn.content[:180]}"
+        return f"{speaker}: {turn.content[:180]}"
 
     def _sanitize_dialog_history(self, history: List[dict]) -> tuple[List[dict], bool]:
         sanitized: List[dict] = []
@@ -476,12 +502,34 @@ class LaneManager:
             if not content:
                 continue
             if role == "assistant":
+                normalized_assistant = sanitize_visible_reply_text(content, fallback_text="")
+                if not normalized_assistant:
+                    continue
+                lines.append(
+                    self._render_social_transcript_turn(
+                        SocialTranscriptTurn(speaker_name=bot_name, turn_type="assistant", content=normalized_assistant),
+                        bot_name,
+                    )
+                )
+                continue
+            if role == "user" and self._looks_like_social_rendered_line(content):
+                lines.append(
+                    self._render_social_transcript_turn(
+                        SocialTranscriptTurn(speaker_name="", turn_type="social_event", content=content),
+                        bot_name,
+                    )
+                )
+                continue
+            if role == "assistant":
                 content = sanitize_visible_reply_text(content, fallback_text="")
                 if not content:
                     continue
                 lines.append(f"{bot_name}: {content[:180]}")
             elif role == "user":
                 if not is_safe_visible_text(content):
+                    continue
+                if self._looks_like_social_rendered_line(content):
+                    lines.append(content[:180])
                     continue
                 if content.startswith("[") and "说:" in content:
                     lines.append(content[:180])

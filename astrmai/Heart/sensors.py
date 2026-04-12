@@ -403,8 +403,12 @@ class PreFilters:
                 bot_name = self.config.system1.nicknames[0]
                 
         target_name = bot_name if target_id == bot_id else await _resolve_name(target_id, "")
+        actor_label = f"{sender_name}({sender_id})" if sender_id and sender_id not in str(sender_name) else sender_name
+        target_label = f"{target_name}({target_id})" if target_id and target_id not in str(target_name) else target_name
+        occurred_at = time.time()
+        relative_age_label = "刚刚"
         
-        virtual_text = f"(Interaction: {sender_name} -> {target_name})"
+        virtual_text = f"(Interaction: {actor_label} -> {target_label})"
         logger.info(f"[AstrMai-Sensor] 👉 捕获互动事件: {virtual_text}")
         
         if target_id == bot_id:
@@ -421,6 +425,16 @@ class PreFilters:
 
         event.message_str = virtual_text
         event.set_extra("is_virtual_poke", True)
+        event.set_extra("astrmai_interaction_kind", "poke")
+        event.set_extra("astrmai_interaction_actor_id", sender_id)
+        event.set_extra("astrmai_interaction_actor_name", sender_name)
+        event.set_extra("astrmai_interaction_actor_display_name", actor_label)
+        event.set_extra("astrmai_interaction_target_id", target_id)
+        event.set_extra("astrmai_interaction_target_name", target_name)
+        event.set_extra("astrmai_interaction_target_display_name", target_label)
+        event.set_extra("astrmai_interaction_target_is_bot", target_id == bot_id)
+        event.set_extra("astrmai_interaction_occurred_at", occurred_at)
+        event.set_extra("astrmai_interaction_relative_age_label", relative_age_label)
         event.set_extra("astrmai_bonus_score", 2.0) 
         
         await attention_gate.process_event(event)

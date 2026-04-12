@@ -1,6 +1,7 @@
 import re
 import asyncio
 import random
+import time
 from typing import List
 from astrbot.api import logger
 try:
@@ -24,7 +25,12 @@ from ..Heart.affection_router import AffectionRouter
 from ..infra.lane_manager import LaneKey
 from ..infra.legacy_compat import emit_legacy_reply_runtime_extras
 from ..infra.output_guard import is_sendable_segment, sanitize_visible_reply_text
-from ..infra.runtime_contracts import VisibleReplyArtifact
+from ..infra.runtime_contracts import (
+    FreshnessState,
+    OutboundPolicy,
+    ReplyMode,
+    VisibleReplyArtifact,
+)
 from ..infra.trace_runtime import preview_text
 # [阶段四新增] 引入情绪归因路由器
 from ..Heart.affection_router import AffectionRouter
@@ -40,10 +46,11 @@ class ReplyEngine:
     回复引擎 (Expression Layer)
     职责: 清洗 LLM 输出、拟人化分段、情绪后处理与表情包发送
     """
-    def __init__(self, state_engine: StateEngine, mood_manager: MoodManager, config=None):
+    def __init__(self, state_engine: StateEngine, mood_manager: MoodManager, config=None, runtime_coordinator=None):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
         self.config = config if config else state_engine.config
+        self.runtime_coordinator = runtime_coordinator
         
         # 接入 Config (不再硬编码)
         self.segmentation_threshold = self.config.reply.segment_min_len # 分段阈值
@@ -56,6 +63,112 @@ class ReplyEngine:
             min_length=self.segmentation_threshold,
             max_length=self.no_segment_limit
         )
+
+    def _reply_max_age_seconds(self) -> float:
+        configured = float(getattr(getattr(self.config, "reply", None), "stale_reply_max_age_sec", 0.0) or 0.0)
+        if configured > 0:
+            return configured
+        api_timeout = float(getattr(getattr(self.config, "infra", None), "api_timeout", 15.0) or 15.0)
+        return max(30.0, min(90.0, api_timeout * 2.5))
+
+    def _resolve_reply_mode(self, event: AstrMessageEvent) -> ReplyMode:
+        prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
+        if prompt_envelope and getattr(prompt_envelope, "reply_mode", None):
+            return prompt_envelope.reply_mode
+        focus_context = event.get_extra("astrmai_focus_thread_context", None)
+        if focus_context and getattr(focus_context, "reply_mode", None):
+            return focus_context.reply_mode
+        raw_mode = str(event.get_extra("astrmai_reply_mode", ReplyMode.CASUAL_FOLLOWUP.value) or ReplyMode.CASUAL_FOLLOWUP.value)
+        try:
+            return ReplyMode(raw_mode)
+        except ValueError:
+            return ReplyMode.CASUAL_FOLLOWUP
+
+    async def _check_reply_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
+        event_ts = float(event.get_extra("astrmai_timestamp", 0.0) or 0.0)
+        if event_ts <= 0:
+            return FreshnessState.FRESH, ""
+
+        reply_age = time.time() - event_ts
+        max_age = self._reply_max_age_seconds()
+        if reply_age > max_age:
+            return FreshnessState.EXPIRED, f"reply_age_exceeded:{reply_age:.1f}s>{max_age:.1f}s"
+
+        if not self.runtime_coordinator:
+            return FreshnessState.FRESH, ""
+
+        if not hasattr(self.runtime_coordinator, "evaluate_reply_freshness"):
+            latest_ts, latest_sender_id, latest_sender_name, latest_preview = await self.runtime_coordinator.get_latest_activity(chat_id)
+            if latest_ts and latest_ts > event_ts:
+                actor = latest_sender_name or latest_sender_id or "unknown"
+                return FreshnessState.EXPIRED, f"superseded_by_newer_activity:{actor}:{preview_text(latest_preview, 60)}"
+            return FreshnessState.FRESH, ""
+
+        thread_signature = str(event.get_extra("astrmai_thread_signature", "") or "")
+        freshness_state, stale_reason = await self.runtime_coordinator.evaluate_reply_freshness(
+            chat_id,
+            event_ts,
+            max_age_seconds=max_age,
+            thread_signature=thread_signature,
+        )
+        if freshness_state != FreshnessState.FRESH and stale_reason.startswith("superseded_by_newer_activity"):
+            latest_ts, latest_sender_id, latest_sender_name, latest_preview = await self.runtime_coordinator.get_latest_activity(chat_id)
+            actor = latest_sender_name or latest_sender_id or "unknown"
+            stale_reason = f"superseded_by_newer_activity:{actor}:{preview_text(latest_preview, 60)}"
+        return freshness_state, stale_reason
+
+    def _build_outbound_policy(
+        self,
+        reply_mode: ReplyMode,
+        freshness_state: FreshnessState,
+        stale_reason: str,
+    ) -> OutboundPolicy:
+        if freshness_state == FreshnessState.EXPIRED:
+            return OutboundPolicy(
+                should_send=False,
+                freshness_state=freshness_state,
+                blocked_reason=stale_reason or "expired",
+            )
+        if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE:
+            return OutboundPolicy(
+                should_send=True,
+                freshness_state=freshness_state,
+                length_class="short",
+                segment_strategy="single",
+                late_rewrite_allowed=True,
+                send_delay_profile="fast",
+            )
+        strategy = "default"
+        if reply_mode in {ReplyMode.PLAYFUL_INTERACTION, ReplyMode.IMAGE_REACTION}:
+            strategy = "single"
+        elif reply_mode == ReplyMode.EMOTIONAL_SUPPORT:
+            strategy = "gentle_two_step"
+        return OutboundPolicy(
+            should_send=True,
+            freshness_state=freshness_state,
+            length_class="normal",
+            segment_strategy=strategy,
+            late_rewrite_allowed=False,
+            send_delay_profile="default",
+        )
+
+    def _rewrite_late_reply(self, reply_mode: ReplyMode, clean_text: str) -> str:
+        fallback_map = {
+            ReplyMode.PLAYFUL_INTERACTION: "欸，我刚刚还想接你这句来着。",
+            ReplyMode.EMOTIONAL_SUPPORT: "我还在这儿，先抱抱你。",
+            ReplyMode.DIRECT_QUESTION: "我刚刚看到你这句了，让我接一下。",
+            ReplyMode.CASUAL_FOLLOWUP: "我还记着你刚刚这句呢。",
+            ReplyMode.IMAGE_REACTION: "刚刚那张我看到啦。",
+            ReplyMode.LATE_RECONNECT: "我这会儿才接上你刚刚那句。",
+            ReplyMode.AMBIENT_IGNORE: "",
+        }
+        if not clean_text:
+            return fallback_map.get(reply_mode, "")
+        first_line = re.split(r"[\r\n。！？!?]", clean_text.strip(), maxsplit=1)[0].strip()
+        if len(first_line) > 24:
+            first_line = first_line[:24].rstrip("，,。.!?？") + "……"
+        fallback = fallback_map.get(reply_mode, "")
+        return first_line or fallback
 
     def _clean_reply_content(self, text: str) -> str:
         """
@@ -82,32 +195,59 @@ class ReplyEngine:
         
         return text.strip()
 
-    def _segment_reply_content(self, text: str) -> List[str]:
+    def _segment_reply_content(self, text: str, reply_mode: ReplyMode, policy: OutboundPolicy) -> List[str]:
         """
         [修改] 拟人化分段算法 (安全闭环版，彻底解决颜文字切片错位与正则冲突)
         代理调用独立的 TextSegmenter 核心，解决正则切割太粗暴与换行符逃逸的问题。
         """
+        if policy.segment_strategy == "single":
+            cleaned = re.sub(r'^\n+|\n+$', '', text.strip())
+            return [cleaned] if cleaned else []
+
         if len(text) > self.no_segment_limit:
             # 即使触发不分段机制，也必须净化首尾换行符，斩杀导致气泡错位的幽灵字符
             cleaned = re.sub(r'^\n+|\n+$', '', text.strip())
             return [cleaned] if cleaned else []
 
         # 直接调用外置的智能状态机分段器，其内部已经妥善处理了片段粘连、标点吞噬和换行符逃逸
-        return self.segmenter.segment(text)
+        segments = self.segmenter.segment(text)
+        if policy.segment_strategy == "gentle_two_step":
+            return segments[:2]
+        return segments
 
-    def _build_visible_reply_artifact(self, text: str) -> VisibleReplyArtifact:
+    def _build_visible_reply_artifact(
+        self,
+        text: str,
+        *,
+        reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP,
+        freshness_state: FreshnessState = FreshnessState.FRESH,
+        stale_reason: str = "",
+    ) -> VisibleReplyArtifact:
+        policy = self._build_outbound_policy(reply_mode, freshness_state, stale_reason)
+        if not policy.should_send:
+            return VisibleReplyArtifact(
+                visible_text="",
+                segments=[],
+                persistable_text="",
+                blocked_reason=policy.blocked_reason or "outbound_blocked",
+                metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
+            )
+
         clean_text = self._clean_reply_content(text)
+        if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE and policy.late_rewrite_allowed:
+            clean_text = self._rewrite_late_reply(reply_mode, clean_text)
         if not clean_text:
             return VisibleReplyArtifact(
                 visible_text="",
                 segments=[],
                 persistable_text="",
                 blocked_reason="empty_or_blocked_reply",
+                metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
             )
 
         segments = [
             segment
-            for segment in self._segment_reply_content(clean_text)
+            for segment in self._segment_reply_content(clean_text, reply_mode, policy)
             if is_sendable_segment(segment)
         ]
         if not segments:
@@ -116,6 +256,7 @@ class ReplyEngine:
                 segments=[],
                 persistable_text="",
                 blocked_reason="no_sendable_segments",
+                metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
             )
 
         visible_text = "\n".join(segments).strip()
@@ -123,7 +264,12 @@ class ReplyEngine:
             visible_text=visible_text,
             segments=segments,
             persistable_text=visible_text,
-            metadata={"segment_count": len(segments)},
+            metadata={
+                "segment_count": len(segments),
+                "reply_mode": reply_mode.value,
+                "freshness_state": freshness_state.value,
+                "segment_strategy": policy.segment_strategy,
+            },
         )
 
     async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
@@ -183,9 +329,22 @@ class ReplyEngine:
         """
         if not raw_text: return
 
-        artifact = self._build_visible_reply_artifact(raw_text)
+        reply_mode = self._resolve_reply_mode(event)
+        freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
+        artifact = self._build_visible_reply_artifact(
+            raw_text,
+            reply_mode=reply_mode,
+            freshness_state=freshness_state,
+            stale_reason=stale_reason,
+        )
         if artifact.blocked:
             logger.debug(f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} reply blocked: {artifact.blocked_reason}")
+            return
+        if freshness_state == FreshnessState.EXPIRED:
+            logger.info(
+                f"[ReplyEngine] skipped stale reply for {chat_id}: {stale_reason} | "
+                f"preview={preview_text(artifact.visible_text, 80)!r}"
+            )
             return
         clean_text = artifact.persistable_text
         logger.debug(
@@ -237,6 +396,13 @@ class ReplyEngine:
         emit_legacy_reply_runtime_extras(event, artifact=artifact, is_self_reply=True)
         
         for i, seg in enumerate(segments):
+            freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
+            if freshness_state == FreshnessState.EXPIRED:
+                logger.info(
+                    f"[ReplyEngine] stopped stale segmented reply for {chat_id}: {stale_reason} | "
+                    f"segment_index={i}"
+                )
+                break
             chain = MessageChain()
             
             if i == 0 and at_targets:
@@ -253,6 +419,7 @@ class ReplyEngine:
             context = getattr(self.state_engine.gateway, 'context', None)
             if context:
                 await context.send_message(event.unified_msg_origin, chain)
+                artifact.sent = True
                 if not event.get_extra("astrmai_reply_sent", False):
                     emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
             else:
@@ -266,6 +433,9 @@ class ReplyEngine:
         # =====================================================================
         # 🟢 步骤 2 滞后：用户已经看到回复了，现在后台慢慢算情绪和好感度
         # =====================================================================
+        if not artifact.sent:
+            return
+
         tag = "neutral"
         force_meme_flag = False
         

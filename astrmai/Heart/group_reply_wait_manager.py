@@ -14,6 +14,9 @@ class GroupReplyWaitState:
     target_name: str = ""
     reason: str = ""
     source_user_id: str = ""
+    thread_signature: str = ""
+    reply_mode: str = ""
+    root_event_identity: str = ""
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
     remaining_messages: int = 5
@@ -56,6 +59,18 @@ class GroupReplyWaitManager:
 
         self._timeout_tasks[chat_id] = loop.create_task(_expire_later())
 
+    @staticmethod
+    def _looks_like_thread_resume(event: AstrMessageEvent) -> bool:
+        message_obj = getattr(event, "message_obj", None)
+        message_chain = getattr(message_obj, "message", None)
+        if message_chain:
+            for component in message_chain:
+                component_name = type(component).__name__
+                if component_name in {"Reply", "At"}:
+                    return True
+        raw_text = str(getattr(event, "message_str", "") or "").strip()
+        return raw_text.startswith("@")
+
     def register_from_reply_event(self, event: AstrMessageEvent) -> bool:
         if not event.get_group_id():
             return False
@@ -84,6 +99,9 @@ class GroupReplyWaitManager:
             target_name=target_name,
             reason=reason,
             source_user_id=str(event.get_sender_id() or ""),
+            thread_signature=str(event.get_extra("astrmai_thread_signature", "") or ""),
+            reply_mode=str(event.get_extra("astrmai_reply_mode", "") or ""),
+            root_event_identity=str(event.get_extra("astrmai_focus_thread_root_reason", "") or ""),
             expires_at=time.time() + self.timeout_sec,
             remaining_messages=self.message_budget,
         )
@@ -111,6 +129,18 @@ class GroupReplyWaitManager:
 
         sender_id = str(event.get_sender_id() or "")
         if sender_id and sender_id == state.target_user_id:
+            if state.thread_signature and not self._looks_like_thread_resume(event):
+                state.remaining_messages -= 1
+                if state.remaining_messages <= 0:
+                    self._states.pop(chat_id, None)
+                    self._cancel_timeout_task(chat_id)
+                    logger.info(f"[GroupWait] wait expired after message budget for chat={chat_id}")
+                    return "EXPIRED"
+                logger.info(
+                    f"[GroupWait] observed target activity but kept waiting for same thread in chat={chat_id}, "
+                    f"target={state.target_name or state.target_user_id}"
+                )
+                return "OBSERVED"
             self._states.pop(chat_id, None)
             self._cancel_timeout_task(chat_id)
             target_label = state.target_name or state.target_user_id
@@ -118,6 +148,10 @@ class GroupReplyWaitManager:
             event.set_extra("astrmai_group_wait_resume", True)
             event.set_extra("astrmai_group_wait_target_id", state.target_user_id)
             event.set_extra("astrmai_group_wait_target_name", state.target_name)
+            if state.thread_signature:
+                event.set_extra("astrmai_thread_signature", state.thread_signature)
+            if state.reply_mode:
+                event.set_extra("astrmai_reply_mode", state.reply_mode)
             event.set_extra("astrmai_wait_resume_thought", f"{target_label}接上了你刚才的话题，立刻自然地继续回应。")
             logger.info(f"[GroupWait] target matched and resumed main flow for chat={chat_id}, target={target_label}")
             return "RESUME"
@@ -150,6 +184,8 @@ class GroupReplyWaitManager:
             "target_user_id": state.target_user_id,
             "target_name": state.target_name,
             "reason": state.reason,
+            "thread_signature": state.thread_signature,
+            "reply_mode": state.reply_mode,
             "remaining_messages": state.remaining_messages,
             "remaining_seconds": max(0.0, state.expires_at - time.time()),
         }

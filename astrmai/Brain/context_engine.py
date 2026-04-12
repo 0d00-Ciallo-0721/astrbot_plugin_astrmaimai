@@ -150,6 +150,7 @@ class ContextEngine:
             style_block = f"对话风格：\n{style_guide}\n"
 
         state_block = self._build_state_block(state)
+        behavior_rule_block = self._build_behavior_rule_block(prompt_envelope)
             
         slang_block = ""
         if slang_patterns and not is_fast_mode and not near_context_priority:
@@ -353,6 +354,7 @@ class ContextEngine:
             block
             for block in [
                 state_block.strip() if state_block else "",
+                behavior_rule_block.strip() if behavior_rule_block else "",
                 private_chat_block.strip() if private_chat_block else "",
                 inner_voice_block.strip() if inner_voice_block else "",
                 expression_block.strip() if expression_block else "",
@@ -400,6 +402,23 @@ class ContextEngine:
             prompt = prompt.replace(f"[picid:{picid}]", resolved_text)
 
         return prompt.strip()
+
+    def _build_behavior_rule_block(self, prompt_envelope: Optional[PromptEnvelope]) -> str:
+        if not isinstance(prompt_envelope, PromptEnvelope):
+            return ""
+        mode = prompt_envelope.reply_mode
+        rules = ["优先接住最近一句，不要突然另起话题。"]
+        if mode == mode.EMOTIONAL_SUPPORT:
+            rules.append("先安抚，再追问；语气保持轻柔。")
+        elif mode == mode.PLAYFUL_INTERACTION:
+            rules.append("被逗时可以轻轻接梗，但不要每句都上戏。")
+        elif mode == mode.IMAGE_REACTION:
+            rules.append("先短促回应画面感，再决定要不要补一句。")
+        elif mode == mode.DIRECT_QUESTION:
+            rules.append("优先正面回答问题，不绕远。")
+        if prompt_envelope.freshness_state == prompt_envelope.freshness_state.STALE_BUT_SALVAGEABLE:
+            rules.append("如果这句话已经偏晚，就轻轻接回当前，不要硬接旧梗。")
+        return "行为规则：\n" + "\n".join(f"- {rule}" for rule in rules)
 
     def _build_state_block(self, state: Optional[ChatState]) -> str:
         if not state:

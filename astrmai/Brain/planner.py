@@ -10,7 +10,7 @@ from ..infra.legacy_compat import (
     emit_legacy_prompt_envelope_extras,
     read_legacy_focus_thread_context,
 )
-from ..infra.runtime_contracts import FocusThreadContext, PromptEnvelope
+from ..infra.runtime_contracts import FocusThreadContext, FreshnessState, PromptEnvelope, ReplyMode
 from ..infra.trace_runtime import preview_text
 from .context_engine import ContextEngine
 from .executor import ConcurrentExecutor
@@ -164,7 +164,25 @@ class Planner:
             focus_reason=focus_context.focus_reason,
             focus_thread_reason=focus_context.root_reason or focus_context.focus_reason,
             near_context_priority=near_context_priority,
+            reply_mode=focus_context.reply_mode,
+            social_state=focus_context.social_state,
+            freshness_state=focus_context.freshness_budget.state or FreshnessState.FRESH,
+            thread_signature=focus_context.thread_signature,
+            guidance_lines=self._build_guidance_lines(focus_context.reply_mode),
         )
+
+    @staticmethod
+    def _build_guidance_lines(reply_mode: ReplyMode) -> List[str]:
+        guidance_map = {
+            ReplyMode.PLAYFUL_INTERACTION: ["先接住互动，再轻轻打趣，不要突然讲大道理。"],
+            ReplyMode.EMOTIONAL_SUPPORT: ["先安抚情绪，再决定是否追问。", "语气保持温柔，不要抢着转移话题。"],
+            ReplyMode.DIRECT_QUESTION: ["优先正面回答当前问题，不要绕远。"],
+            ReplyMode.CASUAL_FOLLOWUP: ["顺着刚才的话自然接下去，不另起话题。"],
+            ReplyMode.IMAGE_REACTION: ["先短促回应看到的画面感，不要铺陈过长。"],
+            ReplyMode.LATE_RECONNECT: ["承认自己是接回当前时刻，保持简短。"],
+            ReplyMode.AMBIENT_IGNORE: ["若没有明确需要，不要强行插话。"],
+        }
+        return guidance_map.get(reply_mode, ["顺着当前对话自然回应。"])
 
     async def _get_recent_dialogue_transcript(self, chat_id: str) -> str:
         lane_manager = getattr(self.gateway, "lane_manager", None)

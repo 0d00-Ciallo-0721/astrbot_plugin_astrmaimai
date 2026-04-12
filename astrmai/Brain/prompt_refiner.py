@@ -5,7 +5,7 @@ import re
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from ..infra.legacy_compat import read_legacy_prompt_envelope
-from ..infra.runtime_contracts import PromptEnvelope
+from ..infra.runtime_contracts import PromptEnvelope, ReplyMode
 
 
 class PromptRefiner:
@@ -144,6 +144,8 @@ class PromptRefiner:
             focus_reason = prompt_envelope.focus_reason.strip()
             focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
             near_context_priority = bool(prompt_envelope.near_context_priority)
+            reply_mode = prompt_envelope.reply_mode
+            guidance_lines = list(prompt_envelope.guidance_lines or [])
         else:
             prompt_envelope = read_legacy_prompt_envelope(event, prompt=prompt)
             recent_transcript = prompt_envelope.recent_transcript.strip()
@@ -153,6 +155,8 @@ class PromptRefiner:
             focus_reason = prompt_envelope.focus_reason.strip()
             focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
             near_context_priority = bool(prompt_envelope.near_context_priority)
+            reply_mode = prompt_envelope.reply_mode
+            guidance_lines = list(prompt_envelope.guidance_lines or [])
         use_lane_history = bool(event.get_extra("astrmai_use_lane_history", False))
         is_fast_mode = "CORE_ONLY" in retrieve_keys
 
@@ -202,6 +206,14 @@ class PromptRefiner:
 
         visual_focus_block = await self._resolve_visual_memory(focus_block)
         prompt_lines = []
+        if guidance_lines:
+            prompt_lines.append("本轮回应方式：\n" + "\n".join(f"- {line}" for line in guidance_lines if line))
+        if not is_fast_mode and reply_mode == ReplyMode.EMOTIONAL_SUPPORT:
+            prompt_lines.append("先安抚情绪，再自然往下接。")
+        elif not is_fast_mode and reply_mode == ReplyMode.IMAGE_REACTION:
+            prompt_lines.append("先短促接住画面反应，不要说太满。")
+        elif not is_fast_mode and reply_mode == ReplyMode.PLAYFUL_INTERACTION:
+            prompt_lines.append("保持轻松俏皮，像当场接梗一样回应。")
         if visual_focus_block:
             prompt_lines.append(f"请优先接住这条对话线索并回答：\n{visual_focus_block}")
         if background_window_text:

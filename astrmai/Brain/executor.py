@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - 测试桩环境降级
 import copy
 from ..infra.gateway import GlobalModelGateway
 from ..infra.lane_manager import LaneKey
-from ..infra.runtime_contracts import FocusThreadContext, PromptEnvelope, VisionBundle
+from ..infra.runtime_contracts import FocusThreadContext, FreshnessState, PromptEnvelope, VisionBundle
 from .reply_engine import ReplyEngine 
 
 class ConcurrentExecutor:
@@ -74,6 +74,29 @@ class ConcurrentExecutor:
             return sanitized_event
         except Exception:
             return event
+
+    async def _evaluate_execution_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
+        if not self.runtime_coordinator:
+            return FreshnessState.FRESH, ""
+        focus_context = event.get_extra("astrmai_focus_thread_context", None)
+        prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
+        focus_timestamp = float(event.get_extra("astrmai_timestamp", getattr(event, "timestamp", 0.0)) or 0.0)
+        thread_signature = ""
+        if isinstance(focus_context, FocusThreadContext):
+            focus_timestamp = float(focus_context.freshness_budget.created_at or focus_timestamp)
+            thread_signature = str(focus_context.thread_signature or "")
+        elif isinstance(prompt_envelope, PromptEnvelope):
+            thread_signature = str(prompt_envelope.thread_signature or "")
+        max_age_seconds = float(getattr(getattr(self.config, "reply", None), "stale_reply_max_age_sec", 0.0) or 0.0)
+        if max_age_seconds <= 0:
+            api_timeout = float(getattr(getattr(self.config, "infra", None), "api_timeout", 15.0) or 15.0)
+            max_age_seconds = max(30.0, min(90.0, api_timeout * 2.5))
+        return await self.runtime_coordinator.evaluate_reply_freshness(
+            chat_id,
+            focus_timestamp,
+            max_age_seconds=max_age_seconds,
+            thread_signature=thread_signature,
+        )
         
         
     async def execute(self, event: AstrMessageEvent, prompt: str, system_prompt: str, tools: List[Any] = None, direct_vision_urls: List[str] = None) -> Optional[str]:
@@ -123,6 +146,10 @@ class ConcurrentExecutor:
                 
                 try:
                     event._is_final_reply_phase = True 
+                    freshness_state, freshness_reason = await self._evaluate_execution_freshness(event, chat_id)
+                    if freshness_state == FreshnessState.EXPIRED:
+                        logger.info(f"[{chat_id}] 跳过过期主链回复计算: {freshness_reason}")
+                        return None
                     
                     # ==========================================
                     # 🟢 复刻 VisualCortex 成功逻辑的同步降维转述
@@ -224,6 +251,10 @@ class ConcurrentExecutor:
                         logger.debug(f"[{chat_id}] ⚡ 纯文本模式运行...")
                         last_error = ""
                         for provider_id in models:
+                            freshness_state, freshness_reason = await self._evaluate_execution_freshness(event, chat_id)
+                            if freshness_state == FreshnessState.EXPIRED:
+                                logger.info(f"[{chat_id}] 中止过期模型计算: {freshness_reason}")
+                                return None
                             try:
                                 result = await self.gateway.chat_in_lane_result(
                                     lane_key=dialog_lane_key,
@@ -265,6 +296,10 @@ class ConcurrentExecutor:
                         tool_set = ToolSet(tools)
                         last_error = "" 
                         for provider_id in models:
+                            freshness_state, freshness_reason = await self._evaluate_execution_freshness(event, chat_id)
+                            if freshness_state == FreshnessState.EXPIRED:
+                                logger.info(f"[{chat_id}] 中止过期 Agent 计算: {freshness_reason}")
+                                return None
                             try:
                                 result = await self.gateway.tool_chat_in_lane_result(
                                     lane_key=dialog_lane_key,

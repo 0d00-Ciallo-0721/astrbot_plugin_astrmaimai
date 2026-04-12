@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Optional
 
-from .runtime_contracts import FocusThreadContext, PromptEnvelope, VisibleReplyArtifact
+from .runtime_contracts import (
+    FocusThreadContext,
+    FreshnessState,
+    PromptEnvelope,
+    ReplyFreshnessBudget,
+    ReplyMode,
+    VisibleReplyArtifact,
+)
 
 
 def emit_legacy_focus_thread_extras(
@@ -18,6 +25,9 @@ def emit_legacy_focus_thread_extras(
     event.set_extra("astrmai_focus_message_text", focus_context.focus_message_text)
     event.set_extra("astrmai_focus_sender_id", focus_context.focus_sender_id)
     event.set_extra("astrmai_focus_sender_name", focus_context.focus_sender_name)
+    event.set_extra("astrmai_reply_mode", focus_context.reply_mode.value)
+    event.set_extra("astrmai_social_state", focus_context.social_state)
+    event.set_extra("astrmai_thread_signature", focus_context.thread_signature)
     event.set_extra("astrmai_background_events", list(focus_context.ambient_events or []))
     event.set_extra("astrmai_focus_thread_root_event", focus_context.root_event)
     event.set_extra("astrmai_focus_thread_root_reason", focus_context.root_reason)
@@ -48,6 +58,10 @@ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -
         focus_message_text=str(event.get_extra("astrmai_focus_message_text", "") or ""),
         focus_sender_id=str(event.get_extra("astrmai_focus_sender_id", "") or ""),
         focus_sender_name=str(event.get_extra("astrmai_focus_sender_name", "") or ""),
+        reply_mode=ReplyMode(str(event.get_extra("astrmai_reply_mode", ReplyMode.CASUAL_FOLLOWUP.value) or ReplyMode.CASUAL_FOLLOWUP.value)),
+        social_state=str(event.get_extra("astrmai_social_state", "") or ""),
+        thread_signature=str(event.get_extra("astrmai_thread_signature", "") or ""),
+        freshness_budget=ReplyFreshnessBudget(),
     )
 
 
@@ -68,6 +82,10 @@ def emit_legacy_prompt_envelope_extras(
     event.set_extra("astrmai_near_context_priority", bool(prompt_envelope.near_context_priority))
     event.set_extra("astrmai_focus_thread_reason", prompt_envelope.focus_thread_reason)
     event.set_extra("astrmai_use_lane_history", bool(use_lane_history))
+    event.set_extra("astrmai_reply_mode", prompt_envelope.reply_mode.value)
+    event.set_extra("astrmai_social_state", prompt_envelope.social_state)
+    event.set_extra("astrmai_freshness_state", prompt_envelope.freshness_state.value)
+    event.set_extra("astrmai_thread_signature", prompt_envelope.thread_signature)
 
 
 def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelope:
@@ -89,6 +107,12 @@ def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelo
             or ""
         ).strip(),
         near_context_priority=bool(event.get_extra("astrmai_near_context_priority", False)),
+        reply_mode=ReplyMode(str(event.get_extra("astrmai_reply_mode", ReplyMode.CASUAL_FOLLOWUP.value) or ReplyMode.CASUAL_FOLLOWUP.value)),
+        social_state=str(event.get_extra("astrmai_social_state", "") or "").strip(),
+        freshness_state=FreshnessState(
+            str(event.get_extra("astrmai_freshness_state", FreshnessState.FRESH.value) or FreshnessState.FRESH.value)
+        ),
+        thread_signature=str(event.get_extra("astrmai_thread_signature", "") or "").strip(),
     )
 
 
