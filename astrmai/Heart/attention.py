@@ -629,6 +629,22 @@ class AttentionGate:
         except asyncio.CancelledError:
             pass       
 
+    async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
+        event_timestamp = float(event.get_extra("astrmai_timestamp", 0.0) or 0.0)
+        if event_timestamp <= 0:
+            event_timestamp = time.time()
+            event.set_extra("astrmai_timestamp", event_timestamp)
+
+        if self.runtime_coordinator:
+            await self.runtime_coordinator.mark_activity(
+                chat_id,
+                event_timestamp,
+                sender_id=str(sender_id),
+                sender_name=str(event.get_sender_name() or sender_id),
+                preview=preview_text(str(event.message_str or ""), 80),
+            )
+        return event_timestamp
+
     async def process_event(self, event: AstrMessageEvent) -> str:
         """
         [修改] 注意力判断入口，返回枚举态字符串 (ENGAGED, BUFFERED, IGNORE) 
@@ -677,6 +693,7 @@ class AttentionGate:
             )
             components = event.message_obj.message if (hasattr(event, "message_obj") and event.message_obj) else event.message_str
             await self._normalize_content_to_str(components, event=event)
+            await self._record_event_activity(chat_id, event, sender_id)
             if self.sys2_process:
                 self._fire_background_task(self.sys2_process(event, [event]))
             return "ENGAGED"
@@ -707,6 +724,7 @@ class AttentionGate:
             # 🚀 [新增] 快速提取视觉特征，确保穿透模式下主脑也能看见图
             components = event.message_obj.message if (hasattr(event, "message_obj") and event.message_obj) else event.message_str
             await self._normalize_content_to_str(components, event=event)
+            await self._record_event_activity(chat_id, event, sender_id)
 
             if self.sys2_process:
                 self._fire_background_task(self.sys2_process(event, [event]))
@@ -782,16 +800,7 @@ class AttentionGate:
                     session.repeat_count = 0
 
             session.accumulation_pool.append(event)
-            event_timestamp = time.time()
-            event.set_extra("astrmai_timestamp", event_timestamp)
-            if self.runtime_coordinator:
-                await self.runtime_coordinator.mark_activity(
-                    chat_id,
-                    event_timestamp,
-                    sender_id=str(sender_id),
-                    sender_name=str(event.get_sender_name() or sender_id),
-                    preview=preview_text(str(event.message_str or ""), 80),
-                )
+            await self._record_event_activity(chat_id, event, sender_id)
 
             if session.is_evaluating:
                 logger.info(f"[{chat_id}] ⏳ [窗口持续] 写入消息 -> 累积池 (当前积压: {len(session.accumulation_pool)}条)")

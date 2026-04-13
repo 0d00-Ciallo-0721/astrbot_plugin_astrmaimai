@@ -53,6 +53,9 @@ class _FakeEvent:
     def get_sender_id(self):
         return "user-1"
 
+    def get_sender_name(self):
+        return "Alice"
+
     def get_self_id(self):
         return "bot-1"
 
@@ -69,6 +72,24 @@ class _FakePrivateChatManager:
 
     async def signal_new_message(self, user_id, message_str):
         self.calls.append((user_id, message_str))
+
+
+class _FakeRuntimeCoordinator:
+    def __init__(self):
+        self.calls = []
+
+    async def mark_activity(self, chat_id, timestamp, sender_id, sender_name, preview, thread_signature=None):
+        self.calls.append((chat_id, timestamp, sender_id, sender_name, preview, thread_signature))
+
+
+class _FakeGroupWakeupEvent(_FakeEvent):
+    def __init__(self):
+        super().__init__()
+        self.message_str = "抱抱"
+        self.unified_msg_origin = "default:GroupMessage:group-1"
+
+    def get_group_id(self):
+        return "group-1"
 
 
 class AttentionPrivateChatTests(unittest.TestCase):
@@ -126,6 +147,50 @@ class AttentionPrivateChatTests(unittest.TestCase):
 
         self.assertEqual(result, "IGNORE")
         self.assertEqual(manager.calls, [("user-1", "hello")])
+
+    def test_fast_wakeup_path_marks_runtime_activity(self):
+        config = SimpleNamespace(
+            attention=SimpleNamespace(max_message_length=100),
+            system1=SimpleNamespace(wakeup_words=[]),
+        )
+        runtime_coordinator = _FakeRuntimeCoordinator()
+        sys2_calls = []
+
+        async def _sys2_callback(event, events):
+            sys2_calls.append((event, events))
+
+        gate = self.attention_mod.AttentionGate(
+            state_engine=SimpleNamespace(config=config),
+            judge=SimpleNamespace(),
+            sensors=SimpleNamespace(
+                is_wakeup_signal=lambda event, self_id: True,
+                is_command=lambda msg_str: asyncio.sleep(0, result=False),
+                should_process_message=lambda event: asyncio.sleep(0, result=False),
+            ),
+            system2_callback=_sys2_callback,
+            runtime_coordinator=runtime_coordinator,
+        )
+        self.attention_mod.AttentionGate._global_msg_cache = []
+
+        async def _run():
+            event = _FakeGroupWakeupEvent()
+            result = await gate.process_event(event)
+            await asyncio.sleep(0)
+            return result, event
+
+        result, event = asyncio.run(_run())
+
+        self.assertEqual(result, "ENGAGED")
+        self.assertGreater(event.get_extra("astrmai_timestamp", 0.0), 0.0)
+        self.assertEqual(len(runtime_coordinator.calls), 1)
+        chat_id, timestamp, sender_id, sender_name, preview, thread_signature = runtime_coordinator.calls[0]
+        self.assertEqual(chat_id, "default:GroupMessage:group-1")
+        self.assertEqual(sender_id, "user-1")
+        self.assertEqual(sender_name, "Alice")
+        self.assertEqual(preview, "抱抱")
+        self.assertIsNone(thread_signature)
+        self.assertEqual(timestamp, event.get_extra("astrmai_timestamp"))
+        self.assertEqual(len(sys2_calls), 1)
 
 
 if __name__ == "__main__":
