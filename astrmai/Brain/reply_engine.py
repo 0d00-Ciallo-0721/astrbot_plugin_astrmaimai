@@ -84,6 +84,27 @@ class ReplyEngine:
         except ValueError:
             return ReplyMode.CASUAL_FOLLOWUP
 
+    def _is_direct_engagement_event(self, event: AstrMessageEvent) -> bool:
+        return bool(
+            event.get_extra("astrmai_group_direct_wakeup", False)
+            or event.get_extra("astrmai_force_engage", False)
+            or event.get_extra("is_private_chat", False)
+        )
+
+    async def _allow_direct_reply_timeout(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        event_ts: float,
+    ) -> bool:
+        if not self._is_direct_engagement_event(event):
+            return False
+        if not self.runtime_coordinator or not hasattr(self.runtime_coordinator, "get_latest_activity"):
+            return False
+
+        latest_ts, _, _, _ = await self.runtime_coordinator.get_latest_activity(chat_id)
+        return not latest_ts or latest_ts <= event_ts
+
     async def _check_reply_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
         event_ts = float(event.get_extra("astrmai_timestamp", 0.0) or 0.0)
         if event_ts <= 0:
@@ -92,6 +113,12 @@ class ReplyEngine:
         reply_age = time.time() - event_ts
         max_age = self._reply_max_age_seconds()
         if reply_age > max_age:
+            if await self._allow_direct_reply_timeout(event, chat_id, event_ts):
+                logger.info(
+                    f"[ReplyEngine] allowing overdue direct reply for {chat_id}: "
+                    f"{reply_age:.1f}s>{max_age:.1f}s without newer activity"
+                )
+                return FreshnessState.FRESH, ""
             return FreshnessState.EXPIRED, f"reply_age_exceeded:{reply_age:.1f}s>{max_age:.1f}s"
 
         if not self.runtime_coordinator:
