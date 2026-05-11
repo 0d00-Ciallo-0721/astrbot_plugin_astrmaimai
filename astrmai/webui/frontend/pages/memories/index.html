@@ -1,0 +1,365 @@
+<div id="page-memory" x-show="currentPage === 'memories'" x-data="memoryPage()" x-cloak class="pb-10 flex flex-col h-full">
+    
+    <!-- Header -->
+    <div class="flex justify-between items-end mb-8">
+        <div>
+            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">四维记忆网络 (Memories)</h2>
+            <p class="text-slate-400">管理 AI 的记忆碎片、反思日志、实体图谱与黑话字典</p>
+        </div>
+        
+        <!-- Navigation Tabs -->
+        <div class="glass-panel p-1.5 flex gap-1 rounded-lg">
+            <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
+                    :class="currentTab === 'events' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
+                    @click="setTab('events')">记忆碎片 (Events)</button>
+            <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
+                    :class="currentTab === 'reflections' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
+                    @click="setTab('reflections')">每日反思 (Reflections)</button>
+            <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
+                    :class="currentTab === 'nodes' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
+                    @click="setTab('nodes')">实体图谱 (Nodes)</button>
+            <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
+                    :class="currentTab === 'jargon' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
+                    @click="setTab('jargon')">黑话字典 (Jargon)</button>
+        </div>
+    </div>
+
+    <!-- Loading State -->
+    <div x-show="loading" class="flex flex-col items-center justify-center py-20 text-slate-400">
+        <i data-lucide="loader-2" class="w-8 h-8 animate-spin mb-4 text-brand-500"></i>
+        <p>正在读取神经网络层...</p>
+    </div>
+
+    <div x-show="!loading" class="flex-1">
+        
+        <!-- EVENTS TAB -->
+        <template x-if="currentTab === 'events'">
+            <div class="flex flex-col gap-6">
+                <div class="flex justify-end">
+                    <button class="glass-btn px-4 py-2 bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 font-medium text-sm flex items-center gap-2" @click="openEventModal()">
+                        <i data-lucide="plus" class="w-4 h-4"></i> 新增核心记忆
+                    </button>
+                </div>
+                
+                <div class="glass-panel overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left">
+                            <thead>
+                                <tr class="border-b border-white/10 text-slate-400 text-sm bg-slate-800/50">
+                                    <th class="px-6 py-3 whitespace-nowrap">时间 / ID</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">分类 / 来源</th>
+                                    <th class="px-6 py-3">记忆叙事 (Narrative)</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">重要度</th>
+                                    <th class="px-6 py-3 w-20 whitespace-nowrap">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-sm text-slate-300">
+                                <template x-for="ev in events" :key="ev.id">
+                                    <tr class="border-b border-white/5 even:bg-white/[0.02] hover:bg-slate-800/40 group">
+                                        <td class="px-6 py-4 font-mono text-xs whitespace-nowrap">
+                                        <div x-text="ev.date" class="text-brand-300 mb-1"></div>
+                                        <div x-text="'#'+ev.id" class="text-slate-500"></div>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <span class="px-2 py-1 rounded text-xs font-bold tracking-wider bg-slate-800 text-slate-300 border border-slate-600 block w-max mb-1" x-text="ev.memory_kind"></span>
+                                        <span class="text-xs text-slate-500" x-text="'Source: ' + ev.source_layer"></span>
+                                    </td>
+                                    <td class="px-6 py-4 max-w-md">
+                                        <p x-text="ev.narrative"></p>
+                                        <div class="flex gap-1 mt-2 flex-wrap">
+                                            <template x-for="tag in (ev.tags || '').split(',').filter(Boolean)">
+                                                <span class="px-1.5 py-0.5 rounded text-[10px] bg-brand-500/20 text-brand-300 border border-brand-500/30" x-text="tag"></span>
+                                            </template>
+                                        </div>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <div class="flex items-center gap-2">
+                                            <div class="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                                <div class="h-full bg-gradient-to-r from-amber-500 to-rose-500" :style="`width: ${ev.importance * 100}%`"></div>
+                                            </div>
+                                            <span class="text-xs text-slate-400" x-text="ev.importance.toFixed(2)"></span>
+                                        </div>
+                                    </td>
+                                    <td class="px-6 py-4 whitespace-nowrap">
+                                        <div class="opacity-0 group-hover:opacity-100 transition-opacity">
+                                            <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-rose-500/20 text-slate-500 hover:text-rose-400" @click="delEvent(ev.id)">
+                                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </template>
+                            <template x-if="!events.length">
+                                <tr>
+                                    <td colspan="5" class="p-8">
+                                        <div class="empty-state border-none bg-transparent p-4">
+                                            <i data-lucide="inbox"></i>
+                                            <p>暂无核心记忆碎片</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </div>
+            </div>
+        </template>
+
+        <!-- REFLECTIONS TAB -->
+        <template x-if="currentTab === 'reflections'">
+            <div class="flex flex-col gap-6">
+                <!-- Month Navigator -->
+                <div class="glass-panel p-4 flex justify-between items-center">
+                    <button class="w-10 h-10 flex items-center justify-center rounded hover:bg-white/10 text-slate-300" @click="prevMonth()"><i data-lucide="chevron-left" class="w-5 h-5"></i></button>
+                    <h3 class="text-xl font-bold text-slate-100 tracking-widest" x-text="currentMonthStr"></h3>
+                    <button class="w-10 h-10 flex items-center justify-center rounded hover:bg-white/10 text-slate-300" @click="nextMonth()"><i data-lucide="chevron-right" class="w-5 h-5"></i></button>
+                </div>
+                
+                <!-- Calendar Grid -->
+                <div class="grid grid-cols-7 gap-4">
+                    <template x-for="dayName in ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']">
+                        <div class="text-center text-xs font-bold text-slate-500 uppercase tracking-widest" x-text="dayName"></div>
+                    </template>
+                    
+                    <template x-for="(dayDate, index) in calendarDays" :key="index">
+                        <div class="glass-panel min-h-[120px] p-3 flex flex-col relative group" 
+                             :class="!dayDate ? 'opacity-0 pointer-events-none' : (reflectionsMap[dayDate] ? 'border-brand-500/30 bg-brand-500/5' : 'border-white/5')">
+                            
+                            <template x-if="dayDate">
+                                <div class="flex-1 flex flex-col cursor-pointer" @click="openReflection(dayDate)">
+                                    <div class="text-sm font-mono text-slate-400 mb-2" x-text="dayDate.split('-')[2]"></div>
+                                    <template x-if="reflectionsMap[dayDate]">
+                                        <div class="text-xs text-brand-300 line-clamp-3 leading-relaxed" x-text="reflectionsMap[dayDate].summary"></div>
+                                    </template>
+                                    <template x-if="!reflectionsMap[dayDate]">
+                                        <div class="text-xs text-slate-600 italic">无日志</div>
+                                    </template>
+                                </div>
+                            </template>
+
+                            <!-- Inline Editor Dropdown -->
+                            <div x-show="activeReflectionDate === dayDate" class="absolute top-full left-0 z-50 w-80 mt-2 glass-panel p-4 shadow-2xl border border-brand-500/50" @click.stop>
+                                <h4 class="text-sm font-bold text-white mb-2 flex justify-between items-center">
+                                    <span x-text="dayDate"></span>
+                                    <template x-if="reflectionsMap[dayDate]">
+                                        <button class="text-rose-400 hover:text-rose-300" @click="delReflection(dayDate)"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                                    </template>
+                                </h4>
+                                <textarea :id="`ref-input-${dayDate}`" class="w-full h-32 bg-slate-900 border border-white/10 rounded p-3 text-sm text-slate-300 resize-none focus:outline-none focus:border-brand-500 mb-3" 
+                                          x-text="reflectionsMap[dayDate] ? reflectionsMap[dayDate].summary : ''" placeholder="撰写或修改今日反思..."></textarea>
+                                <div class="flex justify-end gap-2">
+                                    <button class="px-3 py-1.5 rounded text-xs text-slate-400 hover:bg-white/10" @click="activeReflectionDate = null">取消</button>
+                                    <button class="px-3 py-1.5 rounded text-xs bg-brand-500 text-white hover:bg-brand-600" @click="saveReflection(dayDate)">保存</button>
+                                </div>
+                            </div>
+
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+
+        <!-- NODES TAB -->
+        <template x-if="currentTab === 'nodes'">
+            <div class="flex flex-col gap-6">
+                <div class="flex justify-end">
+                    <button class="glass-btn px-4 py-2 bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 font-medium text-sm flex items-center gap-2" @click="openNodeModal()">
+                        <i data-lucide="plus" class="w-4 h-4"></i> 新增实体节点
+                    </button>
+                </div>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                    <template x-for="node in nodes" :key="node.id">
+                        <div class="glass-panel p-5 relative group">
+                            <div class="absolute top-4 right-4 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button class="w-7 h-7 rounded bg-white/10 flex items-center justify-center hover:bg-blue-500/20 text-blue-300" @click="openNodeModal(node)">
+                                    <i data-lucide="edit-3" class="w-3.5 h-3.5"></i>
+                                </button>
+                                <button class="w-7 h-7 rounded bg-white/10 flex items-center justify-center hover:bg-rose-500/20 text-rose-400" @click="delNode(node.id)">
+                                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                </button>
+                            </div>
+                            <div class="flex items-center gap-3 mb-3">
+                                <div class="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center text-blue-400">
+                                    <i data-lucide="network" class="w-5 h-5"></i>
+                                </div>
+                                <div>
+                                    <h4 class="font-bold text-white text-lg leading-tight" x-text="node.name"></h4>
+                                    <span class="text-[10px] font-mono text-slate-500 uppercase tracking-wider" x-text="node.type"></span>
+                                </div>
+                            </div>
+                            <p class="text-sm text-slate-300 line-clamp-4 leading-relaxed" x-text="node.description"></p>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </template>
+
+        <!-- JARGON TAB -->
+        <template x-if="currentTab === 'jargon'">
+            <div class="flex flex-col gap-6">
+                <div class="flex justify-end">
+                    <button class="glass-btn px-4 py-2 bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 font-medium text-sm flex items-center gap-2" @click="openJargonModal()">
+                        <i data-lucide="plus" class="w-4 h-4"></i> 收录新黑话
+                    </button>
+                </div>
+                
+                <div class="glass-panel overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left">
+                            <thead>
+                                <tr class="border-b border-white/10 text-slate-400 text-sm bg-slate-800/50">
+                                    <th class="px-6 py-3 whitespace-nowrap">黑话词条</th>
+                                    <th class="px-6 py-3">释义 (Meaning)</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">群组范围</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">状态标记</th>
+                                    <th class="px-6 py-3 w-24 whitespace-nowrap">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-sm text-slate-300">
+                                <template x-for="j in jargons" :key="j.id">
+                                    <tr class="border-b border-white/5 even:bg-white/[0.02] hover:bg-slate-800/40 group">
+                                        <td class="px-6 py-4 font-bold text-purple-300 text-base whitespace-nowrap" x-text="j.content"></td>
+                                        <td class="px-6 py-4 max-w-sm"><p class="line-clamp-2" x-text="j.meaning"></p></td>
+                                        <td class="px-6 py-4 font-mono text-xs text-slate-500 whitespace-nowrap" x-text="j.group_id"></td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <div class="flex gap-2">
+                                                <span class="px-2 py-0.5 rounded text-[10px] border" :class="j.is_jargon ? 'bg-purple-500/20 border-purple-500/30 text-purple-300' : 'bg-slate-800 border-slate-600 text-slate-400'">JARGON</span>
+                                                <span class="px-2 py-0.5 rounded text-[10px] border" :class="j.is_complete ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300' : 'bg-amber-500/20 border-amber-500/30 text-amber-300'">COMPLETE</span>
+                                            </div>
+                                        </td>
+                                        <td class="px-6 py-4 whitespace-nowrap">
+                                            <div class="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                            <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-purple-500/20 text-slate-500 hover:text-purple-400" @click="openJargonModal(j)">
+                                                <i data-lucide="edit-2" class="w-4 h-4"></i>
+                                            </button>
+                                            <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-rose-500/20 text-slate-500 hover:text-rose-400" @click="delJargon(j.id)">
+                                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                                </template>
+                                <template x-if="!jargons.length">
+                                    <tr>
+                                        <td colspan="5" class="p-8">
+                                            <div class="empty-state border-none bg-transparent p-4">
+                                                <i data-lucide="book-x"></i>
+                                                <p>暂无收录的黑话</p>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </template>
+
+    </div>
+
+    <!-- MODALS -->
+
+    <!-- Event Modal -->
+    <div x-show="showEventModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
+        <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showEventModal = false">
+            <h3 class="text-xl font-bold text-slate-100 mb-6">新增核心记忆碎片</h3>
+            <div class="flex flex-col gap-4">
+                <div>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">记忆叙事 (Narrative)</label>
+                    <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-24 focus:border-brand-500 focus:outline-none" x-model="newEvent.narrative" placeholder="描述发生的客观事实..."></textarea>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">分类 (Kind)</label>
+                        <select class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.memory_kind">
+                            <option value="Preference">Preference (偏好)</option>
+                            <option value="Event">Event (事件)</option>
+                            <option value="Relationship">Relationship (关系)</option>
+                            <option value="Misc">Misc (杂项)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">重要度 (Importance 0-1)</label>
+                        <input type="number" step="0.1" min="0" max="1" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.importance">
+                    </div>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">标签 (Tags 逗号分隔)</label>
+                    <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.tags" placeholder="例如: preference, food">
+                </div>
+            </div>
+            <div class="flex justify-end gap-3 mt-8">
+                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showEventModal = false">取消</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-brand-500 hover:bg-brand-600 text-white" @click="saveEvent()">确 认</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Node Modal -->
+    <div x-show="showNodeModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
+        <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showNodeModal = false">
+            <h3 class="text-xl font-bold text-slate-100 mb-6" x-text="newNode.id ? '编辑实体节点' : '新增实体节点'"></h3>
+            <div class="flex flex-col gap-4">
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="col-span-2">
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">节点名称 (Name)</label>
+                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:outline-none" x-model="newNode.name">
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">类型 (Type)</label>
+                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:outline-none" x-model="newNode.type" placeholder="如 user">
+                    </div>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">节点描述 (Description)</label>
+                    <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-32 focus:border-blue-500 focus:outline-none" x-model="newNode.description"></textarea>
+                </div>
+            </div>
+            <div class="flex justify-end gap-3 mt-8">
+                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showNodeModal = false">取消</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-blue-500 hover:bg-blue-600 text-white" @click="saveNode()">保 存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Jargon Modal -->
+    <div x-show="showJargonModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
+        <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showJargonModal = false">
+            <h3 class="text-xl font-bold text-slate-100 mb-6" x-text="newJargon.id ? '编辑黑话释义' : '收录新黑话'"></h3>
+            <div class="flex flex-col gap-4">
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">黑话词条 (Content)</label>
+                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="newJargon.content" :disabled="!!newJargon.id" :class="newJargon.id ? 'opacity-50 cursor-not-allowed' : ''">
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">群组约束 (GroupID)</label>
+                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="newJargon.group_id" :disabled="!!newJargon.id" :class="newJargon.id ? 'opacity-50 cursor-not-allowed' : ''">
+                    </div>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">详细释义 (Meaning)</label>
+                    <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-24 focus:border-purple-500 focus:outline-none" x-model="newJargon.meaning"></textarea>
+                </div>
+                <div class="flex gap-6 mt-2">
+                    <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+                        <input type="checkbox" class="rounded border-white/10 bg-slate-900 text-purple-500 focus:ring-purple-500 focus:ring-offset-0" x-model="newJargon.is_jargon" :true-value="1" :false-value="0">
+                        标记为真正黑话
+                    </label>
+                    <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+                        <input type="checkbox" class="rounded border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0" x-model="newJargon.is_complete" :true-value="1" :false-value="0">
+                        释义完整度达标
+                    </label>
+                </div>
+            </div>
+            <div class="flex justify-end gap-3 mt-8">
+                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showJargonModal = false">取消</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-purple-500 hover:bg-purple-600 text-white" @click="saveJargon()">保 存</button>
+            </div>
+        </div>
+    </div>
+
+</div>

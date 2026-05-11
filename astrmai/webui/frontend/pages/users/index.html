@@ -1,0 +1,192 @@
+<div id="page-users" x-show="currentPage === 'users'" x-data="usersPage()" x-cloak class="pb-10 h-full flex flex-col overflow-hidden">
+    <!-- Header -->
+    <div class="flex justify-between items-end mb-8 flex-shrink-0">
+        <div>
+            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">社交画像枢纽 (Users)</h2>
+            <p class="text-slate-400">管理 AI 对人类用户的立体认知、情感羁绊与多维记忆切片</p>
+        </div>
+        <div class="lg:hidden" x-show="activeUser">
+            <button class="glass-btn px-4 py-2 bg-slate-800/50 text-slate-300 hover:bg-slate-800 hover:text-white flex items-center gap-2 font-medium transition-all rounded-lg"
+                    @click="closeUserDetail()">
+                <i data-lucide="arrow-left" class="w-4 h-4"></i> 返回列表
+            </button>
+        </div>
+    </div>
+
+    <!-- Loading State -->
+    <div x-show="loading && !users.length" class="flex flex-col items-center justify-center py-20 text-slate-400 flex-1">
+        <i data-lucide="loader-2" class="w-8 h-8 animate-spin mb-4 text-brand-500"></i>
+        <p>正在读取神经档案...</p>
+    </div>
+
+    <!-- DUAL PANE LAYOUT -->
+    <div x-show="!loading" class="flex-1 flex flex-col lg:flex-row gap-6 min-h-0 overflow-hidden">
+        
+        <!-- Left Sidebar: Users List -->
+        <div class="w-full lg:w-1/3 h-full overflow-y-auto pr-2" :class="activeUser ? 'hidden lg:block' : 'block'">
+            <div class="flex flex-col gap-4">
+                <template x-for="user in users" :key="user.user_id">
+                    <div class="glass-panel p-6 flex items-center gap-4 cursor-pointer hover:border-brand-500/50 transition-all group"
+                         :class="activeUser && activeUser.user_id === user.user_id ? 'border-brand-500/50 shadow-[0_0_15px_rgba(14,165,233,0.15)] bg-slate-800/80' : ''"
+                         @click="openUserDetail(user)">
+                        
+                        <!-- Avatar -->
+                        <div class="w-12 h-12 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-xl font-bold text-slate-200 flex-shrink-0 transition-colors group-hover:bg-slate-700/50">
+                            <span x-text="(user.nickname || user.user_id).charAt(0).toUpperCase()"></span>
+                        </div>
+                        
+                        <!-- Info -->
+                        <div class="flex-1 min-w-0">
+                            <div class="flex justify-between items-start mb-1">
+                                <h3 class="text-base font-bold text-white truncate" x-text="user.nickname || 'Unknown'"></h3>
+                                <span class="text-[10px] font-mono text-slate-500 flex-shrink-0 ml-2 mt-0.5" x-text="user.user_id"></span>
+                            </div>
+                            <p class="text-xs text-slate-400 mb-2 truncate" x-text="user.identity || '未定义身份'"></p>
+                            
+                            <!-- Bond Bar -->
+                            <div class="flex items-center gap-2">
+                                <div class="flex-1 bg-slate-900 rounded-full h-1 overflow-hidden border border-white/5">
+                                    <div class="h-full bg-gradient-to-r from-blue-500 to-rose-500 rounded-full" :style="`width: ${Math.min(100, Math.max(0, user.social_score * 100))}%`"></div>
+                                </div>
+                                <span class="text-xs font-bold text-slate-500 font-mono w-6 text-right" x-text="parseFloat(user.social_score).toFixed(1)"></span>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="!users.length">
+                    <div class="empty-state">
+                        <i data-lucide="users"></i>
+                        <p>目前尚未建立任何人类社交档案</p>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Right Content: User Details -->
+        <div class="w-full lg:w-2/3 h-full overflow-y-auto pr-2" :class="!activeUser ? 'hidden lg:flex lg:items-center lg:justify-center' : 'block'">
+            
+            <template x-if="!activeUser">
+                <div class="empty-state h-full justify-center border-dashed">
+                    <i data-lucide="user-search"></i>
+                    <p class="text-lg font-medium text-slate-400 mt-2 mb-1">请在左侧选择一个用户进行分析</p>
+                </div>
+            </template>
+
+            <template x-if="activeUser">
+                <div class="flex flex-col gap-6">
+                    <!-- Basic Info Panel -->
+                    <div class="glass-panel p-8">
+                        <div class="flex justify-between items-start mb-6">
+                            <div class="flex items-center gap-4">
+                                <div class="w-16 h-16 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-2xl font-bold text-slate-100">
+                                    <span x-text="(activeUser.nickname || activeUser.user_id).charAt(0).toUpperCase()"></span>
+                                </div>
+                                <div>
+                                    <h3 class="text-xl font-bold text-slate-100" x-text="activeUser.user_id"></h3>
+                                    <span class="text-xs font-mono text-brand-400">TARGET ACQUIRED</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="text-xs font-bold text-slate-400 uppercase block mb-1">系统称呼 (Nickname)</label>
+                                <input type="text" class="w-full bg-slate-900 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none transition-colors" x-model="activeUser.nickname">
+                            </div>
+                            <div>
+                                <label class="text-xs font-bold text-slate-400 uppercase block mb-1">称呼缘由 (Reason)</label>
+                                <input type="text" class="w-full bg-slate-900 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none transition-colors" x-model="activeUser.nickname_reason">
+                            </div>
+                            <div>
+                                <label class="text-xs font-bold text-slate-400 uppercase block mb-1">羁绊权重 (Social Score)</label>
+                                <input type="number" step="0.1" class="w-full bg-slate-900 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none transition-colors" x-model="activeUser.social_score">
+                            </div>
+                            <div>
+                                <label class="text-xs font-bold text-slate-400 uppercase block mb-1">底层身份 (Identity)</label>
+                                <input type="text" class="w-full bg-slate-900 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none transition-colors" x-model="activeUser.identity">
+                            </div>
+                            <div class="col-span-1 md:col-span-2">
+                                <label class="text-xs font-bold text-slate-400 uppercase block mb-1">全局标签 (Tags)</label>
+                                <input type="text" class="w-full bg-slate-900 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none transition-colors" x-model="activeUser.tags" placeholder="逗号分隔">
+                            </div>
+                            <div class="col-span-1 md:col-span-2">
+                                <label class="text-xs font-bold text-slate-400 uppercase block mb-1">画像分析概览 (Persona Analysis)</label>
+                                <textarea class="w-full bg-slate-900 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-500 focus:outline-none resize-none h-24 transition-colors" x-model="activeUser.persona_analysis"></textarea>
+                            </div>
+                        </div>
+
+                        <div class="mt-6 flex flex-col sm:flex-row gap-3">
+                            <button class="flex-1 py-2.5 rounded-lg bg-brand-500 hover:bg-brand-600 text-white font-bold text-sm shadow-lg transition-all" @click="saveBasicInfo()">保存基础画像</button>
+                            <button class="flex-1 py-2.5 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500 hover:text-white font-bold text-sm transition-all border border-rose-500/30" @click="deleteUser()">抹除该人类数据</button>
+                        </div>
+                    </div>
+
+                    <!-- Slices Lists -->
+                    <div class="flex flex-col gap-6">
+                        <template x-for="type in ['memory_points', 'identity_points', 'preference_points', 'relationship_points', 'speech_style_points']">
+                            <div class="glass-panel p-8 flex flex-col relative overflow-hidden group">
+                                <!-- BG accent -->
+                                <div class="absolute inset-0 opacity-0 group-hover:opacity-[0.03] transition-opacity pointer-events-none" :class="`bg-${getSliceConfig(type).color}-500`"></div>
+                                
+                                <div class="flex justify-between items-center mb-4 relative z-10">
+                                    <h4 class="text-lg font-bold flex items-center gap-2" :class="`text-${getSliceConfig(type).color}-400`">
+                                        <i :data-lucide="getSliceConfig(type).icon" class="w-5 h-5"></i>
+                                        <span x-text="getSliceConfig(type).title"></span>
+                                        <span class="text-xs font-mono bg-white/10 px-2 py-0.5 rounded-full text-white ml-2" x-text="activeUser[type] ? activeUser[type].length : 0"></span>
+                                    </h4>
+                                    <button class="w-8 h-8 rounded-lg bg-white/5 hover:bg-white/20 flex items-center justify-center text-white transition-colors border border-white/5" @click="openAddSlice(type)">
+                                        <i data-lucide="plus" class="w-4 h-4"></i>
+                                    </button>
+                                </div>
+
+                                <div class="flex flex-col gap-3 relative z-10">
+                                    <template x-if="!activeUser[type] || activeUser[type].length === 0">
+                                        <div class="empty-state border-dashed border-white/10 bg-transparent py-8">
+                                            <p>尚无切片数据</p>
+                                        </div>
+                                    </template>
+                                    
+                                    <template x-for="(slice, index) in (activeUser[type] || [])" :key="index">
+                                        <div class="p-5 bg-slate-900/60 border border-white/5 rounded-lg flex justify-between items-start group/slice hover:border-slate-600 transition-colors">
+                                            <p class="text-sm text-slate-300 leading-relaxed pr-4 whitespace-pre-wrap break-words" x-text="slice"></p>
+                                            <div class="flex gap-1 opacity-0 group-hover/slice:opacity-100 transition-opacity flex-shrink-0">
+                                                <button class="w-7 h-7 rounded hover:bg-brand-500/20 text-slate-500 hover:text-brand-400 flex items-center justify-center" @click="openEditSlice(type, index)">
+                                                    <i data-lucide="edit-2" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                                <button class="w-7 h-7 rounded hover:bg-rose-500/20 text-slate-500 hover:text-rose-400 flex items-center justify-center" @click="delSlice(type, index)">
+                                                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- Slice Edit Modal -->
+    <div x-show="showSliceModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
+        <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showSliceModal = false">
+            <h3 class="text-xl font-bold text-slate-100 mb-2 flex items-center gap-2">
+                <i :data-lucide="sliceModalType ? getSliceConfig(sliceModalType).icon : 'edit'" class="w-5 h-5 text-brand-400"></i>
+                <span x-text="sliceModalMode === 'add' ? '新增画像切片' : '编辑画像切片'"></span>
+            </h3>
+            <p class="text-xs text-slate-400 mb-6 uppercase tracking-wider font-mono" x-text="sliceModalType"></p>
+            
+            <div class="flex flex-col gap-4">
+                <textarea class="w-full bg-slate-900 border border-slate-700/50 rounded-lg p-4 text-sm text-slate-200 resize-none h-32 focus:border-brand-500 focus:outline-none transition-colors" 
+                          x-model="sliceModalContent" placeholder="输入核心记忆点、特征倾向等具体描述..."></textarea>
+            </div>
+            
+            <div class="flex justify-end gap-3 mt-8">
+                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-slate-800 transition-colors border border-slate-700" @click="showSliceModal = false">取消</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-brand-500 hover:bg-brand-600 text-white transition-colors" @click="saveSlice()">保 存</button>
+            </div>
+        </div>
+    </div>
+
+</div>

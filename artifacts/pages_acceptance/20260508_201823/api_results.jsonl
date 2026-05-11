@@ -1,0 +1,27 @@
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/dashboard", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 127.0}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/runtime/health", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 6.0}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/runtime/capabilities", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 26.3}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/runtime/models", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 15.1}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/heartflow/status", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 4.5}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/heartflow/chats", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 28.1}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/heartflow/impulses", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 26.2}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/heartflow/timeline", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 2.1}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/heartflow/topic-digests", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 13.9}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/proactive/intents", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 18.6}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/cognition/recent-decisions", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 4.2}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/cognition/recent-turns", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 24.7}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/tools/status", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 14.0}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/tools/policy", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 15.4}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/tools/recent-calls", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 3.7}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/proactive/status", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 5.7}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/learning/status", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 22.9}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/memory-feedback", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 31.0}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/chats/active", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 6.6}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/reviews/pending", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 31.9}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/reviews", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 8.6}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/memories/events", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 9.8}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/memories/reflections", "query": {"month": "2099-01"}, "ok": true, "http_status": 200, "elapsed_ms": 9.3}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/memories/nodes", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 10.7}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/memories/jargon", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 32.0}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/users", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 10.6}
+{"phase": "readonly_api", "method": "GET", "path": "/api/plug/astrmai/admin/persona/slices", "query": null, "ok": true, "http_status": 200, "elapsed_ms": 8.4}

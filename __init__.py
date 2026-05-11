@@ -1,0 +1,1 @@
+"""AstrMai refactoring workspace package."""

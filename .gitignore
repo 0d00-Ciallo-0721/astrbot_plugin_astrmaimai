@@ -1,6 +1,1 @@
-__pycache__/
-*.pyc
-*.db
-.DS_Store
-data/
-tests/
+/artifacts/kimi_replay/

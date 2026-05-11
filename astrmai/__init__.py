@@ -1,0 +1,1 @@
+"""Refactored AstrMai package layout."""

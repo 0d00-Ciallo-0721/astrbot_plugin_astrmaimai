@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+aiosqlite
+aiofiles
+python-jose[cryptography]

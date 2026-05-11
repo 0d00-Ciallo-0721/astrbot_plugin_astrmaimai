@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Dict, List
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
+
+from ..infrastructure.runtime.lane_manager import LaneKey
+from .contracts.learning_events import (
+    BotReplyRecordedEvent,
+    MiningCompletedEvent,
+    UserMessageRecordedEvent,
+)
+from .logging.bot_reply_recorder import BotReplyRecorder
+from .logging.message_recorder import MessageRecorder
+from .mining.expression_miner import ExpressionMiner
+from .mining.jargon_miner import JargonMiner
+
+
+class EvolutionManager:
+    def __init__(self, db, gateway, config=None, event_bus=None):
+        self.db = db
+        self.gateway = gateway
+        self.config = config if config else gateway.config
+        self.event_bus = event_bus
+        self.expression_miner = ExpressionMiner(gateway, self.config)
+        self.jargon_miner = JargonMiner(self.expression_miner)
+        self.recorder = MessageRecorder(
+            window_seconds=getattr(self.config.evolution, "mining_window_sec", 60),
+            min_messages=getattr(
+                self.config.evolution,
+                "mining_window_min_messages",
+                getattr(self.config.evolution, "mining_trigger", 20),
+            ),
+            cooldown_seconds=getattr(self.config.evolution, "mining_cooldown_sec", 60),
+        )
+        self.bot_reply_recorder = BotReplyRecorder(
+            db,
+            fallback_text=getattr(self.config.reply, "fallback_text", "（陷入了短暂的沉默...）"),
+        )
+        self._mining_locks: Dict[str, asyncio.Lock] = {}
+        self._lock_mutex = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task] = set()
+
+    async def _get_mining_lock(self, group_id: str) -> asyncio.Lock:
+        async with self._lock_mutex:
+            if group_id not in self._mining_locks:
+                self._mining_locks[group_id] = asyncio.Lock()
+            return self._mining_locks[group_id]
+
+    def _fire_background_task(self, coro):
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._handle_task_result)
+
+    def _handle_task_result(self, task: asyncio.Task):
+        self._background_tasks.discard(task)
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"[Evolution Task Error] {exc}", exc_info=exc)
+        except asyncio.CancelledError:
+            pass
+
+    async def _append_message_log(self, *, group_id: str, sender_id: str, sender_name: str, content: str):
+        if hasattr(self.db, "add_message_log_async"):
+            await self.db.add_message_log_async(
+                group_id=group_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                content=content,
+            )
+            return
+        self.db.add_message_log(
+            group_id=group_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            content=content,
+        )
+
+    async def _publish_learning_event(self, publisher_name: str, payload: dict) -> None:
+        if not self.event_bus:
+            return
+        publisher = getattr(self.event_bus, publisher_name, None)
+        if publisher:
+            await publisher(payload)
+
+    async def _load_unprocessed_logs(self, group_id: str, limit: int):
+        if hasattr(self.db, "get_unprocessed_logs_async"):
+            return await self.db.get_unprocessed_logs_async(group_id, limit=limit)
+        return self.db.get_unprocessed_logs(group_id, limit=limit)
+
+    async def _mark_logs_processed(self, log_ids: List[int]) -> None:
+        if hasattr(self.db, "mark_logs_processed_async"):
+            await self.db.mark_logs_processed_async(log_ids)
+            return
+        self.db.mark_logs_processed(log_ids)
+
+    async def _save_patterns(self, patterns) -> None:
+        for pattern in patterns:
+            if hasattr(self.db, "save_pattern_async"):
+                await self.db.save_pattern_async(pattern)
+            else:
+                self.db.save_pattern(pattern)
+
+    async def _save_jargons(self, jargons) -> int:
+        if not hasattr(self.db, "save_jargon_async"):
+            return 0
+        count = 0
+        for jargon in jargons:
+            await self.db.save_jargon_async(jargon)
+            count += 1
+        return count
+
+    async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):
+        bot_id = getattr(event.message_obj, "self_id", "SELF_BOT")
+        if hasattr(event, "bot") and getattr(event, "bot", None):
+            bot_id = getattr(event.bot, "self_id", bot_id)
+        raw_content = event.message_str
+        processed_content = f"(系统指令执行结果): {raw_content}" if is_command else raw_content
+        await self._append_message_log(
+            group_id=event.unified_msg_origin,
+            sender_id=str(bot_id),
+            sender_name="SELF",
+            content=processed_content,
+        )
+        self.recorder.record(event.unified_msg_origin)
+        self._fire_background_task(self._try_trigger_mining(event.unified_msg_origin))
+
+    async def record_user_message(self, event: AstrMessageEvent):
+        rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+        await self._append_message_log(
+            group_id=event.unified_msg_origin,
+            sender_id=event.get_sender_id(),
+            sender_name=event.get_sender_name(),
+            content=rich_text,
+        )
+        self.recorder.record(event.unified_msg_origin)
+        payload = UserMessageRecordedEvent(
+            chat_id=str(event.unified_msg_origin),
+            sender_id=str(event.get_sender_id() or ""),
+            sender_name=str(event.get_sender_name() or ""),
+            content=str(rich_text or ""),
+        ).to_payload()
+        await self._publish_learning_event("publish_learning_message_recorded", payload)
+
+    async def process_logs_and_mine(self, group_id: str, logs: List["MessageLog"]):
+        if not logs:
+            return
+        group_lock = await self._get_mining_lock(group_id)
+        async with group_lock:
+            current_unprocessed = await self._load_unprocessed_logs(group_id, limit=999)
+            current_unprocessed_ids = {log.id for log in current_unprocessed}
+            if not logs or logs[0].id not in current_unprocessed_ids:
+                return
+
+            patterns = await self.expression_miner.mine(group_id, logs)
+            await self._save_patterns(patterns)
+
+            jargon_count = 0
+            if hasattr(self.db, "save_jargon_async"):
+                jargons = await self.jargon_miner.mine(group_id, logs)
+                jargon_count = await self._save_jargons(jargons)
+
+            await self._mark_logs_processed([log.id for log in logs])
+            payload = MiningCompletedEvent(
+                group_id=str(group_id),
+                pattern_count=len(patterns),
+                jargon_count=jargon_count,
+            ).to_payload()
+            await self._publish_learning_event("publish_learning_mining_completed", payload)
+            if self.event_bus and jargon_count > 0:
+                self.event_bus.trigger_knowledge_update()
+
+    async def analyze_and_get_goal(self, chat_id: str, recent_messages: str) -> str:
+        if not recent_messages or not recent_messages.strip():
+            return "陪伴用户，提供有趣且连贯的对话"
+        trimmed = recent_messages.strip()[:200]
+        prompt = f"""根据对话总结当前核心话题(<=15字):\n{trimmed}\nJSON: {{"goal": "string"}}"""
+        try:
+            result = await self.gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="sys2", task_family="goal", scope_id=chat_id),
+                base_origin=chat_id,
+            )
+            if isinstance(result, dict):
+                return str(result.get("goal", "陪伴用户，提供有趣且连贯的对话"))
+            if isinstance(result, str):
+                match = __import__("re").search(r"\{.*?\}", result, __import__("re").DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                    if isinstance(data, dict):
+                        return str(data.get("goal", "陪伴用户，提供有趣且连贯的对话"))
+        except Exception as exc:
+            logger.error(f"[Evolution-Processor] goal analysis failed: {exc}")
+        return "陪伴用户，提供有趣且连贯的对话"
+
+    def get_active_patterns(self, chat_id: str, limit: int = 5) -> str:
+        patterns = self.db.get_patterns(chat_id, limit, True, False, chat_id, 1, "approved")
+        if not patterns:
+            return "暂无特殊语言风格记录。"
+        return "\n".join(f"- 当「{pattern.situation}」时 -> 习惯使用表达/黑话：「{pattern.expression}」" for pattern in patterns)
+
+    async def _try_trigger_mining(self, group_id: str):
+        unprocessed_logs = await self._load_unprocessed_logs(group_id, limit=100)
+        threshold = getattr(self.config.evolution, "mining_trigger", 20)
+        if len(unprocessed_logs) >= threshold:
+            await self.process_logs_and_mine(group_id, unprocessed_logs)
+
+    async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
+        recorded = await self.bot_reply_recorder.record(chat_id, bot_id, reply_text)
+        if recorded:
+            payload = BotReplyRecordedEvent(
+                chat_id=str(chat_id),
+                bot_id=str(bot_id),
+                content=str(reply_text or ""),
+            ).to_payload()
+            await self._publish_learning_event("publish_learning_bot_reply_recorded", payload)

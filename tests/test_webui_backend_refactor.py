@@ -1,0 +1,308 @@
+import asyncio
+import importlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+
+class WebuiBackendRefactorTests(unittest.TestCase):
+    def test_dashboard_service_uses_adapter_and_db_factory(self):
+        service_mod = importlib.import_module(
+            "astrmai.webui.backend.services.dashboard_service"
+        )
+
+        class _Cursor:
+            def __init__(self, value):
+                self.value = value
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def fetchone(self):
+                return (self.value,)
+
+        class _Db:
+            def execute(self, query):
+                if "UserProfile" in query:
+                    return _Cursor(3)
+                if "ExpressionPattern" in query:
+                    return _Cursor(2)
+                return _Cursor(5)
+
+        class _DbCtx:
+            async def __aenter__(self):
+                return _Db()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _PluginApi:
+            async def get_runtime_diagnostics(self):
+                return {"status": {"lifecycle_started": True}}
+
+            async def get_capability_overview(self):
+                return {"workmode": {"enabled": True}}
+
+        service = service_mod.DashboardService(_PluginApi(), lambda: _DbCtx())
+        snapshot = asyncio.run(service.get_snapshot())
+        self.assertEqual(snapshot["total_users"], 3)
+        self.assertEqual(snapshot["pending_reviews"], 2)
+        self.assertIn("capabilities", snapshot)
+
+    def test_server_mounts_aggregated_api_router(self):
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "server.py"
+        content = path.read_text(encoding="utf-8")
+        self.assertIn("from .routes import api_router", content)
+        self.assertIn("app.include_router(api_router, prefix=\"/api\")", content)
+
+    def test_settings_service_builds_effective_config_and_validates_schema(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        service_mod = importlib.import_module("astrmai.webui.backend.services.settings_ui_service")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            schema_path = Path(tmp_dir) / "schema.json"
+            config_path = Path(tmp_dir) / "config.json"
+            schema_path.write_text(
+                json.dumps(
+                    {
+                        "reply": {
+                            "type": "object",
+                            "items": {
+                                "base_frequency": {"type": "float", "default": 0.7},
+                                "enabled": {"type": "bool", "default": True},
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(json.dumps({"reply": {"base_frequency": 0.3}}), encoding="utf-8")
+
+            adapter = adapter_mod.PluginApiAdapter(
+                facade=None,
+                config_path=str(config_path),
+                schema_path=str(schema_path),
+                persona_cache_path=str(Path(tmp_dir) / "persona.json"),
+            )
+            service = service_mod.SettingsUiService(adapter)
+
+            effective = asyncio.run(service.get_effective_config())
+            self.assertEqual(effective["reply"]["base_frequency"], 0.3)
+            self.assertIs(effective["reply"]["enabled"], True)
+
+            bad_field = asyncio.run(service.update_section("reply", {"missing": 1}))
+            self.assertEqual(bad_field["status"], "error")
+
+            bad_type = asyncio.run(service.update_section("reply", {"enabled": "yes"}))
+            self.assertEqual(bad_type["status"], "error")
+
+            reset = asyncio.run(service.reset_section("reply"))
+            self.assertEqual(reset["data"]["base_frequency"], 0.7)
+
+    def test_plugin_api_apply_config_updates_bound_runtime(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Runtime:
+            def __init__(self):
+                self.raw_config = {}
+                self.config = None
+                self.rebuilt = False
+
+            def rebuild_infrastructure_settings(self):
+                self.rebuilt = True
+
+        class _Facade:
+            def __init__(self):
+                self.runtime = _Runtime()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adapter = adapter_mod.PluginApiAdapter(
+                facade=_Facade(),
+                config_path=str(Path(tmp_dir) / "config.json"),
+                schema_path=str(Path(tmp_dir) / "schema.json"),
+                persona_cache_path=str(Path(tmp_dir) / "persona.json"),
+            )
+            result = asyncio.run(adapter.apply_config({"reply": {"base_frequency": 0.2}}, {"reply.base_frequency"}))
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["runtime_bound"])
+            self.assertTrue(adapter.facade.runtime.rebuilt)
+
+    def test_persona_ui_service_exposes_readonly_slice_diagnostics(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        service_mod = importlib.import_module("astrmai.webui.backend.services.persona_ui_service")
+
+        class _PersonaConfig:
+            persona_id = "atri"
+
+        class _Config:
+            persona = _PersonaConfig()
+
+        class _Task:
+            def done(self):
+                return False
+
+        class _Summarizer:
+            pending_tasks = {"atri": _Task()}
+
+        class _Runtime:
+            config = _Config()
+            persona_summarizer = _Summarizer()
+            memory_engine = object()
+
+        class _Facade:
+            runtime = _Runtime()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cache_path = Path(tmp_dir) / "persona.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "atri": {
+                            "summary": "核心摘要",
+                            "first_person_rewrite": "我是亚托莉。",
+                            "style": "轻快",
+                            "shards": {"speech_style": "短句自然"},
+                            "is_full_ready": False,
+                            "raw": "原始人格很长",
+                            "timestamp": 1.0,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            adapter = adapter_mod.PluginApiAdapter(
+                facade=_Facade(),
+                config_path=str(Path(tmp_dir) / "config.json"),
+                schema_path=str(Path(tmp_dir) / "schema.json"),
+                persona_cache_path=str(cache_path),
+            )
+            result = asyncio.run(service_mod.PersonaUiService(adapter).get_persona_slices())
+            data = result["data"]
+            self.assertEqual(data["persona_id"], "atri")
+            self.assertEqual(data["cache_key"], "atri")
+            self.assertEqual(data["summary"], "核心摘要")
+            self.assertEqual(data["shards"]["speech_style"], "短句自然")
+            self.assertTrue(data["pending_task"])
+            self.assertTrue(data["self_lore"]["available"])
+            self.assertNotIn("raw", data)
+            self.assertNotIn("raw_preview", data)
+
+    def test_admin_service_exposes_runtime_and_observability_summaries(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Planner:
+            cognitive_decision_history = [{"chat_id": "chat-1", "social_intent": "join"}]
+            tool_trace_history = [{"chat_id": "chat-1", "tool_tier": "chat", "tool_count": 2}]
+            turn_trace_history = [{"chat_id": "chat-1", "status": "executed", "tools": {"final_tier": "chat"}}]
+
+        class _HeartflowManager:
+            def list_impulse_decisions(self, chat_id=None, limit=50):
+                if chat_id and chat_id != "chat-1":
+                    return []
+                return [
+                    SimpleNamespace(
+                        chat_id="chat-1",
+                        timestamp=1.0,
+                        pulse_type="proactive_hint",
+                        visible_candidate_allowed=True,
+                        dispatch_enabled=False,
+                    )
+                ][:limit]
+
+            def list_timeline(self, chat_id=None, limit=80):
+                if chat_id and chat_id != "chat-1":
+                    return []
+                return [{"kind": "action", "chat_id": "chat-1", "label": "observe", "timestamp": 2.0}][:limit]
+
+        class _TopicDigestService:
+            def list_digests(self, limit=50):
+                return [SimpleNamespace(chat_id="chat-1", timestamp=3.0, status="written", source="heartflow_topic_digest")][:limit]
+
+        class _Runtime:
+            system2_planner = _Planner()
+            proactive_task = SimpleNamespace(
+                heartflow_manager=_HeartflowManager(),
+                heartflow_topic_digest_service=_TopicDigestService(),
+            )
+
+            def build_diagnostics(self):
+                return {"status": {"lifecycle_started": True, "degraded_components": {}}}
+
+            def build_capability_overview_sync(self):
+                return {"proactive": {"enabled": True}}
+
+        class _Facade:
+            runtime = _Runtime()
+
+            def get_runtime_diagnostics(self):
+                return self.runtime.build_diagnostics()
+
+            async def get_capability_overview(self):
+                return self.runtime.build_capability_overview_sync()
+
+        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        status = asyncio.run(service.runtime_status())
+        self.assertTrue(status["runtime_bound"])
+        decisions = asyncio.run(service.recent_decisions(chat_id="chat-1"))
+        self.assertEqual(decisions["items"][0]["social_intent"], "join")
+        tools = asyncio.run(service.recent_tool_traces(chat_id="chat-1"))
+        self.assertEqual(tools["items"][0]["tool_tier"], "chat")
+        turns = asyncio.run(service.recent_turn_traces(chat_id="chat-1"))
+        self.assertEqual(turns["items"][0]["tools"]["final_tier"], "chat")
+        impulses = asyncio.run(service.heartflow_impulses(chat_id="chat-1"))
+        self.assertTrue(impulses["items"][0]["visible_candidate_allowed"])
+        timeline = asyncio.run(service.heartflow_timeline(chat_id="chat-1"))
+        self.assertEqual(timeline["items"][0]["kind"], "action")
+        digests = asyncio.run(service.heartflow_topic_digests())
+        self.assertEqual(digests["items"][0]["source"], "heartflow_topic_digest")
+
+    def test_runtime_capability_imports_are_package_relative(self):
+        path = Path(__file__).resolve().parents[1] / "astrmai" / "app" / "runtime_context.py"
+        content = path.read_text(encoding="utf-8")
+        self.assertNotIn("import_module(\"astrmai.", content)
+        self.assertIn("from .. import multimodal as multimodal_mod", content)
+        self.assertIn("from .. import workmode as workmode_mod", content)
+        self.assertIn("from .. import proactive as proactive_mod", content)
+
+    def test_multimodal_capability_overview_is_json_serializable(self):
+        multimodal_mod = importlib.import_module("astrmai.multimodal")
+        overview = multimodal_mod.describe_multimodal_capabilities(
+            None,
+            vision_enabled=True,
+            meme_enabled=True,
+        )
+        json.dumps(overview)
+        self.assertIsInstance(overview["meme_service"]["memes_dir"], str)
+
+    def test_aggregated_router_registers_admin_routes(self):
+        routes_mod = importlib.import_module("astrmai.webui.backend.routes")
+        router = routes_mod.build_api_router()
+        paths = {route.path for route in router.routes}
+        self.assertIn("/runtime/status", paths)
+        self.assertIn("/heartflow/status", paths)
+        self.assertIn("/heartflow/impulses", paths)
+        self.assertIn("/heartflow/chats/{chat_id}/impulses", paths)
+        self.assertIn("/heartflow/timeline", paths)
+        self.assertIn("/heartflow/chats/{chat_id}/timeline", paths)
+        self.assertIn("/heartflow/topic-digests", paths)
+        self.assertIn("/cognition/recent-decisions", paths)
+        self.assertIn("/cognition/recent-turns", paths)
+        self.assertIn("/cognition/chats/{chat_id}/turns", paths)
+        self.assertIn("/tools/status", paths)
+        self.assertIn("/memory-feedback", paths)
+        self.assertIn("/proactive/status", paths)
+        self.assertIn("/learning/status", paths)
+        self.assertIn("/chats/active", paths)
+
+
+if __name__ == "__main__":
+    unittest.main()

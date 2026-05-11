@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AstrMai WebUI</title>
+    
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['Roboto Mono', 'monospace'],
+                    },
+                    colors: {
+                        brand: {
+                            50: '#EFF7FA',
+                            100: '#DCEEF3',
+                            400: '#4E96AF',
+                            500: '#3B82A0',
+                            600: '#2F6E88',
+                            900: '#244B5A',
+                        },
+                        dark: {
+                            bg: 'var(--bg-root)',
+                            card: 'var(--bg-surface)',
+                            border: 'var(--border-light)'
+                        }
+                    },
+                    boxShadow: {
+                        'glass': '0 12px 28px rgba(37, 48, 63, 0.08)',
+                        'glow': '0 0 0 3px rgba(59, 130, 160, 0.14)',
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="css/main.css">
+    
+    <!-- Scripts -->
+    <script src="js/api.js"></script>
+    <script src="js/app.js"></script>
+    <script src="js/pages/login.js"></script>
+    <script src="js/pages/config.js"></script>
+    <script src="js/pages/reviews.js"></script>
+    <script src="js/pages/memory.js"></script>
+    <script src="js/pages/users.js"></script>
+    <script src="js/pages/persona.js"></script>
+    <script src="js/pages/dashboard.js"></script>
+    <script src="js/pages/learning.js"></script>
+    <script src="js/template_loader.js"></script>
+</head>
+<body x-data="appState()" @toast-notify.window="showToast($event.detail.message, $event.detail.type)" class="bg-[var(--bg-root)] text-[var(--text-secondary)] antialiased min-h-screen flex selection:bg-brand-500 selection:text-white">
+    <div id="layout-overlays"></div>
+    
+    <!-- Sidebar only shows when not on login page -->
+    <div id="layout-sidebar" x-show="currentPage !== 'login'" class="w-64 flex-shrink-0" x-transition></div>
+
+    <main class="flex-1 overflow-x-hidden overflow-y-auto relative" :class="currentPage === 'login' ? 'flex items-center justify-center' : 'p-8'">
+        <!-- Background elements removed for a cleaner look -->
+        
+        <div class="relative z-10 w-full" :class="currentPage === 'login' ? 'max-w-md' : 'max-w-7xl mx-auto'">
+            <div id="page-slot-login"></div>
+            <div id="page-slot-dashboard"></div>
+            <div id="page-slot-learning"></div>
+            <div id="page-slot-settings"></div>
+            <div id="page-slot-reviews"></div>
+            <div id="page-slot-memories"></div>
+            <div id="page-slot-users"></div>
+            <div id="page-slot-persona"></div>
+        </div>
+    </main>
+
+    <!-- Initialize Lucide Icons -->
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // Need a slight delay to ensure Alpine has rendered templates
+            setTimeout(() => {
+                lucide.createIcons();
+            }, 100);
+            
+            let lucideTimeout;
+            // Re-run when DOM changes (debounced)
+            const observer = new MutationObserver((mutations) => {
+                clearTimeout(lucideTimeout);
+                lucideTimeout = setTimeout(() => {
+                    lucide.createIcons();
+                }, 200);
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        });
+    </script>
+</body>
+</html>

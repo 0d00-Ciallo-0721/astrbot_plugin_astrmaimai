@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+import re
+from typing import Any, Sequence
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
+
+from ...infrastructure.runtime.lane_manager import LaneKey
+from ...multimodal import MEMES_DIR, send_meme
+from ...state.relationship.affection_router import AffectionRouter
+
+
+class ReplyPostSendMixin:
+    async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
+        del anchor_event
+        fetch_count = getattr(self.config.attention, "bg_pool_size", 20) if self.config else 20
+        lane_manager = getattr(getattr(self.state_engine, "gateway", None), "lane_manager", None)
+        if lane_manager is None:
+            return []
+        try:
+            raw_history = await lane_manager.get_lane_history(
+                lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
+                base_origin=chat_id,
+            )
+            clean_anchor = re.sub(r"\s+", "", anchor_text or "")
+            if clean_anchor:
+                cutoff_idx = -1
+                for i in range(len(raw_history) - 1, -1, -1):
+                    msg_data = raw_history[i]
+                    if not isinstance(msg_data, dict):
+                        continue
+                    content = str(msg_data.get("content", "") or "").strip()
+                    if content and clean_anchor in re.sub(r"\s+", "", content):
+                        cutoff_idx = i
+                        break
+                if cutoff_idx >= 0:
+                    start_idx = max(0, cutoff_idx - fetch_count)
+                    return raw_history[start_idx:cutoff_idx + 1]
+            return raw_history[-fetch_count:]
+        except Exception as exc:
+            logger.warning(f"[ReplyService] lane history fetch failed: {exc}")
+            return []
+
+    async def _sync_native_history_mirror(self, event: AstrMessageEvent, chat_id: str, user_text: str, assistant_text: str) -> None:
+        del event, chat_id, user_text, assistant_text
+        return
+
+    def _resolve_post_send_tag(self, bypassed_tag: str | None) -> tuple[str, bool]:
+        if not bypassed_tag:
+            return "neutral", False
+        if bypassed_tag == "happy":
+            return "happy", True
+        if bypassed_tag in ["sad", "angry"]:
+            return bypassed_tag, True
+        return bypassed_tag, True
+
+    async def _collect_affection_target(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        tag: str,
+        *,
+        window_events: list | None,
+        anchor_event: AstrMessageEvent | None,
+    ) -> str | None:
+        user_id = event.get_sender_id()
+        is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
+        if is_private_chat:
+            return str(user_id)
+
+        anchor = anchor_event or event.get_extra("astrmai_focus_thread_root_event", None) or event.get_extra("astrmai_focus_event", None) or event.get_extra("astrmai_anchor_event", None)
+        anchor_text = anchor.message_str.strip() if anchor and getattr(anchor, "message_str", None) else ""
+        history_events = await self._fetch_history(chat_id, anchor_text, anchor_event=anchor)
+        return AffectionRouter.route(
+            history_events=history_events,
+            window_events=window_events or event.get_extra("astrmai_window_events", []) or [],
+            trigger_event=event,
+            mood_tag=tag,
+            config=self.config,
+            fallback_uid=user_id,
+        )
+
+    async def _record_private_profile_touch(self, user_id: str) -> None:
+        try:
+            profile = await self.state_engine.get_user_profile(user_id)
+            async with self.state_engine._get_user_lock(user_id):
+                profile.message_count_for_profiling += 1
+                profile.is_dirty = True
+            persistence = getattr(self.state_engine, "persistence", None)
+            if persistence and hasattr(persistence, "save_user_profile"):
+                await persistence.save_user_profile(profile)
+        except Exception as exc:
+            logger.warning(f"[ReplyService] private chat profile touch failed: {exc}")
+
+    async def _settle_post_send(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        *,
+        bypassed_tag: str | None,
+        window_events: list | None,
+        anchor_event: AstrMessageEvent | None,
+    ) -> None:
+        tag, force_meme_flag = self._resolve_post_send_tag(bypassed_tag)
+        try:
+            await self.state_engine.atomic_update_mood(chat_id, delta=0.0 if not bypassed_tag else (0.1 if tag == "happy" else -0.1 if tag in ["sad", "angry"] else 0.0))
+            is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
+            if is_private_chat:
+                await self._record_private_profile_touch(str(event.get_sender_id()))
+            target_user_id = await self._collect_affection_target(
+                event,
+                chat_id,
+                tag,
+                window_events=window_events,
+                anchor_event=anchor_event,
+            )
+            if target_user_id and hasattr(self.state_engine, "calculate_and_update_affection"):
+                await self.state_engine.calculate_and_update_affection(
+                    user_id=str(target_user_id),
+                    group_id=chat_id,
+                    mood_tag=tag,
+                    intensity=1.0,
+                )
+        except Exception as exc:
+            logger.warning(f"[ReplyService] post-send settlement failed: {exc}")
+            tag = "neutral"
+            force_meme_flag = False
+
+        if tag and tag != "neutral":
+            final_prob = 100 if force_meme_flag else self.meme_probability
+            global_context = getattr(self.state_engine.gateway, "context", None)
+            await send_meme(
+                event=event,
+                emotion_tag=tag,
+                probability=final_prob,
+                memes_dir=MEMES_DIR,
+                context=global_context,
+            )

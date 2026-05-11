@@ -1,0 +1,59 @@
+{
+  "status": "failed_mock_writes",
+  "run_id": "codex_pages_smoke_20260508_201823",
+  "readonly_api_count": 27,
+  "mock_failures": [
+    {
+      "phase": "mock_write",
+      "step": "review_verify_cleanup",
+      "ok": false,
+      "http_status": 200
+    },
+    {
+      "phase": "mock_write",
+      "step": "memory_event_create",
+      "ok": false,
+      "http_status": 500,
+      "id": null
+    },
+    {
+      "phase": "mock_write",
+      "step": "reflection_create",
+      "ok": false,
+      "http_status": 500,
+      "date": "2099-01-08"
+    },
+    {
+      "phase": "mock_write",
+      "step": "reflection_verify_list",
+      "ok": false,
+      "http_status": 200
+    },
+    {
+      "phase": "mock_write",
+      "step": "node_create",
+      "ok": false,
+      "http_status": 500,
+      "id": null
+    },
+    {
+      "phase": "mock_write",
+      "step": "jargon_create",
+      "ok": false,
+      "http_status": 500
+    },
+    {
+      "phase": "mock_write",
+      "step": "jargon_verify_list",
+      "ok": false,
+      "http_status": 200,
+      "id": null
+    }
+  ],
+  "residue": [
+    {
+      "type": "review",
+      "id": 1
+    }
+  ]
+}

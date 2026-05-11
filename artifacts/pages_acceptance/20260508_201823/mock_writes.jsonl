@@ -1,0 +1,14 @@
+{"phase": "mock_write", "step": "review_create", "ok": true, "http_status": 200, "id": 1}
+{"phase": "mock_write", "step": "review_verify_list", "ok": true, "http_status": 200}
+{"phase": "mock_write", "step": "review_submit_approve", "ok": true, "http_status": 200}
+{"phase": "mock_write", "step": "review_delete", "ok": true, "http_status": 200}
+{"phase": "mock_write", "step": "review_verify_cleanup", "ok": false, "http_status": 200}
+{"phase": "mock_write", "step": "memory_event_create", "ok": false, "http_status": 500, "id": null}
+{"phase": "mock_write", "step": "reflection_create", "ok": false, "http_status": 500, "date": "2099-01-08"}
+{"phase": "mock_write", "step": "reflection_verify_list", "ok": false, "http_status": 200}
+{"phase": "mock_write", "step": "reflection_delete", "ok": true, "http_status": 200}
+{"phase": "mock_write", "step": "reflection_verify_cleanup", "ok": true, "http_status": 200}
+{"phase": "mock_write", "step": "node_create", "ok": false, "http_status": 500, "id": null}
+{"phase": "mock_write", "step": "jargon_create", "ok": false, "http_status": 500}
+{"phase": "mock_write", "step": "jargon_verify_list", "ok": false, "http_status": 200, "id": null}
+{"phase": "mock_write", "step": "user_slice_skipped", "ok": true, "reason": "skipped_no_user"}

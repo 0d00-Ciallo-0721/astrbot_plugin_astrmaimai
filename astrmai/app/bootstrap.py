@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.api.star import Context
+
+from ..conversation.ingress.sensors import PreFilters
+
+from ..conversation.attention.gate import AttentionGate
+from ..conversation.decision.judge import Judge
+from ..conversation.execution.reply_service import ReplyService
+from ..conversation.execution.system2_runner import System2Runner
+from ..conversation.planning.context_engine import ContextEngine
+from ..conversation.planning.planner import Planner
+from ..conversation.planning.prompt_refiner import PromptRefiner
+from ..infrastructure.gateway.model_gateway import GlobalModelGateway
+from ..infrastructure.persistence.database_service import DatabaseService
+from ..infrastructure.persistence.persistence_manager import PersistenceManager
+from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
+from ..infrastructure.runtime.event_bus import EventBus
+from ..infrastructure.runtime.host_bridge import HostBridge
+from ..infrastructure.runtime.lane_manager import LaneManager
+from ..learning import (
+    EvolutionManager,
+    ExpressionAutoCheckTask,
+    ExpressionReflector,
+    ExpressionReviewService,
+    ReflectTracker,
+)
+from ..memory import MemoryEngine, PersonaSummarizer, ReActRetriever
+from ..multimodal.visual_cortex import VisualCortex
+from ..proactive import ProactiveTask
+from ..state import FrequencyController, GroupReplyWaitManager, PrivateChatManager, StateEngine
+from ..shared.constants.defaults import build_infrastructure_settings
+from ..workmode import CronHeartbeatGuard, Sys3Router
+from .runtime_context import (
+    CognitionServices,
+    CoreServices,
+    InteractionServices,
+    LifecycleServices,
+    PluginRuntimeContext,
+    WorkModeServices,
+)
+
+
+class PluginBootstrap:
+    def __init__(self, context: Context, config: Any, raw_config: dict[str, Any] | None = None):
+        self.context = context
+        self.config = config
+        self.raw_config = raw_config or {}
+
+    def build(self) -> PluginRuntimeContext:
+        runtime = PluginRuntimeContext(
+            host_context=self.context,
+            raw_config=self.raw_config,
+            config=self.config,
+            runtime_coordinator=ChatRuntimeCoordinator(),
+            host_bridge=HostBridge(),
+            infrastructure_settings=build_infrastructure_settings(self.config),
+        )
+        runtime.set_boot_phase("bootstrap.logging")
+        self._log_boot_status(runtime)
+        runtime.set_boot_phase("bootstrap.core")
+        runtime.core = self._build_core_services(runtime)
+        runtime.set_boot_phase("bootstrap.workmode")
+        runtime.workmode = self._build_work_mode(runtime)
+        runtime.set_boot_phase("bootstrap.cognition")
+        runtime.cognition = self._build_cognition_stack(runtime)
+        runtime.set_boot_phase("bootstrap.interaction")
+        runtime.interaction = self._build_interaction_stack(runtime)
+        runtime.set_boot_phase("bootstrap.lifecycle")
+        runtime.lifecycle = self._build_lifecycle_stack(runtime)
+        runtime.status.bootstrap_completed = True
+        runtime.set_boot_phase("bootstrap.ready")
+        return runtime
+
+    def _log_boot_status(self, runtime: PluginRuntimeContext) -> None:
+        task_models = getattr(runtime.config.provider, "task_models", [])
+        agent_models = getattr(runtime.config.provider, "agent_models", [])
+        task_model = (task_models or ["Unconfigured"])[0]
+        agent_model = (agent_models or ["Unconfigured"])[0]
+        logger.info(
+            f"[AstrMai] Booting refactoring workspace... Task(Judge): {task_model} | Agent: {agent_model}"
+        )
+        runtime.status.boot_logged = True
+
+    def _build_core_services(self, runtime: PluginRuntimeContext) -> CoreServices:
+        embedding_models = getattr(runtime.config.provider, "embedding_models", [])
+        persistence = PersistenceManager()
+        db_service = DatabaseService(persistence)
+        gateway = GlobalModelGateway(
+            self.context,
+            runtime.config,
+            settings=runtime.infrastructure_settings.gateway,
+        )
+        lane_manager = LaneManager(
+            self.context.conversation_manager,
+            config=runtime.config,
+            settings=runtime.infrastructure_settings.lane,
+        )
+        gateway.set_lane_manager(lane_manager)
+        event_bus = EventBus()
+        memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
+        state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
+        judge = Judge(gateway, state_engine)
+        sensors = PreFilters(runtime.config)
+        visual_cortex = None
+        if runtime.feature_flags.vision_enabled:
+            try:
+                visual_cortex = VisualCortex(gateway, db_service)
+            except Exception as exc:
+                self._record_optional_failure(runtime, "multimodal.visual_cortex", exc)
+        return CoreServices(
+            persistence=persistence,
+            db_service=db_service,
+            gateway=gateway,
+            lane_manager=lane_manager,
+            event_bus=event_bus,
+            memory_engine=memory_engine,
+            state_engine=state_engine,
+            judge=judge,
+            sensors=sensors,
+            visual_cortex=visual_cortex,
+        )
+
+    def _build_work_mode(self, runtime: PluginRuntimeContext) -> WorkModeServices:
+        enabled = runtime.feature_flags.work_mode_enabled
+        runtime.status.work_mode_enabled = enabled
+        if enabled:
+            logger.info("[AstrMai] Sys3 (Work) enabled by config.")
+            try:
+                return WorkModeServices(
+                    sys3_router=Sys3Router(runtime.config, self.context, runtime.db_service),
+                    cron_guard=CronHeartbeatGuard(runtime.db_service, self.context),
+                )
+            except Exception as exc:
+                runtime.status.work_mode_enabled = False
+                self._record_optional_failure(runtime, "workmode.sys3", exc)
+                return WorkModeServices()
+        logger.info("[AstrMai] Sys3 (Work) disabled; running in chat-only mode.")
+        return WorkModeServices()
+
+    def _build_cognition_stack(self, runtime: PluginRuntimeContext) -> CognitionServices:
+        reply_engine = ReplyService(
+            runtime.state_engine,
+            runtime.state_engine.mood_manager,
+            runtime_coordinator=runtime.runtime_coordinator,
+        )
+        evolution = EvolutionManager(runtime.db_service, runtime.gateway, event_bus=runtime.event_bus)
+        persona_summarizer = PersonaSummarizer(runtime.persistence, runtime.gateway, memory_engine=runtime.memory_engine)
+        context_engine = ContextEngine(runtime.db_service, persona_summarizer)
+        react_retriever = ReActRetriever(
+            memory_engine=runtime.memory_engine,
+            db_service=runtime.db_service,
+            gateway=runtime.gateway,
+            config=runtime.config,
+        )
+        prompt_refiner = PromptRefiner(
+            runtime.memory_engine,
+            runtime.db_service,
+            runtime.config,
+            react_retriever=react_retriever,
+        )
+        system2_planner = Planner(
+            self.context,
+            runtime.gateway,
+            context_engine,
+            reply_engine,
+            runtime.memory_engine,
+            evolution,
+            state_engine=runtime.state_engine,
+            prompt_refiner=prompt_refiner,
+            sys3_router=runtime.sys3_router,
+            runtime_coordinator=runtime.runtime_coordinator,
+        )
+        system2_runner = System2Runner(runtime)
+        self._bind_learning_collaboration(runtime, evolution)
+        return CognitionServices(
+            reply_engine=reply_engine,
+            evolution=evolution,
+            persona_summarizer=persona_summarizer,
+            context_engine=context_engine,
+            react_retriever=react_retriever,
+            prompt_refiner=prompt_refiner,
+            system2_planner=system2_planner,
+            system2_runner=system2_runner,
+        )
+
+    def _build_interaction_stack(self, runtime: PluginRuntimeContext) -> InteractionServices:
+        frequency_controller = FrequencyController(config=runtime.config)
+        private_chat_manager = PrivateChatManager(config=runtime.config)
+        group_reply_wait_manager = GroupReplyWaitManager()
+        attention_gate = AttentionGate(
+            state_engine=runtime.state_engine,
+            judge=runtime.judge,
+            sensors=runtime.sensors,
+            system2_callback=self._build_system2_bridge(runtime),
+            config=runtime.config,
+            persona_summarizer=runtime.persona_summarizer,
+            visual_cortex=runtime.visual_cortex,
+            frequency_controller=frequency_controller,
+            private_chat_manager=private_chat_manager,
+            runtime_coordinator=runtime.runtime_coordinator,
+        )
+        return InteractionServices(
+            frequency_controller=frequency_controller,
+            private_chat_manager=private_chat_manager,
+            group_reply_wait_manager=group_reply_wait_manager,
+            attention_gate=attention_gate,
+        )
+
+    def _build_lifecycle_stack(self, runtime: PluginRuntimeContext) -> LifecycleServices:
+        reflector = ExpressionReflector(
+            db_service=runtime.db_service,
+            gateway=runtime.gateway,
+            config=runtime.config,
+        )
+        reflect_tracker = ReflectTracker(
+            db_service=runtime.db_service,
+            gateway=runtime.gateway,
+            config=runtime.config,
+        )
+        review_service = ExpressionReviewService(runtime.db_service)
+        auto_check_task = None
+        try:
+            auto_check_task = ExpressionAutoCheckTask(
+                db_service=runtime.db_service,
+                gateway=runtime.gateway,
+                tracker=reflect_tracker,
+                config=runtime.config,
+            )
+        except Exception as exc:
+            self._record_optional_failure(runtime, "learning.auto_check_task", exc)
+
+        proactive_task = None
+        if runtime.feature_flags.proactive_enabled:
+            try:
+                proactive_task = ProactiveTask(
+                    context=self.context,
+                    state_engine=runtime.state_engine,
+                    gateway=runtime.gateway,
+                    persistence=runtime.persistence,
+                    memory_engine=runtime.memory_engine,
+                    reflector=reflector,
+                    config=runtime.config,
+                    runtime_coordinator=runtime.runtime_coordinator,
+                    attention_gate=runtime.attention_gate,
+                )
+                if runtime.system2_planner is not None:
+                    runtime.system2_planner.heartflow_manager = proactive_task.heartflow_manager
+                proactive_task.auto_check_task = auto_check_task
+                proactive_task.reflect_tracker = reflect_tracker
+                proactive_task.review_dispatcher.reflect_tracker = reflect_tracker
+                proactive_task.dream_scheduler.dream_visible = runtime.feature_flags.dream_visible
+                proactive_task.set_db_service(runtime.db_service)
+            except Exception as exc:
+                self._record_optional_failure(runtime, "proactive.task", exc)
+        return LifecycleServices(
+            reflector=reflector,
+            reflect_tracker=reflect_tracker,
+            review_service=review_service,
+            auto_check_task=auto_check_task,
+            proactive_task=proactive_task,
+        )
+
+    def _bind_learning_collaboration(self, runtime: PluginRuntimeContext, evolution: EvolutionManager) -> None:
+        if runtime.event_bus is None:
+            return
+        runtime.event_bus.subscribe(
+            runtime.event_bus.TOPIC_LEARNING_MESSAGE_RECORDED,
+            runtime.state_engine.on_learning_message_recorded,
+        )
+        runtime.event_bus.subscribe(
+            runtime.event_bus.TOPIC_LEARNING_BOT_REPLY_RECORDED,
+            runtime.memory_engine.on_learning_bot_reply_recorded,
+        )
+        runtime.event_bus.subscribe(
+            runtime.event_bus.TOPIC_LEARNING_MINING_COMPLETED,
+            runtime.memory_engine.on_learning_mining_completed,
+        )
+
+    def _record_optional_failure(self, runtime: PluginRuntimeContext, component: str, exc: Exception) -> None:
+        runtime.mark_degraded(component, str(exc))
+        logger.warning(f"[AstrMai] Optional component degraded: {component} -> {exc}")
+
+    def _build_system2_bridge(self, runtime: PluginRuntimeContext):
+        async def _bridge(main_event: Any, events_to_process: list[Any] | None = None) -> Any:
+            if runtime.system2_callback is None:
+                raise RuntimeError("System2 callback has not been bound yet.")
+            return await runtime.system2_callback(main_event, events_to_process)
+
+        return _bridge
+
+
+def build_runtime_context(context: Context, config: Any, raw_config: dict[str, Any] | None = None) -> PluginRuntimeContext:
+    return PluginBootstrap(context=context, config=config, raw_config=raw_config).build()

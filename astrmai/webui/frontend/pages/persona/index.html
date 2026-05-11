@@ -1,0 +1,53 @@
+<div id="page-persona" x-show="currentPage === 'persona'" x-data="personaPage()" x-cloak class="pb-10 h-full flex flex-col">
+    <div class="flex justify-between items-end mb-8">
+        <div>
+            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">人格核心设定 (Persona)</h2>
+            <p class="text-slate-400">管理 AI 的长期背景设定与第一人称扮演视角</p>
+        </div>
+        <button class="glass-btn px-6 py-2.5 bg-brand-500/20 text-brand-300 hover:bg-brand-500/30 border border-brand-500/30 flex items-center gap-2 font-medium transition-all"
+                @click="savePersona()">
+            <i data-lucide="save" class="w-4 h-4"></i> 保存设定覆盖
+        </button>
+    </div>
+
+    <div x-show="loading && !persona" class="flex flex-col items-center justify-center py-20 text-slate-400">
+        <i data-lucide="loader-2" class="w-8 h-8 animate-spin mb-4 text-brand-500"></i>
+        <p>正在读取底层人格网络...</p>
+    </div>
+
+    <template x-if="persona && !loading">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 h-full">
+            
+            <!-- Summary (Background) -->
+            <div class="glass-panel p-8 flex flex-col relative group">
+                <div class="absolute inset-0 bg-slate-800/50 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
+                <div class="mb-4">
+                    <h3 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+                        <i data-lucide="book-text" class="w-5 h-5 text-purple-400"></i>
+                        背景设定 (Summary)
+                    </h3>
+                    <p class="text-xs text-slate-500 mt-1">全局生效的背景故事、核心性格特质与系统级禁忌事项。影响深远。</p>
+                </div>
+                <textarea x-model="persona.summary" 
+                          class="flex-1 w-full min-h-[400px] bg-slate-900/50 border border-slate-700/50 rounded-lg p-4 text-slate-300 text-sm focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50 transition-all resize-none placeholder-slate-600"
+                          placeholder="例如：\n你是一个傲娇的二次元少女，叫做 AstrMai...\n你喜欢编程，讨厌吃青椒...\n你的口头禅是：哼，才不是为了帮你呢！"></textarea>
+            </div>
+
+            <!-- First Person Rewrite -->
+            <div class="glass-panel p-8 flex flex-col relative group">
+                <div class="absolute inset-0 bg-slate-800/50 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
+                <div class="mb-4">
+                    <h3 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+                        <i data-lucide="speech" class="w-5 h-5 text-brand-400"></i>
+                        第一人称改写设定 (First Person Rewrite)
+                    </h3>
+                    <p class="text-xs text-slate-500 mt-1">控制 AI 在生成对话时的主观语气、语癖与发声习惯。用于覆盖 System Prompt 的表达层。</p>
+                </div>
+                <textarea x-model="persona.first_person_rewrite" 
+                          class="flex-1 w-full min-h-[400px] bg-slate-900/50 border border-slate-700/50 rounded-lg p-4 text-slate-300 text-sm focus:outline-none focus:border-brand-500/50 focus:ring-1 focus:ring-brand-500/50 transition-all resize-none placeholder-slate-600"
+                          placeholder="例如：\n使用随意的网络聊天语气，多用颜文字（如 QwQ, TAT）。\n尽量使用短句，避免冗长的说教。\n当你困惑时，会发出 '诶？' 的感叹。"></textarea>
+            </div>
+
+        </div>
+    </template>
+</div>
