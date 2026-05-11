@@ -5,16 +5,18 @@ import time
 from astrbot.api import logger
 
 from .dispatcher import ProactiveMessageIntent
+from .rhythm import evaluate_proactive_rhythm
 
 
 class WakeupService:
-    def __init__(self, context, state_engine, persistence, call_background_lane, config, dispatcher=None):
+    def __init__(self, context, state_engine, persistence, call_background_lane, config, dispatcher=None, memory_engine=None):
         self.context = context
         self.state_engine = state_engine
         self.persistence = persistence
         self._call_background_lane = call_background_lane
         self.config = config
         self.dispatcher = dispatcher
+        self.memory_engine = memory_engine
 
     async def run_once(self):
         active_states = self.state_engine.get_active_states()
@@ -85,21 +87,41 @@ class WakeupService:
         )
 
     async def generate_opening_line(self, chat_id: str) -> str:
+        rhythm = evaluate_proactive_rhythm(self.config)
         persona_id = getattr(self.config.persona, "persona_id", "") or "global"
         cache = self.persistence.load_persona_cache()
         persona_data = cache.get(persona_id, {})
         summary = persona_data.get("summary", "")
         style = persona_data.get("style", "")
+        memory_hint = await self._recall_light_memory(chat_id, "recent quiet chat")
         parts = [
-            "The chat has been quiet for a while. Consider one short, natural opening only if it feels welcome.",
-            "If it feels awkward or unrelated, staying quiet is acceptable.",
-            "Do not mention systems, silence thresholds, schedules, or proactive logic.",
+            f"Time tone: {rhythm.time_bucket}.",
+            "Consider one short natural line only if it would feel welcome.",
+            "Make it easy to ignore; no @ mentions, no presence-check questions, no repeated questions.",
+            "Prefer a soft continuation or a tiny everyday observation over a new heavy topic.",
+            "Do not explain why you spoke.",
         ]
+        if rhythm.time_bucket == "evening":
+            parts.append("Evening tone: quieter, lower-pressure, and brief.")
         if summary:
             parts.append(f"Persona tone reference: {str(summary)[:180]}")
         if style:
             parts.append(f"Style hint: {str(style)[:120]}")
+        if memory_hint:
+            parts.append(f"Optional private memory hint, do not quote directly: {memory_hint[:180]}")
         return "\n".join(parts)
+
+    async def _recall_light_memory(self, chat_id: str, query: str) -> str:
+        if not self.memory_engine or not hasattr(self.memory_engine, "recall"):
+            return ""
+        try:
+            result = await self.memory_engine.recall(query, session_id=chat_id, top_k=1)
+        except TypeError:
+            result = await self.memory_engine.recall(query, session_id=chat_id)
+        except Exception as exc:
+            logger.debug(f"[Life] proactive wakeup memory hint degraded: {exc}")
+            return ""
+        return " ".join(str(result or "").split())
 
 
 __all__ = ["WakeupService"]

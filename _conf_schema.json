@@ -452,6 +452,12 @@
         "default": "",
         "hint": "留空时默认发回当前 dream 会话；填写后可固定发送到指定会话。"
       },
+      "proactive_quiet_hours": {
+        "description": "主动开口安静时段",
+        "type": "list",
+        "default": ["23:30-07:30"],
+        "hint": "格式示例：23:30-07:30。处于这些本地时间段时，不主动发起话题，只记录候选与阻断原因。"
+      },
       "silence_threshold": {
         "description": "判定环境安静的时长（分钟）",
         "type": "int",

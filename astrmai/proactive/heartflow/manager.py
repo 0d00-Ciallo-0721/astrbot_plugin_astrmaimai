@@ -7,6 +7,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..dispatcher import ProactiveMessageIntent
+from ..rhythm import evaluate_proactive_rhythm
 from .feedback_bridge import HeartflowFeedbackBridge
 from .models import HeartflowActionDecision, HeartflowChatState, HeartflowImpulseDecision, HeartflowPulse, HeartflowSessionState
 
@@ -33,12 +34,14 @@ class HeartflowManager:
         memory_engine: Any = None,
         semaphore: asyncio.Semaphore | None = None,
         dispatcher: Any = None,
+        config: Any = None,
     ):
         self.runtime_coordinator = runtime_coordinator
         self.state_engine = state_engine
         self.memory_engine = memory_engine
         self._semaphore = semaphore
         self.dispatcher = dispatcher
+        self.config = config
         self.feedback_bridge = HeartflowFeedbackBridge(memory_engine)
         self._states: dict[str, HeartflowChatState] = {}
         self._sessions: dict[str, HeartflowSessionState] = {}
@@ -177,6 +180,9 @@ class HeartflowManager:
             return None
 
         existing = self._sessions.get(chat_id)
+        previous_topic_heat = float(getattr(existing, "topic_heat", 0.0) or 0.0) if existing else 0.0
+        previous_tick_ts = float(getattr(existing, "last_tick_ts", 0.0) or 0.0) if existing else 0.0
+        previous_activity_ts = float(getattr(existing, "last_activity_ts", 0.0) or 0.0) if existing else 0.0
         start_new = existing is None or (
             latest_ts > float(getattr(existing, "last_activity_ts", 0.0) or 0.0)
             and latest_ts - float(getattr(existing, "last_activity_ts", 0.0) or 0.0) > self.ACTIVE_SESSION_TTL_SECONDS
@@ -196,6 +202,10 @@ class HeartflowManager:
         last_bot_reply_ts = self._float_snapshot(snapshot, "last_bot_reply_ts")
         last_user_direct_ts = self._float_snapshot(snapshot, "last_user_direct_ts")
         topic_heat = self._topic_heat(snapshot, now=now)
+        if previous_topic_heat > 0 and previous_tick_ts > 0 and latest_ts <= previous_activity_ts:
+            elapsed = max(0.0, now - previous_tick_ts)
+            retained_heat = previous_topic_heat * max(0.25, 1.0 - elapsed / 2400.0)
+            topic_heat = self._clamp(max(topic_heat, retained_heat))
         low_cost_retained = age_seconds > self.ACTIVE_SESSION_TTL_SECONDS
 
         existing.last_activity_ts = latest_ts
@@ -298,6 +308,7 @@ class HeartflowManager:
             0.12
             + min(recent_count, 6) * 0.10
             + (0.22 if age_seconds <= 90 else 0.0)
+            + float(getattr(session, "topic_heat", 0.0) if session else 0.0) * 0.50
             + (0.08 if "?" in preview or "？" in preview else 0.0)
         )
         engagement = self._clamp(0.08 + min(recent_count_60s, 4) * 0.22 + min(recent_count, 6) * 0.04)
@@ -451,6 +462,9 @@ class HeartflowManager:
         executor_pending = self._int_snapshot(snapshot, "executor_pending")
         age_seconds = max(0.0, now - float(session.last_activity_ts or 0.0)) if session.last_activity_ts > 0 else self.ACTIVE_CHAT_TTL_SECONDS
         visible_score, score_components = self._compute_visible_candidate_score(state, session, now=now)
+        rhythm = evaluate_proactive_rhythm(self.config, now=now)
+        visible_threshold = rhythm.threshold(self.VISIBLE_CANDIDATE_SCORE_THRESHOLD)
+        prepare_threshold = rhythm.threshold(self.PREPARE_CANDIDATE_SCORE_THRESHOLD)
         checks: dict[str, object] = {
             "pulse_type": pulse.pulse_type,
             "low_cost_retained": bool(session.low_cost_retained),
@@ -463,18 +477,37 @@ class HeartflowManager:
             "topic_heat": round(float(session.topic_heat or 0.0), 3),
             "talk_frequency_adjust": round(float(session.talk_frequency_adjust or 0.0), 3),
             "visible_candidate_score": round(visible_score, 3),
-            "visible_candidate_threshold": self.VISIBLE_CANDIDATE_SCORE_THRESHOLD,
-            "prepare_candidate_threshold": self.PREPARE_CANDIDATE_SCORE_THRESHOLD,
+            "visible_candidate_threshold": round(visible_threshold, 3),
+            "prepare_candidate_threshold": round(prepare_threshold, 3),
             "score_components": score_components,
             "frequency_components": dict(session.frequency_components or {}),
             "consecutive_no_reply_count": int(session.consecutive_no_reply_count or 0),
             "consecutive_prepare_count": int(session.consecutive_prepare_count or 0),
+            "quiet_hours": rhythm.quiet_hours,
+            "time_bucket": rhythm.time_bucket,
+            "base_frequency": rhythm.base_frequency,
+            "base_frequency_factor": rhythm.base_frequency_factor,
+            "topic_source_priority": ["conversation_continuity", "recent_memory", "fresh_small_talk"],
         }
         action_type = "observe"
         guidance = "Observe quietly; do not force a response."
         blocked_reason = "hidden_action"
+        conflict_cooldown = self._conflict_penalty(snapshot, state) > 0
+        old_topic_blocked = bool(
+            session.low_cost_retained
+            and (
+                session.topic_heat < 0.32
+                or session.insert_pressure > 0.65
+                or conflict_cooldown
+                or age_seconds > self.ACTIVE_CHAT_TTL_SECONDS
+            )
+        )
 
-        if state.fatigue > 0.75 or state.talk_willingness < 0.25:
+        if rhythm.quiet_hours:
+            action_type = "no_reply"
+            guidance = "Respect quiet hours; keep the thought as hidden context only."
+            blocked_reason = "quiet_hours"
+        elif state.fatigue > 0.75 or state.talk_willingness < 0.25:
             action_type = "cool_down"
             guidance = "Prefer silence or very short future replies while fatigue or low willingness is high."
             blocked_reason = "cool_down"
@@ -482,7 +515,7 @@ class HeartflowManager:
             action_type = "wait"
             guidance = "Wait for the pending user turn or executor result before considering any proactive reply."
             blocked_reason = "user_waiting"
-        elif session.low_cost_retained:
+        elif old_topic_blocked:
             action_type = "complete_topic" if session.topic_heat < 0.18 else "observe"
             guidance = "The last topic is outside the active rhythm window; do not revive it without a new cue."
             blocked_reason = "low_cost_retained"
@@ -490,11 +523,11 @@ class HeartflowManager:
             action_type = "no_reply"
             guidance = "Stay silent this tick; recent rhythm suggests another insertion would be abrupt."
             blocked_reason = "insert_pressure"
-        elif pulse.pulse_type == "proactive_hint" and visible_score >= self.VISIBLE_CANDIDATE_SCORE_THRESHOLD:
+        elif pulse.pulse_type == "proactive_hint" and visible_score >= visible_threshold:
             action_type = "proactive_candidate"
             guidance = pulse.guidance
             blocked_reason = ""
-        elif visible_score >= self.PREPARE_CANDIDATE_SCORE_THRESHOLD or state.interest > 0.70 or pulse.pulse_type in {"prepare_reply", "join"}:
+        elif visible_score >= prepare_threshold or state.interest > 0.70 or pulse.pulse_type in {"prepare_reply", "join"}:
             action_type = "prepare_reply"
             guidance = "Keep a reply prepared, but wait for a fresh relevant user signal."
             blocked_reason = "not_visible_candidate"
@@ -557,6 +590,9 @@ class HeartflowManager:
         executor_pending = int(snapshot.get("executor_pending", 0) or 0)
         session = self._sessions.get(state.chat_id)
         visible_score, score_components = self._compute_visible_candidate_score(state, session, now=now)
+        rhythm = evaluate_proactive_rhythm(self.config, now=now)
+        visible_threshold = rhythm.threshold(self.VISIBLE_CANDIDATE_SCORE_THRESHOLD)
+        prepare_threshold = rhythm.threshold(self.PREPARE_CANDIDATE_SCORE_THRESHOLD)
         recent_proactive_cooldown = bool(
             session
             and session.last_visible_candidate_ts > 0
@@ -577,18 +613,25 @@ class HeartflowManager:
             "recent_proactive_candidate_cooldown": recent_proactive_cooldown,
             "conflict_cooldown": conflict_cooldown,
             "visible_candidate_score": round(visible_score, 3),
-            "visible_candidate_threshold": self.VISIBLE_CANDIDATE_SCORE_THRESHOLD,
-            "prepare_candidate_threshold": self.PREPARE_CANDIDATE_SCORE_THRESHOLD,
+            "visible_candidate_threshold": round(visible_threshold, 3),
+            "prepare_candidate_threshold": round(prepare_threshold, 3),
             "score_components": score_components,
             "frequency_components": dict(getattr(session, "frequency_components", {}) or {}),
             "insert_pressure": round(float(getattr(session, "insert_pressure", 0.0) or 0.0), 3),
             "reply_pressure": round(float(getattr(session, "reply_pressure", 0.0) or 0.0), 3),
             "direct_relevance": round(float(getattr(session, "direct_relevance", 0.0) or 0.0), 3),
             "dispatch_enabled": False,
+            "quiet_hours": rhythm.quiet_hours,
+            "time_bucket": rhythm.time_bucket,
+            "base_frequency": rhythm.base_frequency,
+            "base_frequency_factor": rhythm.base_frequency_factor,
+            "topic_source_priority": ["conversation_continuity", "recent_memory", "fresh_small_talk"],
         }
         blocked_reason = ""
         if pulse.pulse_type != "proactive_hint":
             blocked_reason = "hidden_impulse"
+        elif rhythm.quiet_hours:
+            blocked_reason = "quiet_hours"
         elif not safety_checks["chat_active"]:
             blocked_reason = "chat_inactive"
         elif not safety_checks["energy_enough"]:
@@ -603,7 +646,7 @@ class HeartflowManager:
             blocked_reason = "conflict_cooldown"
         elif float(pulse.urgency or 0.0) < self.VISIBLE_CANDIDATE_MIN_URGENCY:
             blocked_reason = "low_urgency"
-        elif visible_score < self.VISIBLE_CANDIDATE_SCORE_THRESHOLD:
+        elif visible_score < visible_threshold:
             blocked_reason = "low_candidate_score"
 
         allowed = not blocked_reason
@@ -640,11 +683,12 @@ class HeartflowManager:
             decision.safety_checks["dispatcher_available"] = False
             return decision
 
+        guidance = await self._build_visible_candidate_guidance(state, pulse)
         intent = ProactiveMessageIntent(
             chat_id=state.chat_id,
             source="heartflow",
             reason=pulse.reason,
-            guidance=pulse.guidance,
+            guidance=guidance,
             suggested_social_intent=pulse.suggested_social_intent,
             suggested_action_tier="chat",
             urgency=float(pulse.urgency or 0.0),
@@ -655,6 +699,8 @@ class HeartflowManager:
                 "talk_willingness": float(state.talk_willingness or 0.0),
                 "silence_pressure": float(state.silence_pressure or 0.0),
                 "heartflow_pulse_type": pulse.pulse_type,
+                "topic_source_priority": ["conversation_continuity", "recent_memory", "fresh_small_talk"],
+                "time_bucket": decision.safety_checks.get("time_bucket", ""),
             },
         )
         try:
@@ -689,6 +735,37 @@ class HeartflowManager:
         if not decision.synthetic_event_queued:
             decision.blocked_reason = getattr(dispatch_decision, "blocked_reason", "") or "synthetic_event_not_queued"
         return decision
+
+    async def _build_visible_candidate_guidance(self, state: HeartflowChatState, pulse: HeartflowPulse) -> str:
+        focus = " ".join(str(state.current_focus or "").split())
+        memory_hint = await self._recall_topic_memory(state.chat_id, focus)
+        topic_source = "conversation_continuity" if focus else ("recent_memory" if memory_hint else "fresh_small_talk")
+        parts = [
+            f"Topic source: {topic_source}.",
+            "Priority: continue the current chat lightly; use one private memory hint only if it fits; use fresh small talk only when there is no current topic.",
+            "Write at most one short natural line, easy to ignore.",
+            "Do not @ anyone, do not ask whether anyone is here, do not mention hidden state, schedules, scores, or proactive logic.",
+            pulse.guidance,
+        ]
+        if focus:
+            parts.append(f"Current chat clue: {focus[:160]}")
+        if memory_hint:
+            parts.append(f"Optional private memory hint, do not quote directly: {memory_hint[:180]}")
+        if not focus and not memory_hint:
+            parts.append("If nothing feels natural, staying quiet is better than inventing a topic.")
+        return "\n".join(part for part in parts if str(part or "").strip())
+
+    async def _recall_topic_memory(self, chat_id: str, focus: str) -> str:
+        if not focus or not self.memory_engine or not hasattr(self.memory_engine, "recall"):
+            return ""
+        try:
+            result = await self.memory_engine.recall(focus, session_id=chat_id, top_k=1)
+        except TypeError:
+            result = await self.memory_engine.recall(focus, session_id=chat_id)
+        except Exception as exc:
+            logger.debug(f"[Heartflow] memory hint degraded for {chat_id}: {exc}")
+            return ""
+        return " ".join(str(result or "").split())
 
     def _remember_pulse(self, pulse: HeartflowPulse) -> None:
         items = [*self._pulses_by_chat.get(pulse.chat_id, []), pulse]

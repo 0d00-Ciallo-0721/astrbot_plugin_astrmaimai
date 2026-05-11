@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
@@ -65,6 +66,10 @@ def _page_handler(handler: Callable[[Any], Awaitable[Any]]) -> Callable[..., Awa
         return _json_safe(await handler(_make_page_request(path_values)))
 
     return _wrapped
+
+
+def _werkzeug_path_alias(path: str) -> str:
+    return re.sub(r"\{([^{}]+)\}", r"<\1>", path)
 
 
 class AstrMaiAdminPageApi:
@@ -508,8 +513,15 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/persona/slices", api.persona_slices, "AstrMai 角色切片诊断"),
     ]
 
+    registered: set[tuple[str, str]] = set()
     for method, path, handler, description in routes:
-        context.register_web_api(f"{PLUGIN_API_PREFIX}{path}", _page_handler(handler), [method], description)
+        for route_path in dict.fromkeys((path, _werkzeug_path_alias(path))):
+            full_path = f"{PLUGIN_API_PREFIX}{route_path}"
+            key = (method, full_path)
+            if key in registered:
+                continue
+            registered.add(key)
+            context.register_web_api(full_path, _page_handler(handler), [method], description)
 
 
 __all__ = ["AstrMaiAdminPageApi", "PLUGIN_API_PREFIX", "register_astrmai_admin_pages"]

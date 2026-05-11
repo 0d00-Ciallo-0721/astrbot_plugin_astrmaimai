@@ -197,6 +197,125 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(state_engine.energy_calls, [("group:10001", 5)])
         self.assertGreater(state.next_wakeup_timestamp, now)
 
+    def test_dispatcher_blocks_wakeup_and_heartflow_during_quiet_hours(self):
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+        quiet_ts = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+        original_time = dispatcher_mod.time.time
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                raise AssertionError("quiet hours should not inject proactive events")
+
+        class _StateEngine:
+            async def get_state(self, chat_id):
+                return SimpleNamespace(energy=0.9)
+
+        dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=_StateEngine(),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"], wakeup_min_energy=0.6),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+        async def _run():
+            dispatcher_mod.time.time = lambda: quiet_ts
+            try:
+                results = []
+                for source in ("wakeup", "heartflow"):
+                    results.append(
+                        await dispatcher.dispatch(
+                            dispatcher_mod.ProactiveMessageIntent(
+                                chat_id="group:10001",
+                                source=source,
+                                reason="quiet test",
+                                guidance="say one short line",
+                                metadata={"group_id": "group:10001", "talk_willingness": 0.8},
+                            )
+                        )
+                    )
+                return results
+            finally:
+                dispatcher_mod.time.time = original_time
+
+        decisions = asyncio.run(_run())
+
+        self.assertEqual([item.blocked_reason for item in decisions], ["quiet_hours", "quiet_hours"])
+        self.assertTrue(all(item.safety_checks["quiet_hours"] for item in decisions))
+
+    def test_wakeup_quiet_hours_block_does_not_consume_energy_or_cooldown(self):
+        wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
+        now = time.time()
+        state = SimpleNamespace(
+            chat_id="group:10001",
+            last_reply_time=now - 1200,
+            energy=80,
+            next_wakeup_timestamp=0,
+        )
+
+        class _StateEngine:
+            def __init__(self):
+                self.energy_calls = []
+
+            def get_active_states(self):
+                return [state]
+
+            async def consume_energy(self, chat_id, amount=None):
+                self.energy_calls.append((chat_id, amount))
+
+        class _Dispatcher:
+            async def dispatch(self, intent, *, on_complete=None):
+                return SimpleNamespace(allowed=False, blocked_reason="quiet_hours")
+
+        state_engine = _StateEngine()
+        service = wakeup_mod.WakeupService(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            call_background_lane=lambda *args, **kwargs: None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    proactive_quiet_hours=["23:30-07:30"],
+                ),
+                persona=SimpleNamespace(persona_id="global"),
+                reply=SimpleNamespace(base_frequency=0.7),
+            ),
+            dispatcher=_Dispatcher(),
+        )
+
+        asyncio.run(service.run_once())
+
+        self.assertEqual(state_engine.energy_calls, [])
+        self.assertEqual(state.next_wakeup_timestamp, 0)
+
+    def test_wakeup_guidance_is_human_low_pressure(self):
+        wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
+        service = wakeup_mod.WakeupService(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(get_active_states=lambda: []),
+            persistence=SimpleNamespace(load_persona_cache=lambda: {"global": {"summary": "soft and concise"}}),
+            call_background_lane=lambda *args, **kwargs: None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"]),
+                persona=SimpleNamespace(persona_id="global"),
+                reply=SimpleNamespace(base_frequency=0.7),
+            ),
+            dispatcher=None,
+        )
+
+        guidance = asyncio.run(service.generate_opening_line("group:10001"))
+
+        self.assertIn("one short natural line", guidance)
+        self.assertNotIn("threshold", guidance.lower())
+        self.assertNotIn("system", guidance.lower())
+        self.assertNotIn("anyone here", guidance.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

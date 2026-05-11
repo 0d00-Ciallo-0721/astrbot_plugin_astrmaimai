@@ -3,8 +3,11 @@ import importlib
 import json
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+
+import aiosqlite
 
 
 class WebuiBackendRefactorTests(unittest.TestCase):
@@ -61,6 +64,98 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         self.assertIn("from .routes import api_router", content)
         self.assertIn("app.include_router(api_router, prefix=\"/api\")", content)
+
+    def test_memory_ui_service_writes_real_schema_columns(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "astrmai.db"
+                async with aiosqlite.connect(db_path) as db:
+                    await db.executescript(
+                        """
+                        CREATE TABLE MemoryEvent (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            event_id TEXT,
+                            session_id TEXT,
+                            date TEXT,
+                            narrative TEXT,
+                            emotion TEXT,
+                            importance REAL,
+                            emotional_intensity REAL,
+                            reflection TEXT,
+                            memory_kind TEXT,
+                            source_layer TEXT,
+                            tags TEXT,
+                            created_at REAL
+                        );
+                        CREATE TABLE DailyReflection (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            date TEXT UNIQUE,
+                            reflection TEXT,
+                            created_at REAL
+                        );
+                        CREATE TABLE MemoryNode (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT,
+                            type TEXT,
+                            description TEXT,
+                            last_updated REAL
+                        );
+                        CREATE TABLE Jargon (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            content TEXT,
+                            raw_content TEXT,
+                            meaning TEXT,
+                            is_jargon INTEGER,
+                            count INTEGER,
+                            is_complete INTEGER,
+                            group_id TEXT,
+                            created_at REAL,
+                            updated_at REAL
+                        );
+                        """
+                    )
+                    await db.commit()
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                service = service_mod.MemoryUiService(_db_factory)
+                event = await service.create_event({"narrative": "smoke event", "tags": ["codex"], "importance": 0.8})
+                reflection = await service.create_reflection({"date": "2099-01-09", "summary": "smoke reflection"})
+                node = await service.create_node({"name": "smoke node", "type": "topic", "description": "temporary"})
+                jargon = await service.create_jargon({"content": "smoke jargon", "meaning": "temporary meaning"})
+                await service.update_reflection("2099-01-09", {"summary": "updated reflection"})
+                await service.update_node(node["id"], {"name": "updated node", "type": "topic", "description": "updated"})
+                await service.update_jargon(jargon["id"], {"meaning": "updated meaning", "is_complete": 0})
+
+                async with aiosqlite.connect(db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    event_row = dict(await (await db.execute("SELECT * FROM MemoryEvent WHERE id = ?", (event["id"],))).fetchone())
+                    reflection_row = dict(await (await db.execute("SELECT * FROM DailyReflection WHERE date = ?", ("2099-01-09",))).fetchone())
+                    node_row = dict(await (await db.execute("SELECT * FROM MemoryNode WHERE id = ?", (node["id"],))).fetchone())
+                    jargon_row = dict(await (await db.execute("SELECT * FROM Jargon WHERE id = ?", (jargon["id"],))).fetchone())
+                return event, reflection, node, jargon, event_row, reflection_row, node_row, jargon_row
+
+        event, reflection, node, jargon, event_row, reflection_row, node_row, jargon_row = asyncio.run(_run())
+        self.assertEqual(reflection["status"], "ok")
+        self.assertIsInstance(event["id"], int)
+        self.assertIsInstance(node["id"], int)
+        self.assertIsInstance(jargon["id"], int)
+        self.assertTrue(event_row["event_id"].startswith("plugin_page_"))
+        self.assertEqual(event_row["session_id"], "PLUGIN_PAGE_SMOKE")
+        self.assertEqual(event_row["tags"], '["codex"]')
+        self.assertEqual(reflection_row["reflection"], "updated reflection")
+        self.assertEqual(node_row["name"], "updated node")
+        self.assertEqual(jargon_row["raw_content"], "smoke jargon")
+        self.assertEqual(jargon_row["meaning"], "updated meaning")
 
     def test_settings_service_builds_effective_config_and_validates_schema(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")

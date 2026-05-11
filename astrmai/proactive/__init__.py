@@ -5,9 +5,11 @@ __all__ = [
     "DiaryService",
     "DreamScheduler",
     "ProactiveTask",
+    "ProactiveRhythm",
     "ReviewDispatcher",
     "WakeupService",
     "describe_proactive_capabilities",
+    "evaluate_proactive_rhythm",
 ]
 
 
@@ -42,8 +44,10 @@ def __getattr__(name):
         "DiaryService": ".diary_service",
         "DreamScheduler": ".dream_scheduler",
         "ProactiveTask": ".proactive_task",
+        "ProactiveRhythm": ".rhythm",
         "ReviewDispatcher": ".review_dispatcher",
         "WakeupService": ".wakeup_service",
+        "evaluate_proactive_rhythm": ".rhythm",
     }
     module_name = module_map.get(name)
     if module_name is None:

@@ -7,6 +7,8 @@ from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 
+from .rhythm import evaluate_proactive_rhythm
+
 
 CompletionCallback = Callable[[bool, str], Awaitable[None] | None]
 
@@ -103,6 +105,7 @@ class ProactiveDispatcher:
             return {}
 
     async def _safety_check(self, intent: ProactiveMessageIntent, *, now: float) -> tuple[bool, str, dict[str, Any]]:
+        rhythm = evaluate_proactive_rhythm(self.config, now=now)
         snapshot = await self._activity_snapshot(intent.chat_id)
         latest_ts = float(snapshot.get("latest_activity_ts", 0.0) or 0.0)
         active_age = max(0.0, now - latest_ts) if latest_ts > 0 else 0.0
@@ -129,11 +132,18 @@ class ProactiveDispatcher:
             "cooldown_until": cooldown_until,
             "cooldown_clear": now >= cooldown_until,
             "source": intent.source,
+            "quiet_hours": rhythm.quiet_hours,
+            "time_bucket": rhythm.time_bucket,
+            "proactive_quiet_hours": list(rhythm.quiet_ranges),
+            "base_frequency": rhythm.base_frequency,
+            "base_frequency_factor": rhythm.base_frequency_factor,
         }
         if not checks["has_attention_gate"]:
             return False, "attention_gate_unavailable", checks
         if not intent.chat_id:
             return False, "missing_chat_id", checks
+        if intent.source in {"wakeup", "heartflow"} and rhythm.quiet_hours:
+            return False, "quiet_hours", checks
         if not active:
             return False, "chat_inactive", checks
         if wait_targets or executor_pending > 0:
@@ -251,6 +261,7 @@ class ProactiveDispatcher:
                 "astrmai_proactive_urgency": float(intent.urgency or 0.0),
                 "astrmai_proactive_cost": float(intent.cost or 0.0),
                 "astrmai_proactive_cooldown": float(intent.cooldown or 0.0),
+                "astrmai_proactive_time_bucket": checks.get("time_bucket", ""),
                 "astrmai_social_intent": intent.suggested_social_intent,
                 "astrmai_action_tier": intent.suggested_action_tier,
                 "astrmai_proactive_dispatch_decision": decision,

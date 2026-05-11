@@ -67,6 +67,7 @@ class ProactiveTask:
             call_background_lane=self._call_background_lane,
             config=self.config,
             dispatcher=self.proactive_dispatcher,
+            memory_engine=memory_engine,
         )
         self.decay_service = DecayService(state_engine, memory_engine, self.config)
         self.diary_service = DiaryService(
@@ -90,6 +91,7 @@ class ProactiveTask:
             memory_engine=memory_engine,
             semaphore=self._bg_semaphore,
             dispatcher=self.proactive_dispatcher,
+            config=self.config,
         )
         self.heartflow_topic_digest_service = HeartflowTopicDigestService(
             memory_engine=memory_engine,

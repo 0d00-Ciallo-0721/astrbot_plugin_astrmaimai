@@ -69,6 +69,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             "astrmai.proactive.heartflow.feedback_bridge",
             "astrmai.proactive.heartflow.manager",
             "astrmai.proactive.heartflow",
+            "astrmai.proactive.rhythm",
             "astrmai.conversation.planning.cognitive_loop",
         ]:
             sys.modules.pop(name, None)
@@ -284,6 +285,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             tick_count=2,
             topic_heat=0.86,
             direct_relevance=0.62,
+            low_cost_retained=True,
         )
         manager._sessions["chat-1"] = session
         state = self.heartflow_mod.HeartflowChatState(
@@ -324,6 +326,115 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertFalse(decision.synthetic_event_queued)
         self.assertGreaterEqual(decision.safety_checks["visible_candidate_score"], 0.72)
         self.assertIn("Heartflow proactive_hint", decision.synthetic_event_preview)
+
+    def test_heartflow_quiet_hours_blocks_visible_candidate(self):
+        manager = self.heartflow_mod.HeartflowManager(
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"]),
+                reply=SimpleNamespace(base_frequency=0.7),
+            )
+        )
+        now = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+        manager._sessions["chat-1"] = self.heartflow_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=now - 180,
+            last_activity_ts=now - 1500,
+            last_tick_ts=now,
+            expires_at=now - 1200,
+            tick_count=2,
+            topic_heat=0.92,
+            direct_relevance=0.7,
+        )
+        state = self.heartflow_mod.HeartflowChatState(
+            chat_id="chat-1",
+            last_tick_ts=now,
+            last_activity_ts=now - 1500,
+            interest=0.92,
+            engagement=0.2,
+            talk_willingness=0.90,
+            silence_pressure=0.90,
+            fatigue=0.05,
+            mood_bias=0.4,
+            current_focus="quiet but still relevant",
+            recent_impulse="proactive_hint",
+        )
+        pulse = self.heartflow_mod.HeartflowPulse(
+            chat_id="chat-1",
+            timestamp=now,
+            pulse_type="proactive_hint",
+            reason="silence pressure",
+            guidance="There may be room to rejoin later.",
+            suggested_social_intent="join",
+            suggested_action_tier="chat",
+            urgency=0.86,
+        )
+
+        decision = manager._build_impulse_decision(
+            state,
+            pulse,
+            {"latest_activity_ts": now - 1500, "wait_targets": [], "executor_pending": 0},
+            now=now,
+        )
+
+        self.assertFalse(decision.visible_candidate_allowed)
+        self.assertEqual(decision.blocked_reason, "quiet_hours")
+        self.assertTrue(decision.safety_checks["quiet_hours"])
+
+    def test_heartflow_base_frequency_adjusts_candidate_threshold(self):
+        now = time.mktime((2026, 5, 11, 12, 0, 0, 0, 0, -1))
+        manager = self.heartflow_mod.HeartflowManager(
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"]),
+                reply=SimpleNamespace(base_frequency=0.3),
+            )
+        )
+        manager._sessions["chat-1"] = self.heartflow_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=now - 180,
+            last_activity_ts=now - 1500,
+            last_tick_ts=now,
+            expires_at=now - 1200,
+            tick_count=2,
+            topic_heat=0.86,
+            direct_relevance=0.62,
+        )
+        state = self.heartflow_mod.HeartflowChatState(
+            chat_id="chat-1",
+            last_tick_ts=now,
+            last_activity_ts=now - 1500,
+            interest=0.92,
+            engagement=0.2,
+            talk_willingness=0.90,
+            silence_pressure=0.95,
+            fatigue=0.05,
+            mood_bias=0.4,
+            current_focus="quiet but still relevant",
+            recent_impulse="proactive_hint",
+        )
+        pulse = self.heartflow_mod.HeartflowPulse(
+            chat_id="chat-1",
+            timestamp=now,
+            pulse_type="proactive_hint",
+            reason="silence pressure",
+            guidance="There may be room to rejoin later.",
+            suggested_social_intent="join",
+            suggested_action_tier="chat",
+            urgency=0.86,
+        )
+
+        decision = manager._build_impulse_decision(
+            state,
+            pulse,
+            {"latest_activity_ts": now - 1500, "wait_targets": [], "executor_pending": 0},
+            now=now,
+        )
+
+        self.assertGreater(decision.safety_checks["base_frequency_factor"], 1.0)
+        self.assertGreater(decision.safety_checks["visible_candidate_threshold"], 0.72)
+        self.assertEqual(
+            decision.safety_checks["topic_source_priority"],
+            ["conversation_continuity", "recent_memory", "fresh_small_talk"],
+        )
 
     def test_heartflow_visible_candidate_dispatches_through_dispatcher(self):
         class _Dispatcher:
@@ -391,6 +502,44 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertTrue(decision.synthetic_event_queued)
         self.assertFalse(decision.hidden_only)
         self.assertEqual(decision.safety_checks["dispatch_intent_id"], "intent-1")
+
+    def test_heartflow_visible_candidate_guidance_uses_topic_then_memory(self):
+        class _Memory:
+            async def recall(self, query, session_id=None, top_k=None):
+                return "memory: Alice liked calmer evening check-ins"
+
+        manager = self.heartflow_mod.HeartflowManager(memory_engine=_Memory())
+        now = time.time()
+        state = self.heartflow_mod.HeartflowChatState(
+            chat_id="chat-1",
+            last_tick_ts=now,
+            last_activity_ts=now - 900,
+            interest=0.8,
+            engagement=0.2,
+            talk_willingness=0.7,
+            silence_pressure=0.8,
+            fatigue=0.1,
+            mood_bias=0.0,
+            current_focus="talking about exam plans",
+            recent_impulse="proactive_hint",
+        )
+        pulse = self.heartflow_mod.HeartflowPulse(
+            chat_id="chat-1",
+            timestamp=now,
+            pulse_type="proactive_hint",
+            reason="silence pressure",
+            guidance="There may be room to rejoin later.",
+            suggested_social_intent="join",
+            suggested_action_tier="chat",
+            urgency=0.8,
+        )
+
+        guidance = asyncio.run(manager._build_visible_candidate_guidance(state, pulse))
+
+        self.assertIn("Topic source: conversation_continuity", guidance)
+        self.assertIn("Current chat clue: talking about exam plans", guidance)
+        self.assertIn("Optional private memory hint", guidance)
+        self.assertNotIn("threshold", guidance.lower())
 
     def test_heartflow_impulse_blocks_when_user_is_waiting_or_cooldown_hits(self):
         manager = self.heartflow_mod.HeartflowManager()

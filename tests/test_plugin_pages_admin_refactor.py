@@ -33,22 +33,28 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/learning/status", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/memory-feedback/sources", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/reviews/{{id}}/submit", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/reviews/<id>/submit", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/memories/events/{{id}}", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/memories/events/<id>", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/users/{{user_id}}/slices/{{index}}", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices", paths)
         self.assertNotIn(f"{PLUGIN_API_PREFIX}/persona", paths)
         self.assertFalse(any(path.startswith(f"{PLUGIN_API_PREFIX}/config") for path in paths))
 
         mutating = {(path, methods) for path, _, methods, _ in registered if methods != ("GET",)}
         self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/{{id}}/submit", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/<id>/submit", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/reviews/{{id}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/memories/events/{{id}}/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/memories/events/<id>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/memories/reflections/{{date}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/memories/nodes/{{id}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/memories/jargon/{{id}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}/slices/{{index}}/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>/delete", ("POST",)), mutating)
         self.assertNotIn((f"{PLUGIN_API_PREFIX}/persona/save", ("POST",)), mutating)
 
     def test_registered_plugin_page_handlers_accept_astrbot_path_kwargs(self):

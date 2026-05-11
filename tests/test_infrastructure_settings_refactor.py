@@ -1,6 +1,7 @@
 import importlib
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -86,6 +87,21 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
         self.assertEqual(gateway._task_models(), ["task"])
         self.assertEqual(lane_manager.settings.nicknames, ("Mai",))
         self.assertTrue(gateway._debug_mode())
+
+    def test_proactive_rhythm_defaults_cross_midnight_quiet_hours(self):
+        rhythm_mod = importlib.import_module("astrmai.proactive.rhythm")
+        config = SimpleNamespace(life=SimpleNamespace(), reply=SimpleNamespace(base_frequency=0.3))
+        quiet_ts = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+        morning_ts = time.mktime((2026, 5, 12, 8, 30, 0, 0, 0, -1))
+
+        quiet = rhythm_mod.evaluate_proactive_rhythm(config, now=quiet_ts)
+        morning = rhythm_mod.evaluate_proactive_rhythm(config, now=morning_ts)
+
+        self.assertTrue(quiet.quiet_hours)
+        self.assertEqual(quiet.time_bucket, "quiet")
+        self.assertFalse(morning.quiet_hours)
+        self.assertEqual(morning.time_bucket, "morning")
+        self.assertGreater(quiet.base_frequency_factor, 1.0)
 
 
 class PersistenceBoundaryRefactorTests(unittest.TestCase):
