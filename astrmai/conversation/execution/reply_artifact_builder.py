@@ -66,18 +66,50 @@ class ReplyArtifactMixin:
             logger.warning("[ReplyService] sanitized reply text before sending")
         return cleaned
 
-    def _segment_reply_content(self, text: str, reply_mode: ReplyMode, policy: OutboundPolicy) -> List[str]:
+    def _single_segment(self, text: str) -> List[str]:
+        cleaned = re.sub(r"^\n+|\n+$", "", text.strip())
+        return [cleaned] if cleaned else []
+
+    def _join_segments_for_single_send(self, segments: Sequence[str]) -> str:
+        joined = "\n".join(str(segment or "").strip() for segment in segments if str(segment or "").strip())
+        return re.sub(r"^\n+|\n+$", "", joined.strip())
+
+    def _cap_segments(self, segments: Sequence[str], limit: int) -> List[str]:
+        cleaned = [str(segment or "").strip() for segment in segments if str(segment or "").strip()]
+        if len(cleaned) <= limit:
+            return cleaned
+        head = cleaned[: limit - 1]
+        tail = self._join_segments_for_single_send(cleaned[limit - 1 :])
+        return [*head, tail] if tail else head
+
+    def _segment_reply_content(
+        self,
+        text: str,
+        reply_mode: ReplyMode,
+        policy: OutboundPolicy,
+        *,
+        is_proactive: bool = False,
+        force_segment: bool = False,
+    ) -> tuple[List[str], str]:
         del reply_mode
         if policy.segment_strategy == "single":
-            cleaned = re.sub(r"^\n+|\n+$", "", text.strip())
-            return [cleaned] if cleaned else []
-        if len(text) > self.no_segment_limit:
-            cleaned = re.sub(r"^\n+|\n+$", "", text.strip())
-            return [cleaned] if cleaned else []
+            return self._single_segment(text), "policy_single"
+        has_forced_paragraph = force_segment or "\n\n" in text
+        if len(text) <= self.no_segment_limit and not has_forced_paragraph:
+            return self._single_segment(text), "within_single_limit"
         segments = self.segmenter.segment(text)
+        if not segments:
+            return [], "empty_after_segment"
+        if is_proactive:
+            if len(text) <= self.no_segment_limit:
+                return self._single_segment(text), "proactive_single"
+            return self._cap_segments(segments, 2), "proactive_limited"
         if policy.segment_strategy == "gentle_two_step":
-            return segments[:2]
-        return segments
+            gentle_segments = self._cap_segments(segments, 2)
+            if len(gentle_segments) == 2 and len(gentle_segments[1]) > max(48, self.no_segment_limit // 2):
+                return self._single_segment(self._join_segments_for_single_send(gentle_segments)), "gentle_single_fallback"
+            return gentle_segments, "gentle_two_step"
+        return self._cap_segments(segments, 3), "natural_segmenter"
 
     def _build_visible_reply_artifact(
         self,
@@ -86,7 +118,9 @@ class ReplyArtifactMixin:
         reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP,
         freshness_state: FreshnessState = FreshnessState.FRESH,
         stale_reason: str = "",
+        is_proactive: bool = False,
     ) -> VisibleReplyArtifact:
+        force_segment = "\n\n" in str(text or "")
         policy = self._build_outbound_policy(reply_mode, freshness_state, stale_reason)
         if not policy.should_send:
             return VisibleReplyArtifact(
@@ -97,7 +131,15 @@ class ReplyArtifactMixin:
                 metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
             )
 
-        clean_text = self._clean_reply_content(text)
+        if force_segment:
+            clean_parts = [
+                self._clean_reply_content(part)
+                for part in re.split(r"\n{2,}", str(text or ""))
+                if str(part or "").strip()
+            ]
+            clean_text = "\n\n".join(part for part in clean_parts if part)
+        else:
+            clean_text = self._clean_reply_content(text)
         if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE and policy.late_rewrite_allowed:
             clean_text = self._rewrite_late_reply(reply_mode, clean_text)
         if not clean_text:
@@ -109,9 +151,17 @@ class ReplyArtifactMixin:
                 metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
             )
 
+        is_proactive = bool(is_proactive or getattr(self, "_current_reply_is_proactive", False))
+        raw_segments, segment_reason = self._segment_reply_content(
+            clean_text,
+            reply_mode,
+            policy,
+            is_proactive=is_proactive,
+            force_segment=force_segment,
+        )
         segments = [
             segment
-            for segment in self._segment_reply_content(clean_text, reply_mode, policy)
+            for segment in raw_segments
             if is_sendable_segment(segment)
         ]
         if not segments:
@@ -133,6 +183,8 @@ class ReplyArtifactMixin:
                 "reply_mode": reply_mode.value,
                 "freshness_state": freshness_state.value,
                 "segment_strategy": policy.segment_strategy,
+                "segment_reason": segment_reason,
+                "delay_profile": "proactive" if is_proactive else policy.send_delay_profile,
             },
         )
 
@@ -157,6 +209,20 @@ class ReplyArtifactMixin:
             wait_target_name=target_names[0] if target_names else "",
         )
         return merged
+
+    def _segment_send_delay(self, segment: str, profile: str) -> float:
+        base_factor = float(getattr(self.config.reply, "typing_speed_factor", 0.1) or 0.0)
+        if base_factor <= 0:
+            return 0.0
+        length_weight = min(90, max(8, len(str(segment or ""))))
+        delay = 0.32 + (length_weight * base_factor * 0.16)
+        if profile == "gentle":
+            delay += 0.25
+        elif profile == "fast":
+            delay -= 0.15
+        elif profile == "proactive":
+            delay = min(delay, 0.9)
+        return round(min(2.0, max(0.5, delay)), 2)
 
     async def _send_segments(self, event: AstrMessageEvent, chat_id: str, artifact: VisibleReplyArtifact, at_targets: Sequence[str]) -> bool:
         del chat_id
@@ -189,7 +255,6 @@ class ReplyArtifactMixin:
                 emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
 
             if index < len(artifact.segments) - 1:
-                base_factor = getattr(self.config.reply, "typing_speed_factor", 0.1)
-                delay = min(2.0, max(0.5, len(seg) * base_factor))
+                delay = self._segment_send_delay(seg, str(artifact.metadata.get("delay_profile", "default") or "default"))
                 await asyncio.sleep(delay)
         return artifact.sent

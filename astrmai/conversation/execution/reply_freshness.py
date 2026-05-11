@@ -103,17 +103,19 @@ class ReplyFreshnessMixin:
                 send_delay_profile="fast",
             )
         strategy = "default"
+        delay_profile = "default"
         if reply_mode in {ReplyMode.PLAYFUL_INTERACTION, ReplyMode.IMAGE_REACTION}:
             strategy = "single"
         elif reply_mode == ReplyMode.EMOTIONAL_SUPPORT:
             strategy = "gentle_two_step"
+            delay_profile = "gentle"
         return OutboundPolicy(
             should_send=True,
             freshness_state=freshness_state,
             length_class="normal",
             segment_strategy=strategy,
             late_rewrite_allowed=False,
-            send_delay_profile="default",
+            send_delay_profile=delay_profile,
         )
 
     def _rewrite_late_reply(self, reply_mode: ReplyMode, clean_text: str) -> str:

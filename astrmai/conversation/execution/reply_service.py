@@ -81,6 +81,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             reply_mode=reply_mode,
             freshness_state=freshness_state,
             stale_reason=stale_reason,
+            is_proactive=bool(event.get_extra("astrmai_is_proactive_event", False)),
         )
         if artifact.blocked:
             logger.debug(f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} reply blocked: {artifact.blocked_reason}")
