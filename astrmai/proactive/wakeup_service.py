@@ -125,14 +125,7 @@ class WakeupService:
                 return " ".join(str(getattr(candidates[0], "summary", "") or getattr(candidates[0], "content", "")).split()) if candidates else ""
             except Exception as exc:
                 logger.debug(f"[Life] proactive wakeup v2 memory hint degraded: {exc}")
-        try:
-            result = await self.memory_engine.recall(query, session_id=chat_id, top_k=1)
-        except TypeError:
-            result = await self.memory_engine.recall(query, session_id=chat_id)
-        except Exception as exc:
-            logger.debug(f"[Life] proactive wakeup memory hint degraded: {exc}")
-            return ""
-        return " ".join(str(result or "").split())
+        return ""
 
 
 __all__ = ["WakeupService"]

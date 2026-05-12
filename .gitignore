@@ -1,1 +1,8 @@
 /artifacts/kimi_replay/
+__pycache__/
+*.py[cod]
+data/plugin_data/astrmai/memory/
+*.db
+vectors.index
+backup_before_real_migration_*/
+backup_before_v2_*/

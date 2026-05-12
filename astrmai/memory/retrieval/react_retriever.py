@@ -199,10 +199,7 @@ class ReActRetriever:
                 candidates = await retrieval.retrieve_deep(memory_query)
                 if candidates:
                     return retrieval.render_recall(memory_query, candidates)
-            result = await self.memory_engine.recall(query, session_id=chat_id)
-            if result and "什么也没想起来" not in result:
-                return result
-            return "未找到相关记忆"
+            return "记忆检索服务不可用"
         except Exception as exc:  # pragma: no cover - defensive fallback
             return f"记忆检索失败: {exc}"
 

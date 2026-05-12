@@ -966,8 +966,8 @@ def validate_case_trace(case: ReplayCase, trace: dict[str, Any]) -> list[str]:
             errors.append(f"expected think_level=3 for memory case, got {cognitive.get('think_level')!r}")
         if memory.get("injected") is not True:
             errors.append("expected memory.injected=true")
-        if memory.get("source") not in {"react", "fallback_recall"}:
-            errors.append(f"expected memory source react/fallback_recall, got {memory.get('source')!r}")
+        if memory.get("source") not in {"memory_v2", "proactive_recall+memory_v2"}:
+            errors.append(f"expected memory source memory_v2/proactive_recall+memory_v2, got {memory.get('source')!r}")
 
     if case_id in {"pushback_strict", "zh_boundary_mild"}:
         social_intent = str(cognitive.get("social_intent") or cognitive.get("intent") or "").strip().lower()

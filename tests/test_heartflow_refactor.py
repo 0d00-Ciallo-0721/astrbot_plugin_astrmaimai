@@ -504,9 +504,15 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertEqual(decision.safety_checks["dispatch_intent_id"], "intent-1")
 
     def test_heartflow_visible_candidate_guidance_uses_topic_then_memory(self):
-        class _Memory:
-            async def recall(self, query, session_id=None, top_k=None):
+        class _Retrieval:
+            async def retrieve(self, query):
+                return [SimpleNamespace(summary="memory: Alice liked calmer evening check-ins", content="")]
+
+            def render_recall(self, query, candidates):
                 return "memory: Alice liked calmer evening check-ins"
+
+        class _Memory:
+            retrieval_service = _Retrieval()
 
         manager = self.heartflow_mod.HeartflowManager(memory_engine=_Memory())
         now = time.time()

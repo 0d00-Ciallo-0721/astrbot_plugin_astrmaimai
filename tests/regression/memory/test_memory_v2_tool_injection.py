@@ -97,7 +97,7 @@ class MemoryV2ToolInjectionTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_omni_tool_legacy_recall_uses_keyword_query_and_session(self):
+    def test_omni_tool_without_v2_service_returns_offline_note(self):
         class LegacyEngine:
             def __init__(self):
                 self.calls = []
@@ -110,12 +110,12 @@ class MemoryV2ToolInjectionTests(unittest.TestCase):
             engine = LegacyEngine()
             tool = self.pfc_tools.OmniPerceptionTool(memory_engine=engine, chat_id="chat-1")
             result = await tool.call(_FakeWrapper(_FakeEvent()), query="notebook")
-            self.assertIn("legacy memory", result)
-            self.assertEqual(engine.calls, [((), {"query": "notebook", "session_id": "chat-1"})])
+            self.assertIn("系统提示", result)
+            self.assertEqual(engine.calls, [])
 
         asyncio.run(run())
 
-    def test_self_lore_tool_legacy_recall_uses_keyword_query_and_persona(self):
+    def test_self_lore_tool_without_v2_service_returns_offline_note(self):
         class LegacyEngine:
             def __init__(self):
                 self.calls = []
@@ -128,8 +128,8 @@ class MemoryV2ToolInjectionTests(unittest.TestCase):
             engine = LegacyEngine()
             tool = self.pfc_tools.SelfLoreQueryTool(memory_engine=engine, persona_id="persona-a")
             result = await tool.call(_FakeWrapper(_FakeEvent()), query="voice")
-            self.assertEqual(result, "persona fact")
-            self.assertEqual(engine.calls, [((), {"query": "voice", "persona_id": "persona-a"})])
+            self.assertIn("系统提示", result)
+            self.assertEqual(engine.calls, [])
 
         asyncio.run(run())
 

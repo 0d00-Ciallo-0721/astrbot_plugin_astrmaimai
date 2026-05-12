@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import aiosqlite
-from astrbot.api import logger
-
-from ..contracts.memory_query import MemoryWriteRequest
+from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
 
 
 class SelfLoreService:
@@ -13,21 +10,15 @@ class SelfLoreService:
     async def clear_persona_lore(self, persona_id: str | None = None) -> int:
         if hasattr(self.memory_engine, "clear_persona_lore"):
             return await self.memory_engine.clear_persona_lore(persona_id)
-        if not await self.memory_engine._ensure_faiss_initialized():
+        maintenance = getattr(self.memory_engine, "maintenance_service", None)
+        if not maintenance or not hasattr(maintenance, "soft_delete_by_filter"):
             return 0
-        try:
-            async with aiosqlite.connect(self.memory_engine.db_path) as db:
-                query = "DELETE FROM documents WHERE json_extract(metadata, '$.session_id') = '__self_lore__'"
-                params = []
-                if persona_id:
-                    query += " AND json_extract(metadata, '$.persona_id') = ?"
-                    params.append(persona_id)
-                cursor = await db.execute(query, params)
-                await db.commit()
-                return cursor.rowcount
-        except Exception as exc:
-            logger.error(f"[MemoryEngine] clear persona lore failed: {exc}")
-            return 0
+        return await maintenance.soft_delete_by_filter(
+            kind="persona_lore",
+            session_id="__self_lore__",
+            persona_id=str(persona_id or ""),
+            reason="persona_lore_rebuild",
+        )
 
     async def add_persona_lore(self, content: str, persona_id: str | None = None):
         if hasattr(self.memory_engine, "add_persona_lore"):
@@ -49,17 +40,20 @@ class SelfLoreService:
             )
 
     async def recall_persona_lore(self, query: str, persona_id: str | None = None, top_k: int = 3) -> str:
-        if hasattr(self.memory_engine, "recall_persona_lore"):
-            return await self.memory_engine.recall_persona_lore(query=query, persona_id=persona_id, top_k=top_k)
-        if not await self.memory_engine._ensure_faiss_initialized():
-            return "（设定原典离线）"
-        results = await self.memory_engine.retriever.search(
-            query,
-            k=top_k,
-            session_id="__self_lore__",
-            persona_id=persona_id,
+        retrieval = getattr(self.memory_engine, "retrieval_service", None)
+        if not retrieval or not hasattr(retrieval, "retrieve"):
+            return "锛堣瀹氬師鍏哥绾匡級"
+        results = await retrieval.retrieve(
+            MemoryQuery(
+                query=str(query or ""),
+                session_id="__self_lore__",
+                persona_id=str(persona_id or ""),
+                layers=["persona_lore"],
+                top_k=int(top_k or 3),
+                include_persona_lore=True,
+                allow_stale=True,
+            )
         )
-        valid_results = [result for result in results if getattr(result, "score", 1.0) >= 0.05]
-        if not valid_results:
-            return "（潜意识原典库中未发现相关事实）"
-        return "\n".join(f"[绝对事实]: {result.content}" for result in valid_results)
+        if not results:
+            return "锛堟綔鎰忚瘑鍘熷吀搴撲腑鏈彂鐜扮浉鍏充簨瀹烇級"
+        return "\n".join(f"[缁濆浜嬪疄]: {result.summary or result.content}" for result in results)

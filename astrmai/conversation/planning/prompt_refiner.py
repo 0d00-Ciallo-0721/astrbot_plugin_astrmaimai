@@ -149,19 +149,6 @@ class PromptRefiner:
         is_fast_mode: bool = False,
         retrieve_keys: list[str] | None = None,
     ) -> tuple[MemoryInjectionDecision, str]:
-        injection_service = getattr(self.memory_engine, "injection_service", None)
-        if injection_service and hasattr(injection_service, "build_bundle"):
-            bundle = await injection_service.build_bundle(
-                event=event,
-                prompt=prompt,
-                prompt_envelope=prompt_envelope,
-                disable_rag=disable_rag,
-                is_fast_mode=is_fast_mode,
-                retrieve_keys=retrieve_keys,
-            )
-            turn_context = ensure_turn_context(event)
-            return turn_context.memory, str(getattr(bundle, "rendered_prompt_block", "") or "")
-
         retrieve_keys = retrieve_keys or []
         decision = MemoryInjectionDecision(
             policy=self._memory_policy_for_event(event),
@@ -210,49 +197,27 @@ class PromptRefiner:
         if disable_rag or is_fast_mode:
             decision.skip_reason = "disable_rag_injection" if disable_rag else "fast_mode"
             return decision, ""
+        injection_service = getattr(self.memory_engine, "injection_service", None) if self.memory_engine else None
+        if injection_service is None and self.memory_engine:
+            retrieval_service = getattr(self.memory_engine, "retrieval_service", None)
+            if retrieval_service:
+                from ...memory.services.memory_injection_service import MemoryInjectionService
 
-        chat_id = event.unified_msg_origin
-        react_result = ""
-        enable_react = True
-        if self.config and hasattr(self.config, "memory"):
-            enable_react = self.config.memory.enable_react_agent
-        if not self._allow_react_retrieval(
-            think_level=think_level,
-            decision=decision,
-            current_query=current_query,
-        ):
-            enable_react = False
-
-        if self.react_retriever and enable_react:
-            try:
-                react_result = await self.react_retriever.retrieve(
-                    query=current_query,
-                    chat_id=chat_id,
-                    chat_context=prompt,
-                    sender_name=event.get_sender_name() or "",
-                    retrieve_keys=retrieve_keys,
-                )
-            except Exception as exc:
-                logger.debug(f"[PromptRefiner] ReAct retrieve failed, trying plain recall: {exc}")
-
-        if react_result:
-            decision.source = "react"
-            decision.injected = True
-            decision.summary_preview = self._memory_preview(react_result)
-            return decision, self._format_memory_block(react_result)
-
-        if not self.memory_engine:
-            decision.skip_reason = "memory_engine_unavailable"
+                injection_service = MemoryInjectionService(retrieval_service, config=self.config)
+        if not injection_service or not hasattr(injection_service, "build_bundle"):
+            decision.skip_reason = "memory_injection_service_unavailable"
             return decision, ""
 
-        memory_text = await self.memory_engine.recall(current_query, session_id=chat_id)
-        if memory_text and "什么也没想起来" not in memory_text:
-            decision.source = "fallback_recall"
-            decision.injected = True
-            decision.summary_preview = self._memory_preview(memory_text)
-            return decision, self._format_memory_block(memory_text)
-        decision.skip_reason = "no_result"
-        return decision, ""
+        bundle = await injection_service.build_bundle(
+            event=event,
+            prompt=prompt,
+            prompt_envelope=prompt_envelope,
+            disable_rag=disable_rag,
+            is_fast_mode=is_fast_mode,
+            retrieve_keys=retrieve_keys,
+        )
+        turn_context = ensure_turn_context(event)
+        return turn_context.memory, str(getattr(bundle, "rendered_prompt_block", "") or "")
 
     async def _build_memory_injection(
         self,

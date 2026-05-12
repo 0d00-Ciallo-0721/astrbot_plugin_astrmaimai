@@ -769,14 +769,7 @@ class HeartflowManager:
                 return " ".join(str(getattr(candidates[0], "summary", "") or getattr(candidates[0], "content", "")).split()) if candidates else ""
             except Exception as exc:
                 logger.debug(f"[Heartflow] v2 memory hint degraded for {chat_id}: {exc}")
-        try:
-            result = await self.memory_engine.recall(focus, session_id=chat_id, top_k=1)
-        except TypeError:
-            result = await self.memory_engine.recall(focus, session_id=chat_id)
-        except Exception as exc:
-            logger.debug(f"[Heartflow] memory hint degraded for {chat_id}: {exc}")
-            return ""
-        return " ".join(str(result or "").split())
+        return ""
 
     def _remember_pulse(self, pulse: HeartflowPulse) -> None:
         items = [*self._pulses_by_chat.get(pulse.chat_id, []), pulse]

@@ -447,28 +447,12 @@ class MemoryEngine:
         return unique
 
     async def clear_persona_lore(self, persona_id: str = None) -> int:
-        canonical_deleted = await self.maintenance_service.soft_delete_by_filter(
+        return await self.maintenance_service.soft_delete_by_filter(
             kind="persona_lore",
             session_id="__self_lore__",
             persona_id=str(persona_id or ""),
             reason="persona_lore_rebuild",
         )
-        if not await self._ensure_faiss_initialized():
-            return canonical_deleted
-        try:
-            query = "DELETE FROM documents WHERE json_extract(metadata, '$.session_id') = '__self_lore__'"
-            params: list[Any] = []
-            if persona_id:
-                query += " AND json_extract(metadata, '$.persona_id') = ?"
-                params.append(persona_id)
-            legacy_deleted = await self._execute_documents_write(query, tuple(params))
-            logger.info(
-                f"[MemoryEngine] persona lore cleared: canonical={canonical_deleted}, legacy={legacy_deleted} rows (persona={persona_id})"
-            )
-            return canonical_deleted + legacy_deleted
-        except Exception as exc:
-            logger.error(f"[MemoryEngine] clear persona lore failed: {exc}")
-            return 0
 
     async def add_persona_lore(self, content: str, persona_id: str = None):
         await self.write_service.write(
@@ -535,35 +519,12 @@ class MemoryEngine:
         await self.summarizer.start()
 
     async def apply_daily_decay(self, decay_rate: float, days: int = 1) -> int:
-        v2_deleted = await self.maintenance_service.apply_daily_decay(
+        return await self.maintenance_service.apply_daily_decay(
             decay_rate=decay_rate,
             days=days,
             min_score=getattr(getattr(self.config, "memory", None), "prune_threshold", 0.2),
             stale_grace_seconds=7 * 86400,
         )
-        await self._ensure_faiss_initialized()
-        decay_factor = (1 - decay_rate) ** days
-        try:
-            legacy_rows = await self._execute_documents_write(
-                """
-                UPDATE documents
-                SET metadata = json_set(
-                    metadata,
-                    '$.importance',
-                    MAX(0.01, ROUND(
-                        COALESCE(json_extract(metadata, '$.importance'), 0.5) * ?, 4
-                    ))
-                )
-                WHERE (json_extract(metadata, '$.importance') IS NOT NULL
-                   OR metadata LIKE '%"importance"%')
-                  AND COALESCE(json_extract(metadata, '$.session_id'), '') != '__self_lore__'
-                """,
-                (decay_factor,),
-            )
-            return legacy_rows + v2_deleted
-        except Exception as exc:
-            logger.error(f"[Memory] daily decay SQL failed: {exc}")
-            return v2_deleted
 
     async def import_legacy_memory_events(self, *, limit: int = 1000) -> int:
         version = "2_memory_event_import"
@@ -659,26 +620,7 @@ class MemoryEngine:
         return recent_memories
 
     async def prune_low_importance(self, threshold: float = 0.2) -> int:
-        canonical_deleted = await self.maintenance_service.prune_low_importance(threshold=threshold)
-        if not await self._ensure_faiss_initialized():
-            return canonical_deleted
-        try:
-            deleted_rows = await self._execute_documents_write(
-                """
-                DELETE FROM documents
-                WHERE json_extract(metadata, '$.importance') IS NOT NULL
-                  AND CAST(json_extract(metadata, '$.importance') AS REAL) < ?
-                """,
-                (threshold,),
-            )
-            if deleted_rows > 0:
-                logger.info(
-                    f"[MemoryEngine] pruned canonical={canonical_deleted}, legacy={deleted_rows} low-importance memory rows below threshold {threshold}."
-                )
-            return canonical_deleted + deleted_rows
-        except Exception as exc:
-            logger.error(f"[MemoryEngine] prune low importance failed: {exc}")
-            return canonical_deleted
+        return await self.maintenance_service.prune_low_importance(threshold=threshold)
 
     @staticmethod
     def _compute_text_similarity(text_a: str, text_b: str) -> float:

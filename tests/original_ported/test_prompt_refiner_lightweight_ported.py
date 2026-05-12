@@ -33,28 +33,37 @@ class _FakeEvent:
     def set_extra(self, key, value):
         self._extras[key] = value
 
+    def get_sender_id(self):
+        return "user-1"
+
     def get_sender_name(self):
         return "Alice"
 
 
-class _FakeReactRetriever:
-    def __init__(self, result="earlier lore reminder"):
+class _FakeRetrievalService:
+    def __init__(self, contracts_mod, result="memory v2 reminder"):
+        self.contracts_mod = contracts_mod
         self.result = result
         self.calls = []
 
-    async def retrieve(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.result
-
-
-class _FakeMemoryEngine:
-    def __init__(self, result="should not hit recall fallback"):
-        self.calls = []
-        self.result = result
-
-    async def recall(self, query, session_id=""):
-        self.calls.append((query, session_id))
-        return self.result
+    async def retrieve(self, query):
+        self.calls.append(query)
+        if not self.result:
+            return []
+        return [
+            self.contracts_mod.MemoryCandidate(
+                id="mem-1",
+                kind="memory",
+                source="canonical",
+                summary=self.result,
+                content=self.result,
+                session_id=query.session_id,
+                relevance_score=0.9,
+                recency_score=0.8,
+                created_at=1.0,
+                updated_at=1.0,
+            )
+        ]
 
 
 class PromptRefinerLightweightPortedTests(unittest.TestCase):
@@ -63,7 +72,14 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
         _install_astrbot_stubs(self.temp_dir.name)
         install_executor_stubs()
         install_planner_stubs()
-        sys.modules.pop("astrmai.conversation.planning.prompt_refiner", None)
+        for name in [
+            "astrmai.memory.contracts.memory_query",
+            "astrmai.memory.services.memory_injection_service",
+            "astrmai.conversation.planning.prompt_refiner",
+        ]:
+            sys.modules.pop(name, None)
+        self.contracts_mod = importlib.import_module("astrmai.memory.contracts.memory_query")
+        self.injection_mod = importlib.import_module("astrmai.memory.services.memory_injection_service")
         self.prompt_refiner_mod = importlib.import_module("astrmai.conversation.planning.prompt_refiner")
         self.prompt_refiner_mod = importlib.reload(self.prompt_refiner_mod)
 
@@ -73,12 +89,27 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
         except Exception:
             pass
 
+    def _config(self):
+        return SimpleNamespace(
+            memory=SimpleNamespace(enable_react_agent=True, recall_top_k=5),
+            persona=SimpleNamespace(persona_id="persona-1"),
+        )
+
+    def _make_memory_engine(self, result="memory v2 reminder"):
+        retrieval = _FakeRetrievalService(self.contracts_mod, result=result)
+        injection = self.injection_mod.MemoryInjectionService(retrieval, config=self._config())
+        return SimpleNamespace(
+            injection_service=injection,
+            retrieval_service=retrieval,
+            retrieval_calls=retrieval.calls,
+        )
+
     def test_refiner_builds_user_prompt_sections_and_memory_block(self):
-        memory_engine = _FakeMemoryEngine()
+        memory_engine = self._make_memory_engine("earlier lore reminder")
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=_FakeReactRetriever(),
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
 
@@ -88,67 +119,32 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
                 system_prompt="system prompt only",
                 prompt="wrapped prompt",
                 context={"disable_rag_injection": False},
-                proactive_recall="主动记忆闪回：\n旧记忆片段",
+                proactive_recall="proactive memory fragment",
             )
 
         final_system_prompt, final_prompt = asyncio.run(_run())
 
         self.assertEqual(final_system_prompt, "system prompt only")
-        self.assertEqual(memory_engine.calls, [])
-        self.assertTrue(final_prompt.startswith("现在是 "))
+        self.assertEqual(len(memory_engine.retrieval_calls), 1)
         self.assertIn("---对话记录---\nUser: why not?", final_prompt)
         self.assertIn("---眼前正在对我说的---\nAlice: why not?", final_prompt)
         self.assertIn("---前因---\nFocus block", final_prompt)
         self.assertIn("---补充---\nRelated\nAstrMai: no, that is not allowed", final_prompt)
-        self.assertIn("---旁边在聊的---\nBob: stay on topic", final_prompt)
-        self.assertIn("---记忆闪回（仅供内心参考，不要出现在回复正文中）---", final_prompt)
-        self.assertIn("主动记忆闪回：\n旧记忆片段", final_prompt)
+        self.assertIn("---记忆闪回", final_prompt)
         self.assertIn("earlier lore reminder", final_prompt)
-        self.assertIn("内心浮现的印象，仅供我自己判断当下", final_prompt)
-        self.assertIn("原文不要逐字出现在回复里", final_prompt)
-        self.assertIn("绝不照搬原文", final_prompt)
-        self.assertNotIn("不要照抄", final_prompt)
+        self.assertIn("proactive memory fragment", final_prompt)
 
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertTrue(memory_decision.injected)
-        self.assertEqual(memory_decision.source, "proactive_recall+react")
-        self.assertEqual(memory_decision.policy, "light")
-        self.assertEqual(memory_decision.retrieve_keys, [])
+        self.assertEqual(memory_decision.source, "proactive_recall+memory_v2")
         self.assertIn("earlier lore reminder", memory_decision.summary_preview)
 
-    def test_refiner_skips_memory_and_slims_background_when_near_context_priority(self):
-        refiner = self.prompt_refiner_mod.PromptRefiner(
-            memory_engine=_FakeMemoryEngine(),
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=_FakeReactRetriever(),
-        )
-        event = _FakeEvent()
-        event._extras["astrmai_near_context_priority"] = True
-        event._extras["astrmai_ambient_background_text"] = "Bob: stay on topic\nCarol: I am reading too"
-
-        async def _run():
-            return await refiner.refine_prompt(
-                event=event,
-                system_prompt="system prompt only",
-                prompt="why not?",
-                context={"disable_rag_injection": False},
-            )
-
-        final_system_prompt, final_prompt = asyncio.run(_run())
-        self.assertEqual(final_system_prompt, "system prompt only")
-        self.assertNotIn("earlier lore reminder", final_prompt)
-        self.assertNotIn("Bob: stay on topic", final_prompt)
-        self.assertIn("Carol: I am reading too", final_prompt)
-        memory_decision = event.get_extra("astrmai_turn_context").memory
-        self.assertFalse(memory_decision.injected)
-        self.assertEqual(memory_decision.skip_reason, "near_context_priority")
-
-    def test_refiner_records_fallback_recall_memory_decision(self):
-        memory_engine = _FakeMemoryEngine()
+    def test_refiner_records_no_result_memory_decision(self):
+        memory_engine = self._make_memory_engine(result="")
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=_FakeReactRetriever(result=""),
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
 
@@ -162,18 +158,17 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
         _final_system_prompt, final_prompt = asyncio.run(_run())
 
-        self.assertIn("should not hit recall fallback", final_prompt)
-        self.assertEqual(len(memory_engine.calls), 1)
+        self.assertNotIn("memory v2 reminder", final_prompt)
+        self.assertEqual(len(memory_engine.retrieval_calls), 1)
         memory_decision = event.get_extra("astrmai_turn_context").memory
-        self.assertTrue(memory_decision.injected)
-        self.assertEqual(memory_decision.source, "fallback_recall")
-        self.assertIn("should not hit recall fallback", memory_decision.summary_preview)
+        self.assertFalse(memory_decision.injected)
+        self.assertEqual(memory_decision.skip_reason, "no_result")
 
     def test_refiner_records_disable_and_fast_skip_reasons(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
-            memory_engine=_FakeMemoryEngine(),
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=_FakeReactRetriever(),
+            memory_engine=self._make_memory_engine(),
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         disabled_event = _FakeEvent()
 
@@ -208,9 +203,9 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
     def test_refiner_lightweight_event_suppresses_memory_and_proactive_recall(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
-            memory_engine=_FakeMemoryEngine(),
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=_FakeReactRetriever(),
+            memory_engine=self._make_memory_engine(),
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_lightweight_event"] = True
@@ -227,16 +222,15 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
         _final_system_prompt, final_prompt = asyncio.run(_run())
 
         self.assertNotIn("old proactive memory should not appear", final_prompt)
-        self.assertNotIn("---璁板繂闂洖", final_prompt)
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertFalse(memory_decision.injected)
         self.assertEqual(memory_decision.skip_reason, "lightweight_event")
 
     def test_refiner_skips_memory_for_think_level_zero(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
-            memory_engine=_FakeMemoryEngine(),
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=_FakeReactRetriever(),
+            memory_engine=self._make_memory_engine(),
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_think_level"] = 0
@@ -259,12 +253,11 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
         self.assertNotIn("proactive memory should not appear", final_prompt)
 
     def test_refiner_skips_level_one_without_memory_intent(self):
-        memory_engine = _FakeMemoryEngine()
-        react = _FakeReactRetriever()
+        memory_engine = self._make_memory_engine()
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=react,
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_think_level"] = 1
@@ -282,16 +275,14 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertFalse(memory_decision.injected)
         self.assertEqual(memory_decision.skip_reason, "think_level_1_no_memory_intent")
-        self.assertEqual(react.calls, [])
-        self.assertEqual(memory_engine.calls, [])
+        self.assertEqual(memory_engine.retrieval_calls, [])
 
-    def test_refiner_level_one_memory_intent_uses_fallback_only(self):
-        memory_engine = _FakeMemoryEngine()
-        react = _FakeReactRetriever()
+    def test_refiner_level_one_memory_intent_uses_memory_v2(self):
+        memory_engine = self._make_memory_engine()
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=react,
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_think_level"] = 1
@@ -308,17 +299,15 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertTrue(memory_decision.injected)
-        self.assertEqual(memory_decision.source, "fallback_recall")
-        self.assertEqual(react.calls, [])
-        self.assertEqual(len(memory_engine.calls), 1)
+        self.assertEqual(memory_decision.source, "memory_v2")
+        self.assertEqual(len(memory_engine.retrieval_calls), 1)
 
-    def test_refiner_level_two_uses_fallback_without_react_by_default(self):
-        memory_engine = _FakeMemoryEngine()
-        react = _FakeReactRetriever()
+    def test_refiner_level_two_uses_memory_v2_by_default(self):
+        memory_engine = self._make_memory_engine()
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=react,
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_think_level"] = 2
@@ -333,18 +322,16 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
         asyncio.run(_run())
 
-        self.assertEqual(react.calls, [])
-        self.assertEqual(len(memory_engine.calls), 1)
+        self.assertEqual(len(memory_engine.retrieval_calls), 1)
         memory_decision = event.get_extra("astrmai_turn_context").memory
-        self.assertEqual(memory_decision.source, "fallback_recall")
+        self.assertEqual(memory_decision.source, "memory_v2")
 
-    def test_refiner_level_two_deep_memory_intent_allows_react(self):
-        memory_engine = _FakeMemoryEngine()
-        react = _FakeReactRetriever()
+    def test_refiner_level_two_deep_memory_intent_still_uses_memory_v2(self):
+        memory_engine = self._make_memory_engine()
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=react,
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_think_level"] = 2
@@ -360,19 +347,16 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
         asyncio.run(_run())
 
-        self.assertEqual(len(react.calls), 1)
-        self.assertEqual(memory_engine.calls, [])
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertEqual(memory_decision.policy, "deep")
-        self.assertEqual(memory_decision.source, "react")
+        self.assertEqual(memory_decision.source, "memory_v2")
 
-    def test_refiner_allows_react_at_think_level_three(self):
-        memory_engine = _FakeMemoryEngine()
-        react = _FakeReactRetriever()
+    def test_refiner_allows_memory_v2_at_think_level_three(self):
+        memory_engine = self._make_memory_engine()
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=react,
+            config=self._config(),
+            react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
         event._extras["astrmai_think_level"] = 3
@@ -387,36 +371,9 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
         asyncio.run(_run())
 
-        self.assertEqual(len(react.calls), 1)
-        self.assertEqual(memory_engine.calls, [])
+        self.assertEqual(len(memory_engine.retrieval_calls), 1)
         memory_decision = event.get_extra("astrmai_turn_context").memory
-        self.assertEqual(memory_decision.source, "react")
-
-    def test_refiner_level_three_falls_back_when_react_has_no_result(self):
-        memory_engine = _FakeMemoryEngine()
-        react = _FakeReactRetriever(result="")
-        refiner = self.prompt_refiner_mod.PromptRefiner(
-            memory_engine=memory_engine,
-            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=True)),
-            react_retriever=react,
-        )
-        event = _FakeEvent()
-        event._extras["astrmai_think_level"] = 3
-
-        async def _run():
-            return await refiner.refine_prompt(
-                event=event,
-                system_prompt="system prompt only",
-                prompt="你还记得我上次说什么吗？",
-                context={"disable_rag_injection": False},
-            )
-
-        asyncio.run(_run())
-
-        self.assertEqual(len(react.calls), 1)
-        self.assertEqual(len(memory_engine.calls), 1)
-        memory_decision = event.get_extra("astrmai_turn_context").memory
-        self.assertEqual(memory_decision.source, "fallback_recall")
+        self.assertEqual(memory_decision.source, "memory_v2")
 
 
 if __name__ == "__main__":

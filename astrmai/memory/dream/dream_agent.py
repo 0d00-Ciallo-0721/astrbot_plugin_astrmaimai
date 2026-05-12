@@ -33,6 +33,7 @@ from astrbot.api import logger
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.persistence.database_service import DatabaseService
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ..contracts.memory_query import MemoryQuery
 
 
 class DreamAgent:
@@ -196,10 +197,16 @@ class DreamAgent:
         limit = int(params.get("limit", 5))
         if not query:
             return "参数缺失: query"
-        if self.memory_engine:
-            result = await self.memory_engine.recall(query, session_id=session_id, top_k=limit)
+        retrieval = getattr(self.memory_engine, "retrieval_service", None) if self.memory_engine else None
+        if retrieval and hasattr(retrieval, "retrieve"):
+            memory_query = MemoryQuery(query=str(query or ""), session_id=str(session_id or ""), top_k=limit)
+            candidates = await retrieval.retrieve(memory_query)
+            if hasattr(retrieval, "render_recall"):
+                result = retrieval.render_recall(memory_query, candidates)
+            else:
+                result = "\n".join(str(getattr(item, "summary", "") or getattr(item, "content", "")) for item in candidates)
             return result or "未找到相关记忆"
-        return "记忆引擎不可用"
+        return "记忆检索服务不可用"
 
     async def _tool_get_detail(self, params: Dict) -> str:
         event_id = params.get("event_id", "")

@@ -123,18 +123,6 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
             )
 
         async def _fetch_memory():
-            if not self.memory_engine or not query or not self.chat_id:
-                return None
-            search_query = f"{target_name} {query}".strip() if target_name else query
-            try:
-                if hasattr(self.memory_engine, "query"):
-                    return await self.memory_engine.query(query=search_query, session_id=self.chat_id)
-                if hasattr(self.memory_engine, "search"):
-                    return await self.memory_engine.search(query=search_query, session_id=self.chat_id)
-                if hasattr(self.memory_engine, "recall"):
-                    return await self.memory_engine.recall(query=search_query, session_id=self.chat_id)
-            except Exception as exc:
-                logger.debug(f"[OmniPerceptionTool] memory lookup failed: {exc}")
             return None
 
         async def _fetch_profile():
@@ -555,10 +543,6 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
                     event=current_event,
                 )
                 result = tool_service.render_result(tool_result)
-            elif hasattr(self.memory_engine, "recall_persona_lore"):
-                result = await self.memory_engine.recall_persona_lore(query=query, persona_id=self.persona_id)
-            elif hasattr(self.memory_engine, "query_persona_lore"):
-                result = await self.memory_engine.query_persona_lore(query=query, persona_id=self.persona_id)
             else:
                 result = None
         except Exception as exc:

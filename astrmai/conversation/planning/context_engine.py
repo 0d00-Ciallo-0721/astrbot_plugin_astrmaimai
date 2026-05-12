@@ -281,7 +281,7 @@ class ContextEngine:
                     str(getattr(item, "summary", "") or getattr(item, "content", "")) for item in candidates
                 )
             else:
-                recall_result = await memory_engine.recall(last_msg, session_id=chat_id)
+                return ""
         except Exception as exc:
             logger.warning(f"[ContextEngine] proactive recall failed: {exc}")
             return ""

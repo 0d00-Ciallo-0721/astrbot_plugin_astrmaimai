@@ -522,11 +522,23 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
     def test_migration_service_dry_run_execute_verify_and_repair(self):
         async def run():
+            with open(os.path.join(self.temp_dir.name, "persona_cache.json"), "w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"persona-a":{"summary":"Gentle and concise.","style":"Soft replies."},"persona-empty":{"summary":"   "}}'
+                )
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)")
                 await db.execute(
                     "INSERT INTO documents(id, text, metadata) VALUES (1, ?, ?)",
                     ("Alice document import memory.", '{"session_id":"chat-1","source":"legacy"}'),
+                )
+                await db.execute(
+                    "INSERT INTO documents(id, text, metadata) VALUES (2, ?, ?)",
+                    ("Already projected legacy memory.", '{"session_id":"chat-1","canonical_id":"mem-existing"}'),
+                )
+                await db.execute(
+                    "INSERT INTO documents(id, text, metadata) VALUES (3, ?, ?)",
+                    ("", '{"session_id":"chat-1","source":"legacy"}'),
                 )
                 await db.execute(
                     """
@@ -545,20 +557,30 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     "INSERT INTO MemoryEvent(event_id, session_id, narrative, memory_kind, tags, importance) VALUES (?, ?, ?, ?, ?, ?)",
                     ("evt-1", "chat-1", "Alice event import memory.", "event", '["legacy"]', 0.8),
                 )
+                await db.execute(
+                    "INSERT INTO MemoryEvent(event_id, session_id, narrative, memory_kind, tags, importance) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("evt-empty", "chat-1", "", "event", '["legacy"]', 0.2),
+                )
                 await db.commit()
             store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
             migration = self.migration_mod.MemoryMigrationService(store)
 
             dry_run = await migration.dry_run()
-            self.assertEqual(dry_run["totals"]["importable"], 2)
+            self.assertEqual(dry_run["totals"]["importable"], 3)
+            self.assertEqual(dry_run["totals"]["duplicates"], 1)
+            self.assertEqual(dry_run["totals"]["skipped"], 3)
 
             executed = await migration.execute()
             self.assertEqual(executed["imported"]["documents"], 1)
             self.assertEqual(executed["imported"]["MemoryEvent"], 1)
+            self.assertEqual(executed["imported"]["persona_cache"], 1)
 
             verified = await migration.verify()
             self.assertIn("migration", verified)
             self.assertEqual(verified["legacy"]["unmapped_memory_events"], 0)
+            self.assertTrue(await store.find_ids_by_source_ref("documents:1"))
+            self.assertTrue(await store.find_ids_by_source_ref("MemoryEvent:evt-1"))
+            self.assertTrue(await store.find_ids_by_source_ref("persona_cache:persona-a"))
 
             repaired = await migration.repair(verified)
             self.assertEqual(repaired["mode"], "repair")
