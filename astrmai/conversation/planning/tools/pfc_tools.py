@@ -96,6 +96,7 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
         }
     )
     memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    memory_tool_service: Optional[Any] = Field(default=None, exclude=True)
     db_service: Optional[Any] = Field(default=None, exclude=True)
     chat_id: str = Field(default="", exclude=True)
     current_sender_id: str = Field(default="", exclude=True)
@@ -108,17 +109,30 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
         if not (query or target_name or recall_date):
             return "执行失败：请至少提供 query、target_name、recall_date 之一。"
 
+        current_event = _get_current_event(context)
+        tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
+        if tool_service and hasattr(tool_service, "omni_query"):
+            return await tool_service.omni_query(
+                query=query,
+                target_name=target_name,
+                recall_date=recall_date,
+                chat_id=self.chat_id,
+                current_sender_id=self.current_sender_id,
+                current_sender_name=self.current_sender_name,
+                event=current_event,
+            )
+
         async def _fetch_memory():
             if not self.memory_engine or not query or not self.chat_id:
                 return None
             search_query = f"{target_name} {query}".strip() if target_name else query
             try:
                 if hasattr(self.memory_engine, "query"):
-                    return await self.memory_engine.query(self.chat_id, search_query)
+                    return await self.memory_engine.query(query=search_query, session_id=self.chat_id)
                 if hasattr(self.memory_engine, "search"):
-                    return await self.memory_engine.search(self.chat_id, search_query)
+                    return await self.memory_engine.search(query=search_query, session_id=self.chat_id)
                 if hasattr(self.memory_engine, "recall"):
-                    return await self.memory_engine.recall(self.chat_id, search_query)
+                    return await self.memory_engine.recall(query=search_query, session_id=self.chat_id)
             except Exception as exc:
                 logger.debug(f"[OmniPerceptionTool] memory lookup failed: {exc}")
             return None
@@ -513,6 +527,7 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
     name: str = "self_lore_query"
     description: str = "查询当前 persona 的自我设定、世界观或既有自述。"
     memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    memory_tool_service: Optional[Any] = Field(default=None, exclude=True)
     persona_id: str = Field(default="", exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
@@ -528,13 +543,22 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
         query = str(kwargs.get("query", "") or "").strip()
         if not query:
             return "执行失败：query 不能为空。"
-        if not self.memory_engine:
+        if not self.memory_engine and not self.memory_tool_service:
             return "系统提示：当前没有可用的自我设定记忆引擎。"
         try:
-            if hasattr(self.memory_engine, "recall_persona_lore"):
-                result = await self.memory_engine.recall_persona_lore(self.persona_id, query)
+            current_event = _get_current_event(context)
+            tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
+            if tool_service and hasattr(tool_service, "self_lore_query"):
+                tool_result = await tool_service.self_lore_query(
+                    query=query,
+                    persona_id=self.persona_id,
+                    event=current_event,
+                )
+                result = tool_service.render_result(tool_result)
+            elif hasattr(self.memory_engine, "recall_persona_lore"):
+                result = await self.memory_engine.recall_persona_lore(query=query, persona_id=self.persona_id)
             elif hasattr(self.memory_engine, "query_persona_lore"):
-                result = await self.memory_engine.query_persona_lore(self.persona_id, query)
+                result = await self.memory_engine.query_persona_lore(query=query, persona_id=self.persona_id)
             else:
                 result = None
         except Exception as exc:

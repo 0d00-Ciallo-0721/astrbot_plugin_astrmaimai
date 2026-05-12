@@ -10,6 +10,12 @@
         <!-- Navigation Tabs -->
         <div class="glass-panel p-1.5 flex gap-1 rounded-lg">
             <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
+                    :class="currentTab === 'canonical' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
+                    @click="setTab('canonical')">Canonical</button>
+            <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
+                    :class="currentTab === 'diagnostics' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
+                    @click="setTab('diagnostics')">Diagnostics</button>
+            <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
                     :class="currentTab === 'events' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
                     @click="setTab('events')">记忆碎片 (Events)</button>
             <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
@@ -32,6 +38,143 @@
 
     <div x-show="!loading" class="flex-1">
         
+        <!-- CANONICAL MEMORY TAB -->
+        <template x-if="currentTab === 'canonical'">
+            <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_420px] gap-6">
+                <div class="flex flex-col gap-4">
+                    <div class="glass-panel p-4 grid grid-cols-1 md:grid-cols-5 gap-3">
+                        <input class="form-input" placeholder="session_id" x-model="canonicalFilters.session_id" @change="loadCanonical()">
+                        <input class="form-input" placeholder="persona_id" x-model="canonicalFilters.persona_id" @change="loadCanonical()">
+                        <input class="form-input" placeholder="kind" x-model="canonicalFilters.kind" @change="loadCanonical()">
+                        <select class="form-input" x-model="canonicalFilters.status" @change="loadCanonical()">
+                            <option value="">all status</option>
+                            <option value="active">active</option>
+                            <option value="stale">stale</option>
+                            <option value="deleted">deleted</option>
+                            <option value="merged">merged</option>
+                        </select>
+                        <button class="glass-btn px-4 py-2 text-sm" @click="loadCanonical()">
+                            <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                        </button>
+                    </div>
+
+                    <div class="glass-panel overflow-hidden">
+                        <div class="px-5 py-3 border-b border-white/10 flex items-center justify-between">
+                            <div>
+                                <h3 class="font-bold text-slate-100">Canonical Memory</h3>
+                                <p class="text-xs text-slate-500" x-text="`${canonical.total || 0} records`"></p>
+                            </div>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left">
+                                <thead>
+                                    <tr class="border-b border-white/10 text-slate-400 text-sm bg-slate-800/50">
+                                        <th class="px-5 py-3">Memory</th>
+                                        <th class="px-5 py-3 whitespace-nowrap">Kind</th>
+                                        <th class="px-5 py-3 whitespace-nowrap">Status</th>
+                                        <th class="px-5 py-3 whitespace-nowrap">Weight</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="text-sm text-slate-300">
+                                    <template x-for="item in canonical.items" :key="item.id">
+                                        <tr class="border-b border-white/5 hover:bg-slate-800/40 cursor-pointer"
+                                            :class="selectedCanonical && selectedCanonical.id === item.id ? 'bg-brand-500/10' : ''"
+                                            @click="loadCanonicalDetail(item.id)">
+                                            <td class="px-5 py-4">
+                                                <div class="font-mono text-xs text-brand-300" x-text="item.id"></div>
+                                                <div class="mt-1 line-clamp-2" x-text="item.summary || item.content"></div>
+                                                <div class="mt-1 text-xs text-slate-500" x-text="item.session_id || 'global'"></div>
+                                            </td>
+                                            <td class="px-5 py-4 whitespace-nowrap" x-text="item.kind"></td>
+                                            <td class="px-5 py-4 whitespace-nowrap">
+                                                <span class="px-2 py-1 rounded text-xs border"
+                                                      :class="item.status === 'active' ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300' : (item.status === 'stale' ? 'bg-amber-500/15 border-amber-500/30 text-amber-300' : 'bg-slate-800 border-slate-600 text-slate-300')"
+                                                      x-text="item.status"></span>
+                                            </td>
+                                            <td class="px-5 py-4 whitespace-nowrap">
+                                                <span x-text="Number(item.importance || 0).toFixed(2)"></span>
+                                                <span class="text-slate-500"> / </span>
+                                                <span x-text="Number(item.confidence || 0).toFixed(2)"></span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                    <template x-if="!canonical.items || !canonical.items.length">
+                                        <tr><td colspan="4" class="p-8 text-center text-slate-500">No canonical memory records.</td></tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <aside class="glass-panel p-5 h-max sticky top-4" x-show="selectedCanonical">
+                    <div class="flex items-start justify-between gap-3 mb-4">
+                        <div>
+                            <h3 class="font-bold text-slate-100">Memory Detail</h3>
+                            <p class="font-mono text-xs text-brand-300 break-all" x-text="selectedCanonical && selectedCanonical.id"></p>
+                        </div>
+                        <span class="px-2 py-1 rounded text-xs bg-slate-800 text-slate-300" x-text="selectedCanonical && selectedCanonical.visibility"></span>
+                    </div>
+                    <div class="space-y-4 text-sm">
+                        <div>
+                            <div class="text-xs uppercase text-slate-500 mb-1">Summary</div>
+                            <p class="text-slate-200 leading-relaxed" x-text="selectedCanonical && selectedCanonical.summary"></p>
+                        </div>
+                        <div>
+                            <div class="text-xs uppercase text-slate-500 mb-1">Content</div>
+                            <p class="text-slate-300 whitespace-pre-wrap leading-relaxed max-h-56 overflow-auto" x-text="selectedCanonical && selectedCanonical.content"></p>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3 text-xs">
+                            <div><span class="text-slate-500">source</span><div x-text="selectedCanonical && selectedCanonical.source"></div></div>
+                            <div><span class="text-slate-500">kind</span><div x-text="selectedCanonical && selectedCanonical.kind"></div></div>
+                            <div><span class="text-slate-500">updated</span><div x-text="formatDate(selectedCanonical && selectedCanonical.updated_at)"></div></div>
+                            <div><span class="text-slate-500">last access</span><div x-text="formatDate(selectedCanonical && selectedCanonical.last_access_time)"></div></div>
+                        </div>
+                        <pre class="text-xs bg-slate-950/70 border border-white/10 rounded p-3 max-h-48 overflow-auto" x-text="formatJson(selectedCanonical && selectedCanonical.metadata)"></pre>
+                        <div class="flex flex-wrap gap-2 pt-2">
+                            <button class="glass-btn px-3 py-2 text-xs" @click="restoreCanonical(selectedCanonical.id)">Restore</button>
+                            <button class="glass-btn px-3 py-2 text-xs" @click="markCanonicalStale(selectedCanonical.id)">Mark stale</button>
+                            <button class="glass-btn px-3 py-2 text-xs text-rose-300" @click="softDeleteCanonical(selectedCanonical.id)">Soft delete</button>
+                        </div>
+                        <div class="flex gap-2">
+                            <input class="form-input flex-1" placeholder="target memory id" x-model="mergeTargetId">
+                            <button class="glass-btn px-3 py-2 text-xs" @click="mergeCanonical(selectedCanonical.id)">Merge</button>
+                        </div>
+                    </div>
+                </aside>
+            </div>
+        </template>
+
+        <!-- MEMORY DIAGNOSTICS TAB -->
+        <template x-if="currentTab === 'diagnostics'">
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                <div class="glass-panel p-5">
+                    <h3 class="font-bold text-slate-100 mb-4">Migration</h3>
+                    <div class="flex flex-wrap gap-2 mb-4">
+                        <button class="glass-btn px-3 py-2 text-xs" @click="runMigrationDryRun()">Dry run</button>
+                        <button class="glass-btn px-3 py-2 text-xs" @click="runMigrationExecute()">Execute</button>
+                        <button class="glass-btn px-3 py-2 text-xs" @click="runMigrationVerify()">Verify</button>
+                        <button class="glass-btn px-3 py-2 text-xs" @click="runMigrationRepair()">Repair</button>
+                    </div>
+                    <pre class="text-xs bg-slate-950/70 border border-white/10 rounded p-3 max-h-[460px] overflow-auto" x-text="formatJson(migrationReport)"></pre>
+                </div>
+                <div class="glass-panel p-5">
+                    <h3 class="font-bold text-slate-100 mb-4">Index Projection</h3>
+                    <div class="flex flex-wrap gap-2 mb-4">
+                        <button class="glass-btn px-3 py-2 text-xs" @click="loadDiagnostics()">Refresh</button>
+                        <button class="glass-btn px-3 py-2 text-xs" @click="rebuildIndex()">Rebuild all</button>
+                        <button class="glass-btn px-3 py-2 text-xs" @click="runMigrationRepair()">Repair</button>
+                    </div>
+                    <pre class="text-xs bg-slate-950/70 border border-white/10 rounded p-3 max-h-[460px] overflow-auto" x-text="formatJson(indexStatus)"></pre>
+                </div>
+                <div class="glass-panel p-5">
+                    <h3 class="font-bold text-slate-100 mb-4">Maintenance</h3>
+                    <button class="glass-btn px-3 py-2 text-xs mb-4" @click="runMaintenance()">Run once</button>
+                    <pre class="text-xs bg-slate-950/70 border border-white/10 rounded p-3 max-h-[460px] overflow-auto" x-text="formatJson(maintenanceReport)"></pre>
+                </div>
+            </div>
+        </template>
+
         <!-- EVENTS TAB -->
         <template x-if="currentTab === 'events'">
             <div class="flex flex-col gap-6">

@@ -4,6 +4,7 @@ import time
 
 from astrbot.api import logger
 
+from ..memory.contracts.memory_query import MemoryQuery
 from .dispatcher import ProactiveMessageIntent
 from .rhythm import evaluate_proactive_rhythm
 
@@ -112,8 +113,18 @@ class WakeupService:
         return "\n".join(parts)
 
     async def _recall_light_memory(self, chat_id: str, query: str) -> str:
-        if not self.memory_engine or not hasattr(self.memory_engine, "recall"):
+        if not self.memory_engine:
             return ""
+        retrieval = getattr(self.memory_engine, "retrieval_service", None)
+        if retrieval and hasattr(retrieval, "retrieve"):
+            try:
+                memory_query = MemoryQuery(query=str(query or ""), session_id=str(chat_id or ""), top_k=1)
+                candidates = await retrieval.retrieve(memory_query)
+                if hasattr(retrieval, "render_recall"):
+                    return " ".join(str(retrieval.render_recall(memory_query, candidates) or "").split())
+                return " ".join(str(getattr(candidates[0], "summary", "") or getattr(candidates[0], "content", "")).split()) if candidates else ""
+            except Exception as exc:
+                logger.debug(f"[Life] proactive wakeup v2 memory hint degraded: {exc}")
         try:
             result = await self.memory_engine.recall(query, session_id=chat_id, top_k=1)
         except TypeError:

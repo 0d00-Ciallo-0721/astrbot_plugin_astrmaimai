@@ -1,8 +1,15 @@
 function memoryPage() {
     return {
-        currentTab: 'events', // 'events', 'reflections', 'nodes', 'jargon'
+        currentTab: 'canonical', // 'canonical', 'diagnostics', 'events', 'reflections', 'nodes', 'jargon'
         
         // Data
+        canonical: { items: [], total: 0 },
+        canonicalFilters: { session_id: '', persona_id: '', kind: '', status: '' },
+        selectedCanonical: null,
+        mergeTargetId: '',
+        migrationReport: null,
+        indexStatus: null,
+        maintenanceReport: null,
         events: [],
         reflectionsMap: {},
         calendarDays: [],
@@ -33,7 +40,11 @@ function memoryPage() {
         async loadAll() {
             this.loading = true;
             try {
-                if (this.currentTab === 'events') {
+                if (this.currentTab === 'canonical') {
+                    await this.loadCanonical();
+                } else if (this.currentTab === 'diagnostics') {
+                    await this.loadDiagnostics();
+                } else if (this.currentTab === 'events') {
                     this.events = await window.api.get('/memories/events');
                 } else if (this.currentTab === 'reflections') {
                     await this.loadReflections(this.currentMonthStr);
@@ -47,6 +58,91 @@ function memoryPage() {
             } finally {
                 this.loading = false;
             }
+        },
+
+        // --- Canonical Memory v2 ---
+        async loadCanonical() {
+            const params = new URLSearchParams();
+            Object.entries(this.canonicalFilters).forEach(([key, value]) => {
+                if (value) params.set(key, value);
+            });
+            params.set('limit', '100');
+            this.canonical = await window.api.get(`/memories/canonical?${params.toString()}`);
+            if (!this.selectedCanonical && this.canonical.items && this.canonical.items.length) {
+                this.selectedCanonical = this.canonical.items[0];
+            }
+        },
+
+        async loadCanonicalDetail(id) {
+            const result = await window.api.get(`/memories/canonical/${window.api.segment(id)}`);
+            this.selectedCanonical = result.data || null;
+        },
+
+        async softDeleteCanonical(id) {
+            if(await window.app.confirm({title: 'Soft delete memory', message: 'Mark this canonical memory as deleted and remove index projection?', type: 'danger', confirmText: 'Soft delete'})) {
+                await window.api.delete(`/memories/canonical/${window.api.segment(id)}`);
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: 'Canonical memory soft deleted', type: 'success' }}));
+                this.selectedCanonical = null;
+                await this.loadCanonical();
+            }
+        },
+
+        async restoreCanonical(id) {
+            await window.api.post(`/memories/canonical/${window.api.segment(id)}/restore`, {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: 'Canonical memory restored', type: 'success' }}));
+            await this.loadCanonical();
+            await this.loadCanonicalDetail(id);
+        },
+
+        async markCanonicalStale(id) {
+            await window.api.post(`/memories/canonical/${window.api.segment(id)}/stale`, {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: 'Canonical memory marked stale', type: 'success' }}));
+            await this.loadCanonical();
+            await this.loadCanonicalDetail(id);
+        },
+
+        async mergeCanonical(id) {
+            if (!this.mergeTargetId) return;
+            await window.api.post(`/memories/canonical/${window.api.segment(id)}/merge`, { target_id: this.mergeTargetId });
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: 'Canonical memory merged', type: 'success' }}));
+            this.mergeTargetId = '';
+            await this.loadCanonical();
+            await this.loadCanonicalDetail(id);
+        },
+
+        async loadDiagnostics() {
+            this.migrationReport = await window.api.get('/memories/diagnostics/migrations');
+            this.indexStatus = await window.api.get('/memories/diagnostics/index');
+        },
+
+        async runMigrationDryRun() {
+            this.migrationReport = await window.api.post('/memories/migration/dry-run', {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: 'Migration dry-run completed', type: 'success' }}));
+        },
+
+        async runMigrationExecute() {
+            if(await window.app.confirm({title: 'Execute migration', message: 'Backup legacy stores, import into canonical memory, then rebuild projections?', type: 'warning', confirmText: 'Execute'})) {
+                this.migrationReport = await window.api.post('/memories/migration/execute', {});
+            }
+        },
+
+        async runMigrationVerify() {
+            this.migrationReport = await window.api.get('/memories/migration/verify');
+        },
+
+        async runMigrationRepair() {
+            this.migrationReport = await window.api.post('/memories/migration/repair', {});
+            this.indexStatus = await window.api.get('/memories/diagnostics/index');
+        },
+
+        async rebuildIndex() {
+            this.indexStatus = await window.api.post('/memories/index/rebuild', {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: 'Index rebuild requested', type: 'success' }}));
+        },
+
+        async runMaintenance() {
+            this.maintenanceReport = await window.api.post('/memories/maintenance/run', {});
+            await this.loadCanonical();
         },
 
         // --- Events ---
@@ -217,6 +313,14 @@ function memoryPage() {
             if (!ts) return '';
             const d = new Date(ts * 1000);
             return d.toLocaleDateString();
+        },
+
+        formatJson(value) {
+            try {
+                return JSON.stringify(value || {}, null, 2);
+            } catch(e) {
+                return String(value || '');
+            }
         }
     }
 }

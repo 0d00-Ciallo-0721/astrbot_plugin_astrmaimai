@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import aiosqlite
-import time
-
 from astrbot.api import logger
+
+from ..contracts.memory_query import MemoryWriteRequest
 
 
 class SelfLoreService:
@@ -11,6 +11,8 @@ class SelfLoreService:
         self.memory_engine = memory_engine
 
     async def clear_persona_lore(self, persona_id: str | None = None) -> int:
+        if hasattr(self.memory_engine, "clear_persona_lore"):
+            return await self.memory_engine.clear_persona_lore(persona_id)
         if not await self.memory_engine._ensure_faiss_initialized():
             return 0
         try:
@@ -28,23 +30,27 @@ class SelfLoreService:
             return 0
 
     async def add_persona_lore(self, content: str, persona_id: str | None = None):
-        if not await self.memory_engine._ensure_faiss_initialized():
-            return
-        from ...conversation.execution.text_segmenter import TextSegmenter
-
-        chunks = TextSegmenter.semantic_chunk(content, max_chunk_size=800)
-        for index, chunk in enumerate(chunks):
-            metadata = {
-                "session_id": "__self_lore__",
-                "persona_id": persona_id,
-                "chunk_index": index,
-                "importance": 1.0,
-                "create_time": time.time(),
-                "last_access_time": time.time(),
-            }
-            await self.memory_engine.retriever.add_memory(chunk, metadata)
+        if hasattr(self.memory_engine, "add_persona_lore"):
+            return await self.memory_engine.add_persona_lore(content, persona_id)
+        writer = getattr(self.memory_engine, "write_service", None)
+        if writer and hasattr(writer, "write"):
+            return await writer.write(
+                MemoryWriteRequest(
+                    source="persona_lore",
+                    kind="persona_lore",
+                    session_id="__self_lore__",
+                    persona_id=str(persona_id or ""),
+                    content=str(content or ""),
+                    summary=str(content or "")[:240],
+                    importance=1.0,
+                    confidence=0.9,
+                    source_ref=f"persona_lore:{persona_id or ''}",
+                )
+            )
 
     async def recall_persona_lore(self, query: str, persona_id: str | None = None, top_k: int = 3) -> str:
+        if hasattr(self.memory_engine, "recall_persona_lore"):
+            return await self.memory_engine.recall_persona_lore(query=query, persona_id=persona_id, top_k=top_k)
         if not await self.memory_engine._ensure_faiss_initialized():
             return "（设定原典离线）"
         results = await self.memory_engine.retriever.search(

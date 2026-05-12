@@ -220,12 +220,20 @@ class DreamAgent:
             return "参数缺失: event_ids 或 new_narrative"
         try:
             # 创建新的精华记忆
+            new_memory_id = ""
             if self.memory_engine:
-                await self.memory_engine.add_memory(
+                new_memory_id = await self.memory_engine.add_memory(
                     content=new_narrative,
                     session_id=session_id,
                     importance=0.7
                 )
+                canonical_ids = []
+                for eid in event_ids:
+                    finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
+                    if finder:
+                        canonical_ids.extend(await finder(f"MemoryEvent:{eid}"))
+                if canonical_ids and getattr(self.memory_engine, "maintenance_service", None) and new_memory_id:
+                    await self.memory_engine.maintenance_service.mark_merged(canonical_ids, superseded_by=new_memory_id)
             # 删除旧的冗余记忆
             for eid in event_ids:
                 await asyncio.to_thread(self._delete_event, eid)
@@ -240,6 +248,17 @@ class DreamAgent:
             return "参数缺失"
         try:
             await asyncio.to_thread(self._update_event_narrative, event_id, new_narrative)
+            if self.memory_engine:
+                finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
+                if finder:
+                    for memory_id in await finder(f"MemoryEvent:{event_id}"):
+                        await self.memory_engine.v2_store.update_content(
+                            memory_id,
+                            content=new_narrative,
+                            summary=new_narrative[:240],
+                        )
+                        if getattr(self.memory_engine, "index_projector", None):
+                            await self.memory_engine.index_projector.project(memory_id)
             return f"已更新记忆 {event_id}"
         except Exception as e:
             return f"更新失败: {e}"
@@ -251,6 +270,11 @@ class DreamAgent:
             return "参数缺失: event_id"
         try:
             await asyncio.to_thread(self._delete_event, event_id)
+            if self.memory_engine:
+                finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
+                if finder and getattr(self.memory_engine, "maintenance_service", None):
+                    for memory_id in await finder(f"MemoryEvent:{event_id}"):
+                        await self.memory_engine.maintenance_service.soft_delete(memory_id, reason=reason)
             return f"已删除记忆 {event_id} (原因: {reason})"
         except Exception as e:
             return f"删除失败: {e}"

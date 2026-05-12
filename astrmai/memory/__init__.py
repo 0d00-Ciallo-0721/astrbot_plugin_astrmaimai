@@ -2,7 +2,9 @@ from importlib import import_module
 
 __all__ = [
     "MemoryEngine",
+    "MemoryMigrationService",
     "MemoryQuery",
+    "MemoryToolService",
     "PersonaSummarizer",
     "ReActRetriever",
     "RetrievalTrace",
@@ -12,7 +14,9 @@ __all__ = [
 def __getattr__(name):
     module_map = {
         "MemoryEngine": ".services.memory_engine",
+        "MemoryMigrationService": ".services.memory_migration_service",
         "MemoryQuery": ".contracts.memory_query",
+        "MemoryToolService": ".services.memory_tool_service",
         "PersonaSummarizer": ".persona.persona_summarizer",
         "ReActRetriever": ".retrieval.react_retriever",
         "RetrievalTrace": ".contracts.retrieval_trace",

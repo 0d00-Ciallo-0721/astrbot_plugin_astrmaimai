@@ -149,6 +149,19 @@ class PromptRefiner:
         is_fast_mode: bool = False,
         retrieve_keys: list[str] | None = None,
     ) -> tuple[MemoryInjectionDecision, str]:
+        injection_service = getattr(self.memory_engine, "injection_service", None)
+        if injection_service and hasattr(injection_service, "build_bundle"):
+            bundle = await injection_service.build_bundle(
+                event=event,
+                prompt=prompt,
+                prompt_envelope=prompt_envelope,
+                disable_rag=disable_rag,
+                is_fast_mode=is_fast_mode,
+                retrieve_keys=retrieve_keys,
+            )
+            turn_context = ensure_turn_context(event)
+            return turn_context.memory, str(getattr(bundle, "rendered_prompt_block", "") or "")
+
         retrieve_keys = retrieve_keys or []
         decision = MemoryInjectionDecision(
             policy=self._memory_policy_for_event(event),

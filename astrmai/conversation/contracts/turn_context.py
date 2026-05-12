@@ -99,6 +99,9 @@ class MemoryInjectionDecision:
     policy: str = ""
     source: str = ""
     retrieve_keys: list[str] = field(default_factory=list)
+    layers: list[str] = field(default_factory=list)
+    selected_ids: list[str] = field(default_factory=list)
+    trace_id: str = ""
     injected: bool = False
     skip_reason: str = ""
     summary_preview: str = ""
@@ -340,6 +343,9 @@ def build_turn_trace_summary(
             "policy": memory.policy,
             "source": memory.source,
             "retrieve_keys": list(memory.retrieve_keys or []),
+            "layers": list(memory.layers or []),
+            "selected_ids": list(memory.selected_ids or []),
+            "trace_id": memory.trace_id,
             "injected": bool(memory.injected),
             "skip_reason": memory.skip_reason,
             "summary_preview": _preview_text(memory.summary_preview, 160),

@@ -102,6 +102,9 @@ class PluginBootstrap:
         gateway.set_lane_manager(lane_manager)
         event_bus = EventBus()
         memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
+        memory_engine.db_service = db_service
+        if hasattr(memory_engine, "tool_service"):
+            memory_engine.tool_service.db_service = db_service
         state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
         judge = Judge(gateway, state_engine)
         sensors = PreFilters(runtime.config)

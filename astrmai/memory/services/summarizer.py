@@ -275,13 +275,6 @@ class ChatHistorySummarizer:
 
         try:
             # 存入引擎底层 (Vector + BM25)
-            await self.engine.add_memory(
-                content=final_content,
-                session_id=str(session_id),
-                persona_id=persona_id,
-                importance=importance
-            )
-
             # 🟢 分流三：存入结构化的 Event 表扩充属性维度，便于回溯提取
             import time
             import uuid
@@ -291,6 +284,38 @@ class ChatHistorySummarizer:
             from ...infrastructure.persistence import MemoryEvent
             
             event_id = f"evt_{date_str.replace('-', '')}_{uuid.uuid4().hex[:8]}"
+            canonical_id = ""
+            if hasattr(self.engine, "write_service"):
+                from ..contracts.memory_query import MemoryWriteRequest
+
+                canonical_id = await self.engine.write_service.write(
+                    MemoryWriteRequest(
+                        source="memory_summary",
+                        kind="topic" if valid_topics else "fact",
+                        session_id=str(session_id),
+                        persona_id=str(persona_id or ""),
+                        content=final_content,
+                        summary=str(summary or "")[:240],
+                        tags=valid_topics,
+                        importance=float(importance or 0.5),
+                        confidence=0.8,
+                        metadata={
+                            "legacy_event_id": event_id,
+                            "reflection": reflection,
+                            "sentiment": sentiment,
+                            "canonical_write": True,
+                        },
+                        dedup_key=f"memory_summary:{session_id}:{event_id}",
+                        source_ref=f"MemoryEvent:{event_id}",
+                    )
+                )
+            else:
+                await self.engine.add_memory(
+                    content=final_content,
+                    session_id=str(session_id),
+                    persona_id=persona_id,
+                    importance=importance
+                )
             event = MemoryEvent(
                 event_id=event_id,
                 session_id=str(session_id),
@@ -302,7 +327,7 @@ class ChatHistorySummarizer:
                 reflection=reflection,
                 memory_kind="topic" if valid_topics else "fact",
                 source_layer="topic" if valid_topics else "fact",
-                tags=json.dumps(valid_topics)
+                tags=json.dumps([*valid_topics, f"canonical_id:{canonical_id}"] if canonical_id else valid_topics)
             )
             
             if plugin and hasattr(plugin, 'db_service') and hasattr(plugin.db_service, 'save_event_async'):

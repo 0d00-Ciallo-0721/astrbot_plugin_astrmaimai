@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 from astrbot.api import logger
 
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ..contracts.memory_query import MemoryQuery
 from ..contracts.retrieval_trace import RetrievalTrace
 
 
@@ -185,6 +186,19 @@ class ReActRetriever:
         if not self.memory_engine or not query:
             return "记忆模块离线或查询为空"
         try:
+            retrieval = getattr(self.memory_engine, "retrieval_service", None)
+            if retrieval and hasattr(retrieval, "retrieve_deep"):
+                memory_query = MemoryQuery(
+                    query=query,
+                    session_id=chat_id,
+                    top_k=3,
+                    policy="deep",
+                    allow_stale=False,
+                    metadata={"visibility_mode": "tool"},
+                )
+                candidates = await retrieval.retrieve_deep(memory_query)
+                if candidates:
+                    return retrieval.render_recall(memory_query, candidates)
             result = await self.memory_engine.recall(query, session_id=chat_id)
             if result and "什么也没想起来" not in result:
                 return result

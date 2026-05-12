@@ -62,9 +62,16 @@ class BM25Retriever:
             doc_ids = [r[0] for r in fts_results]
             placeholders = ",".join("?" * len(doc_ids))
             
+            columns_cursor = await db.execute(f"PRAGMA table_info({self.doc_table})")
+            columns = {str(row[1]) for row in await columns_cursor.fetchall()}
+            text_col = "page_content" if "page_content" in columns else ("content" if "content" in columns else "text")
+            if text_col not in columns or "metadata" not in columns:
+                logger.warning("[BM25] documents schema is incompatible; skip bm25 projection lookup.")
+                return []
+
             # 从主表拉取全量数据以供过滤
             cursor = await db.execute(
-                f"SELECT id, text, metadata FROM {self.doc_table} WHERE id IN ({placeholders})", doc_ids
+                f"SELECT id, {text_col}, metadata FROM {self.doc_table} WHERE id IN ({placeholders})", doc_ids
             )
             
             docs = {}

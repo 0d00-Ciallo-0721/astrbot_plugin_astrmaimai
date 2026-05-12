@@ -237,11 +237,17 @@ class PlannerSideInputMixin:
 
     def _build_full_pfc_tools(self, chat_id: str, user_id, sender_name: str):
         target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
+        memory_tool_service = getattr(self.memory_engine, "tool_service", None)
         return [
             WaitTool(),
-            SelfLoreQueryTool(memory_engine=self.memory_engine, persona_id=target_persona_id),
+            SelfLoreQueryTool(
+                memory_engine=self.memory_engine,
+                memory_tool_service=memory_tool_service,
+                persona_id=target_persona_id,
+            ),
             OmniPerceptionTool(
                 memory_engine=self.memory_engine,
+                memory_tool_service=memory_tool_service,
                 db_service=self.context_engine.db,
                 chat_id=chat_id,
                 current_sender_id=str(user_id) if user_id is not None else "",
@@ -346,18 +352,24 @@ class PlannerSideInputMixin:
         if is_tool_call_mode:
             sys3_light_tools = (await self.sys3_router.get_light_tools_for_planner()).tools
             target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
+            memory_tool_service = getattr(self.memory_engine, "tool_service", None)
             self._set_disable_rag_injection(ctx, True)
             self._set_tool_tier(event, "sys3")
             tools = [
                 WaitTool(),
                 OmniPerceptionTool(
                     memory_engine=self.memory_engine,
+                    memory_tool_service=memory_tool_service,
                     db_service=self.context_engine.db,
                     chat_id=chat_id,
                     current_sender_id=str(user_id) if user_id is not None else "",
                     current_sender_name=sender_name,
                 ),
-                SelfLoreQueryTool(memory_engine=self.memory_engine, persona_id=target_persona_id),
+                SelfLoreQueryTool(
+                    memory_engine=self.memory_engine,
+                    memory_tool_service=memory_tool_service,
+                    persona_id=target_persona_id,
+                ),
             ] + sys3_light_tools
             turn_tools = ensure_turn_context(event).tools
             tool_names = [

@@ -6,6 +6,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ...memory.contracts.memory_query import MemoryQuery
 from ..dispatcher import ProactiveMessageIntent
 from ..rhythm import evaluate_proactive_rhythm
 from .feedback_bridge import HeartflowFeedbackBridge
@@ -756,8 +757,18 @@ class HeartflowManager:
         return "\n".join(part for part in parts if str(part or "").strip())
 
     async def _recall_topic_memory(self, chat_id: str, focus: str) -> str:
-        if not focus or not self.memory_engine or not hasattr(self.memory_engine, "recall"):
+        if not focus or not self.memory_engine:
             return ""
+        retrieval = getattr(self.memory_engine, "retrieval_service", None)
+        if retrieval and hasattr(retrieval, "retrieve"):
+            try:
+                memory_query = MemoryQuery(query=str(focus or ""), session_id=str(chat_id or ""), top_k=1)
+                candidates = await retrieval.retrieve(memory_query)
+                if hasattr(retrieval, "render_recall"):
+                    return " ".join(str(retrieval.render_recall(memory_query, candidates) or "").split())
+                return " ".join(str(getattr(candidates[0], "summary", "") or getattr(candidates[0], "content", "")).split()) if candidates else ""
+            except Exception as exc:
+                logger.debug(f"[Heartflow] v2 memory hint degraded for {chat_id}: {exc}")
         try:
             result = await self.memory_engine.recall(focus, session_id=chat_id, top_k=1)
         except TypeError:

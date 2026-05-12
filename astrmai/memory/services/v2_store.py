@@ -1,0 +1,924 @@
+from __future__ import annotations
+
+import json
+import shutil
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import aiosqlite
+
+from astrbot.api import logger
+
+from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
+
+
+ACTIVE_STATUS = "active"
+STALE_STATUS = "stale"
+DELETED_STATUS = "deleted"
+MERGED_STATUS = "merged"
+DEPRECATED_STATUS = "deprecated"
+
+
+class MemoryV2Store:
+    """SQL-backed canonical memory store.
+
+    The existing vector/BM25 documents table remains an index projection. This
+    store owns the authoritative v2 records and can be used even when the vector
+    index is offline.
+    """
+
+    def __init__(self, db_path: str, *, data_path: Path | None = None):
+        self.db_path = str(db_path)
+        self.data_path = Path(data_path) if data_path else Path(db_path).parent
+        self._initialized = False
+        self.last_physical_delete_ids: list[str] = []
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        backup_dir = await self._backup_legacy_once()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS canonical_memories (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT DEFAULT '',
+                    persona_id TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    kind TEXT DEFAULT '',
+                    content TEXT DEFAULT '',
+                    summary TEXT DEFAULT '',
+                    tags TEXT DEFAULT '[]',
+                    importance REAL DEFAULT 0.5,
+                    confidence REAL DEFAULT 0.8,
+                    status TEXT DEFAULT 'active',
+                    decay_score REAL DEFAULT 1.0,
+                    create_time REAL DEFAULT 0,
+                    update_time REAL DEFAULT 0,
+                    last_access_time REAL DEFAULT 0,
+                    access_count INTEGER DEFAULT 0,
+                    superseded_by TEXT DEFAULT '',
+                    deleted_reason TEXT DEFAULT '',
+                    metadata TEXT DEFAULT '{}',
+                    dedup_key TEXT DEFAULT '',
+                    source_ref TEXT DEFAULT '',
+                    visibility TEXT DEFAULT 'auto_and_tool'
+                )
+                """
+            )
+            await self._migrate_schema(db)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_canonical_memories_session ON canonical_memories(session_id, status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_canonical_memories_persona ON canonical_memories(persona_id, kind, status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_canonical_memories_dedup ON canonical_memories(dedup_key)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_v2_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT DEFAULT ''
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_v2_migrations (
+                    version TEXT PRIMARY KEY,
+                    backup_dir TEXT DEFAULT '',
+                    status TEXT DEFAULT '',
+                    detail TEXT DEFAULT '',
+                    applied_at REAL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO memory_v2_meta(key, value) VALUES ('schema_version', '2')"
+            )
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO memory_v2_migrations(version, backup_dir, status, detail, applied_at)
+                VALUES ('2', ?, 'applied', 'canonical schema ready', ?)
+                """,
+                (str(backup_dir or ""), self._now()),
+            )
+            await db.commit()
+        self._initialized = True
+
+    async def _migrate_schema(self, db) -> None:
+        cursor = await db.execute("PRAGMA table_info(canonical_memories)")
+        columns = {str(row[1]) for row in await cursor.fetchall()}
+        migrations = {
+            "source_ref": "ALTER TABLE canonical_memories ADD COLUMN source_ref TEXT DEFAULT ''",
+            "visibility": "ALTER TABLE canonical_memories ADD COLUMN visibility TEXT DEFAULT 'auto_and_tool'",
+        }
+        for column, sql in migrations.items():
+            if column not in columns:
+                await db.execute(sql)
+
+    async def _backup_legacy_once(self) -> Path | None:
+        marker = self.data_path / ".memory_v2_backup_done"
+        if marker.exists():
+            try:
+                value = marker.read_text(encoding="utf-8").strip()
+                return Path(value) if value else None
+            except Exception:
+                return None
+        try:
+            self.data_path.mkdir(parents=True, exist_ok=True)
+            backup_dir = self.data_path / f"backup_before_v2_{time.strftime('%Y%m%d_%H%M%S')}"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("docs.db", "vectors.index", "persona_cache.json"):
+                source = self.data_path / name
+                if source.exists():
+                    shutil.copy2(source, backup_dir / name)
+            marker.write_text(str(backup_dir), encoding="utf-8")
+            logger.info(f"[MemoryV2] legacy memory backup prepared at {backup_dir}")
+            return backup_dir
+        except Exception as exc:
+            logger.warning(f"[MemoryV2] legacy backup skipped: {exc}")
+            return None
+
+    @staticmethod
+    def _now() -> float:
+        return time.time()
+
+    @staticmethod
+    def _json_list(value: Any) -> str:
+        if isinstance(value, str):
+            return json.dumps([value], ensure_ascii=False)
+        if not isinstance(value, list):
+            value = []
+        return json.dumps([str(item) for item in value if str(item).strip()], ensure_ascii=False)
+
+    @staticmethod
+    def _json_dict(value: Any) -> str:
+        return json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False)
+
+    async def upsert(self, request: MemoryWriteRequest) -> str:
+        await self.initialize()
+        now = self._now()
+        memory_id = f"mem_{uuid.uuid4().hex[:16]}"
+        summary = request.summary or request.content[:240]
+        dedup_key = request.dedup_key.strip()
+        visibility = request.visibility if request.visibility in {"auto_and_tool", "tool_only", "maintenance_only"} else "auto_and_tool"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            if dedup_key:
+                cursor = await db.execute(
+                    """
+                    SELECT id, content, summary, access_count
+                    FROM canonical_memories
+                    WHERE dedup_key = ? AND status IN ('active', 'stale')
+                    LIMIT 1
+                    """,
+                    (dedup_key,),
+                )
+                row = await cursor.fetchone()
+                if row:
+                    memory_id = str(row[0])
+                    merged_content = str(request.content or row[1] or "")
+                    merged_summary = str(summary or row[2] or "")[:500]
+                    await db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET content = ?, summary = ?, source = ?, kind = ?,
+                            importance = MAX(importance, ?),
+                            confidence = MAX(confidence, ?),
+                            status = 'active',
+                            update_time = ?, last_access_time = ?,
+                            access_count = COALESCE(access_count, 0) + 1,
+                            tags = ?, metadata = ?, source_ref = ?, visibility = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            merged_content,
+                            merged_summary,
+                            request.source,
+                            request.kind,
+                            float(request.importance or 0.5),
+                            float(request.confidence or 0.8),
+                            now,
+                            now,
+                            self._json_list(request.tags),
+                            self._json_dict(request.metadata),
+                            request.source_ref,
+                            visibility,
+                            memory_id,
+                        ),
+                    )
+                    await db.commit()
+                    return memory_id
+
+            await db.execute(
+                """
+                INSERT INTO canonical_memories (
+                    id, session_id, persona_id, source, kind, content, summary,
+                    tags, importance, confidence, status, decay_score,
+                    create_time, update_time, last_access_time, access_count,
+                    metadata, dedup_key, source_ref, visibility
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    request.session_id,
+                    request.persona_id,
+                    request.source,
+                    request.kind,
+                    request.content,
+                    summary,
+                    self._json_list(request.tags),
+                    float(request.importance or 0.5),
+                    float(request.confidence or 0.8),
+                    now,
+                    now,
+                    now,
+                    self._json_dict(request.metadata),
+                    dedup_key,
+                    request.source_ref,
+                    visibility,
+                ),
+            )
+            await db.commit()
+        return memory_id
+
+    async def get_by_id(self, memory_id: str, *, allow_stale: bool = False) -> MemoryCandidate | None:
+        await self.initialize()
+        statuses = [ACTIVE_STATUS]
+        if allow_stale:
+            statuses.append(STALE_STATUS)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                WHERE id = ? AND status IN ({','.join('?' for _ in statuses)})
+                LIMIT 1
+                """,
+                (memory_id, *statuses),
+            )
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return self._row_to_candidate(row)
+
+    async def get_canonical(self, memory_id: str, *, include_inactive: bool = False) -> MemoryCandidate | None:
+        await self.initialize()
+        where = "id = ?"
+        params: tuple[Any, ...] = (memory_id,)
+        if not include_inactive:
+            where += " AND status IN ('active', 'stale')"
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                WHERE {where}
+                LIMIT 1
+                """,
+                params,
+            )
+            row = await cursor.fetchone()
+        return self._row_to_candidate(row) if row else None
+
+    def _row_to_candidate(self, row) -> MemoryCandidate:
+        try:
+            tags = json.loads(row[7] or "[]")
+            if not isinstance(tags, list):
+                tags = []
+        except Exception:
+            tags = []
+        try:
+            metadata = json.loads(row[14] or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except Exception:
+            metadata = {}
+        now = self._now()
+        created_at = float(row[11] or 0.0)
+        age_days = max(0.0, (now - created_at) / 86400) if created_at else 0.0
+        return MemoryCandidate(
+            id=str(row[0] or ""),
+            kind=str(row[1] or ""),
+            source=str(row[2] or ""),
+            summary=str(row[3] or ""),
+            content=str(row[4] or ""),
+            session_id=str(row[5] or ""),
+            persona_id=str(row[6] or ""),
+            tags=[str(item) for item in tags],
+            importance=float(row[8] or 0.5),
+            confidence=float(row[9] or 0.8),
+            recency_score=1.0 / (1.0 + age_days),
+            status=str(row[10] or ACTIVE_STATUS),
+            visibility=str(row[15] or "auto_and_tool"),
+            created_at=created_at,
+            updated_at=float(row[12] or 0.0),
+            last_access_time=float(row[13] or 0.0),
+            metadata=metadata,
+        )
+
+    async def search(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        persona_id: str = "",
+        layers: list[str] | None = None,
+        top_k: int = 5,
+        exclude_ids: list[str] | None = None,
+        allow_stale: bool = False,
+        visibility_mode: str = "",
+    ) -> list[MemoryCandidate]:
+        await self.initialize()
+        query_text = str(query or "").strip()
+        if not query_text:
+            return []
+        lowered_terms = [term.lower() for term in query_text.split() if term.strip()]
+        statuses = [ACTIVE_STATUS]
+        if allow_stale:
+            statuses.append(STALE_STATUS)
+        exclude = {str(item) for item in exclude_ids or [] if str(item).strip()}
+        layer_set = {str(item) for item in layers or [] if str(item).strip()}
+        if visibility_mode == "auto":
+            allowed_visibility = {"auto_and_tool"}
+        elif visibility_mode == "tool":
+            allowed_visibility = {"auto_and_tool", "tool_only"}
+        else:
+            allowed_visibility = {"auto_and_tool", "tool_only"}
+
+        where = ["status IN (" + ",".join("?" for _ in statuses) + ")"]
+        params: list[Any] = list(statuses)
+        where.append("visibility IN (" + ",".join("?" for _ in allowed_visibility) + ")")
+        params.extend(sorted(allowed_visibility))
+        if session_id == "__self_lore__":
+            where.append("session_id = ?")
+            params.append(session_id)
+        elif session_id:
+            where.append("(session_id = ? OR session_id = '')")
+            params.append(session_id)
+        if persona_id:
+            where.append("(persona_id = ? OR persona_id = '')")
+            params.append(persona_id)
+        if layer_set:
+            where.append("kind IN (" + ",".join("?" for _ in layer_set) + ")")
+            params.extend(layer_set)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                WHERE {' AND '.join(where)}
+                ORDER BY update_time DESC
+                LIMIT ?
+                """,
+                (*params, max(int(top_k or 5) * 8, 20)),
+            )
+            rows = await cursor.fetchall()
+
+        candidates: list[MemoryCandidate] = []
+        now = self._now()
+        for row in rows:
+            memory_id = str(row[0])
+            if memory_id in exclude:
+                continue
+            summary = str(row[3] or "")
+            content = str(row[4] or "")
+            haystack = f"{summary}\n{content}".lower()
+            if lowered_terms:
+                overlap = sum(1 for term in lowered_terms if term in haystack)
+                if overlap <= 0:
+                    continue
+                relevance = min(1.0, overlap / max(len(lowered_terms), 1))
+            else:
+                relevance = 0.1
+            candidate = self._row_to_candidate(row)
+            candidate.relevance_score = relevance
+            candidates.append(candidate)
+
+        candidates.sort(
+            key=lambda item: (
+                item.relevance_score * 0.45
+                + item.importance * 0.2
+                + item.confidence * 0.15
+                + item.recency_score * 0.1
+                - (0.25 if item.status == STALE_STATUS else 0.0)
+            ),
+            reverse=True,
+        )
+        selected = candidates[: max(int(top_k or 5), 1)]
+        if selected:
+            await self.mark_accessed([item.id for item in selected])
+        return selected
+
+    async def list_canonical(
+        self,
+        *,
+        session_id: str = "",
+        persona_id: str = "",
+        kind: str = "",
+        status: str = "",
+        limit: int = 100,
+        offset: int = 0,
+        include_inactive: bool = True,
+    ) -> dict[str, Any]:
+        await self.initialize()
+        where: list[str] = []
+        params: list[Any] = []
+        if not include_inactive:
+            where.append("status IN ('active', 'stale')")
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if persona_id:
+            where.append("persona_id = ?")
+            params.append(persona_id)
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        page_limit = max(1, min(int(limit or 100), 500))
+        page_offset = max(0, int(offset or 0))
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"SELECT COUNT(*) FROM canonical_memories {where_sql}",
+                tuple(params),
+            )
+            total_row = await cursor.fetchone()
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                {where_sql}
+                ORDER BY update_time DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_limit, page_offset),
+            )
+            rows = await cursor.fetchall()
+        return {
+            "items": [self._candidate_to_dict(self._row_to_candidate(row)) for row in rows],
+            "total": int(total_row[0] if total_row else 0),
+            "limit": page_limit,
+            "offset": page_offset,
+        }
+
+    @staticmethod
+    def _candidate_to_dict(candidate: MemoryCandidate) -> dict[str, Any]:
+        return {
+            "id": candidate.id,
+            "kind": candidate.kind,
+            "source": candidate.source,
+            "summary": candidate.summary,
+            "content": candidate.content,
+            "session_id": candidate.session_id,
+            "persona_id": candidate.persona_id,
+            "tags": list(candidate.tags or []),
+            "importance": candidate.importance,
+            "confidence": candidate.confidence,
+            "relevance_score": candidate.relevance_score,
+            "recency_score": candidate.recency_score,
+            "status": candidate.status,
+            "visibility": candidate.visibility,
+            "created_at": candidate.created_at,
+            "updated_at": candidate.updated_at,
+            "last_access_time": candidate.last_access_time,
+            "metadata": dict(candidate.metadata or {}),
+        }
+
+    async def mark_accessed(self, memory_ids: list[str]) -> None:
+        ids = [str(item) for item in memory_ids if str(item).strip()]
+        if not ids:
+            return
+        await self.initialize()
+        now = self._now()
+        async with aiosqlite.connect(self.db_path) as db:
+            for memory_id in ids:
+                await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET last_access_time = ?, access_count = COALESCE(access_count, 0) + 1,
+                        status = CASE WHEN status = 'stale' THEN 'active' ELSE status END
+                    WHERE id = ?
+                    """,
+                    (now, memory_id),
+                )
+            await db.commit()
+
+    async def apply_decay(
+        self,
+        *,
+        decay_rate: float,
+        min_score: float = 0.05,
+        stale_grace_seconds: float = 7 * 86400,
+        days: int = 1,
+        allow_protected_physical_delete: bool = False,
+        protected_kinds: tuple[str, ...] = ("persona_lore", "profile"),
+        protected_importance: float = 0.95,
+    ) -> int:
+        await self.initialize()
+        self.last_physical_delete_ids = []
+        now = self._now()
+        decay_factor = max(0.0, min(1.0, (1 - float(decay_rate or 0.0)) ** max(int(days or 1), 1)))
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE canonical_memories
+                SET decay_score = MAX(0.0, COALESCE(decay_score, 1.0) * ?),
+                    status = CASE
+                        WHEN status = 'active'
+                         AND (COALESCE(decay_score, 1.0) * ?) <= ?
+                        THEN 'stale'
+                        ELSE status
+                    END,
+                    update_time = ?
+                WHERE status IN ('active', 'stale')
+                """,
+                (decay_factor, decay_factor, min_score, now),
+            )
+            delete_where = [
+                "status = 'stale'",
+                "COALESCE(last_access_time, create_time, 0) <= ?",
+            ]
+            delete_params: list[Any] = [now - stale_grace_seconds]
+            if not allow_protected_physical_delete:
+                delete_where.append(
+                    f"kind NOT IN ({','.join('?' for _ in protected_kinds)})"
+                )
+                delete_params.extend(protected_kinds)
+                delete_where.append("importance < ?")
+                delete_params.append(float(protected_importance))
+            cursor = await db.execute(
+                f"SELECT id FROM canonical_memories WHERE {' AND '.join(delete_where)}",
+                tuple(delete_params),
+            )
+            self.last_physical_delete_ids = [str(row[0]) for row in await cursor.fetchall()]
+            cursor = await db.execute(
+                f"DELETE FROM canonical_memories WHERE {' AND '.join(delete_where)}",
+                tuple(delete_params),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE canonical_memories
+                SET status = 'deleted', deleted_reason = ?, update_time = ?
+                WHERE id = ?
+                """,
+                (reason, self._now(), memory_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def restore(self, memory_id: str, *, reason: str = "manual_restore") -> int:
+        await self.initialize()
+        now = self._now()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE canonical_memories
+                SET status = 'active',
+                    deleted_reason = '',
+                    decay_score = MAX(COALESCE(decay_score, 1.0), 0.5),
+                    update_time = ?,
+                    last_access_time = ?
+                WHERE id = ? AND status IN ('stale', 'deleted')
+                """,
+                (now, now, memory_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def mark_stale(self, memory_id: str, *, reason: str = "manual_stale") -> int:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE canonical_memories
+                SET status = 'stale', deleted_reason = ?, update_time = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (reason, self._now(), memory_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def soft_delete_by_filter(
+        self,
+        *,
+        kind: str = "",
+        session_id: str = "",
+        persona_id: str = "",
+        reason: str = "",
+    ) -> list[str]:
+        await self.initialize()
+        where = ["status IN ('active', 'stale')"]
+        params: list[Any] = []
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if persona_id:
+            where.append("persona_id = ?")
+            params.append(persona_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"SELECT id FROM canonical_memories WHERE {' AND '.join(where)}",
+                tuple(params),
+            )
+            ids = [str(row[0]) for row in await cursor.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                await db.execute(
+                    f"""
+                    UPDATE canonical_memories
+                    SET status = 'deleted', deleted_reason = ?, update_time = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (reason, self._now(), *ids),
+                )
+                await db.commit()
+        return ids
+
+    async def soft_delete_low_importance(self, *, threshold: float, reason: str = "low_importance") -> list[str]:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT id FROM canonical_memories
+                WHERE status IN ('active', 'stale')
+                  AND importance < ?
+                """,
+                (float(threshold),),
+            )
+            ids = [str(row[0]) for row in await cursor.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                await db.execute(
+                    f"""
+                    UPDATE canonical_memories
+                    SET status = 'deleted', deleted_reason = ?, update_time = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (reason, self._now(), *ids),
+                )
+                await db.commit()
+        return ids
+
+    async def mark_merged(self, memory_ids: list[str], *, superseded_by: str) -> int:
+        ids = [str(item) for item in memory_ids if str(item).strip()]
+        if not ids:
+            return 0
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            count = 0
+            for memory_id in ids:
+                cursor = await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET status = 'merged', superseded_by = ?, update_time = ?
+                    WHERE id = ?
+                    """,
+                    (superseded_by, self._now(), memory_id),
+                )
+                count += cursor.rowcount
+            await db.commit()
+            return count
+
+    async def find_ids_by_source_ref(self, source_ref: str) -> list[str]:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT id FROM canonical_memories
+                WHERE source_ref = ? AND status IN ('active', 'stale')
+                """,
+                (source_ref,),
+            )
+            return [str(row[0]) for row in await cursor.fetchall()]
+
+    async def update_content(self, memory_id: str, *, content: str, summary: str = "") -> int:
+        await self.initialize()
+        now = self._now()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE canonical_memories
+                SET content = ?, summary = ?, update_time = ?, status = 'active'
+                WHERE id = ? AND status IN ('active', 'stale')
+                """,
+                (content, summary or str(content or "")[:240], now, memory_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def list_projectable(self, *, session_id: str = "") -> list[MemoryCandidate]:
+        await self.initialize()
+        where = ["status = 'active'", "visibility IN ('auto_and_tool', 'tool_only')"]
+        params: list[Any] = []
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                WHERE {' AND '.join(where)}
+                ORDER BY update_time DESC
+                """,
+                tuple(params),
+            )
+            rows = await cursor.fetchall()
+        return [self._row_to_candidate(row) for row in rows]
+
+    async def migration_applied(self, version: str) -> bool:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM memory_v2_migrations WHERE version = ? AND status = 'applied'",
+                (version,),
+            )
+            return await cursor.fetchone() is not None
+
+    async def record_migration(self, version: str, *, status: str, detail: str = "") -> None:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO memory_v2_migrations(version, backup_dir, status, detail, applied_at)
+                VALUES (?, COALESCE((SELECT backup_dir FROM memory_v2_migrations WHERE version = '2'), ''), ?, ?, ?)
+                """,
+                (version, status, detail, self._now()),
+            )
+            await db.commit()
+
+    async def migration_report(self) -> dict[str, Any]:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT version, backup_dir, status, detail, applied_at FROM memory_v2_migrations ORDER BY applied_at DESC"
+            )
+            migrations = [
+                {
+                    "version": str(row[0] or ""),
+                    "backup_dir": str(row[1] or ""),
+                    "status": str(row[2] or ""),
+                    "detail": str(row[3] or ""),
+                    "applied_at": float(row[4] or 0.0),
+                }
+                for row in await cursor.fetchall()
+            ]
+            counts: dict[str, int] = {}
+            for status in (ACTIVE_STATUS, STALE_STATUS, DELETED_STATUS, MERGED_STATUS, DEPRECATED_STATUS):
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM canonical_memories WHERE status = ?",
+                    (status,),
+                )
+                row = await cursor.fetchone()
+                counts[status] = int(row[0] if row else 0)
+            legacy_counts: dict[str, int] = {}
+            for table in ("documents", "MemoryEvent"):
+                try:
+                    cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
+                    row = await cursor.fetchone()
+                    legacy_counts[table] = int(row[0] if row else 0)
+                except Exception:
+                    legacy_counts[table] = 0
+        return {
+            "schema_version": 2,
+            "backup_dir": migrations[-1]["backup_dir"] if migrations else "",
+            "migrations": migrations,
+            "canonical_counts": counts,
+            "legacy_counts": legacy_counts,
+            "persona_cache_exists": (self.data_path / "persona_cache.json").exists(),
+        }
+
+    async def import_legacy_documents(self, *, limit: int = 1000) -> int:
+        version = "2_legacy_documents_import"
+        if await self.migration_applied(version):
+            return 0
+        await self.initialize()
+        imported = 0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("PRAGMA table_info(documents)")
+                columns = {str(row[1]) for row in await cursor.fetchall()}
+                text_col = "page_content" if "page_content" in columns else ("content" if "content" in columns else "text")
+                if text_col not in columns or "metadata" not in columns:
+                    await self.record_migration(version, status="applied", detail="documents table unavailable")
+                    return 0
+                cursor = await db.execute(
+                    f"SELECT id, {text_col}, metadata FROM documents ORDER BY id DESC LIMIT ?",
+                    (int(limit or 1000),),
+                )
+                rows = await cursor.fetchall()
+            for doc_id, text, metadata_raw in rows:
+                content = str(text or "").strip()
+                if not content:
+                    continue
+                try:
+                    metadata = json.loads(metadata_raw or "{}") if isinstance(metadata_raw, str) else {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                except Exception:
+                    metadata = {}
+                canonical_id = str(metadata.get("canonical_id") or "")
+                if canonical_id:
+                    continue
+                session_id = str(metadata.get("session_id") or "")
+                persona_id = str(metadata.get("persona_id") or "")
+                kind = str(metadata.get("kind") or ("persona_lore" if session_id == "__self_lore__" else "memory"))
+                request = MemoryWriteRequest(
+                    source=str(metadata.get("source") or "legacy_documents"),
+                    kind=kind,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    content=content,
+                    summary=content[:240],
+                    importance=float(metadata.get("importance") or 0.5),
+                    confidence=0.65,
+                    metadata={"legacy_doc_id": doc_id, **metadata},
+                    dedup_key=f"legacy_documents:{doc_id}",
+                    source_ref=f"documents:{doc_id}",
+                )
+                await self.upsert(request)
+                imported += 1
+            await self.record_migration(version, status="applied", detail=f"imported={imported}")
+        except Exception as exc:
+            await self.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] legacy documents import degraded: {exc}")
+        return imported
+
+    async def import_persona_cache(self) -> int:
+        version = "2_persona_cache_import"
+        if await self.migration_applied(version):
+            return 0
+        cache_path = self.data_path / "persona_cache.json"
+        if not cache_path.exists():
+            await self.record_migration(version, status="applied", detail="persona cache unavailable")
+            return 0
+        imported = 0
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8") or "{}")
+            if not isinstance(data, dict):
+                data = {}
+            for persona_id, payload in data.items():
+                if not isinstance(payload, dict):
+                    continue
+                parts = []
+                for key in ("first_person_rewrite", "summary", "style"):
+                    value = str(payload.get(key) or "").strip()
+                    if value:
+                        parts.append(value)
+                shards = payload.get("shards")
+                if isinstance(shards, dict):
+                    parts.extend(str(value).strip() for value in shards.values() if str(value).strip())
+                content = "\n".join(dict.fromkeys(parts)).strip()
+                if not content:
+                    continue
+                await self.upsert(
+                    MemoryWriteRequest(
+                        source="persona_cache",
+                        kind="persona_lore",
+                        session_id="__self_lore__",
+                        persona_id=str(persona_id),
+                        content=content,
+                        summary=content[:240],
+                        importance=1.0,
+                        confidence=0.75,
+                        dedup_key=f"persona_cache:{persona_id}",
+                        source_ref=f"persona_cache:{persona_id}",
+                    )
+                )
+                imported += 1
+            await self.record_migration(version, status="applied", detail=f"imported={imported}")
+        except Exception as exc:
+            await self.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] persona cache import degraded: {exc}")
+        return imported

@@ -89,6 +89,30 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                             tags TEXT,
                             created_at REAL
                         );
+                        CREATE TABLE canonical_memories (
+                            id TEXT PRIMARY KEY,
+                            session_id TEXT,
+                            persona_id TEXT,
+                            source TEXT,
+                            kind TEXT,
+                            content TEXT,
+                            summary TEXT,
+                            tags TEXT,
+                            importance REAL,
+                            confidence REAL,
+                            status TEXT,
+                            decay_score REAL,
+                            create_time REAL,
+                            update_time REAL,
+                            last_access_time REAL,
+                            access_count INTEGER,
+                            superseded_by TEXT,
+                            deleted_reason TEXT,
+                            metadata TEXT,
+                            dedup_key TEXT,
+                            source_ref TEXT,
+                            visibility TEXT
+                        );
                         CREATE TABLE DailyReflection (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             date TEXT UNIQUE,
@@ -138,24 +162,124 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
                 async with aiosqlite.connect(db_path) as db:
                     db.row_factory = aiosqlite.Row
-                    event_row = dict(await (await db.execute("SELECT * FROM MemoryEvent WHERE id = ?", (event["id"],))).fetchone())
+                    canonical_row = dict(await (await db.execute("SELECT * FROM canonical_memories WHERE id = ?", (event["id"],))).fetchone())
+                    event_count = (await (await db.execute("SELECT COUNT(*) FROM MemoryEvent")).fetchone())[0]
                     reflection_row = dict(await (await db.execute("SELECT * FROM DailyReflection WHERE date = ?", ("2099-01-09",))).fetchone())
                     node_row = dict(await (await db.execute("SELECT * FROM MemoryNode WHERE id = ?", (node["id"],))).fetchone())
                     jargon_row = dict(await (await db.execute("SELECT * FROM Jargon WHERE id = ?", (jargon["id"],))).fetchone())
-                return event, reflection, node, jargon, event_row, reflection_row, node_row, jargon_row
+                return event, reflection, node, jargon, canonical_row, event_count, reflection_row, node_row, jargon_row
 
-        event, reflection, node, jargon, event_row, reflection_row, node_row, jargon_row = asyncio.run(_run())
+        event, reflection, node, jargon, canonical_row, event_count, reflection_row, node_row, jargon_row = asyncio.run(_run())
         self.assertEqual(reflection["status"], "ok")
-        self.assertIsInstance(event["id"], int)
+        self.assertTrue(str(event["id"]).startswith("mem_webui_"))
         self.assertIsInstance(node["id"], int)
         self.assertIsInstance(jargon["id"], int)
-        self.assertTrue(event_row["event_id"].startswith("plugin_page_"))
-        self.assertEqual(event_row["session_id"], "PLUGIN_PAGE_SMOKE")
-        self.assertEqual(event_row["tags"], '["codex"]')
+        self.assertEqual(event["mode"], "canonical_redirect")
+        self.assertEqual(event_count, 0)
+        self.assertEqual(canonical_row["session_id"], "PLUGIN_PAGE_SMOKE")
+        self.assertEqual(canonical_row["tags"], '["codex"]')
         self.assertEqual(reflection_row["reflection"], "updated reflection")
         self.assertEqual(node_row["name"], "updated node")
         self.assertEqual(jargon_row["raw_content"], "smoke jargon")
         self.assertEqual(jargon_row["meaning"], "updated meaning")
+
+    def test_memory_service_exposes_canonical_memory_and_legacy_marker(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "webui.db")
+
+            async def _run():
+                async with aiosqlite.connect(db_path) as db:
+                    await db.executescript(
+                        """
+                        CREATE TABLE MemoryEvent (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            event_id TEXT,
+                            session_id TEXT,
+                            date TEXT,
+                            narrative TEXT,
+                            emotion TEXT,
+                            importance REAL,
+                            emotional_intensity REAL,
+                            reflection TEXT,
+                            memory_kind TEXT,
+                            source_layer TEXT,
+                            tags TEXT,
+                            created_at REAL
+                        );
+                        CREATE TABLE canonical_memories (
+                            id TEXT PRIMARY KEY,
+                            session_id TEXT,
+                            persona_id TEXT,
+                            source TEXT,
+                            kind TEXT,
+                            content TEXT,
+                            summary TEXT,
+                            tags TEXT,
+                            importance REAL,
+                            confidence REAL,
+                            status TEXT,
+                            decay_score REAL,
+                            create_time REAL,
+                            update_time REAL,
+                            last_access_time REAL,
+                            access_count INTEGER,
+                            superseded_by TEXT,
+                            deleted_reason TEXT,
+                            metadata TEXT,
+                            dedup_key TEXT,
+                            source_ref TEXT,
+                            visibility TEXT
+                        );
+                        INSERT INTO canonical_memories (
+                            id, session_id, persona_id, source, kind, content, summary,
+                            tags, importance, confidence, status, decay_score, create_time,
+                            update_time, last_access_time, access_count, superseded_by,
+                            deleted_reason, metadata, dedup_key, source_ref, visibility
+                        ) VALUES (
+                            'mem-ui-1', 'chat-1', '', 'summary', 'memory',
+                            'Alice canonical UI memory.', 'Alice canonical UI memory.',
+                            '[]', 0.8, 0.9, 'active', 1.0, 1.0, 2.0, 1.0,
+                            0, '', '', '{}', 'ui:1', 'test', 'auto_and_tool'
+                        );
+                        """
+                    )
+                    await db.commit()
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                service = service_mod.MemoryUiService(_db_factory)
+                canonical = await service.list_canonical(session_id="chat-1")
+                detail = await service.get_canonical("mem-ui-1")
+                deleted = await service.delete_canonical("mem-ui-1")
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        "INSERT INTO MemoryEvent(event_id, session_id, narrative, tags, importance) VALUES (?, ?, ?, ?, ?)",
+                        ("evt-ui-1", "chat-1", "legacy row", '["canonical_id:mem-ui-1"]', 0.8),
+                    )
+                    await db.commit()
+                legacy_event = await service.create_event({"narrative": "smoke event", "tags": ["codex"], "importance": 0.8})
+                legacy_rows = await service.list_events()
+                legacy_delete = await service.delete_event(1)
+                return canonical, detail, deleted, legacy_event, legacy_rows, legacy_delete
+
+            canonical, detail, deleted, legacy_event, legacy_rows, legacy_delete = asyncio.run(_run())
+        self.assertEqual(canonical["total"], 1)
+        self.assertEqual(canonical["items"][0]["id"], "mem-ui-1")
+        self.assertEqual(detail["data"]["id"], "mem-ui-1")
+        self.assertTrue(deleted["changed"])
+        self.assertEqual(legacy_event["mode"], "canonical_redirect")
+        self.assertTrue(legacy_rows[0]["legacy"])
+        self.assertEqual(legacy_rows[0]["canonical_id"], "mem-ui-1")
+        self.assertEqual(legacy_delete["mode"], "canonical_soft_delete")
 
     def test_settings_service_builds_effective_config_and_validates_schema(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -385,6 +509,13 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("/runtime/status", paths)
         self.assertIn("/heartflow/status", paths)
         self.assertIn("/heartflow/impulses", paths)
+        self.assertIn("/memories/canonical/{memory_id}/restore", paths)
+        self.assertIn("/memories/canonical/{memory_id}/stale", paths)
+        self.assertIn("/memories/canonical/{memory_id}/merge", paths)
+        self.assertIn("/memories/migration/dry-run", paths)
+        self.assertIn("/memories/migration/execute", paths)
+        self.assertIn("/memories/migration/verify", paths)
+        self.assertIn("/memories/migration/repair", paths)
         self.assertIn("/heartflow/chats/{chat_id}/impulses", paths)
         self.assertIn("/heartflow/timeline", paths)
         self.assertIn("/heartflow/chats/{chat_id}/timeline", paths)

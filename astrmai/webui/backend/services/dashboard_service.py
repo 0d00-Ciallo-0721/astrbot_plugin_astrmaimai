@@ -24,6 +24,7 @@ class DashboardService:
             "total_users": 0,
             "pending_reviews": 0,
             "total_memory_events": 0,
+            "total_canonical_memories": 0,
             "diagnostics": await self.plugin_api.get_runtime_diagnostics(),
             "capabilities": await self.plugin_api.get_capability_overview(),
         }
@@ -35,6 +36,11 @@ class DashboardService:
                     stats["pending_reviews"] = (await cursor.fetchone())[0]
                 async with db.execute("SELECT COUNT(*) FROM MemoryEvent") as cursor:
                     stats["total_memory_events"] = (await cursor.fetchone())[0]
+                try:
+                    async with db.execute("SELECT COUNT(*) FROM canonical_memories") as cursor:
+                        stats["total_canonical_memories"] = (await cursor.fetchone())[0]
+                except sqlite3.OperationalError:
+                    stats["total_canonical_memories"] = 0
         except sqlite3.OperationalError:
             pass
         return stats

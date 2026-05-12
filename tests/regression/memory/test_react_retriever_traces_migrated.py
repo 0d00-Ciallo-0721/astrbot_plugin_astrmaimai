@@ -86,5 +86,38 @@ class ReactRetrieverTraceMigratedTests(unittest.TestCase):
         self.assertEqual(trace.chat_id, "group-1")
         self.assertIn("person", json.loads(trace.source_layers))
 
+    def test_query_memory_prefers_v2_retrieval_service(self):
+        class _RetrievalService:
+            def __init__(self):
+                self.calls = []
+
+            async def retrieve_deep(self, query):
+                self.calls.append(query)
+                return [SimpleNamespace(id="mem-1", summary="Alice v2 memory", content="Alice v2 memory", status="active")]
+
+            def render_recall(self, query, candidates):
+                return f"v2:{candidates[0].summary}"
+
+        class _MemoryEngine:
+            def __init__(self):
+                self.retrieval_service = _RetrievalService()
+                self.recall_calls = []
+
+            async def recall(self, *args, **kwargs):
+                self.recall_calls.append((args, kwargs))
+                return "legacy"
+
+        async def _run():
+            engine = _MemoryEngine()
+            retriever = self.mod.ReActRetriever(memory_engine=engine)
+            result = await retriever._tool_query_memory(chat_id="chat-1", query="Alice")
+            return engine, result
+
+        engine, result = asyncio.run(_run())
+        self.assertEqual(result, "v2:Alice v2 memory")
+        self.assertEqual(engine.recall_calls, [])
+        self.assertEqual(engine.retrieval_service.calls[0].session_id, "chat-1")
+        self.assertEqual(engine.retrieval_service.calls[0].policy, "deep")
+
 
 __all__ = ["ReactRetrieverTraceMigratedTests"]

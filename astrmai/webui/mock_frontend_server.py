@@ -431,6 +431,45 @@ def _reflections(month: str) -> list[dict]:
     ]
 
 
+def _canonical_memories() -> list[dict]:
+    return [
+        {
+            "id": "mem-can-001",
+            "session_id": "chat:demo",
+            "persona_id": "atri",
+            "source": "summary",
+            "kind": "memory",
+            "content": "User prefers deterministic Memory v2 behavior with SQL canonical storage.",
+            "summary": "SQL canonical memory is the only authority; vector/BM25 are projections.",
+            "tags": ["memory-v2", "canonical"],
+            "importance": 0.92,
+            "confidence": 0.9,
+            "status": "active",
+            "visibility": "auto_and_tool",
+            "updated_at": NOW - 1800,
+            "last_access_time": NOW - 1200,
+            "metadata": {"source_ref": "mock:summary"},
+        },
+        {
+            "id": "mem-can-002",
+            "session_id": "__self_lore__",
+            "persona_id": "atri",
+            "source": "persona_cache",
+            "kind": "persona_lore",
+            "content": "I speak in a concise, warm, practical style.",
+            "summary": "Concise warm practical style.",
+            "tags": ["persona"],
+            "importance": 1.0,
+            "confidence": 0.8,
+            "status": "stale",
+            "visibility": "auto_and_tool",
+            "updated_at": NOW - 86400,
+            "last_access_time": NOW - 86400,
+            "metadata": {"source_ref": "persona_cache:atri"},
+        },
+    ]
+
+
 def _memory_nodes() -> list[dict]:
     return [
         {"id": "node-webui", "name": "WebUI 管理台", "type": "project", "description": "AstrMai 后台管理入口。"},
@@ -446,6 +485,7 @@ def _jargons() -> list[dict]:
 
 
 MOCK_MEMORY_EVENTS = _memory_events()
+MOCK_CANONICAL_MEMORIES = _canonical_memories()
 MOCK_REVIEW_ITEMS = [
     {"id": "rv-001", "situation": "用户夸 bot 可爱", "expression": "嘿嘿，那我今天也稍微得意一下。", "style": "warm", "weight": 1.1, "group_id": "group:10001", "status": "pending"},
     {"id": "rv-002", "situation": "强攻击边界", "expression": "这话有点过了，我不接这个。", "style": "boundary", "weight": 0.8, "group_id": "GLOBAL", "status": "pending"},
@@ -607,6 +647,7 @@ class MockFrontendHandler(BaseHTTPRequestHandler):
                     "total_users": 128,
                     "pending_reviews": 9,
                     "total_memory_events": 642,
+                    "total_canonical_memories": len(MOCK_CANONICAL_MEMORIES),
                     "active_chats": 3,
                     "uptime_seconds": 18642,
                 }
@@ -813,6 +854,77 @@ class MockFrontendHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
 
+        if path == "/memories/canonical" and method == "GET":
+            items = _copy_rows(MOCK_CANONICAL_MEMORIES)
+            status = (query.get("status") or [""])[0]
+            kind = (query.get("kind") or [""])[0]
+            session_id = (query.get("session_id") or [""])[0]
+            if status:
+                items = [item for item in items if item.get("status") == status]
+            if kind:
+                items = [item for item in items if item.get("kind") == kind]
+            if session_id:
+                items = [item for item in items if item.get("session_id") == session_id]
+            self._send_json({"status": "ok", "items": items, "total": len(items), "runtime_bound": False})
+            return
+        if path.startswith("/memories/canonical/") and method == "GET":
+            memory_id = unquote(path.rsplit("/", 1)[-1])
+            item = next((row for row in MOCK_CANONICAL_MEMORIES if row["id"] == memory_id), None)
+            self._send_json({"status": "ok" if item else "not_found", "data": item})
+            return
+        if path.startswith("/memories/canonical/") and path.endswith("/restore"):
+            memory_id = unquote(path.split("/")[3])
+            for item in MOCK_CANONICAL_MEMORIES:
+                if item["id"] == memory_id:
+                    item["status"] = "active"
+            self._send_json({"status": "ok", "changed": True})
+            return
+        if path.startswith("/memories/canonical/") and path.endswith("/stale"):
+            memory_id = unquote(path.split("/")[3])
+            for item in MOCK_CANONICAL_MEMORIES:
+                if item["id"] == memory_id:
+                    item["status"] = "stale"
+            self._send_json({"status": "ok", "changed": True})
+            return
+        if path.startswith("/memories/canonical/") and path.endswith("/merge"):
+            memory_id = unquote(path.split("/")[3])
+            for item in MOCK_CANONICAL_MEMORIES:
+                if item["id"] == memory_id:
+                    item["status"] = "merged"
+                    item["superseded_by"] = (body or {}).get("target_id", "")
+            self._send_json({"status": "ok", "changed": True})
+            return
+        if path.startswith("/memories/canonical/") and method == "DELETE":
+            memory_id = unquote(path.rsplit("/", 1)[-1])
+            for item in MOCK_CANONICAL_MEMORIES:
+                if item["id"] == memory_id:
+                    item["status"] = "deleted"
+            self._send_json({"status": "ok", "changed": True})
+            return
+        if path == "/memories/diagnostics/migrations":
+            self._send_json({"status": "ok", "data": {"schema_version": 2, "canonical_counts": {"active": 1, "stale": 1}, "migrations": []}})
+            return
+        if path == "/memories/diagnostics/index":
+            self._send_json({"status": "ok", "data": {"projection_count": 2, "missing_projection_ids": [], "orphan_projection_ids": []}})
+            return
+        if path == "/memories/migration/dry-run":
+            self._send_json({"status": "ok", "data": {"mode": "dry_run", "totals": {"importable": 2, "duplicates": 0, "skipped": 0}}})
+            return
+        if path == "/memories/migration/execute":
+            self._send_json({"status": "ok", "data": {"mode": "execute", "imported": {"documents": 1, "MemoryEvent": 1}, "rebuilt_projection": 2}})
+            return
+        if path == "/memories/migration/verify":
+            self._send_json({"status": "ok", "data": {"mode": "verify", "legacy": {"unmapped_memory_events": 0}}})
+            return
+        if path == "/memories/migration/repair" or path == "/memories/diagnostics/index/repair":
+            self._send_json({"status": "ok", "data": {"mode": "repair", "index": {"rebuilt_missing": 0}}})
+            return
+        if path == "/memories/index/rebuild":
+            self._send_json({"status": "ok", "rebuilt": len(MOCK_CANONICAL_MEMORIES)})
+            return
+        if path == "/memories/maintenance/run":
+            self._send_json({"status": "ok", "data": {"decayed": 1, "marked_stale": 0, "restored": 0, "physically_deleted": 0, "projection_deleted": 0, "protected_skipped": 1, "errors": []}})
+            return
         if path == "/memories/events" and method == "GET":
             self._send_json(_copy_rows(MOCK_MEMORY_EVENTS))
             return

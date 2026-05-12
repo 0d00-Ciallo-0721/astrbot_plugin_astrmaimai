@@ -27,6 +27,7 @@ def install_astrbot_stubs(data_dir: str):
     api_message_components_mod = types.ModuleType("astrbot.api.message_components")
     api_star_mod.Context = type("Context", (), {})
     api_event_mod.AstrMessageEvent = type("AstrMessageEvent", (), {})
+    api_event_mod.MessageChain = type("MessageChain", (), {})
     for name in ["Plain", "At", "Image", "Face"]:
         setattr(api_message_components_mod, name, type(name, (), {}))
 

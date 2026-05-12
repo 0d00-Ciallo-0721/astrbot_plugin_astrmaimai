@@ -103,6 +103,7 @@ class AdminUiService:
                 "active_chats": active_chats,
                 "pending_reviews": await self._safe_count("ExpressionPattern", "status='pending'"),
                 "total_memory_events": await self._safe_count("MemoryEvent"),
+                "total_canonical_memories": await self._safe_count("canonical_memories"),
             },
             "runtime_bound": runtime is not None,
         }

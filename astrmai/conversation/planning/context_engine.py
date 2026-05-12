@@ -10,6 +10,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ...infrastructure.persistence import DatabaseService, VisualMemory
+from ...memory.contracts.memory_query import MemoryQuery
 from ..contracts.prompt_envelope import PromptEnvelope
 from ...memory.persona.persona_summarizer import PersonaSummarizer
 
@@ -256,7 +257,7 @@ class ContextEngine:
         if memory_engine is None:
             memory_engine = getattr(getattr(self.summarizer.gateway, "context", None), "astrmai", None)
             memory_engine = getattr(memory_engine, "memory_engine", None)
-        if memory_engine is None or not hasattr(memory_engine, "recall"):
+        if memory_engine is None:
             return ""
 
         last_msg = str(event_messages[-1].message_str or "").strip()
@@ -272,7 +273,15 @@ class ContextEngine:
             return ""
 
         try:
-            recall_result = await memory_engine.recall(last_msg, session_id=chat_id)
+            retrieval = getattr(memory_engine, "retrieval_service", None)
+            if retrieval and hasattr(retrieval, "retrieve"):
+                memory_query = MemoryQuery(query=last_msg, session_id=str(chat_id or ""), top_k=3)
+                candidates = await retrieval.retrieve(memory_query)
+                recall_result = retrieval.render_recall(memory_query, candidates) if hasattr(retrieval, "render_recall") else "\n".join(
+                    str(getattr(item, "summary", "") or getattr(item, "content", "")) for item in candidates
+                )
+            else:
+                recall_result = await memory_engine.recall(last_msg, session_id=chat_id)
         except Exception as exc:
             logger.warning(f"[ContextEngine] proactive recall failed: {exc}")
             return ""

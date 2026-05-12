@@ -20,6 +20,15 @@ except ImportError:
 from ..retrieval.bm25 import BM25Retriever
 from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
+from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
+from .memory_index_projector import MemoryIndexProjector
+from .memory_injection_service import MemoryInjectionService
+from .memory_maintenance_service import MemoryMaintenanceService
+from .memory_migration_service import MemoryMigrationService
+from .memory_retrieval_service import MemoryRetrievalService
+from .memory_tool_service import MemoryToolService
+from .memory_write_service import MemoryWriteService
+from .v2_store import MemoryV2Store
 
 
 @dataclass(slots=True)
@@ -40,6 +49,7 @@ class MemoryEngine:
         self.context = context
         self.gateway = gateway
         self.config = config if config else gateway.config
+        self.db_service = None
         if hasattr(self.config, "provider") and getattr(self.config.provider, "embedding_models", None):
             self.embedding_models = self.config.provider.embedding_models
         else:
@@ -61,6 +71,18 @@ class MemoryEngine:
         self._learning_event_history = []
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
         self._disabled_cognitive_feedback_keys: set[tuple[str, str, str, str]] = set()
+        self.v2_store = MemoryV2Store(self.db_path, data_path=self.data_path)
+        self.index_projector = MemoryIndexProjector(self)
+        self.write_service = MemoryWriteService(self.v2_store, self.index_projector)
+        self.retrieval_service = MemoryRetrievalService(self.v2_store, engine=self)
+        self.injection_service = MemoryInjectionService(self.retrieval_service, config=self.config)
+        self.tool_service = MemoryToolService(self.retrieval_service, config=self.config)
+        self.maintenance_service = MemoryMaintenanceService(self.v2_store, self.index_projector)
+        self.migration_service = MemoryMigrationService(
+            self.v2_store,
+            index_projector=self.index_projector,
+            engine=self,
+        )
 
     def _remember_learning_event(self, event_name: str, payload: dict | None) -> None:
         event_payload = dict(payload or {})
@@ -123,6 +145,10 @@ class MemoryEngine:
         return "\n".join(f"- {item.content}" for item in results)
 
     async def initialize(self):
+        await self.v2_store.initialize()
+        await self.v2_store.import_legacy_documents()
+        await self.v2_store.import_persona_cache()
+        await self.import_legacy_memory_events()
         self.bm25_retriever = BM25Retriever(self.db_path)
         await self.bm25_retriever.initialize()
         logger.info("[AstrMai] memory skeleton initialized; vector store will be lazy-loaded.")
@@ -181,14 +207,28 @@ class MemoryEngine:
         self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
         self._is_ready = True
         self._init_failures = 0
+        if not await self.v2_store.migration_applied("2_index_rebuild"):
+            try:
+                rebuilt = await self.index_projector.rebuild_all()
+                await self.v2_store.record_migration("2_index_rebuild", status="applied", detail=f"rebuilt={rebuilt}")
+            except Exception as exc:
+                await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])
+                logger.debug(f"[MemoryV2] index rebuild degraded: {exc}")
         logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
         return True
 
     async def add_memory(self, content: str, session_id: str, persona_id: str = None, importance: float = 0.8):
-        if not await self._ensure_faiss_initialized():
-            return
-        metadata = self._build_memory_metadata(session_id=session_id, persona_id=persona_id, importance=importance)
-        await self.retriever.add_memory(content, metadata)
+        request = MemoryWriteRequest(
+            source="legacy_add_memory",
+            kind="persona_lore" if session_id == "__self_lore__" else "memory",
+            session_id=str(session_id or ""),
+            persona_id=str(persona_id or ""),
+            content=str(content or ""),
+            importance=float(importance or 0.8),
+            confidence=0.8,
+            source_ref="memory_engine.add_memory",
+        )
+        return await self.write_service.write(request)
 
     @staticmethod
     def _feedback_prefix(source: str) -> str:
@@ -303,23 +343,27 @@ class MemoryEngine:
             importance=float(importance or 0.5),
         )
         self._remember_cognitive_feedback(signal)
-
-        if not await self._ensure_faiss_initialized():
-            return
-        content = self._format_cognitive_feedback_content(
-            source=signal.source,
-            summary=signal.summary,
-            guidance=signal.guidance,
-            tags=signal.tags,
+        await self.write_service.write(
+            MemoryWriteRequest(
+                source=signal.source,
+                kind="feedback",
+                session_id=chat_id,
+                content=self._format_cognitive_feedback_content(
+                    source=signal.source,
+                    summary=signal.summary,
+                    guidance=signal.guidance,
+                    tags=signal.tags,
+                ),
+                summary=signal.summary,
+                tags=signal.tags,
+                importance=signal.importance,
+                confidence=0.8,
+                metadata={"guidance": signal.guidance, "cognitive_feedback": True},
+                dedup_key=f"feedback:{chat_id}:{signal.source}:{signal.summary}:{signal.guidance}",
+                source_ref=f"cognitive_feedback:{signal.source}",
+                visibility="tool_only",
+            )
         )
-        metadata = self._build_memory_metadata(
-            session_id=chat_id,
-            importance=signal.importance,
-            feedback_source=signal.source,
-            cognitive_feedback=True,
-            tags=json.dumps(signal.tags, ensure_ascii=False),
-        )
-        await self.retriever.add_memory(content, metadata)
 
     async def get_cognitive_feedback(
         self,
@@ -403,79 +447,86 @@ class MemoryEngine:
         return unique
 
     async def clear_persona_lore(self, persona_id: str = None) -> int:
+        canonical_deleted = await self.maintenance_service.soft_delete_by_filter(
+            kind="persona_lore",
+            session_id="__self_lore__",
+            persona_id=str(persona_id or ""),
+            reason="persona_lore_rebuild",
+        )
         if not await self._ensure_faiss_initialized():
-            return 0
+            return canonical_deleted
         try:
             query = "DELETE FROM documents WHERE json_extract(metadata, '$.session_id') = '__self_lore__'"
             params: list[Any] = []
             if persona_id:
                 query += " AND json_extract(metadata, '$.persona_id') = ?"
                 params.append(persona_id)
-            deleted = await self._execute_documents_write(query, tuple(params))
-            logger.info(f"[MemoryEngine] persona lore cleared: {deleted} rows (persona={persona_id})")
-            return deleted
+            legacy_deleted = await self._execute_documents_write(query, tuple(params))
+            logger.info(
+                f"[MemoryEngine] persona lore cleared: canonical={canonical_deleted}, legacy={legacy_deleted} rows (persona={persona_id})"
+            )
+            return canonical_deleted + legacy_deleted
         except Exception as exc:
             logger.error(f"[MemoryEngine] clear persona lore failed: {exc}")
             return 0
 
     async def add_persona_lore(self, content: str, persona_id: str = None):
-        if not await self._ensure_faiss_initialized():
-            return
-        from ...conversation.execution.text_segmenter import TextSegmenter
-
-        chunks = TextSegmenter.semantic_chunk(content, max_chunk_size=800)
-        logger.info(f"[MemoryEngine] storing {len(chunks)} persona lore chunks.")
-        for index, chunk in enumerate(chunks):
-            metadata = self._build_memory_metadata(
+        await self.write_service.write(
+            MemoryWriteRequest(
+                source="persona_lore",
+                kind="persona_lore",
                 session_id="__self_lore__",
-                persona_id=persona_id,
+                persona_id=str(persona_id or ""),
+                content=str(content or ""),
+                summary=str(content or "")[:240],
                 importance=1.0,
-                chunk_index=index,
+                confidence=0.9,
+                dedup_key=f"persona_lore:{persona_id or ''}:{hash(str(content or ''))}",
+                source_ref=f"persona_lore:{persona_id or ''}",
             )
-            await self.retriever.add_memory(chunk, metadata)
+        )
 
     async def recall_persona_lore(self, query: str, persona_id: str = None, top_k: int = 3) -> str:
-        if not await self._ensure_faiss_initialized():
-            return "(persona lore offline)"
-
-        results = await self._search_memories(
-            query,
-            top_k=top_k,
+        memory_query = MemoryQuery(
+            query=str(query or ""),
             session_id="__self_lore__",
-            persona_id=persona_id,
+            persona_id=str(persona_id or ""),
+            layers=["persona_lore"],
+            top_k=int(top_k or 3),
+            include_persona_lore=True,
+            allow_stale=True,
         )
-        valid_results = self._filter_search_results(results, min_score=0.05)
-        if not valid_results:
+        candidates = await self.retrieval_service.retrieve(memory_query)
+        if not candidates:
             return "(no relevant persona lore found)"
-        return "\n".join(f"[fact] {item.content}" for item in valid_results)
+        return "\n".join(f"[fact] {item.summary or item.content}" for item in candidates)
 
     async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None) -> str:
-        if not await self._ensure_faiss_initialized():
-            return "(memory offline)"
-
-        recall_top_k = top_k if top_k is not None else getattr(self.config.memory, "recall_top_k", 5)
-        results = await self._search_memories(
-            query,
-            top_k=recall_top_k,
-            session_id=session_id,
-            persona_id=persona_id,
+        recall_top_k = top_k if top_k is not None else getattr(getattr(self.config, "memory", None), "recall_top_k", 5)
+        memory_query = MemoryQuery(
+            query=str(query or ""),
+            session_id=str(session_id or ""),
+            persona_id=str(persona_id or ""),
+            top_k=int(recall_top_k or 5),
         )
-        valid_results = self._filter_search_results(results, min_score=0.02)
-        valid_results = [
+        candidates = [
             item
-            for item in valid_results
-            if not self._is_cognitive_feedback_content(getattr(item, "content", ""))
+            for item in await self.retrieval_service.retrieve(memory_query)
+            if not self._is_cognitive_feedback_content(item.content)
         ]
-        if not valid_results:
+        if not candidates:
             return f"No relevant memory found for '{query}'."
+        logger.info(f"[Memory] recall matched {len(candidates)} high-relevance fragments.")
+        return self.retrieval_service.render_recall(memory_query, candidates)
 
-        retrieved_memory = self._format_bullet_memories(valid_results)
-        logger.info(f"[Memory] recall matched {len(valid_results)} high-relevance fragments.")
-        return (
-            f"Relevant memory about '{query}':\n"
-            f"{retrieved_memory}\n"
-            "(use these memories naturally in the follow-up reply)"
-        )
+    async def query(self, query: str, session_id: str = "", **kwargs) -> str:
+        return await self.recall(query=query, session_id=session_id, top_k=kwargs.get("top_k"))
+
+    async def search(self, query: str, session_id: str = "", **kwargs) -> str:
+        return await self.recall(query=query, session_id=session_id, top_k=kwargs.get("top_k"))
+
+    async def query_persona_lore(self, query: str, persona_id: str = "", **kwargs) -> str:
+        return await self.recall_persona_lore(query=query, persona_id=persona_id, top_k=kwargs.get("top_k", 3))
 
     async def start_background_tasks(self):
         from .summarizer import ChatHistorySummarizer
@@ -484,10 +535,16 @@ class MemoryEngine:
         await self.summarizer.start()
 
     async def apply_daily_decay(self, decay_rate: float, days: int = 1) -> int:
+        v2_deleted = await self.maintenance_service.apply_daily_decay(
+            decay_rate=decay_rate,
+            days=days,
+            min_score=getattr(getattr(self.config, "memory", None), "prune_threshold", 0.2),
+            stale_grace_seconds=7 * 86400,
+        )
         await self._ensure_faiss_initialized()
         decay_factor = (1 - decay_rate) ** days
         try:
-            return await self._execute_documents_write(
+            legacy_rows = await self._execute_documents_write(
                 """
                 UPDATE documents
                 SET metadata = json_set(
@@ -503,9 +560,71 @@ class MemoryEngine:
                 """,
                 (decay_factor,),
             )
+            return legacy_rows + v2_deleted
         except Exception as exc:
             logger.error(f"[Memory] daily decay SQL failed: {exc}")
+            return v2_deleted
+
+    async def import_legacy_memory_events(self, *, limit: int = 1000) -> int:
+        version = "2_memory_event_import"
+        if await self.v2_store.migration_applied(version):
             return 0
+        db_service = getattr(self, "db_service", None)
+        if not db_service or not hasattr(db_service, "get_session"):
+            await self.v2_store.record_migration(version, status="applied", detail="db service unavailable")
+            return 0
+        imported = 0
+        try:
+            from ...infrastructure.persistence import MemoryEvent
+            from sqlmodel import desc, select
+
+            def _load_events():
+                with db_service.get_session() as session:
+                    statement = select(MemoryEvent).order_by(desc(MemoryEvent.created_at)).limit(limit)
+                    return [MemoryEvent.model_validate(item.model_dump()) for item in session.exec(statement).all()]
+
+            import asyncio
+
+            events = await asyncio.to_thread(_load_events)
+            for event in events:
+                content = str(getattr(event, "narrative", "") or "").strip()
+                if not content:
+                    continue
+                tags = []
+                try:
+                    parsed_tags = json.loads(getattr(event, "tags", "") or "[]")
+                    if isinstance(parsed_tags, list):
+                        tags = [str(item) for item in parsed_tags]
+                except Exception:
+                    tags = []
+                metadata = {
+                    "legacy_event_id": getattr(event, "event_id", ""),
+                    "emotion": getattr(event, "emotion", ""),
+                    "reflection": getattr(event, "reflection", ""),
+                    "memory_kind": getattr(event, "memory_kind", ""),
+                    "source_layer": getattr(event, "source_layer", ""),
+                }
+                await self.write_service.write(
+                    MemoryWriteRequest(
+                        source="memory_event",
+                        kind=str(getattr(event, "memory_kind", "") or "event"),
+                        session_id=str(getattr(event, "session_id", "") or getattr(event, "date", "") or ""),
+                        content=content,
+                        summary=content[:240],
+                        tags=tags,
+                        importance=max(0.1, min(1.0, float(getattr(event, "importance", 5) or 5) / 10.0)),
+                        confidence=0.75,
+                        metadata=metadata,
+                        dedup_key=f"memory_event:{getattr(event, 'event_id', '')}",
+                        source_ref=f"MemoryEvent:{getattr(event, 'event_id', '')}",
+                    )
+                )
+                imported += 1
+            await self.v2_store.record_migration(version, status="applied", detail=f"imported={imported}")
+        except Exception as exc:
+            await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] MemoryEvent import degraded: {exc}")
+        return imported
 
     async def get_recent_memories(self, session_id: str, hours: int = 24) -> list:
         if not await self._ensure_faiss_initialized():
@@ -540,8 +659,9 @@ class MemoryEngine:
         return recent_memories
 
     async def prune_low_importance(self, threshold: float = 0.2) -> int:
+        canonical_deleted = await self.maintenance_service.prune_low_importance(threshold=threshold)
         if not await self._ensure_faiss_initialized():
-            return 0
+            return canonical_deleted
         try:
             deleted_rows = await self._execute_documents_write(
                 """
@@ -553,12 +673,12 @@ class MemoryEngine:
             )
             if deleted_rows > 0:
                 logger.info(
-                    f"[MemoryEngine] pruned {deleted_rows} low-importance memory rows below threshold {threshold}."
+                    f"[MemoryEngine] pruned canonical={canonical_deleted}, legacy={deleted_rows} low-importance memory rows below threshold {threshold}."
                 )
-            return deleted_rows
+            return canonical_deleted + deleted_rows
         except Exception as exc:
             logger.error(f"[MemoryEngine] prune low importance failed: {exc}")
-            return 0
+            return canonical_deleted
 
     @staticmethod
     def _compute_text_similarity(text_a: str, text_b: str) -> float:
@@ -572,15 +692,21 @@ class MemoryEngine:
         return len(a & b) / len(a | b)
 
     async def store_topic_results(self, topic_results: list, session_id: str, persona_id: str = None):
-        if not await self._ensure_faiss_initialized():
-            return
-
         for topic_result in topic_results:
             summary = topic_result.get("summary", "")
             if not summary or summary == "topic too short":
                 continue
 
-            existing_results = await self.retriever.search(summary, k=1, session_id=session_id, persona_id=persona_id)
+            existing_results = await self.retrieval_service.retrieve(
+                MemoryQuery(
+                    query=summary,
+                    session_id=str(session_id or ""),
+                    persona_id=str(persona_id or ""),
+                    layers=["memory", "topic", "event"],
+                    top_k=1,
+                    metadata={"visibility_mode": "tool"},
+                )
+            )
             merged = False
             if existing_results:
                 existing_doc = existing_results[0]
@@ -589,10 +715,42 @@ class MemoryEngine:
                     merged_summary = f"{existing_text}\nSupplement: {summary}"
                     if len(merged_summary) > len(existing_text) * 2:
                         merged_summary = merged_summary[: len(existing_text) * 2] + "..."
-                    await self.add_memory(merged_summary, session_id=session_id, persona_id=persona_id, importance=0.85)
+                    new_id = await self.write_service.write(
+                        MemoryWriteRequest(
+                            source="topic_summarizer",
+                            kind=existing_doc.kind or "topic",
+                            session_id=str(session_id or ""),
+                            persona_id=str(persona_id or ""),
+                            content=merged_summary,
+                            summary=merged_summary[:240],
+                            tags=list(existing_doc.tags or []),
+                            importance=0.85,
+                            confidence=max(existing_doc.confidence, 0.8),
+                            metadata={"merged_from": [existing_doc.id], "topic_result": dict(topic_result or {})},
+                            dedup_key=f"topic_merged:{session_id}:{hash(merged_summary)}",
+                            source_ref="summarizer.topic_merge",
+                        )
+                    )
+                    if new_id:
+                        await self.maintenance_service.mark_merged([existing_doc.id], superseded_by=new_id)
                     logger.info(f"[MemoryEngine] merged similar topic memory: {summary[:20]}...")
                     merged = True
 
             if not merged:
                 importance = float(topic_result.get("importance", 0.4) or 0.4)
-                await self.add_memory(summary, session_id=session_id, persona_id=persona_id, importance=importance)
+                await self.write_service.write(
+                    MemoryWriteRequest(
+                        source="topic_summarizer",
+                        kind="topic",
+                        session_id=str(session_id or ""),
+                        persona_id=str(persona_id or ""),
+                        content=str(summary or ""),
+                        summary=str(summary or "")[:240],
+                        tags=[str(item) for item in topic_result.get("topic_keywords", []) or []],
+                        importance=importance,
+                        confidence=0.8,
+                        metadata={"topic_result": dict(topic_result or {})},
+                        dedup_key=f"topic:{session_id}:{hash(str(summary or ''))}",
+                        source_ref="summarizer.topic",
+                    )
+                )

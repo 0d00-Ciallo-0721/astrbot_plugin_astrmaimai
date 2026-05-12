@@ -601,11 +601,17 @@ class CognitiveLoop:
         chat_id = event.unified_msg_origin
         sender_id = str(event.get_sender_id() or "")
         if tool_name == "self_lore":
-            if not self.memory_engine or not hasattr(self.memory_engine, "recall_persona_lore"):
+            if not self.memory_engine:
                 return "Self lore is offline."
             persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")
             query = tool_query or self._current_text(event, None)
-            return await self.memory_engine.recall_persona_lore(query=query, persona_id=persona_id)
+            tool_service = getattr(self.memory_engine, "tool_service", None)
+            if tool_service and hasattr(tool_service, "self_lore_query"):
+                result = await tool_service.self_lore_query(query=query, persona_id=persona_id, event=event)
+                return tool_service.render_result(result)
+            if hasattr(self.memory_engine, "recall_persona_lore"):
+                return await self.memory_engine.recall_persona_lore(query=query, persona_id=persona_id)
+            return "Self lore is offline."
 
         if tool_name == "user_profile":
             if not self.state_engine or not hasattr(self.state_engine, "get_user_profile_summary"):
@@ -638,10 +644,16 @@ class CognitiveLoop:
             )
 
         if tool_name == "light_memory":
-            if not self.memory_engine or not hasattr(self.memory_engine, "recall"):
+            if not self.memory_engine:
                 return "Light memory service is offline."
             query = tool_query or self._current_text(event, None)
-            return await self.memory_engine.recall(query, session_id=chat_id, top_k=2)
+            tool_service = getattr(self.memory_engine, "tool_service", None)
+            if tool_service and hasattr(tool_service, "search_memory"):
+                result = await tool_service.search_memory(query=query, session_id=chat_id, top_k=2, event=event)
+                return tool_service.render_result(result)
+            if hasattr(self.memory_engine, "recall"):
+                return await self.memory_engine.recall(query, session_id=chat_id, top_k=2)
+            return "Light memory service is offline."
 
         return f"Readonly restriction: tool `{tool_name}` is not available."
 

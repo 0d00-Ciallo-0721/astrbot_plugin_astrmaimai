@@ -125,6 +125,9 @@ class AstrMaiAdminPageApi:
     def _reviews(self) -> ReviewUiService:
         return ReviewUiService(self.plugin_api, get_db)
 
+    def _memory(self) -> MemoryUiService:
+        return MemoryUiService(get_db, self.plugin_api)
+
     async def dashboard(self, request: Any) -> dict[str, Any]:
         return await DashboardService(self.plugin_api, get_db).get_snapshot()
 
@@ -324,50 +327,111 @@ class AstrMaiAdminPageApi:
         return await self._reviews().delete_review_record(self._int(self._path(request).get("id")))
 
     async def list_memory_events(self, request: Any) -> Any:
-        return await MemoryUiService(get_db).list_events()
+        return await self._memory().list_events()
+
+    async def list_canonical_memories(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        return await self._memory().list_canonical(
+            session_id=str(query.get("session_id", "") or ""),
+            persona_id=str(query.get("persona_id", "") or ""),
+            kind=str(query.get("kind", "") or ""),
+            status=str(query.get("status", "") or ""),
+            limit=self._int(query.get("limit"), 100),
+            offset=self._int(query.get("offset"), 0),
+        )
+
+    async def canonical_memory(self, request: Any) -> dict[str, Any]:
+        return await self._memory().get_canonical(str(self._path(request).get("memory_id", "")))
+
+    async def delete_canonical_memory(self, request: Any) -> dict[str, Any]:
+        return await self._memory().delete_canonical(str(self._path(request).get("memory_id", "")))
+
+    async def restore_canonical_memory(self, request: Any) -> dict[str, Any]:
+        return await self._memory().restore_canonical(str(self._path(request).get("memory_id", "")))
+
+    async def stale_canonical_memory(self, request: Any) -> dict[str, Any]:
+        return await self._memory().mark_canonical_stale(str(self._path(request).get("memory_id", "")))
+
+    async def merge_canonical_memory(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().merge_canonical(
+            str(self._path(request).get("memory_id", "")),
+            target_id=str(body.get("target_id", "") or ""),
+        )
+
+    async def memory_migration_report(self, request: Any) -> dict[str, Any]:
+        return await self._memory().migration_report()
+
+    async def memory_migration_dry_run(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().migration_dry_run(sources=list(body.get("import_sources") or []))
+
+    async def memory_migration_execute(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().migration_execute(sources=list(body.get("import_sources") or []))
+
+    async def memory_migration_verify(self, request: Any) -> dict[str, Any]:
+        return await self._memory().migration_verify()
+
+    async def memory_migration_repair(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().migration_repair(report=body.get("report"))
+
+    async def memory_index_status(self, request: Any) -> dict[str, Any]:
+        return await self._memory().index_status()
+
+    async def repair_memory_index(self, request: Any) -> dict[str, Any]:
+        return await self._memory().repair_index()
+
+    async def rebuild_memory_index(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().rebuild_index(session_id=str(body.get("session_id", "") or ""))
+
+    async def run_memory_maintenance(self, request: Any) -> dict[str, Any]:
+        return await self._memory().run_maintenance(policy=await self._body(request))
 
     async def create_memory_event(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).create_event(await self._body(request))
+        return await self._memory().create_event(await self._body(request))
 
     async def delete_memory_event(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).delete_event(self._int(self._path(request).get("id")))
+        return await self._memory().delete_event(self._int(self._path(request).get("id")))
 
     async def list_reflections(self, request: Any) -> Any:
         month = str(self._query(request).get("month", "") or "")
-        return await MemoryUiService(get_db).list_reflections(month)
+        return await self._memory().list_reflections(month)
 
     async def create_reflection(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).create_reflection(await self._body(request))
+        return await self._memory().create_reflection(await self._body(request))
 
     async def update_reflection(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).update_reflection(str(self._path(request).get("date", "")), await self._body(request))
+        return await self._memory().update_reflection(str(self._path(request).get("date", "")), await self._body(request))
 
     async def delete_reflection(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).delete_reflection(str(self._path(request).get("date", "")))
+        return await self._memory().delete_reflection(str(self._path(request).get("date", "")))
 
     async def list_nodes(self, request: Any) -> Any:
-        return await MemoryUiService(get_db).list_nodes()
+        return await self._memory().list_nodes()
 
     async def create_node(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).create_node(await self._body(request))
+        return await self._memory().create_node(await self._body(request))
 
     async def update_node(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).update_node(self._int(self._path(request).get("id")), await self._body(request))
+        return await self._memory().update_node(self._int(self._path(request).get("id")), await self._body(request))
 
     async def delete_node(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).delete_node(self._int(self._path(request).get("id")))
+        return await self._memory().delete_node(self._int(self._path(request).get("id")))
 
     async def list_jargon(self, request: Any) -> Any:
-        return await MemoryUiService(get_db).list_jargon()
+        return await self._memory().list_jargon()
 
     async def create_jargon(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).create_jargon(await self._body(request))
+        return await self._memory().create_jargon(await self._body(request))
 
     async def update_jargon(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).update_jargon(self._int(self._path(request).get("id")), await self._body(request))
+        return await self._memory().update_jargon(self._int(self._path(request).get("id")), await self._body(request))
 
     async def delete_jargon(self, request: Any) -> dict[str, Any]:
-        return await MemoryUiService(get_db).delete_jargon(self._int(self._path(request).get("id")))
+        return await self._memory().delete_jargon(self._int(self._path(request).get("id")))
 
     async def users(self, request: Any) -> Any:
         return await UserUiService(get_db).list_users()
@@ -432,6 +496,22 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
 
     routes: list[tuple[str, str, Callable[[Any], Awaitable[Any]], str]] = [
         ("GET", "/heartflow/impulses", api.heartflow_impulses, "AstrMai Heartflow impulse safety decisions"),
+        ("GET", "/memories/canonical", api.list_canonical_memories, "AstrMai canonical memories"),
+        ("GET", "/memories/canonical/{memory_id}", api.canonical_memory, "AstrMai canonical memory detail"),
+        ("POST", "/memories/canonical/{memory_id}/restore", api.restore_canonical_memory, "AstrMai restore canonical memory"),
+        ("POST", "/memories/canonical/{memory_id}/stale", api.stale_canonical_memory, "AstrMai mark canonical memory stale"),
+        ("POST", "/memories/canonical/{memory_id}/merge", api.merge_canonical_memory, "AstrMai merge canonical memory"),
+        ("POST", "/memories/canonical/{memory_id}/delete", api.delete_canonical_memory, "AstrMai soft delete canonical memory"),
+        ("DELETE", "/memories/canonical/{memory_id}", api.delete_canonical_memory, "AstrMai soft delete canonical memory"),
+        ("GET", "/memories/diagnostics/migrations", api.memory_migration_report, "AstrMai memory migration report"),
+        ("POST", "/memories/migration/dry-run", api.memory_migration_dry_run, "AstrMai memory migration dry run"),
+        ("POST", "/memories/migration/execute", api.memory_migration_execute, "AstrMai memory migration execute"),
+        ("GET", "/memories/migration/verify", api.memory_migration_verify, "AstrMai memory migration verify"),
+        ("POST", "/memories/migration/repair", api.memory_migration_repair, "AstrMai memory migration repair"),
+        ("GET", "/memories/diagnostics/index", api.memory_index_status, "AstrMai memory index status"),
+        ("POST", "/memories/diagnostics/index/repair", api.repair_memory_index, "AstrMai repair memory index"),
+        ("POST", "/memories/index/rebuild", api.rebuild_memory_index, "AstrMai rebuild memory index"),
+        ("POST", "/memories/maintenance/run", api.run_memory_maintenance, "AstrMai run memory maintenance"),
         ("GET", "/heartflow/chats/{chat_id}/impulses", api.heartflow_chat_impulses, "AstrMai chat Heartflow impulse safety decisions"),
         ("GET", "/heartflow/timeline", api.heartflow_timeline, "AstrMai Heartflow timeline"),
         ("GET", "/heartflow/chats/{chat_id}/timeline", api.heartflow_chat_timeline, "AstrMai chat Heartflow timeline"),
