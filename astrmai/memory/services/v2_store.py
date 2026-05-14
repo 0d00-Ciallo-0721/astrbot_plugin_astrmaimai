@@ -19,6 +19,8 @@ STALE_STATUS = "stale"
 DELETED_STATUS = "deleted"
 MERGED_STATUS = "merged"
 DEPRECATED_STATUS = "deprecated"
+REVIEW_PENDING_STATUS = "review_pending"
+REJECTED_STATUS = "rejected"
 
 
 class MemoryV2Store:
@@ -167,6 +169,17 @@ class MemoryV2Store:
         summary = request.summary or request.content[:240]
         dedup_key = request.dedup_key.strip()
         visibility = request.visibility if request.visibility in {"auto_and_tool", "tool_only", "maintenance_only"} else "auto_and_tool"
+        status = str(request.status or ACTIVE_STATUS).strip() or ACTIVE_STATUS
+        if status not in {
+            ACTIVE_STATUS,
+            STALE_STATUS,
+            DELETED_STATUS,
+            MERGED_STATUS,
+            DEPRECATED_STATUS,
+            REVIEW_PENDING_STATUS,
+            REJECTED_STATUS,
+        }:
+            status = ACTIVE_STATUS
 
         async with aiosqlite.connect(self.db_path) as db:
             if dedup_key:
@@ -174,7 +187,7 @@ class MemoryV2Store:
                     """
                     SELECT id, content, summary, access_count
                     FROM canonical_memories
-                    WHERE dedup_key = ? AND status IN ('active', 'stale')
+                    WHERE dedup_key = ? AND status IN ('active', 'stale', 'review_pending')
                     LIMIT 1
                     """,
                     (dedup_key,),
@@ -190,7 +203,7 @@ class MemoryV2Store:
                         SET content = ?, summary = ?, source = ?, kind = ?,
                             importance = MAX(importance, ?),
                             confidence = MAX(confidence, ?),
-                            status = 'active',
+                            status = ?,
                             update_time = ?, last_access_time = ?,
                             access_count = COALESCE(access_count, 0) + 1,
                             tags = ?, metadata = ?, source_ref = ?, visibility = ?
@@ -203,6 +216,7 @@ class MemoryV2Store:
                             request.kind,
                             float(request.importance or 0.5),
                             float(request.confidence or 0.8),
+                            status,
                             now,
                             now,
                             self._json_list(request.tags),
@@ -223,7 +237,7 @@ class MemoryV2Store:
                     create_time, update_time, last_access_time, access_count,
                     metadata, dedup_key, source_ref, visibility
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     memory_id,
@@ -236,6 +250,7 @@ class MemoryV2Store:
                     self._json_list(request.tags),
                     float(request.importance or 0.5),
                     float(request.confidence or 0.8),
+                    status,
                     now,
                     now,
                     now,
@@ -276,6 +291,30 @@ class MemoryV2Store:
         params: tuple[Any, ...] = (memory_id,)
         if not include_inactive:
             where += " AND status IN ('active', 'stale')"
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                WHERE {where}
+                LIMIT 1
+                """,
+                params,
+            )
+            row = await cursor.fetchone()
+        return self._row_to_candidate(row) if row else None
+
+    async def get_by_dedup_key(self, dedup_key: str, *, include_inactive: bool = False) -> MemoryCandidate | None:
+        await self.initialize()
+        clean_key = str(dedup_key or "").strip()
+        if not clean_key:
+            return None
+        where = "dedup_key = ?"
+        params: tuple[Any, ...] = (clean_key,)
+        if not include_inactive:
+            where += " AND status IN ('active', 'stale', 'review_pending')"
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""
@@ -422,6 +461,63 @@ class MemoryV2Store:
         if selected:
             await self.mark_accessed([item.id for item in selected])
         return selected
+
+    async def list_candidates(
+        self,
+        *,
+        session_id: str = "",
+        persona_id: str = "",
+        kinds: list[str] | None = None,
+        statuses: list[str] | None = None,
+        limit: int = 200,
+        include_inactive: bool = False,
+        visibility_mode: str = "",
+    ) -> list[MemoryCandidate]:
+        await self.initialize()
+        where: list[str] = []
+        params: list[Any] = []
+        active_statuses = list(statuses or ([] if include_inactive else [ACTIVE_STATUS, STALE_STATUS]))
+        if active_statuses:
+            where.append("status IN (" + ",".join("?" for _ in active_statuses) + ")")
+            params.extend(active_statuses)
+        if session_id == "__self_lore__":
+            where.append("session_id = ?")
+            params.append(session_id)
+        elif session_id:
+            where.append("(session_id = ? OR session_id = '')")
+            params.append(session_id)
+        if persona_id:
+            where.append("(persona_id = ? OR persona_id = '')")
+            params.append(persona_id)
+        clean_kinds = [str(item) for item in kinds or [] if str(item).strip()]
+        if clean_kinds:
+            where.append("kind IN (" + ",".join("?" for _ in clean_kinds) + ")")
+            params.extend(clean_kinds)
+        if visibility_mode == "auto":
+            allowed_visibility = {"auto_and_tool"}
+        elif visibility_mode == "tool":
+            allowed_visibility = {"auto_and_tool", "tool_only"}
+        else:
+            allowed_visibility = set()
+        if allowed_visibility:
+            where.append("visibility IN (" + ",".join("?" for _ in allowed_visibility) + ")")
+            params.extend(sorted(allowed_visibility))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility
+                FROM canonical_memories
+                {where_sql}
+                ORDER BY update_time DESC
+                LIMIT ?
+                """,
+                (*params, max(1, min(int(limit or 200), 500))),
+            )
+            rows = await cursor.fetchall()
+        return [self._row_to_candidate(row) for row in rows]
 
     async def list_canonical(
         self,
@@ -576,6 +672,104 @@ class MemoryV2Store:
             )
             await db.commit()
             return cursor.rowcount
+
+    async def purge_jargon_candidates(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        older_than_seconds: float,
+        min_confidence_to_keep: float = 0.9,
+        min_count_to_keep: int = 5,
+        review_statuses: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        await self.initialize()
+        cutoff = self._now() - max(float(older_than_seconds or 0.0), 0.0)
+        deleted_ids: list[str] = []
+        protected_skipped = 0
+        if not statuses:
+            return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, metadata, confidence
+                FROM canonical_memories
+                WHERE kind = 'jargon'
+                  AND status IN ({','.join('?' for _ in statuses)})
+                  AND COALESCE(update_time, create_time, 0) <= ?
+                """,
+                (*statuses, cutoff),
+            )
+            rows = await cursor.fetchall()
+            for memory_id, metadata_raw, confidence_value in rows:
+                try:
+                    metadata = json.loads(metadata_raw or "{}")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                except Exception:
+                    metadata = {}
+                review_status = str(metadata.get("review_status") or "").strip().lower()
+                if review_statuses and review_status not in {str(item).strip().lower() for item in review_statuses if str(item).strip()}:
+                    continue
+                confidence = float(metadata.get("confidence") or confidence_value or 0.0)
+                count = int(metadata.get("count") or 0)
+                if confidence >= float(min_confidence_to_keep or 0.9) or count >= int(min_count_to_keep or 5):
+                    protected_skipped += 1
+                    continue
+                deleted_ids.append(str(memory_id))
+            for memory_id in deleted_ids:
+                await db.execute("DELETE FROM canonical_memories WHERE id = ?", (memory_id,))
+            await db.commit()
+        return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
+
+    async def purge_kind_candidates(
+        self,
+        *,
+        kind: str,
+        statuses: tuple[str, ...],
+        older_than_seconds: float,
+        min_confidence_to_keep: float = 0.9,
+        min_count_to_keep: int = 5,
+        review_statuses: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        await self.initialize()
+        cutoff = self._now() - max(float(older_than_seconds or 0.0), 0.0)
+        deleted_ids: list[str] = []
+        protected_skipped = 0
+        clean_kind = str(kind or "").strip()
+        if not statuses or not clean_kind:
+            return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, metadata, confidence
+                FROM canonical_memories
+                WHERE kind = ?
+                  AND status IN ({','.join('?' for _ in statuses)})
+                  AND COALESCE(update_time, create_time, 0) <= ?
+                """,
+                (clean_kind, *statuses, cutoff),
+            )
+            rows = await cursor.fetchall()
+            for memory_id, metadata_raw, confidence_value in rows:
+                try:
+                    metadata = json.loads(metadata_raw or "{}")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                except Exception:
+                    metadata = {}
+                review_status = str(metadata.get("review_status") or "").strip().lower()
+                if review_statuses and review_status not in {str(item).strip().lower() for item in review_statuses if str(item).strip()}:
+                    continue
+                confidence = float(metadata.get("confidence") or confidence_value or 0.0)
+                count = int(metadata.get("count") or 0)
+                if confidence >= float(min_confidence_to_keep or 0.9) or count >= int(min_count_to_keep or 5):
+                    protected_skipped += 1
+                    continue
+                deleted_ids.append(str(memory_id))
+            for memory_id in deleted_ids:
+                await db.execute("DELETE FROM canonical_memories WHERE id = ?", (memory_id,))
+            await db.commit()
+        return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
 
     async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:
         await self.initialize()
@@ -735,6 +929,66 @@ class MemoryV2Store:
             await db.commit()
             return cursor.rowcount
 
+    async def update_memory(
+        self,
+        memory_id: str,
+        *,
+        content: str | None = None,
+        summary: str | None = None,
+        tags: list[str] | None = None,
+        importance: float | None = None,
+        confidence: float | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        visibility: str | None = None,
+        dedup_key: str | None = None,
+        source_ref: str | None = None,
+    ) -> int:
+        await self.initialize()
+        payload: dict[str, Any] = {"update_time": self._now()}
+        if content is not None:
+            payload["content"] = str(content or "")
+            payload["summary"] = str(summary or str(content or "")[:240])
+        elif summary is not None:
+            payload["summary"] = str(summary or "")
+        if tags is not None:
+            payload["tags"] = self._json_list(tags)
+        if importance is not None:
+            payload["importance"] = float(importance)
+        if confidence is not None:
+            payload["confidence"] = float(confidence)
+        if status is not None:
+            clean_status = str(status or "").strip()
+            if clean_status in {
+                ACTIVE_STATUS,
+                STALE_STATUS,
+                DELETED_STATUS,
+                MERGED_STATUS,
+                DEPRECATED_STATUS,
+                REVIEW_PENDING_STATUS,
+                REJECTED_STATUS,
+            }:
+                payload["status"] = clean_status
+        if metadata is not None:
+            payload["metadata"] = self._json_dict(metadata)
+        if visibility is not None and visibility in {"auto_and_tool", "tool_only", "maintenance_only"}:
+            payload["visibility"] = visibility
+        if dedup_key is not None:
+            payload["dedup_key"] = str(dedup_key or "")
+        if source_ref is not None:
+            payload["source_ref"] = str(source_ref or "")
+        if len(payload) <= 1:
+            return 0
+        columns = list(payload.keys())
+        assignments = ", ".join(f"{column} = ?" for column in columns)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"UPDATE canonical_memories SET {assignments} WHERE id = ?",
+                (*[payload[column] for column in columns], memory_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def list_projectable(self, *, session_id: str = "") -> list[MemoryCandidate]:
         await self.initialize()
         where = ["status = 'active'", "visibility IN ('auto_and_tool', 'tool_only')"]
@@ -795,7 +1049,15 @@ class MemoryV2Store:
                 for row in await cursor.fetchall()
             ]
             counts: dict[str, int] = {}
-            for status in (ACTIVE_STATUS, STALE_STATUS, DELETED_STATUS, MERGED_STATUS, DEPRECATED_STATUS):
+            for status in (
+                ACTIVE_STATUS,
+                STALE_STATUS,
+                DELETED_STATUS,
+                MERGED_STATUS,
+                DEPRECATED_STATUS,
+                REVIEW_PENDING_STATUS,
+                REJECTED_STATUS,
+            ):
                 cursor = await db.execute(
                     "SELECT COUNT(*) FROM canonical_memories WHERE status = ?",
                     (status,),
@@ -803,7 +1065,7 @@ class MemoryV2Store:
                 row = await cursor.fetchone()
                 counts[status] = int(row[0] if row else 0)
             legacy_counts: dict[str, int] = {}
-            for table in ("documents", "MemoryEvent"):
+            for table in ("documents", "MemoryEvent", "Jargon"):
                 try:
                     cursor = await db.execute(f"SELECT COUNT(*) FROM {table}")
                     row = await cursor.fetchone()

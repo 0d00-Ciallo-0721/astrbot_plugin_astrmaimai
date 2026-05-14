@@ -79,6 +79,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.behavior_tuning = BehaviorTuningPolicy()
         self.think_level_policy = ThinkLevelPolicy()
         self.input_loader = PlanningInputLoader(self)
+        self.reflector = None
         self.cognitive_decision_history: list[dict] = []
         self.tool_trace_history: list[dict] = []
         self.turn_trace_history: list[dict] = []
@@ -96,6 +97,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             db=context_engine.db,
             gateway=gateway,
             config=gateway.config,
+            pattern_service=getattr(memory_engine, "expression_pattern_service", None),
         )
         self.executor = ConcurrentExecutor(
             context,
@@ -361,6 +363,27 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_preview=str(reply_text or ""),
         )
         self.turn_trace_history = [*self.turn_trace_history, item][-300:]
+
+    async def _record_expression_pattern_usage(self, event: AstrMessageEvent, chat_id: str, reply_text: str | None) -> None:
+        reflector = getattr(self, "reflector", None)
+        trace = event.get_extra("astrmai_expression_pattern_trace", None) if hasattr(event, "get_extra") else None
+        selected = list(getattr(trace, "items", []) or [])
+        if not reflector or not selected or not str(reply_text or "").strip():
+            return
+        for item in selected:
+            expression = str(getattr(item, "expression", "") or "").strip()
+            if not expression:
+                continue
+            normalized_expression = "".join(expression.lower().split())
+            normalized_reply = "".join(str(reply_text or "").lower().split())
+            await reflector.record_usage(
+                pattern_id=str(getattr(item, "id", "") or ""),
+                pattern_situation=str(getattr(item, "situation", "") or ""),
+                pattern_expression=expression,
+                actual_reply=str(reply_text or ""),
+                user_reaction="matched" if normalized_expression and normalized_expression in normalized_reply else "",
+                chat_id=str(chat_id or ""),
+            )
 
     async def _load_memory_feedback_summary(self, chat_id: str) -> str:
         if not self.memory_engine or not hasattr(self.memory_engine, "get_cognitive_feedback"):
@@ -821,6 +844,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tools=tools,
             direct_vision_urls=direct_vision_urls,
         )
+        await self._record_expression_pattern_usage(event, chat_id, reply_text)
         self._record_agency_reflection(chat_id, reply_text, tools, cognitive_decision)
         self._record_conversation_continuity(
             chat_id,

@@ -19,12 +19,18 @@ class _FakeStateEngine:
 class _FakeMemoryEngine:
     def __init__(self):
         self.received = []
+        self.writes = []
+        self.write_service = SimpleNamespace(write=self._write)
 
     async def on_learning_bot_reply_recorded(self, payload):
         self.received.append(("bot", payload))
 
     async def on_learning_mining_completed(self, payload):
         self.received.append(("mining", payload))
+
+    async def _write(self, request):
+        self.writes.append(request)
+        return f"mem-{len(self.writes)}"
 
 
 class LearningEventCollaborationTests(unittest.TestCase):
@@ -75,17 +81,14 @@ class LearningEventCollaborationTests(unittest.TestCase):
         async def _save_pattern_async(pattern):
             return None
 
-        async def _save_jargon_async(jargon):
-            return None
-
         async def _mark_logs_processed_async(ids):
             db.unprocessed = []
 
         db.add_message_log_async = _add_message_log_async
         db.get_unprocessed_logs_async = _get_unprocessed_logs_async
         db.save_pattern_async = _save_pattern_async
-        db.save_jargon_async = _save_jargon_async
         db.mark_logs_processed_async = _mark_logs_processed_async
+        db.memory_engine = memory_engine
 
         manager = self.learning_mod.EvolutionManager(db, SimpleNamespace(config=config), config=config, event_bus=event_bus)
 
@@ -93,7 +96,7 @@ class LearningEventCollaborationTests(unittest.TestCase):
             return [SimpleNamespace()]
 
         async def _mine_jargons(group_id, logs):
-            return [SimpleNamespace()]
+            return [SimpleNamespace(content="bigbird", raw_content="bigbird is coming again")]
 
         manager.expression_miner.mine = _mine
         manager.jargon_miner.mine = _mine_jargons
@@ -117,6 +120,8 @@ class LearningEventCollaborationTests(unittest.TestCase):
         self.assertEqual(state_engine.received[0]["sender_id"], "user-1")
         self.assertEqual(memory_engine.received[0][0], "bot")
         self.assertEqual(memory_engine.received[1][0], "mining")
+        self.assertEqual(memory_engine.writes[0].kind, "jargon")
+        self.assertEqual(memory_engine.writes[0].status, "review_pending")
 
 
 if __name__ == "__main__":

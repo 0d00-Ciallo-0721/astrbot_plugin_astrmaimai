@@ -1,10 +1,10 @@
-<div id="page-memory" x-show="currentPage === 'memories'" x-data="memoryPage()" x-cloak class="pb-10 flex flex-col h-full">
+﻿<div id="page-memory" x-show="currentPage === 'memories'" x-data="memoryPage()" x-cloak class="pb-10 flex flex-col h-full">
     
     <!-- Header -->
     <div class="flex justify-between items-end mb-8">
         <div>
-            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">四维记忆网络 (Memories)</h2>
-            <p class="text-slate-400">管理 AI 的记忆碎片、反思日志、实体图谱与黑话字典</p>
+            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">鍥涚淮璁板繂缃戠粶 (Memories)</h2>
+            <p class="text-slate-400">绠＄悊 AI 鐨勮蹇嗙鐗囥€佸弽鎬濇棩蹇椼€佸疄浣撳浘璋变笌榛戣瘽瀛楀吀</p>
         </div>
         
         <!-- Navigation Tabs -->
@@ -17,23 +17,23 @@
                     @click="setTab('diagnostics')">Diagnostics</button>
             <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
                     :class="currentTab === 'events' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
-                    @click="setTab('events')">记忆碎片 (Events)</button>
+                    @click="setTab('events')">璁板繂纰庣墖 (Events)</button>
             <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
                     :class="currentTab === 'reflections' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
-                    @click="setTab('reflections')">每日反思 (Reflections)</button>
+                    @click="setTab('reflections')">姣忔棩鍙嶆€?(Reflections)</button>
             <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
                     :class="currentTab === 'nodes' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
-                    @click="setTab('nodes')">实体图谱 (Nodes)</button>
+                    @click="setTab('nodes')">瀹炰綋鍥捐氨 (Nodes)</button>
             <button class="px-4 py-2 rounded-lg text-sm font-medium transition-all"
                     :class="currentTab === 'jargon' ? 'bg-brand-500/10 text-brand-400' : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'"
-                    @click="setTab('jargon')">黑话字典 (Jargon)</button>
+                    @click="setTab('jargon')">榛戣瘽瀛楀吀 (Jargon)</button>
         </div>
     </div>
 
     <!-- Loading State -->
     <div x-show="loading" class="flex flex-col items-center justify-center py-20 text-slate-400">
         <i data-lucide="loader-2" class="w-8 h-8 animate-spin mb-4 text-brand-500"></i>
-        <p>正在读取神经网络层...</p>
+        <p>姝ｅ湪璇诲彇绁炵粡缃戠粶灞?..</p>
     </div>
 
     <div x-show="!loading" class="flex-1">
@@ -180,7 +180,7 @@
             <div class="flex flex-col gap-6">
                 <div class="flex justify-end">
                     <button class="glass-btn px-4 py-2 bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 font-medium text-sm flex items-center gap-2" @click="openEventModal()">
-                        <i data-lucide="plus" class="w-4 h-4"></i> 新增核心记忆
+                        <i data-lucide="plus" class="w-4 h-4"></i> 鏂板鏍稿績璁板繂
                     </button>
                 </div>
                 
@@ -189,11 +189,11 @@
                         <table class="w-full text-left">
                             <thead>
                                 <tr class="border-b border-white/10 text-slate-400 text-sm bg-slate-800/50">
-                                    <th class="px-6 py-3 whitespace-nowrap">时间 / ID</th>
-                                    <th class="px-6 py-3 whitespace-nowrap">分类 / 来源</th>
-                                    <th class="px-6 py-3">记忆叙事 (Narrative)</th>
-                                    <th class="px-6 py-3 whitespace-nowrap">重要度</th>
-                                    <th class="px-6 py-3 w-20 whitespace-nowrap">操作</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">鏃堕棿 / ID</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">鍒嗙被 / 鏉ユ簮</th>
+                                    <th class="px-6 py-3">璁板繂鍙欎簨 (Narrative)</th>
+                                    <th class="px-6 py-3 whitespace-nowrap">閲嶈搴?/th>
+                                    <th class="px-6 py-3 w-20 whitespace-nowrap">鎿嶄綔</th>
                                 </tr>
                             </thead>
                             <tbody class="text-sm text-slate-300">
@@ -237,7 +237,7 @@
                                     <td colspan="5" class="p-8">
                                         <div class="empty-state border-none bg-transparent p-4">
                                             <i data-lucide="inbox"></i>
-                                            <p>暂无核心记忆碎片</p>
+                                            <p>鏆傛棤鏍稿績璁板繂纰庣墖</p>
                                         </div>
                                     </td>
                                 </tr>
@@ -276,7 +276,7 @@
                                         <div class="text-xs text-brand-300 line-clamp-3 leading-relaxed" x-text="reflectionsMap[dayDate].summary"></div>
                                     </template>
                                     <template x-if="!reflectionsMap[dayDate]">
-                                        <div class="text-xs text-slate-600 italic">无日志</div>
+                                        <div class="text-xs text-slate-600 italic">鏃犳棩蹇?/div>
                                     </template>
                                 </div>
                             </template>
@@ -290,10 +290,10 @@
                                     </template>
                                 </h4>
                                 <textarea :id="`ref-input-${dayDate}`" class="w-full h-32 bg-slate-900 border border-white/10 rounded p-3 text-sm text-slate-300 resize-none focus:outline-none focus:border-brand-500 mb-3" 
-                                          x-text="reflectionsMap[dayDate] ? reflectionsMap[dayDate].summary : ''" placeholder="撰写或修改今日反思..."></textarea>
+                                          x-text="reflectionsMap[dayDate] ? reflectionsMap[dayDate].summary : ''" placeholder="鎾板啓鎴栦慨鏀逛粖鏃ュ弽鎬?.."></textarea>
                                 <div class="flex justify-end gap-2">
-                                    <button class="px-3 py-1.5 rounded text-xs text-slate-400 hover:bg-white/10" @click="activeReflectionDate = null">取消</button>
-                                    <button class="px-3 py-1.5 rounded text-xs bg-brand-500 text-white hover:bg-brand-600" @click="saveReflection(dayDate)">保存</button>
+                                    <button class="px-3 py-1.5 rounded text-xs text-slate-400 hover:bg-white/10" @click="activeReflectionDate = null">鍙栨秷</button>
+                                    <button class="px-3 py-1.5 rounded text-xs bg-brand-500 text-white hover:bg-brand-600" @click="saveReflection(dayDate)">淇濆瓨</button>
                                 </div>
                             </div>
 
@@ -308,7 +308,7 @@
             <div class="flex flex-col gap-6">
                 <div class="flex justify-end">
                     <button class="glass-btn px-4 py-2 bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 font-medium text-sm flex items-center gap-2" @click="openNodeModal()">
-                        <i data-lucide="plus" class="w-4 h-4"></i> 新增实体节点
+                        <i data-lucide="plus" class="w-4 h-4"></i> 鏂板瀹炰綋鑺傜偣
                     </button>
                 </div>
                 
@@ -342,65 +342,113 @@
         <!-- JARGON TAB -->
         <template x-if="currentTab === 'jargon'">
             <div class="flex flex-col gap-6">
-                <div class="flex justify-end">
+                <div class="glass-panel p-4 flex flex-wrap items-center gap-3">
+                    <select class="bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="jargonFilters.status" @change="loadJargons()">
+                        <option value="">全部状态</option>
+                        <option value="active">active</option>
+                        <option value="review_pending">review_pending</option>
+                        <option value="rejected">rejected</option>
+                        <option value="stale">stale</option>
+                        <option value="deleted">deleted</option>
+                        <option value="merged">merged</option>
+                    </select>
+                    <input type="text" class="bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="jargonFilters.group_id" @change="loadJargons()" placeholder="Group ID">
+                    <input type="text" class="flex-1 min-w-[180px] bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="jargonFilters.query" @input.debounce.300ms="loadJargons()" placeholder="搜索词条 / 含义 / 场景 / 例句">
                     <button class="glass-btn px-4 py-2 bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 font-medium text-sm flex items-center gap-2" @click="openJargonModal()">
-                        <i data-lucide="plus" class="w-4 h-4"></i> 收录新黑话
+                        <i data-lucide="plus" class="w-4 h-4"></i> 新增黑话
                     </button>
                 </div>
-                
-                <div class="glass-panel overflow-hidden">
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left">
-                            <thead>
-                                <tr class="border-b border-white/10 text-slate-400 text-sm bg-slate-800/50">
-                                    <th class="px-6 py-3 whitespace-nowrap">黑话词条</th>
-                                    <th class="px-6 py-3">释义 (Meaning)</th>
-                                    <th class="px-6 py-3 whitespace-nowrap">群组范围</th>
-                                    <th class="px-6 py-3 whitespace-nowrap">状态标记</th>
-                                    <th class="px-6 py-3 w-24 whitespace-nowrap">操作</th>
-                                </tr>
-                            </thead>
-                            <tbody class="text-sm text-slate-300">
-                                <template x-for="j in jargons" :key="j.id">
-                                    <tr class="border-b border-white/5 even:bg-white/[0.02] hover:bg-slate-800/40 group">
-                                        <td class="px-6 py-4 font-bold text-purple-300 text-base whitespace-nowrap" x-text="j.content"></td>
-                                        <td class="px-6 py-4 max-w-sm"><p class="line-clamp-2" x-text="j.meaning"></p></td>
-                                        <td class="px-6 py-4 font-mono text-xs text-slate-500 whitespace-nowrap" x-text="j.group_id"></td>
-                                        <td class="px-6 py-4 whitespace-nowrap">
-                                            <div class="flex gap-2">
-                                                <span class="px-2 py-0.5 rounded text-[10px] border" :class="j.is_jargon ? 'bg-purple-500/20 border-purple-500/30 text-purple-300' : 'bg-slate-800 border-slate-600 text-slate-400'">JARGON</span>
-                                                <span class="px-2 py-0.5 rounded text-[10px] border" :class="j.is_complete ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300' : 'bg-amber-500/20 border-amber-500/30 text-amber-300'">COMPLETE</span>
-                                            </div>
-                                        </td>
-                                        <td class="px-6 py-4 whitespace-nowrap">
-                                            <div class="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-purple-500/20 text-slate-500 hover:text-purple-400" @click="openJargonModal(j)">
-                                                <i data-lucide="edit-2" class="w-4 h-4"></i>
-                                            </button>
-                                            <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-rose-500/20 text-slate-500 hover:text-rose-400" @click="delJargon(j.id)">
-                                                <i data-lucide="trash-2" class="w-4 h-4"></i>
-                                            </button>
-                                        </div>
-                                    </td>
-                                </tr>
-                                </template>
-                                <template x-if="!jargons.length">
-                                    <tr>
-                                        <td colspan="5" class="p-8">
-                                            <div class="empty-state border-none bg-transparent p-4">
-                                                <i data-lucide="book-x"></i>
-                                                <p>暂无收录的黑话</p>
-                                            </div>
-                                        </td>
+
+                <div class="grid lg:grid-cols-[minmax(0,1.25fr)_360px] gap-6 items-start">
+                    <div class="glass-panel overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left">
+                                <thead>
+                                    <tr class="border-b border-white/10 text-slate-400 text-sm bg-slate-800/50">
+                                        <th class="px-6 py-3 whitespace-nowrap">词条</th>
+                                        <th class="px-6 py-3">释义</th>
+                                        <th class="px-6 py-3 whitespace-nowrap">群组</th>
+                                        <th class="px-6 py-3 whitespace-nowrap">状态</th>
+                                        <th class="px-6 py-3 whitespace-nowrap">置信度</th>
+                                        <th class="px-6 py-3 w-32 whitespace-nowrap">操作</th>
                                     </tr>
-                                </template>
-                            </tbody>
-                        </table>
+                                </thead>
+                                <tbody class="text-sm text-slate-300">
+                                    <template x-for="j in jargons" :key="j.id">
+                                        <tr class="border-b border-white/5 even:bg-white/[0.02] hover:bg-slate-800/40 cursor-pointer" :class="selectedJargon && selectedJargon.id === j.id ? 'bg-purple-500/10' : ''" @click="selectJargon(j)">
+                                            <td class="px-6 py-4 font-bold text-purple-300 text-base whitespace-nowrap" x-text="j.content"></td>
+                                            <td class="px-6 py-4 max-w-sm"><p class="line-clamp-2" x-text="j.meaning || '-' "></p></td>
+                                            <td class="px-6 py-4 font-mono text-xs text-slate-500 whitespace-nowrap" x-text="j.group_id"></td>
+                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                <span class="px-2 py-0.5 rounded text-[10px] border uppercase" :class="j.status === 'active' ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300' : (j.status === 'review_pending' ? 'bg-amber-500/20 border-amber-500/30 text-amber-300' : (j.status === 'rejected' ? 'bg-rose-500/20 border-rose-500/30 text-rose-300' : 'bg-slate-800 border-slate-600 text-slate-300'))" x-text="j.status"></span>
+                                            </td>
+                                            <td class="px-6 py-4 whitespace-nowrap" x-text="Number(j.confidence || 0).toFixed(2)"></td>
+                                            <td class="px-6 py-4 whitespace-nowrap">
+                                                <div class="flex gap-1">
+                                                    <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-purple-500/20 text-slate-500 hover:text-purple-400" @click.stop="openJargonModal(j)">
+                                                        <i data-lucide="edit-2" class="w-4 h-4"></i>
+                                                    </button>
+                                                    <button class="w-8 h-8 rounded flex items-center justify-center hover:bg-rose-500/20 text-slate-500 hover:text-rose-400" @click.stop="delJargon(j.id)">
+                                                        <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                    <template x-if="!jargons.length">
+                                        <tr>
+                                            <td colspan="6" class="p-8">
+                                                <div class="empty-state border-none bg-transparent p-4">
+                                                    <i data-lucide="book-x"></i>
+                                                    <p>暂无黑话记录</p>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel p-5 flex flex-col gap-4" x-show="selectedJargon" x-cloak>
+                        <div>
+                            <div class="text-[10px] uppercase tracking-wider text-slate-500">Canonical Jargon</div>
+                            <h3 class="text-xl font-bold text-white mt-1" x-text="selectedJargon?.content || '-' "></h3>
+                            <div class="flex flex-wrap gap-2 mt-3">
+                                <span class="px-2 py-0.5 rounded text-[10px] border" :class="selectedJargon?.status === 'active' ? 'bg-emerald-500/20 border-emerald-500/30 text-emerald-300' : 'bg-slate-800 border-slate-600 text-slate-300'" x-text="selectedJargon?.status || '-' "></span>
+                                <span class="px-2 py-0.5 rounded text-[10px] border bg-slate-800 border-slate-600 text-slate-300" x-text="selectedJargon?.review_status || '-' "></span>
+                                <span class="px-2 py-0.5 rounded text-[10px] border bg-slate-800 border-slate-600 text-slate-300" x-text="selectedJargon?.source || '-' "></span>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3 text-sm text-slate-300">
+                            <div><div class="text-slate-500 text-xs uppercase mb-1">释义</div><div x-text="selectedJargon?.meaning || '-' "></div></div>
+                            <div><div class="text-slate-500 text-xs uppercase mb-1">场景</div><div x-text="selectedJargon?.scene || '-' "></div></div>
+                            <div><div class="text-slate-500 text-xs uppercase mb-1">例句</div><div class="whitespace-pre-wrap" x-text="(selectedJargon?.examples || []).join('\n') || '-' "></div></div>
+                            <div class="grid grid-cols-2 gap-3 text-xs text-slate-400">
+                                <div>confidence: <span class="text-slate-200" x-text="Number(selectedJargon?.confidence || 0).toFixed(2)"></span></div>
+                                <div>importance: <span class="text-slate-200" x-text="Number(selectedJargon?.importance || 0).toFixed(2)"></span></div>
+                                <div>group: <span class="text-slate-200" x-text="selectedJargon?.group_id || '-' "></span></div>
+                                <div>legacy id: <span class="text-slate-200" x-text="selectedJargon?.legacy_jargon_id || '-' "></span></div>
+                                <div>last access: <span class="text-slate-200" x-text="formatDate(selectedJargon?.last_access_time)"></span></div>
+                                <div>visibility: <span class="text-slate-200" x-text="selectedJargon?.visibility || '-' "></span></div>
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap gap-2 pt-2 border-t border-white/10">
+                            <button class="glass-btn px-3 py-2 text-xs bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30" @click="approveJargon(selectedJargon.id)">Approve</button>
+                            <button class="glass-btn px-3 py-2 text-xs bg-rose-500/20 text-rose-300 hover:bg-rose-500/30" @click="rejectJargon(selectedJargon.id)">Reject</button>
+                            <button class="glass-btn px-3 py-2 text-xs bg-sky-500/20 text-sky-300 hover:bg-sky-500/30" @click="restoreJargon(selectedJargon.id)">Restore</button>
+                            <button class="glass-btn px-3 py-2 text-xs bg-amber-500/20 text-amber-300 hover:bg-amber-500/30" @click="markJargonStale(selectedJargon.id)">Mark stale</button>
+                        </div>
+                        <div class="flex gap-2 items-center pt-2 border-t border-white/10">
+                            <input type="text" class="flex-1 bg-slate-900 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="jargonMergeTargetId" placeholder="合并目标 canonical id">
+                            <button class="glass-btn px-3 py-2 text-xs bg-purple-500/20 text-purple-300 hover:bg-purple-500/30" @click="mergeJargon(selectedJargon.id)">Merge</button>
+                        </div>
                     </div>
                 </div>
             </div>
         </template>
-
     </div>
 
     <!-- MODALS -->
@@ -408,35 +456,35 @@
     <!-- Event Modal -->
     <div x-show="showEventModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
         <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showEventModal = false">
-            <h3 class="text-xl font-bold text-slate-100 mb-6">新增核心记忆碎片</h3>
+            <h3 class="text-xl font-bold text-slate-100 mb-6">鏂板鏍稿績璁板繂纰庣墖</h3>
             <div class="flex flex-col gap-4">
                 <div>
-                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">记忆叙事 (Narrative)</label>
-                    <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-24 focus:border-brand-500 focus:outline-none" x-model="newEvent.narrative" placeholder="描述发生的客观事实..."></textarea>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">璁板繂鍙欎簨 (Narrative)</label>
+                    <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-24 focus:border-brand-500 focus:outline-none" x-model="newEvent.narrative" placeholder="鎻忚堪鍙戠敓鐨勫瑙備簨瀹?.."></textarea>
                 </div>
                 <div class="grid grid-cols-2 gap-4">
                     <div>
-                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">分类 (Kind)</label>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">鍒嗙被 (Kind)</label>
                         <select class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.memory_kind">
-                            <option value="Preference">Preference (偏好)</option>
-                            <option value="Event">Event (事件)</option>
-                            <option value="Relationship">Relationship (关系)</option>
-                            <option value="Misc">Misc (杂项)</option>
+                            <option value="Preference">Preference (鍋忓ソ)</option>
+                            <option value="Event">Event (浜嬩欢)</option>
+                            <option value="Relationship">Relationship (鍏崇郴)</option>
+                            <option value="Misc">Misc (鏉傞」)</option>
                         </select>
                     </div>
                     <div>
-                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">重要度 (Importance 0-1)</label>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">閲嶈搴?(Importance 0-1)</label>
                         <input type="number" step="0.1" min="0" max="1" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.importance">
                     </div>
                 </div>
                 <div>
-                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">标签 (Tags 逗号分隔)</label>
-                    <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.tags" placeholder="例如: preference, food">
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">鏍囩 (Tags 閫楀彿鍒嗛殧)</label>
+                    <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-brand-500 focus:outline-none" x-model="newEvent.tags" placeholder="渚嬪: preference, food">
                 </div>
             </div>
             <div class="flex justify-end gap-3 mt-8">
-                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showEventModal = false">取消</button>
-                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-brand-500 hover:bg-brand-600 text-white" @click="saveEvent()">确 认</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showEventModal = false">鍙栨秷</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-brand-500 hover:bg-brand-600 text-white" @click="saveEvent()">纭?璁?/button>
             </div>
         </div>
     </div>
@@ -444,65 +492,85 @@
     <!-- Node Modal -->
     <div x-show="showNodeModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
         <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showNodeModal = false">
-            <h3 class="text-xl font-bold text-slate-100 mb-6" x-text="newNode.id ? '编辑实体节点' : '新增实体节点'"></h3>
+            <h3 class="text-xl font-bold text-slate-100 mb-6" x-text="newNode.id ? '缂栬緫瀹炰綋鑺傜偣' : '鏂板瀹炰綋鑺傜偣'"></h3>
             <div class="flex flex-col gap-4">
                 <div class="grid grid-cols-3 gap-4">
                     <div class="col-span-2">
-                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">节点名称 (Name)</label>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">鑺傜偣鍚嶇О (Name)</label>
                         <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:outline-none" x-model="newNode.name">
                     </div>
                     <div>
-                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">类型 (Type)</label>
-                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:outline-none" x-model="newNode.type" placeholder="如 user">
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">绫诲瀷 (Type)</label>
+                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:outline-none" x-model="newNode.type" placeholder="濡?user">
                     </div>
                 </div>
                 <div>
-                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">节点描述 (Description)</label>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">鑺傜偣鎻忚堪 (Description)</label>
                     <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-32 focus:border-blue-500 focus:outline-none" x-model="newNode.description"></textarea>
                 </div>
             </div>
             <div class="flex justify-end gap-3 mt-8">
-                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showNodeModal = false">取消</button>
-                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-blue-500 hover:bg-blue-600 text-white" @click="saveNode()">保 存</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showNodeModal = false">鍙栨秷</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-blue-500 hover:bg-blue-600 text-white" @click="saveNode()">淇?瀛?/button>
             </div>
         </div>
     </div>
 
     <!-- Jargon Modal -->
     <div x-show="showJargonModal" class="fixed inset-0 z-50 flex items-center justify-center bg-[#090A10]/60 backdrop-blur-[12px] p-4" x-cloak>
-        <div class="glass-panel w-full max-w-lg p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showJargonModal = false">
-            <h3 class="text-xl font-bold text-slate-100 mb-6" x-text="newJargon.id ? '编辑黑话释义' : '收录新黑话'"></h3>
+        <div class="glass-panel w-full max-w-2xl p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showJargonModal = false">
+            <h3 class="text-xl font-bold text-slate-100 mb-6" x-text="newJargon.id ? '编辑 canonical 黑话' : '新增 canonical 黑话'"></h3>
             <div class="flex flex-col gap-4">
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid md:grid-cols-2 gap-4">
                     <div>
-                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">黑话词条 (Content)</label>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">词条 (Content)</label>
                         <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="newJargon.content" :disabled="!!newJargon.id" :class="newJargon.id ? 'opacity-50 cursor-not-allowed' : ''">
                     </div>
                     <div>
-                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">群组约束 (GroupID)</label>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">群组 (Group ID)</label>
                         <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="newJargon.group_id" :disabled="!!newJargon.id" :class="newJargon.id ? 'opacity-50 cursor-not-allowed' : ''">
                     </div>
                 </div>
+                <div class="grid md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">状态 (Status)</label>
+                        <select class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="newJargon.status">
+                            <option value="active">active</option>
+                            <option value="review_pending">review_pending</option>
+                            <option value="rejected">rejected</option>
+                            <option value="stale">stale</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">场景 (Scene)</label>
+                        <input type="text" class="w-full bg-slate-900 border border-white/10 rounded-lg p-2.5 text-sm text-white focus:border-purple-500 focus:outline-none" x-model="newJargon.scene">
+                    </div>
+                </div>
                 <div>
-                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">详细释义 (Meaning)</label>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">释义 (Meaning)</label>
                     <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-24 focus:border-purple-500 focus:outline-none" x-model="newJargon.meaning"></textarea>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">例句 (Examples, one per line)</label>
+                    <textarea class="w-full bg-slate-900 border border-white/10 rounded-lg p-3 text-sm text-white resize-none h-24 focus:border-purple-500 focus:outline-none" x-model="newJargon.examples_text"></textarea>
                 </div>
                 <div class="flex gap-6 mt-2">
                     <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
                         <input type="checkbox" class="rounded border-white/10 bg-slate-900 text-purple-500 focus:ring-purple-500 focus:ring-offset-0" x-model="newJargon.is_jargon" :true-value="1" :false-value="0">
-                        标记为真正黑话
+                        标记为真实黑话
                     </label>
                     <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
                         <input type="checkbox" class="rounded border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0" x-model="newJargon.is_complete" :true-value="1" :false-value="0">
-                        释义完整度达标
+                        释义完整
                     </label>
                 </div>
             </div>
             <div class="flex justify-end gap-3 mt-8">
                 <button class="px-5 py-2 rounded-lg text-sm font-medium text-slate-300 hover:bg-white/10" @click="showJargonModal = false">取消</button>
-                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-purple-500 hover:bg-purple-600 text-white" @click="saveJargon()">保 存</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-purple-500 hover:bg-purple-600 text-white" @click="saveJargon()">保存</button>
             </div>
         </div>
     </div>
-
 </div>
+
+

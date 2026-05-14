@@ -257,6 +257,38 @@ class MemoryUiService:
                 item[key] = [] if key == "tags" else {}
         return item
 
+    @staticmethod
+    def _canonical_jargon_view(item: dict) -> dict:
+        metadata = dict(item.get("metadata") or {})
+        status = str(item.get("status") or "active")
+        review_status = str(metadata.get("review_status") or ("approved" if status == "active" else status))
+        return {
+            "id": item.get("id"),
+            "canonical_id": item.get("id"),
+            "content": str(item.get("content") or ""),
+            "raw_content": str(metadata.get("raw_content") or item.get("content") or ""),
+            "meaning": str(metadata.get("meaning") or item.get("summary") or ""),
+            "is_jargon": 1 if status == "active" else 0,
+            "is_complete": 1 if status == "active" else 0,
+            "count": int(metadata.get("count") or 1),
+            "group_id": str(item.get("session_id") or "GLOBAL"),
+            "status": status,
+            "scene": str(metadata.get("scene") or ""),
+            "examples": list(metadata.get("examples") or []),
+            "review_status": review_status,
+            "review_reason": str(metadata.get("review_reason") or ""),
+            "review_suggestion": str(metadata.get("review_suggestion") or ""),
+            "confidence": float(item.get("confidence") or metadata.get("confidence") or 0.0),
+            "importance": float(item.get("importance") or 0.0),
+            "source": str(item.get("source") or ""),
+            "visibility": str(item.get("visibility") or ""),
+            "last_access_time": float(item.get("last_access_time") or 0.0),
+            "legacy_jargon_id": metadata.get("legacy_jargon_id"),
+            "created_at": float(item.get("created_at") or item.get("create_time") or 0.0),
+            "updated_at": float(item.get("updated_at") or item.get("update_time") or 0.0),
+            "legacy": False,
+        }
+
     async def migration_report(self) -> dict:
         engine = self._memory_engine()
         migration = getattr(engine, "migration_service", None) if engine else None
@@ -340,11 +372,62 @@ class MemoryUiService:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
-    async def list_jargon(self):
+    async def list_jargon(self, *, status: str = "", group_id: str = "", query: str = ""):
+        engine = self._memory_engine()
+        store = getattr(engine, "v2_store", None) if engine else None
+        if store and hasattr(store, "list_canonical"):
+            result = await store.list_canonical(kind="jargon", status=status, session_id=group_id, limit=200)
+            items = [self._canonical_jargon_view(item) for item in result.get("items", [])]
+            return self._filter_jargon_rows(items, query=query)
         async with self.db_factory() as db:
-            async with db.execute("SELECT * FROM Jargon ORDER BY id DESC") as cursor:
+            try:
+                where = ["kind = 'jargon'"]
+                params = []
+                if status:
+                    where.append("status = ?")
+                    params.append(status)
+                if group_id:
+                    where.append("session_id = ?")
+                    params.append(group_id)
+                async with db.execute(
+                    f"SELECT * FROM canonical_memories WHERE {' AND '.join(where)} ORDER BY update_time DESC LIMIT 200",
+                    tuple(params),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                if rows:
+                    items = [self._canonical_jargon_view(self._canonical_row(row)) for row in rows]
+                    return self._filter_jargon_rows(items, query=query)
+            except Exception:
+                pass
+            legacy_sql = "SELECT * FROM Jargon"
+            legacy_params = []
+            if group_id:
+                legacy_sql += " WHERE group_id = ?"
+                legacy_params.append(group_id)
+            legacy_sql += " ORDER BY id DESC"
+            async with db.execute(legacy_sql, tuple(legacy_params)) as cursor:
                 rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+            items = [dict(row) | {"legacy": True, "review_status": "legacy_readonly", "status": "legacy"} for row in rows]
+            return self._filter_jargon_rows(items, query=query)
+
+    @staticmethod
+    def _filter_jargon_rows(items: list[dict], *, query: str = "") -> list[dict]:
+        lowered = str(query or "").strip().lower()
+        if not lowered:
+            return items
+        filtered = []
+        for item in items:
+            haystack = "\n".join(
+                [
+                    str(item.get("content") or ""),
+                    str(item.get("meaning") or ""),
+                    str(item.get("scene") or ""),
+                    " ".join(str(example) for example in item.get("examples", []) or []),
+                ]
+            ).lower()
+            if lowered in haystack:
+                filtered.append(item)
+        return filtered
 
     async def create_event(self, data: dict) -> dict[str, object]:
         now = time.time()
@@ -537,52 +620,177 @@ class MemoryUiService:
 
     async def create_jargon(self, data: dict) -> dict[str, object]:
         now = time.time()
-        content = data.get("content", "")
+        content = str(data.get("content", "") or "").strip()
+        meaning = str(data.get("meaning", "") or "").strip()
+        group_id = str(data.get("group_id", "GLOBAL") or "GLOBAL")
+        is_jargon = bool(int(data.get("is_jargon", 1) or 0))
+        is_complete = bool(int(data.get("is_complete", 1) or 0))
+        confidence = float(data.get("confidence", 0.9 if is_jargon and meaning else 0.55) or 0.55)
+        requested_status = str(data.get("status", "") or "").strip().lower()
+        auto_status = "active" if is_jargon and is_complete and meaning else "review_pending"
+        allowed_statuses = {"active", "review_pending", "rejected", "stale"}
+        status = requested_status if requested_status in allowed_statuses else auto_status
+        review_status = "approved" if status == "active" else ("rejected" if status == "rejected" else "review_pending")
+        metadata = {
+            "raw_content": str(data.get("raw_content", content) or content),
+            "meaning": meaning,
+            "count": int(data.get("count", 1) or 1),
+            "scene": str(data.get("scene", "") or ""),
+            "examples": list(data.get("examples", []) or []),
+            "review_status": review_status,
+            "review_reason": str(data.get("review_reason", "") or ""),
+            "review_suggestion": str(data.get("review_suggestion", "") or ""),
+            "confidence": confidence,
+        }
+        request = MemoryWriteRequest(
+            source="webui_jargon",
+            kind="jargon",
+            session_id=group_id,
+            content=content,
+            summary=meaning or content,
+            importance=float(data.get("importance", 0.7) or 0.7),
+            confidence=confidence,
+            metadata=metadata,
+            dedup_key=f"jargon:{group_id}:{content.lower()}",
+            source_ref=f"webui_jargon:{group_id}:{content.lower()}",
+            visibility="auto_and_tool" if status == "active" else "maintenance_only",
+            status=status,
+        )
+        engine = self._memory_engine()
+        writer = getattr(engine, "write_service", None) if engine else None
+        if writer and hasattr(writer, "write"):
+            memory_id = await writer.write(request)
+            return {"status": "ok", "id": memory_id, "canonical_id": memory_id, "legacy": False}
         async with self.db_factory() as db:
-            cursor = await self._insert(
+            canonical_id = f"mem_jargon_{int(now * 1000)}"
+            await self._insert(
                 db,
-                "Jargon",
+                "canonical_memories",
                 {
-                    "content": content,
-                    "raw_content": data.get("raw_content", content),
-                    "meaning": data.get("meaning", ""),
-                    "is_jargon": data.get("is_jargon", 1),
-                    "is_complete": data.get("is_complete", 1),
-                    "count": data.get("count", 0),
-                    "group_id": data.get("group_id", "GLOBAL"),
-                    "created_at": data.get("created_at", now),
-                    "updated_at": data.get("updated_at", now),
+                    "id": canonical_id,
+                    "session_id": request.session_id,
+                    "persona_id": request.persona_id,
+                    "source": request.source,
+                    "kind": request.kind,
+                    "content": request.content,
+                    "summary": request.summary,
+                    "tags": request.tags,
+                    "importance": request.importance,
+                    "confidence": request.confidence,
+                    "status": request.status,
+                    "decay_score": 1.0,
+                    "create_time": data.get("created_at", now),
+                    "update_time": data.get("updated_at", now),
+                    "last_access_time": data.get("updated_at", now),
+                    "access_count": 0,
+                    "superseded_by": "",
+                    "deleted_reason": "",
+                    "metadata": request.metadata,
+                    "dedup_key": request.dedup_key,
+                    "source_ref": request.source_ref,
+                    "visibility": request.visibility,
                 },
             )
             await db.commit()
-            return {"status": "ok", "id": getattr(cursor, "lastrowid", None)}
+            return {"status": "ok", "id": canonical_id, "canonical_id": canonical_id, "legacy": False}
 
-    async def update_jargon(self, jargon_id: int, data: dict) -> dict[str, str]:
+    async def update_jargon(self, jargon_id: str, data: dict) -> dict[str, str]:
         now = time.time()
+        engine = self._memory_engine()
+        store = getattr(engine, "v2_store", None) if engine else None
+        projector = getattr(engine, "index_projector", None) if engine else None
+        current = await store.get_canonical(str(jargon_id), include_inactive=True) if store and hasattr(store, "get_canonical") else None
+        metadata = dict(getattr(current, "metadata", {}) or {})
+        if not metadata:
+            async with self.db_factory() as db:
+                try:
+                    async with db.execute("SELECT * FROM canonical_memories WHERE id = ?", (jargon_id,)) as cursor:
+                        row = await cursor.fetchone()
+                    if row:
+                        current_row = self._canonical_row(row)
+                        metadata = dict(current_row.get("metadata") or {})
+                        if current is None:
+                            current = type(
+                                "_CurrentJargon",
+                                (),
+                                {
+                                    "summary": current_row.get("summary", ""),
+                                    "metadata": metadata,
+                                },
+                            )()
+                except Exception:
+                    pass
+        if "meaning" in data:
+            metadata["meaning"] = str(data.get("meaning") or "").strip()
+        if "raw_content" in data:
+            metadata["raw_content"] = str(data.get("raw_content") or "").strip()
+        if "scene" in data:
+            metadata["scene"] = str(data.get("scene") or "").strip()
+        if "examples" in data:
+            metadata["examples"] = list(data.get("examples", []) or [])
+        if "count" in data:
+            metadata["count"] = int(data.get("count", 1) or 1)
+        next_status = str(data.get("status") or "").strip()
+        if not next_status:
+            is_jargon = bool(int(data.get("is_jargon", 1) or 0))
+            is_complete = bool(int(data.get("is_complete", 1) or 0))
+            next_status = "active" if is_jargon and metadata.get("meaning") and is_complete else "review_pending"
+        if next_status == "active":
+            metadata["review_status"] = "approved"
+        elif next_status == "rejected":
+            metadata["review_status"] = "rejected"
+        else:
+            metadata["review_status"] = str(data.get("review_status") or metadata.get("review_status") or "review_pending")
+        if "review_reason" in data:
+            metadata["review_reason"] = str(data.get("review_reason") or "")
+        if "review_suggestion" in data:
+            metadata["review_suggestion"] = str(data.get("review_suggestion") or "")
+        summary = str(metadata.get("meaning") or data.get("summary") or getattr(current, "summary", "") or "").strip()
+        content = data.get("content")
+        visibility = "auto_and_tool" if next_status == "active" else "maintenance_only"
+        if store and hasattr(store, "update_memory"):
+            changed = await store.update_memory(
+                str(jargon_id),
+                content=str(content) if content is not None else None,
+                summary=summary if summary else None,
+                status=next_status,
+                metadata=metadata,
+                visibility=visibility,
+            )
+            if changed and projector:
+                if next_status == "active":
+                    await projector.project(str(jargon_id))
+                else:
+                    await projector.cleanup_deleted([str(jargon_id)])
+            return {"status": "ok"}
         async with self.db_factory() as db:
             await self._update(
                 db,
-                "Jargon",
+                "canonical_memories",
                 "id",
                 jargon_id,
                 {
-                    "content": data.get("content"),
-                    "raw_content": data.get("raw_content"),
-                    "meaning": data.get("meaning"),
-                    "is_jargon": data.get("is_jargon"),
-                    "is_complete": data.get("is_complete"),
-                    "group_id": data.get("group_id"),
-                    "updated_at": data.get("updated_at", now),
+                    "content": content,
+                    "summary": summary or None,
+                    "metadata": metadata,
+                    "status": next_status,
+                    "visibility": visibility,
+                    "update_time": data.get("updated_at", now),
                 },
             )
             await db.commit()
         return {"status": "ok"}
 
-    async def delete_jargon(self, jargon_id: int) -> dict[str, str]:
-        async with self.db_factory() as db:
-            await db.execute("DELETE FROM Jargon WHERE id = ?", (jargon_id,))
-            await db.commit()
-        return {"status": "ok"}
+    async def delete_jargon(self, jargon_id: str) -> dict[str, str]:
+        result = await self.delete_canonical(str(jargon_id))
+        result.update({"legacy": False, "mode": "canonical_soft_delete"})
+        return result
+
+    async def approve_jargon(self, jargon_id: str) -> dict[str, str]:
+        return await self.update_jargon(str(jargon_id), {"status": "active"})
+
+    async def reject_jargon(self, jargon_id: str) -> dict[str, str]:
+        return await self.update_jargon(str(jargon_id), {"status": "rejected"})
 
 
 __all__ = ["MemoryUiService"]

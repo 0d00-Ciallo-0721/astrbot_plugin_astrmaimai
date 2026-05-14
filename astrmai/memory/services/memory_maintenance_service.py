@@ -41,6 +41,13 @@ class MemoryMaintenanceService:
             "physically_deleted": 0,
             "projection_deleted": 0,
             "protected_skipped": 0,
+            "jargon_pending_deleted": 0,
+            "jargon_pending_human_deleted": 0,
+            "jargon_rejected_deleted": 0,
+            "protected_jargon_skipped": 0,
+            "expression_pending_deleted": 0,
+            "expression_rejected_deleted": 0,
+            "protected_expression_skipped": 0,
             "errors": [],
             "protected_physical_delete": bool(policy.get("allow_protected_physical_delete", False)),
         }
@@ -70,6 +77,76 @@ class MemoryMaintenanceService:
         if not bool(policy.get("allow_protected_physical_delete", False)):
             protected = await self.store.list_canonical(limit=1, status="stale", kind="persona_lore")
             report["protected_skipped"] = int(protected.get("total", 0) or 0)
+        try:
+            pending_cleanup = await self.store.purge_jargon_candidates(
+                statuses=("review_pending",),
+                older_than_seconds=float(policy.get("pending_jargon_grace_seconds", 14 * 86400)),
+                min_confidence_to_keep=float(policy.get("protected_jargon_confidence", 0.9)),
+                min_count_to_keep=int(policy.get("protected_jargon_count", 5)),
+                review_statuses=("review_pending",),
+            )
+            pending_human_cleanup = await self.store.purge_jargon_candidates(
+                statuses=("review_pending",),
+                older_than_seconds=float(policy.get("pending_human_jargon_grace_seconds", 14 * 86400)),
+                min_confidence_to_keep=float(policy.get("protected_jargon_confidence", 0.9)),
+                min_count_to_keep=int(policy.get("protected_jargon_count", 5)),
+                review_statuses=("pending_human",),
+            )
+            rejected_cleanup = await self.store.purge_jargon_candidates(
+                statuses=("rejected",),
+                older_than_seconds=float(policy.get("rejected_jargon_grace_seconds", 7 * 86400)),
+                min_confidence_to_keep=float(policy.get("protected_jargon_confidence", 0.9)),
+                min_count_to_keep=int(policy.get("protected_jargon_count", 5)),
+                review_statuses=("rejected",),
+            )
+            deleted_ids = (
+                list(pending_cleanup.get("deleted_ids", []) or [])
+                + list(pending_human_cleanup.get("deleted_ids", []) or [])
+                + list(rejected_cleanup.get("deleted_ids", []) or [])
+            )
+            jargon_projection_deleted = 0
+            if deleted_ids and self.index_projector:
+                jargon_projection_deleted = await self.index_projector.cleanup_deleted(deleted_ids)
+            report["jargon_pending_deleted"] = len(list(pending_cleanup.get("deleted_ids", []) or []))
+            report["jargon_pending_human_deleted"] = len(list(pending_human_cleanup.get("deleted_ids", []) or []))
+            report["jargon_rejected_deleted"] = len(list(rejected_cleanup.get("deleted_ids", []) or []))
+            report["protected_jargon_skipped"] = (
+                int(pending_cleanup.get("protected_skipped", 0) or 0)
+                + int(rejected_cleanup.get("protected_skipped", 0) or 0)
+                + int(pending_human_cleanup.get("protected_skipped", 0) or 0)
+            )
+            report["projection_deleted"] += int(jargon_projection_deleted or 0)
+            report["physically_deleted"] += len(deleted_ids)
+        except Exception as exc:
+            report["errors"].append(f"jargon_cleanup:{exc}")
+        try:
+            pending_cleanup = await self.store.purge_kind_candidates(
+                kind="expression_pattern",
+                statuses=("review_pending",),
+                older_than_seconds=float(policy.get("pending_expression_grace_seconds", 21 * 86400)),
+                min_confidence_to_keep=float(policy.get("protected_expression_confidence", 0.95)),
+                min_count_to_keep=int(policy.get("protected_expression_count", 8)),
+            )
+            rejected_cleanup = await self.store.purge_kind_candidates(
+                kind="expression_pattern",
+                statuses=("rejected",),
+                older_than_seconds=float(policy.get("rejected_expression_grace_seconds", 14 * 86400)),
+                min_confidence_to_keep=float(policy.get("protected_expression_confidence", 0.95)),
+                min_count_to_keep=int(policy.get("protected_expression_count", 8)),
+            )
+            deleted_ids = list(pending_cleanup.get("deleted_ids", []) or []) + list(rejected_cleanup.get("deleted_ids", []) or [])
+            expression_projection_deleted = 0
+            if deleted_ids and self.index_projector:
+                expression_projection_deleted = await self.index_projector.cleanup_deleted(deleted_ids)
+            report["expression_pending_deleted"] = len(list(pending_cleanup.get("deleted_ids", []) or []))
+            report["expression_rejected_deleted"] = len(list(rejected_cleanup.get("deleted_ids", []) or []))
+            report["protected_expression_skipped"] = int(pending_cleanup.get("protected_skipped", 0) or 0) + int(
+                rejected_cleanup.get("protected_skipped", 0) or 0
+            )
+            report["projection_deleted"] += int(expression_projection_deleted or 0)
+            report["physically_deleted"] += len(deleted_ids)
+        except Exception as exc:
+            report["errors"].append(f"expression_pattern_cleanup:{exc}")
         return report
 
     async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:

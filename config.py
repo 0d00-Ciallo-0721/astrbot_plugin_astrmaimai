@@ -83,6 +83,8 @@ class EvolutionConfig(BaseModel):
     enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
     enable_relationship_engine: bool = Field(default=True, description="启动好感度四维关系图谱推演")
 
+    jargon_min_count: int = Field(default=2, description="黑话进入自动审核前所需的最少证据次数")
+
 class LifeConfig(BaseModel):
     silence_threshold: int = Field(default=120)
     wakeup_min_energy: float = Field(default=0.6)

@@ -186,41 +186,59 @@ class ContextEngine:
         if "FriendMessage" not in chat_id or not event_messages or is_fast_mode:
             return ""
         user_id = str(event_messages[-1].get_sender_id() or "")
-        persistence = getattr(self.db, "persistence", None)
-        if not persistence or not hasattr(persistence, "load_user_profile"):
-            return ""
-        try:
-            profile = await persistence.load_user_profile(user_id)
-        except Exception as exc:
-            logger.warning(f"[ContextEngine] private profile load failed: {exc}")
-            return ""
-        if not profile:
-            return ""
+        bundle = None
+        plugin = getattr(self.context, "astrmai_plugin", None) or getattr(self.context, "astrmai", None)
+        runtime = getattr(plugin, "runtime", None)
+        state_engine = getattr(runtime, "state_engine", None)
+        if state_engine and hasattr(state_engine, "get_profile_prompt_bundle"):
+            try:
+                bundle = await state_engine.get_profile_prompt_bundle(user_id)
+            except Exception as exc:
+                logger.warning(f"[ContextEngine] private profile bundle degraded: {exc}")
 
-        nickname = str(profile.get("nickname", "") or "").strip()
-        raw_name = str(profile.get("name", "该用户") or "该用户")
-        display_name = f"{nickname}（{raw_name}）" if nickname else raw_name
-        tags = profile.get("tags", []) or []
-        tags_text = " / ".join(str(item) for item in tags if str(item).strip()) or "暂无标签"
-        analysis = str(profile.get("persona_analysis", "暂无深度侧写。") or "暂无深度侧写。")
-        memory_points = [str(item) for item in (profile.get("memory_points", []) or [])[:6] if str(item).strip()]
-        structured_lines = []
-        for key, label in [
-            ("identity_points", "身份画像"),
-            ("preference_points", "偏好画像"),
-            ("relationship_points", "关系画像"),
-            ("speech_style_points", "表达画像"),
-        ]:
-            values = [str(item) for item in (profile.get(key, []) or [])[:4] if str(item).strip()]
-            if values:
-                structured_lines.append(f"[{label}] " + "；".join(values))
+        if not bundle:
+            persistence = getattr(self.db, "persistence", None)
+            if not persistence or not hasattr(persistence, "load_user_profile"):
+                return ""
+            try:
+                profile = await persistence.load_user_profile(user_id)
+            except Exception as exc:
+                logger.warning(f"[ContextEngine] private profile load failed: {exc}")
+                return ""
+            if not profile:
+                return ""
+
+            nickname = str(profile.get("nickname", "") or "").strip()
+            raw_name = str(profile.get("name", "该用户") or "该用户")
+            structured_sections = []
+            for key, label in [
+                ("identity_points", "身份画像"),
+                ("preference_points", "偏好画像"),
+                ("relationship_points", "关系画像"),
+                ("speech_style_points", "表达画像"),
+            ]:
+                values = [str(item) for item in (profile.get(key, []) or [])[:4] if str(item).strip()]
+                if values:
+                    structured_sections.append({"label": label, "values": values})
+            bundle = {
+                "display_name": f"{nickname}（{raw_name}）" if nickname else raw_name,
+                "tags_text": " / ".join(str(item) for item in (profile.get("tags", []) or []) if str(item).strip()) or "暂无标签",
+                "analysis": str(profile.get("persona_analysis", "暂无深度侧写。") or "暂无深度侧写。"),
+                "memory_points": [str(item) for item in (profile.get("memory_points", []) or [])[:6] if str(item).strip()],
+                "structured_sections": structured_sections,
+            }
 
         lines = [
-            f"我现在正在和 {display_name} 私聊，要更专注地照看这段一对一交流。",
-            f"我对 ta 的标签印象：{tags_text}",
-            f"我对 ta 的侧写理解：{analysis}",
+            f"我现在正在和 {bundle['display_name']} 私聊，要更专注地照看这段一对一交流。",
+            f"我对 ta 的标签印象：{bundle['tags_text']}",
+            f"我对 ta 的侧写理解：{bundle['analysis']}",
         ]
-        lines.extend(structured_lines)
+        for section in bundle.get("structured_sections", []) or []:
+            label = str(section.get("label", "") or "").strip()
+            values = [str(item).strip() for item in (section.get("values", []) or []) if str(item).strip()]
+            if label and values:
+                lines.append(f"[{label}] " + "；".join(values))
+        memory_points = [str(item).strip() for item in (bundle.get("memory_points", []) or []) if str(item).strip()]
         if memory_points:
             lines.append("我还记得这些点：" + "；".join(memory_points))
         return self._block("私聊上下文", "\n".join(lines))
@@ -263,7 +281,7 @@ class ContextEngine:
         last_msg = str(event_messages[-1].message_str or "").strip()
         if not last_msg:
             return ""
-        trigger_keywords = ["之前", "记得", "回忆", "想起", "以前", "过去"]
+        trigger_keywords = ["之前", "记得", "回忆", "想起", "以前", "过去", "涔嬪墠", "璁板緱", "鍥炲繂", "鎯宠捣", "浠ュ墠", "杩囧幓"]
         try_recall = any(keyword in last_msg for keyword in trigger_keywords)
         if not try_recall:
             probability = float(getattr(getattr(self.config, "memory", None), "auto_recall_probability", 0.0) or 0.0)

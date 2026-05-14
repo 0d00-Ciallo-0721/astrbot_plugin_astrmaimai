@@ -1,4 +1,4 @@
-function memoryPage() {
+﻿function memoryPage() {
     return {
         currentTab: 'canonical', // 'canonical', 'diagnostics', 'events', 'reflections', 'nodes', 'jargon'
         
@@ -18,6 +18,9 @@ function memoryPage() {
         
         nodes: [],
         jargons: [],
+        jargonFilters: { status: '', group_id: '', query: '' },
+        selectedJargon: null,
+        jargonMergeTargetId: '',
         
         loading: false,
 
@@ -51,13 +54,30 @@ function memoryPage() {
                 } else if (this.currentTab === 'nodes') {
                     this.nodes = await window.api.get('/memories/nodes');
                 } else if (this.currentTab === 'jargon') {
-                    this.jargons = await window.api.get('/memories/jargon');
+                    await this.loadJargons();
                 }
             } catch(e) {
                 // Ignore silent errors
             } finally {
                 this.loading = false;
             }
+        },
+
+        async loadJargons() {
+            const params = new URLSearchParams();
+            Object.entries(this.jargonFilters).forEach(([key, value]) => {
+                if (value) params.set(key, value);
+            });
+            this.jargons = await window.api.get(`/memories/jargon?${params.toString()}`);
+            if (this.selectedJargon) {
+                this.selectedJargon = this.jargons.find(item => item.id === this.selectedJargon.id) || this.jargons[0] || null;
+            } else {
+                this.selectedJargon = this.jargons[0] || null;
+            }
+        },
+
+        selectJargon(jargon) {
+            this.selectedJargon = jargon;
         },
 
         // --- Canonical Memory v2 ---
@@ -157,18 +177,18 @@ function memoryPage() {
         async saveEvent() {
             try {
                 await window.api.post('/memories/events', this.newEvent);
-                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '新增事件成功', type: 'success' }}));
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '记忆事件已保存', type: 'success' }}));
                 this.showEventModal = false;
                 this.loadAll();
             } catch(e) {
-                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '新增失败', type: 'error' }}));
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '记忆事件保存失败', type: 'error' }}));
             }
         },
         
         async delEvent(id) {
-            if(await window.app.confirm({title: '极度危险: 删除记忆', message: '您确定要物理删除这条核心记忆事件吗？此操作无法撤销。', type: 'danger', confirmText: '物理删除'})) {
+            if(await window.app.confirm({title: '确认删除记忆事件', message: '确定要删除这条记忆事件吗？', type: 'danger', confirmText: '确认删除'})) {
                 await window.api.delete('/memories/events/' + window.api.segment(id));
-                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '记忆已粉碎', type: 'success' }}));
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '记忆事件已删除', type: 'success' }}));
                 this.loadAll();
             }
         },
@@ -218,16 +238,16 @@ function memoryPage() {
                 } else {
                     await window.api.post(`/memories/reflections`, { date, summary: text, raw_log: '', meta: '{}' });
                 }
-                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '总结保存成功', type: 'success' }}));
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '反思已保存', type: 'success' }}));
                 this.loadAll();
                 this.activeReflectionDate = null;
             } catch(e) {
-                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '保存失败', type: 'error' }}));
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '反思保存失败', type: 'error' }}));
             }
         },
 
         async delReflection(date) {
-            if(await window.app.confirm({title: '确认删除', message: '删除该日的总结与日志？', type: 'danger', confirmText: '确认删除'})) {
+            if(await window.app.confirm({title: '确认删除', message: '删除这一天的反思内容？', type: 'danger', confirmText: '确认删除'})) {
                 await window.api.delete(`/memories/reflections/${window.api.segment(date)}`);
                 window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '反思已删除', type: 'success' }}));
                 this.loadAll();
@@ -259,56 +279,92 @@ function memoryPage() {
                 this.showNodeModal = false;
                 this.loadAll();
             } catch(e) {
-                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '保存失败', type: 'error' }}));
+                window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '节点保存失败', type: 'error' }}));
             }
         },
         
         async delNode(id) {
-            if(await window.app.confirm({title: '确认删除实体', message: '删除实体节点将影响图谱完整性，确定删除？', type: 'danger', confirmText: '确认删除'})) {
+            if(await window.app.confirm({title: '确认删除节点', message: '删除这个实体节点会影响图谱展示，确认继续？', type: 'danger', confirmText: '确认删除'})) {
                 await window.api.delete(`/memories/nodes/${window.api.segment(id)}`);
                 this.loadAll();
             }
         },
 
         // --- Jargon ---
-        newJargon: { id: null, content: '', meaning: '', is_jargon: 1, is_complete: 1, group_id: 'GLOBAL' },
+        newJargon: { id: null, content: '', meaning: '', scene: '', examples_text: '', is_jargon: 1, is_complete: 1, group_id: 'GLOBAL', status: 'active' },
         showJargonModal: false,
-        
+
         openJargonModal(j = null) {
             if (j) {
-                this.newJargon = { ...j };
+                this.newJargon = { ...j, examples_text: Array.isArray(j.examples) ? j.examples.join('\n') : '' };
             } else {
-                this.newJargon = { id: null, content: '', meaning: '', is_jargon: 1, is_complete: 1, group_id: 'GLOBAL' };
+                this.newJargon = { id: null, content: '', meaning: '', scene: '', examples_text: '', is_jargon: 1, is_complete: 1, group_id: 'GLOBAL', status: 'active' };
             }
             this.showJargonModal = true;
         },
-        
+
         async saveJargon() {
             try {
+                const payload = {
+                    meaning: this.newJargon.meaning,
+                    scene: this.newJargon.scene,
+                    examples: String(this.newJargon.examples_text || '').split('\n').map(item => item.trim()).filter(Boolean),
+                    is_jargon: this.newJargon.is_jargon,
+                    is_complete: this.newJargon.is_complete,
+                    status: this.newJargon.status,
+                };
                 if (this.newJargon.id) {
-                    await window.api.put(`/memories/jargon/${window.api.segment(this.newJargon.id)}`, { 
-                        meaning: this.newJargon.meaning, 
-                        is_jargon: this.newJargon.is_jargon, 
-                        is_complete: this.newJargon.is_complete 
-                    });
+                    await window.api.put(`/memories/jargon/${window.api.segment(this.newJargon.id)}`, payload);
                 } else {
-                    await window.api.post('/memories/jargon', this.newJargon);
+                    await window.api.post('/memories/jargon', { ...this.newJargon, ...payload });
                 }
                 window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '黑话词汇保存成功', type: 'success' }}));
                 this.showJargonModal = false;
-                this.loadAll();
+                await this.loadJargons();
             } catch(e) {
                 window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '保存失败', type: 'error' }}));
             }
         },
 
+        async approveJargon(id) {
+            await window.api.post(`/memories/jargon/${window.api.segment(id)}/approve`, {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '黑话已通过审核', type: 'success' }}));
+            await this.loadJargons();
+        },
+
+        async rejectJargon(id) {
+            await window.api.post(`/memories/jargon/${window.api.segment(id)}/reject`, {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '黑话已标记拒绝', type: 'success' }}));
+            await this.loadJargons();
+        },
+
+        async restoreJargon(id) {
+            await window.api.post(`/memories/canonical/${window.api.segment(id)}/restore`, {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '黑话已恢复为 active', type: 'success' }}));
+            await this.loadJargons();
+        },
+
+        async markJargonStale(id) {
+            await window.api.post(`/memories/canonical/${window.api.segment(id)}/stale`, {});
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '黑话已标记为 stale', type: 'success' }}));
+            await this.loadJargons();
+        },
+
+        async mergeJargon(id) {
+            if (!this.jargonMergeTargetId) return;
+            await window.api.post(`/memories/canonical/${window.api.segment(id)}/merge`, { target_id: this.jargonMergeTargetId });
+            window.dispatchEvent(new CustomEvent('toast-notify', { detail: { message: '黑话已合并', type: 'success' }}));
+            this.jargonMergeTargetId = '';
+            await this.loadJargons();
+        },
+
         async delJargon(id) {
              if(await window.app.confirm({title: '确认删除', message: '确定要删除此词条吗？', type: 'danger', confirmText: '确认删除'})) {
                 await window.api.delete(`/memories/jargon/${window.api.segment(id)}`);
-                this.loadAll();
+                await this.loadJargons();
             }
         },
-        
+
         formatDate(ts) {
             if (!ts) return '';
             const d = new Date(ts * 1000);
@@ -324,3 +380,4 @@ function memoryPage() {
         }
     }
 }
+

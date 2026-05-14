@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Optional
 
 from astrbot.api import logger
@@ -29,11 +30,22 @@ class ExpressionAutoCheckTask:
         self.gateway = gateway
         self.tracker = tracker
         self.config = config if config else gateway.config
+        self._last_run_at: dict[str, float] = {}
 
     async def run_once(self, group_id: Optional[str] = None) -> int:
+        now = time.time()
+        scope = str(group_id or "__global__")
+        min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 45) or 45)
+        if now - float(self._last_run_at.get(scope, 0.0) or 0.0) < min_interval:
+            return 0
+        self._last_run_at[scope] = now
         limit = getattr(self.config.evolution, "review_batch_size", 10)
         min_count = getattr(self.config.evolution, "review_min_count", 2)
-        patterns = await self.db.list_reviewable_patterns_async(group_id=group_id, limit=limit)
+        service = getattr(getattr(self.db, "memory_engine", None), "expression_pattern_service", None)
+        if service and hasattr(service, "list_reviewable_patterns"):
+            patterns = await service.list_reviewable_patterns(group_id=group_id, limit=limit)
+        else:
+            patterns = await self.db.list_reviewable_patterns_async(group_id=group_id, limit=limit)
         processed = 0
         for pattern in patterns:
             if int(getattr(pattern, "count", 1) or 1) < min_count:
@@ -103,7 +115,11 @@ class ExpressionAutoCheckTask:
                 }
             )
 
-        updated = await self.db.update_pattern_review_async(pattern.id, **kwargs)
+        service = getattr(getattr(self.db, "memory_engine", None), "expression_pattern_service", None)
+        if service and hasattr(service, "update_review"):
+            updated = await service.update_review(str(pattern.id), **kwargs)
+        else:
+            updated = await self.db.update_pattern_review_async(pattern.id, **kwargs)
         if decision == "revision_needed" and updated and self.tracker:
             self.tracker.queue_review_request(updated, reason=reason, replacement=replacement)
         logger.info(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import psutil
 import sqlite3
@@ -13,6 +14,27 @@ class DashboardService:
     def __init__(self, plugin_api: PluginApiAdapter, db_factory: Callable):
         self.plugin_api = plugin_api
         self.db_factory = db_factory
+
+    async def _count_pending_expression_reviews(self, db) -> int:
+        async with db.execute(
+            """
+            SELECT status, metadata
+            FROM canonical_memories
+            WHERE kind = 'expression_pattern'
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+        count = 0
+        for row in rows:
+            status = str(row[0] or "").strip().lower()
+            try:
+                metadata = json.loads(row[1] or "{}")
+            except Exception:
+                metadata = {}
+            review_status = str((metadata or {}).get("review_status") or "").strip().lower()
+            if status == "review_pending" or review_status in {"pending", "revision_needed", "pending_human"}:
+                count += 1
+        return count
 
     async def get_snapshot(self) -> dict:
         db_path = default_db_path()
@@ -32,15 +54,15 @@ class DashboardService:
             async with self.db_factory() as db:
                 async with db.execute("SELECT COUNT(*) FROM UserProfile") as cursor:
                     stats["total_users"] = (await cursor.fetchone())[0]
-                async with db.execute("SELECT COUNT(*) FROM ExpressionPattern WHERE status='pending'") as cursor:
-                    stats["pending_reviews"] = (await cursor.fetchone())[0]
                 async with db.execute("SELECT COUNT(*) FROM MemoryEvent") as cursor:
                     stats["total_memory_events"] = (await cursor.fetchone())[0]
                 try:
                     async with db.execute("SELECT COUNT(*) FROM canonical_memories") as cursor:
                         stats["total_canonical_memories"] = (await cursor.fetchone())[0]
+                    stats["pending_reviews"] = await self._count_pending_expression_reviews(db)
                 except sqlite3.OperationalError:
                     stats["total_canonical_memories"] = 0
+                    stats["pending_reviews"] = 0
         except sqlite3.OperationalError:
             pass
         return stats

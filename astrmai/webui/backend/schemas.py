@@ -31,7 +31,7 @@ class ReviewActionRequest(BaseModel):
 
 
 class BatchReviewRequest(BaseModel):
-    ids: list[int] = Field(default_factory=list)
+    ids: list[str] = Field(default_factory=list)
     action: str
 
 

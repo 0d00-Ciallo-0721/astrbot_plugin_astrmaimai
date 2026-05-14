@@ -103,6 +103,7 @@ class UserProfile:
     relationship_points: List[str] = field(default_factory=list)
     speech_style_points: List[str] = field(default_factory=list)
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    profile_metadata: Dict[str, Any] = field(default_factory=dict)
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
 

@@ -158,6 +158,9 @@ class StateEngine:
     def user_profiles(self) -> Dict[str, UserProfile]:
         return self.user_profile_service.user_profiles
 
+    def _get_user_lock(self, user_id: str):
+        return self.user_profile_service._get_user_lock(user_id)
+
     async def get_state(self, chat_id: str) -> ChatState:
         return await self.chat_state_service.get_state(chat_id)
 
@@ -217,12 +220,43 @@ class StateEngine:
         return self.energy_manager.should_drop_by_energy(state, msg_count)
 
     async def increment_user_message_count(self, user_id: str):
-        await self.user_profile_service.increment_user_message_count(user_id)
+        await self.user_profile_service.observe_user_activity(user_id, source="message_counter")
 
     async def on_learning_message_recorded(self, payload: dict) -> None:
         sender_id = str((payload or {}).get("sender_id", "") or "")
         if sender_id:
-            await self.increment_user_message_count(sender_id)
+            await self.user_profile_service.observe_user_activity(
+                sender_id,
+                chat_id=str((payload or {}).get("chat_id", "") or ""),
+                sender_name=str((payload or {}).get("sender_name", "") or ""),
+                content=str((payload or {}).get("content", "") or ""),
+                source="learning_message",
+            )
+
+    async def record_profile_learning_touch(
+        self,
+        user_id: str,
+        *,
+        chat_id: str = "",
+        source: str = "private_reply",
+        weight: float = 1.0,
+        sender_name: str = "",
+        increment_know_times: bool = False,
+    ) -> None:
+        await self.user_profile_service.record_profile_learning_touch(
+            user_id,
+            chat_id=chat_id,
+            source=source,
+            weight=weight,
+            sender_name=sender_name,
+            increment_know_times=increment_know_times,
+        )
+
+    async def apply_profile_name(self, user_id: str, new_name: str, *, source: str = "event") -> bool:
+        return await self.user_profile_service.apply_profile_name(user_id, new_name, source=source)
+
+    async def get_profile_prompt_bundle(self, user_id: str) -> dict:
+        return await self.user_profile_service.get_profile_prompt_bundle_for_user(user_id)
 
     async def flush_message_counters(self):
         await self.user_profile_service.flush_message_counters()

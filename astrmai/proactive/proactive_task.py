@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import random
 import time
 
@@ -169,7 +170,52 @@ class ProactiveTask:
         except TypeError:
             await self.persistence.save_user_profile(getattr(profile, "user_id", ""), profile)
 
+    async def _select_group_profile_target(self, chat_id: str) -> tuple[str, str, int] | None:
+        db_service = self._db_service
+        if not db_service or not hasattr(db_service, "get_recent_message_logs_async"):
+            return None
+        try:
+            logs = await db_service.get_recent_message_logs_async(
+                chat_id,
+                limit=80,
+                max_age_seconds=3600,
+                include_processed=True,
+            )
+        except TypeError:
+            logs = await db_service.get_recent_message_logs_async(chat_id, limit=80)
+        except Exception as exc:
+            logger.debug(f"[Life] group profile target degraded for {chat_id}: {exc}")
+            return None
+        if not logs:
+            return None
+
+        counts: Counter[str] = Counter()
+        display_names: dict[str, str] = {}
+        bot_id = str(getattr(self.state_engine, "bot_id", "") or "")
+        for item in logs:
+            sender_id = str(getattr(item, "sender_id", "") or "")
+            sender_name = str(getattr(item, "sender_name", "") or "")
+            content = str(getattr(item, "content", "") or "")
+            if not sender_id or sender_name == "SELF":
+                continue
+            if bot_id and sender_id == bot_id:
+                continue
+            if not content.strip():
+                continue
+            counts[sender_id] += 1
+            if sender_name.strip():
+                display_names[sender_id] = sender_name.strip()
+        if not counts:
+            return None
+        top_user_id, top_count = counts.most_common(1)[0]
+        return top_user_id, display_names.get(top_user_id, ""), int(top_count)
+
     async def _generate_persona_analysis(self, profile) -> None:
+        recent_summary = ""
+        if hasattr(self.state_engine, "user_profile_service"):
+            recent_summary = self.state_engine.user_profile_service.build_recent_interaction_summary(profile)
+        if recent_summary:
+            setattr(profile, "recent_interaction_summary", recent_summary)
         summary = await self._load_persona_summary()
         prompt = self.profile_generator.build_prompt(profile, summary)
         result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
@@ -177,22 +223,29 @@ class ProactiveTask:
         analysis = parsed["analysis"]
         tags = parsed["tags"]
         memory_points = parsed["memory_points"]
-
-        if analysis:
-            profile.persona_analysis = analysis.strip()
-        if tags:
-            profile.tags = tags
-        if memory_points:
-            profile.memory_points = memory_points
-            categorized = self.profile_generator.categorize_memory_points(memory_points)
-            profile.identity_points = categorized["identity_points"]
-            profile.preference_points = categorized["preference_points"]
-            profile.relationship_points = categorized["relationship_points"]
-            profile.speech_style_points = categorized["speech_style_points"]
-
-        profile.message_count_for_profiling = 0
-        profile.last_persona_gen_time = time.time()
-        profile.is_dirty = True
+        if hasattr(self.state_engine, "user_profile_service"):
+            self.state_engine.user_profile_service.refresh_profile_from_generation(
+                profile,
+                analysis=analysis,
+                tags=tags,
+                memory_points=memory_points,
+                source="auto_profile_generation",
+            )
+        else:
+            if analysis:
+                profile.persona_analysis = analysis.strip()
+            if tags:
+                profile.tags = tags
+            if memory_points:
+                profile.memory_points = memory_points
+                categorized = self.profile_generator.categorize_memory_points(memory_points)
+                profile.identity_points = categorized["identity_points"]
+                profile.preference_points = categorized["preference_points"]
+                profile.relationship_points = categorized["relationship_points"]
+                profile.speech_style_points = categorized["speech_style_points"]
+            profile.message_count_for_profiling = 0
+            profile.last_persona_gen_time = time.time()
+            profile.is_dirty = True
         await self._save_user_profile(profile)
         logger.info(
             f"[Life] persona profiling completed for {getattr(profile, 'name', '')}: "
@@ -202,6 +255,8 @@ class ProactiveTask:
     async def _generate_nickname(self, profile) -> None:
         if not profile or getattr(profile, "is_known", False):
             return
+        if hasattr(self.state_engine, "user_profile_service") and not self.state_engine.user_profile_service.can_auto_update_nickname(profile):
+            return
         summary = await self._load_persona_summary()
         prompt = self.nickname_generator.build_prompt(profile, summary)
         result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
@@ -209,20 +264,41 @@ class ProactiveTask:
         nickname = self.nickname_generator.choose(getattr(profile, "name", ""), preferred=nickname)
         if not nickname:
             return
-        profile.nickname = nickname
-        profile.nickname_reason = reason
-        profile.is_known = True
-        profile.is_dirty = True
+        if hasattr(self.state_engine, "user_profile_service"):
+            applied = self.state_engine.user_profile_service.set_auto_nickname(profile, nickname, reason)
+            if not applied:
+                return
+        else:
+            profile.nickname = nickname
+            profile.nickname_reason = reason
+            profile.is_known = True
+            profile.is_dirty = True
         await self._save_user_profile(profile)
         logger.info(f"[Life] nickname generated for {getattr(profile, 'name', '')}: {nickname}")
 
     async def _run_profiling_task(self):
         async with self._bg_semaphore:
+            for state in self.state_engine.get_active_states():
+                chat_id = str(getattr(state, "chat_id", "") or "")
+                if not chat_id or "FriendMessage" in chat_id:
+                    continue
+                target = await self._select_group_profile_target(chat_id)
+                if not target:
+                    continue
+                user_id, sender_name, weight = target
+                await self.state_engine.record_profile_learning_touch(
+                    user_id,
+                    chat_id=chat_id,
+                    source="group_periodic",
+                    weight=weight,
+                    sender_name=sender_name,
+                    increment_know_times=True,
+                )
+
             active_profiles = self.state_engine.get_active_profiles()
             threshold = int(getattr(getattr(self.config, "life", None), "profiling_msg_threshold", 200) or 200)
 
             for profile in active_profiles:
-                profile.know_times = int(getattr(profile, "know_times", 0) or 0) + 1
                 if profile.know_times >= 3 and not getattr(profile, "is_known", False):
                     try:
                         await self._generate_nickname(profile)

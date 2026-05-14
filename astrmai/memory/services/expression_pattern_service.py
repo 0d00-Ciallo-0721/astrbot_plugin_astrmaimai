@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
+from .v2_store import MemoryV2Store
+
+
+@dataclass(slots=True)
+class ExpressionPatternRecord:
+    id: str
+    group_id: str
+    situation: str
+    expression: str
+    style: str = ""
+    content_list: str = "[]"
+    count: int = 1
+    checked: bool = False
+    rejected: bool = False
+    modified_by: str = ""
+    source: str = "learning_expression_pattern"
+    shared_scope: str = ""
+    think_level: int = 0
+    review_status: str = "pending"
+    review_reason: str = ""
+    review_suggestion: str = ""
+    last_review_time: float = 0.0
+    weight: float = 1.0
+    last_active_time: float = 0.0
+    create_time: float = 0.0
+    status: str = "review_pending"
+    visibility: str = "maintenance_only"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ExpressionPatternService:
+    def __init__(self, store: MemoryV2Store, write_service):
+        self.store = store
+        self.write_service = write_service
+
+    @staticmethod
+    def normalize_text(value: str) -> str:
+        return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+    @classmethod
+    def build_dedup_key(cls, group_id: str, situation: str, expression: str, shared_scope: str = "") -> str:
+        return "expression_pattern:{group}:{scope}:{situation}:{expression}".format(
+            group=str(group_id or ""),
+            scope=cls.normalize_text(shared_scope or ""),
+            situation=cls.normalize_text(situation or ""),
+            expression=cls.normalize_text(expression or ""),
+        )
+
+    @staticmethod
+    def _canonical_status(review_status: str) -> str:
+        normalized = str(review_status or "pending").strip().lower()
+        if normalized == "approved":
+            return "active"
+        if normalized == "rejected":
+            return "rejected"
+        if normalized == "stale":
+            return "stale"
+        return "review_pending"
+
+    @staticmethod
+    def _visibility_for_status(status: str) -> str:
+        return "auto_and_tool" if status == "active" else "maintenance_only"
+
+    @staticmethod
+    def _merge_review_status(existing: str, incoming: str) -> str:
+        old = str(existing or "").strip().lower()
+        new = str(incoming or "").strip().lower()
+        if new in {"approved", "rejected", "pending_human", "revision_needed"}:
+            return new
+        if old in {"approved", "rejected", "pending_human", "revision_needed"}:
+            return old
+        return new or old or "pending"
+
+    @staticmethod
+    def _source_requires_review(source: str) -> bool:
+        normalized = str(source or "").strip().lower()
+        return normalized in {
+            "learning_expression_pattern",
+            "legacy_expression_write",
+        }
+
+    @classmethod
+    def _normalize_incoming_review_status(cls, review_status: str, *, source: str) -> str:
+        normalized = str(review_status or "pending").strip().lower()
+        if cls._source_requires_review(source) and normalized == "approved":
+            return "pending"
+        if normalized in {"approved", "pending", "pending_human", "revision_needed", "rejected", "stale"}:
+            return normalized
+        return "pending"
+
+    @staticmethod
+    def _json_samples(value: Any) -> str:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    value = parsed
+            except Exception:
+                value = [value]
+        if not isinstance(value, list):
+            value = []
+        return json.dumps(list(dict.fromkeys([str(item).strip() for item in value if str(item).strip()]))[:12], ensure_ascii=False)
+
+    @staticmethod
+    def _sample_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    value = parsed
+                else:
+                    value = [value]
+            except Exception:
+                value = [value]
+        if not isinstance(value, list):
+            value = []
+        return [str(item).strip() for item in value if str(item).strip()][:12]
+
+    @staticmethod
+    def _candidate_to_record(candidate: MemoryCandidate) -> ExpressionPatternRecord:
+        metadata = dict(candidate.metadata or {})
+        review_status = str(metadata.get("review_status") or candidate.status or "pending")
+        content_samples = ExpressionPatternService._sample_list(metadata.get("content_samples", []))
+        return ExpressionPatternRecord(
+            id=str(candidate.id or ""),
+            group_id=str(candidate.session_id or ""),
+            situation=str(metadata.get("situation") or ""),
+            expression=str(candidate.content or ""),
+            style=str(metadata.get("style") or ""),
+            content_list=json.dumps(content_samples, ensure_ascii=False),
+            count=int(metadata.get("count") or 1),
+            checked=review_status == "approved",
+            rejected=review_status == "rejected",
+            modified_by=str(metadata.get("modified_by") or ""),
+            source=str(candidate.source or ""),
+            shared_scope=str(metadata.get("shared_scope") or ""),
+            think_level=int(metadata.get("think_level") or 0),
+            review_status=review_status,
+            review_reason=str(metadata.get("review_reason") or ""),
+            review_suggestion=str(metadata.get("review_suggestion") or ""),
+            last_review_time=float(metadata.get("last_review_time") or 0.0),
+            weight=float(metadata.get("weight") or 1.0),
+            last_active_time=float(metadata.get("last_active_time") or candidate.last_access_time or candidate.updated_at or candidate.created_at or 0.0),
+            create_time=float(candidate.created_at or 0.0),
+            status=str(candidate.status or "review_pending"),
+            visibility=str(candidate.visibility or ""),
+            metadata=metadata,
+        )
+
+    async def get_pattern(self, pattern_id: str) -> ExpressionPatternRecord | None:
+        candidate = await self.store.get_canonical(str(pattern_id or ""), include_inactive=True)
+        if not candidate or candidate.kind != "expression_pattern":
+            return None
+        return self._candidate_to_record(candidate)
+
+    async def list_patterns(
+        self,
+        group_id: str,
+        *,
+        limit: int = 20,
+        only_checked: bool = False,
+        include_rejected: bool = False,
+        shared_scope: str | None = None,
+        think_level: int | None = None,
+        review_status: str | None = None,
+        statuses: list[str] | None = None,
+    ) -> list[ExpressionPatternRecord]:
+        rows = await self.store.list_candidates(
+            session_id=str(group_id or ""),
+            kinds=["expression_pattern"],
+            statuses=statuses or ["active", "review_pending", "rejected", "stale"],
+            limit=max(int(limit or 20) * 6, 60),
+            include_inactive=True,
+        )
+        results: list[ExpressionPatternRecord] = []
+        for candidate in rows:
+            record = self._candidate_to_record(candidate)
+            if only_checked and not record.checked:
+                continue
+            if not include_rejected and record.rejected:
+                continue
+            if shared_scope is not None and record.shared_scope and record.shared_scope != shared_scope:
+                continue
+            if think_level is not None and int(record.think_level or 0) > int(think_level or 0):
+                continue
+            if review_status and str(record.review_status or "").strip().lower() != str(review_status).strip().lower():
+                continue
+            results.append(record)
+        results.sort(
+            key=lambda item: (
+                float(item.weight or 1.0),
+                int(item.count or 1),
+                float(item.last_active_time or 0.0),
+            ),
+            reverse=True,
+        )
+        return results[: max(int(limit or 20), 1)]
+
+    async def list_reviewable_patterns(self, group_id: str | None = None, limit: int = 20) -> list[ExpressionPatternRecord]:
+        rows = await self.list_patterns(
+            str(group_id or ""),
+            limit=max(int(limit or 20), 1),
+            only_checked=False,
+            include_rejected=False,
+            statuses=["review_pending"],
+        )
+        return [
+            item
+            for item in rows
+            if str(item.review_status or "").strip().lower() in {"pending", "revision_needed", "pending_human"}
+        ][: max(int(limit or 20), 1)]
+
+    async def list_governance_groups(self, *, limit: int = 500) -> list[str]:
+        rows = await self.store.list_candidates(
+            kinds=["expression_pattern"],
+            statuses=["active", "review_pending", "rejected", "stale"],
+            limit=max(int(limit or 500), 1),
+            include_inactive=True,
+        )
+        groups: list[str] = []
+        for candidate in rows:
+            metadata = dict(candidate.metadata or {})
+            review_status = str(metadata.get("review_status") or "").strip().lower()
+            if candidate.status not in {"active", "review_pending", "rejected", "stale"} and review_status not in {
+                "approved",
+                "pending",
+                "pending_human",
+                "revision_needed",
+                "rejected",
+            }:
+                continue
+            scope_id = str(candidate.session_id or metadata.get("shared_scope") or "GLOBAL").strip() or "GLOBAL"
+            groups.append(scope_id)
+        return list(dict.fromkeys(groups))
+
+    async def update_review(
+        self,
+        pattern_id: str,
+        *,
+        checked: bool | None = None,
+        rejected: bool | None = None,
+        modified_by: str | None = None,
+        review_status: str | None = None,
+        review_reason: str | None = None,
+        review_suggestion: str | None = None,
+        weight_delta: float = 0.0,
+        replacement_expression: str | None = None,
+        apply_replacement: bool = False,
+        style: str | None = None,
+    ) -> ExpressionPatternRecord | None:
+        current = await self.get_pattern(pattern_id)
+        if not current:
+            return None
+        metadata = dict(current.metadata or {})
+        expression = str(current.expression or "")
+        situation = str(current.situation or "")
+        shared_scope = str(current.shared_scope or "")
+        if replacement_expression and apply_replacement:
+            expression = str(replacement_expression or "").strip() or expression
+        if style is not None:
+            metadata["style"] = str(style or "").strip()
+        if modified_by is not None:
+            metadata["modified_by"] = str(modified_by or "")
+        if review_reason is not None:
+            metadata["review_reason"] = str(review_reason or "")
+        if review_suggestion is not None:
+            metadata["review_suggestion"] = str(review_suggestion or "")
+        if review_status is not None:
+            metadata["review_status"] = str(review_status or "").strip().lower()
+        if checked is not None and checked:
+            metadata["review_status"] = "approved"
+        if rejected is not None and rejected:
+            metadata["review_status"] = "rejected"
+        metadata["last_review_time"] = time.time()
+        metadata["weight"] = max(0.0, min(3.0, float(metadata.get("weight") or current.weight or 1.0) + float(weight_delta or 0.0)))
+        next_review_status = str(metadata.get("review_status") or current.review_status or "pending").strip().lower()
+        status = self._canonical_status(next_review_status)
+        visibility = self._visibility_for_status(status)
+        metadata["content_samples"] = self._sample_list(metadata.get("content_samples") or current.content_list)
+        updated = await self.store.update_memory(
+            str(pattern_id),
+            content=expression,
+            summary=str(metadata.get("summary") or expression[:240]),
+            metadata=metadata,
+            status=status,
+            visibility=visibility,
+        )
+        if not updated:
+            return None
+        return await self.get_pattern(pattern_id)
+
+    async def adjust_weight(self, pattern_id: str, delta: float) -> ExpressionPatternRecord | None:
+        current = await self.get_pattern(pattern_id)
+        if not current:
+            return None
+        metadata = dict(current.metadata or {})
+        metadata["weight"] = max(0.0, min(3.0, float(metadata.get("weight") or current.weight or 1.0) + float(delta or 0.0)))
+        metadata["last_active_time"] = time.time()
+        changed = await self.store.update_memory(str(pattern_id), metadata=metadata)
+        if not changed:
+            return None
+        return await self.get_pattern(pattern_id)
+
+    async def write_pattern(self, group_id: str, payload: dict[str, Any], *, source: str = "learning_expression_pattern") -> str:
+        expression = str(payload.get("expression") or "").strip()
+        situation = str(payload.get("situation") or "").strip()
+        if not expression or not situation:
+            return ""
+        shared_scope = str(payload.get("shared_scope") or group_id or "").strip()
+        dedup_key = self.build_dedup_key(group_id, situation, expression, shared_scope)
+        existing = await self.store.get_by_dedup_key(dedup_key, include_inactive=True)
+        incoming_samples = self._sample_list(payload.get("content_samples", []))
+        now = time.time()
+        existing_metadata = dict(existing.metadata or {}) if existing else {}
+        incoming_review_status = self._normalize_incoming_review_status(payload.get("review_status", "pending"), source=source)
+        review_status = self._merge_review_status(existing_metadata.get("review_status", ""), incoming_review_status)
+        merged_samples = self._sample_list([*self._sample_list(existing_metadata.get("content_samples", [])), *incoming_samples])
+        merged_count = int(existing_metadata.get("count") or 0) + max(int(payload.get("count") or 1), 1)
+        merged_weight = float(existing_metadata.get("weight") or 0.0) + max(float(payload.get("weight") or 1.0), 0.1)
+        summary = str(payload.get("summary") or expression).strip()
+        confidence = float(payload.get("confidence") or payload.get("activation_score") or existing_metadata.get("confidence") or 0.6)
+        importance = max(0.2, min(1.0, float(payload.get("activation_score") or confidence or 0.6)))
+        status = self._canonical_status(review_status)
+        metadata = {
+            **existing_metadata,
+            "situation": situation,
+            "style": str(payload.get("style") or existing_metadata.get("style") or "").strip(),
+            "content_samples": merged_samples,
+            "shared_scope": shared_scope,
+            "think_level": int(payload.get("think_level") or existing_metadata.get("think_level") or 0),
+            "review_status": review_status,
+            "review_reason": str(payload.get("review_reason") or existing_metadata.get("review_reason") or "").strip(),
+            "review_suggestion": str(payload.get("review_suggestion") or existing_metadata.get("review_suggestion") or "").strip(),
+            "weight": merged_weight,
+            "count": merged_count,
+            "last_active_time": now,
+            "confidence": confidence,
+            "summary": summary,
+        }
+        if payload.get("legacy_pattern_id"):
+            metadata["legacy_pattern_id"] = payload.get("legacy_pattern_id")
+        await self.write_service.write(
+            MemoryWriteRequest(
+                source=source,
+                kind="expression_pattern",
+                session_id=str(group_id or ""),
+                content=expression,
+                summary=summary,
+                importance=importance,
+                confidence=max(0.0, min(confidence, 1.0)),
+                metadata=metadata,
+                dedup_key=dedup_key,
+                source_ref=str(payload.get("source_ref") or f"{source}:{dedup_key}"),
+                visibility=self._visibility_for_status(status),
+                status=status,
+            )
+        )
+        return str((await self.store.get_by_dedup_key(dedup_key, include_inactive=True)).id)
+
+    async def render_active_patterns(self, group_id: str, *, limit: int = 5) -> str:
+        patterns = await self.list_patterns(
+            group_id,
+            limit=limit,
+            only_checked=True,
+            include_rejected=False,
+            review_status="approved",
+            statuses=["active"],
+        )
+        if not patterns:
+            return "暂无特殊语言风格记录。"
+        return "\n".join(
+            f"- 当「{pattern.situation}」时 -> 习惯使用表达/风格：「{pattern.expression}」"
+            for pattern in patterns
+        )
+
+
+__all__ = ["ExpressionPatternRecord", "ExpressionPatternService"]

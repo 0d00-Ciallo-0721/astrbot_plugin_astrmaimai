@@ -21,7 +21,7 @@ class WorkCommandRequest:
 
 @dataclass(slots=True)
 class ReviewDecisionRequest:
-    pattern_id: int
+    pattern_id: str
     decision: str
     reviewer_id: str
     replacement_expression: str = ""

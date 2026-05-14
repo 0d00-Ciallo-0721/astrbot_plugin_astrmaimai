@@ -965,6 +965,9 @@ class MockFrontendHandler(BaseHTTPRequestHandler):
         if path == "/memories/jargon":
             self._send_json(_jargons())
             return
+        if path.endswith("/approve") or path.endswith("/reject"):
+            self._send_json({"status": "ok"})
+            return
         if path.startswith("/memories/jargon"):
             self._send_json({"ok": True})
             return

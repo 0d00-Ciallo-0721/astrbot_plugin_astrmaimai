@@ -31,7 +31,16 @@ class MemoryContextBuilder:
         budget = self.max_chars
         selected = self.select(candidates)
         for item in selected:
-            text = self._clean(item.summary or item.content)
+            if item.kind == "jargon":
+                meaning = self._clean(str((item.metadata or {}).get("meaning") or item.summary or ""))
+                scene = self._clean(str((item.metadata or {}).get("scene") or ""))
+                text = self._clean(item.content)
+                if meaning:
+                    text = f"{text} -> {meaning}"
+                if scene:
+                    text = f"{text} (scene: {scene})"
+            else:
+                text = self._clean(item.summary or item.content)
             if not text:
                 continue
             prefix = f"- [{item.kind or 'memory'}]"

@@ -108,6 +108,15 @@ class MemoryInjectionDecision:
 
 
 @dataclass
+class ExpressionPatternDecision:
+    source: str = ""
+    selected_ids: list[str] = field(default_factory=list)
+    injected: bool = False
+    skip_reason: str = ""
+    summary_preview: str = ""
+
+
+@dataclass
 class FollowUpSnapshot:
     eligible: bool = False
     skipped_reason: str = ""
@@ -208,6 +217,7 @@ class TurnContext:
     cognitive: CognitiveSnapshot = field(default_factory=CognitiveSnapshot)
     continuity: ContinuitySnapshot = field(default_factory=ContinuitySnapshot)
     memory: MemoryInjectionDecision = field(default_factory=MemoryInjectionDecision)
+    expression_patterns: ExpressionPatternDecision = field(default_factory=ExpressionPatternDecision)
     follow_up: FollowUpSnapshot = field(default_factory=FollowUpSnapshot)
     side_inputs: SideInputSnapshot = field(default_factory=SideInputSnapshot)
     proactive: ProactiveSnapshot = field(default_factory=ProactiveSnapshot)
@@ -350,6 +360,13 @@ def build_turn_trace_summary(
             "skip_reason": memory.skip_reason,
             "summary_preview": _preview_text(memory.summary_preview, 160),
         },
+        "expression_patterns": {
+            "source": turn_context.expression_patterns.source,
+            "selected_ids": list(turn_context.expression_patterns.selected_ids or []),
+            "injected": bool(turn_context.expression_patterns.injected),
+            "skip_reason": turn_context.expression_patterns.skip_reason,
+            "summary_preview": _preview_text(turn_context.expression_patterns.summary_preview, 160),
+        },
         "follow_up": {
             "eligible": bool(follow_up.eligible),
             "skipped_reason": follow_up.skipped_reason,
@@ -402,6 +419,7 @@ __all__ = [
     "AttentionSnapshot",
     "CognitiveSnapshot",
     "ContinuitySnapshot",
+    "ExpressionPatternDecision",
     "FollowUpSnapshot",
     "MemoryInjectionDecision",
     "PerceptionSnapshot",

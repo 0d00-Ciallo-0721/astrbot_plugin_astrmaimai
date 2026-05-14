@@ -7,7 +7,7 @@ async def list_pending_reviews(facade, group_id: str = "", limit: int = 50):
     return await facade.list_pending_expression_reviews(group_id=group_id, limit=limit)
 
 
-async def get_review_detail(facade, pattern_id: int):
+async def get_review_detail(facade, pattern_id: str):
     return await facade.get_expression_review_detail(pattern_id)
 
 

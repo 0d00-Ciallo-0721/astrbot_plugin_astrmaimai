@@ -86,9 +86,9 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
                 """
                 INSERT OR REPLACE INTO user_profiles
                 (user_id, name, social_score, last_seen, persona_analysis, group_footprints,
-                 identity, tags, nickname, nickname_reason, know_times, is_known,
-                 memory_points, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 profile_metadata, identity, tags, nickname, nickname_reason, know_times, is_known,
+                 memory_points, message_count_for_profiling, last_persona_gen_time, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "user-1",
@@ -97,6 +97,7 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
                     123.0,
                     "喜欢测试",
                     json.dumps({"group-a": 3}, ensure_ascii=False),
+                    json.dumps({"manual_locked_fields": ["nickname"]}, ensure_ascii=False),
                     "tester",
                     json.dumps(["friend", "qa"], ensure_ascii=False),
                     "阿测",
@@ -104,6 +105,8 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
                     7,
                     1,
                     json.dumps(["会写测试"], ensure_ascii=False),
+                    9,
+                    321.0,
                     999.0,
                 ),
             )
@@ -116,6 +119,8 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
         self.assertEqual(profiles["user-1"]["nickname"], "阿测")
         self.assertEqual(profiles["user-1"]["tags"], ["friend", "qa"])
         self.assertEqual(profiles["user-1"]["memory_points"], ["会写测试"])
+        self.assertEqual(profiles["user-1"]["message_count_for_profiling"], 9)
+        self.assertEqual(profiles["user-1"]["profile_metadata"]["manual_locked_fields"], ["nickname"])
 
     def test_memory_engine_recall_accepts_and_forwards_top_k(self):
         engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

@@ -21,6 +21,8 @@ class MemoryToolService:
     def _already_injected_ids(event) -> list[str]:
         trace = event.get_extra("astrmai_memory_injection_trace", None) if hasattr(event, "get_extra") else None
         selected = list(getattr(trace, "selected_ids", []) or [])
+        jargon_trace = event.get_extra("astrmai_jargon_injection_trace", None) if hasattr(event, "get_extra") else None
+        selected.extend(list(getattr(jargon_trace, "selected_ids", []) or []))
         turn_context = get_turn_context(event)
         if turn_context is not None:
             selected.extend(list(getattr(turn_context.memory, "selected_ids", []) or []))
@@ -33,7 +35,17 @@ class MemoryToolService:
             lines = []
             for item in result.items:
                 status_note = " (possibly stale)" if item.status == "stale" else ""
-                lines.append(f"- [{item.kind or 'memory'}]{status_note} {item.summary or item.content}")
+                if item.kind == "jargon":
+                    meaning = str((item.metadata or {}).get("meaning") or item.summary or "").strip()
+                    scene = str((item.metadata or {}).get("scene") or "").strip()
+                    line = f"- [jargon]{status_note} {item.content}"
+                    if meaning:
+                        line += f" -> {meaning}"
+                    if scene:
+                        line += f" (scene: {scene})"
+                else:
+                    line = f"- [{item.kind or 'memory'}]{status_note} {item.summary or item.content}"
+                lines.append(line)
             sections.append("[Memory]\n" + "\n".join(lines))
         if result.guidance:
             sections.append("[Guidance]\n" + result.guidance)
@@ -120,6 +132,7 @@ class MemoryToolService:
                     event=event,
                     allow_stale=False,
                 )
+                result.items = [item for item in result.items if item.kind != "jargon"]
                 return self.render_result(result) if result.items else None
             except Exception as exc:
                 logger.debug(f"[MemoryToolService] memory lookup failed: {exc}")
@@ -182,13 +195,19 @@ class MemoryToolService:
                 return None
 
         async def _jargon():
-            if not self.db_service or not query:
+            if not search_query:
                 return None
             try:
-                if hasattr(self.db_service, "get_jargon"):
-                    jargon = self.db_service.get_jargon(chat_id, query)
-                    if jargon:
-                        return f"{query}: {jargon}"
+                result = await self.search_memory(
+                    query=search_query,
+                    session_id=chat_id,
+                    layers=["jargon"],
+                    top_k=3,
+                    event=event,
+                    allow_stale=False,
+                )
+                if result.items:
+                    return self.render_result(result)
             except Exception as exc:
                 logger.debug(f"[MemoryToolService] jargon lookup failed: {exc}")
             return None
@@ -204,7 +223,7 @@ class MemoryToolService:
         if memory:
             sections.append(memory)
         if jargon:
-            sections.append(f"[Jargon]\n{jargon}")
+            sections.append(jargon)
         if profile:
             sections.append(f"[Profile]\n{profile}")
         if nodes:

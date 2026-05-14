@@ -8,6 +8,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..infrastructure.runtime.lane_manager import LaneKey
+from ..memory.contracts.memory_query import MemoryWriteRequest
 from .contracts.learning_events import (
     BotReplyRecordedEvent,
     MiningCompletedEvent,
@@ -25,8 +26,15 @@ class EvolutionManager:
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.event_bus = event_bus
-        self.expression_miner = ExpressionMiner(gateway, self.config)
-        self.jargon_miner = JargonMiner(self.expression_miner)
+        self.expression_miner = ExpressionMiner(
+            gateway,
+            self.config,
+            memory_engine=getattr(self.db, "memory_engine", None),
+        )
+        self.jargon_miner = JargonMiner(
+            self.expression_miner,
+            memory_engine=getattr(self.db, "memory_engine", None),
+        )
         self.recorder = MessageRecorder(
             window_seconds=getattr(self.config.evolution, "mining_window_sec", 60),
             min_messages=getattr(
@@ -98,19 +106,109 @@ class EvolutionManager:
             return
         self.db.mark_logs_processed(log_ids)
 
-    async def _save_patterns(self, patterns) -> None:
-        for pattern in patterns:
-            if hasattr(self.db, "save_pattern_async"):
-                await self.db.save_pattern_async(pattern)
-            else:
-                self.db.save_pattern(pattern)
+    @staticmethod
+    def _field(item, key, default=None):
+        if isinstance(item, dict):
+            return item.get(key, default)
+        return getattr(item, key, default)
 
-    async def _save_jargons(self, jargons) -> int:
-        if not hasattr(self.db, "save_jargon_async"):
+    @staticmethod
+    def _normalize_pattern_review_status(value) -> str:
+        normalized = str(value or "pending").strip().lower()
+        if normalized == "approved":
+            return "pending"
+        if normalized in {"pending", "pending_human", "rejected"}:
+            return normalized
+        return "pending"
+
+    @staticmethod
+    def _normalize_jargon_review_status(value) -> str:
+        normalized = str(value or "review_pending").strip().lower()
+        if normalized == "active":
+            return "review_pending"
+        if normalized in {"review_pending", "pending_human", "rejected"}:
+            return normalized
+        return "review_pending"
+
+    async def _save_patterns(self, patterns) -> None:
+        memory_engine = getattr(self.db, "memory_engine", None)
+        service = getattr(memory_engine, "expression_pattern_service", None) if memory_engine else None
+        if service and hasattr(service, "write_pattern"):
+            for pattern in patterns or []:
+                review_status = self._normalize_pattern_review_status(self._field(pattern, "review_status", "pending"))
+                await service.write_pattern(
+                    str(self._field(pattern, "group_id", "") or ""),
+                    {
+                        "expression": self._field(pattern, "expression", ""),
+                        "situation": self._field(pattern, "situation", ""),
+                        "style": self._field(pattern, "style", ""),
+                        "content_samples": list(self._field(pattern, "content_samples", []) or []),
+                        "count": int(self._field(pattern, "count", 1) or 1),
+                        "think_level": int(self._field(pattern, "think_level", 0) or 0),
+                        "review_status": review_status,
+                        "review_reason": self._field(pattern, "review_reason", ""),
+                        "review_suggestion": self._field(pattern, "review_suggestion", ""),
+                        "weight": float(self._field(pattern, "weight", 1.0) or 1.0),
+                        "shared_scope": self._field(pattern, "shared_scope", ""),
+                        "summary": self._field(pattern, "summary", self._field(pattern, "expression", "")),
+                        "confidence": float(self._field(pattern, "confidence", self._field(pattern, "activation_score", 0.65)) or 0.65),
+                        "activation_score": float(self._field(pattern, "activation_score", 0.65) or 0.65),
+                    },
+                    source="learning_expression_pattern",
+            )
+            return
+        return
+
+    async def _save_jargons(self, group_id: str, jargons) -> int:
+        memory_engine = getattr(self.db, "memory_engine", None)
+        writer = getattr(memory_engine, "write_service", None) if memory_engine else None
+        if not writer or not hasattr(writer, "write"):
             return 0
+
+        def _normalized_key(value: str) -> str:
+            return "".join(str(value or "").strip().lower().split())
+
         count = 0
         for jargon in jargons:
-            await self.db.save_jargon_async(jargon)
+            content = str(self._field(jargon, "content", "") or "").strip()
+            if not content:
+                continue
+            meaning = str(self._field(jargon, "meaning", "") or "").strip()
+            raw_content = str(self._field(jargon, "raw_content", "") or content).strip()
+            confidence = float(self._field(jargon, "confidence", 0.0) or 0.0)
+            activation_score = float(self._field(jargon, "activation_score", 0.0) or 0.0)
+            is_jargon = bool(self._field(jargon, "is_jargon", True))
+            scene = str(self._field(jargon, "scene", "") or "").strip()
+            examples = [str(item).strip() for item in (self._field(jargon, "examples", []) or []) if str(item).strip()]
+            review_status = self._normalize_jargon_review_status(self._field(jargon, "review_status", "review_pending"))
+            status = "rejected" if review_status == "rejected" else "review_pending"
+            visibility = "maintenance_only"
+            await writer.write(
+                MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id=str(group_id or ""),
+                    content=content,
+                    summary=meaning or content,
+                    tags=["jargon", "learning"],
+                    importance=min(1.0, max(0.35, activation_score)),
+                    confidence=max(0.1, min(confidence or activation_score or 0.55, 1.0)),
+                    metadata={
+                        "raw_content": raw_content,
+                        "meaning": meaning,
+                        "confidence": confidence,
+                        "activation_score": activation_score,
+                        "examples": examples,
+                        "scene": scene,
+                        "review_status": review_status,
+                        "count": int(self._field(jargon, "count", 1) or 1),
+                    },
+                    dedup_key=f"jargon:{group_id}:{_normalized_key(content)}",
+                    source_ref=f"learning_jargon:{group_id}:{_normalized_key(content)}",
+                    visibility=visibility,
+                    status=status,
+                )
+            )
             count += 1
         return count
 
@@ -160,9 +258,9 @@ class EvolutionManager:
             await self._save_patterns(patterns)
 
             jargon_count = 0
-            if hasattr(self.db, "save_jargon_async"):
+            if getattr(getattr(self.db, "memory_engine", None), "write_service", None):
                 jargons = await self.jargon_miner.mine(group_id, logs)
-                jargon_count = await self._save_jargons(jargons)
+                jargon_count = await self._save_jargons(group_id, jargons)
 
             await self._mark_logs_processed([log.id for log in logs])
             payload = MiningCompletedEvent(
@@ -199,10 +297,22 @@ class EvolutionManager:
         return "陪伴用户，提供有趣且连贯的对话"
 
     def get_active_patterns(self, chat_id: str, limit: int = 5) -> str:
-        patterns = self.db.get_patterns(chat_id, limit, True, False, chat_id, 1, "approved")
-        if not patterns:
-            return "暂无特殊语言风格记录。"
-        return "\n".join(f"- 当「{pattern.situation}」时 -> 习惯使用表达/黑话：「{pattern.expression}」" for pattern in patterns)
+        return self.get_active_patterns_canonical(chat_id, limit=limit)
+
+    def get_active_patterns_canonical(self, chat_id: str, limit: int = 5) -> str:
+        memory_engine = getattr(self.db, "memory_engine", None)
+        service = getattr(memory_engine, "expression_pattern_service", None) if memory_engine else None
+        if service and hasattr(service, "render_active_patterns"):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                raise RuntimeError("get_active_patterns should run in a worker thread when loop is active")
+            return asyncio.run(service.render_active_patterns(chat_id, limit=limit))
+        return ""
+
+    get_active_patterns = get_active_patterns_canonical
 
     async def _try_trigger_mining(self, group_id: str):
         unprocessed_logs = await self._load_unprocessed_logs(group_id, limit=100)

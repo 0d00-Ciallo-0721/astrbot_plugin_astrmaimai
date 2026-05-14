@@ -234,16 +234,16 @@ class ReActRetriever:
                 else:
                     display_name = nickname or profile_name or uid
                 sections = [
-                    f"姓名: {display_name}, 好感度: {score}, 标签: {', '.join(tags) if tags else '?'}, 侧写: {analysis}"
+                    f"姓名: {display_name}, 好感度: {score}, 标签: {', '.join(tags) if tags else '-'}, 侧写: {analysis}"
                 ]
                 if identity_points:
-                    sections.append(f"身份记忆: {'?'.join(identity_points[:3])}")
+                    sections.append(f"身份记忆: {' / '.join(identity_points[:3])}")
                 if preference_points:
-                    sections.append(f"偏好记忆: {'?'.join(preference_points[:3])}")
+                    sections.append(f"偏好记忆: {' / '.join(preference_points[:3])}")
                 if relationship_points:
-                    sections.append(f"关系记忆: {'?'.join(relationship_points[:3])}")
+                    sections.append(f"关系记忆: {' / '.join(relationship_points[:3])}")
                 if speech_style_points:
-                    sections.append(f"说话风格: {'?'.join(speech_style_points[:3])}")
+                    sections.append(f"说话风格: {' / '.join(speech_style_points[:3])}")
                 return "\n".join(sections)
             return f"未找到关于 '{name}' 的档案"
         except Exception as exc:  # pragma: no cover - defensive fallback
@@ -251,19 +251,31 @@ class ReActRetriever:
             return f"查询人物档案失败: {exc}"
 
     async def _tool_query_jargon(self, chat_id: str, word: str = "", **_: dict) -> str:
-        if not self.db_service or not word:
-            return "词典模块离线或查询词为空"
+        if not self.memory_engine or not word:
+            return "黑话模块离线或查询词为空"
         try:
-            if hasattr(self.db_service, "get_jargon"):
-                result = self.db_service.get_jargon(chat_id, word)
-                if result:
-                    return f"'{word}' 的含义: {result}"
-            if hasattr(self.db_service, "search_jargons"):
-                results = self.db_service.search_jargons(word, limit=3)
-                if results:
-                    return "\n".join(
-                        f"'{item.content}': {item.meaning}" for item in results if getattr(item, "meaning", "")
-                    )
+            retrieval = getattr(self.memory_engine, "retrieval_service", None)
+            if not retrieval:
+                return "黑话检索服务不可用"
+            query = MemoryQuery(
+                query=word,
+                session_id=chat_id,
+                layers=["jargon"],
+                top_k=3,
+                intent="jargon",
+                allow_stale=False,
+                metadata={"visibility_mode": "tool"},
+            )
+            results = await retrieval.retrieve(query)
+            if results:
+                rendered = []
+                for item in results:
+                    term = str(getattr(item, "content", "") or "").strip()
+                    meaning = str(getattr(item, "summary", "") or item.metadata.get("meaning", "")).strip()
+                    if term and meaning:
+                        rendered.append(f"'{term}': {meaning}")
+                if rendered:
+                    return "\n".join(rendered)
             return f"词典中未收录 '{word}'"
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.debug(f"[ReAct] query_jargon failed: {exc}")

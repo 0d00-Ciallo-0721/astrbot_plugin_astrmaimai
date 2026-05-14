@@ -158,17 +158,30 @@ async def delete_node(id: int, user: str = Depends(get_current_user)):
 # 4. Jargon
 # -----------------
 @router.get("/jargon")
-async def list_jargon(user: str = Depends(get_current_user)):
-    return await _service().list_jargon()
+async def list_jargon(
+    status: str = "",
+    group_id: str = "",
+    query: str = "",
+    user: str = Depends(get_current_user),
+):
+    return await _service().list_jargon(status=status, group_id=group_id, query=query)
 
 @router.post("/jargon")
 async def create_jargon(data: Dict[str, Any], user: str = Depends(get_current_user)):
     return await _service().create_jargon(data)
 
+@router.post("/jargon/{id}/approve")
+async def approve_jargon(id: str, user: str = Depends(get_current_user)):
+    return await _service().approve_jargon(id)
+
+@router.post("/jargon/{id}/reject")
+async def reject_jargon(id: str, user: str = Depends(get_current_user)):
+    return await _service().reject_jargon(id)
+
 @router.put("/jargon/{id}")
-async def update_jargon(id: int, data: Dict[str, Any], user: str = Depends(get_current_user)):
+async def update_jargon(id: str, data: Dict[str, Any], user: str = Depends(get_current_user)):
     return await _service().update_jargon(id, data)
 
 @router.delete("/jargon/{id}")
-async def delete_jargon(id: int, user: str = Depends(get_current_user)):
+async def delete_jargon(id: str, user: str = Depends(get_current_user)):
     return await _service().delete_jargon(id)

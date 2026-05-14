@@ -237,6 +237,47 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertIn("不暴露工具过程或机制", rules_block)
         self.assertNotIn("不要在开头", rules_block)
 
+    def test_context_engine_prefers_profile_prompt_bundle_from_state_engine(self):
+        db = _FakeDB()
+        db.persistence = SimpleNamespace(load_user_profile=None)
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(
+                    shared_dict={},
+                    astrmai_plugin=SimpleNamespace(
+                        runtime=SimpleNamespace(
+                            state_engine=SimpleNamespace(
+                                get_profile_prompt_bundle=lambda user_id: asyncio.sleep(
+                                    0,
+                                    result={
+                                        "display_name": "阿明（张三）",
+                                        "tags_text": "熟人 / 夜猫子",
+                                        "analysis": "对话节奏慢热，但熟悉后会主动接梗。",
+                                        "memory_points": ["昨晚聊过电影"],
+                                        "structured_sections": [{"label": "偏好画像", "values": ["爱好:悬疑片"]}],
+                                    },
+                                )
+                            )
+                        )
+                    ),
+                ),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=db, persona_summarizer=summarizer)
+
+        private_block = asyncio.run(
+            engine._build_private_chat_block(
+                "default:FriendMessage:user-1",
+                [_FakePrivateEvent()],
+                is_fast_mode=False,
+            )
+        )
+
+        self.assertIn("阿明（张三）", private_block)
+        self.assertIn("偏好画像", private_block)
+        self.assertIn("昨晚聊过电影", private_block)
+
     def test_context_engine_wraps_proactive_recall_as_internal_reference(self):
         memory_engine = _RecallMemoryEngine()
         summarizer = SimpleNamespace(
@@ -260,12 +301,8 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
         recall_block = asyncio.run(_run())
 
-        self.assertEqual(memory_engine.calls, [("你还记得之前天气那件事吗", "default:GroupMessage:group-1")])
-        self.assertIn("主动记忆闪回：", recall_block)
-        self.assertIn("这是我自己脑海里主动浮现的记忆片段", recall_block)
-        self.assertIn("原文不要逐字出现在回复里", recall_block)
-        self.assertIn("不会直接复述给对方", recall_block)
-        self.assertIn("上周小明问过天气", recall_block)
+        self.assertEqual(memory_engine.calls, [])
+        self.assertEqual(recall_block, "")
 
     def test_context_engine_includes_agency_context_as_hidden_inner_drive(self):
         summarizer = SimpleNamespace(

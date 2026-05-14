@@ -29,6 +29,7 @@ class DatabaseService(
     def __init__(self, persistence: PersistenceManager):
         self.persistence = persistence
         self._db_lock_instance = None
+        self.memory_engine = None
         from .repositories.chat_repository import ChatRepository
         from .repositories.memory_repository import MemoryRepository
         from .repositories.profile_repository import ProfileRepository

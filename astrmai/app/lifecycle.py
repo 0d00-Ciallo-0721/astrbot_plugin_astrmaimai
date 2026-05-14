@@ -48,6 +48,7 @@ class PluginLifecycleManager:
         await self.initialize_memory()
         init_meme_storage()
         await self.load_command_metadata()
+        await self.start_expression_governance_services()
         await self.start_proactive_services()
         await self.start_visual_services()
         self.start_background_services()
@@ -76,6 +77,17 @@ class PluginLifecycleManager:
         except Exception as exc:
             self.runtime.mark_degraded("proactive.runtime", str(exc))
             logger.warning(f"[AstrMai] Proactive services degraded: {exc}")
+
+    async def start_expression_governance_services(self) -> None:
+        runner = getattr(self.runtime, "expression_governance_runner", None)
+        if not runner:
+            return
+        self.runtime.set_boot_phase("lifecycle.expression_governance")
+        try:
+            await runner.start()
+        except Exception as exc:
+            self.runtime.mark_degraded("learning.expression_governance", str(exc))
+            logger.warning(f"[AstrMai] Expression governance degraded: {exc}")
 
     async def start_visual_services(self) -> None:
         self.runtime.set_boot_phase("lifecycle.visual")
@@ -148,6 +160,7 @@ class PluginLifecycleManager:
             await summarizer.stop()
 
         await self.stop_proactive_services()
+        await self.stop_expression_governance_services()
 
         if self.runtime.cron_guard:
             self.runtime.cron_guard.stop()
@@ -182,6 +195,17 @@ class PluginLifecycleManager:
         except Exception as exc:
             self.runtime.mark_degraded("proactive.shutdown", str(exc))
             logger.warning(f"[AstrMai] Proactive shutdown degraded: {exc}")
+
+    async def stop_expression_governance_services(self) -> None:
+        runner = getattr(self.runtime, "expression_governance_runner", None)
+        if not runner:
+            return
+        self.runtime.set_boot_phase("shutdown.expression_governance")
+        try:
+            await runner.stop()
+        except Exception as exc:
+            self.runtime.mark_degraded("learning.expression_governance_shutdown", str(exc))
+            logger.warning(f"[AstrMai] Expression governance shutdown degraded: {exc}")
 
     def stop_visual_services(self) -> None:
         self.runtime.set_boot_phase("shutdown.visual")

@@ -129,6 +129,25 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertIn("heartflow", status)
         self.assertFalse(status["heartflow"]["enabled"])
 
+    def test_group_profile_target_prefers_top_non_self_speaker(self):
+        task = self.mod.ProactiveTask.__new__(self.mod.ProactiveTask)
+        task._db_service = SimpleNamespace(
+            get_recent_message_logs_async=lambda chat_id, limit=80, max_age_seconds=3600, include_processed=True: asyncio.sleep(
+                0,
+                result=[
+                    SimpleNamespace(sender_id="user-1", sender_name="Alice", content="hello"),
+                    SimpleNamespace(sender_id="user-2", sender_name="Bob", content="yo"),
+                    SimpleNamespace(sender_id="user-1", sender_name="Alice", content="still here"),
+                    SimpleNamespace(sender_id="bot-1", sender_name="SELF", content="reply"),
+                ],
+            )
+        )
+        task.state_engine = SimpleNamespace(bot_id="bot-1")
+
+        result = asyncio.run(task._select_group_profile_target("group-1"))
+
+        self.assertEqual(result, ("user-1", "Alice", 2))
+
     def test_proactive_task_no_longer_imports_legacy_proactive_helper(self):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "proactive" / "proactive_task.py"
         content = path.read_text(encoding="utf-8")

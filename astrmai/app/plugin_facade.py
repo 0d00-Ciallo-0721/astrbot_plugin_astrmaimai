@@ -27,12 +27,15 @@ class PluginFacade:
     async def list_pending_expression_reviews(self, group_id: str = "", limit: int = 50):
         return await self.runtime.review_service.list_pending_reviews(group_id=group_id or None, limit=limit)
 
-    async def get_expression_review_detail(self, pattern_id: int):
+    async def list_recent_expression_reviews(self, group_id: str = "", limit: int = 50):
+        return await self.runtime.review_service.list_recent_reviews(group_id=group_id or None, limit=limit)
+
+    async def get_expression_review_detail(self, pattern_id: str):
         return await self.runtime.review_service.get_review_detail(pattern_id)
 
     async def submit_expression_review(
         self,
-        pattern_id: int,
+        pattern_id: str,
         decision: str,
         reviewer_id: str,
         replacement_expression: str = "",

@@ -81,15 +81,23 @@ class ReplyPostSendMixin:
             fallback_uid=user_id,
         )
 
-    async def _record_private_profile_touch(self, user_id: str) -> None:
+    async def _record_private_profile_touch(self, user_id: str, *, chat_id: str = "", sender_name: str = "") -> None:
         try:
-            profile = await self.state_engine.get_user_profile(user_id)
-            async with self.state_engine._get_user_lock(user_id):
-                profile.message_count_for_profiling += 1
-                profile.is_dirty = True
+            await self.state_engine.record_profile_learning_touch(
+                user_id,
+                chat_id=chat_id,
+                source="private_reply",
+                weight=1.0,
+                sender_name=sender_name,
+                increment_know_times=True,
+            )
             persistence = getattr(self.state_engine, "persistence", None)
+            profile = await self.state_engine.get_user_profile(user_id)
             if persistence and hasattr(persistence, "save_user_profile"):
-                await persistence.save_user_profile(profile)
+                try:
+                    await persistence.save_user_profile(profile)
+                except TypeError:
+                    await persistence.save_user_profile(user_id, profile)
         except Exception as exc:
             logger.warning(f"[ReplyService] private chat profile touch failed: {exc}")
 
@@ -107,7 +115,11 @@ class ReplyPostSendMixin:
             await self.state_engine.atomic_update_mood(chat_id, delta=0.0 if not bypassed_tag else (0.1 if tag == "happy" else -0.1 if tag in ["sad", "angry"] else 0.0))
             is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
             if is_private_chat:
-                await self._record_private_profile_touch(str(event.get_sender_id()))
+                await self._record_private_profile_touch(
+                    str(event.get_sender_id()),
+                    chat_id=chat_id,
+                    sender_name=str(event.get_sender_name() or ""),
+                )
             target_user_id = await self._collect_affection_target(
                 event,
                 chat_id,

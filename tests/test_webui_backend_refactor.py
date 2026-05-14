@@ -17,8 +17,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         )
 
         class _Cursor:
-            def __init__(self, value):
+            def __init__(self, value=None, rows=None):
                 self.value = value
+                self.rows = rows or []
 
             async def __aenter__(self):
                 return self
@@ -29,12 +30,20 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             async def fetchone(self):
                 return (self.value,)
 
+            async def fetchall(self):
+                return list(self.rows)
+
         class _Db:
             def execute(self, query):
                 if "UserProfile" in query:
                     return _Cursor(3)
-                if "ExpressionPattern" in query:
-                    return _Cursor(2)
+                if "FROM canonical_memories" in query and "status, metadata" in query:
+                    return _Cursor(
+                        rows=[
+                            ("review_pending", '{"review_status":"pending"}'),
+                            ("active", '{"review_status":"approved"}'),
+                        ]
+                    )
                 return _Cursor(5)
 
         class _DbCtx:
@@ -54,7 +63,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         service = service_mod.DashboardService(_PluginApi(), lambda: _DbCtx())
         snapshot = asyncio.run(service.get_snapshot())
         self.assertEqual(snapshot["total_users"], 3)
-        self.assertEqual(snapshot["pending_reviews"], 2)
+        self.assertEqual(snapshot["pending_reviews"], 1)
         self.assertIn("capabilities", snapshot)
 
     def test_server_mounts_aggregated_api_router(self):
@@ -166,22 +175,26 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                     event_count = (await (await db.execute("SELECT COUNT(*) FROM MemoryEvent")).fetchone())[0]
                     reflection_row = dict(await (await db.execute("SELECT * FROM DailyReflection WHERE date = ?", ("2099-01-09",))).fetchone())
                     node_row = dict(await (await db.execute("SELECT * FROM MemoryNode WHERE id = ?", (node["id"],))).fetchone())
-                    jargon_row = dict(await (await db.execute("SELECT * FROM Jargon WHERE id = ?", (jargon["id"],))).fetchone())
+                    jargon_row = dict(await (await db.execute("SELECT * FROM canonical_memories WHERE id = ?", (jargon["id"],))).fetchone())
                 return event, reflection, node, jargon, canonical_row, event_count, reflection_row, node_row, jargon_row
 
         event, reflection, node, jargon, canonical_row, event_count, reflection_row, node_row, jargon_row = asyncio.run(_run())
         self.assertEqual(reflection["status"], "ok")
         self.assertTrue(str(event["id"]).startswith("mem_webui_"))
         self.assertIsInstance(node["id"], int)
-        self.assertIsInstance(jargon["id"], int)
+        self.assertIsInstance(jargon["id"], str)
         self.assertEqual(event["mode"], "canonical_redirect")
         self.assertEqual(event_count, 0)
         self.assertEqual(canonical_row["session_id"], "PLUGIN_PAGE_SMOKE")
         self.assertEqual(canonical_row["tags"], '["codex"]')
         self.assertEqual(reflection_row["reflection"], "updated reflection")
         self.assertEqual(node_row["name"], "updated node")
-        self.assertEqual(jargon_row["raw_content"], "smoke jargon")
-        self.assertEqual(jargon_row["meaning"], "updated meaning")
+        self.assertEqual(jargon_row["kind"], "jargon")
+        self.assertEqual(jargon_row["content"], "smoke jargon")
+        self.assertEqual(jargon_row["status"], "review_pending")
+        jargon_meta = json.loads(jargon_row["metadata"])
+        self.assertEqual(jargon_meta["raw_content"], "smoke jargon")
+        self.assertEqual(jargon_meta["meaning"], "updated meaning")
 
     def test_memory_service_exposes_canonical_memory_and_legacy_marker(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
@@ -280,6 +293,123 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertTrue(legacy_rows[0]["legacy"])
         self.assertEqual(legacy_rows[0]["canonical_id"], "mem-ui-1")
         self.assertEqual(legacy_delete["mode"], "canonical_soft_delete")
+
+    def test_memory_ui_service_lists_and_reviews_canonical_jargon(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "jargon.db")
+
+            async def _run():
+                async with aiosqlite.connect(db_path) as db:
+                    await db.executescript(
+                        """
+                        CREATE TABLE canonical_memories (
+                            id TEXT PRIMARY KEY,
+                            session_id TEXT,
+                            persona_id TEXT,
+                            source TEXT,
+                            kind TEXT,
+                            content TEXT,
+                            summary TEXT,
+                            tags TEXT,
+                            importance REAL,
+                            confidence REAL,
+                            status TEXT,
+                            decay_score REAL,
+                            create_time REAL,
+                            update_time REAL,
+                            last_access_time REAL,
+                            access_count INTEGER,
+                            superseded_by TEXT,
+                            deleted_reason TEXT,
+                            metadata TEXT,
+                            dedup_key TEXT,
+                            source_ref TEXT,
+                            visibility TEXT
+                        );
+                        """
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO canonical_memories (
+                            id, session_id, source, kind, content, summary, tags, importance, confidence, status,
+                            decay_score, create_time, update_time, last_access_time, access_count, superseded_by,
+                            deleted_reason, metadata, dedup_key, source_ref, visibility
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "mem-jargon-1",
+                            "group-1",
+                            "learning_jargon",
+                            "jargon",
+                            "bigbird",
+                            "raid boss nickname",
+                            "[]",
+                            0.7,
+                            0.8,
+                            "review_pending",
+                            1.0,
+                            1.0,
+                            2.0,
+                            1.5,
+                            0,
+                            "",
+                            "",
+                            json.dumps(
+                                {
+                                    "meaning": "raid boss nickname",
+                                    "scene": "raid call",
+                                    "examples": ["bigbird is here"],
+                                    "review_status": "review_pending",
+                                    "review_reason": "needs more evidence",
+                                    "review_suggestion": "confirm whether it is boss shorthand",
+                                    "legacy_jargon_id": 7,
+                                }
+                            ),
+                            "jargon:group-1:bigbird",
+                            "Jargon:7",
+                            "maintenance_only",
+                        ),
+                    )
+                    await db.commit()
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                service = service_mod.MemoryUiService(_db_factory)
+                pending = await service.list_jargon(status="review_pending", group_id="group-1", query="raid")
+                approved = await service.approve_jargon("mem-jargon-1")
+                active = await service.list_jargon(status="active", group_id="group-1", query="bigbird")
+                rejected = await service.reject_jargon("mem-jargon-1")
+                final_detail = await service.get_canonical("mem-jargon-1")
+                return pending, approved, active, rejected, final_detail
+
+            pending, approved, active, rejected, final_detail = asyncio.run(_run())
+
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["legacy_jargon_id"], 7)
+        self.assertEqual(approved["status"], "ok")
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["status"], "active")
+        self.assertEqual(active[0]["scene"], "raid call")
+        self.assertEqual(pending[0]["review_reason"], "needs more evidence")
+        self.assertEqual(pending[0]["review_suggestion"], "confirm whether it is boss shorthand")
+        self.assertEqual(rejected["status"], "ok")
+        self.assertEqual(final_detail["data"]["status"], "rejected")
+        self.assertEqual(final_detail["data"]["metadata"]["review_status"], "rejected")
+
+    def test_memory_route_file_exposes_jargon_review_endpoints(self):
+        path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "routes" / "memory_routes.py"
+        content = path.read_text(encoding="utf-8")
+        self.assertIn('@router.post("/jargon/{id}/approve")', content)
+        self.assertIn('@router.post("/jargon/{id}/reject")', content)
 
     def test_settings_service_builds_effective_config_and_validates_schema(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -483,6 +613,199 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(timeline["items"][0]["kind"], "action")
         digests = asyncio.run(service.heartflow_topic_digests())
         self.assertEqual(digests["items"][0]["source"], "heartflow_topic_digest")
+
+    def test_review_ui_service_is_canonical_first_and_degrades_to_readonly_when_runtime_missing(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.review_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "review.db"
+                async with aiosqlite.connect(db_path) as db:
+                    await db.executescript(
+                        """
+                        CREATE TABLE canonical_memories (
+                            id TEXT PRIMARY KEY,
+                            session_id TEXT,
+                            persona_id TEXT,
+                            source TEXT,
+                            kind TEXT,
+                            content TEXT,
+                            summary TEXT,
+                            tags TEXT,
+                            importance REAL,
+                            confidence REAL,
+                            status TEXT,
+                            decay_score REAL,
+                            create_time REAL,
+                            update_time REAL,
+                            last_access_time REAL,
+                            access_count INTEGER,
+                            superseded_by TEXT,
+                            deleted_reason TEXT,
+                            metadata TEXT,
+                            dedup_key TEXT,
+                            source_ref TEXT,
+                            visibility TEXT
+                        );
+                        CREATE TABLE ExpressionPattern (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            situation TEXT,
+                            expression TEXT
+                        );
+                        """
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO canonical_memories (
+                            id, session_id, source, kind, content, summary, tags, importance, confidence, status,
+                            decay_score, create_time, update_time, last_access_time, access_count, superseded_by,
+                            deleted_reason, metadata, dedup_key, source_ref, visibility
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "mem-review-1",
+                            "group-1",
+                            "learning_expression_pattern",
+                            "expression_pattern",
+                            "ship it softly",
+                            "ship it softly",
+                            "[]",
+                            0.6,
+                            0.7,
+                            "review_pending",
+                            1.0,
+                            1.0,
+                            2.0,
+                            1.0,
+                            0,
+                            "",
+                            "",
+                            json.dumps({"situation": "daily reply", "review_status": "pending"}),
+                            "expr:1",
+                            "test",
+                            "maintenance_only",
+                        ),
+                    )
+                    await db.commit()
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                service = service_mod.ReviewUiService(adapter_mod.PluginApiAdapter(facade=None), _db_factory)
+                pending = await service.list_pending()
+                created = await service.create_review({"group_id": "group-1", "situation": "daily reply", "expression": "ship it"})
+                submitted = await service.submit_review("mem-review-1", "approve")
+                async with aiosqlite.connect(db_path) as db:
+                    legacy_count = (await (await db.execute("SELECT COUNT(*) FROM ExpressionPattern")).fetchone())[0]
+                return pending, created, submitted, legacy_count
+
+        pending, created, submitted, legacy_count = asyncio.run(_run())
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["id"], "mem-review-1")
+        self.assertEqual(created["status"], "degraded")
+        self.assertEqual(submitted["status"], "degraded")
+        self.assertEqual(legacy_count, 0)
+
+    def test_admin_expression_stats_reads_canonical_expression_patterns(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "admin.db"
+                async with aiosqlite.connect(db_path) as db:
+                    await db.executescript(
+                        """
+                        CREATE TABLE canonical_memories (
+                            id TEXT PRIMARY KEY,
+                            session_id TEXT,
+                            persona_id TEXT,
+                            source TEXT,
+                            kind TEXT,
+                            content TEXT,
+                            summary TEXT,
+                            tags TEXT,
+                            importance REAL,
+                            confidence REAL,
+                            status TEXT,
+                            decay_score REAL,
+                            create_time REAL,
+                            update_time REAL,
+                            last_access_time REAL,
+                            access_count INTEGER,
+                            superseded_by TEXT,
+                            deleted_reason TEXT,
+                            metadata TEXT,
+                            dedup_key TEXT,
+                            source_ref TEXT,
+                            visibility TEXT
+                        );
+                        """
+                    )
+                    rows = [
+                        ("expr-1", "review_pending", {"review_status": "pending"}),
+                        ("expr-2", "active", {"review_status": "approved"}),
+                        ("expr-3", "rejected", {"review_status": "rejected"}),
+                    ]
+                    for memory_id, status, metadata in rows:
+                        await db.execute(
+                            """
+                            INSERT INTO canonical_memories (
+                                id, session_id, source, kind, content, summary, tags, importance, confidence, status,
+                                decay_score, create_time, update_time, last_access_time, access_count, superseded_by,
+                                deleted_reason, metadata, dedup_key, source_ref, visibility
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                memory_id,
+                                "group-1",
+                                "learning_expression_pattern",
+                                "expression_pattern",
+                                "expr",
+                                "expr",
+                                "[]",
+                                0.6,
+                                0.7,
+                                status,
+                                1.0,
+                                1.0,
+                                2.0,
+                                1.0,
+                                0,
+                                "",
+                                "",
+                                json.dumps(metadata),
+                                memory_id,
+                                "test",
+                                "maintenance_only",
+                            ),
+                        )
+                    await db.commit()
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=None), _db_factory)
+                return await service.expression_stats()
+
+        stats = asyncio.run(_run())
+        self.assertEqual(stats["data"]["total"], 3)
+        self.assertEqual(stats["data"]["pending"], 1)
+        self.assertEqual(stats["data"]["approved"], 1)
+        self.assertEqual(stats["data"]["rejected"], 1)
 
     def test_runtime_capability_imports_are_package_relative(self):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "app" / "runtime_context.py"

@@ -68,6 +68,13 @@ class ReviewPersistenceMixin:
         return existing
 
     def save_pattern(self, pattern: ExpressionPattern):
+        service = getattr(getattr(self, "memory_engine", None), "expression_pattern_service", None)
+        if service and hasattr(service, "write_pattern"):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(self._save_pattern_to_canonical_async(pattern))
+                return pattern
         with self.get_session() as session:
             statement = select(ExpressionPattern).where(
                 ExpressionPattern.group_id == pattern.group_id,
@@ -164,7 +171,35 @@ class ReviewPersistenceMixin:
             return [ExpressionPattern.model_validate(item.model_dump()) for item in results]
 
     async def save_pattern_async(self, pattern: ExpressionPattern):
+        service = getattr(getattr(self, "memory_engine", None), "expression_pattern_service", None)
+        if service and hasattr(service, "write_pattern"):
+            await self._save_pattern_to_canonical_async(pattern)
+            return pattern
         return await self._run_blocking(self.save_pattern, pattern, with_lock=True)
+
+    async def _save_pattern_to_canonical_async(self, pattern: ExpressionPattern):
+        service = getattr(getattr(self, "memory_engine", None), "expression_pattern_service", None)
+        if not service or not hasattr(service, "write_pattern"):
+            return None
+        return await service.write_pattern(
+            str(getattr(pattern, "group_id", "") or ""),
+            {
+                "situation": getattr(pattern, "situation", ""),
+                "expression": getattr(pattern, "expression", ""),
+                "style": getattr(pattern, "style", ""),
+                "content_samples": getattr(pattern, "content_list", "[]"),
+                "count": int(getattr(pattern, "count", 1) or 1),
+                "shared_scope": getattr(pattern, "shared_scope", ""),
+                "think_level": int(getattr(pattern, "think_level", 0) or 0),
+                "review_status": getattr(pattern, "review_status", "pending"),
+                "review_reason": getattr(pattern, "review_reason", ""),
+                "review_suggestion": getattr(pattern, "review_suggestion", ""),
+                "weight": float(getattr(pattern, "weight", 1.0) or 1.0),
+                "legacy_pattern_id": getattr(pattern, "id", None),
+                "source_ref": f"legacy_expression_write:{getattr(pattern, 'group_id', '')}:{getattr(pattern, 'situation', '')}:{getattr(pattern, 'expression', '')}",
+            },
+            source="legacy_expression_write",
+        )
 
     async def get_patterns_async(self, group_id: str, limit: int = 5, **kwargs):
         return await self._run_blocking(self.get_patterns, group_id, limit, **kwargs)

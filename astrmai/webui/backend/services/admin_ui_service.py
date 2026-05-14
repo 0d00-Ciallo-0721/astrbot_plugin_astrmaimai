@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from dataclasses import asdict, is_dataclass
@@ -61,6 +62,38 @@ class AdminUiService:
         except (sqlite3.OperationalError, ValueError, TypeError):
             return 0
 
+    async def _expression_pattern_stats(self) -> dict[str, int]:
+        if not self.db_factory:
+            return {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
+        try:
+            async with self.db_factory() as db:
+                async with db.execute(
+                    """
+                    SELECT status, metadata
+                    FROM canonical_memories
+                    WHERE kind = 'expression_pattern'
+                    """
+                ) as cursor:
+                    rows = await cursor.fetchall()
+        except (sqlite3.OperationalError, ValueError, TypeError):
+            return {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
+        stats = {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
+        for status_value, metadata_raw in rows:
+            stats["total"] += 1
+            status = str(status_value or "").strip().lower()
+            try:
+                metadata = json.loads(metadata_raw or "{}")
+            except Exception:
+                metadata = {}
+            review_status = str((metadata or {}).get("review_status") or "").strip().lower()
+            if status == "review_pending" or review_status in {"pending", "pending_human", "revision_needed"}:
+                stats["pending"] += 1
+            elif status == "active" and review_status == "approved":
+                stats["approved"] += 1
+            elif status == "rejected" or review_status == "rejected":
+                stats["rejected"] += 1
+        return stats
+
     async def runtime_status(self) -> dict[str, Any]:
         return {
             "status": "ok",
@@ -94,6 +127,7 @@ class AdminUiService:
                 active_chats = len(await coordinator.list_active_chats(1800))
             except Exception:
                 active_chats = 0
+        expression_stats = await self._expression_pattern_stats()
         return {
             "status": "ok",
             "data": {
@@ -101,7 +135,7 @@ class AdminUiService:
                 "boot_phase": status.get("boot_phase", ""),
                 "degraded_count": len(status.get("degraded_components", {}) or {}),
                 "active_chats": active_chats,
-                "pending_reviews": await self._safe_count("ExpressionPattern", "status='pending'"),
+                "pending_reviews": expression_stats["pending"],
                 "total_memory_events": await self._safe_count("MemoryEvent"),
                 "total_canonical_memories": await self._safe_count("canonical_memories"),
             },
@@ -374,14 +408,10 @@ class AdminUiService:
         }
 
     async def expression_stats(self) -> dict[str, Any]:
+        stats = await self._expression_pattern_stats()
         return {
             "status": "ok",
-            "data": {
-                "total": await self._safe_count("ExpressionPattern"),
-                "pending": await self._safe_count("ExpressionPattern", "status='pending'"),
-                "approved": await self._safe_count("ExpressionPattern", "status='approved'"),
-                "rejected": await self._safe_count("ExpressionPattern", "status='rejected'"),
-            },
+            "data": stats,
         }
 
     async def expression_cooldowns(self) -> dict[str, Any]:

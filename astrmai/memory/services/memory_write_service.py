@@ -45,6 +45,7 @@ class MemoryWriteService:
             dedup_key=dedup_key,
             source_ref=str(request.source_ref or ""),
             visibility=request.visibility if request.visibility in {"auto_and_tool", "tool_only", "maintenance_only"} else "auto_and_tool",
+            status=str(request.status or "active").strip() or "active",
         )
         memory_id = await self.store.upsert(normalized)
         if self.index_projector and memory_id:

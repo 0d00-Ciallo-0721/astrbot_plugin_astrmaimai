@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import importlib
 import sys
 import time
@@ -60,6 +60,11 @@ class _ExpressionSelector:
         return "expression habits"
 
 
+class _TraceExpressionSelector:
+    async def select_with_trace(self, **kwargs):
+        return "trace expression habits", [SimpleNamespace(id="mem-expression-1", expression="soft ping")]
+
+
 class _EvolutionManager:
     def __init__(self, calls):
         self.calls = calls
@@ -78,12 +83,36 @@ class _Db:
         return [{"text": "x", "meaning": "y", "situation": "chat"}]
 
 
+class _RetrievalService:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def retrieve(self, query):
+        self.calls.append(("canonical_jargon", query.query, list(query.layers or []), query.intent))
+        return [
+            SimpleNamespace(
+                id="mem-jargon-1",
+                content="x",
+                summary="y",
+                metadata={"meaning": "y", "scene": "chat"},
+            )
+        ]
+
+
+class _EmptyRetrievalService:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def retrieve(self, query):
+        self.calls.append(("canonical_jargon_empty", query.query, list(query.layers or []), query.intent))
+        return []
+
+
 class _GoalManager:
     def __init__(self, calls):
         self.calls = calls
 
     async def analyze_and_update(self, chat_id, recent_messages):
-        self.calls.append(("goal_update", chat_id, recent_messages))
         return "keep current topic"
 
     def get_goals_context(self, chat_id):
@@ -116,6 +145,7 @@ class _Planner:
         self.expression_selector = _ExpressionSelector(self.calls)
         self.evolution_manager = _EvolutionManager(self.calls)
         self.context_engine = SimpleNamespace(db=_Db(self.calls))
+        self.memory_engine = SimpleNamespace(retrieval_service=_RetrievalService(self.calls))
         self.goal_manager = _GoalManager(self.calls)
         self.state_engine = _StateEngine(self.calls)
 
@@ -189,17 +219,49 @@ def test_budgeted_prompt_inputs_respect_think_level(tmp_path):
     )
     assert level_one["expression_habits"] == "expression habits"
     assert level_one["tool_state"].state.energy == 0.7
-    assert ("goal_update", "chat-1", "hello there") not in planner.calls
 
     level_two_event = _Event()
     level_two = asyncio.run(
         loader.load_prompt_inputs(level_two_event, "chat-1", None, ["please analyze this"], 2, user_id="user-1")
     )
-    assert level_two["slang_context"] == "slang context"
-    assert "x -> y (scene: chat)" in level_two["jargon_explanation"]
+    assert level_two["slang_context"] == ""
+    assert level_two["jargon_explanation"] == ""
+    assert ("jargon", "chat-1", 8) not in planner.calls
     assert level_two["planner_reasoning"] == "keep current topic"
     assert level_two["goals_context"] == "goal context"
-    assert any(call[0] == "goal_update" for call in planner.calls)
+
+
+def test_jargon_loader_returns_empty_instead_of_legacy_fallback(tmp_path):
+    module = _load_loader_module(tmp_path)
+    planner = _Planner()
+    loader = module.PlanningInputLoader(planner)
+
+    query_text = "please check whether bigbird slang is still active"
+    result = asyncio.run(
+        loader._load_jargon_explanation(_Event(), "chat-1", None, [query_text])
+    )
+
+    assert result == ""
+    assert ("jargon", "chat-1", 8) not in planner.calls
+
+
+def test_expression_habit_loader_writes_canonical_trace(tmp_path):
+    module = _load_loader_module(tmp_path)
+    planner = _Planner()
+    planner.expression_selector = _TraceExpressionSelector()
+    loader = module.PlanningInputLoader(planner)
+    event = _Event()
+
+    result = asyncio.run(
+        loader._load_expression_habits(event, "chat-1", None, ["this context is long enough for expression"], 1)
+    )
+
+    assert result == "trace expression habits"
+    trace = event.get_extra("astrmai_expression_pattern_trace")
+    assert trace.selected_ids == ["mem-expression-1"]
+    turn_context = event.get_extra("astrmai_turn_context")
+    assert turn_context.expression_patterns.selected_ids == ["mem-expression-1"]
+    assert turn_context.expression_patterns.injected is True
 
 
 def test_memory_feedback_and_failures_degrade_without_blocking(tmp_path):

@@ -45,6 +45,42 @@ class DatabaseAdaptersPortedTests(unittest.TestCase):
         jargon_list = asyncio.run(self.db.load_jargon_list("group-1", limit=5))
         self.assertEqual(jargon_list, [{"text": "spark", "meaning": "first meaning", "situation": ""}])
 
+    def test_legacy_save_jargon_redirects_to_canonical_memory(self):
+        saved = self.db.save_jargon(
+            self.Jargon(
+                group_id="group-1",
+                content="phoenix",
+                raw_content="phoenix",
+                meaning="reborn strategy",
+                is_jargon=True,
+                is_complete=True,
+                count=1,
+            )
+        )
+
+        with sqlite3.connect(self.manager.db_path) as conn:
+            canonical = conn.execute(
+                """
+                SELECT kind, session_id, content, summary, status, visibility, metadata
+                FROM canonical_memories
+                WHERE kind = 'jargon' AND session_id = ? AND content = ?
+                """,
+                ("group-1", "phoenix"),
+            ).fetchone()
+            legacy_count = conn.execute(
+                "SELECT COUNT(*) FROM Jargon WHERE group_id = ? AND content = ?",
+                ("group-1", "phoenix"),
+            ).fetchone()[0]
+
+        self.assertIsNotNone(canonical)
+        self.assertEqual(canonical[0], "jargon")
+        self.assertEqual(canonical[3], "reborn strategy")
+        self.assertEqual(canonical[4], "active")
+        self.assertEqual(canonical[5], "auto_and_tool")
+        self.assertEqual(legacy_count, 0)
+        self.assertEqual(saved.content, "phoenix")
+        self.assertEqual(saved.meaning, "reborn strategy")
+
     def test_profile_lookup_by_name_and_nickname(self):
         with sqlite3.connect(self.manager.db_path) as conn:
             conn.execute(

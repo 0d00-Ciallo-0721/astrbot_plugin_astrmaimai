@@ -23,6 +23,7 @@ class ProfileGenerator:
         old_memory_points = getattr(profile, "memory_points", []) or []
         old_memory_text = "\n".join(str(item) for item in old_memory_points) if old_memory_points else "暂无记忆点"
         profiling_count = int(getattr(profile, "message_count_for_profiling", 0) or 0)
+        recent_interaction_summary = str(getattr(profile, "recent_interaction_summary", "") or "").strip() or "暂无最近互动摘要"
         return f"""{persona_injection}
 请基于用户“{getattr(profile, 'name', '')}”与你最近的互动，做一次增量人物画像更新。
 本轮新增互动次数：{profiling_count}
@@ -30,6 +31,8 @@ class ProfileGenerator:
 【旧标签】{old_tags_str}
 【旧记忆点】
 {old_memory_text}
+【最近互动摘要】
+{recent_interaction_summary}
 
 请严格输出 JSON：
 {{

@@ -26,11 +26,14 @@ from ..learning import (
     ExpressionAutoCheckTask,
     ExpressionReflector,
     ExpressionReviewService,
+    JargonAutoCheckTask,
     ReflectTracker,
 )
+from ..learning.review.expression_governance_runner import ExpressionGovernanceRunner
 from ..memory import MemoryEngine, PersonaSummarizer, ReActRetriever
 from ..multimodal.visual_cortex import VisualCortex
 from ..proactive import ProactiveTask
+from ..proactive.review_dispatcher import ReviewDispatcher
 from ..state import FrequencyController, GroupReplyWaitManager, PrivateChatManager, StateEngine
 from ..shared.constants.defaults import build_infrastructure_settings
 from ..workmode import CronHeartbeatGuard, Sys3Router
@@ -103,6 +106,7 @@ class PluginBootstrap:
         event_bus = EventBus()
         memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
         memory_engine.db_service = db_service
+        db_service.memory_engine = memory_engine
         if hasattr(memory_engine, "tool_service"):
             memory_engine.tool_service.db_service = db_service
         state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
@@ -225,7 +229,9 @@ class PluginBootstrap:
             config=runtime.config,
         )
         review_service = ExpressionReviewService(runtime.db_service)
+        review_dispatcher = ReviewDispatcher(self.context, reflect_tracker)
         auto_check_task = None
+        jargon_auto_check_task = None
         try:
             auto_check_task = ExpressionAutoCheckTask(
                 db_service=runtime.db_service,
@@ -235,8 +241,27 @@ class PluginBootstrap:
             )
         except Exception as exc:
             self._record_optional_failure(runtime, "learning.auto_check_task", exc)
+        try:
+            jargon_auto_check_task = JargonAutoCheckTask(
+                db_service=runtime.db_service,
+                gateway=runtime.gateway,
+                config=runtime.config,
+            )
+        except Exception as exc:
+            self._record_optional_failure(runtime, "learning.jargon_auto_check_task", exc)
 
         proactive_task = None
+        expression_governance_runner = ExpressionGovernanceRunner(
+            state_engine=runtime.state_engine,
+            pattern_service=getattr(runtime.memory_engine, "expression_pattern_service", None),
+            reflector=reflector,
+            auto_check_task=auto_check_task,
+            jargon_auto_check_task=jargon_auto_check_task,
+            review_dispatcher=review_dispatcher,
+            interval_seconds=getattr(getattr(runtime.config, "evolution", None), "review_runner_interval_sec", 60),
+        )
+        if runtime.system2_planner is not None:
+            runtime.system2_planner.reflector = reflector
         if runtime.feature_flags.proactive_enabled:
             try:
                 proactive_task = ProactiveTask(
@@ -252,9 +277,9 @@ class PluginBootstrap:
                 )
                 if runtime.system2_planner is not None:
                     runtime.system2_planner.heartflow_manager = proactive_task.heartflow_manager
-                proactive_task.auto_check_task = auto_check_task
-                proactive_task.reflect_tracker = reflect_tracker
-                proactive_task.review_dispatcher.reflect_tracker = reflect_tracker
+                proactive_task.auto_check_task = None
+                proactive_task.reflect_tracker = None
+                proactive_task.review_dispatcher.reflect_tracker = None
                 proactive_task.dream_scheduler.dream_visible = runtime.feature_flags.dream_visible
                 proactive_task.set_db_service(runtime.db_service)
             except Exception as exc:
@@ -264,6 +289,7 @@ class PluginBootstrap:
             reflect_tracker=reflect_tracker,
             review_service=review_service,
             auto_check_task=auto_check_task,
+            expression_governance_runner=expression_governance_runner,
             proactive_task=proactive_task,
         )
 

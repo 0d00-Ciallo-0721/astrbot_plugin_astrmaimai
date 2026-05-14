@@ -119,5 +119,48 @@ class ReactRetrieverTraceMigratedTests(unittest.TestCase):
         self.assertEqual(engine.retrieval_service.calls[0].session_id, "chat-1")
         self.assertEqual(engine.retrieval_service.calls[0].policy, "deep")
 
+    def test_query_jargon_prefers_v2_retrieval_service(self):
+        class _RetrievalService:
+            def __init__(self):
+                self.calls = []
+
+            async def retrieve(self, query):
+                self.calls.append(query)
+                return [
+                    SimpleNamespace(
+                        id="jargon-1",
+                        content="开黑",
+                        summary="一起组队玩游戏",
+                        metadata={"meaning": "一起组队玩游戏"},
+                        status="active",
+                    )
+                ]
+
+        class _MemoryEngine:
+            def __init__(self):
+                self.retrieval_service = _RetrievalService()
+
+        class _LegacyDB:
+            def __init__(self):
+                self.get_jargon_calls = []
+
+            def get_jargon(self, *args, **kwargs):
+                self.get_jargon_calls.append((args, kwargs))
+                return "legacy"
+
+        async def _run():
+            db = _LegacyDB()
+            engine = _MemoryEngine()
+            retriever = self.mod.ReActRetriever(memory_engine=engine, db_service=db)
+            result = await retriever._tool_query_jargon(chat_id="group-1", word="开黑")
+            return engine, db, result
+
+        engine, db, result = asyncio.run(_run())
+        self.assertIn("'开黑': 一起组队玩游戏", result)
+        self.assertEqual(db.get_jargon_calls, [])
+        self.assertEqual(engine.retrieval_service.calls[0].session_id, "group-1")
+        self.assertEqual(engine.retrieval_service.calls[0].layers, ["jargon"])
+        self.assertEqual(engine.retrieval_service.calls[0].intent, "jargon")
+
 
 __all__ = ["ReactRetrieverTraceMigratedTests"]

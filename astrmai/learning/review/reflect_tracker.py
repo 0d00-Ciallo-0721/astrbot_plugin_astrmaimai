@@ -20,14 +20,18 @@ class ReflectTracker:
         self.db = db_service
         self.gateway = gateway
         self.config = config if config else gateway.config
-        self._pending: Dict[int, Dict] = {}
+        self._pending: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
+
+    def _pattern_service(self):
+        return getattr(getattr(self.db, "memory_engine", None), "expression_pattern_service", None)
 
     def queue_review_request(self, pattern: ExpressionPattern, reason: str = "", replacement: str = ""):
         if not getattr(pattern, "id", None):
             return
-        self._pending[int(pattern.id)] = {
-            "pattern_id": int(pattern.id),
+        pattern_id = str(pattern.id)
+        self._pending[pattern_id] = {
+            "pattern_id": pattern_id,
             "group_id": pattern.group_id,
             "question": self._build_question(pattern, reason=reason, replacement=replacement),
             "created_at": time.time(),
@@ -119,9 +123,14 @@ class ReflectTracker:
         else:
             return None
 
-        updated = await self.db.update_pattern_review_async(pattern_id, **kwargs)
+        service = self._pattern_service()
+        if service and hasattr(service, "update_review"):
+            updated = await service.update_review(str(pattern_id), **kwargs)
+        else:
+            legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
+            updated = await self.db.update_pattern_review_async(legacy_id, **kwargs)
         async with self._lock:
-            self._pending.pop(pattern_id, None)
+            self._pending.pop(str(pattern_id), None)
         if not updated:
             return None
         return f"已处理表达审核 #{pattern_id}：{action}"
@@ -169,3 +178,14 @@ class ReflectTracker:
         if match:
             return int(match.group(1))
         return None
+def _extract_canonical_pattern_id(text: str) -> Optional[str]:
+    match = re.search(r"#([A-Za-z0-9_-]+)", str(text or ""))
+    if match:
+        return str(match.group(1))
+    match = re.search(r"expression\s+review\s+([A-Za-z0-9_-]+)", str(text or ""), re.IGNORECASE)
+    if match:
+        return str(match.group(1))
+    return None
+
+
+ReflectTracker._extract_pattern_id = staticmethod(_extract_canonical_pattern_id)

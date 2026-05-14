@@ -37,6 +37,9 @@ function usersPage() {
         
         openUserDetail(u) {
             this.activeUser = JSON.parse(JSON.stringify(u)); // Deep copy to avoid mutating list directly
+            if (Array.isArray(this.activeUser.tags)) {
+                this.activeUser.tags = this.activeUser.tags.join(', ');
+            }
         },
         
         closeUserDetail() {
@@ -47,6 +50,7 @@ function usersPage() {
         async saveBasicInfo() {
             try {
                 await window.api.patch(`/users/${window.api.segment(this.activeUser.user_id)}`, {
+                    name: this.activeUser.name,
                     nickname: this.activeUser.nickname,
                     nickname_reason: this.activeUser.nickname_reason,
                     social_score: parseFloat(this.activeUser.social_score || 0),

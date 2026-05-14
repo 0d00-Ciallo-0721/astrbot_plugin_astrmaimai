@@ -55,6 +55,7 @@ class LifecycleServices:
     reflect_tracker: Any = None
     review_service: Any = None
     auto_check_task: Any = None
+    expression_governance_runner: Any = None
     proactive_task: Any = None
     manager: Any = None
 
@@ -249,6 +250,10 @@ class PluginRuntimeContext:
         return self.lifecycle.auto_check_task
 
     @property
+    def expression_governance_runner(self) -> Any:
+        return self.lifecycle.expression_governance_runner
+
+    @property
     def proactive_task(self) -> Any:
         return self.lifecycle.proactive_task
 
@@ -257,6 +262,7 @@ class PluginRuntimeContext:
             self.lifecycle.manager,
             self.attention_gate,
             self.evolution,
+            self.expression_governance_runner,
             self.proactive_task,
         )
 

@@ -10,6 +10,9 @@ class ExpressionReviewService:
     def __init__(self, db_service: DatabaseService):
         self.db = db_service
 
+    def _pattern_service(self):
+        return getattr(getattr(self.db, "memory_engine", None), "expression_pattern_service", None)
+
     @staticmethod
     def _serialize_pattern(pattern: ExpressionPattern) -> Dict[str, Any]:
         return {
@@ -36,26 +39,45 @@ class ExpressionReviewService:
         }
 
     async def list_pending_reviews(self, group_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        patterns = await self.db.list_expression_reviews_async(
-            group_id=group_id,
-            statuses=["pending", "revision_needed", "pending_human"],
-            limit=limit,
-        )
+        service = self._pattern_service()
+        if service and hasattr(service, "list_reviewable_patterns"):
+            patterns = await service.list_reviewable_patterns(group_id=group_id, limit=limit)
+        else:
+            patterns = await self.db.list_expression_reviews_async(
+                group_id=group_id,
+                statuses=["pending", "revision_needed", "pending_human"],
+                limit=limit,
+            )
         return [self._serialize_pattern(pattern) for pattern in patterns]
 
     async def list_recent_reviews(self, group_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        patterns = await self.db.list_expression_reviews_async(group_id=group_id, limit=limit)
+        service = self._pattern_service()
+        if service and hasattr(service, "list_patterns"):
+            patterns = await service.list_patterns(
+                str(group_id or ""),
+                limit=limit,
+                only_checked=False,
+                include_rejected=True,
+                statuses=["active", "review_pending", "rejected", "stale"],
+            )
+        else:
+            patterns = await self.db.list_expression_reviews_async(group_id=group_id, limit=limit)
         return [self._serialize_pattern(pattern) for pattern in patterns]
 
-    async def get_review_detail(self, pattern_id: int) -> Optional[Dict[str, Any]]:
-        pattern = await self.db.get_pattern_by_id_async(pattern_id)
+    async def get_review_detail(self, pattern_id: str) -> Optional[Dict[str, Any]]:
+        service = self._pattern_service()
+        if service and hasattr(service, "get_pattern"):
+            pattern = await service.get_pattern(pattern_id)
+        else:
+            legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
+            pattern = await self.db.get_pattern_by_id_async(legacy_id)
         if not pattern:
             return None
         return self._serialize_pattern(pattern)
 
     async def submit_review(
         self,
-        pattern_id: int,
+        pattern_id: str,
         decision: str,
         reviewer_id: str,
         *,
@@ -103,7 +125,12 @@ class ExpressionReviewService:
         else:
             return None
 
-        updated = await self.db.update_pattern_review_async(pattern_id, **kwargs)
+        service = self._pattern_service()
+        if service and hasattr(service, "update_review"):
+            updated = await service.update_review(pattern_id, **kwargs)
+        else:
+            legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
+            updated = await self.db.update_pattern_review_async(legacy_id, **kwargs)
         if not updated:
             return None
         return self._serialize_pattern(updated)

@@ -34,20 +34,41 @@ class ExpressionReflector:
         self._lock = asyncio.Lock()
         self._last_audit_time = 0.0
 
-    async def record_usage(self, pattern_situation: str, pattern_expression: str,
-                           actual_reply: str, user_reaction: str = ""):
+    def _pattern_service(self):
+        return getattr(getattr(self.db, "memory_engine", None), "expression_pattern_service", None)
+
+    async def record_usage(
+        self,
+        pattern_situation: str = "",
+        pattern_expression: str = "",
+        actual_reply: str = "",
+        user_reaction: str = "",
+        *,
+        pattern_id: str = "",
+        chat_id: str = "",
+    ):
         """
         记录一次表达使用，添加到待反思队列。
         由 ReplyEngine 在每次回复后调用。
         """
         async with self._lock:
             self._pending_reflections.append({
+                "pattern_id": str(pattern_id or ""),
+                "chat_id": str(chat_id or ""),
                 "situation": pattern_situation,
                 "expression": pattern_expression,
                 "reply": actual_reply[:300],
                 "reaction": user_reaction[:200] if user_reaction else "",
                 "time": time.time()
             })
+
+    async def pending_scope_ids(self) -> list[str]:
+        async with self._lock:
+            values = [
+                str(item.get("chat_id") or "GLOBAL").strip() or "GLOBAL"
+                for item in self._pending_reflections
+            ]
+        return list(dict.fromkeys(values))
 
     async def reflect_batch(self, group_id: str):
         """
@@ -97,16 +118,17 @@ class ExpressionReflector:
                 score = score_item.get("score", 5)
 
                 if 0 <= idx < len(batch):
+                    pattern_id = str(batch[idx].get("pattern_id") or "")
                     expression = batch[idx]["expression"]
                     situation = batch[idx]["situation"]
 
                     if score <= 2:
                         # 低分: 降权
-                        await self._adjust_pattern_weight(group_id, situation, expression, delta=-0.3)
+                        await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=-0.3, pattern_id=pattern_id)
                         logger.info(f"[Reflector] 📉 表达效果不佳 (得分:{score}): 「{expression}」已降权")
                     elif score >= 9:
                         # 高分: 加权
-                        await self._adjust_pattern_weight(group_id, situation, expression, delta=0.15)
+                        await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=0.15, pattern_id=pattern_id)
                         logger.debug(f"[Reflector] 📈 表达效果极佳 (得分:{score}): 「{expression}」已加权")
 
         except Exception as e:
@@ -123,13 +145,18 @@ class ExpressionReflector:
         self._last_audit_time = now
 
         try:
-            patterns = self.db.get_patterns(
-                group_id,
-                limit=200,
-                only_checked=True,
-                include_rejected=False,
-                review_status="approved",
-            )
+            service = self._pattern_service()
+            if service and hasattr(service, "list_patterns"):
+                patterns = await service.list_patterns(
+                    group_id,
+                    limit=200,
+                    only_checked=True,
+                    include_rejected=False,
+                    review_status="approved",
+                    statuses=["active"],
+                )
+            else:
+                return
             if len(patterns) < 10:
                 return
 
@@ -137,15 +164,8 @@ class ExpressionReflector:
             low_weight_count = 0
             for p in patterns:
                 weight = getattr(p, 'weight', 1.0)
-                if weight < self.WEIGHT_FLOOR and hasattr(self.db, 'update_pattern_review'):
-                    self.db.update_pattern_review(
-                        getattr(p, "id", 0),
-                        checked=False,
-                        rejected=True,
-                        modified_by="ai",
-                        review_status="rejected",
-                        weight_delta=-0.2,
-                    )
+                if weight < self.WEIGHT_FLOOR:
+                    await self._reject_pattern(getattr(p, "id", ""), weight_delta=-0.2)
                     low_weight_count += 1
 
             # 2. 相似度去重
@@ -173,15 +193,8 @@ class ExpressionReflector:
             dup_count = 0
             for p in remaining:
                 if id(p) in to_remove_ids:
-                    if hasattr(self.db, 'update_pattern_review') and hasattr(p, 'id'):
-                        self.db.update_pattern_review(
-                            p.id,
-                            checked=False,
-                            rejected=True,
-                            modified_by="ai",
-                            review_status="rejected",
-                            weight_delta=-0.2,
-                        )
+                    changed = await self._reject_pattern(getattr(p, "id", ""), weight_delta=-0.2)
+                    if changed:
                         dup_count += 1
 
             total_cleaned = low_weight_count + dup_count
@@ -199,21 +212,52 @@ class ExpressionReflector:
     # 内部工具
     # ==========================================
 
-    async def _adjust_pattern_weight(self, group_id: str, situation: str, expression: str, delta: float):
+    async def _reject_pattern(self, pattern_id, *, weight_delta: float = -0.2) -> bool:
+        service = self._pattern_service()
+        try:
+            if service and hasattr(service, "update_review") and pattern_id:
+                return bool(
+                    await service.update_review(
+                        str(pattern_id),
+                        checked=False,
+                        rejected=True,
+                        modified_by="ai",
+                        review_status="rejected",
+                        weight_delta=weight_delta,
+                    )
+                )
+            if hasattr(self.db, "update_pattern_review") and pattern_id:
+                legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
+                return bool(
+                    self.db.update_pattern_review(
+                        legacy_id,
+                        checked=False,
+                        rejected=True,
+                        modified_by="ai",
+                        review_status="rejected",
+                        weight_delta=weight_delta,
+                    )
+                )
+        except Exception as e:
+            logger.debug(f"[Reflector] pattern reject degraded: {e}")
+        return False
+
+    async def _adjust_canonical_pattern_weight(self, group_id: str, situation: str, expression: str, delta: float, pattern_id: str = ""):
         """调整表达模式的权重"""
         try:
-            if hasattr(self.db, 'adjust_pattern_weight_async'):
-                await self.db.adjust_pattern_weight_async(group_id, situation, expression, delta)
-            elif hasattr(self.db, 'adjust_pattern_weight'):
-                self.db.adjust_pattern_weight(group_id, situation, expression, delta)
+            service = self._pattern_service()
+            if service and hasattr(service, "adjust_weight") and pattern_id:
+                await service.adjust_weight(str(pattern_id), delta)
+            elif False:
+                return
             else:
                 # 兜底: 尝试通过 get_patterns + save_pattern 手动调整
-                patterns = self.db.get_patterns(group_id, limit=200)
+                return
                 for p in patterns:
                     if getattr(p, 'expression', '') == expression:
                         p.weight = max(0.0, min(2.0, getattr(p, 'weight', 1.0) + delta))
                         if hasattr(self.db, 'save_pattern'):
-                            self.db.save_pattern(p)
+                            pass
                         break
         except Exception as e:
             logger.debug(f"[Reflector] 权重调整失败: {e}")

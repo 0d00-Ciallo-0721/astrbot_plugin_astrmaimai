@@ -43,6 +43,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
         self.maintenance_mod = importlib.import_module("astrmai.memory.services.memory_maintenance_service")
         self.migration_mod = importlib.import_module("astrmai.memory.services.memory_migration_service")
         self.projector_mod = importlib.import_module("astrmai.memory.services.memory_index_projector")
+        self.expression_mod = importlib.import_module("astrmai.memory.services.expression_pattern_service")
         self.db_path = os.path.join(self.temp_dir.name, "docs.db")
 
     def tearDown(self):
@@ -134,6 +135,47 @@ class MemoryV2ServiceTests(unittest.TestCase):
             result = await tools.search_memory(query="Alice", session_id="chat-1", event=event)
             self.assertEqual(result.already_injected_ids, injected_ids)
             self.assertFalse(set(injected_ids) & {item.id for item in result.items})
+
+        asyncio.run(run())
+
+    def test_jargon_auto_injection_flows_through_main_memory_bundle(self):
+        async def run():
+            _store, _retrieval, writer, injection, tools, _maintenance = self._services()
+            jargon_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="bigbird",
+                    summary="a raid boss nickname",
+                    confidence=0.92,
+                    metadata={
+                        "meaning": "a raid boss nickname",
+                        "scene": "raid call",
+                        "review_status": "active",
+                    },
+                    dedup_key="jargon:chat-1:bigbird",
+                    status="active",
+                    visibility="auto_and_tool",
+                )
+            )
+            event = _FakeEvent("remember bigbird")
+            event.set_extra("astrmai_think_level", 2)
+            bundle = await injection.build_bundle(event=event, prompt="bigbird")
+            self.assertIn("[jargon]", bundle.rendered_prompt_block)
+            self.assertIn("bigbird -> a raid boss nickname (scene: raid call)", bundle.rendered_prompt_block)
+            trace = event.get_extra("astrmai_memory_injection_trace")
+            self.assertIn("jargon", trace.layers)
+            self.assertIn(jargon_id, trace.selected_ids)
+
+            result = await tools.search_memory(
+                query="bigbird",
+                session_id="chat-1",
+                layers=["jargon"],
+                event=event,
+            )
+            self.assertEqual(result.already_injected_ids, trace.selected_ids)
+            self.assertEqual(result.items, [])
 
         asyncio.run(run())
 
@@ -258,6 +300,48 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(auto_rows, [])
             self.assertEqual(len(tool_rows.items), 1)
             self.assertEqual(tool_rows.items[0].visibility, "tool_only")
+
+        asyncio.run(run())
+
+    def test_review_pending_jargon_is_hidden_from_default_retrieval_until_approved(self):
+        async def run():
+            store, retrieval, writer, _injection, tools, _maintenance = self._services()
+            pending_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="bigbird",
+                    summary="a raid boss nickname",
+                    confidence=0.55,
+                    metadata={"meaning": "a raid boss nickname", "review_status": "review_pending"},
+                    dedup_key="jargon:chat-1:bigbird",
+                    status="review_pending",
+                    visibility="maintenance_only",
+                )
+            )
+            rows = await retrieval.retrieve(
+                self.contracts.MemoryQuery(
+                    query="bigbird",
+                    session_id="chat-1",
+                    layers=["jargon"],
+                    intent="jargon",
+                )
+            )
+            self.assertEqual(rows, [])
+            await store.update_memory(
+                pending_id,
+                status="active",
+                visibility="auto_and_tool",
+                metadata={"meaning": "a raid boss nickname", "review_status": "active"},
+            )
+            rows = await tools.search_memory(
+                query="bigbird",
+                session_id="chat-1",
+                layers=["jargon"],
+            )
+            self.assertEqual(len(rows.items), 1)
+            self.assertEqual(rows.items[0].kind, "jargon")
 
         asyncio.run(run())
 
@@ -436,6 +520,100 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_maintenance_run_once_purges_old_jargon_candidates_but_keeps_protected(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, maintenance = self._services()
+            old_ts = time.time() - 21 * 86400
+            pending_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="pendingbird",
+                    summary="pending meaning",
+                    confidence=0.4,
+                    metadata={"meaning": "pending meaning", "review_status": "review_pending", "count": 1, "confidence": 0.4},
+                    dedup_key="jargon:pendingbird",
+                    status="review_pending",
+                    visibility="maintenance_only",
+                )
+            )
+            rejected_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="rejectbird",
+                    summary="rejected meaning",
+                    confidence=0.4,
+                    metadata={"meaning": "rejected meaning", "review_status": "rejected", "count": 1, "confidence": 0.4},
+                    dedup_key="jargon:rejectbird",
+                    status="rejected",
+                    visibility="maintenance_only",
+                )
+            )
+            pending_human_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="humanbird",
+                    summary="needs human eyes",
+                    confidence=0.35,
+                    metadata={
+                        "meaning": "needs human eyes",
+                        "review_status": "pending_human",
+                        "review_suggestion": "confirm exact meaning",
+                        "count": 1,
+                        "confidence": 0.35,
+                    },
+                    dedup_key="jargon:humanbird",
+                    status="review_pending",
+                    visibility="maintenance_only",
+                )
+            )
+            protected_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="protectedbird",
+                    summary="protected meaning",
+                    confidence=0.95,
+                    metadata={"meaning": "protected meaning", "review_status": "review_pending", "count": 6, "confidence": 0.95},
+                    dedup_key="jargon:protectedbird",
+                    status="review_pending",
+                    visibility="maintenance_only",
+                )
+            )
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE canonical_memories SET update_time = ?, create_time = ? WHERE id IN (?, ?, ?, ?)",
+                    (old_ts, old_ts, pending_id, rejected_id, pending_human_id, protected_id),
+                )
+                await db.commit()
+
+            report = await maintenance.run_once(
+                policy={
+                    "decay_rate": 0.0,
+                    "pending_jargon_grace_seconds": 14 * 86400,
+                    "rejected_jargon_grace_seconds": 7 * 86400,
+                    "protected_jargon_confidence": 0.9,
+                    "protected_jargon_count": 5,
+                }
+            )
+
+            self.assertEqual(report["jargon_pending_deleted"], 1)
+            self.assertEqual(report["jargon_pending_human_deleted"], 1)
+            self.assertEqual(report["jargon_rejected_deleted"], 1)
+            self.assertEqual(report["protected_jargon_skipped"], 1)
+            self.assertIsNone(await store.get_canonical(pending_id, include_inactive=True))
+            self.assertIsNone(await store.get_canonical(rejected_id, include_inactive=True))
+            self.assertIsNone(await store.get_canonical(pending_human_id, include_inactive=True))
+            self.assertIsNotNone(await store.get_canonical(protected_id, include_inactive=True))
+
+        asyncio.run(run())
+
     def test_projector_checks_and_repairs_consistency(self):
         class _Engine:
             def __init__(self, store, rows):
@@ -554,6 +732,22 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     """
                 )
                 await db.execute(
+                    """
+                    CREATE TABLE Jargon (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        content TEXT,
+                        raw_content TEXT,
+                        meaning TEXT,
+                        is_jargon INTEGER,
+                        count INTEGER,
+                        is_complete INTEGER,
+                        group_id TEXT,
+                        created_at REAL,
+                        updated_at REAL
+                    )
+                    """
+                )
+                await db.execute(
                     "INSERT INTO MemoryEvent(event_id, session_id, narrative, memory_kind, tags, importance) VALUES (?, ?, ?, ?, ?, ?)",
                     ("evt-1", "chat-1", "Alice event import memory.", "event", '["legacy"]', 0.8),
                 )
@@ -561,12 +755,16 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     "INSERT INTO MemoryEvent(event_id, session_id, narrative, memory_kind, tags, importance) VALUES (?, ?, ?, ?, ?, ?)",
                     ("evt-empty", "chat-1", "", "event", '["legacy"]', 0.2),
                 )
+                await db.execute(
+                    "INSERT INTO Jargon(content, raw_content, meaning, is_jargon, count, is_complete, group_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("bigbird", "bigbird arrived again", "raid boss nickname", 1, 3, 1, "chat-1", 1.0, 2.0),
+                )
                 await db.commit()
             store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
             migration = self.migration_mod.MemoryMigrationService(store)
 
             dry_run = await migration.dry_run()
-            self.assertEqual(dry_run["totals"]["importable"], 3)
+            self.assertEqual(dry_run["totals"]["importable"], 4)
             self.assertEqual(dry_run["totals"]["duplicates"], 1)
             self.assertEqual(dry_run["totals"]["skipped"], 3)
 
@@ -574,16 +772,226 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(executed["imported"]["documents"], 1)
             self.assertEqual(executed["imported"]["MemoryEvent"], 1)
             self.assertEqual(executed["imported"]["persona_cache"], 1)
+            self.assertEqual(executed["imported"]["Jargon"], 1)
 
             verified = await migration.verify()
             self.assertIn("migration", verified)
             self.assertEqual(verified["legacy"]["unmapped_memory_events"], 0)
+            self.assertEqual(verified["legacy"]["unmapped_jargons"], 0)
+            self.assertEqual(verified["jargon"]["missing_meaning"], 0)
+            self.assertEqual(verified["jargon"]["missing_review_status"], 0)
+            self.assertEqual(verified["jargon"]["active_non_approved_metadata"], 0)
+            self.assertEqual(verified["jargon"]["pending_human_without_review_suggestion"], 0)
+            self.assertEqual(verified["jargon"]["visibility_anomalies"], 0)
             self.assertTrue(await store.find_ids_by_source_ref("documents:1"))
             self.assertTrue(await store.find_ids_by_source_ref("MemoryEvent:evt-1"))
             self.assertTrue(await store.find_ids_by_source_ref("persona_cache:persona-a"))
+            self.assertTrue(await store.find_ids_by_source_ref("Jargon:1"))
 
             repaired = await migration.repair(verified)
             self.assertEqual(repaired["mode"], "repair")
+            self.assertIn("filled_review_status", repaired["jargon"])
+
+        asyncio.run(run())
+
+    def test_expression_pattern_service_writes_retrieves_and_updates_canonical_records(self):
+        async def run():
+            store, retrieval, writer, _injection, _tools, _maintenance = self._services()
+            service = self.expression_mod.ExpressionPatternService(store, writer)
+            pattern_id = await service.write_pattern(
+                "chat-1",
+                {
+                    "situation": "daily reply",
+                    "expression": "ship it softly",
+                    "style": "plain",
+                    "content_samples": ["ship it softly"],
+                    "count": 2,
+                    "review_status": "approved",
+                    "shared_scope": "chat-1",
+                    "confidence": 0.82,
+                },
+                source="webui_expression_pattern",
+            )
+            rows = await retrieval.retrieve(
+                self.contracts.MemoryQuery(
+                    query="ship it",
+                    session_id="chat-1",
+                    layers=["expression_pattern"],
+                    intent="expression_pattern",
+                    metadata={"shared_scope": "chat-1"},
+                )
+            )
+            self.assertEqual([item.id for item in rows], [pattern_id])
+            updated = await service.update_review(pattern_id, rejected=True, review_status="rejected", weight_delta=-0.5)
+            self.assertEqual(updated.status, "rejected")
+            hidden = await retrieval.retrieve(
+                self.contracts.MemoryQuery(
+                    query="ship it",
+                    session_id="chat-1",
+                    layers=["expression_pattern"],
+                    intent="expression_pattern",
+                    metadata={"shared_scope": "chat-1"},
+                )
+            )
+            self.assertEqual(hidden, [])
+
+        asyncio.run(run())
+
+    def test_learning_expression_pattern_cannot_write_directly_to_approved(self):
+        async def run():
+            store, retrieval, writer, _injection, _tools, _maintenance = self._services()
+            service = self.expression_mod.ExpressionPatternService(store, writer)
+            pattern_id = await service.write_pattern(
+                "chat-1",
+                {
+                    "situation": "daily reply",
+                    "expression": "ship it softly",
+                    "style": "plain",
+                    "content_samples": ["ship it softly"],
+                    "count": 2,
+                    "review_status": "approved",
+                    "shared_scope": "chat-1",
+                    "confidence": 0.82,
+                },
+                source="learning_expression_pattern",
+            )
+            pattern = await service.get_pattern(pattern_id)
+            self.assertEqual(pattern.review_status, "pending")
+            self.assertEqual(pattern.status, "review_pending")
+            rows = await retrieval.retrieve(
+                self.contracts.MemoryQuery(
+                    query="ship it",
+                    session_id="chat-1",
+                    layers=["expression_pattern"],
+                    intent="expression_pattern",
+                    metadata={"shared_scope": "chat-1"},
+                )
+            )
+            self.assertEqual(rows, [])
+
+        asyncio.run(run())
+
+    def test_maintenance_purges_old_expression_candidates_but_keeps_protected(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, maintenance = self._services()
+            old_ts = time.time() - 30 * 86400
+            pending_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_expression_pattern",
+                    kind="expression_pattern",
+                    session_id="chat-1",
+                    content="soft ping",
+                    summary="soft ping",
+                    metadata={"review_status": "pending", "count": 1, "confidence": 0.4},
+                    dedup_key="expression:pending",
+                    status="review_pending",
+                    visibility="maintenance_only",
+                )
+            )
+            protected_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_expression_pattern",
+                    kind="expression_pattern",
+                    session_id="chat-1",
+                    content="core phrase",
+                    summary="core phrase",
+                    metadata={"review_status": "pending", "count": 9, "confidence": 0.96},
+                    dedup_key="expression:protected",
+                    status="review_pending",
+                    visibility="maintenance_only",
+                )
+            )
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE canonical_memories SET create_time = ?, update_time = ? WHERE kind = 'expression_pattern'",
+                    (old_ts, old_ts),
+                )
+                await db.commit()
+            report = await maintenance.run_once(
+                policy={
+                    "decay_rate": 0.0,
+                    "pending_expression_grace_seconds": 21 * 86400,
+                    "protected_expression_confidence": 0.95,
+                    "protected_expression_count": 8,
+                }
+            )
+            self.assertEqual(report["expression_pending_deleted"], 1)
+            self.assertEqual(report["protected_expression_skipped"], 1)
+            self.assertIsNone(await store.get_canonical(pending_id, include_inactive=True))
+            self.assertIsNotNone(await store.get_canonical(protected_id, include_inactive=True))
+
+        asyncio.run(run())
+
+    def test_migration_service_imports_legacy_expression_patterns(self):
+        async def run():
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    CREATE TABLE ExpressionPattern (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT,
+                        situation TEXT,
+                        expression TEXT,
+                        style TEXT,
+                        content_list TEXT,
+                        count INTEGER,
+                        checked INTEGER,
+                        rejected INTEGER,
+                        modified_by TEXT,
+                        source TEXT,
+                        shared_scope TEXT,
+                        think_level INTEGER,
+                        review_status TEXT,
+                        review_reason TEXT,
+                        review_suggestion TEXT,
+                        last_review_time REAL,
+                        weight REAL,
+                        last_active_time REAL,
+                        create_time REAL
+                    )
+                    """
+                )
+                await db.execute(
+                    """
+                    INSERT INTO ExpressionPattern (
+                        group_id, situation, expression, style, content_list, count, checked,
+                        rejected, modified_by, source, shared_scope, think_level, review_status,
+                        review_reason, review_suggestion, last_review_time, weight, last_active_time, create_time
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "chat-1",
+                        "daily reply",
+                        "ship it softly",
+                        "plain",
+                        '["ship it softly"]',
+                        3,
+                        1,
+                        0,
+                        "legacy",
+                        "joint_mining",
+                        "chat-1",
+                        1,
+                        "approved",
+                        "",
+                        "",
+                        1.0,
+                        1.2,
+                        2.0,
+                        1.0,
+                    ),
+                )
+                await db.commit()
+            store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
+            migration = self.migration_mod.MemoryMigrationService(store)
+            dry_run = await migration.dry_run(["expression_patterns"])
+            self.assertEqual(dry_run["sources"]["ExpressionPattern"]["importable"], 1)
+            executed = await migration.execute(["expression_patterns"])
+            self.assertEqual(executed["imported"]["ExpressionPattern"], 1)
+            self.assertTrue(await store.find_ids_by_source_ref("ExpressionPattern:1"))
+            verified = await migration.verify()
+            self.assertEqual(verified["legacy"]["unmapped_expression_patterns"], 0)
+            self.assertEqual(verified["expression_pattern"]["missing_review_status"], 0)
 
         asyncio.run(run())
 

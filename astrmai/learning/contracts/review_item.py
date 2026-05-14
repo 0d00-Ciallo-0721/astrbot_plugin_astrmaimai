@@ -6,7 +6,7 @@ from typing import Any
 
 @dataclass(slots=True)
 class ReviewItem:
-    pattern_id: int
+    pattern_id: str
     group_id: str
     situation: str
     expression: str
@@ -17,7 +17,7 @@ class ReviewItem:
     @classmethod
     def from_pattern(cls, pattern: Any) -> "ReviewItem":
         return cls(
-            pattern_id=int(getattr(pattern, "id", 0) or 0),
+            pattern_id=str(getattr(pattern, "id", "") or ""),
             group_id=str(getattr(pattern, "group_id", "") or ""),
             situation=str(getattr(pattern, "situation", "") or ""),
             expression=str(getattr(pattern, "expression", "") or ""),

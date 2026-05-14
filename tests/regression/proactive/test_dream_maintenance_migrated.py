@@ -13,16 +13,27 @@ class _FakeGateway:
         self.config = SimpleNamespace()
 
 
-class _FakeJargon:
-    def __init__(self, content, meaning, count):
+class _FakeCandidate:
+    def __init__(self, content, meaning, count, *, status="active", memory_id="mem-jargon-1"):
+        self.id = memory_id
         self.content = content
-        self.meaning = meaning
-        self.count = count
+        self.summary = meaning
+        self.status = status
+        self.metadata = {"meaning": meaning, "count": count}
 
 
-class _FakeDB:
-    def search_jargons(self, query, limit=5):
-        return [_FakeJargon("团建黑话", "周五聚餐", 4)]
+class _FakeRetrievalService:
+    def __init__(self):
+        self.calls = []
+
+    async def retrieve(self, query):
+        self.calls.append(query)
+        return [_FakeCandidate("团建黑话", "周五聚餐", 4)]
+
+
+class _FakeMemoryEngine:
+    def __init__(self):
+        self.retrieval_service = _FakeRetrievalService()
 
 
 class DreamMaintenanceMigratedTests(unittest.TestCase):
@@ -43,16 +54,20 @@ class DreamMaintenanceMigratedTests(unittest.TestCase):
             pass
 
     def test_dream_agent_supports_read_only_jargon_tools(self):
-        agent = self.agent_mod.DreamAgent(_FakeGateway(), _FakeDB())
+        memory_engine = _FakeMemoryEngine()
+        agent = self.agent_mod.DreamAgent(_FakeGateway(), SimpleNamespace(), memory_engine=memory_engine)
 
         async def _run():
             jargon_text = await agent._tool_search_jargon({"query": "团建", "limit": 3}, "group-1")
             suggestion = await agent._tool_suggest_jargon_review({"words": ["团建黑话"], "reason": "含义漂移"})
-            return jargon_text, suggestion
+            return jargon_text, suggestion, memory_engine.retrieval_service.calls
 
-        jargon_text, suggestion = asyncio.run(_run())
+        jargon_text, suggestion, calls = asyncio.run(_run())
         self.assertIn("团建黑话", jargon_text)
         self.assertIn("建议复核黑话", suggestion)
+        self.assertEqual(calls[0].layers, ["jargon"])
+        self.assertEqual(calls[0].intent, "jargon")
+        self.assertTrue(calls[0].allow_stale)
 
     def test_build_maintenance_result_keeps_jargon_suggestions(self):
         result = self.generator_mod.DreamGenerator.build_maintenance_result(

@@ -21,6 +21,7 @@ from ..retrieval.bm25 import BM25Retriever
 from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
 from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
+from .expression_pattern_service import ExpressionPatternService
 from .memory_index_projector import MemoryIndexProjector
 from .memory_injection_service import MemoryInjectionService
 from .memory_maintenance_service import MemoryMaintenanceService
@@ -75,6 +76,7 @@ class MemoryEngine:
         self.index_projector = MemoryIndexProjector(self)
         self.write_service = MemoryWriteService(self.v2_store, self.index_projector)
         self.retrieval_service = MemoryRetrievalService(self.v2_store, engine=self)
+        self.expression_pattern_service = ExpressionPatternService(self.v2_store, self.write_service)
         self.injection_service = MemoryInjectionService(self.retrieval_service, config=self.config)
         self.tool_service = MemoryToolService(self.retrieval_service, config=self.config)
         self.maintenance_service = MemoryMaintenanceService(self.v2_store, self.index_projector)
@@ -149,6 +151,8 @@ class MemoryEngine:
         await self.v2_store.import_legacy_documents()
         await self.v2_store.import_persona_cache()
         await self.import_legacy_memory_events()
+        await self.import_legacy_jargons()
+        await self.import_legacy_expression_patterns()
         self.bm25_retriever = BM25Retriever(self.db_path)
         await self.bm25_retriever.initialize()
         logger.info("[AstrMai] memory skeleton initialized; vector store will be lazy-loaded.")
@@ -585,6 +589,117 @@ class MemoryEngine:
         except Exception as exc:
             await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
             logger.warning(f"[MemoryV2] MemoryEvent import degraded: {exc}")
+        return imported
+
+    async def import_legacy_jargons(self, *, limit: int = 1000) -> int:
+        version = "2_jargon_import"
+        if await self.v2_store.migration_applied(version):
+            return 0
+        db_service = getattr(self, "db_service", None)
+        if not db_service or not hasattr(db_service, "get_session"):
+            await self.v2_store.record_migration(version, status="applied", detail="db service unavailable")
+            return 0
+        imported = 0
+        try:
+            from ...infrastructure.persistence import Jargon
+            from sqlmodel import desc, select
+
+            def _load_jargons():
+                with db_service.get_session() as session:
+                    statement = select(Jargon).order_by(desc(Jargon.updated_at)).limit(limit)
+                    return [Jargon.model_validate(item.model_dump()) for item in session.exec(statement).all()]
+
+            import asyncio
+
+            rows = await asyncio.to_thread(_load_jargons)
+            for item in rows:
+                content = str(getattr(item, "content", "") or "").strip()
+                if not content:
+                    continue
+                meaning = str(getattr(item, "meaning", "") or "").strip()
+                group_id = str(getattr(item, "group_id", "") or "GLOBAL")
+                status = "active" if bool(getattr(item, "is_jargon", False)) and bool(getattr(item, "is_complete", False)) and meaning else "review_pending"
+                await self.write_service.write(
+                    MemoryWriteRequest(
+                        source="legacy_jargon",
+                        kind="jargon",
+                        session_id=group_id,
+                        content=content,
+                        summary=meaning or content,
+                        importance=0.65,
+                        confidence=0.75 if status == "active" else 0.55,
+                        metadata={
+                            "legacy_jargon_id": getattr(item, "id", None),
+                            "raw_content": str(getattr(item, "raw_content", "") or content),
+                            "meaning": meaning,
+                            "count": int(getattr(item, "count", 1) or 1),
+                            "review_status": status,
+                        },
+                        dedup_key=f"jargon:{group_id}:{content.lower()}",
+                        source_ref=f"Jargon:{getattr(item, 'id', '')}",
+                        visibility="auto_and_tool" if status == "active" else "maintenance_only",
+                        status=status,
+                    )
+                )
+                imported += 1
+            await self.v2_store.record_migration(version, status="applied", detail=f"imported={imported}")
+        except Exception as exc:
+            await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] Jargon import degraded: {exc}")
+        return imported
+
+    async def import_legacy_expression_patterns(self, *, limit: int = 1000) -> int:
+        version = "2_expression_pattern_import"
+        if await self.v2_store.migration_applied(version):
+            return 0
+        db_service = getattr(self, "db_service", None)
+        service = getattr(self, "expression_pattern_service", None)
+        if not db_service or not hasattr(db_service, "get_session") or service is None:
+            await self.v2_store.record_migration(version, status="applied", detail="db service unavailable")
+            return 0
+        imported = 0
+        try:
+            from ...infrastructure.persistence import ExpressionPattern
+            from sqlmodel import desc, select
+
+            def _load_patterns():
+                with db_service.get_session() as session:
+                    statement = select(ExpressionPattern).order_by(desc(ExpressionPattern.last_active_time)).limit(limit)
+                    return [ExpressionPattern.model_validate(item.model_dump()) for item in session.exec(statement).all()]
+
+            import asyncio
+
+            rows = await asyncio.to_thread(_load_patterns)
+            for item in rows:
+                expression = str(getattr(item, "expression", "") or "").strip()
+                situation = str(getattr(item, "situation", "") or "").strip()
+                if not expression or not situation:
+                    continue
+                await service.write_pattern(
+                    str(getattr(item, "group_id", "") or ""),
+                    {
+                        "expression": expression,
+                        "situation": situation,
+                        "style": str(getattr(item, "style", "") or ""),
+                        "content_samples": json.loads(getattr(item, "content_list", "[]") or "[]"),
+                        "count": int(getattr(item, "count", 1) or 1),
+                        "think_level": int(getattr(item, "think_level", 0) or 0),
+                        "review_status": str(getattr(item, "review_status", "pending") or "pending"),
+                        "review_reason": str(getattr(item, "review_reason", "") or ""),
+                        "review_suggestion": str(getattr(item, "review_suggestion", "") or ""),
+                        "weight": float(getattr(item, "weight", 1.0) or 1.0),
+                        "shared_scope": str(getattr(item, "shared_scope", "") or ""),
+                        "legacy_pattern_id": getattr(item, "id", None),
+                        "source_ref": f"ExpressionPattern:{getattr(item, 'id', '')}",
+                        "summary": expression,
+                    },
+                    source="legacy_expression_pattern",
+                )
+                imported += 1
+            await self.v2_store.record_migration(version, status="applied", detail=f"imported={imported}")
+        except Exception as exc:
+            await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] ExpressionPattern import degraded: {exc}")
         return imported
 
     async def get_recent_memories(self, session_id: str, hours: int = 24) -> list:

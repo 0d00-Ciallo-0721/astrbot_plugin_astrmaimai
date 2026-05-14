@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 
 from astrmai.learning.review.expression_auto_check_task import ExpressionAutoCheckTask
+from astrmai.learning.review.expression_governance_runner import ExpressionGovernanceRunner
+from astrmai.learning.review.jargon_auto_check_task import JargonAutoCheckTask
 from astrmai.learning.review.reflect_tracker import ReflectTracker
 
 
@@ -34,6 +36,53 @@ class FakeDB:
                     pattern.expression = kwargs["replacement_expression"]
                 return pattern
         return None
+
+
+class FakeStore:
+    def __init__(self, rows=None):
+        self.rows = rows or []
+        self.updated = []
+
+    async def list_candidates(self, session_id="", kinds=None, statuses=None, limit=20, include_inactive=False):
+        filtered = []
+        for row in self.rows:
+            if session_id and session_id not in {"GLOBAL", row.session_id or "GLOBAL"}:
+                continue
+            if kinds and row.kind not in kinds:
+                continue
+            if statuses and row.status not in statuses:
+                continue
+            filtered.append(row)
+        return filtered[:limit]
+
+    async def update_memory(self, memory_id, **kwargs):
+        self.updated.append((memory_id, kwargs))
+        for row in self.rows:
+            if row.id != memory_id:
+                continue
+            if "summary" in kwargs:
+                row.summary = kwargs["summary"]
+            if "status" in kwargs:
+                row.status = kwargs["status"]
+            if "visibility" in kwargs:
+                row.visibility = kwargs["visibility"]
+            if "metadata" in kwargs:
+                row.metadata = kwargs["metadata"]
+            return 1
+        return 0
+
+
+class FakeProjector:
+    def __init__(self):
+        self.projected = []
+        self.cleaned = []
+
+    async def project(self, memory_id):
+        self.projected.append(memory_id)
+
+    async def cleanup_deleted(self, memory_ids):
+        self.cleaned.extend(memory_ids)
+        return len(memory_ids)
 
 
 class FakeEvent:
@@ -89,6 +138,98 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
         message = await tracker.try_consume_feedback(FakeEvent("expression review #2 approve"))
         self.assertIn("#2", message)
         self.assertEqual(db.updated[0][1]["review_status"], "approved")
+
+    async def test_governance_runner_uses_canonical_backlog_not_active_states(self):
+        calls = []
+
+        class _Reflector:
+            async def reflect_batch(self, chat_id):
+                calls.append(("reflect", chat_id))
+
+            async def auto_audit(self, chat_id):
+                calls.append(("audit", chat_id))
+
+            async def pending_scope_ids(self):
+                return ["chat-pending"]
+
+        class _AutoCheck:
+            async def run_once(self, chat_id):
+                calls.append(("check", chat_id))
+
+        class _PatternService:
+            async def list_governance_groups(self):
+                return ["chat-review", "chat-pending"]
+
+        class _Dispatcher:
+            async def dispatch_pending(self):
+                calls.append(("dispatch", None))
+
+        runner = ExpressionGovernanceRunner(
+            state_engine=SimpleNamespace(get_active_states=lambda: []),
+            pattern_service=_PatternService(),
+            reflector=_Reflector(),
+            auto_check_task=_AutoCheck(),
+            review_dispatcher=_Dispatcher(),
+        )
+        await runner.run_once()
+        self.assertIn(("reflect", "chat-review"), calls)
+        self.assertIn(("audit", "chat-review"), calls)
+        self.assertIn(("check", "chat-review"), calls)
+        self.assertIn(("reflect", "chat-pending"), calls)
+        self.assertIn(("dispatch", None), calls)
+
+    async def test_jargon_auto_check_promotes_or_rejects_candidates(self):
+        projector = FakeProjector()
+        store = FakeStore(
+            [
+                SimpleNamespace(
+                    id="mem-jargon-1",
+                    kind="jargon",
+                    session_id="group-1",
+                    content="bigbird",
+                    summary="raid boss nickname",
+                    confidence=0.7,
+                    status="review_pending",
+                    visibility="maintenance_only",
+                    metadata={"meaning": "raid boss nickname", "count": 3, "review_status": "review_pending", "examples": ["bigbird is here"]},
+                )
+            ]
+        )
+        db = SimpleNamespace(memory_engine=SimpleNamespace(v2_store=store, index_projector=projector))
+        task = JargonAutoCheckTask(
+            db_service=db,
+            gateway=FakeGateway({"decision": "approved", "reason": "group-specific and stable", "meaning": "raid boss nickname"}),
+            config=SimpleNamespace(evolution=SimpleNamespace(review_batch_size=10, review_runner_min_interval_sec=0, jargon_min_count=2, review_min_count=2)),
+        )
+
+        processed = await task.run_once("group-1")
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(store.updated[0][0], "mem-jargon-1")
+        self.assertEqual(store.updated[0][1]["status"], "active")
+        self.assertEqual(store.updated[0][1]["metadata"]["review_status"], "approved")
+        self.assertEqual(projector.projected, ["mem-jargon-1"])
+
+    async def test_governance_runner_processes_jargon_backlog_without_active_chat(self):
+        calls = []
+
+        class _JargonCheck:
+            async def list_governance_groups(self):
+                return ["group-jargon"]
+
+            async def run_once(self, chat_id):
+                calls.append(("jargon", chat_id))
+
+        runner = ExpressionGovernanceRunner(
+            state_engine=SimpleNamespace(get_active_states=lambda: []),
+            pattern_service=None,
+            reflector=None,
+            auto_check_task=None,
+            jargon_auto_check_task=_JargonCheck(),
+            review_dispatcher=None,
+        )
+        await runner.run_once()
+        self.assertEqual(calls, [("jargon", "group-jargon")])
 
 
 if __name__ == "__main__":

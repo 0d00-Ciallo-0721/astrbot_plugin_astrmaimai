@@ -6,6 +6,8 @@ import time
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryCandidate, MemoryQuery
+from .expression_pattern_retrieval_policy import ExpressionPatternRetrievalPolicy
+from .jargon_retrieval_policy import JargonRetrievalPolicy
 from .v2_store import MemoryV2Store
 
 
@@ -13,6 +15,8 @@ class MemoryRetrievalService:
     def __init__(self, store: MemoryV2Store, engine=None):
         self.store = store
         self.engine = engine
+        self.jargon_policy = JargonRetrievalPolicy(store)
+        self.expression_pattern_policy = ExpressionPatternRetrievalPolicy(store)
 
     @staticmethod
     def _result_to_candidate(result, query: MemoryQuery) -> MemoryCandidate:
@@ -101,6 +105,28 @@ class MemoryRetrievalService:
 
     async def _retrieve_once(self, query: MemoryQuery) -> list[MemoryCandidate]:
         visibility_mode = str(query.metadata.get("visibility_mode") or "")
+        query_layers = {str(item) for item in query.layers or [] if str(item).strip()}
+        if query.intent == "jargon" or query_layers == {"jargon"}:
+            return await self.jargon_policy.search(
+                query=query.query,
+                session_id=query.session_id,
+                persona_id=query.persona_id,
+                top_k=query.top_k,
+                exclude_ids=query.exclude_ids,
+                allow_stale=query.allow_stale,
+                visibility_mode=visibility_mode,
+            )
+        if query.intent == "expression_pattern" or query_layers == {"expression_pattern"}:
+            return await self.expression_pattern_policy.search(
+                query=query.query,
+                session_id=query.session_id,
+                top_k=query.top_k,
+                shared_scope=str(query.metadata.get("shared_scope") or query.session_id or ""),
+                think_level=query.think_level,
+                exclude_ids=query.exclude_ids,
+                allow_stale=query.allow_stale,
+                visibility_mode=visibility_mode,
+            )
         candidates = await self.store.search(
             query.query,
             session_id=query.session_id,
@@ -140,7 +166,7 @@ class MemoryRetrievalService:
                 candidate = canonical
             if candidate.id in seen or candidate.id in excluded:
                 continue
-            if candidate.status in {"deleted", "merged", "deprecated"}:
+            if candidate.status in {"deleted", "merged", "deprecated", "review_pending", "rejected"}:
                 continue
             if candidate.status == "stale" and not query.allow_stale:
                 continue

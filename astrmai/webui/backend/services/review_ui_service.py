@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import time
+from dataclasses import asdict, is_dataclass
+import json
 
 from ..adapters.plugin_api import PluginApiAdapter
 
@@ -10,10 +11,13 @@ class ReviewUiService:
         self.plugin_api = plugin_api
         self.db_factory = db_factory
 
-    async def _columns(self, db) -> set[str]:
-        async with db.execute("PRAGMA table_info(ExpressionPattern)") as cursor:
-            rows = await cursor.fetchall()
-            return {str(row[1]) for row in rows}
+    def _pattern_service(self):
+        runtime = self.plugin_api.get_runtime() if hasattr(self.plugin_api, "get_runtime") else None
+        memory_engine = getattr(runtime, "memory_engine", None)
+        return getattr(memory_engine, "expression_pattern_service", None)
+
+    def _runtime_bound(self) -> bool:
+        return self._pattern_service() is not None
 
     @staticmethod
     def _normalize_item(item: dict) -> dict:
@@ -21,207 +25,241 @@ class ReviewUiService:
             item["status"] = item.get("review_status")
         return item
 
+    @staticmethod
+    def _record_dict(record) -> dict:
+        if record is None:
+            return {}
+        if isinstance(record, dict):
+            return dict(record)
+        if is_dataclass(record):
+            return asdict(record)
+        if hasattr(record, "__dict__"):
+            return dict(getattr(record, "__dict__", {}) or {})
+        return {}
+
+    @staticmethod
+    def _canonical_to_review_item(row: dict) -> dict:
+        metadata = row.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        review_status = str(metadata.get("review_status") or row.get("status") or "pending").strip().lower()
+        return {
+            "id": str(row.get("id") or ""),
+            "group_id": str(row.get("session_id") or ""),
+            "situation": str(metadata.get("situation") or ""),
+            "expression": str(row.get("content") or ""),
+            "style": str(metadata.get("style") or ""),
+            "count": int(metadata.get("count") or 1),
+            "checked": review_status == "approved",
+            "rejected": review_status == "rejected",
+            "review_status": review_status,
+            "review_reason": str(metadata.get("review_reason") or ""),
+            "review_suggestion": str(metadata.get("review_suggestion") or ""),
+            "shared_scope": str(metadata.get("shared_scope") or ""),
+            "think_level": int(metadata.get("think_level") or 0),
+            "weight": float(metadata.get("weight") or 1.0),
+            "modified_by": str(metadata.get("modified_by") or ""),
+            "source": str(row.get("source") or ""),
+            "content_list": json.dumps(metadata.get("content_samples") or [], ensure_ascii=False),
+            "last_review_time": float(metadata.get("last_review_time") or 0.0),
+            "last_active_time": float(metadata.get("last_active_time") or row.get("last_access_time") or 0.0),
+            "create_time": float(row.get("create_time") or 0.0),
+            "status": str(row.get("status") or "review_pending"),
+            "legacy": False,
+        }
+
+    async def _list_canonical_reviews(self, *, status=None, group_id=None, keyword=None, page: int = 1, page_size: int = 20):
+        offset = max(page - 1, 0) * page_size
+        async with self.db_factory() as db:
+            async with db.execute(
+                """
+                SELECT id, session_id, source, content, status, create_time, last_access_time, metadata
+                FROM canonical_memories
+                WHERE kind = 'expression_pattern'
+                ORDER BY update_time DESC, create_time DESC
+                LIMIT ?
+                """,
+                (max(page * page_size * 4, page_size * 8),),
+            ) as cursor:
+                rows = [dict(row) for row in await cursor.fetchall()]
+        items = [self._canonical_to_review_item(row) for row in rows]
+        filtered = []
+        normalized_status = str(status or "").strip().lower()
+        normalized_group = str(group_id or "").strip()
+        normalized_keyword = str(keyword or "").strip().lower()
+        for item in items:
+            if normalized_status:
+                review_status = str(item.get("review_status") or item.get("status") or "").strip().lower()
+                status_value = str(item.get("status") or "").strip().lower()
+                if normalized_status not in {review_status, status_value}:
+                    continue
+            if normalized_group and str(item.get("group_id") or "") != normalized_group:
+                continue
+            if normalized_keyword:
+                haystack = " ".join(
+                    [
+                        str(item.get("situation") or ""),
+                        str(item.get("expression") or ""),
+                        str(item.get("review_reason") or ""),
+                        str(item.get("review_suggestion") or ""),
+                    ]
+                ).lower()
+                if normalized_keyword not in haystack:
+                    continue
+            filtered.append(self._normalize_item(item))
+        return {
+            "items": filtered[offset : offset + page_size],
+            "total": len(filtered),
+            "page": page,
+            "page_size": page_size,
+        }
+
     async def list_pending(self):
         facade_items = await self.plugin_api.list_pending_reviews()
-        if facade_items:
+        if self._runtime_bound():
             return facade_items
-        async with self.db_factory() as db:
-            columns = await self._columns(db)
-            if "status" in columns:
-                query = "SELECT * FROM ExpressionPattern WHERE status='pending' ORDER BY id DESC"
-                params: list[object] = []
-            elif "review_status" in columns:
-                query = (
-                    "SELECT * FROM ExpressionPattern "
-                    "WHERE review_status IN (?, ?, ?) ORDER BY id DESC"
-                )
-                params = ["pending", "revision_needed", "pending_human"]
-            else:
-                return []
-            async with db.execute(query, params) as cursor:
-                rows = await cursor.fetchall()
-                return [self._normalize_item(dict(row)) for row in rows]
+        result = await self._list_canonical_reviews(status="pending", page=1, page_size=200)
+        pending = [
+            item
+            for item in result["items"]
+            if str(item.get("review_status") or "").strip().lower() in {"pending", "revision_needed", "pending_human"}
+        ]
+        return pending
 
     async def list_reviews(self, status=None, group_id=None, keyword=None, page: int = 1, page_size: int = 20):
         offset = (page - 1) * page_size
-        async with self.db_factory() as db:
-            columns = await self._columns(db)
-            filters = ["1=1"]
-            params: list[object] = []
-            if status:
-                if "status" in columns:
-                    filters.append("status = ?")
-                    params.append(status)
-                elif "review_status" in columns:
-                    filters.append("review_status = ?")
-                    params.append(status)
-            if group_id:
-                filters.append("group_id = ?")
-                params.append(group_id)
-            if keyword:
-                filters.append("situation LIKE ?")
-                params.append(f"%{keyword}%")
-            where = " AND ".join(filters)
-            query = f"SELECT * FROM ExpressionPattern WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?"
-            async with db.execute(query, [*params, page_size, offset]) as cursor:
-                rows = await cursor.fetchall()
-                items = [self._normalize_item(dict(row)) for row in rows]
-            count_query = f"SELECT COUNT(*) FROM ExpressionPattern WHERE {where}"
-            async with db.execute(count_query, params) as cursor:
-                total = (await cursor.fetchone())[0]
-        return {"items": items, "total": total, "page": page, "page_size": page_size}
+        facade_items = await self.plugin_api.list_recent_reviews(group_id=group_id or "", limit=max(page * page_size, page_size))
+        if self._runtime_bound():
+            filtered = []
+            for item in facade_items:
+                if status and str(item.get("review_status") or item.get("status") or "") != str(status):
+                    continue
+                if keyword and str(keyword).lower() not in f"{item.get('situation', '')} {item.get('expression', '')}".lower():
+                    continue
+                filtered.append(self._normalize_item(dict(item)))
+            return {
+                "items": filtered[offset : offset + page_size],
+                "total": len(filtered),
+                "page": page,
+                "page_size": page_size,
+            }
+        return await self._list_canonical_reviews(
+            status=status,
+            group_id=group_id,
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
 
-    async def submit_review(self, review_id: int, action: str, replacement=None, weight=None, reason=None):
+    async def submit_review(self, review_id: str, action: str, replacement=None, weight=None, reason=None):
         mapped = "approved" if action == "approve" else "rejected"
-        async with self.db_factory() as db:
-            columns = await self._columns(db)
-            updates = []
-            params: list[object] = []
-            if "status" in columns:
-                updates.append("status = ?")
-                params.append(mapped)
-            if "review_status" in columns:
-                updates.append("review_status = ?")
-                params.append(mapped)
-            if "checked" in columns:
-                updates.append("checked = ?")
-                params.append(1 if mapped == "approved" else 0)
-            if "rejected" in columns:
-                updates.append("rejected = ?")
-                params.append(1 if mapped == "rejected" else 0)
-            if "last_review_time" in columns:
-                updates.append("last_review_time = ?")
-                params.append(time.time())
-            if replacement and "expression" in columns:
-                updates.append("expression = ?")
-                params.append(replacement)
-            if weight is not None and "weight" in columns:
-                updates.append("weight = ?")
-                params.append(weight)
-            if reason and "review_reason" in columns:
-                updates.append("review_reason = ?")
-                params.append(reason)
-            if not updates:
-                return {"status": "ok"}
-            params.append(review_id)
-            await db.execute(f"UPDATE ExpressionPattern SET {', '.join(updates)} WHERE id = ?", params)
-            await db.commit()
-        return {"status": "ok"}
+        result = await self.plugin_api.submit_review(
+            pattern_id=str(review_id),
+            decision=mapped,
+            reviewer_id="webui",
+            replacement_expression=replacement or "",
+            reason=reason or "",
+            weight_delta=0.0,
+        )
+        if result and result.get("id"):
+            return {"status": "ok", "data": result}
+        service = self._pattern_service()
+        if service and hasattr(service, "update_review"):
+            updated = await service.update_review(
+                str(review_id),
+                replacement_expression=replacement or None,
+                apply_replacement=bool(replacement),
+                review_status=mapped,
+                review_reason=reason or "",
+                weight_delta=0.0,
+                checked=(mapped == "approved"),
+                rejected=(mapped == "rejected"),
+            )
+            if updated:
+                if weight is not None:
+                    delta = float(weight) - float(getattr(updated, "weight", 1.0) or 1.0)
+                    if abs(delta) > 1e-9:
+                        await service.adjust_weight(str(review_id), delta)
+                        updated = await service.get_pattern(str(review_id))
+                data = self._canonical_to_review_item(
+                    {
+                        "id": getattr(updated, "id", ""),
+                        "session_id": getattr(updated, "group_id", ""),
+                        "source": getattr(updated, "source", ""),
+                        "content": getattr(updated, "expression", ""),
+                        "status": getattr(updated, "status", "review_pending"),
+                        "create_time": getattr(updated, "create_time", 0.0),
+                        "last_access_time": getattr(updated, "last_active_time", 0.0),
+                        "metadata": self._record_dict(updated),
+                    }
+                )
+                return {"status": "ok", "data": self._normalize_item(data)}
+        return {"status": "degraded", "message": "canonical review runtime unavailable", "readonly": True}
 
-    async def batch_review(self, ids: list[int], action: str):
+    async def batch_review(self, ids: list[str], action: str):
         if not ids:
             return {"status": "ok", "updated": 0}
-        mapped = "approved" if action == "approve" else "rejected"
-        placeholders = ",".join(["?"] * len(ids))
-        async with self.db_factory() as db:
-            columns = await self._columns(db)
-            updates = []
-            params: list[object] = []
-            if "status" in columns:
-                updates.append("status = ?")
-                params.append(mapped)
-            if "review_status" in columns:
-                updates.append("review_status = ?")
-                params.append(mapped)
-            if "checked" in columns:
-                updates.append("checked = ?")
-                params.append(1 if mapped == "approved" else 0)
-            if "rejected" in columns:
-                updates.append("rejected = ?")
-                params.append(1 if mapped == "rejected" else 0)
-            if "last_review_time" in columns:
-                updates.append("last_review_time = ?")
-                params.append(time.time())
-            if not updates:
-                return {"status": "ok", "updated": 0}
-            await db.execute(
-                f"UPDATE ExpressionPattern SET {', '.join(updates)} WHERE id IN ({placeholders})",
-                [*params, *ids],
-            )
-            await db.commit()
-        return {"status": "ok", "updated": len(ids)}
+        updated = 0
+        for review_id in ids:
+            result = await self.submit_review(str(review_id), action)
+            if result.get("status") == "ok":
+                updated += 1
+        if updated:
+            return {"status": "ok", "updated": updated}
+        return {"status": "degraded", "updated": 0, "readonly": True}
 
     async def create_review(self, data: dict) -> dict[str, object]:
-        async with self.db_factory() as db:
-            columns = await self._columns(db)
-            if "status" in columns:
-                query = """
-                INSERT INTO ExpressionPattern (situation, expression, style, weight, status, count, group_id)
-                VALUES (?, ?, ?, ?, 'approved', 0, ?)
-                """
-                params = (
-                    data.get("situation", ""),
-                    data.get("expression", ""),
-                    data.get("style", ""),
-                    float(data.get("weight", 1.0)),
-                    data.get("group_id", "GLOBAL"),
-                )
-            else:
-                now = time.time()
-                query = """
-                INSERT INTO ExpressionPattern (
-                    situation, expression, style, content_list, count, checked, rejected,
-                    modified_by, source, shared_scope, think_level, review_status,
-                    review_reason, review_suggestion, last_review_time, weight,
-                    last_active_time, create_time, group_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """
-                params = (
-                    data.get("situation", ""),
-                    data.get("expression", ""),
-                    data.get("style", ""),
-                    "[]",
-                    0,
-                    1,
-                    0,
-                    "plugin_page",
-                    "plugin_page",
-                    "",
-                    0,
-                    "approved",
-                    "",
-                    "",
-                    now,
-                    float(data.get("weight", 1.0)),
-                    now,
-                    now,
-                    data.get("group_id", "GLOBAL"),
-                )
-            cursor = await db.execute(query, params)
-            await db.commit()
-            return {"status": "ok", "id": cursor.lastrowid}
+        service = self._pattern_service()
+        if service and hasattr(service, "write_pattern"):
+            pattern_id = await service.write_pattern(
+                str(data.get("group_id") or "GLOBAL"),
+                {
+                    "situation": data.get("situation", ""),
+                    "expression": data.get("expression", ""),
+                    "style": data.get("style", ""),
+                    "weight": float(data.get("weight", 1.0)),
+                    "count": int(data.get("count", 1) or 1),
+                    "review_status": str(data.get("review_status") or "approved"),
+                    "summary": data.get("summary") or data.get("expression", ""),
+                    "shared_scope": data.get("shared_scope", ""),
+                },
+                source="webui_expression_pattern",
+            )
+            return {"status": "ok", "id": pattern_id, "mode": "canonical"}
+        return {"status": "degraded", "message": "canonical review runtime unavailable", "readonly": True}
 
-    async def update_review_record(self, review_id: int, data: dict) -> dict[str, str]:
+    async def update_review_record(self, review_id: str, data: dict) -> dict[str, str]:
         expression = data.get("expression")
         style = data.get("style")
         weight = data.get("weight")
+        service = self._pattern_service()
+        if service and hasattr(service, "update_review"):
+            await service.update_review(
+                str(review_id),
+                replacement_expression=expression or None,
+                apply_replacement=expression is not None,
+                style=style,
+                weight_delta=0.0,
+            )
+            if weight is not None and hasattr(service, "get_pattern"):
+                pattern = await service.get_pattern(str(review_id))
+                if pattern:
+                    delta = float(weight) - float(getattr(pattern, "weight", 1.0) or 1.0)
+                    await service.adjust_weight(str(review_id), delta)
+            return {"status": "ok"}
+        return {"status": "degraded", "message": "canonical review runtime unavailable", "readonly": True}
 
-        async with self.db_factory() as db:
-            columns = await self._columns(db)
-            updates = []
-            params: list[object] = []
-            if expression is not None and "expression" in columns:
-                updates.append("expression = ?")
-                params.append(expression)
-            if style is not None and "style" in columns:
-                updates.append("style = ?")
-                params.append(style)
-            if weight is not None and "weight" in columns:
-                updates.append("weight = ?")
-                params.append(float(weight))
-
-            if updates:
-                params.append(review_id)
-                await db.execute(f"UPDATE ExpressionPattern SET {', '.join(updates)} WHERE id = ?", params)
-                await db.commit()
-        return {"status": "ok"}
-
-    async def delete_review_record(self, review_id: int) -> dict[str, str]:
-        async with self.db_factory() as db:
-            await db.execute("DELETE FROM ExpressionPattern WHERE id = ?", (review_id,))
-            await db.commit()
-        return {"status": "ok"}
+    async def delete_review_record(self, review_id: str) -> dict[str, str]:
+        service = self._pattern_service()
+        if service and hasattr(service, "store"):
+            await service.store.update_memory(str(review_id), status="deleted", visibility="maintenance_only")
+            return {"status": "ok", "mode": "canonical_soft_delete"}
+        return {"status": "degraded", "message": "canonical review runtime unavailable", "readonly": True}
 
 
 __all__ = ["ReviewUiService"]

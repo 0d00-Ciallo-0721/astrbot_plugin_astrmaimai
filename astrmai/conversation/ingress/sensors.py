@@ -381,15 +381,18 @@ class PreFilters:
                 if profile.name != final_name:
                     try:
                         # 严格遵守 Phase 2 的并发控制规范，获取原子锁防脏写
-                        lock_func = getattr(attention_gate.state_engine, '_get_user_lock', None)
-                        if lock_func:
-                            async with lock_func(uid):
+                        if hasattr(attention_gate.state_engine, "apply_profile_name"):
+                            await attention_gate.state_engine.apply_profile_name(uid, final_name, source="sensor_resolve")
+                        else:
+                            lock_func = getattr(attention_gate.state_engine, '_get_user_lock', None)
+                            if lock_func:
+                                async with lock_func(uid):
+                                    profile.name = final_name
+                                    profile.is_dirty = True
+                            else:
+                                # 降级直接赋值并打脏标记
                                 profile.name = final_name
                                 profile.is_dirty = True
-                        else:
-                            # 降级直接赋值并打脏标记
-                            profile.name = final_name
-                            profile.is_dirty = True
                         logger.debug(f"[AstrMai-Sensor] 💾 数据自愈: 成功将用户 {uid} 的真实昵称 '{final_name}' 同步落盘至 UserProfile 画像库。")
                     except Exception as e:
                         logger.error(f"[AstrMai-Sensor] ⚠️ 回写用户画像昵称失败: {e}")

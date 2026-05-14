@@ -65,7 +65,10 @@ class PersistenceSchemaMixin:
                         social_score REAL,
                         last_seen REAL,
                         persona_analysis TEXT,
+                        message_count_for_profiling INTEGER DEFAULT 0,
+                        last_persona_gen_time REAL DEFAULT 0,
                         group_footprints TEXT,
+                        profile_metadata TEXT DEFAULT '{}',
                         identity TEXT,
                         tags TEXT DEFAULT '[]',
                         nickname TEXT DEFAULT '',
@@ -91,6 +94,9 @@ class PersistenceSchemaMixin:
                     "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN message_count_for_profiling INTEGER DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN last_persona_gen_time REAL DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN profile_metadata TEXT DEFAULT '{}'",
                 ]:
                     try:
                         db.execute(col_def)
@@ -168,7 +174,10 @@ class PersistenceSchemaMixin:
                         social_score REAL,
                         last_seen REAL,
                         persona_analysis TEXT,
+                        message_count_for_profiling INTEGER DEFAULT 0,
+                        last_persona_gen_time REAL DEFAULT 0,
                         group_footprints TEXT,
+                        profile_metadata TEXT DEFAULT '{}',
                         identity TEXT,
                         tags TEXT DEFAULT '[]',
                         nickname TEXT DEFAULT '',
@@ -195,6 +204,9 @@ class PersistenceSchemaMixin:
                     "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'",
+                    "ALTER TABLE user_profiles ADD COLUMN message_count_for_profiling INTEGER DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN last_persona_gen_time REAL DEFAULT 0",
+                    "ALTER TABLE user_profiles ADD COLUMN profile_metadata TEXT DEFAULT '{}'",
                 ]:
                     try:
                         await db.execute(col_def)

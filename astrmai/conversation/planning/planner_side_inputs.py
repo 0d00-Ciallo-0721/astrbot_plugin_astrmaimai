@@ -163,24 +163,6 @@ class PlannerSideInputMixin:
             )
 
         async def _load_jargons():
-            try:
-                jargon_list = (
-                    await self.context_engine.db.load_jargon_list(chat_id, limit=8)
-                    if hasattr(self.context_engine.db, "load_jargon_list")
-                    else []
-                )
-                if jargon_list:
-                    if all(isinstance(item, str) for item in jargon_list):
-                        lines = [item for item in jargon_list if item]
-                    else:
-                        lines = [
-                            f"{j.get('text', '')} -> {j.get('meaning', '...')} (场景: {j.get('situation', '?')})"
-                            for j in jargon_list
-                            if isinstance(j, dict) and j.get("meaning") and j.get("text")
-                        ]
-                    return "\n".join(lines) if lines else ""
-            except Exception as exc:
-                logger.debug(f"[Planner] 黑话加载失败: {exc}")
             return ""
 
         slang_context, expression_habits, jargon_explanation = await asyncio.gather(

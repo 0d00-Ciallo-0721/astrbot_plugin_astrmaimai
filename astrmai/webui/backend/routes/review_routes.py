@@ -33,7 +33,7 @@ async def get_reviews(
     )
 
 @router.post("/{id}/submit")
-async def submit_review(id: int, req: ReviewActionRequest, user: str = Depends(get_current_user)):
+async def submit_review(id: str, req: ReviewActionRequest, user: str = Depends(get_current_user)):
     service = ReviewUiService(PluginApiAdapter(), get_db)
     return await service.submit_review(id, req.action, req.replacement, req.weight, req.reason)
 
@@ -47,9 +47,9 @@ async def create_review(data: Dict[str, Any], user: str = Depends(get_current_us
     return await ReviewUiService(PluginApiAdapter(), get_db).create_review(data)
 
 @router.put("/{id}")
-async def update_review(id: int, data: Dict[str, Any], user: str = Depends(get_current_user)):
+async def update_review(id: str, data: Dict[str, Any], user: str = Depends(get_current_user)):
     return await ReviewUiService(PluginApiAdapter(), get_db).update_review_record(id, data)
 
 @router.delete("/{id}")
-async def delete_review(id: int, user: str = Depends(get_current_user)):
+async def delete_review(id: str, user: str = Depends(get_current_user)):
     return await ReviewUiService(PluginApiAdapter(), get_db).delete_review_record(id)

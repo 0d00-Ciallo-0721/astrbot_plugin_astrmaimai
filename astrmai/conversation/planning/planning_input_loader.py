@@ -165,7 +165,7 @@ class PlanningInputLoader:
             self._run_timed(
                 event,
                 "expression_habits",
-                lambda: self._load_expression_habits(chat_id, prompt_envelope, window_lines, level),
+                lambda: self._load_expression_habits(event, chat_id, prompt_envelope, window_lines, level),
                 "",
             ),
             self._run_timed(
@@ -179,7 +179,12 @@ class PlanningInputLoader:
             tasks.extend(
                 [
                     self._run_timed(event, "slang_context", lambda: self._load_slang_context(chat_id), ""),
-                    self._run_timed(event, "jargon_explanation", lambda: self._load_jargon_explanation(chat_id), ""),
+                    self._run_timed(
+                        event,
+                        "jargon_explanation",
+                        lambda: self._load_jargon_explanation(event, chat_id, prompt_envelope, window_lines),
+                        "",
+                    ),
                 ]
             )
         loaded_items = await asyncio.gather(*tasks)
@@ -254,6 +259,7 @@ class PlanningInputLoader:
 
     async def _load_expression_habits(
         self,
+        event,
         chat_id: str,
         prompt_envelope: PromptEnvelope,
         window_lines: list[str],
@@ -264,35 +270,71 @@ class PlanningInputLoader:
             return ""
         recent_text = self.planner._planner_side_input_text(prompt_envelope, window_lines, recent_only=True)
         expression_think_level = 1 if think_level >= 1 and (len(recent_text) >= 40 or len(window_lines) >= 2) else 0
-        return await selector.select(
-            chat_id=chat_id,
-            context_text=recent_text,
-            think_level=expression_think_level,
-            shared_scope=chat_id,
-        )
+        if hasattr(selector, "select_with_trace"):
+            text, selected = await selector.select_with_trace(
+                chat_id=chat_id,
+                context_text=recent_text,
+                think_level=expression_think_level,
+                shared_scope=chat_id,
+            )
+        else:
+            text = await selector.select(
+                chat_id=chat_id,
+                context_text=recent_text,
+                think_level=expression_think_level,
+                shared_scope=chat_id,
+            )
+            selected = []
+        decision = ensure_turn_context(event).expression_patterns
+        decision.source = "canonical_expression_pattern"
+        decision.selected_ids = [str(getattr(item, "id", "") or "") for item in selected if str(getattr(item, "id", "") or "").strip()]
+        decision.injected = bool(text and selected)
+        decision.skip_reason = "" if text else f"selector_empty_think_level_{expression_think_level}"
+        decision.summary_preview = str(text or "")[:180]
+        if hasattr(event, "set_extra"):
+            event.set_extra(
+                "astrmai_expression_pattern_trace",
+                type(
+                    "ExpressionPatternTrace",
+                    (),
+                    {
+                        "selected_ids": list(decision.selected_ids),
+                        "items": list(selected),
+                        "source": decision.source,
+                        "injected": decision.injected,
+                        "skip_reason": decision.skip_reason,
+                        "summary_preview": decision.summary_preview,
+                    },
+                )(),
+            )
+        return text
 
     async def _load_slang_context(self, chat_id: str) -> str:
-        evolution = getattr(self.planner, "evolution_manager", None)
-        if not evolution or not hasattr(evolution, "get_active_patterns"):
-            return ""
-        return await asyncio.to_thread(evolution.get_active_patterns, chat_id)
+        return ""
 
-    async def _load_jargon_explanation(self, chat_id: str) -> str:
-        db = getattr(getattr(self.planner, "context_engine", None), "db", None)
-        if not db or not hasattr(db, "load_jargon_list"):
-            return ""
-        jargon_list = await db.load_jargon_list(chat_id, limit=8)
-        if not jargon_list:
-            return ""
-        if all(isinstance(item, str) for item in jargon_list):
-            lines = [item for item in jargon_list if item]
-        else:
-            lines = [
-                f"{j.get('text', '')} -> {j.get('meaning', '...')} (scene: {j.get('situation', '?')})"
-                for j in jargon_list
-                if isinstance(j, dict) and j.get("meaning") and j.get("text")
-            ]
-        return "\n".join(lines) if lines else ""
+    @staticmethod
+    def _render_jargon_lines(items: list[Any]) -> list[str]:
+        lines: list[str] = []
+        for item in items or []:
+            if isinstance(item, dict):
+                text = str(item.get("text") or item.get("content") or "").strip()
+                meaning = str(item.get("meaning") or item.get("summary") or "").strip()
+                scene = str(item.get("situation") or item.get("scene") or "").strip()
+            else:
+                text = str(getattr(item, "content", "") or "").strip()
+                metadata = dict(getattr(item, "metadata", {}) or {})
+                meaning = str(metadata.get("meaning") or getattr(item, "summary", "") or "").strip()
+                scene = str(metadata.get("scene") or "").strip()
+            if not text or not meaning:
+                continue
+            line = f"{text} -> {meaning}"
+            if scene:
+                line += f" (scene: {scene})"
+            lines.append(line)
+        return lines
+
+    async def _load_jargon_explanation(self, event, chat_id: str, prompt_envelope: PromptEnvelope, window_lines: list[str]) -> str:
+        return ""
 
     async def _load_goal_update(self, chat_id: str, prompt_envelope: PromptEnvelope, window_lines: list[str]) -> str:
         manager = getattr(self.planner, "goal_manager", None)

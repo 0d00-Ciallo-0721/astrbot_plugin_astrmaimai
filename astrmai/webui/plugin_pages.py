@@ -422,16 +422,27 @@ class AstrMaiAdminPageApi:
         return await self._memory().delete_node(self._int(self._path(request).get("id")))
 
     async def list_jargon(self, request: Any) -> Any:
-        return await self._memory().list_jargon()
+        query = self._query(request)
+        return await self._memory().list_jargon(
+            status=str(query.get("status", "") or ""),
+            group_id=str(query.get("group_id", "") or ""),
+            query=str(query.get("query", "") or ""),
+        )
 
     async def create_jargon(self, request: Any) -> dict[str, Any]:
         return await self._memory().create_jargon(await self._body(request))
 
     async def update_jargon(self, request: Any) -> dict[str, Any]:
-        return await self._memory().update_jargon(self._int(self._path(request).get("id")), await self._body(request))
+        return await self._memory().update_jargon(str(self._path(request).get("id", "")), await self._body(request))
 
     async def delete_jargon(self, request: Any) -> dict[str, Any]:
-        return await self._memory().delete_jargon(self._int(self._path(request).get("id")))
+        return await self._memory().delete_jargon(str(self._path(request).get("id", "")))
+
+    async def approve_jargon(self, request: Any) -> dict[str, Any]:
+        return await self._memory().approve_jargon(str(self._path(request).get("id", "")))
+
+    async def reject_jargon(self, request: Any) -> dict[str, Any]:
+        return await self._memory().reject_jargon(str(self._path(request).get("id", "")))
 
     async def users(self, request: Any) -> Any:
         return await UserUiService(get_db).list_users()
@@ -577,6 +588,8 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("DELETE", "/memories/nodes/{id}", api.delete_node, "AstrMai 删除记忆节点"),
         ("GET", "/memories/jargon", api.list_jargon, "AstrMai 黑话字典"),
         ("POST", "/memories/jargon", api.create_jargon, "AstrMai 新建黑话"),
+        ("POST", "/memories/jargon/{id}/approve", api.approve_jargon, "AstrMai 通过黑话审核"),
+        ("POST", "/memories/jargon/{id}/reject", api.reject_jargon, "AstrMai 拒绝黑话"),
         ("PUT", "/memories/jargon/{id}", api.update_jargon, "AstrMai 更新黑话"),
         ("POST", "/memories/jargon/{id}/delete", api.delete_jargon, "AstrMai 删除黑话"),
         ("DELETE", "/memories/jargon/{id}", api.delete_jargon, "AstrMai 删除黑话"),

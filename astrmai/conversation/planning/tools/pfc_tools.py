@@ -185,15 +185,6 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
                 return None
 
         async def _fetch_jargon():
-            if not self.db_service or not query:
-                return None
-            try:
-                if hasattr(self.db_service, "get_jargon"):
-                    jargon = self.db_service.get_jargon(self.chat_id, query)
-                    if jargon:
-                        return f"{query}: {jargon}"
-            except Exception as exc:
-                logger.debug(f"[OmniPerceptionTool] jargon lookup failed: {exc}")
             return None
 
         memory_result, profile_result, node_result, reflection_result, jargon_result = await asyncio.gather(

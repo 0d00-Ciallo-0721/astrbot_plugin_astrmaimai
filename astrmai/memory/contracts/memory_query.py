@@ -39,6 +39,7 @@ class MemoryWriteRequest:
     dedup_key: str = ""
     source_ref: str = ""
     visibility: str = "auto_and_tool"
+    status: str = "active"
 
 
 @dataclass(slots=True)

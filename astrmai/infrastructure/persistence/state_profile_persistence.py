@@ -51,7 +51,10 @@ class StateProfilePersistenceMixin:
                     "social_score": row_dict.get("social_score", 0.0),
                     "last_seen": row_dict.get("last_seen", 0.0),
                     "persona_analysis": row_dict.get("persona_analysis", ""),
+                    "message_count_for_profiling": int(row_dict.get("message_count_for_profiling") or 0),
+                    "last_persona_gen_time": float(row_dict.get("last_persona_gen_time") or 0.0),
                     "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
+                    "profile_metadata": json.loads(row_dict.get("profile_metadata") or "{}"),
                     "identity": row_dict.get("identity", ""),
                     "tags": json.loads(row_dict.get("tags") or "[]"),
                     # Phase 8.1: 
@@ -87,7 +90,10 @@ class StateProfilePersistenceMixin:
                 "social_score": row_dict.get("social_score", 0.0),
                 "last_seen": row_dict.get("last_seen", 0.0),
                 "persona_analysis": row_dict.get("persona_analysis", ""),
+                "message_count_for_profiling": int(row_dict.get("message_count_for_profiling") or 0),
+                "last_persona_gen_time": float(row_dict.get("last_persona_gen_time") or 0.0),
                 "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
+                "profile_metadata": json.loads(row_dict.get("profile_metadata") or "{}"),
                 "identity": row_dict.get("identity", ""),
                 "tags": json.loads(row_dict.get("tags") or "[]"),
                 "nickname": row_dict.get("nickname", ""),
@@ -104,6 +110,7 @@ class StateProfilePersistenceMixin:
 
     async def save_user_profile(self, profile: 'UserProfile'):
         footprints_json = json.dumps(profile.group_footprints, ensure_ascii=False)
+        profile_metadata_json = json.dumps(getattr(profile, "profile_metadata", {}) or {}, ensure_ascii=False)
         tags_json = json.dumps(profile.tags, ensure_ascii=False)
         memory_points_json = json.dumps(profile.memory_points, ensure_ascii=False)
         identity_points_json = json.dumps(getattr(profile, "identity_points", []), ensure_ascii=False)
@@ -113,14 +120,16 @@ class StateProfilePersistenceMixin:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO user_profiles 
-                (user_id, name, social_score, last_seen, persona_analysis, group_footprints,
+                (user_id, name, social_score, last_seen, persona_analysis, message_count_for_profiling,
+                 last_persona_gen_time, group_footprints, profile_metadata,
                  identity, tags, nickname, nickname_reason, know_times, is_known,
                  memory_points, identity_points, preference_points, relationship_points,
                  speech_style_points, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (profile.user_id, profile.name, profile.social_score, profile.last_seen,
-                  profile.persona_analysis, footprints_json, profile.identity,
-                  tags_json,
+                  profile.persona_analysis, int(getattr(profile, "message_count_for_profiling", 0) or 0),
+                  float(getattr(profile, "last_persona_gen_time", 0.0) or 0.0),
+                  footprints_json, profile_metadata_json, profile.identity, tags_json,
                   profile.nickname, profile.nickname_reason,
                   profile.know_times, int(profile.is_known),
                   memory_points_json, identity_points_json, preference_points_json,

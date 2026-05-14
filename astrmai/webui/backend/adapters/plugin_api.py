@@ -98,7 +98,12 @@ class PluginApiAdapter:
             return await self.facade.list_pending_expression_reviews(group_id=group_id, limit=limit)
         return []
 
-    async def get_review_detail(self, pattern_id: int):
+    async def list_recent_reviews(self, group_id: str = "", limit: int = 50):
+        if self.facade and hasattr(self.facade, "list_recent_expression_reviews"):
+            return await self.facade.list_recent_expression_reviews(group_id=group_id, limit=limit)
+        return []
+
+    async def get_review_detail(self, pattern_id: str):
         if self.facade:
             return await self.facade.get_expression_review_detail(pattern_id)
         return None

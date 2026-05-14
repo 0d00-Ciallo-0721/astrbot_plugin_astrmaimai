@@ -265,10 +265,11 @@ class ExpressionSelector:
     RECENT_PATTERN_WINDOW = 6
     EXPRESSION_SYSTEM_PROMPT = '你是表达风格匹配器，需要从候选表达中挑选出当前语境最自然、最贴切的几条。'
 
-    def __init__(self, db: DatabaseService, gateway: GlobalModelGateway, config=None):
+    def __init__(self, db: DatabaseService, gateway: GlobalModelGateway, config=None, pattern_service=None):
         self.db = db
         self.gateway = gateway
         self.config = config if config else gateway.config
+        self.pattern_service = pattern_service
         self._recent_pattern_keys: dict[str, List[tuple[str, str]]] = {}
 
     async def select(
@@ -278,6 +279,21 @@ class ExpressionSelector:
         think_level: int = 0,
         shared_scope: Optional[str] = None,
     ) -> str:
+        text, _selected = await self.select_with_trace(
+            chat_id,
+            context_text=context_text,
+            think_level=think_level,
+            shared_scope=shared_scope,
+        )
+        return text
+
+    async def select_with_trace(
+        self,
+        chat_id: str,
+        context_text: str = '',
+        think_level: int = 0,
+        shared_scope: Optional[str] = None,
+    ) -> tuple[str, list[Any]]:
         try:
             if think_level <= 0:
                 return await self._fast_select(chat_id, context_text=context_text, shared_scope=shared_scope, think_level=think_level)
@@ -289,7 +305,7 @@ class ExpressionSelector:
             )
         except Exception as exc:
             logger.warning(f'[ExpressionSelector] selection failed: {exc}')
-            return ''
+            return '', []
 
     def _scope_key(self, chat_id: str, shared_scope: Optional[str]) -> str:
         return str(shared_scope or chat_id or "global")
@@ -349,23 +365,42 @@ class ExpressionSelector:
             recent.append(key)
         self._recent_pattern_keys[scope_key] = recent[-self.RECENT_PATTERN_WINDOW:]
 
-    def _finalize_habits(self, scope_key: str, patterns: List[ExpressionPattern]) -> str:
+    def _finalize_habits(self, scope_key: str, patterns: List[Any]) -> tuple[str, list[Any]]:
         self._remember_patterns(scope_key, patterns)
-        return self._format_habits(patterns)
+        return self._format_habits(patterns), list(patterns or [])
 
-    async def _fast_select(self, chat_id: str, context_text: str = '', shared_scope: Optional[str] = None, think_level: int = 0) -> str:
-        patterns = await asyncio.to_thread(
-            self.db.get_patterns,
+    async def _load_patterns(
+        self,
+        chat_id: str,
+        *,
+        limit: int,
+        shared_scope: Optional[str],
+        think_level: int,
+        review_status: str,
+    ) -> list[Any]:
+        if self.pattern_service and hasattr(self.pattern_service, "list_patterns"):
+            return await self.pattern_service.list_patterns(
+                chat_id,
+                limit=limit,
+                only_checked=(review_status == "approved"),
+                include_rejected=False,
+                shared_scope=shared_scope,
+                think_level=think_level,
+                review_status=review_status,
+                statuses=["active"] if review_status == "approved" else ["review_pending", "active"],
+            )
+        return []
+
+    async def _fast_select(self, chat_id: str, context_text: str = '', shared_scope: Optional[str] = None, think_level: int = 0) -> tuple[str, list[Any]]:
+        patterns = await self._load_patterns(
             chat_id,
-            20,
-            True,
-            False,
-            shared_scope,
-            think_level,
-            'approved',
+            limit=20,
+            shared_scope=shared_scope,
+            think_level=think_level,
+            review_status='approved',
         )
         if not patterns:
-            return ''
+            return '', []
         scope_key = self._scope_key(chat_id, shared_scope)
         selected = self._apply_pattern_cooldown(scope_key, patterns, context_text, self.FAST_SELECT_LIMIT)
         return self._finalize_habits(scope_key, selected)
@@ -376,29 +411,23 @@ class ExpressionSelector:
         context_text: str,
         shared_scope: Optional[str] = None,
         think_level: int = 1,
-    ) -> str:
-        top_patterns = await asyncio.to_thread(
-            self.db.get_patterns,
+    ) -> tuple[str, list[Any]]:
+        top_patterns = await self._load_patterns(
             chat_id,
-            5,
-            True,
-            False,
-            shared_scope,
-            think_level,
-            'approved',
+            limit=5,
+            shared_scope=shared_scope,
+            think_level=think_level,
+            review_status='approved',
         )
-        all_patterns = await asyncio.to_thread(
-            self.db.get_patterns,
+        all_patterns = await self._load_patterns(
             chat_id,
-            50,
-            True,
-            False,
-            shared_scope,
-            think_level,
-            'approved',
+            limit=50,
+            shared_scope=shared_scope,
+            think_level=think_level,
+            review_status='approved',
         )
         if not top_patterns and not all_patterns:
-            return ''
+            return '', []
 
         seen = set()
         candidates: List[ExpressionPattern] = []
