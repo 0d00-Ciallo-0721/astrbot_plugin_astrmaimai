@@ -62,6 +62,7 @@ class LLMCallResult:
     provider_family: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     raw_completion: str = ""
+    economy: dict[str, Any] = field(default_factory=dict)
 
 
 __all__ = [

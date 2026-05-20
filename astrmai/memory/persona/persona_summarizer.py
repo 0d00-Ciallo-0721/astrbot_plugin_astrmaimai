@@ -5,6 +5,7 @@ import json
 import time
 from typing import Dict, Any, Tuple
 from astrbot.api import logger
+from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.persistence.persistence_manager import PersistenceManager
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
@@ -24,6 +25,7 @@ class PersonaSummarizer:
         # 运行时任务锁
         self.pending_tasks: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
 
     def _compute_hash(self, text: str) -> str:
         """计算人设内容的 Hash 值，用于缓存 Key"""
@@ -39,6 +41,7 @@ class PersonaSummarizer:
         system_prompt: str = "",
         is_json: bool = False,
         prefix_hash: str = "",
+        template_envelope=None,
     ):
         return await self.gateway.call_persona_task(
             prompt=prompt,
@@ -48,6 +51,48 @@ class PersonaSummarizer:
             base_origin="",
             prefix_hash=prefix_hash or self._compute_hash(system_prompt or prompt[:400]),
             persona_id=cache_key,
+            template_envelope=template_envelope,
+        )
+
+    def _render_persona_template(self, template_id: PromptTemplateId, *, original_prompt: str, cache_key: str):
+        if self.prompt_registry is None:
+            return None
+        return self.prompt_registry.render_template(
+            template_id,
+            {
+                "original_prompt": original_prompt,
+                "cache_key": cache_key,
+            },
+        )
+
+    async def _call_persona_template(
+        self,
+        template_id: PromptTemplateId,
+        *,
+        original_prompt: str,
+        cache_key: str,
+        is_json: bool = False,
+        fallback_prompt: str = "",
+        fallback_system_prompt: str = "",
+    ):
+        envelope = self._render_persona_template(
+            template_id,
+            original_prompt=original_prompt,
+            cache_key=cache_key,
+        )
+        if envelope is None:
+            return await self._call_persona_lane(
+                fallback_prompt or original_prompt,
+                cache_key,
+                system_prompt=fallback_system_prompt,
+                is_json=is_json,
+            )
+        return await self._call_persona_lane(
+            envelope.prompt,
+            cache_key,
+            system_prompt=envelope.system_prompt,
+            is_json=is_json,
+            template_envelope=envelope,
         )
 
     async def _persist_cache(self) -> None:
@@ -86,12 +131,29 @@ Rules:
 - Output plain text only, within 120 characters if possible.
 """
         try:
-            res = await self._call_persona_lane(
-                prompt,
-                cache_key,
-                system_prompt="Rewrite persona summaries into concise first-person self-awareness text.",
-                is_json=False,
-            )
+            if self.prompt_registry is not None:
+                envelope = self.prompt_registry.render_template(
+                    PromptTemplateId.PERSONA_FIRST_PERSON_REWRITE,
+                    {
+                        "original_prompt": original_prompt,
+                        "summary": summary,
+                        "style": style,
+                    },
+                )
+                res = await self._call_persona_lane(
+                    envelope.prompt,
+                    cache_key,
+                    system_prompt=envelope.system_prompt,
+                    is_json=False,
+                    template_envelope=envelope,
+                )
+            else:
+                res = await self._call_persona_lane(
+                    prompt,
+                    cache_key,
+                    system_prompt="Rewrite persona summaries into concise first-person self-awareness text.",
+                    is_json=False,
+                )
         except Exception as exc:
             logger.warning(f"[PersonaSummarizer] first-person rewrite failed [{cache_key}]: {exc}")
             return ""
@@ -289,7 +351,14 @@ Rules:
 """
         for attempt in range(max_retries):
             try:
-                res = await self._call_persona_lane(prompt, cache_key, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=False)
+                res = await self._call_persona_template(
+                    PromptTemplateId.PERSONA_CORE_IDENTITY,
+                    original_prompt=original_prompt,
+                    cache_key=cache_key,
+                    is_json=False,
+                    fallback_prompt=prompt,
+                    fallback_system_prompt="你是一个资深的角色扮演设定提取专家。",
+                )
                 if res and len(str(res).strip()) > 10:
                     return str(res).strip()
                 logger.warning(f"[PersonaSummarizer] ⚠️ 核心身份提取结果过短，准备重试 ({attempt+1}/{max_retries})")
@@ -332,7 +401,14 @@ Rules:
 """
         for attempt in range(max_retries):
             try:
-                res = await self._call_persona_lane(prompt, cache_key, system_prompt="你是一个资深的角色扮演设定提取专家。", is_json=False)
+                res = await self._call_persona_template(
+                    PromptTemplateId.PERSONA_STYLE,
+                    original_prompt=original_prompt,
+                    cache_key=cache_key,
+                    is_json=False,
+                    fallback_prompt=prompt,
+                    fallback_system_prompt="你是一个资深的角色扮演设定提取专家。",
+                )
                 if res and len(str(res).strip()) > 5:
                     return str(res).strip()
             except Exception as e:
@@ -370,7 +446,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_LOGIC_STYLE,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -401,7 +483,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_SPEECH_STYLE,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -427,7 +515,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_WORLD_VIEW,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -453,7 +547,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_TIMELINE,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -479,7 +579,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_RELATIONS,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -503,7 +609,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_SKILLS,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -528,7 +640,13 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_VALUES,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"
 
@@ -554,6 +672,12 @@ Rules:
 {original_prompt}
 """
         try:
-            return await self._call_persona_lane(prompt, cache_key, is_json=False)
+            return await self._call_persona_template(
+                PromptTemplateId.PERSONA_SECRETS,
+                original_prompt=original_prompt,
+                cache_key=cache_key,
+                is_json=False,
+                fallback_prompt=prompt,
+            )
         except Exception:
             return "无"

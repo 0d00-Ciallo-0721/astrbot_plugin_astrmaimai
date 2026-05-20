@@ -264,6 +264,7 @@ class ProactiveDispatcher:
                 "astrmai_proactive_time_bucket": checks.get("time_bucket", ""),
                 "astrmai_social_intent": intent.suggested_social_intent,
                 "astrmai_action_tier": intent.suggested_action_tier,
+                "astrmai_loop_source": "proactive_dispatcher",
                 "astrmai_proactive_dispatch_decision": decision,
                 "astrmai_proactive_completion_callback": _completion,
                 "astrmai_force_engage": True,

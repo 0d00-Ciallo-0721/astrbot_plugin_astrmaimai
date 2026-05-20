@@ -39,6 +39,9 @@ class RuntimeFeatureFlags:
     proactive_enabled: bool = True
     dream_visible: bool = False
     meme_enabled: bool = False
+    dialogue_store_enabled: bool = True
+    context_compaction_enabled: bool = True
+    prefix_caching_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +84,9 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
             proactive_enabled=bool(getattr(life, "enable_proactive", True)),
             dream_visible=bool(getattr(life, "dream_visible", False)),
             meme_enabled=bool(int(getattr(reply, "meme_probability", 0) or 0) > 0),
+            dialogue_store_enabled=bool(getattr(getattr(config, "conversation", None), "enable_dialogue_store", True)),
+            context_compaction_enabled=bool(getattr(getattr(config, "conversation", None), "enable_context_compaction", True)),
+            prefix_caching_enabled=bool(getattr(getattr(config, "conversation", None), "enable_prefix_caching", True)),
         ),
     )
 

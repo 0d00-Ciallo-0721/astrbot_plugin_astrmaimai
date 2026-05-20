@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryCandidate, MemoryQuery
+from .memory_scoring import DEFAULT_MEMORY_SCORING, MemoryScoringConfig
 from .expression_pattern_retrieval_policy import ExpressionPatternRetrievalPolicy
 from .jargon_retrieval_policy import JargonRetrievalPolicy
 from .v2_store import MemoryV2Store
 
 
 class MemoryRetrievalService:
-    def __init__(self, store: MemoryV2Store, engine=None):
+    def __init__(self, store: MemoryV2Store, engine=None, scoring: MemoryScoringConfig | None = None):
         self.store = store
         self.engine = engine
+        self.scoring = scoring or DEFAULT_MEMORY_SCORING
         self.jargon_policy = JargonRetrievalPolicy(store)
         self.expression_pattern_policy = ExpressionPatternRetrievalPolicy(store)
 
@@ -127,21 +130,31 @@ class MemoryRetrievalService:
                 allow_stale=query.allow_stale,
                 visibility_mode=visibility_mode,
             )
-        candidates = await self.store.search(
+
+        limit = max(int(query.top_k or 5), 1)
+        canonical_task = self.store.search(
             query.query,
             session_id=query.session_id,
             persona_id=query.persona_id,
             layers=query.layers,
-            top_k=query.top_k,
+            top_k=limit,
             exclude_ids=query.exclude_ids,
             allow_stale=query.allow_stale,
             visibility_mode=visibility_mode,
         )
-        if len(candidates) >= max(int(query.top_k or 5), 1):
-            return candidates[: query.top_k]
+        hybrid_task = self._hybrid_search(query, visibility_mode)
+        canonical_results, hybrid_results = await asyncio.gather(canonical_task, hybrid_task, return_exceptions=True)
+        if isinstance(canonical_results, Exception):
+            logger.debug(f"[MemoryRetrievalService] canonical search degraded: {canonical_results}")
+            canonical_results = []
+        if isinstance(hybrid_results, Exception):
+            logger.debug(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
+            hybrid_results = []
+        return self._fuse_candidates(canonical_results, hybrid_results, query)
 
+    async def _hybrid_search(self, query: MemoryQuery, visibility_mode: str) -> list[MemoryCandidate]:
         if not self.engine or not hasattr(self.engine, "_search_memories"):
-            return candidates
+            return []
         try:
             session_id = "__self_lore__" if query.include_persona_lore or "persona_lore" in query.layers else query.session_id
             results = await self.engine._search_memories(
@@ -150,11 +163,13 @@ class MemoryRetrievalService:
                 session_id=session_id,
                 persona_id=query.persona_id or None,
             )
-        except Exception:
-            results = []
+        except Exception as exc:
+            logger.debug(f"[MemoryRetrievalService] hybrid engine search failed: {exc}")
+            return []
 
-        seen = {item.id for item in candidates}
-        excluded = set(query.exclude_ids or [])
+        excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
+        layer_set = {str(item) for item in query.layers or [] if str(item).strip()}
+        candidates: list[MemoryCandidate] = []
         for result in results:
             candidate = self._result_to_candidate(result, query)
             canonical_id = str(candidate.metadata.get("canonical_id") or candidate.id or "")
@@ -164,7 +179,7 @@ class MemoryRetrievalService:
                     continue
                 canonical.relevance_score = max(candidate.relevance_score, canonical.relevance_score)
                 candidate = canonical
-            if candidate.id in seen or candidate.id in excluded:
+            if candidate.id in excluded:
                 continue
             if candidate.status in {"deleted", "merged", "deprecated", "review_pending", "rejected"}:
                 continue
@@ -174,13 +189,58 @@ class MemoryRetrievalService:
                 continue
             if visibility_mode == "tool" and candidate.visibility not in {"auto_and_tool", "tool_only"}:
                 continue
-            if query.layers and candidate.kind not in set(query.layers):
+            if layer_set and candidate.kind not in layer_set:
                 continue
-            seen.add(candidate.id)
             candidates.append(candidate)
-            if len(candidates) >= max(int(query.top_k or 5), 1):
-                break
         return candidates
+
+    def _fuse_candidates(
+        self,
+        canonical: list[MemoryCandidate],
+        hybrid: list[MemoryCandidate],
+        query: MemoryQuery,
+    ) -> list[MemoryCandidate]:
+        excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
+        merged: dict[str, MemoryCandidate] = {}
+        for c in canonical or []:
+            if c.id in excluded:
+                continue
+            c.metadata = dict(c.metadata or {})
+            c.metadata["_canon_score"] = float(c.relevance_score or 0.0)
+            c.metadata.setdefault("_hybrid_score", 0.0)
+            merged[c.id] = c
+        for h in hybrid or []:
+            if h.id in excluded:
+                continue
+            h.metadata = dict(h.metadata or {})
+            if h.id in merged:
+                existing = merged[h.id]
+                existing.metadata["_hybrid_score"] = max(
+                    float(existing.metadata.get("_hybrid_score", 0.0)),
+                    float(h.relevance_score or 0.0),
+                )
+                existing.metadata["_canon_score"] = max(
+                    float(existing.metadata.get("_canon_score", 0.0)),
+                    float(existing.relevance_score or 0.0),
+                )
+            else:
+                h.metadata.setdefault("_canon_score", 0.0)
+                h.metadata["_hybrid_score"] = float(h.relevance_score or 0.0)
+                merged[h.id] = h
+
+        for item in merged.values():
+            canon = float(item.metadata.get("_canon_score", 0.0))
+            hybrid_score = float(item.metadata.get("_hybrid_score", 0.0))
+            item.relevance_score = (
+                canon * self.scoring.canonical_weight
+                + hybrid_score * self.scoring.hybrid_weight
+                + float(item.importance or 0.0) * self.scoring.importance_weight
+                + float(item.recency_score or 0.0) * self.scoring.recency_weight
+                + float(item.confidence or 0.0) * self.scoring.confidence_weight
+                - (self.scoring.stale_penalty if item.status == "stale" else 0.0)
+            )
+        ranked = sorted(merged.values(), key=lambda item: item.relevance_score, reverse=True)
+        return ranked[: max(int(query.top_k or 5), 1)]
 
     async def _rewrite_queries(self, query: MemoryQuery) -> list[str]:
         base_query = str(query.query or "").strip()

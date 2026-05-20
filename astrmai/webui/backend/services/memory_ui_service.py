@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 
-from astrmai.memory.contracts.memory_query import MemoryWriteRequest
+from ....memory.contracts.memory_query import MemoryWriteRequest
 
 from ..adapters.plugin_api import PluginApiAdapter
 

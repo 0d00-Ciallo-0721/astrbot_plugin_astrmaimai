@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from astrbot.api import logger
+from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
 
 
@@ -72,6 +73,15 @@ class TopicSummarizer:
     def __init__(self, gateway=None, config=None):
         self.gateway = gateway
         self.config = config
+        self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None) if gateway else None
+
+    @staticmethod
+    def _memory_lane_key(session_id: str) -> LaneKey:
+        normalized = str(session_id or "").strip()
+        if normalized and normalized != "global":
+            return LaneKey(subsystem="bg", task_family="memory", scope_id=normalized, scope_kind="chat")
+        logger.warning("[TopicSummarizer] global scope fallback engaged; expected a concrete session_id for topic summarization")
+        return LaneKey(subsystem="bg", task_family="memory", scope_id="global", scope_kind="global")
 
     async def process_history(
         self, messages: List[Dict], session_id: str = ""
@@ -315,7 +325,6 @@ class TopicSummarizer:
             blocks.append(f"[话题{i + 1}] (共{seg.message_count}条消息)\n{text}")
 
         combined = "\n\n---\n\n".join(blocks)
-
         prompt = f"""以下是从群聊中按话题分割出的 {len(segments)} 个对话段。
 请为每个话题段生成一句简洁的摘要（不超过30字）。
 
@@ -323,13 +332,25 @@ class TopicSummarizer:
 
 严格返回 JSON 数组，顺序对应各话题段:
 ["话题1摘要", "话题2摘要", ...]"""
+        system_prompt = ""
+        envelope = None
+        if self.prompt_registry is not None:
+            envelope = self.prompt_registry.render_template(
+                PromptTemplateId.MEMORY_TOPIC_SUMMARY,
+                {"segment_count": len(segments), "combined_segments": combined},
+            )
+            prompt = envelope.prompt
+            system_prompt = envelope.system_prompt
 
         try:
+            lane_key = self._memory_lane_key(session_id)
             result = await self.gateway.call_data_process_task(
-                prompt,
+                prompt=prompt,
+                system_prompt=system_prompt,
                 is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=session_id or "global", scope_kind="global"),
+                lane_key=lane_key,
                 base_origin="",
+                template_envelope=envelope,
             )
             summaries = self._parse_summaries(result, len(segments))
             return summaries

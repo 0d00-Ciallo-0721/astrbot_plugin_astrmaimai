@@ -1,0 +1,28 @@
+[5612:5516:0519/215037.654:ERROR:chrome\installer\util\google_update_settings_win.cc:517] Failed opening key Software\Microsoft\EdgeUpdate\ClientStateMedium\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062} to set usagestats; result: 5
+[5612:5516:0519/215037.654:ERROR:chrome\installer\util\google_update_settings_win.cc:550] Failed opening key Software\Microsoft\EdgeUpdate\ClientStateMedium\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062} to set urlstats; result: 5
+[5612:6008:0519/215037.689:WARNING:chrome\browser\extensions\activity_log\activity_log_policy.cc:71] Scheduling init
+[5612:6008:0519/215037.689:WARNING:chrome\browser\extensions\activity_log\activity_log_policy.cc:71] Scheduling init
+[23248:11972:0519/215037.713:ERROR:ui\gl\direct_composition_support.cc:243] GetGpuDriverOverlayInfo: Failed to retrieve video device
+[5612:16468:0519/215037.814:INFO:chrome\common\importer\edge_chrome_importer_utils_win.cc:34] Google chrome user data path not found.
+[5612:16468:0519/215037.816:ERROR:chrome\browser\importer\edge_china_browsers\edge_qqbrowser_importer_utils_win.cc:164] QQBrowser user data path not found.
+[5612:6008:0519/215040.344:ERROR:mojo\public\cpp\bindings\lib\interface_endpoint_client.cc:748] Message 7 rejected by interface blink.mojom.WidgetHost
+[5612:6008:0519/215040.344:ERROR:mojo\public\cpp\bindings\lib\interface_endpoint_client.cc:748] Message 8 rejected by interface blink.mojom.WidgetHost
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.355:INFO:CONSOLE:0] "Tracking Prevention blocked access to storage for https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js.", source: http://127.0.0.1:6185/ (0)
+[5612:6008:0519/215040.529:INFO:CONSOLE:1493] "🌍 新i18n系统初始化完成", source: http://127.0.0.1:6185/assets/index-4f7Vox82.js (1493)
+[5612:6008:0519/215040.599:INFO:CONSOLE:0] "Slow network is detected. See https://www.chromestatus.com/feature/5636954674692096 for more details. Fallback font will be used while loading: http://127.0.0.1:6185/assets/materialdesignicons-webfont-subset-CBrf_aOp.woff2", source: http://127.0.0.1:6185/#/auth/login (0)
+[5612:6008:0519/215040.696:INFO:CONSOLE:0] "[DOM] Input elements should have autocomplete attributes (suggested: "current-password"): (More info: https://www.chromium.org/developers/design-documents/create-amazing-password-forms) %o", source: http://127.0.0.1:6185/#/auth/login (0)
+[5612:6008:0519/215042.152:WARNING:chrome\browser\edge_underside\underside_helper.cc:1157] If test does not need FrontLoad, this may be expected. SetFrontLoadDecision: 11
+[5612:6008:0519/215042.152:WARNING:chrome\browser\ui\edge_window_tab_manager\api\wtm_image_web_contents_helper.cc:890] Favicon request has been preempted. Skipping.  old request_start_time=2026-05-19 13:50:38.808004 UTC, pending_favicon_request_start_time_=2026-05-19 13:50:40.579357 UTC
+[5612:6008:0519/215042.152:WARNING:chrome\browser\ui\edge_window_tab_manager\api\wtm_image_web_contents_helper.cc:890] Favicon request has been preempted. Skipping.  old request_start_time=2026-05-19 13:50:40.317934 UTC, pending_favicon_request_start_time_=2026-05-19 13:50:40.579357 UTC
+[5612:6008:0519/215042.152:WARNING:chrome\browser\ui\edge_window_tab_manager\api\wtm_image_web_contents_helper.cc:890] Favicon request has been preempted. Skipping.  old request_start_time=2026-05-19 13:50:40.343288 UTC, pending_favicon_request_start_time_=2026-05-19 13:50:40.579357 UTC
+[5612:6008:0519/215042.152:WARNING:chrome\browser\ui\edge_window_tab_manager\api\wtm_image_web_contents_helper.cc:890] Favicon request has been preempted. Skipping.  old request_start_time=2026-05-19 13:50:40.570326 UTC, pending_favicon_request_start_time_=2026-05-19 13:50:40.579357 UTC
+[5612:24768:0519/215042.172:ERROR:chrome\browser\edge_aadc\user_age_utils_win.cc:163] couldn't get user2.
+[5612:24768:0519/215042.172:ERROR:chrome\browser\edge_aadc\user_age_utils_win.cc:310] couldn't get windows user age group.
+[5612:24768:0519/215042.172:ERROR:chrome\browser\edge_aadc\user_age_utils_win.cc:156] callback wasn't called.

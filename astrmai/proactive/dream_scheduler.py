@@ -31,16 +31,56 @@ class DreamScheduler:
             and self._within_dream_time_range()
         )
 
-    async def run_once(self):
+    def describe_session_eligibility(self, session_id: str, now_ts: float) -> dict:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return {
+                "eligible": False,
+                "reason": "missing_session_id",
+                "session_id": "",
+                "throttle_scope": "global",
+            }
+        if self.dream_agent is None or self.dream_generator is None:
+            return {
+                "eligible": False,
+                "reason": "dependencies_unavailable",
+                "session_id": session_id,
+                "throttle_scope": "global",
+            }
+        if not self._within_dream_time_range():
+            return {
+                "eligible": False,
+                "reason": "dream_window_closed",
+                "session_id": session_id,
+                "throttle_scope": "global",
+            }
+        if now_ts - self._last_dream_time < self._dream_interval:
+            return {
+                "eligible": False,
+                "reason": "dream_global_cooldown",
+                "session_id": session_id,
+                "throttle_scope": "global",
+            }
+        return {
+            "eligible": True,
+            "reason": "eligible",
+            "session_id": session_id,
+            "throttle_scope": "global",
+        }
+
+    def should_run_for_session(self, session_id: str, now_ts: float) -> bool:
+        return bool(self.describe_session_eligibility(session_id, now_ts).get("eligible", False))
+
+    async def _run_for_session(self, session_id: str | None) -> dict:
         if not self.dream_agent or not self.dream_generator:
-            return
+            return {"performed": False, "reason": "dependencies_unavailable", "session_id": str(session_id or ""), "throttle_scope": "global"}
         self._last_dream_time = time.time()
         min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
         self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
         async with self._bg_semaphore:
-            dream_log = await self.dream_agent.run_dream_cycle()
+            dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
             if not dream_log:
-                return
+                return {"performed": False, "reason": "no_dream_log", "session_id": str(session_id or ""), "throttle_scope": "global"}
 
             session_id = getattr(self.dream_agent, "_last_session_id", "global")
             persona_name = getattr(getattr(self.config, "persona", None), "name", "Mai")
@@ -85,6 +125,27 @@ class DreamScheduler:
                     await self.context.send_message(target, MessageChain().message(dream_text))
                 except Exception as exc:
                     logger.warning(f"[DreamScheduler] dream push degraded: {exc}")
+            return {
+                "performed": True,
+                "session_id": str(session_id or ""),
+                "dream_visible": bool(dream_text and self.dream_visible),
+                "summary": str(maintenance.get("summary", "") or ""),
+                "throttle_scope": "global",
+            }
+
+    async def run_once(self):
+        return await self._run_for_session(None)
+
+    async def run_once_for_session(self, session_id: str) -> dict:
+        eligibility = self.describe_session_eligibility(session_id, time.time())
+        if not eligibility.get("eligible", False):
+            return {
+                "performed": False,
+                "reason": str(eligibility.get("reason", "dream_global_cooldown") or "dream_global_cooldown"),
+                "session_id": str(eligibility.get("session_id", session_id) or ""),
+                "throttle_scope": "global",
+            }
+        return await self._run_for_session(session_id)
 
     def _within_dream_time_range(self) -> bool:
         time_ranges = getattr(self.config.life, "dream_time_ranges", []) if hasattr(self.config, "life") else []
@@ -132,6 +193,7 @@ class DreamScheduler:
             "last_dream_time": self._last_dream_time,
             "dream_agent_bound": self.dream_agent is not None,
             "dream_generator_bound": self.dream_generator is not None,
+            "throttle_scope": "global",
         }
 
 

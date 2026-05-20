@@ -185,6 +185,15 @@ class AstrMaiAdminPageApi:
             limit=self._int(query.get("limit"), 50),
         )
 
+    async def scheduler_status(self, request: Any) -> dict[str, Any]:
+        return await self._admin().scheduler_status_view()
+
+    async def scheduler_due_selection(self, request: Any) -> dict[str, Any]:
+        return await self._admin().scheduler_due_selection_view()
+
+    async def scheduler_chat(self, request: Any) -> dict[str, Any]:
+        return await self._admin().scheduler_chat_view(str(self._path(request).get("chat_id", "")))
+
     async def heartflow_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().heartflow_status()
 
@@ -540,6 +549,9 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/cognition/chats/{chat_id}/recent-decisions", api.chat_recent_decisions, "AstrMai chat 认知决策"),
         ("GET", "/cognition/recent-turns", api.recent_turns, "AstrMai recent turn context traces"),
         ("GET", "/cognition/chats/{chat_id}/turns", api.chat_recent_turns, "AstrMai chat turn context traces"),
+        ("GET", "/cognition/scheduler/status", api.scheduler_status, "AstrMai scheduler status diagnostics"),
+        ("GET", "/cognition/scheduler/due-selection", api.scheduler_due_selection, "AstrMai scheduler due selection diagnostics"),
+        ("GET", "/cognition/scheduler/chats/{chat_id}", api.scheduler_chat, "AstrMai scheduler chat loop diagnostics"),
         ("GET", "/heartflow/status", api.heartflow_status, "AstrMai 心流状态"),
         ("GET", "/heartflow/chats", api.heartflow_chats, "AstrMai 心流 chat 列表"),
         ("GET", "/heartflow/chats/{chat_id}", api.heartflow_chat, "AstrMai 心流 chat 详情"),

@@ -1,8 +1,8 @@
-<div id="page-dashboard" x-show="currentPage === 'dashboard'" x-data="dashboardPage()" x-cloak class="pb-10">
+﻿<div id="page-dashboard" x-show="currentPage === 'dashboard'" x-data="dashboardPage()" x-cloak class="pb-10">
     <div class="flex justify-between items-end mb-8">
         <div>
-            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">运行状态大盘</h2>
-            <p class="text-slate-400">实时监控 AstrMai 核心系统的生命周期与资源利用率</p>
+            <h2 class="text-2xl font-bold tracking-tight text-slate-100 mb-2">杩愯鐘舵€佸ぇ鐩?/h2>
+            <p class="text-slate-400">瀹炴椂鐩戞帶 AstrMai 鏍稿績绯荤粺鐨勭敓鍛藉懆鏈熶笌璧勬簮鍒╃敤鐜?/p>
         </div>
         
         <!-- Global Health Indicator -->
@@ -15,8 +15,8 @@
                         :class="!health.data.running ? 'bg-slate-500' : (health.data.degraded_count > 0 ? 'bg-amber-500' : 'bg-emerald-500')"></span>
                 </div>
                 <div class="flex flex-col">
-                    <span class="text-sm font-bold text-slate-200" x-text="!health.data.running ? '系统停止' : (health.data.degraded_count > 0 ? '部分降级运行' : '全系统健康运行')"></span>
-                    <span class="text-[10px] text-slate-400 uppercase tracking-wider" x-text="'阶段: ' + health.data.boot_phase"></span>
+                    <span class="text-sm font-bold text-slate-200" x-text="!health.data.running ? '绯荤粺鍋滄' : (health.data.degraded_count > 0 ? '閮ㄥ垎闄嶇骇杩愯' : '鍏ㄧ郴缁熷仴搴疯繍琛?)"></span>
+                    <span class="text-[10px] text-slate-400 uppercase tracking-wider" x-text="'闃舵: ' + health.data.boot_phase"></span>
                 </div>
             </div>
         </template>
@@ -29,7 +29,7 @@
                 @click="setTab('overview')">
             <div class="flex items-center gap-2">
                 <i data-lucide="layout-dashboard" class="w-4 h-4"></i>
-                <span>运行概览</span>
+                <span>杩愯姒傝</span>
             </div>
             <div class="absolute bottom-0 left-0 w-full h-0.5 bg-brand-500 rounded-t-full transition-transform duration-300"
                  :class="currentTab === 'overview' ? 'scale-x-100' : 'scale-x-0'"></div>
@@ -39,7 +39,7 @@
                 @click="setTab('heartflow')">
             <div class="flex items-center gap-2">
                 <i data-lucide="activity" class="w-4 h-4"></i>
-                <span>心智流 (Heartflow)</span>
+                <span>蹇冩櫤娴?(Heartflow)</span>
             </div>
             <div class="absolute bottom-0 left-0 w-full h-0.5 bg-rose-500 rounded-t-full transition-transform duration-300"
                  :class="currentTab === 'heartflow' ? 'scale-x-100' : 'scale-x-0'"></div>
@@ -49,7 +49,7 @@
                 @click="setTab('cognition')">
             <div class="flex items-center gap-2">
                 <i data-lucide="brain" class="w-4 h-4"></i>
-                <span>主动决策池 (Cognition)</span>
+                <span>涓诲姩鍐崇瓥姹?(Cognition)</span>
             </div>
             <div class="absolute bottom-0 left-0 w-full h-0.5 bg-purple-500 rounded-t-full transition-transform duration-300"
                  :class="currentTab === 'cognition' ? 'scale-x-100' : 'scale-x-0'"></div>
@@ -59,7 +59,7 @@
                 @click="setTab('tools')">
             <div class="flex items-center gap-2">
                 <i data-lucide="wrench" class="w-4 h-4"></i>
-                <span>工具链观测 (Tools)</span>
+                <span>宸ュ叿閾捐娴?(Tools)</span>
             </div>
             <div class="absolute bottom-0 left-0 w-full h-0.5 bg-emerald-500 rounded-t-full transition-transform duration-300"
                  :class="currentTab === 'tools' ? 'scale-x-100' : 'scale-x-0'"></div>
@@ -68,7 +68,7 @@
 
     <div x-show="loading && !stats" class="flex flex-col items-center justify-center py-20 text-slate-400">
         <i data-lucide="loader-2" class="w-8 h-8 animate-spin mb-4 text-brand-500"></i>
-        <p>正在拉取实时监控数据...</p>
+        <p>姝ｅ湪鎷夊彇瀹炴椂鐩戞帶鏁版嵁...</p>
     </div>
 
     <!-- OVERVIEW TAB -->
@@ -93,7 +93,7 @@
                             <span class="text-xs text-brand-400 font-semibold">%</span>
                         </div>
                     </div>
-                    <span class="text-sm font-medium text-slate-400">CPU 负载</span>
+                    <span class="text-sm font-medium text-slate-400">CPU 璐熻浇</span>
                 </div>
                 
                 <!-- System Memory -->
@@ -111,7 +111,7 @@
                             <span class="text-xs text-purple-400 font-semibold">%</span>
                         </div>
                     </div>
-                    <span class="text-sm font-medium text-slate-400">系统内存</span>
+                    <span class="text-sm font-medium text-slate-400">绯荤粺鍐呭瓨</span>
                 </div>
                 
                 <!-- WebUI Memory -->
@@ -120,7 +120,7 @@
                         <i data-lucide="server" class="w-8 h-8"></i>
                     </div>
                     <div>
-                        <p class="text-sm font-medium text-slate-400 mb-1">WebUI 独立进程</p>
+                        <p class="text-sm font-medium text-slate-400 mb-1">WebUI 鐙珛杩涚▼</p>
                         <h3 class="text-3xl font-bold text-slate-100 font-mono tracking-tight flex items-baseline gap-1">
                             <span x-text="stats.webui_mem_mb.toFixed(1)"></span>
                             <span class="text-xs font-semibold text-emerald-400 uppercase">MB</span>
@@ -138,13 +138,13 @@
                         <i data-lucide="database" class="w-8 h-8"></i>
                     </div>
                     <div>
-                        <p class="text-sm font-medium text-slate-400 mb-1">持久化体积</p>
+                        <p class="text-sm font-medium text-slate-400 mb-1">鎸佷箙鍖栦綋绉?/p>
                         <h3 class="text-3xl font-bold text-slate-100 font-mono tracking-tight flex items-baseline gap-1">
                             <span x-text="(stats.db_size_kb / 1024).toFixed(2)"></span>
                             <span class="text-xs font-semibold text-amber-400 uppercase">MB</span>
                         </h3>
                     </div>
-                    <p class="text-xs text-slate-500 mt-4">Astrmai 本地 SQLite</p>
+                    <p class="text-xs text-slate-500 mt-4">Astrmai 鏈湴 SQLite</p>
                 </div>
             </div>
 
@@ -156,7 +156,7 @@
                         <i data-lucide="users-round" class="w-6 h-6"></i>
                     </div>
                     <div>
-                        <p class="text-sm font-medium text-slate-400 mb-1">全局解析用户</p>
+                        <p class="text-sm font-medium text-slate-400 mb-1">鍏ㄥ眬瑙ｆ瀽鐢ㄦ埛</p>
                         <h4 class="text-3xl font-bold text-slate-100 font-mono" x-text="stats.total_users"></h4>
                     </div>
                 </div>
@@ -167,7 +167,7 @@
                         <i data-lucide="shield-alert" class="w-6 h-6"></i>
                     </div>
                     <div>
-                        <p class="text-sm font-medium text-slate-400 mb-1">待人工审核规则</p>
+                        <p class="text-sm font-medium text-slate-400 mb-1">寰呬汉宸ュ鏍歌鍒?/p>
                         <h4 class="text-3xl font-bold text-slate-100 font-mono" x-text="stats.pending_reviews"></h4>
                     </div>
                 </div>
@@ -178,7 +178,7 @@
                         <i data-lucide="brain-circuit" class="w-6 h-6"></i>
                     </div>
                     <div>
-                        <p class="text-sm font-medium text-slate-400 mb-1">长期记忆印记</p>
+                        <p class="text-sm font-medium text-slate-400 mb-1">闀挎湡璁板繂鍗拌</p>
                         <h4 class="text-3xl font-bold text-slate-100 font-mono" x-text="stats.total_memory_events"></h4>
                     </div>
                 </div>
@@ -189,8 +189,7 @@
                 <div class="glass-panel p-8">
                     <h3 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
                         <i data-lucide="network" class="w-5 h-5 text-brand-400"></i>
-                        大模型引擎连接状态
-                    </h3>
+                        澶фā鍨嬪紩鎿庤繛鎺ョ姸鎬?                    </h3>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <template x-for="(modelData, engineName) in models.data" :key="engineName">
                             <div class="bg-slate-800/40 border border-slate-700/50 rounded-lg p-4 flex justify-between items-center">
@@ -217,7 +216,7 @@
                 <div class="glass-panel p-8">
                     <h3 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
                         <i data-lucide="blocks" class="w-5 h-5 text-emerald-400"></i>
-                        能力矩阵 (Capabilities)
+                        鑳藉姏鐭╅樀 (Capabilities)
                     </h3>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <template x-for="entry in capabilityEntries()" :key="entry.key">
@@ -252,13 +251,12 @@
                         </div>
                         <div class="flex gap-2">
                             <button class="glass-btn px-3 py-1.5 text-xs hover:bg-slate-700/50" @click="openChatTraceDetails(chat.chat_id)">
-                                <i data-lucide="list-tree" class="w-3.5 h-3.5"></i>轨迹
+                                <i data-lucide="list-tree" class="w-3.5 h-3.5"></i>杞ㄨ抗
                             </button>
                             <button class="glass-btn px-3 py-1.5 text-xs hover:bg-slate-700/50" @click="openHiddenContext(chat.chat_id)">
-                                <i data-lucide="eye" class="w-3.5 h-3.5"></i>探查潜意识
-                            </button>
+                                <i data-lucide="eye" class="w-3.5 h-3.5"></i>鎺㈡煡娼滄剰璇?                            </button>
                             <button class="glass-btn px-3 py-1.5 text-xs hover:bg-slate-700/50" @click="clearCooldowns(chat.chat_id)">
-                                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>重置冷却
+                                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>閲嶇疆鍐峰嵈
                             </button>
                         </div>
                     </div>
@@ -267,7 +265,7 @@
                         <!-- Interest -->
                         <div>
                             <div class="flex justify-between text-sm mb-1">
-                                <span class="text-slate-400">兴趣度 (Interest)</span>
+                                <span class="text-slate-400">鍏磋叮搴?(Interest)</span>
                                 <span class="text-rose-400 font-bold" x-text="(chat.interest * 100).toFixed(0) + '%'"></span>
                             </div>
                             <div class="w-full bg-slate-800 rounded-full h-2">
@@ -277,7 +275,7 @@
                         <!-- Engagement -->
                         <div>
                             <div class="flex justify-between text-sm mb-1">
-                                <span class="text-slate-400">参与度 (Engagement)</span>
+                                <span class="text-slate-400">鍙備笌搴?(Engagement)</span>
                                 <span class="text-amber-400 font-bold" x-text="(chat.engagement * 100).toFixed(0) + '%'"></span>
                             </div>
                             <div class="w-full bg-slate-800 rounded-full h-2">
@@ -287,7 +285,7 @@
                         <!-- Fatigue -->
                         <div>
                             <div class="flex justify-between text-sm mb-1">
-                                <span class="text-slate-400">疲劳值 (Fatigue)</span>
+                                <span class="text-slate-400">鐤插姵鍊?(Fatigue)</span>
                                 <span class="text-purple-400 font-bold" x-text="(chat.fatigue * 100).toFixed(0) + '%'"></span>
                             </div>
                             <div class="w-full bg-slate-800 rounded-full h-2">
@@ -300,7 +298,7 @@
             <template x-if="heartflowChats.length === 0">
                 <div class="col-span-full empty-state">
                     <i data-lucide="activity"></i>
-                    <p>当前没有活跃的心智流状态</p>
+                    <p>褰撳墠娌℃湁娲昏穬鐨勫績鏅烘祦鐘舵€?/p>
                 </div>
             </template>
         </div>
@@ -308,11 +306,264 @@
 
     <!-- COGNITION TAB -->
         <div x-show="currentTab === 'cognition'" x-cloak>
-        <div class="glass-panel p-8">
+        <div class="flex flex-col gap-6">
+            <div class="glass-panel p-8">
+                <h3 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
+                    <i data-lucide="radar" class="w-5 h-5 text-violet-400"></i>
+                    Scheduler Diagnostics
+                </h3>
+                <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                    <div class="bg-slate-800/40 border border-slate-700/50 rounded-lg p-5">
+                        <div class="flex items-center justify-between mb-4">
+                            <h4 class="text-sm font-bold uppercase tracking-wider text-slate-300">Scheduler Overview</h4>
+                            <span class="status-badge status-badge-ai" x-text="schedulerStatus?.data?.scheduler_policy?.active_profile || 'balanced'"></span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3 text-sm">
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">Poll Mode</p>
+                                <p class="font-mono text-white" x-text="schedulerOverview().scheduler_poll_mode || '-'"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">Poll Interval</p>
+                                <p class="font-mono text-white" x-text="schedulerOverview().scheduler_poll_interval ?? 0"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">Due Chats</p>
+                                <p class="font-mono text-white" x-text="schedulerOverview().due_chat_count ?? 0"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">Forced Promotions</p>
+                                <p class="font-mono text-white" x-text="schedulerOverview().forced_promotion_count ?? 0"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">Maintenance Budget</p>
+                                <p class="font-mono text-white" x-text="`${schedulerOverview().maintenance_budget_remaining ?? 0}/${schedulerOverview().maintenance_budget_total ?? 0}`"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">Batch Fill</p>
+                                <p class="font-mono text-white" x-text="formatPercent(schedulerOverview().batch_fill_rate)"></p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-slate-800/40 border border-slate-700/50 rounded-lg p-5">
+                        <h4 class="text-sm font-bold uppercase tracking-wider text-slate-300 mb-4">Batch / Backpressure</h4>
+                        <div class="flex flex-wrap gap-2 mb-4">
+                            <span class="status-badge" :class="schedulerStatus?.data?.proactive?.busy_backpressure_active ? 'status-badge-danger' : 'status-badge-success'">
+                                busy_backpressure_active
+                            </span>
+                            <span class="status-badge" :class="schedulerStatus?.data?.proactive?.maintenance_backpressure_active ? 'status-badge-warning' : 'status-badge-success'">
+                                maintenance_backpressure_active
+                            </span>
+                        </div>
+                        <div class="space-y-3 text-sm">
+                            <div>
+                                <p class="text-xs text-slate-500 mb-1">scheduler_batch_plan</p>
+                                <pre class="bg-slate-900/60 border border-slate-700/40 rounded-lg p-3 text-xs text-slate-300 overflow-auto max-h-44" x-text="formatJson(schedulerStatus?.data?.proactive?.scheduler_batch_plan || {})"></pre>
+                            </div>
+                            <div>
+                                <p class="text-xs text-slate-500 mb-1">quota_skip_counts</p>
+                                <pre class="bg-slate-900/60 border border-slate-700/40 rounded-lg p-3 text-xs text-slate-300 overflow-auto max-h-32" x-text="formatJson(schedulerStatus?.data?.proactive?.quota_skip_counts || {})"></pre>
+                            </div>
+                            <div>
+                                <p class="text-xs text-slate-500 mb-1">poll_mode_transition</p>
+                                <pre class="bg-slate-900/60 border border-slate-700/40 rounded-lg p-3 text-xs text-slate-300 overflow-auto max-h-32" x-text="formatJson(schedulerStatus?.data?.proactive?.poll_mode_transition || {})"></pre>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-slate-800/40 border border-slate-700/50 rounded-lg p-5">
+                        <h4 class="text-sm font-bold uppercase tracking-wider text-slate-300 mb-4">Chat Loop Drill-down</h4>
+                        <div class="flex gap-2 mb-3">
+                            <input
+                                x-model="schedulerChatId"
+                                type="text"
+                                class="flex-1 bg-slate-900/60 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200"
+                                placeholder="chat_id"
+                            />
+                            <button class="glass-btn px-3 py-2 text-xs" @click="loadSchedulerChatLoop()">Load</button>
+                        </div>
+                        <div class="flex flex-wrap gap-2 mb-4" x-show="(schedulerReport().selected || []).length > 0">
+                            <template x-for="chatId in (schedulerReport().selected || []).slice(0, 6)" :key="chatId">
+                                <button class="px-2.5 py-1 rounded-full border border-slate-700/60 bg-slate-900/60 text-xs text-slate-300 hover:border-violet-400/40" @click="loadSchedulerChatLoop(chatId)" x-text="chatId"></button>
+                            </template>
+                        </div>
+                        <div
+                            x-show="schedulerChatLoop?.data?.state_present === false"
+                            class="mb-4 rounded-lg border border-dashed border-slate-700/60 bg-slate-900/40 px-4 py-3 text-sm text-slate-400"
+                        >
+                            暂无 loop state。该 chat 尚未进入 scheduler 跟踪。
+                        </div>
+                        <div class="grid grid-cols-2 gap-3 mb-4 text-sm">
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">phase</p>
+                                <p class="font-mono text-white" x-text="schedulerChatLoop?.data?.phase || '-'"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">next_tick_at</p>
+                                <p class="font-mono text-white" x-text="schedulerChatLoop?.data?.next_tick_at ?? 0"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">missed_due_passes</p>
+                                <p class="font-mono text-white" x-text="schedulerChatLoop?.data?.missed_due_passes ?? 0"></p>
+                            </div>
+                            <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-3">
+                                <p class="text-xs text-slate-500 mb-1">forced_promotion_count</p>
+                                <p class="font-mono text-white" x-text="schedulerChatLoop?.data?.forced_promotion_count ?? 0"></p>
+                            </div>
+                        </div>
+                        <div class="space-y-3">
+                            <div>
+                                <p class="text-xs text-slate-500 mb-1">scheduler_pending_signals</p>
+                                <pre class="bg-slate-900/60 border border-slate-700/40 rounded-lg p-3 text-xs text-slate-300 overflow-auto max-h-40" x-text="formatJson(schedulerChatLoop?.data?.scheduler_pending_signals || {})"></pre>
+                            </div>
+                            <div>
+                                <p class="text-xs text-slate-500 mb-1">last_due_selection_report</p>
+                                <pre class="bg-slate-900/60 border border-slate-700/40 rounded-lg p-3 text-xs text-slate-300 overflow-auto max-h-40" x-text="formatJson(schedulerReport())"></pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4" x-show="contextEconomy">
+                <div class="glass-panel p-6 border-t-2 border-t-purple-500">
+                    <p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Total Calls</p>
+                    <h3 class="text-3xl font-bold text-white font-mono" x-text="contextEconomy?.total_calls ?? 0"></h3>
+                </div>
+                <div class="glass-panel p-6 border-t-2 border-t-amber-500">
+                    <p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Lane Rotates</p>
+                    <h3 class="text-3xl font-bold text-white font-mono" x-text="contextEconomy?.total_rotates ?? 0"></h3>
+                </div>
+                <div class="glass-panel p-6 border-t-2 border-t-emerald-500">
+                    <p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Primary Hit</p>
+                    <h3 class="text-3xl font-bold text-white font-mono" x-text="formatPercent(contextEconomy?.primary_hit_rate)"></h3>
+                </div>
+                <div class="glass-panel p-6 border-t-2 border-t-cyan-500">
+                    <p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Session Reuse</p>
+                    <h3 class="text-3xl font-bold text-white font-mono" x-text="formatPercent(contextEconomy?.provider_session_reuse_rate)"></h3>
+                </div>
+                <div class="glass-panel p-6 border-t-2 border-t-rose-500">
+                    <p class="text-xs uppercase tracking-wider text-slate-400 mb-2">Templates</p>
+                    <h3 class="text-3xl font-bold text-white font-mono" x-text="contextEconomy?.template_count ?? 0"></h3>
+                </div>
+            </div>
+
+            <div class="glass-panel p-8">
+                <h3 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
+                    <i data-lucide="database-zap" class="w-5 h-5 text-purple-400"></i>
+                    Context Economy 妯℃澘瑙傛祴
+                </h3>
+                <div class="flex flex-wrap items-center gap-2 mb-4">
+                    <span class="text-xs uppercase tracking-wider text-slate-400 mr-1">Issue Views</span>
+                    <button
+                        type="button"
+                        title="按 lane rotate 次数从高到低查看最不稳定的模板。"
+                        class="px-3 py-1.5 rounded-full border text-xs font-medium transition-colors"
+                        :class="contextEconomyQuickView === 'high_rotate' ? 'bg-amber-500/15 border-amber-400/50 text-amber-200' : 'bg-slate-900/60 border-slate-700/60 text-slate-300 hover:border-amber-400/30'"
+                        @click="setContextEconomyQuickView('high_rotate')"
+                    >
+                        High Rotate
+                    </button>
+                    <button
+                        type="button"
+                        title="按 provider session reuse 最差优先查看缓存复用表现不好的模板。"
+                        class="px-3 py-1.5 rounded-full border text-xs font-medium transition-colors"
+                        :class="contextEconomyQuickView === 'low_reuse' ? 'bg-cyan-500/15 border-cyan-400/50 text-cyan-200' : 'bg-slate-900/60 border-slate-700/60 text-slate-300 hover:border-cyan-400/30'"
+                        @click="setContextEconomyQuickView('low_reuse')"
+                    >
+                        Low Reuse
+                    </button>
+                    <button
+                        type="button"
+                        title="按调用量从高到低查看最值得优先优化的高流量模板。"
+                        class="px-3 py-1.5 rounded-full border text-xs font-medium transition-colors"
+                        :class="contextEconomyQuickView === 'high_traffic' ? 'bg-rose-500/15 border-rose-400/50 text-rose-200' : 'bg-slate-900/60 border-slate-700/60 text-slate-300 hover:border-rose-400/30'"
+                        @click="setContextEconomyQuickView('high_traffic')"
+                    >
+                        High Traffic
+                    </button>
+                </div>
+                <p class="text-xs text-slate-500 mb-6">
+                    快捷视图会切换模板排序：先看 rotate 最多、reuse 最差或流量最高的模板，便于我们优先定位最值得优化的问题点。
+                </p>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-6">
+                    <label class="flex flex-col gap-2">
+                        <span class="text-xs uppercase tracking-wider text-slate-400">Template Filter</span>
+                        <input
+                            x-model="contextEconomyFilterText"
+                            @input.debounce.300ms="applyContextEconomyFilters()"
+                            type="text"
+                            placeholder="filter by template"
+                            class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-purple-500/40 focus:border-purple-500/50"
+                        >
+                    </label>
+                    <label class="flex flex-col gap-2">
+                        <span class="text-xs uppercase tracking-wider text-slate-400">Workload</span>
+                        <select
+                            x-model="contextEconomyWorkloadFamily"
+                            @change="applyContextEconomyFilters()"
+                            class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/40 focus:border-purple-500/50"
+                        >
+                            <option value="">All Workloads</option>
+                            <template x-for="family in contextEconomyAvailableFamilies" :key="family">
+                                <option :value="family" x-text="family"></option>
+                            </template>
+                        </select>
+                    </label>
+                    <label class="flex flex-col gap-2">
+                        <span class="text-xs uppercase tracking-wider text-slate-400">Sort</span>
+                        <select
+                            x-model="contextEconomySortBy"
+                            @change="applyContextEconomyFilters()"
+                            class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/40 focus:border-purple-500/50"
+                        >
+                            <option value="rotate">Most Rotates</option>
+                            <option value="session_reuse">Worst Session Reuse</option>
+                            <option value="calls">Most Calls</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="overflow-x-auto max-h-[520px] overflow-y-auto pr-2">
+                    <div class="flex flex-col gap-3">
+                        <template x-for="(item, index) in contextEconomyTemplates" :key="item.template_key || index">
+                            <div class="bg-slate-800/40 border border-slate-700/50 rounded-lg p-4 group hover:border-purple-500/30 transition-colors" x-data="{ expanded: false }">
+                                <div class="flex flex-wrap items-center gap-4 cursor-pointer" @click="expanded = !expanded">
+                                    <div class="min-w-[220px]">
+                                        <div class="text-sm font-bold text-white" x-text="item.template_key"></div>
+                                        <div class="text-xs text-slate-500 mt-1" x-text="formatFamilies(item.workload_families)"></div>
+                                    </div>
+                                    <span class="status-badge status-badge-ai" x-text="'calls ' + item.call_count"></span>
+                                    <span class="status-badge" :class="item.lane_rotate_count > 0 ? 'status-badge-danger' : 'status-badge-success'" x-text="'rotate ' + item.lane_rotate_count"></span>
+                                    <span class="text-xs text-emerald-300 font-mono" x-text="'primary ' + formatPercent(item.primary_hit_rate)"></span>
+                                    <span class="text-xs text-cyan-300 font-mono" x-text="'session ' + formatPercent(item.provider_session_reuse_rate)"></span>
+                                    <span class="text-xs text-slate-400 font-mono" x-text="'shell ' + item.avg_stable_prefix_length.toFixed(1)"></span>
+                                    <span class="text-xs text-slate-400 font-mono" x-text="'payload ' + item.avg_dynamic_payload_length.toFixed(1)"></span>
+                                    <button class="icon-btn ml-auto">
+                                        <i data-lucide="chevron-down" class="w-4 h-4 transition-transform" :class="expanded ? 'rotate-180' : ''"></i>
+                                    </button>
+                                </div>
+                                <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
+                                    <div class="flex justify-end mb-2">
+                                        <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(item)">
+                                            <i data-lucide="copy" class="w-3.5 h-3.5"></i> 婢跺秴鍩?JSON
+                                        </button>
+                                    </div>
+                                    <div class="json-preview" x-text="formatJson(item)"></div>
+                                </div>
+                            </div>
+                        </template>
+                        <template x-if="contextEconomyTemplates.length === 0">
+                            <div class="empty-state border-none bg-transparent p-4">
+                                <i data-lucide="database-zap"></i>
+                                <p x-text="contextEconomyFilterText || contextEconomyWorkloadFamily ? '当前筛选条件下暂无模板结果。' : '暂无模板级 Context Economy 指标。'"></p>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass-panel p-8">
             <h3 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
                 <i data-lucide="brain" class="w-5 h-5 text-purple-400"></i>
-                最近主观决策流水
-            </h3>
+                鏈€杩戜富瑙傚喅绛栨祦姘?            </h3>
             
             <div class="relative border-l border-slate-700/50 ml-3 space-y-4 max-h-[520px] overflow-y-auto pr-2">
                 <template x-for="(decision, index) in recentDecisions" :key="index">
@@ -324,7 +575,7 @@
                                 <span class="text-sm font-bold text-white" x-text="decision.chat_id"></span>
                                 <span class="text-xs text-slate-500" x-text="formatTime(decision.created_at)"></span>
                                 <span class="status-badge status-badge-ai" x-text="decision.action"></span>
-                                <span class="text-xs text-slate-400" x-text="decision.social_intent || '无意图'"></span>
+                                <span class="text-xs text-slate-400" x-text="decision.social_intent || '鏃犳剰鍥?"></span>
                                 <span class="text-xs text-slate-500 font-mono" x-text="decision.action_tier"></span>
                                 
                                 <button class="icon-btn ml-auto">
@@ -335,7 +586,7 @@
                             <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
                                 <div class="flex justify-end mb-2">
                                     <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(decision)">
-                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制 JSON
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 澶嶅埗 JSON
                                     </button>
                                 </div>
                                 <div class="json-preview" x-text="formatJson(decision)"></div>
@@ -344,7 +595,7 @@
                     </div>
                 </template>
                 <template x-if="recentDecisions.length === 0">
-                    <div class="pl-6 text-slate-500 py-4">暂无主观决策流水...</div>
+                    <div class="pl-6 text-slate-500 py-4">鏆傛棤涓昏鍐崇瓥娴佹按...</div>
                 </template>
             </div>
         </div>
@@ -387,7 +638,7 @@
                 <div class="glass-panel p-8 border border-emerald-500/20">
                     <h4 class="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4 flex items-center gap-2">
                         <i data-lucide="shield-check" class="w-4 h-4 text-emerald-400"></i>
-                        工具策略说明
+                        宸ュ叿绛栫暐璇存槑
                     </h4>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                         <template x-for="rule in toolsPolicy.data.rules" :key="rule">
@@ -401,8 +652,7 @@
             <div class="glass-panel p-8 mt-4">
                 <h3 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
                     <i data-lucide="wrench" class="w-5 h-5 text-emerald-400"></i>
-                    最近工具调用轨迹
-                </h3>
+                    鏈€杩戝伐鍏疯皟鐢ㄨ建杩?                </h3>
                 <div class="overflow-x-auto max-h-[520px] overflow-y-auto pr-2">
                     <div class="flex flex-col gap-3">
                         <template x-for="(call, index) in recentToolCalls" :key="index">
@@ -427,7 +677,7 @@
                                 <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
                                     <div class="flex justify-end mb-2">
                                         <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(call)">
-                                            <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制 JSON
+                                            <i data-lucide="copy" class="w-3.5 h-3.5"></i> 澶嶅埗 JSON
                                         </button>
                                     </div>
                                     <div class="json-preview" x-text="formatJson(call)"></div>
@@ -437,7 +687,7 @@
                         <template x-if="recentToolCalls.length === 0">
                             <div class="empty-state">
                                 <i data-lucide="wrench"></i>
-                                <p>暂无近期工具调用记录...</p>
+                                <p>鏆傛棤杩戞湡宸ュ叿璋冪敤璁板綍...</p>
                             </div>
                         </template>
                     </div>
@@ -453,21 +703,21 @@
                 <div>
                     <h3 class="text-xl font-bold text-white flex items-center gap-2">
                         <i data-lucide="list-tree" class="w-5 h-5 text-purple-400"></i>
-                        Chat 轨迹详情
+                        Chat 杞ㄨ抗璇︽儏
                     </h3>
                     <p class="text-xs text-slate-400 mt-1 font-mono" x-text="activeTraceChat"></p>
                 </div>
-                <button class="glass-btn px-3 py-1.5 text-xs" @click="showChatTraceModal = false">关闭</button>
+                <button class="glass-btn px-3 py-1.5 text-xs" @click="showChatTraceModal = false">鍏抽棴</button>
             </div>
 
             <div x-show="chatTraceLoading" class="py-10 text-center text-slate-400">
                 <i data-lucide="loader-2" class="w-6 h-6 animate-spin mx-auto mb-3 text-purple-400"></i>
-                正在读取该 chat 的决策与工具轨迹...
+                姝ｅ湪璇诲彇璇?chat 鐨勫喅绛栦笌宸ュ叿杞ㄨ抗...
             </div>
 
             <div x-show="!chatTraceLoading" class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div class="bg-slate-900/40 border border-white/5 rounded-lg p-4 max-h-[520px] overflow-auto">
-                    <h4 class="text-sm font-bold text-slate-300 mb-4">最近主观决策</h4>
+                    <h4 class="text-sm font-bold text-slate-300 mb-4">鏈€杩戜富瑙傚喅绛?/h4>
                     <template x-for="(decision, index) in chatDecisions" :key="index">
                         <div class="mb-3 rounded-lg bg-slate-800/60 border border-white/5 p-3 group" x-data="{ expanded: false }">
                             <div class="flex justify-between items-center gap-3 cursor-pointer" @click="expanded = !expanded">
@@ -484,18 +734,18 @@
                             <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
                                 <div class="flex justify-end mb-2">
                                     <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(decision)">
-                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 澶嶅埗
                                     </button>
                                 </div>
                                 <div class="json-preview" x-text="formatJson(decision)"></div>
                             </div>
                         </div>
                     </template>
-                    <div x-show="chatDecisions.length === 0" class="text-sm text-slate-500">暂无该 chat 的决策记录。</div>
+                    <div x-show="chatDecisions.length === 0" class="text-sm text-slate-500">鏆傛棤璇?chat 鐨勫喅绛栬褰曘€?/div>
                 </div>
 
                 <div class="bg-slate-900/40 border border-white/5 rounded-lg p-4 max-h-[520px] overflow-auto">
-                    <h4 class="text-sm font-bold text-slate-300 mb-4">最近工具轨迹</h4>
+                    <h4 class="text-sm font-bold text-slate-300 mb-4">鏈€杩戝伐鍏疯建杩?/h4>
                     <template x-for="(call, index) in chatToolCalls" :key="index">
                         <div class="mb-3 rounded-lg bg-slate-800/60 border border-white/5 p-3" x-data="{ expanded: false }">
                             <div class="flex justify-between items-center gap-3 cursor-pointer" @click="expanded = !expanded">
@@ -516,14 +766,14 @@
                             <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
                                 <div class="flex justify-end mb-2">
                                     <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(call)">
-                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 澶嶅埗
                                     </button>
                                 </div>
                                 <div class="json-preview" x-text="formatJson(call)"></div>
                             </div>
                         </div>
                     </template>
-                    <div x-show="chatToolCalls.length === 0" class="text-sm text-slate-500">暂无该 chat 的工具轨迹。</div>
+                    <div x-show="chatToolCalls.length === 0" class="text-sm text-slate-500">鏆傛棤璇?chat 鐨勫伐鍏疯建杩广€?/div>
                 </div>
             </div>
         </div>
@@ -534,7 +784,7 @@
         <div class="glass-panel w-full max-w-2xl p-6 border border-slate-700 shadow-2xl max-h-[90vh] overflow-y-auto" @click.away="showHiddenContextModal = false">
             <h3 class="text-xl font-bold text-slate-100 mb-2 flex items-center gap-2">
                 <i data-lucide="eye" class="w-5 h-5 text-brand-400"></i>
-                潜意识档案 (Hidden Context)
+                娼滄剰璇嗘。妗?(Hidden Context)
             </h3>
             <p class="text-xs text-slate-400 mb-6 font-mono" x-text="activeHiddenContextChat"></p>
             
@@ -544,7 +794,7 @@
             </div>
             
             <div class="flex justify-end gap-3 mt-8">
-                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-brand-500 hover:bg-brand-600 text-white transition-colors" @click="showHiddenContextModal = false">关 闭</button>
+                <button class="px-5 py-2 rounded-lg text-sm font-medium bg-brand-500 hover:bg-brand-600 text-white transition-colors" @click="showHiddenContextModal = false">鍏?闂?/button>
             </div>
         </div>
     </div>

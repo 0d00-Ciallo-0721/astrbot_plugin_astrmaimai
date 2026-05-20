@@ -7,6 +7,7 @@ import time
 
 from astrbot.api import logger
 
+from ..infrastructure.context_economy import PromptTemplateId
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..learning.profiling.nickname_generator import NicknameGenerator
 from ..learning.profiling.profile_generator import ProfileGenerator
@@ -16,6 +17,7 @@ from .decay_service import DecayService
 from .diary_service import DiaryService
 from .dream_scheduler import DreamScheduler
 from .dispatcher import ProactiveDispatcher
+from .group_signin_service import GroupSigninService
 from .heartflow import HeartflowManager, HeartflowTopicDigestService
 from .review_dispatcher import ReviewDispatcher
 from .wakeup_service import WakeupService
@@ -23,6 +25,13 @@ from .wakeup_service import WakeupService
 
 class ProactiveTask:
     """Refactoring-side lifecycle scheduler that delegates concrete jobs to subservices."""
+
+    FAST_POLL_INTERVAL_SECONDS = 5.0
+    NORMAL_POLL_INTERVAL_SECONDS = 10.0
+    IDLE_POLL_INTERVAL_SECONDS = 15.0
+    GLOBAL_MAINTENANCE_INTERVAL_SECONDS = 60.0
+    HEARTBEAT_DUE_HORIZON_SECONDS = 2.0
+    HEARTBEAT_MAX_BATCH = 32
 
     def __init__(
         self,
@@ -42,6 +51,7 @@ class ProactiveTask:
         self.persistence = persistence
         self.memory_engine = memory_engine
         self.reflector = reflector
+        self.runtime_coordinator = runtime_coordinator
         self.auto_check_task = None
         self.reflect_tracker = None
         self.config = config if config else gateway.config
@@ -51,9 +61,33 @@ class ProactiveTask:
         self._bg_semaphore = asyncio.Semaphore(2)
         self._last_profile_run = 0.0
         self._last_diary_date = ""
+        self._last_global_maintenance_run = 0.0
+        self._last_due_chat_count = 0
+        self._last_skipped_not_due_count = 0
+        self._scheduler_poll_mode = "FAST"
+        self._scheduler_poll_interval_seconds = self.FAST_POLL_INTERVAL_SECONDS
+        self._last_due_phase_mix: dict[str, int] = {}
+        self._last_maintenance_budget_total = 0
+        self._last_maintenance_budget_used = 0
+        self._last_maintenance_budget_remaining = 0
+        self._scheduler_batch_limit = self.HEARTBEAT_MAX_BATCH
+        self._last_scheduler_batch_plan: dict[str, int] = {}
+        self._last_batch_fill_rate = 0.0
+        self._last_forced_promotion_count = 0
+        self._last_quota_skip_counts: dict[str, int] = {}
+        self._last_selection_summary: dict[str, Any] = {}
+        self._busy_backpressure_active = False
+        self._maintenance_backpressure_active = False
+        self._last_poll_mode_transition = {
+            "previous": "FAST",
+            "current": "FAST",
+            "reason": "startup",
+        }
         self._db_service = None
+        self.chat_loop_kernel = None
         self.profile_generator = ProfileGenerator()
         self.nickname_generator = NicknameGenerator()
+        self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
         self.proactive_dispatcher = ProactiveDispatcher(
             attention_gate=attention_gate,
             runtime_coordinator=runtime_coordinator,
@@ -69,6 +103,13 @@ class ProactiveTask:
             config=self.config,
             dispatcher=self.proactive_dispatcher,
             memory_engine=memory_engine,
+            prompt_registry=self.prompt_registry,
+        )
+        self.group_signin_service = GroupSigninService(
+            state_engine=state_engine,
+            persistence=persistence,
+            dispatcher=self.proactive_dispatcher,
+            config=self.config,
         )
         self.decay_service = DecayService(state_engine, memory_engine, self.config)
         self.diary_service = DiaryService(
@@ -77,6 +118,7 @@ class ProactiveTask:
             config=self.config,
             call_background_lane=self._call_background_lane,
             semaphore=self._bg_semaphore,
+            prompt_registry=self.prompt_registry,
         )
         self.dream_scheduler = DreamScheduler(
             context=context,
@@ -101,19 +143,30 @@ class ProactiveTask:
         self.dream_generator = DreamGenerator(gateway, config=self.config)
         self.dream_agent = None
 
-    async def _call_background_lane(self, task_family: str, scope_id: str, prompt: str, system_prompt: str = "") -> str:
+    async def _call_background_lane(
+        self,
+        task_family: str,
+        scope_id: str,
+        prompt: str,
+        system_prompt: str = "",
+        template_envelope=None,
+    ) -> str:
         return await self.gateway.call_proactive_task(
             prompt=prompt,
             system_prompt=system_prompt,
             lane_key=LaneKey(subsystem="bg", task_family=task_family, scope_id=scope_id or "global", scope_kind="global"),
             base_origin="",
             persona_id=getattr(self.config.persona, "persona_id", "") or "global",
+            template_envelope=template_envelope,
         )
 
     async def start(self):
         if self._is_running:
             return
         self._is_running = True
+        self._last_global_maintenance_run = time.time()
+        self._scheduler_poll_mode = "FAST"
+        self._scheduler_poll_interval_seconds = self.FAST_POLL_INTERVAL_SECONDS
         if self.dream_agent is None and self._db_service:
             self._bind_dream_dependencies()
         self._task = asyncio.create_task(self._loop())
@@ -127,6 +180,27 @@ class ProactiveTask:
         self._db_service = db_service
         if self._is_running and self.dream_agent is None:
             self._bind_dream_dependencies()
+
+    def bind_chat_loop_kernel(self, chat_loop_kernel) -> None:
+        self.chat_loop_kernel = chat_loop_kernel
+        if chat_loop_kernel is None:
+            return
+        if hasattr(chat_loop_kernel, "bind_heartbeat_handler"):
+            chat_loop_kernel.bind_heartbeat_handler(self.handle_chat_heartbeat)
+        if hasattr(chat_loop_kernel, "bind_signal_sources"):
+            chat_loop_kernel.bind_signal_sources(
+                wakeup_service=self.wakeup_service,
+                heartflow_manager=self.heartflow_manager,
+                memory_service=self.memory_engine,
+                dream_scheduler=self.dream_scheduler,
+                context_compaction=getattr(self.state_engine, "context_compaction", None),
+            )
+        if hasattr(chat_loop_kernel, "bind_dispatch_bridge"):
+            chat_loop_kernel.bind_dispatch_bridge("PROACTIVE_WAKEUP", self.handle_wakeup_signal)
+            chat_loop_kernel.bind_dispatch_bridge("HEARTFLOW_EVALUATE", self.handle_heartflow_signal)
+            chat_loop_kernel.bind_dispatch_bridge("DREAM_MAINTENANCE", self.handle_dream_signal)
+            chat_loop_kernel.bind_dispatch_bridge("MEMORY_MAINTENANCE", self.handle_memory_signal)
+            chat_loop_kernel.bind_dispatch_bridge("COMPACTION_EVALUATE", self.handle_compaction_signal)
 
     def _bind_dream_dependencies(self):
         self.dream_agent = DreamAgent(
@@ -217,8 +291,21 @@ class ProactiveTask:
         if recent_summary:
             setattr(profile, "recent_interaction_summary", recent_summary)
         summary = await self._load_persona_summary()
-        prompt = self.profile_generator.build_prompt(profile, summary)
-        result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
+        if self.prompt_registry is not None:
+            envelope = self.prompt_registry.render_template(
+                PromptTemplateId.PROFILE_GENERATION,
+                self.profile_generator.build_template_payload(profile, summary),
+            )
+            result = await self._call_background_lane(
+                "profile",
+                str(getattr(profile, "user_id", profile.name)),
+                envelope.prompt,
+                system_prompt=envelope.system_prompt,
+                template_envelope=envelope,
+            )
+        else:
+            prompt = self.profile_generator.build_prompt(profile, summary)
+            result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
         parsed = self.profile_generator.parse_result(result)
         analysis = parsed["analysis"]
         tags = parsed["tags"]
@@ -258,8 +345,21 @@ class ProactiveTask:
         if hasattr(self.state_engine, "user_profile_service") and not self.state_engine.user_profile_service.can_auto_update_nickname(profile):
             return
         summary = await self._load_persona_summary()
-        prompt = self.nickname_generator.build_prompt(profile, summary)
-        result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
+        if self.prompt_registry is not None:
+            envelope = self.prompt_registry.render_template(
+                PromptTemplateId.PROFILE_NICKNAME_GENERATION,
+                self.nickname_generator.build_template_payload(profile, summary),
+            )
+            result = await self._call_background_lane(
+                "profile",
+                str(getattr(profile, "user_id", profile.name)),
+                envelope.prompt,
+                system_prompt=envelope.system_prompt,
+                template_envelope=envelope,
+            )
+        else:
+            prompt = self.nickname_generator.build_prompt(profile, summary)
+            result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
         nickname, reason = self.nickname_generator.parse_result(result)
         nickname = self.nickname_generator.choose(getattr(profile, "name", ""), preferred=nickname)
         if not nickname:
@@ -328,24 +428,273 @@ class ProactiveTask:
         await asyncio.sleep(random.randint(1, 300))
         await self.diary_service.run_once(self.state_engine.get_active_states())
 
+    async def handle_chat_heartbeat(self, chat_id: str, snapshot, decision) -> dict:
+        decision.metadata["dispatch_mode"] = "observe_only"
+        hidden_context = ""
+        manager = getattr(self, "heartflow_manager", None)
+        if manager is not None and hasattr(manager, "get_hidden_context"):
+            try:
+                hidden_context = str(manager.get_hidden_context(chat_id) or "")
+            except Exception as exc:
+                logger.debug(f"[ProactiveTask] heartflow hidden context degraded for {chat_id}: {exc}")
+        return {
+            "chat_id": chat_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "executor_pending": snapshot.executor_pending,
+            "wait_targets_count": len(snapshot.wait_targets),
+            "has_hidden_context": bool(hidden_context.strip()),
+            "dispatch_mode": "observe_only",
+        }
+
+    async def handle_wakeup_signal(self, chat_id: str, snapshot, decision) -> dict:
+        decision.metadata["dispatch_mode"] = "kernel_mediated"
+        decision.metadata["dispatch_bridge"] = "PROACTIVE_WAKEUP"
+        decision.metadata["wakeup_candidate_present"] = bool(getattr(snapshot, "proactive_summary", {}).get("candidate_present", False))
+        decision.metadata["wakeup_cooldown_until"] = float(getattr(snapshot, "proactive_summary", {}).get("next_wakeup_timestamp", 0.0) or 0.0)
+        result = await self.wakeup_service.run_for_chat(chat_id)
+        cooldown_until = 0.0
+        proactive_summary = dict(getattr(snapshot, "latest_activity", {}).get("proactive_summary", {}) or {})
+        if bool(result.get("performed", False)) and not bool(result.get("reason") == "quiet_hours"):
+            cooldown_until = float(proactive_summary.get("next_wakeup_timestamp", 0.0) or 0.0)
+            if cooldown_until <= time.time():
+                cooldown_seconds = float(proactive_summary.get("wakeup_cooldown", 0.0) or 0.0)
+                if cooldown_seconds > 0:
+                    cooldown_until = time.time() + cooldown_seconds
+            if cooldown_until > time.time() and self.chat_loop_kernel is not None:
+                await self.chat_loop_kernel.set_cooldown(chat_id, "wakeup", cooldown_until, reason=str(result.get("reason", "") or "wakeup_dispatch"))
+        return {
+            "chat_id": chat_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "dispatch_mode": "kernel_mediated",
+            "bridge": "PROACTIVE_WAKEUP",
+            "result": result,
+            "cooldown_until": cooldown_until,
+            "cooldown_reason": str(result.get("reason", "") or "wakeup_dispatch"),
+        }
+
+    async def handle_heartflow_signal(self, chat_id: str, snapshot, decision) -> dict:
+        decision.metadata["dispatch_mode"] = "kernel_mediated"
+        decision.metadata["dispatch_bridge"] = "HEARTFLOW_EVALUATE"
+        result = await self.heartflow_manager.tick_chat(chat_id, snapshot=dict(getattr(snapshot, "latest_activity", {}) or {}))
+        cooldown_until = 0.0
+        visible_dispatch_performed = bool(
+            result.get("visible_dispatch_performed", False) or result.get("synthetic_event_queued", False)
+        )
+        decision.metadata["heartflow_dispatch_performed"] = bool(result.get("performed", False))
+        decision.metadata["heartflow_visible_dispatch"] = visible_dispatch_performed
+        if visible_dispatch_performed:
+            cooldown_seconds = float(getattr(self.heartflow_manager, "VISIBLE_CANDIDATE_COOLDOWN_SECONDS", 0.0) or 0.0)
+            if cooldown_seconds > 0:
+                cooldown_until = time.time() + cooldown_seconds
+                if self.chat_loop_kernel is not None:
+                    await self.chat_loop_kernel.set_cooldown(chat_id, "heartflow", cooldown_until, reason="heartflow_dispatch")
+        return {
+            "chat_id": chat_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "dispatch_mode": "kernel_mediated",
+            "bridge": "HEARTFLOW_EVALUATE",
+            "result": result,
+            "cooldown_until": cooldown_until,
+            "cooldown_reason": "heartflow_dispatch" if cooldown_until > 0 else "",
+            "visible_dispatch_performed": visible_dispatch_performed,
+        }
+
+    async def handle_dream_signal(self, chat_id: str, snapshot, decision) -> dict:
+        decision.metadata["dispatch_mode"] = "kernel_mediated"
+        decision.metadata["dispatch_bridge"] = "DREAM_MAINTENANCE"
+        result = await self.dream_scheduler.run_once_for_session(chat_id)
+        if isinstance(result, dict):
+            result.setdefault("throttle_scope", "global")
+        return {
+            "chat_id": chat_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "dispatch_mode": "kernel_mediated",
+            "bridge": "DREAM_MAINTENANCE",
+            "result": result,
+        }
+
+    async def handle_memory_signal(self, chat_id: str, snapshot, decision) -> dict:
+        decision.metadata["dispatch_mode"] = "kernel_mediated"
+        decision.metadata["dispatch_bridge"] = "MEMORY_MAINTENANCE"
+        summarizer = getattr(self.memory_engine, "summarizer", None)
+        if summarizer is None or not hasattr(summarizer, "run_once_for_session"):
+            result = {"performed": False, "reason": "memory_summarizer_unavailable"}
+        else:
+            result = await summarizer.run_once_for_session(chat_id)
+        return {
+            "chat_id": chat_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "dispatch_mode": "kernel_mediated",
+            "bridge": "MEMORY_MAINTENANCE",
+            "result": result,
+        }
+
+    async def handle_compaction_signal(self, chat_id: str, snapshot, decision) -> dict:
+        decision.metadata["dispatch_mode"] = "kernel_mediated"
+        decision.metadata["dispatch_bridge"] = "COMPACTION_EVALUATE"
+        engine = getattr(self.state_engine, "context_compaction", None)
+        if engine is None or not hasattr(engine, "maybe_compact"):
+            return {
+                "chat_id": chat_id,
+                "action": decision.action,
+                "reason": decision.reason,
+                "dispatch_mode": "kernel_mediated",
+                "bridge": "COMPACTION_EVALUATE",
+                "result": {"performed": False, "reason": "compaction_unavailable"},
+            }
+        result = await engine.maybe_compact(chat_id)
+        cooldown_until = 0.0
+        if hasattr(engine, "get_cooldown_until"):
+            try:
+                cooldown_until = float(await engine.get_cooldown_until(chat_id) if asyncio.iscoroutinefunction(engine.get_cooldown_until) else engine.get_cooldown_until(chat_id) or 0.0)
+            except Exception as exc:
+                logger.debug(f"[ProactiveTask] compaction cooldown lookup degraded for {chat_id}: {exc}")
+                cooldown_until = 0.0
+        if cooldown_until > time.time() and self.chat_loop_kernel is not None:
+            await self.chat_loop_kernel.set_cooldown(chat_id, "compaction", cooldown_until, reason=str(getattr(result, "reason", "") or getattr(result, "skipped_reason", "") or "compaction_dispatch"))
+        return {
+            "chat_id": chat_id,
+            "action": decision.action,
+            "reason": decision.reason,
+            "dispatch_mode": "kernel_mediated",
+            "bridge": "COMPACTION_EVALUATE",
+            "result": result,
+            "cooldown_until": cooldown_until,
+            "cooldown_reason": str(getattr(result, "reason", "") or getattr(result, "skipped_reason", "") or "compaction_dispatch"),
+        }
+
+    async def _run_chat_heartbeat_pass(self) -> list[dict]:
+        if self.runtime_coordinator is None or self.chat_loop_kernel is None:
+            self._last_due_chat_count = 0
+            self._last_skipped_not_due_count = 0
+            self._last_due_phase_mix = {}
+            self._set_scheduler_poll_mode("IDLE")
+            return []
+        if not hasattr(self.runtime_coordinator, "list_active_chats"):
+            self._last_due_chat_count = 0
+            self._last_skipped_not_due_count = 0
+            self._last_due_phase_mix = {}
+            self._set_scheduler_poll_mode("IDLE")
+            return []
+        try:
+            chat_ids = await self.runtime_coordinator.list_active_chats()
+        except Exception as exc:
+            logger.debug(f"[ProactiveTask] active chat scan degraded for kernel heartbeat: {exc}")
+            self._last_due_chat_count = 0
+            self._last_skipped_not_due_count = 0
+            self._last_due_phase_mix = {}
+            self._set_scheduler_poll_mode("IDLE")
+            return []
+        try:
+            selection_report = await self.chat_loop_kernel.describe_due_selection(
+                chat_ids,
+                now=time.time(),
+                horizon_seconds=self.HEARTBEAT_DUE_HORIZON_SECONDS,
+                max_batch=self.HEARTBEAT_MAX_BATCH,
+            )
+        except Exception as exc:
+            logger.debug(f"[ProactiveTask] due chat selection degraded for kernel heartbeat: {exc}")
+            selection_report = {
+                "selected": list(chat_ids or []),
+                "skipped_not_due": [],
+                "score_breakdown": {},
+                "due_phase_mix": {},
+                "poll_mode": "FAST",
+                "maintenance_budget_total": 0,
+                "maintenance_budget_used": 0,
+                "maintenance_budget_remaining": 0,
+                "maintenance_blocked_by_budget": [],
+            }
+        due_chat_ids = list(selection_report.get("selected", []) or [])
+        previous_poll_mode = self._scheduler_poll_mode
+        self._last_due_chat_count = len(due_chat_ids)
+        self._last_skipped_not_due_count = len(selection_report.get("skipped_not_due", []) or [])
+        self._last_due_phase_mix = dict(selection_report.get("due_phase_mix", {}) or {})
+        self._last_maintenance_budget_total = int(selection_report.get("maintenance_budget_total", 0) or 0)
+        self._last_maintenance_budget_used = int(selection_report.get("maintenance_budget_used", 0) or 0)
+        self._last_maintenance_budget_remaining = int(selection_report.get("maintenance_budget_remaining", 0) or 0)
+        self._scheduler_batch_limit = int(dict(selection_report.get("batch_plan", {}) or {}).get("total_limit", self.HEARTBEAT_MAX_BATCH) or self.HEARTBEAT_MAX_BATCH)
+        self._last_scheduler_batch_plan = dict(selection_report.get("batch_plan", {}) or {})
+        self._last_batch_fill_rate = float(selection_report.get("batch_fill_rate", 0.0) or 0.0)
+        self._last_forced_promotion_count = len(list(selection_report.get("forced_promotions_selected", []) or []))
+        self._last_quota_skip_counts = dict(selection_report.get("quota_skip_counts", {}) or {})
+        self._busy_backpressure_active = bool(selection_report.get("busy_backpressure_active", False))
+        self._maintenance_backpressure_active = bool(selection_report.get("maintenance_backpressure_active", False))
+        self._last_selection_summary = {
+            "selected_count": len(due_chat_ids),
+            "forced_promotion_count": self._last_forced_promotion_count,
+            "dialogue_selected_count": len(list(selection_report.get("dialogue_selected", []) or [])),
+            "maintenance_selected_count": len(list(selection_report.get("maintenance_selected", []) or [])),
+            "skipped_by_batch_count": len(list(selection_report.get("skipped_by_batch", []) or [])),
+        }
+        self._set_scheduler_poll_mode(str(selection_report.get("poll_mode", "IDLE") or "IDLE"))
+        self._last_poll_mode_transition = {
+            "previous": previous_poll_mode,
+            "current": self._scheduler_poll_mode,
+            "reason": str(selection_report.get("poll_mode_reason", "") or ""),
+        }
+        if hasattr(self.chat_loop_kernel, "commit_due_selection_counters"):
+            try:
+                await self.chat_loop_kernel.commit_due_selection_counters(selection_report)
+            except Exception as exc:
+                logger.debug(f"[ProactiveTask] due selection counter commit degraded: {exc}")
+        results: list[dict] = []
+        if hasattr(self.chat_loop_kernel, "set_heartbeat_scheduler_context"):
+            self.chat_loop_kernel.set_heartbeat_scheduler_context(selection_report)
+        try:
+            for chat_id in due_chat_ids:
+                try:
+                    tick = await self.chat_loop_kernel.tick(chat_id=str(chat_id or ""), trigger="heartbeat")
+                    results.append(
+                        {
+                            "chat_id": str(chat_id or ""),
+                            "action": tick.decision.action,
+                            "reason": tick.decision.reason,
+                        }
+                    )
+                except Exception as exc:
+                    logger.debug(f"[ProactiveTask] kernel heartbeat degraded for {chat_id}: {exc}")
+        finally:
+            final_context = {}
+            if hasattr(self.chat_loop_kernel, "get_heartbeat_scheduler_context"):
+                try:
+                    final_context = dict(self.chat_loop_kernel.get_heartbeat_scheduler_context() or {})
+                except Exception:
+                    final_context = {}
+            if hasattr(self.chat_loop_kernel, "clear_heartbeat_scheduler_context"):
+                self.chat_loop_kernel.clear_heartbeat_scheduler_context()
+        if final_context:
+            self._last_maintenance_budget_used = int(final_context.get("maintenance_budget_used", 0) or 0)
+            self._last_maintenance_budget_remaining = int(final_context.get("maintenance_budget_remaining", 0) or 0)
+        else:
+            self._last_maintenance_budget_used = int(selection_report.get("maintenance_budget_used", 0) or 0)
+            self._last_maintenance_budget_remaining = int(selection_report.get("maintenance_budget_remaining", 0) or 0)
+        return results
+
     async def _loop(self):
         while self._is_running:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(self._scheduler_poll_interval_seconds)
+                await self._run_chat_heartbeat_pass()
+                now = time.time()
+                if (now - self._last_global_maintenance_run) < self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS:
+                    continue
+
+                self._last_global_maintenance_run = now
                 await self.decay_service.run_once()
-                await self.wakeup_service.run_once()
-                await self.heartflow_manager.tick()
+                await self.group_signin_service.run_once()
                 self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
 
-                now = time.time()
                 if now - self._last_profile_run > 3600:
                     await self._run_profiling_task()
                     self._last_profile_run = now
 
                 await self._run_reflection_tasks()
-
-                if self.dream_scheduler.should_run(now):
-                    self._fire_background_task(self.dream_scheduler.run_once())
 
                 if self.diary_service.should_run(self._last_diary_date, now):
                     self._last_diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -354,9 +703,31 @@ class ProactiveTask:
                 break
             except Exception as exc:
                 logger.error(f"[ProactiveTask] scheduler loop degraded: {exc}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(self._scheduler_poll_interval_seconds)
+
+    def _set_scheduler_poll_mode(self, mode: str) -> None:
+        normalized = str(mode or "IDLE").strip().upper()
+        if normalized == "FAST":
+            self._scheduler_poll_mode = "FAST"
+            self._scheduler_poll_interval_seconds = self.FAST_POLL_INTERVAL_SECONDS
+            return
+        if normalized == "NORMAL":
+            self._scheduler_poll_mode = "NORMAL"
+            self._scheduler_poll_interval_seconds = self.NORMAL_POLL_INTERVAL_SECONDS
+            return
+        self._scheduler_poll_mode = "IDLE"
+        self._scheduler_poll_interval_seconds = self.IDLE_POLL_INTERVAL_SECONDS
 
     def describe_status(self) -> dict:
+        bridge_status = {}
+        kernel_status = {}
+        if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "describe_status_sync"):
+            try:
+                kernel_status = dict(self.chat_loop_kernel.describe_status_sync() or {})
+                bridge_status = dict(kernel_status.get("dispatch_bridges", {}) or {})
+            except Exception:
+                kernel_status = {}
+                bridge_status = {}
         return {
             "running": self._is_running,
             "dream_ready": self.dream_agent is not None,
@@ -367,7 +738,38 @@ class ProactiveTask:
             "heartflow": self.heartflow_manager.describe_status(),
             "heartflow_topic_digest": self.heartflow_topic_digest_service.describe_status(),
             "proactive_dispatcher": self.proactive_dispatcher.describe_status(),
+            "group_signin": self.group_signin_service.describe_status(),
             "review_dispatcher_ready": self.review_dispatcher.reflect_tracker is not None,
+            "chat_loop_kernel_bound": self.chat_loop_kernel is not None,
+            "heartbeat_mode": "kernel_mediated",
+            "scheduler_poll_mode": self._scheduler_poll_mode,
+            "scheduler_poll_interval": self._scheduler_poll_interval_seconds,
+            "global_maintenance_interval": self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS,
+            "due_chat_count": self._last_due_chat_count,
+            "skipped_not_due_count": self._last_skipped_not_due_count,
+            "due_phase_mix": dict(self._last_due_phase_mix),
+            "scheduler_batch_limit": self._scheduler_batch_limit,
+            "scheduler_batch_plan": dict(self._last_scheduler_batch_plan),
+            "batch_fill_rate": self._last_batch_fill_rate,
+            "forced_promotion_count": self._last_forced_promotion_count,
+            "quota_skip_counts": dict(self._last_quota_skip_counts),
+            "busy_backpressure_active": self._busy_backpressure_active,
+            "maintenance_backpressure_active": self._maintenance_backpressure_active,
+            "last_selection_summary": dict(self._last_selection_summary),
+            "poll_mode_transition": dict(self._last_poll_mode_transition),
+            "maintenance_budget_total": self._last_maintenance_budget_total,
+            "maintenance_budget_used": self._last_maintenance_budget_used,
+            "maintenance_budget_remaining": self._last_maintenance_budget_remaining,
+            "scheduler_policy": dict(kernel_status.get("scheduler_policy", {}) or {}),
+            "kernel_due_selection_summary": dict(kernel_status.get("last_due_selection_summary", {}) or {}),
+            "private_wait_visible_in_heartbeat": True,
+            "heartflow_preview_readonly": True,
+            "dream_scope": "global_throttle",
+            "wakeup_bridge_ready": bool(bridge_status.get("PROACTIVE_WAKEUP", False)),
+            "heartflow_bridge_ready": bool(bridge_status.get("HEARTFLOW_EVALUATE", False)),
+            "dream_bridge_ready": bool(bridge_status.get("DREAM_MAINTENANCE", False)),
+            "memory_bridge_ready": bool(bridge_status.get("MEMORY_MAINTENANCE", False)),
+            "compaction_bridge_ready": bool(bridge_status.get("COMPACTION_EVALUATE", False)),
         }
 
 

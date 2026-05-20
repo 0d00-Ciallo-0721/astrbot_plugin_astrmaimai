@@ -74,6 +74,7 @@ class GatewayResultMixin:
         parsed_json: Any = None,
         model_id: str = "",
         usage: Optional[Dict[str, int]] = None,
+        economy: Optional[Dict[str, Any]] = None,
     ) -> LLMCallResult:
         capabilities = infer_provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
@@ -84,6 +85,7 @@ class GatewayResultMixin:
             provider_family=getattr(capabilities, "provider_family", ""),
             usage=usage or {},
             raw_completion=text,
+            economy=dict(economy or {}),
         )
 
     def _bot_speaker_names(self) -> List[str]:
@@ -100,6 +102,7 @@ class GatewayResultMixin:
         error_message: str,
         model_id: str = "",
         raw_completion: str = "",
+        economy: Optional[Dict[str, Any]] = None,
     ) -> LLMCallResult:
         capabilities = infer_provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
@@ -109,6 +112,7 @@ class GatewayResultMixin:
             model_id=model_id,
             provider_family=getattr(capabilities, "provider_family", ""),
             raw_completion=raw_completion,
+            economy=dict(economy or {}),
         )
 
     def _extract_json(self, text: str) -> str:

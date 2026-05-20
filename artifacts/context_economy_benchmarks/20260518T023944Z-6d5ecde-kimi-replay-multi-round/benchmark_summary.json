@@ -1,0 +1,950 @@
+{
+  "overview": {
+    "call_count": 26,
+    "input_tokens": 875,
+    "cached_input_tokens": 189,
+    "output_tokens": 418,
+    "total_tokens": 1293,
+    "cached_input_ratio": 0.216,
+    "provider_session_enabled_rate": 1.0,
+    "provider_session_reuse_rate": 0.1923,
+    "primary_hit_rate": 1.0,
+    "lane_rotate_rate": 0.2308,
+    "lane_rotate_count": 6,
+    "avg_stable_prefix_length": 365.23,
+    "avg_dynamic_payload_length": 134.42,
+    "rotate_reasons": {
+      "template_version_changed": 6,
+      "schema_changed": 3
+    },
+    "actual_models": {
+      "kimi-k2.6": 26
+    },
+    "workload_families": {
+      "proactive_generation": 1,
+      "chat_dialog": 9,
+      "memory_global_summary": 2,
+      "memory_structured_extraction": 2,
+      "persona_summary": 6,
+      "compaction_summary": 3,
+      "dream_generation": 3
+    }
+  },
+  "by_workload_family": {
+    "chat_dialog": {
+      "call_count": 9,
+      "input_tokens": 190,
+      "cached_input_tokens": 39,
+      "output_tokens": 110,
+      "total_tokens": 300,
+      "cached_input_ratio": 0.2053,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.3333,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 310.0,
+      "avg_dynamic_payload_length": 105.33,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 9
+      },
+      "workload_families": {
+        "chat_dialog": 9
+      }
+    },
+    "compaction_summary": {
+      "call_count": 3,
+      "input_tokens": 120,
+      "cached_input_tokens": 54,
+      "output_tokens": 36,
+      "total_tokens": 156,
+      "cached_input_ratio": 0.45,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 390.0,
+      "avg_dynamic_payload_length": 120.0,
+      "rotate_reasons": {
+        "template_version_changed": 3,
+        "schema_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "compaction_summary": 3
+      }
+    },
+    "dream_generation": {
+      "call_count": 3,
+      "input_tokens": 90,
+      "cached_input_tokens": 30,
+      "output_tokens": 60,
+      "total_tokens": 150,
+      "cached_input_ratio": 0.3333,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 340.0,
+      "avg_dynamic_payload_length": 140.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "dream_generation": 3
+      }
+    },
+    "memory_global_summary": {
+      "call_count": 2,
+      "input_tokens": 96,
+      "cached_input_tokens": 27,
+      "output_tokens": 42,
+      "total_tokens": 138,
+      "cached_input_ratio": 0.2812,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 420.0,
+      "avg_dynamic_payload_length": 153.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_global_summary": 2
+      }
+    },
+    "memory_structured_extraction": {
+      "call_count": 2,
+      "input_tokens": 65,
+      "cached_input_tokens": 16,
+      "output_tokens": 28,
+      "total_tokens": 93,
+      "cached_input_ratio": 0.2462,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 360.0,
+      "avg_dynamic_payload_length": 131.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_structured_extraction": 2
+      }
+    },
+    "persona_summary": {
+      "call_count": 6,
+      "input_tokens": 292,
+      "cached_input_tokens": 18,
+      "output_tokens": 131,
+      "total_tokens": 423,
+      "cached_input_ratio": 0.0616,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.5,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 446.0,
+      "avg_dynamic_payload_length": 182.5,
+      "rotate_reasons": {
+        "template_version_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 6
+      },
+      "workload_families": {
+        "persona_summary": 6
+      }
+    },
+    "proactive_generation": {
+      "call_count": 1,
+      "input_tokens": 22,
+      "cached_input_tokens": 5,
+      "output_tokens": 11,
+      "total_tokens": 33,
+      "cached_input_ratio": 0.2273,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 280.0,
+      "avg_dynamic_payload_length": 102.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 1
+      },
+      "workload_families": {
+        "proactive_generation": 1
+      }
+    }
+  },
+  "by_template": {
+    "chat_dialog@v1": {
+      "call_count": 9,
+      "input_tokens": 190,
+      "cached_input_tokens": 39,
+      "output_tokens": 110,
+      "total_tokens": 300,
+      "cached_input_ratio": 0.2053,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.3333,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 310.0,
+      "avg_dynamic_payload_length": 105.33,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 9
+      },
+      "workload_families": {
+        "chat_dialog": 9
+      }
+    },
+    "compaction_summary_v2@v2": {
+      "call_count": 3,
+      "input_tokens": 120,
+      "cached_input_tokens": 54,
+      "output_tokens": 36,
+      "total_tokens": 156,
+      "cached_input_ratio": 0.45,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 390.0,
+      "avg_dynamic_payload_length": 120.0,
+      "rotate_reasons": {
+        "template_version_changed": 3,
+        "schema_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "compaction_summary": 3
+      }
+    },
+    "dream_generation@v1": {
+      "call_count": 3,
+      "input_tokens": 90,
+      "cached_input_tokens": 30,
+      "output_tokens": 60,
+      "total_tokens": 150,
+      "cached_input_ratio": 0.3333,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 340.0,
+      "avg_dynamic_payload_length": 140.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "dream_generation": 3
+      }
+    },
+    "memory_global_summary@v1": {
+      "call_count": 2,
+      "input_tokens": 96,
+      "cached_input_tokens": 27,
+      "output_tokens": 42,
+      "total_tokens": 138,
+      "cached_input_ratio": 0.2812,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 420.0,
+      "avg_dynamic_payload_length": 153.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_global_summary": 2
+      }
+    },
+    "memory_structured_extraction@v1": {
+      "call_count": 2,
+      "input_tokens": 65,
+      "cached_input_tokens": 16,
+      "output_tokens": 28,
+      "total_tokens": 93,
+      "cached_input_ratio": 0.2462,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 360.0,
+      "avg_dynamic_payload_length": 131.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_structured_extraction": 2
+      }
+    },
+    "persona_core_identity@v2": {
+      "call_count": 3,
+      "input_tokens": 143,
+      "cached_input_tokens": 18,
+      "output_tokens": 64,
+      "total_tokens": 207,
+      "cached_input_ratio": 0.1259,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 440.0,
+      "avg_dynamic_payload_length": 181.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    "persona_core_identity@v3": {
+      "call_count": 3,
+      "input_tokens": 149,
+      "cached_input_tokens": 0,
+      "output_tokens": 67,
+      "total_tokens": 216,
+      "cached_input_ratio": 0.0,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 452.0,
+      "avg_dynamic_payload_length": 184.0,
+      "rotate_reasons": {
+        "template_version_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    "proactive_wakeup_opening@v1": {
+      "call_count": 1,
+      "input_tokens": 22,
+      "cached_input_tokens": 5,
+      "output_tokens": 11,
+      "total_tokens": 33,
+      "cached_input_ratio": 0.2273,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 280.0,
+      "avg_dynamic_payload_length": 102.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 1
+      },
+      "workload_families": {
+        "proactive_generation": 1
+      }
+    }
+  },
+  "high_rotate_templates": [
+    {
+      "template_key": "compaction_summary_v2@v2",
+      "call_count": 3,
+      "input_tokens": 120,
+      "cached_input_tokens": 54,
+      "output_tokens": 36,
+      "total_tokens": 156,
+      "cached_input_ratio": 0.45,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 390.0,
+      "avg_dynamic_payload_length": 120.0,
+      "rotate_reasons": {
+        "template_version_changed": 3,
+        "schema_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "compaction_summary": 3
+      }
+    },
+    {
+      "template_key": "persona_core_identity@v3",
+      "call_count": 3,
+      "input_tokens": 149,
+      "cached_input_tokens": 0,
+      "output_tokens": 67,
+      "total_tokens": 216,
+      "cached_input_ratio": 0.0,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 452.0,
+      "avg_dynamic_payload_length": 184.0,
+      "rotate_reasons": {
+        "template_version_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    {
+      "template_key": "dream_generation@v1",
+      "call_count": 3,
+      "input_tokens": 90,
+      "cached_input_tokens": 30,
+      "output_tokens": 60,
+      "total_tokens": 150,
+      "cached_input_ratio": 0.3333,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 340.0,
+      "avg_dynamic_payload_length": 140.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "dream_generation": 3
+      }
+    },
+    {
+      "template_key": "persona_core_identity@v2",
+      "call_count": 3,
+      "input_tokens": 143,
+      "cached_input_tokens": 18,
+      "output_tokens": 64,
+      "total_tokens": 207,
+      "cached_input_ratio": 0.1259,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 440.0,
+      "avg_dynamic_payload_length": 181.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    {
+      "template_key": "memory_global_summary@v1",
+      "call_count": 2,
+      "input_tokens": 96,
+      "cached_input_tokens": 27,
+      "output_tokens": 42,
+      "total_tokens": 138,
+      "cached_input_ratio": 0.2812,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 420.0,
+      "avg_dynamic_payload_length": 153.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_global_summary": 2
+      }
+    },
+    {
+      "template_key": "memory_structured_extraction@v1",
+      "call_count": 2,
+      "input_tokens": 65,
+      "cached_input_tokens": 16,
+      "output_tokens": 28,
+      "total_tokens": 93,
+      "cached_input_ratio": 0.2462,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 360.0,
+      "avg_dynamic_payload_length": 131.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_structured_extraction": 2
+      }
+    },
+    {
+      "template_key": "proactive_wakeup_opening@v1",
+      "call_count": 1,
+      "input_tokens": 22,
+      "cached_input_tokens": 5,
+      "output_tokens": 11,
+      "total_tokens": 33,
+      "cached_input_ratio": 0.2273,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 280.0,
+      "avg_dynamic_payload_length": 102.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 1
+      },
+      "workload_families": {
+        "proactive_generation": 1
+      }
+    },
+    {
+      "template_key": "chat_dialog@v1",
+      "call_count": 9,
+      "input_tokens": 190,
+      "cached_input_tokens": 39,
+      "output_tokens": 110,
+      "total_tokens": 300,
+      "cached_input_ratio": 0.2053,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.3333,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 310.0,
+      "avg_dynamic_payload_length": 105.33,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 9
+      },
+      "workload_families": {
+        "chat_dialog": 9
+      }
+    }
+  ],
+  "low_reuse_templates": [
+    {
+      "template_key": "compaction_summary_v2@v2",
+      "call_count": 3,
+      "input_tokens": 120,
+      "cached_input_tokens": 54,
+      "output_tokens": 36,
+      "total_tokens": 156,
+      "cached_input_ratio": 0.45,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 390.0,
+      "avg_dynamic_payload_length": 120.0,
+      "rotate_reasons": {
+        "template_version_changed": 3,
+        "schema_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "compaction_summary": 3
+      }
+    },
+    {
+      "template_key": "persona_core_identity@v3",
+      "call_count": 3,
+      "input_tokens": 149,
+      "cached_input_tokens": 0,
+      "output_tokens": 67,
+      "total_tokens": 216,
+      "cached_input_ratio": 0.0,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 452.0,
+      "avg_dynamic_payload_length": 184.0,
+      "rotate_reasons": {
+        "template_version_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    {
+      "template_key": "dream_generation@v1",
+      "call_count": 3,
+      "input_tokens": 90,
+      "cached_input_tokens": 30,
+      "output_tokens": 60,
+      "total_tokens": 150,
+      "cached_input_ratio": 0.3333,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 340.0,
+      "avg_dynamic_payload_length": 140.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "dream_generation": 3
+      }
+    },
+    {
+      "template_key": "persona_core_identity@v2",
+      "call_count": 3,
+      "input_tokens": 143,
+      "cached_input_tokens": 18,
+      "output_tokens": 64,
+      "total_tokens": 207,
+      "cached_input_ratio": 0.1259,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 440.0,
+      "avg_dynamic_payload_length": 181.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    {
+      "template_key": "memory_global_summary@v1",
+      "call_count": 2,
+      "input_tokens": 96,
+      "cached_input_tokens": 27,
+      "output_tokens": 42,
+      "total_tokens": 138,
+      "cached_input_ratio": 0.2812,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 420.0,
+      "avg_dynamic_payload_length": 153.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_global_summary": 2
+      }
+    },
+    {
+      "template_key": "memory_structured_extraction@v1",
+      "call_count": 2,
+      "input_tokens": 65,
+      "cached_input_tokens": 16,
+      "output_tokens": 28,
+      "total_tokens": 93,
+      "cached_input_ratio": 0.2462,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 360.0,
+      "avg_dynamic_payload_length": 131.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_structured_extraction": 2
+      }
+    },
+    {
+      "template_key": "proactive_wakeup_opening@v1",
+      "call_count": 1,
+      "input_tokens": 22,
+      "cached_input_tokens": 5,
+      "output_tokens": 11,
+      "total_tokens": 33,
+      "cached_input_ratio": 0.2273,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 280.0,
+      "avg_dynamic_payload_length": 102.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 1
+      },
+      "workload_families": {
+        "proactive_generation": 1
+      }
+    },
+    {
+      "template_key": "chat_dialog@v1",
+      "call_count": 9,
+      "input_tokens": 190,
+      "cached_input_tokens": 39,
+      "output_tokens": 110,
+      "total_tokens": 300,
+      "cached_input_ratio": 0.2053,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.3333,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 310.0,
+      "avg_dynamic_payload_length": 105.33,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 9
+      },
+      "workload_families": {
+        "chat_dialog": 9
+      }
+    }
+  ],
+  "high_traffic_templates": [
+    {
+      "template_key": "chat_dialog@v1",
+      "call_count": 9,
+      "input_tokens": 190,
+      "cached_input_tokens": 39,
+      "output_tokens": 110,
+      "total_tokens": 300,
+      "cached_input_ratio": 0.2053,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.3333,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 310.0,
+      "avg_dynamic_payload_length": 105.33,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 9
+      },
+      "workload_families": {
+        "chat_dialog": 9
+      }
+    },
+    {
+      "template_key": "compaction_summary_v2@v2",
+      "call_count": 3,
+      "input_tokens": 120,
+      "cached_input_tokens": 54,
+      "output_tokens": 36,
+      "total_tokens": 156,
+      "cached_input_ratio": 0.45,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 390.0,
+      "avg_dynamic_payload_length": 120.0,
+      "rotate_reasons": {
+        "template_version_changed": 3,
+        "schema_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "compaction_summary": 3
+      }
+    },
+    {
+      "template_key": "persona_core_identity@v3",
+      "call_count": 3,
+      "input_tokens": 149,
+      "cached_input_tokens": 0,
+      "output_tokens": 67,
+      "total_tokens": 216,
+      "cached_input_ratio": 0.0,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 1.0,
+      "lane_rotate_count": 3,
+      "avg_stable_prefix_length": 452.0,
+      "avg_dynamic_payload_length": 184.0,
+      "rotate_reasons": {
+        "template_version_changed": 3
+      },
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    {
+      "template_key": "dream_generation@v1",
+      "call_count": 3,
+      "input_tokens": 90,
+      "cached_input_tokens": 30,
+      "output_tokens": 60,
+      "total_tokens": 150,
+      "cached_input_ratio": 0.3333,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 340.0,
+      "avg_dynamic_payload_length": 140.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "dream_generation": 3
+      }
+    },
+    {
+      "template_key": "persona_core_identity@v2",
+      "call_count": 3,
+      "input_tokens": 143,
+      "cached_input_tokens": 18,
+      "output_tokens": 64,
+      "total_tokens": 207,
+      "cached_input_ratio": 0.1259,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 440.0,
+      "avg_dynamic_payload_length": 181.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 3
+      },
+      "workload_families": {
+        "persona_summary": 3
+      }
+    },
+    {
+      "template_key": "memory_global_summary@v1",
+      "call_count": 2,
+      "input_tokens": 96,
+      "cached_input_tokens": 27,
+      "output_tokens": 42,
+      "total_tokens": 138,
+      "cached_input_ratio": 0.2812,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 420.0,
+      "avg_dynamic_payload_length": 153.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_global_summary": 2
+      }
+    },
+    {
+      "template_key": "memory_structured_extraction@v1",
+      "call_count": 2,
+      "input_tokens": 65,
+      "cached_input_tokens": 16,
+      "output_tokens": 28,
+      "total_tokens": 93,
+      "cached_input_ratio": 0.2462,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 360.0,
+      "avg_dynamic_payload_length": 131.5,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 2
+      },
+      "workload_families": {
+        "memory_structured_extraction": 2
+      }
+    },
+    {
+      "template_key": "proactive_wakeup_opening@v1",
+      "call_count": 1,
+      "input_tokens": 22,
+      "cached_input_tokens": 5,
+      "output_tokens": 11,
+      "total_tokens": 33,
+      "cached_input_ratio": 0.2273,
+      "provider_session_enabled_rate": 1.0,
+      "provider_session_reuse_rate": 0.0,
+      "primary_hit_rate": 1.0,
+      "lane_rotate_rate": 0.0,
+      "lane_rotate_count": 0,
+      "avg_stable_prefix_length": 280.0,
+      "avg_dynamic_payload_length": 102.0,
+      "rotate_reasons": {},
+      "actual_models": {
+        "kimi-k2.6": 1
+      },
+      "workload_families": {
+        "proactive_generation": 1
+      }
+    }
+  ]
+}

@@ -45,6 +45,16 @@ class AttentionSnapshot:
     is_lightweight_event: bool = False
     focus_reason: str = ""
     root_reason: str = ""
+    warm_transcript_preview: str = ""
+    warm_transcript_source: str = ""
+    warm_summary_preview: str = ""
+    warm_quotes_preview: str = ""
+    warm_topics_preview: str = ""
+    recent_transcript_preview: str = ""
+    recent_transcript_reason: str = ""
+    recent_transcript_used: bool = False
+    reply_prompt_focus_anchor: str = ""
+    cold_summary_preview: str = ""
 
 
 @dataclass
@@ -92,6 +102,46 @@ class ContinuitySnapshot:
     goal_status: str = ""
     continuity_weight: str = ""
     turn_count: int = 0
+    dialogue_store_version: str = ""
+    compaction_status: str = ""
+    compaction_eligibility_reason: str = ""
+    recompact_armed: bool = False
+    focus_tail_overlap: bool = False
+    delta_old_segments: int = 0
+    delta_old_message_load: float = 0.0
+    delta_old_long_message_count: int = 0
+    cold_summary_section_counts: dict[str, int] = field(default_factory=dict)
+    prefix_hash: str = ""
+    prefix_stable: bool = False
+    prefix_changed_reason: str = ""
+    message_count_since_last_compaction: int = 0
+    next_eval_at_count: int = 80
+    final_score: float = 0.0
+    count_score: float = 0.0
+    closure_score: float = 0.0
+    tail_activity_score: float = 0.0
+    topic_density_score: float = 0.0
+    stability_score: float = 0.0
+    benefit_score: float = 0.0
+    is_forced: bool = False
+    is_safe_to_compact: bool = False
+    closure_signals: list[str] = field(default_factory=list)
+    tail_activity_signals: list[str] = field(default_factory=list)
+    topic_density_signals: list[str] = field(default_factory=list)
+    stability_signals: list[str] = field(default_factory=list)
+    benefit_signals: list[str] = field(default_factory=list)
+    forced_pending_message_delta: int = 0
+    last_safe_window_seen_at_count: int = 0
+    post_compaction_recovery_rounds: int = 0
+    evaluation_count: int = 0
+    current_message_count: int = 0
+    queued_eval_node: int = 0
+    pending_eval_nodes_count: int = 0
+    pending_eval_nodes: list[int] = field(default_factory=list)
+    force_execute_on_next_safe_hook: bool = False
+    safe_hook_block_reason: str = ""
+    last_hook_source: str = ""
+    last_safe_hook_checked_at: int = 0
 
 
 @dataclass
@@ -304,6 +354,16 @@ def build_turn_trace_summary(
             "root_reason": attention.root_reason,
             "window_event_count": len(attention.window_events or []),
             "focus_preview": focus_preview,
+            "warm_transcript_preview": _preview_text(getattr(attention, "warm_transcript_preview", ""), 180),
+            "warm_transcript_source": getattr(attention, "warm_transcript_source", ""),
+            "warm_summary_preview": _preview_text(getattr(attention, "warm_summary_preview", ""), 180),
+            "warm_quotes_preview": _preview_text(getattr(attention, "warm_quotes_preview", ""), 180),
+            "warm_topics_preview": _preview_text(getattr(attention, "warm_topics_preview", ""), 180),
+            "recent_transcript_preview": _preview_text(getattr(attention, "recent_transcript_preview", ""), 180),
+            "recent_transcript_reason": getattr(attention, "recent_transcript_reason", ""),
+            "recent_transcript_used": bool(getattr(attention, "recent_transcript_used", False)),
+            "reply_prompt_focus_anchor": _preview_text(getattr(attention, "reply_prompt_focus_anchor", ""), 180),
+            "cold_summary_preview": _preview_text(getattr(attention, "cold_summary_preview", ""), 180),
         },
         "cognitive": {
             "action": cognitive.action,
@@ -348,6 +408,87 @@ def build_turn_trace_summary(
             "turn_count": int(continuity.turn_count or 0),
             "agency_reflection_preview": _preview_text(continuity.agency_reflection_summary, 160),
             "memory_feedback_preview": _preview_text(continuity.memory_feedback_summary, 160),
+            "dialogue_store_version": continuity.dialogue_store_version,
+            "compaction_status": continuity.compaction_status,
+            "compaction_eligibility_reason": continuity.compaction_eligibility_reason,
+            "recompact_armed": bool(continuity.recompact_armed),
+            "focus_tail_overlap": bool(continuity.focus_tail_overlap),
+            "delta_old_segments": int(continuity.delta_old_segments or 0),
+            "delta_old_message_load": float(continuity.delta_old_message_load or 0.0),
+            "delta_old_long_message_count": int(continuity.delta_old_long_message_count or 0),
+            "cold_summary_section_counts": dict(continuity.cold_summary_section_counts or {}),
+            "prefix_hash": continuity.prefix_hash,
+            "prefix_stable": bool(continuity.prefix_stable),
+            "prefix_changed_reason": continuity.prefix_changed_reason,
+            "message_count_since_last_compaction": int(continuity.message_count_since_last_compaction or 0),
+            "next_eval_at_count": int(continuity.next_eval_at_count or 80),
+            "final_score": float(continuity.final_score or 0.0),
+            "count_score": float(continuity.count_score or 0.0),
+            "closure_score": float(continuity.closure_score or 0.0),
+            "tail_activity_score": float(continuity.tail_activity_score or 0.0),
+            "topic_density_score": float(continuity.topic_density_score or 0.0),
+            "stability_score": float(continuity.stability_score or 0.0),
+            "benefit_score": float(continuity.benefit_score or 0.0),
+            "is_forced": bool(continuity.is_forced),
+            "is_safe_to_compact": bool(continuity.is_safe_to_compact),
+            "closure_signals": list(continuity.closure_signals or []),
+            "tail_activity_signals": list(continuity.tail_activity_signals or []),
+            "topic_density_signals": list(continuity.topic_density_signals or []),
+            "stability_signals": list(continuity.stability_signals or []),
+            "benefit_signals": list(continuity.benefit_signals or []),
+            "forced_pending_message_delta": int(continuity.forced_pending_message_delta or 0),
+            "last_safe_window_seen_at_count": int(continuity.last_safe_window_seen_at_count or 0),
+            "post_compaction_recovery_rounds": int(continuity.post_compaction_recovery_rounds or 0),
+            "evaluation_count": int(continuity.evaluation_count or 0),
+            "current_message_count": int(continuity.current_message_count or 0),
+            "queued_eval_node": int(continuity.queued_eval_node or 0),
+            "pending_eval_nodes_count": int(continuity.pending_eval_nodes_count or 0),
+            "pending_eval_nodes": list(continuity.pending_eval_nodes or []),
+            "force_execute_on_next_safe_hook": bool(continuity.force_execute_on_next_safe_hook),
+            "safe_hook_block_reason": continuity.safe_hook_block_reason,
+            "last_hook_source": continuity.last_hook_source,
+            "last_safe_hook_checked_at": int(continuity.last_safe_hook_checked_at or 0),
+        },
+        "conversation_compression": {
+            "warm_summary_preview": _preview_text(getattr(attention, "warm_summary_preview", ""), 180),
+            "warm_quotes_preview": _preview_text(getattr(attention, "warm_quotes_preview", ""), 180),
+            "warm_topics_preview": _preview_text(getattr(attention, "warm_topics_preview", ""), 180),
+            "recent_transcript_preview": _preview_text(getattr(attention, "recent_transcript_preview", ""), 180),
+            "recent_used": bool(getattr(attention, "recent_transcript_used", False)),
+            "recent_reason": getattr(attention, "recent_transcript_reason", ""),
+            "reply_prompt_focus_anchor": _preview_text(getattr(attention, "reply_prompt_focus_anchor", ""), 180),
+            "compaction_state": continuity.compaction_status,
+            "eligibility_reason": continuity.compaction_eligibility_reason,
+            "focus_tail_overlap": bool(continuity.focus_tail_overlap),
+            "recompact_armed": bool(continuity.recompact_armed),
+            "message_count_since_last_compaction": int(continuity.message_count_since_last_compaction or 0),
+            "next_eval_at_count": int(continuity.next_eval_at_count or 80),
+            "final_score": float(continuity.final_score or 0.0),
+            "count_score": float(continuity.count_score or 0.0),
+            "closure_score": float(continuity.closure_score or 0.0),
+            "tail_activity_score": float(continuity.tail_activity_score or 0.0),
+            "topic_density_score": float(continuity.topic_density_score or 0.0),
+            "stability_score": float(continuity.stability_score or 0.0),
+            "benefit_score": float(continuity.benefit_score or 0.0),
+            "is_forced": bool(continuity.is_forced),
+            "is_safe_to_compact": bool(continuity.is_safe_to_compact),
+            "closure_signals": list(continuity.closure_signals or []),
+            "tail_activity_signals": list(continuity.tail_activity_signals or []),
+            "topic_density_signals": list(continuity.topic_density_signals or []),
+            "stability_signals": list(continuity.stability_signals or []),
+            "benefit_signals": list(continuity.benefit_signals or []),
+            "forced_pending_message_delta": int(continuity.forced_pending_message_delta or 0),
+            "last_safe_window_seen_at_count": int(continuity.last_safe_window_seen_at_count or 0),
+            "post_compaction_recovery_rounds": int(continuity.post_compaction_recovery_rounds or 0),
+            "evaluation_count": int(continuity.evaluation_count or 0),
+            "current_message_count": int(continuity.current_message_count or 0),
+            "queued_eval_node": int(continuity.queued_eval_node or 0),
+            "pending_eval_nodes_count": int(continuity.pending_eval_nodes_count or 0),
+            "pending_eval_nodes": list(continuity.pending_eval_nodes or []),
+            "force_execute_on_next_safe_hook": bool(continuity.force_execute_on_next_safe_hook),
+            "safe_hook_block_reason": continuity.safe_hook_block_reason,
+            "last_hook_source": continuity.last_hook_source,
+            "last_safe_hook_checked_at": int(continuity.last_safe_hook_checked_at or 0),
         },
         "memory": {
             "policy": memory.policy,

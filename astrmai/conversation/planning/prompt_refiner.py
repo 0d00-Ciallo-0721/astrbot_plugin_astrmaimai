@@ -328,6 +328,14 @@ class PromptRefiner:
             prompt_envelope = read_legacy_prompt_envelope(event, prompt=prompt)
 
         recent_transcript = prompt_envelope.recent_transcript.strip()
+        recent_transcript_source = getattr(prompt_envelope, "recent_transcript_source", "").strip()
+        recent_transcript_reason = getattr(prompt_envelope, "recent_transcript_reason", "").strip()
+        warm_zone_transcript = getattr(prompt_envelope, "warm_zone_transcript", "").strip()
+        warm_zone_transcript_source = getattr(prompt_envelope, "warm_zone_transcript_source", "").strip()
+        warm_zone_summary = getattr(prompt_envelope, "warm_zone_summary", "").strip()
+        warm_zone_quotes = getattr(prompt_envelope, "warm_zone_quotes", "").strip()
+        if warm_zone_summary or warm_zone_quotes:
+            warm_zone_transcript = "\n".join(part for part in (warm_zone_summary, warm_zone_quotes) if part).strip()
         raw_user_text = (prompt_envelope.raw_user_text or prompt).strip()
         focus_message_text = (prompt_envelope.focus_message_text or raw_user_text or prompt).strip()
         direct_context_text = prompt_envelope.direct_context_text.strip()
@@ -379,11 +387,17 @@ class PromptRefiner:
         recent_transcript = self._deduplicate_transcript(
             recent_transcript,
             [
+                warm_zone_transcript,
                 focus_message_text,
                 direct_context_text,
                 related_context_text,
                 background_window_text,
             ],
+            min_dedup_length=6,
+        )
+        warm_zone_transcript = self._deduplicate_transcript(
+            warm_zone_transcript,
+            [focus_message_text, direct_context_text, related_context_text, background_window_text, recent_transcript],
             min_dedup_length=6,
         )
 
@@ -399,8 +413,18 @@ class PromptRefiner:
                     "如果不自然，可以保持沉默。不要提到系统机制或这段指引。\n"
                     + proactive_guidance[:500]
                 )
+        if warm_zone_transcript:
+            warm_title = "---近期对话脉络---"
+            if warm_zone_transcript_source:
+                warm_title = f"---近期对话脉络（来源：{warm_zone_transcript_source}）---"
+            sections.append(f"{warm_title}\n{await self._resolve_visual_memory(warm_zone_transcript)}")
         if recent_transcript:
-            sections.append(f"---对话记录---\n{await self._resolve_visual_memory(recent_transcript)}")
+            recent_title = "---对话记录---"
+            if recent_transcript_source:
+                recent_title = f"---对话记录（来源：{recent_transcript_source}）---"
+            if recent_transcript_reason:
+                recent_title = f"{recent_title}\n[reason: {recent_transcript_reason}]"
+            sections.append(f"{recent_title}\n{await self._resolve_visual_memory(recent_transcript)}")
         if focus_message_text:
             sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(focus_message_text)}")
         if direct_context_text:
@@ -439,6 +463,7 @@ class PromptRefiner:
                 f"direct_context={direct_context_text[:120]!r} "
                 f"related_context={related_context_text[:120]!r} "
                 f"background={background_window_text[:120]!r} "
+                f"warm_transcript={warm_zone_transcript[:160]!r} "
                 f"recent_transcript={recent_transcript[:160]!r} "
                 f"focus_reason={focus_reason!r} "
                 f"focus_thread_reason={focus_thread_reason!r} "

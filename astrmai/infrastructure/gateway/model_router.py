@@ -63,11 +63,18 @@ class ModelRouter:
 
     def __init__(self):
         self._pools: Dict[str, PoolState] = {}
+        self._sticky_primary: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 公共接口
     # ------------------------------------------------------------------
-    def get_ranked_models(self, pool_name: str, models: List[str]) -> List[str]:
+    def get_ranked_models(
+        self,
+        pool_name: str,
+        models: List[str],
+        sticky_key: str = "",
+        sticky_preferred: str = "",
+    ) -> List[str]:
         """
         获取按健康度排序的模型列表。
 
@@ -115,6 +122,22 @@ class ModelRouter:
             return (-state.health_score, relative_pos)
 
         available.sort(key=sort_key)
+        sticky_primary = self._resolve_sticky_primary(
+            pool_name=pool_name,
+            unique_models=unique_models,
+            sticky_key=sticky_key,
+            sticky_preferred=sticky_preferred,
+        )
+        if sticky_primary:
+            pinned = None
+            tail = []
+            for item in available:
+                if item[0] == sticky_primary:
+                    pinned = item
+                else:
+                    tail.append(item)
+            if pinned is not None:
+                available = [pinned] + tail
 
         # 冷却中的模型：按最早解冻时间升序
         cooling.sort(key=lambda x: x[1].cooldown_until)
@@ -212,3 +235,21 @@ class ModelRouter:
         if pool_name not in self._pools:
             self._pools[pool_name] = PoolState()
         return self._pools[pool_name]
+
+    def _resolve_sticky_primary(
+        self,
+        *,
+        pool_name: str,
+        unique_models: List[str],
+        sticky_key: str,
+        sticky_preferred: str,
+    ) -> str:
+        if not sticky_key or not unique_models:
+            return ""
+        sticky_slot = f"{pool_name}:{sticky_key}"
+        current = self._sticky_primary.get(sticky_slot, "")
+        if current in unique_models:
+            return current
+        preferred = sticky_preferred if sticky_preferred in unique_models else unique_models[0]
+        self._sticky_primary[sticky_slot] = preferred
+        return preferred

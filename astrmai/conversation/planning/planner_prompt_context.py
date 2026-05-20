@@ -40,6 +40,83 @@ class PlannerPromptContextMixin:
         return any(phrase in normalized for phrase in trigger_phrases)
 
     @staticmethod
+    def _is_followup_question_like(message_text: str) -> bool:
+        normalized = str(message_text or "").strip().lower()
+        if not normalized:
+            return False
+        followup_tokens = (
+            "should",
+            "can",
+            "could",
+            "why",
+            "how",
+            "still",
+            "continue",
+            "exact mainline",
+            "without drifting",
+            "right after compaction",
+            "keep the compaction mainline",
+            "delay compaction",
+            "reply chain",
+            "follow the exact mainline",
+            "截图",
+            "图片",
+        )
+        return any(token in normalized for token in followup_tokens)
+
+    @staticmethod
+    def _looks_like_vision_mainline_query(message_text: str) -> bool:
+        normalized = str(message_text or "").strip().lower()
+        if not normalized:
+            return False
+        return any(token in normalized for token in ("screenshot", "image", "picture", "photo", "截图", "图片"))
+
+    @staticmethod
+    def _has_recent_tail_context(recent_transcript: str) -> bool:
+        lines = [line.strip() for line in str(recent_transcript or "").splitlines() if line.strip()]
+        return len(lines) >= 2
+
+    @staticmethod
+    def _keyword_tokens(text: str) -> set[str]:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return set()
+        for token in ",.!?;:()[]{}<>\"'`~@#%^&*-_=+/\\|\t\r\n":
+            normalized = normalized.replace(token, " ")
+        return {
+            part
+            for part in normalized.split(" ")
+            if len(part) >= 4
+        }
+
+    @classmethod
+    def _recent_tail_stays_on_followup_chain(cls, focus_message_text: str, recent_transcript: str) -> bool:
+        lines = [line.strip() for line in str(recent_transcript or "").splitlines() if line.strip()]
+        if len(lines) < 2:
+            return False
+        tail_lines = lines[-2:]
+        focus_tokens = cls._keyword_tokens(focus_message_text)
+        if not focus_tokens:
+            return False
+        tail_token_hits = 0
+        for line in tail_lines:
+            if cls._keyword_tokens(line) & focus_tokens:
+                tail_token_hits += 1
+        if tail_token_hits >= 2:
+            return True
+        if tail_token_hits == 1:
+            joined_tail = " ".join(tail_lines).lower()
+            return any(token in joined_tail for token in ("astrmai", "mai", "bot", "reply", "回覆", "回复"))
+        return False
+
+    @staticmethod
+    def _warm_mentions_visual_context(warm_bundle) -> bool:
+        summary = str(getattr(warm_bundle, "summary_text", "") or "").lower()
+        quotes = str(getattr(warm_bundle, "quote_text", "") or "").lower()
+        combined = f"{summary}\n{quotes}"
+        return any(token in combined for token in ("screenshot", "image", "picture", "photo", "截图", "图片", "图文"))
+
+    @staticmethod
     def _render_event_line(message_event: AstrMessageEvent) -> str:
         return MessageRenderer.render_event(message_event)
 
@@ -100,12 +177,30 @@ class PlannerPromptContextMixin:
         related_context_text: str,
         ambient_background_text: str,
         recent_transcript: str,
+        recent_transcript_source: str,
+        recent_transcript_reason: str,
+        warm_zone_transcript: str,
+        warm_zone_transcript_source: str,
+        warm_zone_summary: str,
+        warm_zone_quotes: str,
+        warm_topics_preview: str,
+        warm_zone_has_latest_assistant: bool,
+        warm_zone_quote_event_ids: list[str],
         last_assistant_reply: str,
         near_context_priority: bool,
     ) -> PromptEnvelope:
         return PromptEnvelope(
             raw_user_text=focus_message_text,
             recent_transcript=recent_transcript,
+            recent_transcript_source=recent_transcript_source,
+            recent_transcript_reason=recent_transcript_reason,
+            warm_zone_transcript=warm_zone_transcript,
+            warm_zone_transcript_source=warm_zone_transcript_source,
+            warm_zone_summary=warm_zone_summary,
+            warm_zone_quotes=warm_zone_quotes,
+            warm_topics_preview=warm_topics_preview,
+            warm_zone_has_latest_assistant=warm_zone_has_latest_assistant,
+            warm_zone_quote_event_ids=list(warm_zone_quote_event_ids or []),
             last_assistant_reply=last_assistant_reply,
             focus_message_text=focus_message_text,
             direct_context_text=direct_context_text,
@@ -162,6 +257,68 @@ class PlannerPromptContextMixin:
             logger.debug(f"[{chat_id}] recent transcript load failed: {exc}")
             return ""
 
+    async def _get_warm_context_bundle(self, chat_id: str):
+        context_engine = getattr(self, "context_engine", None)
+        context_db = getattr(context_engine, "db", None)
+        store = (
+            getattr(self, "dialogue_store", None)
+            or getattr(context_db, "dialogue_store", None)
+            or getattr(self.gateway, "dialogue_store", None)
+            or getattr(getattr(self.gateway, "db_service", None), "dialogue_store", None)
+        )
+        if not store:
+            return None
+        try:
+            return await store.get_warm_context_bundle(chat_id, max_age_seconds=300.0, max_tokens=1200)
+        except Exception as exc:
+            logger.debug(f"[{chat_id}] warm transcript load failed: {exc}")
+            return None
+
+    async def _get_compaction_trace_status(self, chat_id: str, focus_context: FocusThreadContext | None):
+        compaction = getattr(self, "context_compaction", None)
+        if compaction is None or not hasattr(compaction, "get_trace_status"):
+            return {}
+        try:
+            return await compaction.get_trace_status(chat_id, focus_context=focus_context)
+        except Exception as exc:
+            logger.debug(f"[{chat_id}] compaction trace load failed: {exc}")
+            return {}
+
+    def _should_include_recent_transcript(
+        self,
+        focus_message_text: str,
+        warm_bundle,
+        recent_transcript: str,
+        *,
+        post_compaction_recovery_rounds: int = 0,
+    ) -> tuple[bool, str]:
+        if not str(recent_transcript or "").strip():
+            return False, "empty"
+        if warm_bundle is None:
+            return True, "warm_empty"
+        warm_summary = str(getattr(warm_bundle, "summary_text", "") or "").strip()
+        warm_quotes = str(getattr(warm_bundle, "quote_text", "") or "").strip()
+        if not warm_summary and not warm_quotes:
+            return True, "warm_empty"
+        if post_compaction_recovery_rounds > 0:
+            return True, "post_compaction_recovery"
+        if not bool(getattr(warm_bundle, "has_latest_assistant", False)) and self._is_near_context_query(focus_message_text):
+            return True, "missing_latest_assistant"
+        if (
+            self._looks_like_vision_mainline_query(focus_message_text)
+            and self._warm_mentions_visual_context(warm_bundle)
+            and self._has_recent_tail_context(recent_transcript)
+        ):
+            return True, "vision_mainline_recent"
+        if (
+            bool(getattr(warm_bundle, "has_latest_assistant", False))
+            and self._is_followup_question_like(focus_message_text)
+            and self._has_recent_tail_context(recent_transcript)
+            and self._recent_tail_stays_on_followup_chain(focus_message_text, recent_transcript)
+        ):
+            return True, "tail_followup_recent"
+        return False, "warm_sufficient"
+
     def _set_disable_rag_injection(self, ctx, disabled: bool) -> None:
         if not ctx:
             return
@@ -202,10 +359,30 @@ class PlannerPromptContextMixin:
         )
         ambient_background_text = self._build_ambient_background_text(ambient_events)
         raw_window_text = focus_message_text
+        warm_bundle = None if is_lightweight_event else await self._get_warm_context_bundle(chat_id)
+        warm_zone_summary = "" if warm_bundle is None else str(getattr(warm_bundle, "summary_text", "") or "").strip()
+        warm_zone_quotes = "" if warm_bundle is None else str(getattr(warm_bundle, "quote_text", "") or "").strip()
+        warm_topics_preview = "" if warm_bundle is None else str(getattr(warm_bundle, "topic_preview", "") or "").strip()
+        warm_zone_quote_event_ids = [] if warm_bundle is None else list(getattr(warm_bundle, "quote_event_ids", []) or [])
+        warm_zone_has_latest_assistant = bool(getattr(warm_bundle, "has_latest_assistant", False)) if warm_bundle is not None else False
+        warm_zone_transcript = "\n".join(part for part in (warm_zone_summary, warm_zone_quotes) if part).strip()
         recent_transcript = "" if is_lightweight_event else await self._get_recent_dialogue_transcript(chat_id)
+        compaction_trace_status = {} if is_lightweight_event else await self._get_compaction_trace_status(chat_id, focus_context)
+        post_compaction_recovery_rounds = int(compaction_trace_status.get("post_compaction_recovery_rounds", 0) or 0)
+        include_recent, recent_transcript_reason = self._should_include_recent_transcript(
+            focus_message_text or event.message_str or raw_window_text,
+            warm_bundle,
+            recent_transcript,
+            post_compaction_recovery_rounds=post_compaction_recovery_rounds,
+        )
+        if not include_recent:
+            recent_transcript = ""
         last_assistant_reply = ""
-        if recent_transcript:
-            transcript_lines = [line.strip() for line in recent_transcript.splitlines() if line.strip()]
+        transcript_source = warm_zone_transcript or recent_transcript
+        warm_zone_transcript_source = "store" if warm_zone_transcript else "empty"
+        recent_transcript_source = "lane_fallback" if recent_transcript else "empty"
+        if transcript_source:
+            transcript_lines = [line.strip() for line in transcript_source.splitlines() if line.strip()]
             bot_name = "Bot"
             nicknames = getattr(getattr(self.gateway.config, "system1", None), "nicknames", [])
             if isinstance(nicknames, list) and nicknames:
@@ -228,6 +405,15 @@ class PlannerPromptContextMixin:
             related_context_text=related_context_text,
             ambient_background_text=ambient_background_text,
             recent_transcript=recent_transcript,
+            recent_transcript_source=recent_transcript_source,
+            recent_transcript_reason=recent_transcript_reason,
+            warm_zone_transcript=warm_zone_transcript,
+            warm_zone_transcript_source=warm_zone_transcript_source,
+            warm_zone_summary=warm_zone_summary,
+            warm_zone_quotes=warm_zone_quotes,
+            warm_topics_preview=warm_topics_preview,
+            warm_zone_has_latest_assistant=warm_zone_has_latest_assistant,
+            warm_zone_quote_event_ids=warm_zone_quote_event_ids,
             last_assistant_reply=last_assistant_reply,
             near_context_priority=near_context_priority,
         )
@@ -244,6 +430,7 @@ class PlannerPromptContextMixin:
                 f"direct_context={preview_text(direct_context_text, 160)!r} "
                 f"related_context={preview_text(related_context_text, 160)!r} "
                 f"background={preview_text(ambient_background_text, 160)!r} "
+                f"warm_transcript={preview_text(warm_zone_transcript, 160)!r} "
                 f"recent_transcript={preview_text(recent_transcript, 160)!r} "
                 f"near_context_priority={near_context_priority}"
             )

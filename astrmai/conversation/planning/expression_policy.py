@@ -33,10 +33,12 @@ class ActionModifier:
     }
     CHAT_LOW_ENERGY_TOOLS = {
         'message_reaction_action',
+        'message_emoji_like_action',
         'proactive_like_action',
     }
     CHAT_HOSTILE_TOOLS = {
         'message_reaction_action',
+        'message_emoji_like_action',
     }
 
     INTIMATE_THRESHOLD = 20
@@ -200,7 +202,7 @@ class ActionModifier:
             self._trace_filter_step(trace, "action_modifier.mood", before, filtered, reason, "mood")
 
         if patience < 0.25 or normalized_intent in {"boundary", "observe", "ignore"}:
-            calm_tools = {'wait_and_listen', 'message_reaction_action'}
+            calm_tools = {'wait_and_listen', 'message_reaction_action', 'message_emoji_like_action'}
             before = list(filtered)
             filtered = [tool for tool in filtered if getattr(tool, 'name', '') in calm_tools]
             reason = f'low_patience_or_boundary({patience:.2f})'

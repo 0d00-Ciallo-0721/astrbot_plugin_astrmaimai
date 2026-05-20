@@ -1,4 +1,5 @@
 const API_PREFIX = "admin";
+const SCHEDULER_POLL_INTERVAL_MS = 5000;
 
 const TABS = [
   { id: "dashboard", label: "Dashboard" },
@@ -29,6 +30,11 @@ const state = {
   dashboardTab: "overview",
   reviewTab: "pending",
   memoryTab: "events",
+  schedulerStatus: null,
+  schedulerDueSelection: null,
+  schedulerChatLoop: null,
+  schedulerChatId: "",
+  schedulerPollTimer: null,
   selectedReviews: new Set(),
   activeUserId: "",
   cache: {
@@ -85,10 +91,23 @@ function formatTime(value) {
   return new Date(ts * 1000).toLocaleString();
 }
 
+function formatPercent(value) {
+  const num = Number(value || 0);
+  return `${(num <= 1 ? num * 100 : num).toFixed(1)}%`;
+}
+
 function asItems(value) {
   if (Array.isArray(value)) return value;
   if (Array.isArray(value?.items)) return value.items;
   return [];
+}
+
+function schedulerReport() {
+  return state.schedulerDueSelection?.data?.report || {};
+}
+
+function schedulerOverview() {
+  return state.schedulerStatus?.data?.overview || {};
 }
 
 function clampPercent(value) {
@@ -373,9 +392,20 @@ function openJsonModal(title, value, onSubmit) {
 
 async function loadDashboard() {
   showLoading("正在读取运行状态大盘...");
-  if (state.dashboardTab === "overview") return renderDashboardOverview();
-  if (state.dashboardTab === "heartflow") return renderDashboardHeartflow();
-  if (state.dashboardTab === "cognition") return renderDashboardCognition();
+  if (state.dashboardTab === "overview") {
+    stopSchedulerPolling();
+    return renderDashboardOverview();
+  }
+  if (state.dashboardTab === "heartflow") {
+    stopSchedulerPolling();
+    return renderDashboardHeartflow();
+  }
+  if (state.dashboardTab === "cognition") {
+    await renderDashboardCognition();
+    startSchedulerPolling();
+    return;
+  }
+  stopSchedulerPolling();
   return renderDashboardTools();
 }
 
@@ -538,12 +568,114 @@ async function renderDashboardHeartflow() {
   }));
 }
 
+async function loadSchedulerChatLoop(chatId = null) {
+  const targetChat = String(chatId ?? state.schedulerChatId ?? "").trim();
+  if (!targetChat) {
+    state.schedulerChatLoop = null;
+    return;
+  }
+  state.schedulerChatId = targetChat;
+  state.schedulerChatLoop = await api.get(`/cognition/scheduler/chats/${segment(targetChat)}`).catch(() => null);
+}
+
+function shouldPollScheduler() {
+  return state.current === "dashboard" && state.dashboardTab === "cognition";
+}
+
+function stopSchedulerPolling() {
+  if (state.schedulerPollTimer) {
+    clearInterval(state.schedulerPollTimer);
+    state.schedulerPollTimer = null;
+  }
+}
+
+function startSchedulerPolling() {
+  stopSchedulerPolling();
+  if (!shouldPollScheduler()) return;
+  state.schedulerPollTimer = setInterval(() => {
+    if (!shouldPollScheduler()) {
+      stopSchedulerPolling();
+      return;
+    }
+    renderDashboardCognition().catch(() => {});
+  }, SCHEDULER_POLL_INTERVAL_MS);
+}
+
+function renderSchedulerDiagnosticsSection() {
+  const overview = schedulerOverview();
+  const report = schedulerReport();
+  const selected = asItems(report.selected).slice(0, 6);
+  const chatData = state.schedulerChatLoop?.data || {};
+  const emptyState = chatData.state_present === false
+    ? `<div class="empty-state compact"><p>暂无 loop state。该 chat 尚未进入 scheduler 跟踪。</p></div>`
+    : "";
+  const quickButtons = selected.length
+    ? `<div class="chip-row">${selected.map((chatId) => `<button class="ghost-button" data-scheduler-chat="${attr(chatId)}" type="button">${escapeHtml(chatId)}</button>`).join("")}</div>`
+    : `<div class="empty-state compact"><p>当前没有 due selection 选中的 chat。</p></div>`;
+  return section(
+    "Scheduler Diagnostics",
+    "Chat Loop Kernel 在 AstrBot 插件页内的调度摘要、批次配额与单 chat 诊断。",
+    `
+      <div class="grid">
+        ${metric("Profile", state.schedulerStatus?.data?.scheduler_policy?.active_profile || "balanced")}
+        ${metric("Poll Mode", overview.scheduler_poll_mode || "-")}
+        ${metric("Poll Interval", overview.scheduler_poll_interval ?? 0)}
+        ${metric("Due Chats", overview.due_chat_count ?? 0)}
+        ${metric("Forced Promotions", overview.forced_promotion_count ?? 0)}
+        ${metric("Batch Fill", formatPercent(overview.batch_fill_rate ?? 0))}
+      </div>
+      <div class="grid two">
+        ${section("Batch / Backpressure", "", `
+          <div class="chip-row">
+            ${statusChip(`busy_backpressure: ${state.schedulerStatus?.data?.proactive?.busy_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.data?.proactive?.busy_backpressure_active ? "warn" : "ok")}
+            ${statusChip(`maintenance_backpressure: ${state.schedulerStatus?.data?.proactive?.maintenance_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.data?.proactive?.maintenance_backpressure_active ? "warn" : "ok")}
+          </div>
+          <pre>${json(state.schedulerStatus?.data?.proactive?.scheduler_batch_plan || {})}</pre>
+          <pre>${json(state.schedulerStatus?.data?.proactive?.quota_skip_counts || {})}</pre>
+          <pre>${json(state.schedulerStatus?.data?.proactive?.poll_mode_transition || {})}</pre>
+        `)}
+        ${section("Chat Loop Drill-down", "", `
+          <div class="form-grid single">
+            <label>chat_id<input id="scheduler-chat-id" value="${attr(state.schedulerChatId || "")}" placeholder="chat_id"></label>
+          </div>
+          <div class="row-actions">
+            <button class="primary-button" data-scheduler-load type="button">加载 scheduler chat</button>
+          </div>
+          ${quickButtons}
+          ${emptyState}
+          <div class="grid">
+            ${metric("phase", chatData.phase || "-")}
+            ${metric("next_tick_at", chatData.next_tick_at ?? 0)}
+            ${metric("missed_due_passes", chatData.missed_due_passes ?? 0)}
+            ${metric("forced_promotion_count", chatData.forced_promotion_count ?? 0)}
+          </div>
+          <pre>${json(chatData.scheduler_pending_signals || {})}</pre>
+          <pre>${json(report)}</pre>
+        `)}
+      </div>
+    `,
+  );
+}
+
 async function renderDashboardCognition() {
-  const [decisions, turns] = await Promise.all([
+  const [decisions, turns, schedulerStatus, schedulerDueSelection] = await Promise.all([
     api.get("/cognition/recent-decisions?limit=50").catch(() => ({ items: [] })),
     api.get("/cognition/recent-turns?limit=50").catch(() => ({ items: [] })),
+    api.get("/cognition/scheduler/status").catch(() => null),
+    api.get("/cognition/scheduler/due-selection").catch(() => null),
   ]);
+  state.schedulerStatus = schedulerStatus;
+  state.schedulerDueSelection = schedulerDueSelection;
   state.cache.turns = asItems(turns);
+  const selectedSchedulerChats = asItems(schedulerReport().selected);
+  if (!state.schedulerChatId && selectedSchedulerChats.length > 0) {
+    state.schedulerChatId = selectedSchedulerChats[0];
+  }
+  if (state.schedulerChatId) {
+    await loadSchedulerChatLoop(state.schedulerChatId);
+  } else {
+    state.schedulerChatLoop = null;
+  }
   const decisionRows = asItems(decisions).map((item) => `
     <tr>
       <td>${escapeHtml(item.chat_id || "-")}</td>
@@ -576,9 +708,19 @@ async function renderDashboardCognition() {
     `;
   });
   dashboardShell(`
+    ${renderSchedulerDiagnosticsSection()}
     ${section("主动决策池 Cognition", "最近 CognitiveLoop 决策，支持按 chat 查看决策/工具轨迹。", table(["Chat", "意图", "动作层级", "姿态", "操作"], decisionRows))}
     ${section("Turn Context", "每轮心智状态摘要：感知、注意力、主观决策、工具决策和连续性来源。", table(["时间", "Chat", "Sender", "Judge", "Intent", "Budget", "Tier", "工具数", "Heartflow", "操作"], turnRows))}
   `);
+  $('[data-scheduler-load]')?.addEventListener("click", async () => {
+    const input = $("#scheduler-chat-id");
+    await loadSchedulerChatLoop(input ? input.value : state.schedulerChatId);
+    renderDashboardCognition();
+  });
+  $$('[data-scheduler-chat]').forEach((button) => button.addEventListener("click", async () => {
+    await loadSchedulerChatLoop(button.dataset.schedulerChat);
+    renderDashboardCognition();
+  }));
   $$('[data-chat-trace]').forEach((button) => button.addEventListener("click", () => openChatTrace(button.dataset.chatTrace)));
   $$('[data-turn-detail]').forEach((button) => button.addEventListener("click", () => openTurnTrace(Number(button.dataset.turnDetail))));
 }
@@ -1132,6 +1274,9 @@ async function loadCurrent() {
     users: loadUsers,
     personaSlices: loadPersonaSlices,
   };
+  if (state.current !== "dashboard") {
+    stopSchedulerPolling();
+  }
   try {
     await (loaders[state.current] || loadDashboard)();
   } catch (error) {

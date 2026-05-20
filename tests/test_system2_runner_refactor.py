@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import unittest
+from types import SimpleNamespace
 
 
 class _DummyLock:
@@ -60,10 +61,29 @@ class _FakeGroupReplyWaitManager:
 class _FakePrivateChatManager:
     def __init__(self):
         self.calls = []
+        self.timeout_sec = 30.0
 
-    async def wait_for_new_message(self, sender_id):
+    async def wait_for_new_message(self, sender_id, chat_id=""):
         self.calls.append(sender_id)
         return True
+
+
+class _FakeKernel:
+    DEFAULT_FOLLOWUP_COOLDOWN_SEC = 8.0
+
+    def __init__(self):
+        self.wait_target_syncs = []
+        self.group_waits = []
+        self.cooldowns = []
+
+    async def sync_runtime_wait_targets(self, chat_id, targets, target_name):
+        self.wait_target_syncs.append((chat_id, list(targets), target_name))
+
+    async def arm_group_wait(self, chat_id, payload):
+        self.group_waits.append((chat_id, dict(payload or {})))
+
+    async def set_cooldown(self, chat_id, action, until_ts, reason=""):
+        self.cooldowns.append((chat_id, action, reason))
 
 
 class _FakeEvent:
@@ -97,6 +117,8 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
                 "system2_planner": _FakePlanner(),
                 "private_chat_manager": _FakePrivateChatManager(),
                 "group_reply_wait_manager": _FakeGroupReplyWaitManager(),
+                "chat_loop_kernel": _FakeKernel(),
+                "config": SimpleNamespace(attention=SimpleNamespace(thread_same_speaker_followup_sec=8)),
             },
         )()
         runner = runner_mod.System2Runner(runtime)
@@ -114,6 +136,11 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
             runtime.runtime_coordinator.wait_updates,
             [(event.unified_msg_origin, ["user-2"], "Bob")],
         )
+        self.assertEqual(
+            runtime.chat_loop_kernel.wait_target_syncs,
+            [(event.unified_msg_origin, ["user-2"], "Bob")],
+        )
+        self.assertEqual(runtime.chat_loop_kernel.cooldowns[0][1:], ("followup", "followup_dispatch"))
         self.assertEqual(runtime.group_reply_wait_manager.events, [event])
 
 

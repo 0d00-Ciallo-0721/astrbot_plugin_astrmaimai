@@ -46,11 +46,12 @@ from .reply_post_send import ReplyPostSendMixin
 class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
     """Handles visible reply sanitizing, sending, and post-send emotional settlement."""
 
-    def __init__(self, state_engine, mood_manager, config=None, runtime_coordinator=None):
+    def __init__(self, state_engine, mood_manager, config=None, runtime_coordinator=None, memory_engine=None):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
         self.config = config if config else state_engine.config
         self.runtime_coordinator = runtime_coordinator
+        self.memory_engine = memory_engine
 
         self.segmentation_threshold = self.config.reply.segment_min_len
         self.no_segment_limit = self.config.reply.no_segment_max_len
@@ -105,6 +106,12 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         at_targets = self._merge_wait_targets(event, pending_actions)
         if not await self._send_segments(event, chat_id, artifact, at_targets):
             return
+        await self._ingest_memory_turn(
+            event,
+            chat_id,
+            formatted_user_text,
+            artifact.persistable_text,
+        )
 
         await self._settle_post_send(
             event,

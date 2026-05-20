@@ -45,6 +45,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         ("sys2", "retrieval"): LanePolicy(store_mode="structured", max_raw_turns=4),
         ("sys3", "direct"): LanePolicy(store_mode="full", max_raw_turns=8),
         ("bg", "memory"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
+        ("bg", "compaction"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
         ("bg", "dream"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
         ("bg", "reflect"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
         ("bg", "proactive"): LanePolicy(store_mode="summary_only", max_raw_turns=3),
@@ -88,17 +89,51 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         prefix_hash: str,
         model_id: str,
         persona_id: str,
+        template_id: str = "",
+        schema_id: str = "",
+        persona_core_version: str = "",
     ) -> bool:
+        return bool(
+            self._rotation_reason(
+                lane_umo=lane_umo,
+                prompt_version=prompt_version,
+                prefix_hash=prefix_hash,
+                model_id=model_id,
+                persona_id=persona_id,
+                template_id=template_id,
+                schema_id=schema_id,
+                persona_core_version=persona_core_version,
+            )
+        )
+
+    def _rotation_reason(
+        self,
+        lane_umo: str,
+        prompt_version: str,
+        prefix_hash: str,
+        model_id: str,
+        persona_id: str,
+        template_id: str = "",
+        schema_id: str = "",
+        persona_core_version: str = "",
+    ) -> str:
         meta = self._runtime_meta.get(lane_umo)
         if not meta:
-            return False
-        return any(
-            [
-                meta.get("prompt_version") != prompt_version,
-                meta.get("prefix_hash") != prefix_hash,
-                meta.get("persona_id") != persona_id,
-            ]
-        )
+            return ""
+        reasons = []
+        if meta.get("template_id") != template_id:
+            reasons.append("template_changed")
+        if meta.get("prompt_version") != prompt_version:
+            reasons.append("template_version_changed")
+        if meta.get("schema_id") != schema_id:
+            reasons.append("schema_changed")
+        if meta.get("prefix_hash") != prefix_hash:
+            reasons.append("prefix_hash")
+        if meta.get("persona_core_version") != persona_core_version:
+            reasons.append("persona_core_version_changed")
+        if meta.get("persona_id") != persona_id:
+            reasons.append("persona_id")
+        return ",".join(reasons)
 
     def _build_title(self, lane_key: LaneKey) -> str:
         return f"AstrMai {lane_key.subsystem}/{lane_key.task_family}"
@@ -108,3 +143,6 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         if key not in self._remote_sessions:
             self._remote_sessions[key] = lane_umo
         return self._remote_sessions[key]
+
+    def get_runtime_meta(self, lane_umo: str) -> Dict[str, Any]:
+        return dict(self._runtime_meta.get(lane_umo, {}) or {})

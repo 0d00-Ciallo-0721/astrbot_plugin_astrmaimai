@@ -9,6 +9,17 @@ function dashboardPage() {
         heartflowStatus: null,
         heartflowChats: [],
         recentDecisions: [],
+        schedulerStatus: null,
+        schedulerDueSelection: null,
+        schedulerChatLoop: null,
+        schedulerChatId: '',
+        contextEconomy: null,
+        contextEconomyTemplates: [],
+        contextEconomyAvailableFamilies: [],
+        contextEconomyFilterText: '',
+        contextEconomyWorkloadFamily: '',
+        contextEconomyQuickView: 'high_rotate',
+        contextEconomySortBy: 'rotate',
         toolsStatus: null,
         toolsPolicy: null,
         recentToolCalls: [],
@@ -64,6 +75,23 @@ function dashboardPage() {
                     promises.push(window.api.get('/heartflow/chats').then(res => this.heartflowChats = res.items || []));
                 } else if (this.currentTab === 'cognition') {
                     promises.push(window.api.get('/cognition/recent-decisions?limit=30').then(res => this.recentDecisions = res.items || []));
+                    promises.push(window.api.get('/cognition/scheduler/status').catch(() => null).then(res => this.schedulerStatus = res));
+                    promises.push(
+                        window.api.get('/cognition/scheduler/due-selection').catch(() => null).then(async res => {
+                            this.schedulerDueSelection = res;
+                            const selected = res?.data?.report?.selected || [];
+                            if (!this.schedulerChatId && selected.length > 0) {
+                                this.schedulerChatId = selected[0];
+                            }
+                            if (this.schedulerChatId) {
+                                await this.loadSchedulerChatLoop(this.schedulerChatId);
+                            }
+                        })
+                    );
+                    promises.push(window.api.get('/cognition/context-economy?limit=20').catch(() => null).then(res => {
+                        this.contextEconomy = res?.data?.overview || null;
+                    }));
+                    promises.push(this.loadContextEconomyTemplates());
                 } else if (this.currentTab === 'tools') {
                     promises.push(window.api.get('/tools/status').then(res => this.toolsStatus = res));
                     promises.push(window.api.get('/tools/policy').catch(() => null).then(res => this.toolsPolicy = res));
@@ -156,6 +184,90 @@ function dashboardPage() {
             } catch (e) {
                 return String(value);
             }
+        },
+
+        formatPercent(value) {
+            return `${(Number(value || 0) * 100).toFixed(1)}%`;
+        },
+
+        formatFamilies(families) {
+            const entries = Object.entries(families || {});
+            if (!entries.length) return '—';
+            return entries
+                .sort((a, b) => b[1] - a[1])
+                .map(([name, count]) => `${name} (${count})`)
+                .join(', ');
+        },
+
+        schedulerReport() {
+            return this.schedulerDueSelection?.data?.report || {};
+        },
+
+        schedulerOverview() {
+            return this.schedulerStatus?.data?.overview || {};
+        },
+
+        async loadSchedulerChatLoop(chatId = null) {
+            const targetChat = (chatId ?? this.schedulerChatId ?? '').trim();
+            if (!targetChat) {
+                this.schedulerChatLoop = null;
+                return;
+            }
+            this.schedulerChatId = targetChat;
+            const encodedChat = window.api.segment(targetChat);
+            this.schedulerChatLoop = await window.api.get(`/cognition/scheduler/chats/${encodedChat}`).catch(() => null);
+        },
+
+        contextEconomySortParams() {
+            if (this.contextEconomySortBy === 'session_reuse') {
+                return { sort_by: 'session_reuse', sort_dir: 'asc' };
+            }
+            if (this.contextEconomySortBy === 'calls') {
+                return { sort_by: 'calls', sort_dir: 'desc' };
+            }
+            return { sort_by: 'rotate', sort_dir: 'desc' };
+        },
+
+        setContextEconomyQuickView(view) {
+            this.contextEconomyQuickView = view;
+            if (view === 'low_reuse') {
+                this.contextEconomySortBy = 'session_reuse';
+            } else if (view === 'high_traffic') {
+                this.contextEconomySortBy = 'calls';
+            } else {
+                this.contextEconomySortBy = 'rotate';
+            }
+            return this.applyContextEconomyFilters();
+        },
+
+        async loadContextEconomyTemplates() {
+            const sort = this.contextEconomySortParams();
+            const params = new URLSearchParams({
+                limit: '20',
+                sort_by: sort.sort_by,
+                sort_dir: sort.sort_dir,
+            });
+            if (this.contextEconomyFilterText.trim()) {
+                params.set('template_id', this.contextEconomyFilterText.trim());
+            }
+            if (this.contextEconomyWorkloadFamily) {
+                params.set('workload_family', this.contextEconomyWorkloadFamily);
+            }
+            const res = await window.api.get(`/cognition/context-economy/templates?${params.toString()}`).catch(() => null);
+            this.contextEconomyTemplates = res?.items || [];
+            this.contextEconomyAvailableFamilies = res?.available_workload_families || [];
+        },
+
+        async applyContextEconomyFilters() {
+            if (this.currentTab !== 'cognition') return;
+            if (this.contextEconomySortBy === 'session_reuse') {
+                this.contextEconomyQuickView = 'low_reuse';
+            } else if (this.contextEconomySortBy === 'calls') {
+                this.contextEconomyQuickView = 'high_traffic';
+            } else {
+                this.contextEconomyQuickView = 'high_rotate';
+            }
+            await this.loadContextEconomyTemplates();
         },
 
         async copyJson(obj) {

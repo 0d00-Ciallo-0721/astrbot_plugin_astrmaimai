@@ -1,0 +1,38 @@
+{
+  "total_scenarios": 0,
+  "total_turns": 0,
+  "passed_turns": 0,
+  "failed_turns": 0,
+  "pass_rate": 0.0,
+  "worst_wait_next_node_scenario": "(none)",
+  "earliest_cooldown_scenario": "(none)",
+  "most_common_block_reason": "(none)",
+  "most_unstable_score_signal": "(none)",
+  "scenario_pass_rates": {},
+  "scenario_state_counts": {},
+  "scenario_first_state_turns": {},
+  "scenario_block_reason_counts": {},
+  "evaluated_turn_count": 0,
+  "block_reason_counts": {},
+  "score_averages": {
+    "closure_score": 0.0,
+    "tail_activity_score": 0.0,
+    "topic_density_score": 0.0,
+    "stability_score": 0.0,
+    "benefit_score": 0.0
+  },
+  "score_ranges": {
+    "closure_score": 0.0,
+    "tail_activity_score": 0.0,
+    "topic_density_score": 0.0,
+    "stability_score": 0.0,
+    "benefit_score": 0.0
+  },
+  "score_stddevs": {
+    "closure_score": 0.0,
+    "tail_activity_score": 0.0,
+    "topic_density_score": 0.0,
+    "stability_score": 0.0,
+    "benefit_score": 0.0
+  }
+}

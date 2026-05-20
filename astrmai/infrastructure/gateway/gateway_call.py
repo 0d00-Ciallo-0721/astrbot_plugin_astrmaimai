@@ -1,8 +1,10 @@
 import asyncio
+import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from astrbot.api import logger
 
+from ..context_economy import WorkloadPolicy
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import looks_like_provider_failure_text, sanitize_visible_reply_text
@@ -10,6 +12,83 @@ from .provider_capabilities import infer_provider_capabilities
 
 
 class GatewayCallMixin:
+    async def _record_benchmark_sample(
+        self,
+        *,
+        usage: Dict[str, int],
+        model_id: str,
+        provider_family: str,
+        workload_policy: Optional[WorkloadPolicy],
+        economy_payload: Optional[Dict[str, Any]],
+        fallback_used: bool,
+        provider_session_id: str = "",
+    ) -> None:
+        store = getattr(self, "benchmark_sample_store", None)
+        if store is None:
+            return
+        economy_payload = dict(economy_payload or {})
+        try:
+            template_id = str(
+                economy_payload.get("template_id", "")
+                or getattr(workload_policy, "template_id", "")
+                or "unknown"
+            )
+            template_version = str(
+                economy_payload.get("template_version", "")
+                or getattr(workload_policy, "template_version", "")
+                or "v1"
+            )
+            sample = {
+                "source_run_id": str(getattr(store, "run_id", "") or ""),
+                "created_at": time.time(),
+                "workload_family": str(
+                    economy_payload.get("workload_family", "")
+                    or getattr(getattr(workload_policy, "family", None), "value", "")
+                    or "unknown"
+                ),
+                "template_id": template_id,
+                "template_version": template_version,
+                "template_key": f"{template_id}@{template_version}",
+                "schema_id": str(
+                    economy_payload.get("schema_id", "")
+                    or getattr(workload_policy, "schema_id", "")
+                    or ""
+                ),
+                "model_id": str(model_id or ""),
+                "provider_family": str(provider_family or ""),
+                "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                "cached_input_tokens": int(usage.get("input_cached", 0) or 0),
+                "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+                "provider_session_id": str(
+                    provider_session_id
+                    or economy_payload.get("provider_session_id", "")
+                    or ""
+                ),
+                "lane_rotated": bool(economy_payload.get("lane_rotated", False)),
+                "lane_rotate_reason": str(economy_payload.get("lane_rotate_reason", "") or ""),
+                "stable_prefix_length": int(economy_payload.get("stable_prefix_length", 0) or 0),
+                "dynamic_payload_length": int(economy_payload.get("dynamic_payload_length", 0) or 0),
+                "primary_model": str(
+                    economy_payload.get("primary_model", "")
+                    or getattr(workload_policy, "primary_model", "")
+                    or ""
+                ),
+                "actual_model": str(model_id or ""),
+                "primary_hit": bool(
+                    str(model_id or "")
+                    and str(model_id or "") == str(
+                        economy_payload.get("primary_model", "")
+                        or getattr(workload_policy, "primary_model", "")
+                        or ""
+                    )
+                ),
+                "fallback_used": bool(fallback_used),
+            }
+            await store.append(sample)
+        except Exception as exc:
+            logger.debug(f"[Gateway] benchmark sample skipped: {exc}")
+
     async def _elastic_call_result(
         self,
         pool_name: str,
@@ -24,9 +103,16 @@ class GatewayCallMixin:
         debug_meta: Optional[Dict[str, Any]] = None,
         request_kwargs: Optional[Dict[str, Any]] = None,
         request_kwargs_factory: Optional[Callable[[str], Dict[str, Any]]] = None,
+        workload_policy: Optional[WorkloadPolicy] = None,
+        record_economy: bool = True,
     ) -> LLMCallResult:
         async with self._global_semaphore:
-            primary_models, attempt_queue = self._build_attempt_queue(pool_name, models, use_fallback)
+            primary_models, attempt_queue = self._build_attempt_queue(
+                pool_name,
+                models,
+                use_fallback,
+                workload_policy=workload_policy,
+            )
             if not attempt_queue:
                 raise LLMCascadeFailureException(f"未配置可用模型池: {pool_name}")
 
@@ -42,18 +128,19 @@ class GatewayCallMixin:
                 report_pool = pool_name if model_id in primary_models else "fallback"
                 for attempt in range(max_retries + 1):
                     try:
+                        llm_kwargs = self._build_request_kwargs(
+                            model_id=model_id,
+                            system_prompt=system_prompt,
+                            image_urls=image_urls,
+                            request_kwargs=request_kwargs,
+                            request_kwargs_factory=request_kwargs_factory,
+                        )
                         response = await asyncio.wait_for(
                             self.context.llm_generate(
                                 chat_provider_id=model_id,
                                 prompt=prompt if prompt else None,
                                 contexts=list(contexts or []),
-                                **self._build_request_kwargs(
-                                    model_id=model_id,
-                                    system_prompt=system_prompt,
-                                    image_urls=image_urls,
-                                    request_kwargs=request_kwargs,
-                                    request_kwargs_factory=request_kwargs_factory,
-                                ),
+                                **llm_kwargs,
                             ),
                             timeout=timeout_limit,
                         )
@@ -93,11 +180,34 @@ class GatewayCallMixin:
                             parsed_json = self._parse_json_completion(content)
                             self.router.report_success(report_pool, model_id)
                             self._log_usage(report_pool, model_id, usage, log_meta)
+                            economy_payload = {}
+                            if workload_policy and record_economy:
+                                workload_trace = self.context_economy.build_trace(
+                                    policy=workload_policy,
+                                    actual_model=model_id,
+                                    fallback_used=bool(model_id not in primary_models),
+                                    provider_family=log_meta["provider"],
+                                    provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
+                                    provider_session_enabled=bool(llm_kwargs.get("session_id")),
+                                    provider_cache_hint_enabled=bool(llm_kwargs.get("cache_control")),
+                                )
+                                self.context_economy.record_trace(workload_trace)
+                                economy_payload = workload_trace.as_dict()
+                            await self._record_benchmark_sample(
+                                usage=usage,
+                                model_id=model_id,
+                                provider_family=log_meta["provider"],
+                                workload_policy=workload_policy,
+                                economy_payload=economy_payload,
+                                fallback_used=bool(model_id not in primary_models),
+                                provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
+                            )
                             return self._build_success_result(
                                 text=str(content).strip(),
                                 parsed_json=parsed_json,
                                 model_id=model_id,
                                 usage=usage,
+                                economy=economy_payload,
                             )
 
                         safe_text = sanitize_visible_reply_text(
@@ -110,10 +220,33 @@ class GatewayCallMixin:
 
                         self.router.report_success(report_pool, model_id)
                         self._log_usage(report_pool, model_id, usage, log_meta)
+                        economy_payload = {}
+                        if workload_policy and record_economy:
+                            workload_trace = self.context_economy.build_trace(
+                                policy=workload_policy,
+                                actual_model=model_id,
+                                fallback_used=bool(model_id not in primary_models),
+                                provider_family=log_meta["provider"],
+                                provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
+                                provider_session_enabled=bool(llm_kwargs.get("session_id")),
+                                provider_cache_hint_enabled=bool(llm_kwargs.get("cache_control")),
+                            )
+                            self.context_economy.record_trace(workload_trace)
+                            economy_payload = workload_trace.as_dict()
+                        await self._record_benchmark_sample(
+                            usage=usage,
+                            model_id=model_id,
+                            provider_family=log_meta["provider"],
+                            workload_policy=workload_policy,
+                            economy_payload=economy_payload,
+                            fallback_used=bool(model_id not in primary_models),
+                            provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
+                        )
                         return self._build_success_result(
                             text=safe_text.strip(),
                             model_id=model_id,
                             usage=usage,
+                            economy=economy_payload,
                         )
                     except Exception as exc:
                         last_error = str(exc)

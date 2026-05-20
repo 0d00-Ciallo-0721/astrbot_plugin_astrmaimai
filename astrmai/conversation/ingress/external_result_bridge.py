@@ -39,6 +39,11 @@ async def bridge_external_plugin_result(runtime, event) -> None:
     chat_id = event.unified_msg_origin
     bot_id = get_event_self_id(event)
     bot_reply_event = build_external_reply_event(reply_text)
+    bot_reply_event["extra"] = {
+        **dict(bot_reply_event.get("extra", {}) or {}),
+        "astrmai_loop_source": "external_result_bridge",
+        "is_external_bot_reply": True,
+    }
     debug_trace(event, "ingress.external_result", preview=preview_text(reply_text, 100))
 
     if runtime.attention_gate and hasattr(runtime.attention_gate, "inject_external_event"):

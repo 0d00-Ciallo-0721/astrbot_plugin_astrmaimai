@@ -1,0 +1,25 @@
+{
+  "overview": {
+    "call_count": 0,
+    "input_tokens": 0,
+    "cached_input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "cached_input_ratio": 0.0,
+    "provider_session_enabled_rate": 0.0,
+    "provider_session_reuse_rate": 0.0,
+    "primary_hit_rate": 0.0,
+    "lane_rotate_rate": 0.0,
+    "lane_rotate_count": 0,
+    "avg_stable_prefix_length": 0.0,
+    "avg_dynamic_payload_length": 0.0,
+    "rotate_reasons": {},
+    "actual_models": {},
+    "workload_families": {}
+  },
+  "by_workload_family": {},
+  "by_template": {},
+  "high_rotate_templates": [],
+  "low_reuse_templates": [],
+  "high_traffic_templates": []
+}

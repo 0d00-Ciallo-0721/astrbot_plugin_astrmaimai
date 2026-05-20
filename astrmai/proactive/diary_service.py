@@ -4,14 +4,17 @@ import time
 
 from astrbot.api import logger
 
+from ..infrastructure.context_economy import PromptTemplateId
+
 
 class DiaryService:
-    def __init__(self, persistence, memory_engine, config, call_background_lane, semaphore):
+    def __init__(self, persistence, memory_engine, config, call_background_lane, semaphore, prompt_registry=None):
         self.persistence = persistence
         self.memory_engine = memory_engine
         self.config = config
         self._call_background_lane = call_background_lane
         self._bg_semaphore = semaphore
+        self.prompt_registry = prompt_registry
 
     async def run_once(self, active_states):
         async with self._bg_semaphore:
@@ -19,7 +22,7 @@ class DiaryService:
             cache = self.persistence.load_persona_cache()
             persona_data = cache.get(persona_id, {})
             summary = persona_data.get("summary", "")
-            persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""
+            persona_injection = f"\n[浣犵殑鏍稿績浜鸿]: {summary}\n" if summary else ""
 
             for state in active_states:
                 group_id = getattr(state, "chat_id", None)
@@ -33,19 +36,35 @@ class DiaryService:
                 recent_memories = []
                 if self.memory_engine and hasattr(self.memory_engine, "get_recent_memories"):
                     recent_memories = await self.memory_engine.get_recent_memories(group_id, hours=24)
-                recent_text = "\n".join(str(item) for item in recent_memories[:12]) or "今天没有显著事件。"
-                prompt = f"""{persona_injection}
-请根据以下群聊最近24小时记忆，写一段仅供内部记录的简短日记摘要。
-群聊ID: {group_id}
-最近记忆:
+                recent_text = "\n".join(str(item) for item in recent_memories[:12]) or "浠婂ぉ娌℃湁鏄捐憲浜嬩欢銆?"
+
+                if self.prompt_registry is not None:
+                    envelope = self.prompt_registry.render_template(
+                        PromptTemplateId.PROACTIVE_DIARY_SUMMARY,
+                        {
+                            "persona_summary": summary,
+                            "chat_id": str(group_id),
+                            "recent_text": recent_text,
+                        },
+                    )
+                    diary = await self._call_background_lane(
+                        "diary",
+                        str(group_id),
+                        envelope.prompt,
+                        system_prompt=envelope.system_prompt,
+                        template_envelope=envelope,
+                    )
+                else:
+                    prompt = f"""{persona_injection}
+璇锋牴鎹互涓嬬兢鑱婃渶杩?4灏忔椂璁板繂锛屽啓涓€娈典粎渚涘唴閮ㄨ褰曠殑绠€鐭棩璁版憳瑕併€?缇よ亰ID: {group_id}
+鏈€杩戣蹇?
 {recent_text}
 
-要求：
-- 100字以内
-- 偏总结，不要像聊天回复
-- 直接输出正文
+瑕佹眰锛?- 100瀛椾互鍐?- 鍋忔€荤粨锛屼笉瑕佸儚鑱婂ぉ鍥炲
+- 鐩存帴杈撳嚭姝ｆ枃
 """
-                diary = await self._call_background_lane("diary", str(group_id), prompt)
+                    diary = await self._call_background_lane("diary", str(group_id), prompt)
+
                 if diary and self.memory_engine and hasattr(self.memory_engine, "record_cognitive_feedback"):
                     try:
                         await self.memory_engine.record_cognitive_feedback(
@@ -61,7 +80,7 @@ class DiaryService:
                 if diary and self.memory_engine and hasattr(self.memory_engine, "add_memory"):
                     try:
                         await self.memory_engine.add_memory(
-                            content=f"[内部日记] {diary}",
+                            content=f"[鍐呴儴鏃ヨ] {diary}",
                             session_id=str(group_id),
                             importance=0.45,
                         )

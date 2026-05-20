@@ -30,3 +30,41 @@ async def list_recent_turns(limit: int = 50, user: str = Depends(get_current_use
 @router.get("/chats/{chat_id}/turns")
 async def list_chat_recent_turns(chat_id: str, limit: int = 50, user: str = Depends(get_current_user)):
     return await _service().recent_turn_traces(chat_id=chat_id, limit=limit)
+
+
+@router.get("/context-economy")
+async def get_context_economy(limit: int = 20, user: str = Depends(get_current_user)):
+    return await _service().context_economy_overview_view(limit=limit)
+
+
+@router.get("/context-economy/templates")
+async def list_context_economy_templates(
+    limit: int = 50,
+    template_id: str | None = None,
+    workload_family: str | None = None,
+    sort_by: str = "rotate",
+    sort_dir: str | None = None,
+    user: str = Depends(get_current_user),
+):
+    return await _service().context_economy_templates_view(
+        limit=limit,
+        template_id=template_id,
+        workload_family=workload_family,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+
+
+@router.get("/scheduler/status")
+async def get_scheduler_status(user: str = Depends(get_current_user)):
+    return await _service().scheduler_status_view()
+
+
+@router.get("/scheduler/due-selection")
+async def get_scheduler_due_selection(user: str = Depends(get_current_user)):
+    return await _service().scheduler_due_selection_view()
+
+
+@router.get("/scheduler/chats/{chat_id}")
+async def get_scheduler_chat(chat_id: str, user: str = Depends(get_current_user)):
+    return await _service().scheduler_chat_view(chat_id)

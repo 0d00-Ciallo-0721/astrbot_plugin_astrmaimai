@@ -15,6 +15,24 @@ class ProfileGenerator:
             "memory_points": list(getattr(profile, "memory_points", []) or []),
         }
 
+    def build_template_payload(self, profile, persona_summary: str = "") -> dict[str, str]:
+        old_analysis = getattr(profile, "persona_analysis", "") or "鏆傛棤鏃х敾鍍?"
+        old_tags = getattr(profile, "tags", []) or []
+        old_tags_str = ", ".join(old_tags) if old_tags else "鏆傛棤鏍囩"
+        old_memory_points = getattr(profile, "memory_points", []) or []
+        old_memory_text = "\n".join(str(item) for item in old_memory_points) if old_memory_points else "鏆傛棤璁板繂鐐?"
+        profiling_count = int(getattr(profile, "message_count_for_profiling", 0) or 0)
+        recent_interaction_summary = str(getattr(profile, "recent_interaction_summary", "") or "").strip() or "鏆傛棤鏈€杩戜簰鍔ㄦ憳瑕?"
+        return {
+            "persona_summary": str(persona_summary or "").strip(),
+            "name": str(getattr(profile, "name", "") or "").strip(),
+            "profiling_count": str(profiling_count),
+            "old_analysis": str(old_analysis or "").strip(),
+            "old_tags_text": str(old_tags_str or "").strip(),
+            "old_memory_text": str(old_memory_text or "").strip(),
+            "recent_interaction_summary": recent_interaction_summary,
+        }
+
     def build_prompt(self, profile, persona_summary: str = "") -> str:
         persona_injection = f"\n[你的人设摘要]: {persona_summary}\n" if persona_summary else ""
         old_analysis = getattr(profile, "persona_analysis", "") or "暂无旧画像"

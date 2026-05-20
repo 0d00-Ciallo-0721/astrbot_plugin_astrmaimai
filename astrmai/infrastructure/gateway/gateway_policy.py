@@ -1,11 +1,26 @@
 from typing import Any, Callable, Dict, List, Optional
 
+from ..context_economy import WorkloadPolicy
+
 from ..runtime.runtime_contracts import FailureKind
 
 
 class GatewayPolicyMixin:
-    def _build_attempt_queue(self, pool_name: str, models: List[str], use_fallback: bool) -> tuple[List[str], List[str]]:
-        primary_models = self.router.get_ranked_models(pool_name, models)
+    def _build_attempt_queue(
+        self,
+        pool_name: str,
+        models: List[str],
+        use_fallback: bool,
+        workload_policy: Optional[WorkloadPolicy] = None,
+    ) -> tuple[List[str], List[str]]:
+        sticky_key = workload_policy.sticky_key if workload_policy and workload_policy.sticky_model else ""
+        sticky_preferred = workload_policy.primary_model if workload_policy else ""
+        primary_models = self.router.get_ranked_models(
+            pool_name,
+            models,
+            sticky_key=sticky_key,
+            sticky_preferred=sticky_preferred,
+        )
         attempt_queue = primary_models.copy()
         if use_fallback:
             fallback_models = self.router.get_ranked_models("fallback", self._fallback_models())

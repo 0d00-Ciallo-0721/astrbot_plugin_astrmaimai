@@ -72,6 +72,10 @@ class RefactoredExternalResultBridgeTests(unittest.TestCase):
 
         self.assertEqual(len(runtime.attention_gate.calls), 1)
         self.assertEqual(
+            runtime.attention_gate.calls[0][1]["extra"]["astrmai_loop_source"],
+            "external_result_bridge",
+        )
+        self.assertEqual(
             runtime.evolution.calls,
             [("default:GroupMessage:group-1", "bot-1", "(内置插件执行结果): 任务完成[图片]")],
         )

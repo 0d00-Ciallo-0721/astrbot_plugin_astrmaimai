@@ -79,6 +79,9 @@ class MemoryToolService:
             metadata={"visibility_mode": "tool"},
         )
         items = await self.retrieval_service.retrieve(memory_query)
+        if exclude_ids:
+            excluded = set(exclude_ids)
+            items = [item for item in items if item.id not in excluded]
         warnings = ["Some returned memories may be stale."] if any(item.status == "stale" for item in items) else []
         return MemoryToolResult(
             query=query,

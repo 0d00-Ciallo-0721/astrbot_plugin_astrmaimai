@@ -120,6 +120,78 @@
       }
     }
   },
+  "conversation": {
+    "type": "object",
+    "description": "对话分层存储与上下文压缩",
+    "items": {
+      "enable_dialogue_store": {
+        "description": "启用对话分层存储",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，会把最近对话按热区/温区/冷区分层保存，帮助稳定上下文。"
+      },
+      "enable_context_compaction": {
+        "description": "启用上下文压缩",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，热区片段累计到阈值时会自动压缩成冷区摘要，减少上下文膨胀。"
+      },
+      "enable_prefix_caching": {
+        "description": "启用前缀缓存",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，较稳定的系统提示前缀会尝试缓存复用，降低重复构建成本。"
+      },
+      "hot_zone_ttl_seconds": {
+        "description": "热区保留时长（秒）",
+        "type": "float",
+        "default": 30.0,
+        "hint": "最近的高活跃片段会优先留在热区。"
+      },
+      "warm_zone_ttl_seconds": {
+        "description": "温区保留时长（秒）",
+        "type": "float",
+        "default": 300.0,
+        "hint": "较近但不那么新的片段会进入温区，供 prompt 参考。"
+      },
+      "warm_zone_max_tokens": {
+        "description": "温区最大 token 预算",
+        "type": "int",
+        "default": 1200,
+        "hint": "温区 transcript 的长度上限，避免 prompt 过长。"
+      },
+      "compaction_provider_id": {
+        "description": "压缩摘要使用的模型 ID",
+        "type": "string",
+        "default": "",
+        "hint": "留空时使用默认逻辑；填写后可指定更适合摘要的模型。"
+      },
+      "compaction_trigger_segments": {
+        "description": "触发压缩的片段数阈值",
+        "type": "int",
+        "default": 30,
+        "hint": "当同一会话累计片段达到这个数量时，会尝试生成冷区摘要。"
+      },
+      "compaction_trigger_tokens": {
+        "description": "触发压缩的 token 阈值",
+        "type": "int",
+        "default": 1800,
+        "hint": "当会话累计 token 接近这个值时，会尝试压缩旧片段。"
+      },
+      "compaction_keep_recent_segments": {
+        "description": "压缩后保留的最近片段数",
+        "type": "int",
+        "default": 12,
+        "hint": "压缩时会保留最近这几条消息，其余内容进入冷区摘要。"
+      },
+      "compaction_summary_max_tokens": {
+        "description": "冷区摘要最大 token 预算",
+        "type": "int",
+        "default": 450,
+        "hint": "控制冷区摘要本身的长度上限。"
+      }
+    }
+  },
   "reply": {
     "type": "object",
     "description": "回复风格与发送行为",

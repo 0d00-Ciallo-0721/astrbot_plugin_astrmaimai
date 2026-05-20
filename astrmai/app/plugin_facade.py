@@ -248,19 +248,36 @@ class PluginFacade:
                 await self.runtime.system2_planner.plan_and_execute(main_event, queue_events)
                 reply_sent = bool(main_event.get_extra("astrmai_reply_sent", False))
 
-                await self.runtime.runtime_coordinator.update_wait_targets(
-                    chat_id,
-                    list(main_event.get_extra("astrmai_wait_targets", []) or []),
-                    str(main_event.get_extra("astrmai_wait_target_name", "") or ""),
-                )
+                wait_targets = list(main_event.get_extra("astrmai_wait_targets", []) or [])
+                wait_target_name = str(main_event.get_extra("astrmai_wait_target_name", "") or "")
+                await self.runtime.runtime_coordinator.update_wait_targets(chat_id, wait_targets, wait_target_name)
+                if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+                    await self.runtime.chat_loop_kernel.sync_runtime_wait_targets(chat_id, wait_targets, wait_target_name)
 
                 is_private = main_event.get_extra("is_private_chat", False)
                 if reply_sent and is_private and self.runtime.private_chat_manager:
                     sender_id = str(main_event.get_sender_id())
-                    has_reply = await self.runtime.private_chat_manager.wait_for_new_message(sender_id)
+                    if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+                        await self.runtime.chat_loop_kernel.arm_private_wait(
+                            chat_id,
+                            {
+                                "user_id": sender_id,
+                                "target_ids": [sender_id],
+                                "target_name": str(main_event.get_sender_name() or ""),
+                                "timeout": float(getattr(self.runtime.private_chat_manager, "timeout_sec", 0.0) or 0.0),
+                                "reason": "private_followup_wait",
+                            },
+                        )
+                    has_reply = await self.runtime.private_chat_manager.wait_for_new_message(sender_id, chat_id=chat_id)
                     if not has_reply:
                         logger.info(f"[{chat_id}] 私聊用户长时间未回复，会话已自然休眠。")
+                        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+                            await self.runtime.chat_loop_kernel.expire_wait(chat_id, "private_wait_timeout")
                 elif reply_sent and main_event.get_group_id() and self.runtime.group_reply_wait_manager:
-                    self.runtime.group_reply_wait_manager.register_from_reply_event(main_event)
+                    if self.runtime.group_reply_wait_manager.register_from_reply_event(main_event):
+                        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+                            payload = self.runtime.group_reply_wait_manager.get_wait_info(chat_id)
+                            if payload:
+                                await self.runtime.chat_loop_kernel.arm_group_wait(chat_id, payload)
             finally:
                 logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")

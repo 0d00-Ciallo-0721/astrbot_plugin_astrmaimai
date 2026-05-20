@@ -24,9 +24,27 @@ class ContextEngine:
         self.config = config if config else self.summarizer.gateway.config
         self.context = context if context else self.summarizer.gateway.context
         self._prefix_hash_by_chat: Dict[str, str] = {}
+        self._prefix_meta_by_chat: Dict[str, Dict[str, Any]] = {}
+        self.prefix_caching_enabled = bool(getattr(getattr(self.config, "conversation", None), "enable_prefix_caching", True))
 
     def get_last_prefix_hash(self, chat_id: str) -> str:
+        if not self.prefix_caching_enabled:
+            return ""
         return self._prefix_hash_by_chat.get(chat_id, "")
+
+    def get_last_prefix_status(self, chat_id: str) -> dict[str, Any]:
+        if not self.prefix_caching_enabled:
+            return {
+                "prefix_hash": "",
+                "prefix_stable": False,
+                "prefix_changed_reason": "disabled",
+            }
+        meta = dict(self._prefix_meta_by_chat.get(chat_id, {}) or {})
+        return {
+            "prefix_hash": str(meta.get("prefix_hash", "") or ""),
+            "prefix_stable": bool(meta.get("prefix_stable", False)),
+            "prefix_changed_reason": str(meta.get("prefix_changed_reason", "unknown") or "unknown"),
+        }
 
     async def build_prompt(
         self,
@@ -75,17 +93,19 @@ class ContextEngine:
         slang_block = self._wrap_optional_block("群聊表达参考", slang_patterns, enabled=not is_fast_mode and not near_context_priority)
         jargon_block = self._wrap_optional_block("群内黑话参考", jargon_explanation, enabled=not is_fast_mode and not near_context_priority)
         style_variant = self._pick_reply_style(chat_id, is_fast_mode)
+        cold_summary = await self._load_dialogue_cold_summary(chat_id)
 
-        stable_prefix = "\n\n".join(
+        frozen_prefix = "\n\n".join(
             block
             for block in [
                 self._block("自我认知", role_block),
                 self._block("说话方式", style_block),
                 self._system_rules_block(),
+                self._block("冷区摘要", cold_summary),
             ]
             if block
         )
-        lane_state = "\n\n".join(
+        semi_stable_block = "\n\n".join(
             block
             for block in [
                 state_block.strip() if state_block else "",
@@ -94,17 +114,64 @@ class ContextEngine:
                 expression_block.strip() if expression_block else "",
                 slang_block.strip() if slang_block else "",
                 jargon_block.strip() if jargon_block else "",
+            ]
+            if block
+        )
+        dynamic_block = "\n\n".join(
+            block
+            for block in [
                 inner_voice_block.strip() if inner_voice_block else "",
             ]
             if block
         )
-        self._prefix_hash_by_chat[chat_id] = hashlib.md5(stable_prefix.encode("utf-8")).hexdigest()
-        system_prompt = "\n\n".join(block for block in [stable_prefix, lane_state] if block)
+        if self.prefix_caching_enabled:
+            current_hash = hashlib.md5(frozen_prefix.encode("utf-8")).hexdigest()
+            previous_meta = dict(self._prefix_meta_by_chat.get(chat_id, {}) or {})
+            previous_hash = str(previous_meta.get("prefix_hash", "") or "")
+            previous_cold_summary = str(previous_meta.get("cold_summary", "") or "")
+            if not previous_hash:
+                prefix_stable = False
+                prefix_changed_reason = "first_seen"
+            elif previous_hash == current_hash:
+                prefix_stable = True
+                prefix_changed_reason = ""
+            elif previous_cold_summary != cold_summary:
+                prefix_stable = False
+                prefix_changed_reason = "cold_summary_changed"
+            else:
+                prefix_stable = False
+                prefix_changed_reason = "frozen_rules_or_persona_changed"
+            self._prefix_hash_by_chat[chat_id] = current_hash
+            self._prefix_meta_by_chat[chat_id] = {
+                "prefix_hash": current_hash,
+                "prefix_stable": prefix_stable,
+                "prefix_changed_reason": prefix_changed_reason,
+                "cold_summary": str(cold_summary or ""),
+            }
+        else:
+            self._prefix_hash_by_chat.pop(chat_id, None)
+            self._prefix_meta_by_chat[chat_id] = {
+                "prefix_hash": "",
+                "prefix_stable": False,
+                "prefix_changed_reason": "disabled",
+                "cold_summary": str(cold_summary or ""),
+            }
+        system_prompt = "\n\n".join(block for block in [frozen_prefix, semi_stable_block, dynamic_block] if block)
         return (
             system_prompt.strip(),
             style_variant.strip(),
             proactive_recall_block.strip(),
         )
+
+    async def _load_dialogue_cold_summary(self, chat_id: str) -> str:
+        store = getattr(self.db, "dialogue_store", None)
+        if not store:
+            return ""
+        try:
+            return await store.get_cold_summary(chat_id)
+        except Exception as exc:
+            logger.debug(f"[{chat_id}] cold summary load failed: {exc}")
+            return ""
 
     async def _load_persona_payload(self, chat_id: str, retrieve_keys: list[str], is_fast_mode: bool) -> dict[str, Any]:
         target_persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")

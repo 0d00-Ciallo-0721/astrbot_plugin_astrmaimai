@@ -17,6 +17,8 @@ class CoreServices:
     lane_manager: Any = None
     event_bus: Any = None
     memory_engine: Any = None
+    dialogue_store: Any = None
+    context_compaction: Any = None
     state_engine: Any = None
     judge: Any = None
     sensors: Any = None
@@ -105,6 +107,7 @@ class PluginRuntimeContext:
     config: Any
     runtime_coordinator: Any
     host_bridge: Any
+    chat_loop_kernel: Any = None
     infrastructure_settings: InfrastructureSettings = field(
         default_factory=InfrastructureSettings
     )
@@ -176,6 +179,14 @@ class PluginRuntimeContext:
     @property
     def visual_cortex(self) -> Any:
         return self.core.visual_cortex
+
+    @property
+    def dialogue_store(self) -> Any:
+        return self.core.dialogue_store
+
+    @property
+    def context_compaction(self) -> Any:
+        return self.core.context_compaction
 
     @property
     def sys3_router(self) -> Any:
@@ -284,6 +295,9 @@ class PluginRuntimeContext:
                     "proactive_enabled": self.infrastructure_settings.features.proactive_enabled,
                     "dream_visible": self.infrastructure_settings.features.dream_visible,
                     "meme_enabled": self.infrastructure_settings.features.meme_enabled,
+                    "dialogue_store_enabled": self.infrastructure_settings.features.dialogue_store_enabled,
+                    "context_compaction_enabled": self.infrastructure_settings.features.context_compaction_enabled,
+                    "prefix_caching_enabled": self.infrastructure_settings.features.prefix_caching_enabled,
                 },
             },
             "components": {
@@ -299,7 +313,13 @@ class PluginRuntimeContext:
                 "cron_guard": self.cron_guard is not None,
                 "visual_cortex": self.visual_cortex is not None,
                 "proactive_task": self.proactive_task is not None,
+                "dialogue_store": self.dialogue_store is not None,
+                "context_compaction": self.context_compaction is not None,
+                "chat_loop_kernel": self.chat_loop_kernel is not None,
             },
+            "chat_loop": self.chat_loop_kernel.describe_status_sync()
+            if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "describe_status_sync")
+            else {"enabled": False, "tracked_chats": 0},
         }
 
     def build_capability_overview_sync(self) -> dict[str, Any]:
@@ -368,6 +388,8 @@ LEGACY_RUNTIME_ATTRS = (
     "judge",
     "sensors",
     "visual_cortex",
+    "dialogue_store",
+    "context_compaction",
     "sys3_router",
     "cron_guard",
     "reply_engine",
@@ -387,6 +409,7 @@ LEGACY_RUNTIME_ATTRS = (
     "review_service",
     "auto_check_task",
     "proactive_task",
+    "chat_loop_kernel",
 )
 
 

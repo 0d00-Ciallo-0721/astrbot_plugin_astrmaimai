@@ -13,6 +13,9 @@ class LaneStorageMixin:
         prefix_hash: str = "",
         model_id: str = "",
         persona_id: str = "",
+        template_id: str = "",
+        schema_id: str = "",
+        persona_core_version: str = "",
     ) -> tuple[str, str, List[dict], LanePolicy]:
         lane_umo = self.resolve_lane_umo(base_origin, lane_key)
         lane_lock = await self._get_lane_lock(lane_umo)
@@ -30,13 +33,28 @@ class LaneStorageMixin:
                     old_history = self._load_history(old_conversation)
                 except Exception:
                     old_history = []
+                rotate_reason = self._rotation_reason(
+                    lane_umo=lane_umo,
+                    prompt_version=lane_key.prompt_version,
+                    prefix_hash=prefix_hash,
+                    model_id=model_id,
+                    persona_id=persona_id,
+                    template_id=template_id,
+                    schema_id=schema_id,
+                    persona_core_version=persona_core_version,
+                )
                 rotate = self._should_rotate(
                     lane_umo=lane_umo,
                     prompt_version=lane_key.prompt_version,
                     prefix_hash=prefix_hash,
                     model_id=model_id,
                     persona_id=persona_id,
+                    template_id=template_id,
+                    schema_id=schema_id,
+                    persona_core_version=persona_core_version,
                 )
+            else:
+                rotate_reason = ""
 
             if not conversation_id or rotate:
                 conversation_id = await self.conversation_manager.new_conversation(
@@ -78,6 +96,11 @@ class LaneStorageMixin:
                 "prefix_hash": prefix_hash,
                 "model_id": model_id,
                 "persona_id": persona_id,
+                "template_id": template_id,
+                "schema_id": schema_id,
+                "persona_core_version": persona_core_version,
+                "lane_rotated": bool(rotate),
+                "lane_rotate_reason": rotate_reason,
             }
             return lane_umo, conversation_id, history, self.get_policy(lane_key)
 
@@ -91,6 +114,9 @@ class LaneStorageMixin:
         prefix_hash: str = "",
         model_id: str = "",
         persona_id: str = "",
+        template_id: str = "",
+        schema_id: str = "",
+        persona_core_version: str = "",
     ) -> List[dict]:
         normalized = self._normalize_history(history, lane_key)
         await self.conversation_manager.update_conversation(
@@ -107,6 +133,11 @@ class LaneStorageMixin:
             "prefix_hash": prefix_hash,
             "model_id": model_id,
             "persona_id": persona_id,
+            "template_id": template_id,
+            "schema_id": schema_id,
+            "persona_core_version": persona_core_version,
+            "lane_rotated": False,
+            "lane_rotate_reason": "",
         }
         return normalized
 
@@ -120,6 +151,9 @@ class LaneStorageMixin:
         prefix_hash: str = "",
         model_id: str = "",
         persona_id: str = "",
+        template_id: str = "",
+        schema_id: str = "",
+        persona_core_version: str = "",
     ) -> List[dict]:
         lane_umo, conversation_id, history, _ = await self.ensure_lane(
             lane_key=lane_key,
@@ -127,6 +161,9 @@ class LaneStorageMixin:
             prefix_hash=prefix_hash,
             model_id=model_id,
             persona_id=persona_id,
+            template_id=template_id,
+            schema_id=schema_id,
+            persona_core_version=persona_core_version,
         )
         user_turn = self.build_history_turn("user", user_content)
         assistant_turn = self.build_history_turn("assistant", assistant_content)
@@ -143,6 +180,9 @@ class LaneStorageMixin:
             prefix_hash=prefix_hash,
             model_id=model_id,
             persona_id=persona_id,
+            template_id=template_id,
+            schema_id=schema_id,
+            persona_core_version=persona_core_version,
         )
 
     async def append_visible_reply_artifact(
@@ -155,6 +195,9 @@ class LaneStorageMixin:
         prefix_hash: str = "",
         model_id: str = "",
         persona_id: str = "",
+        template_id: str = "",
+        schema_id: str = "",
+        persona_core_version: str = "",
     ) -> List[dict]:
         if artifact.blocked or not artifact.persistable_text:
             lane_umo, conversation_id, history, _ = await self.ensure_lane(
@@ -163,6 +206,9 @@ class LaneStorageMixin:
                 prefix_hash=prefix_hash,
                 model_id=model_id,
                 persona_id=persona_id,
+                template_id=template_id,
+                schema_id=schema_id,
+                persona_core_version=persona_core_version,
             )
             return history
         return await self.append_exchange(
@@ -174,6 +220,9 @@ class LaneStorageMixin:
             prefix_hash=prefix_hash,
             model_id=model_id,
             persona_id=persona_id,
+            template_id=template_id,
+            schema_id=schema_id,
+            persona_core_version=persona_core_version,
         )
 
     async def get_lane_history(
@@ -186,4 +235,3 @@ class LaneStorageMixin:
             base_origin=base_origin,
         )
         return list(history)
-

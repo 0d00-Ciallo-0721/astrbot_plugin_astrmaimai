@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -7,10 +8,13 @@ from astrbot.api.star import Context
 
 from ..conversation.ingress.sensors import PreFilters
 
+from ..conversation.attention.context_compaction import ContextCompactionEngine
 from ..conversation.attention.gate import AttentionGate
+from ..conversation.attention.group_dialogue_store import GroupDialogueStore
 from ..conversation.decision.judge import Judge
 from ..conversation.execution.reply_service import ReplyService
 from ..conversation.execution.system2_runner import System2Runner
+from ..conversation.loop import ChatLoopKernel
 from ..conversation.planning.context_engine import ContextEngine
 from ..conversation.planning.planner import Planner
 from ..conversation.planning.prompt_refiner import PromptRefiner
@@ -21,6 +25,8 @@ from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordin
 from ..infrastructure.runtime.event_bus import EventBus
 from ..infrastructure.runtime.host_bridge import HostBridge
 from ..infrastructure.runtime.lane_manager import LaneManager
+from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
+from ..infrastructure.runtime.turn_trace_store import TurnTraceSampleStore
 from ..learning import (
     EvolutionManager,
     ExpressionAutoCheckTask,
@@ -72,6 +78,7 @@ class PluginBootstrap:
         runtime.cognition = self._build_cognition_stack(runtime)
         runtime.set_boot_phase("bootstrap.interaction")
         runtime.interaction = self._build_interaction_stack(runtime)
+        runtime.chat_loop_kernel = self._build_chat_loop_kernel(runtime)
         runtime.set_boot_phase("bootstrap.lifecycle")
         runtime.lifecycle = self._build_lifecycle_stack(runtime)
         runtime.status.bootstrap_completed = True
@@ -107,9 +114,41 @@ class PluginBootstrap:
         memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
         memory_engine.db_service = db_service
         db_service.memory_engine = memory_engine
+        trace_cache_dir = Path(getattr(persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache"))
+        db_service.turn_trace_store = TurnTraceSampleStore(trace_cache_dir)
+        db_service.context_economy_benchmark_store = ContextEconomyBenchmarkSampleStore(trace_cache_dir)
+        gateway.benchmark_sample_store = db_service.context_economy_benchmark_store
         if hasattr(memory_engine, "tool_service"):
             memory_engine.tool_service.db_service = db_service
+        conversation_settings = getattr(runtime.config, "conversation", None)
         state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
+        dialogue_store = None
+        if runtime.feature_flags.dialogue_store_enabled:
+            dialogue_store = GroupDialogueStore(
+                hot_zone_ttl_seconds=getattr(conversation_settings, "hot_zone_ttl_seconds", 30.0),
+                warm_zone_ttl_seconds=getattr(conversation_settings, "warm_zone_ttl_seconds", 300.0),
+                warm_zone_max_tokens=getattr(conversation_settings, "warm_zone_max_tokens", 1200),
+            )
+            db_service.dialogue_store = dialogue_store
+        else:
+            db_service.dialogue_store = None
+        gateway.dialogue_store = dialogue_store
+        gateway.db_service = db_service
+        state_engine.dialogue_store = dialogue_store
+        compaction = None
+        if runtime.feature_flags.context_compaction_enabled and dialogue_store is not None:
+            compaction = ContextCompactionEngine(
+                dialogue_store,
+                compaction_trigger_segments=getattr(conversation_settings, "compaction_trigger_segments", 40),
+                compaction_trigger_tokens=getattr(conversation_settings, "compaction_trigger_tokens", 1800),
+                compaction_keep_recent_segments=getattr(conversation_settings, "compaction_keep_recent_segments", 16),
+                compaction_summary_max_tokens=getattr(conversation_settings, "compaction_summary_max_tokens", 450),
+                provider_id=getattr(conversation_settings, "compaction_provider_id", ""),
+                gateway=gateway,
+            )
+        db_service.context_compaction = compaction
+        gateway.context_compaction = compaction
+        state_engine.context_compaction = compaction
         judge = Judge(gateway, state_engine)
         sensors = PreFilters(runtime.config)
         visual_cortex = None
@@ -125,6 +164,8 @@ class PluginBootstrap:
             lane_manager=lane_manager,
             event_bus=event_bus,
             memory_engine=memory_engine,
+            dialogue_store=dialogue_store,
+            context_compaction=compaction,
             state_engine=state_engine,
             judge=judge,
             sensors=sensors,
@@ -153,6 +194,7 @@ class PluginBootstrap:
             runtime.state_engine,
             runtime.state_engine.mood_manager,
             runtime_coordinator=runtime.runtime_coordinator,
+            memory_engine=runtime.memory_engine,
         )
         evolution = EvolutionManager(runtime.db_service, runtime.gateway, event_bus=runtime.event_bus)
         persona_summarizer = PersonaSummarizer(runtime.persistence, runtime.gateway, memory_engine=runtime.memory_engine)
@@ -216,6 +258,20 @@ class PluginBootstrap:
             group_reply_wait_manager=group_reply_wait_manager,
             attention_gate=attention_gate,
         )
+
+    def _build_chat_loop_kernel(self, runtime: PluginRuntimeContext) -> ChatLoopKernel:
+        kernel = ChatLoopKernel(
+            runtime_coordinator=runtime.runtime_coordinator,
+            message_handler=runtime.attention_gate.process_event if runtime.attention_gate is not None else None,
+        )
+        kernel.bind_signal_sources(
+            group_reply_wait_manager=runtime.group_reply_wait_manager,
+            private_chat_manager=runtime.private_chat_manager,
+            context_compaction=runtime.context_compaction,
+        )
+        if runtime.attention_gate is not None and hasattr(runtime.attention_gate, "bind_chat_loop_kernel"):
+            runtime.attention_gate.bind_chat_loop_kernel(kernel)
+        return kernel
 
     def _build_lifecycle_stack(self, runtime: PluginRuntimeContext) -> LifecycleServices:
         reflector = ExpressionReflector(
@@ -282,6 +338,7 @@ class PluginBootstrap:
                 proactive_task.review_dispatcher.reflect_tracker = None
                 proactive_task.dream_scheduler.dream_visible = runtime.feature_flags.dream_visible
                 proactive_task.set_db_service(runtime.db_service)
+                proactive_task.bind_chat_loop_kernel(runtime.chat_loop_kernel)
             except Exception as exc:
                 self._record_optional_failure(runtime, "proactive.task", exc)
         return LifecycleServices(

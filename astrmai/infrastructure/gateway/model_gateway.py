@@ -5,6 +5,7 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 
 from ...shared.constants.defaults import GatewaySettings, build_infrastructure_settings
+from ..context_economy import ContextEconomyCenter
 from ..runtime.lane_manager import LaneManager
 from .gateway_call import GatewayCallMixin
 from .gateway_exceptions import LLMCascadeFailureException
@@ -29,6 +30,8 @@ class GlobalModelGateway(
         self.config = config
         self.settings = settings or build_infrastructure_settings(config).gateway
         self.router = ModelRouter()
+        self.context_economy = ContextEconomyCenter()
+        self.benchmark_sample_store = None
         self.lane_manager: Optional[LaneManager] = None
         self._global_semaphore = asyncio.Semaphore(self.settings.max_concurrent_llm_calls)
         logger.info(
@@ -40,6 +43,9 @@ class GlobalModelGateway(
 
     def set_lane_manager(self, lane_manager: LaneManager) -> None:
         self.lane_manager = lane_manager
+
+    def get_context_economy_stats(self) -> dict:
+        return self.context_economy.snapshot_metrics()
 
     def _fallback_models(self) -> List[str]:
         return list(self.settings.fallback_models)

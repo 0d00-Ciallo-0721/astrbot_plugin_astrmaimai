@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Any, Optional
 
 from pydantic import Field
@@ -10,6 +11,14 @@ from astrbot.api import logger
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
+
+
+QQ_MESSAGE_EMOJI_OPTIONS: dict[str, list[str]] = {
+    "support": ["66", "124"],
+    "approve": ["66", "76"],
+    "laugh": ["63", "85"],
+    "cute": ["124", "79"],
+}
 
 
 def _get_current_event(context: ContextWrapper[AstrAgentContext]):
@@ -40,6 +49,18 @@ def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
     pending_actions.append(action)
     _set_pending_actions(event, pending_actions)
     return True
+
+
+def _coerce_action_identifier(value: Any) -> Any:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return int(text) if text.isdigit() else text
+
+
+def _current_message_id(event) -> str:
+    message_obj = getattr(event, "message_obj", None)
+    return str(getattr(message_obj, "message_id", "") or "").strip()
 
 
 async def _resolve_target(
@@ -289,7 +310,16 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
             )
             if not resolved:
                 return f"动作取消：当前上下文里无法锁定 {target_name}。"
-            target_id, _ = resolved
+            target_id, resolved_group_id = resolved
+            current_group_id = str(group_id or "").strip()
+            resolved_group_id = str(resolved_group_id or "").strip()
+            if current_group_id:
+                if resolved_group_id and resolved_group_id != current_group_id:
+                    return f"动作取消：{target_name} 不在当前群聊上下文里。"
+            else:
+                current_peer_id = str(current_event.get_sender_id() or "").strip()
+                if resolved_group_id or str(target_id or "").strip() != current_peer_id:
+                    return f"动作取消：{target_name} 不在当前私聊上下文里。"
         else:
             target_id = str(current_event.get_sender_id())
 
@@ -302,14 +332,133 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
             if api is None:
                 return "动作取消：底层 poke API 不可用。"
             if group_id:
-                await api.call_action("send_poke", user_id=int(target_id), group_id=int(group_id))
+                await api.call_action(
+                    "send_poke",
+                    user_id=_coerce_action_identifier(target_id),
+                    group_id=_coerce_action_identifier(group_id),
+                )
             else:
-                await api.call_action("send_poke", user_id=int(target_id))
+                await api.call_action("send_poke", user_id=_coerce_action_identifier(target_id))
             logger.info(f"[ProactivePokeTool] poked target={target_id} group={group_id}")
             return f"已主动戳了 {display_name}，请继续生成自然的文字回应。"
         except Exception as exc:
             logger.error(f"[ProactivePokeTool] execution failed: {exc}")
             return f"动作执行失败：{exc}"
+
+
+@dataclass
+class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
+    name: str = "message_emoji_like_action"
+    description: str = "为当前焦点消息设置 QQ 原生表情回复。只会从内置的小型表情集合里挑选。"
+    emoji_options: dict[str, list[str]] = Field(default_factory=lambda: dict(QQ_MESSAGE_EMOJI_OPTIONS), exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "tone": {
+                    "type": "string",
+                    "description": "表情语气，可选 support/approve/laugh/cute，留空则随机。",
+                }
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
+        client = getattr(current_event, "bot", None)
+        api = getattr(client, "api", None)
+        if api is None:
+            return "动作取消：底层表情回复 API 不可用。"
+        message_id = _current_message_id(current_event)
+        if not message_id:
+            return "动作取消：当前消息没有可定位的 message_id。"
+
+        tone = str(kwargs.get("tone", "") or "").strip().lower()
+        selected_pool = list(self.emoji_options.get(tone) or [])
+        selected_tone = tone if selected_pool else ""
+        if not selected_pool:
+            fallback_items = [(bucket, values) for bucket, values in self.emoji_options.items() if values]
+            if not fallback_items:
+                return "动作取消：当前没有可用的内置表情回复集合。"
+            selected_tone, selected_pool = random.choice(fallback_items)
+        emoji_id = random.choice(selected_pool)
+
+        try:
+            await api.call_action(
+                "set_msg_emoji_like",
+                message_id=_coerce_action_identifier(message_id),
+                emoji_id=str(emoji_id),
+            )
+            logger.info(
+                f"[MessageEmojiLikeTool] liked message={message_id} tone={selected_tone or tone or 'random'} emoji={emoji_id}"
+            )
+            return f"已给当前消息加了一个 QQ 表情回复（{selected_tone or tone or 'random'}）。"
+        except Exception as exc:
+            logger.error(f"[MessageEmojiLikeTool] execution failed: {exc}")
+            return f"动作执行失败：{exc}"
+
+
+@dataclass
+class GroupSignTool(FunctionTool[AstrAgentContext]):
+    name: str = "group_sign_action"
+    description: str = "对当前群聊执行一次群签到。只允许在当前群上下文里使用。"
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        del kwargs
+        current_event = _get_current_event(context)
+        group_id = str(current_event.get_group_id() or "").strip()
+        if not group_id:
+            return "动作取消：当前不是群聊，无法执行群签到。"
+        client = getattr(current_event, "bot", None)
+        api = getattr(client, "api", None)
+        if api is None:
+            return "动作取消：底层群签到 API 不可用。"
+        try:
+            await api.call_action("set_group_sign", group_id=str(group_id))
+            logger.info(f"[GroupSignTool] signed group={group_id}")
+            return "已完成当前群签到。"
+        except Exception as exc:
+            logger.error(f"[GroupSignTool] execution failed: {exc}")
+            return f"动作执行失败：{exc}"
+
+
+@dataclass
+class CustomFaceCatalogQueryTool(FunctionTool[AstrAgentContext]):
+    name: str = "custom_face_catalog_query"
+    description: str = "查询当前账号可用的 QQ 自定义表情目录，供后续聊天动作参考。"
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "description": "最多返回多少个表情，默认 24。"}
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
+        client = getattr(current_event, "bot", None)
+        api = getattr(client, "api", None)
+        if api is None:
+            return "系统提示：当前无法访问 QQ 自定义表情目录。"
+        try:
+            count = int(kwargs.get("count", 24) or 24)
+        except (TypeError, ValueError):
+            count = 24
+        count = max(1, min(count, 96))
+        try:
+            payload = await api.call_action("fetch_custom_face", count=count)
+        except Exception as exc:
+            logger.error(f"[CustomFaceCatalogQueryTool] execution failed: {exc}")
+            return f"系统提示：查询自定义表情失败：{exc}"
+
+        faces = payload if isinstance(payload, list) else []
+        normalized = [str(item).strip() for item in faces if str(item or "").strip()]
+        if not normalized:
+            return "系统提示：当前没有查询到可用的 QQ 自定义表情。"
+        preview = "\n".join(f"- {item}" for item in normalized[:count])
+        return f"可用的 QQ 自定义表情如下：\n{preview}"
 
 
 @dataclass
@@ -545,8 +694,11 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
 
 
 __all__ = [
+    "CustomFaceCatalogQueryTool",
     "ConstructAtEventTool",
+    "GroupSignTool",
     "MemeResonanceTool",
+    "MessageEmojiLikeTool",
     "MessageReactionTool",
     "OmniPerceptionTool",
     "ProactiveLikeTool",

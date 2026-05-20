@@ -12,6 +12,7 @@ import aiosqlite
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
+from .memory_scoring import DEFAULT_MEMORY_SCORING
 
 
 ACTIVE_STATUS = "active"
@@ -36,6 +37,38 @@ class MemoryV2Store:
         self.data_path = Path(data_path) if data_path else Path(db_path).parent
         self._initialized = False
         self.last_physical_delete_ids: list[str] = []
+
+    @staticmethod
+    def _build_fts_query(text: str) -> str:
+        import re
+
+        segments = re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", str(text or ""))
+        terms: list[str] = []
+        for seg in segments:
+            if re.fullmatch(r"[a-zA-Z0-9]+", seg):
+                terms.append(f'"{seg}"')
+            else:
+                if len(seg) == 1:
+                    terms.append(f'"{seg}"')
+                else:
+                    for i in range(len(seg) - 1):
+                        terms.append(f'"{seg[i:i+2]}"')
+        return " OR ".join(terms)
+
+    async def _sync_fts(self, db, memory_id: str, *, delete_only: bool = False) -> None:
+        await db.execute("DELETE FROM canonical_fts WHERE memory_id = ?", (memory_id,))
+        if delete_only:
+            return
+        cursor = await db.execute(
+            "SELECT content, summary, tags FROM canonical_memories WHERE id = ? AND status = 'active'",
+            (memory_id,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            await db.execute(
+                "INSERT INTO canonical_fts(memory_id, content, summary, tags) VALUES (?, ?, ?, ?)",
+                (memory_id, row[0] or "", row[1] or "", row[2] or ""),
+            )
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -108,6 +141,18 @@ class MemoryV2Store:
                 VALUES ('2', ?, 'applied', 'canonical schema ready', ?)
                 """,
                 (str(backup_dir or ""), self._now()),
+            )
+            await db.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS canonical_fts
+                USING fts5(
+                    memory_id UNINDEXED,
+                    content,
+                    summary,
+                    tags,
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+                """
             )
             await db.commit()
         self._initialized = True
@@ -226,6 +271,7 @@ class MemoryV2Store:
                             memory_id,
                         ),
                     )
+                    await self._sync_fts(db, memory_id)
                     await db.commit()
                     return memory_id
 
@@ -260,6 +306,7 @@ class MemoryV2Store:
                     visibility,
                 ),
             )
+            await self._sync_fts(db, memory_id)
             await db.commit()
         return memory_id
 
@@ -382,6 +429,7 @@ class MemoryV2Store:
         query_text = str(query or "").strip()
         if not query_text:
             return []
+        fts_query = self._build_fts_query(query_text)
         lowered_terms = [term.lower() for term in query_text.split() if term.strip()]
         statuses = [ACTIVE_STATUS]
         if allow_stale:
@@ -413,47 +461,69 @@ class MemoryV2Store:
             params.extend(layer_set)
 
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
-                       tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
-                FROM canonical_memories
-                WHERE {' AND '.join(where)}
-                ORDER BY update_time DESC
-                LIMIT ?
-                """,
-                (*params, max(int(top_k or 5) * 8, 20)),
-            )
-            rows = await cursor.fetchall()
-
-        candidates: list[MemoryCandidate] = []
-        now = self._now()
-        for row in rows:
-            memory_id = str(row[0])
-            if memory_id in exclude:
-                continue
-            summary = str(row[3] or "")
-            content = str(row[4] or "")
-            haystack = f"{summary}\n{content}".lower()
-            if lowered_terms:
-                overlap = sum(1 for term in lowered_terms if term in haystack)
-                if overlap <= 0:
-                    continue
-                relevance = min(1.0, overlap / max(len(lowered_terms), 1))
+            if fts_query:
+                cursor = await db.execute(
+                    f"""
+                    SELECT cm.id, cm.kind, cm.source, cm.summary, cm.content, cm.session_id, cm.persona_id,
+                           cm.tags, cm.importance, cm.confidence, cm.status, cm.create_time,
+                           cm.update_time, cm.last_access_time, cm.metadata, cm.visibility,
+                           bm25(canonical_fts) AS fts_score
+                    FROM canonical_fts
+                    JOIN canonical_memories cm ON cm.id = canonical_fts.memory_id
+                    WHERE canonical_fts MATCH ? AND {' AND '.join(where)}
+                    ORDER BY fts_score ASC, cm.update_time DESC
+                    LIMIT ?
+                    """,
+                    (fts_query, *params, max(int(top_k or 5) * 8, 20)),
+                )
+                rows = await cursor.fetchall()
+                candidates = []
+                for row in rows:
+                    candidate = self._row_to_candidate(row)
+                    if candidate.id in exclude:
+                        continue
+                    candidate.relevance_score = max(0.0, 1.0 - (float(row[16] or 0.0) if len(row) > 16 else 0.0))
+                    candidates.append(candidate)
             else:
-                relevance = 0.1
-            candidate = self._row_to_candidate(row)
-            candidate.relevance_score = relevance
-            candidates.append(candidate)
+                cursor = await db.execute(
+                    f"""
+                    SELECT id, kind, source, summary, content, session_id, persona_id,
+                           tags, importance, confidence, status, create_time,
+                           update_time, last_access_time, metadata, visibility
+                    FROM canonical_memories
+                    WHERE {' AND '.join(where)}
+                    ORDER BY update_time DESC
+                    LIMIT ?
+                    """,
+                    (*params, max(int(top_k or 5) * 8, 20)),
+                )
+                rows = await cursor.fetchall()
+                candidates = []
+                for row in rows:
+                    memory_id = str(row[0])
+                    if memory_id in exclude:
+                        continue
+                    summary = str(row[3] or "")
+                    content = str(row[4] or "")
+                    haystack = f"{summary}\n{content}".lower()
+                    if lowered_terms:
+                        overlap = sum(1 for term in lowered_terms if term in haystack)
+                        if overlap <= 0:
+                            continue
+                        relevance = min(1.0, overlap / max(len(lowered_terms), 1))
+                    else:
+                        relevance = 0.1
+                    candidate = self._row_to_candidate(row)
+                    candidate.relevance_score = relevance
+                    candidates.append(candidate)
 
         candidates.sort(
             key=lambda item: (
-                item.relevance_score * 0.45
-                + item.importance * 0.2
-                + item.confidence * 0.15
-                + item.recency_score * 0.1
-                - (0.25 if item.status == STALE_STATUS else 0.0)
+                item.relevance_score * DEFAULT_MEMORY_SCORING.search_weight
+                + item.importance * DEFAULT_MEMORY_SCORING.search_importance_weight
+                + item.confidence * DEFAULT_MEMORY_SCORING.search_confidence_weight
+                + item.recency_score * DEFAULT_MEMORY_SCORING.search_recency_weight
+                - (DEFAULT_MEMORY_SCORING.search_stale_penalty if item.status == STALE_STATUS else 0.0)
             ),
             reverse=True,
         )
@@ -498,7 +568,7 @@ class MemoryV2Store:
         elif visibility_mode == "tool":
             allowed_visibility = {"auto_and_tool", "tool_only"}
         else:
-            allowed_visibility = set()
+            allowed_visibility = {"auto_and_tool", "tool_only"}
         if allowed_visibility:
             where.append("visibility IN (" + ",".join("?" for _ in allowed_visibility) + ")")
             params.extend(sorted(allowed_visibility))
@@ -666,6 +736,12 @@ class MemoryV2Store:
                 tuple(delete_params),
             )
             self.last_physical_delete_ids = [str(row[0]) for row in await cursor.fetchall()]
+            if self.last_physical_delete_ids:
+                placeholders = ",".join("?" for _ in self.last_physical_delete_ids)
+                await db.execute(
+                    f"DELETE FROM canonical_fts WHERE memory_id IN ({placeholders})",
+                    tuple(self.last_physical_delete_ids),
+                )
             cursor = await db.execute(
                 f"DELETE FROM canonical_memories WHERE {' AND '.join(delete_where)}",
                 tuple(delete_params),
@@ -782,6 +858,7 @@ class MemoryV2Store:
                 """,
                 (reason, self._now(), memory_id),
             )
+            await self._sync_fts(db, memory_id, delete_only=True)
             await db.commit()
             return cursor.rowcount
 
@@ -801,6 +878,8 @@ class MemoryV2Store:
                 """,
                 (now, now, memory_id),
             )
+            if cursor.rowcount:
+                await self._sync_fts(db, memory_id)
             await db.commit()
             return cursor.rowcount
 
@@ -815,6 +894,7 @@ class MemoryV2Store:
                 """,
                 (reason, self._now(), memory_id),
             )
+            await self._sync_fts(db, memory_id, delete_only=True)
             await db.commit()
             return cursor.rowcount
 
@@ -854,6 +934,8 @@ class MemoryV2Store:
                     """,
                     (reason, self._now(), *ids),
                 )
+                for memory_id in ids:
+                    await self._sync_fts(db, memory_id, delete_only=True)
                 await db.commit()
         return ids
 
@@ -879,6 +961,8 @@ class MemoryV2Store:
                     """,
                     (reason, self._now(), *ids),
                 )
+                for memory_id in ids:
+                    await self._sync_fts(db, memory_id, delete_only=True)
                 await db.commit()
         return ids
 
@@ -926,6 +1010,7 @@ class MemoryV2Store:
                 """,
                 (content, summary or str(content or "")[:240], now, memory_id),
             )
+            await self._sync_fts(db, memory_id)
             await db.commit()
             return cursor.rowcount
 
@@ -986,6 +1071,7 @@ class MemoryV2Store:
                 f"UPDATE canonical_memories SET {assignments} WHERE id = ?",
                 (*[payload[column] for column in columns], memory_id),
             )
+            await self._sync_fts(db, memory_id)
             await db.commit()
             return cursor.rowcount
 

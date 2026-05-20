@@ -5,6 +5,16 @@ import unittest
 
 
 class PluginPagesAdminRefactorTests(unittest.TestCase):
+    def setUp(self):
+        from astrmai.webui.backend.adapters.plugin_api import get_active_facade
+
+        self._original_active_facade = get_active_facade()
+
+    def tearDown(self):
+        from astrmai.webui.backend.adapters.plugin_api import set_active_facade
+
+        set_active_facade(self._original_active_facade)
+
     def test_native_admin_api_registers_core_routes(self):
         from astrmai.webui.plugin_pages import PLUGIN_API_PREFIX, register_astrmai_admin_pages
 
@@ -23,6 +33,9 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/recent-decisions", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/recent-turns", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/{{chat_id}}/turns", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/status", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/due-selection", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/chats/{{chat_id}}", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/impulses", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/chats/{{chat_id}}/impulses", paths)
@@ -106,6 +119,26 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn("记忆裁决 Memory", app_js)
         self.assertIn("/cognition/recent-turns", app_js)
         self.assertIn("/cognition/chats/${segment(chatId)}/turns", app_js)
+        self.assertIn("Scheduler Diagnostics", app_js)
+        self.assertIn("/cognition/scheduler/status", app_js)
+        self.assertIn("/cognition/scheduler/due-selection", app_js)
+        self.assertIn("/cognition/scheduler/chats/${segment(targetChat)}", app_js)
+        self.assertIn("暂无 loop state。该 chat 尚未进入 scheduler 跟踪。", app_js)
+        self.assertIn("SCHEDULER_POLL_INTERVAL_MS = 5000", app_js)
+        self.assertIn('state.current === "dashboard" && state.dashboardTab === "cognition"', app_js)
+        self.assertIn("startSchedulerPolling()", app_js)
+        self.assertIn("stopSchedulerPolling()", app_js)
+        self.assertIn("${renderSchedulerDiagnosticsSection()}", app_js)
+        self.assertNotIn('insertAdjacentHTML("afterbegin", renderSchedulerDiagnosticsSection())', app_js)
+        self.assertIn('if (state.dashboardTab === "cognition") {\n    await renderDashboardCognition();\n    startSchedulerPolling();\n    return;\n  }', app_js)
+        cognition_render_start = app_js.index("async function renderDashboardCognition()")
+        cognition_render_end = app_js.index("function renderThinkLevelSummary", cognition_render_start)
+        cognition_render = app_js[cognition_render_start:cognition_render_end]
+        scheduler_idx = cognition_render.index("${renderSchedulerDiagnosticsSection()}")
+        cognition_idx = cognition_render.index("主动决策池 Cognition")
+        turn_context_idx = cognition_render.index("Turn Context")
+        self.assertLess(scheduler_idx, cognition_idx)
+        self.assertLess(cognition_idx, turn_context_idx)
         self.assertIn("Impulse Safety", app_js)
         self.assertIn("/heartflow/impulses", app_js)
         self.assertIn("/heartflow/chats/${segment(chatId)}/impulses", app_js)
@@ -192,6 +225,19 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
             "八维角色切片",
         ]:
             self.assertIn(label, app_js)
+
+    def test_memory_ui_service_uses_package_relative_memory_import(self):
+        service_path = (
+            Path(__file__).resolve().parents[1]
+            / "astrmai"
+            / "webui"
+            / "backend"
+            / "services"
+            / "memory_ui_service.py"
+        )
+        content = service_path.read_text(encoding="utf-8")
+        self.assertIn("from ....memory.contracts.memory_query import MemoryWriteRequest", content)
+        self.assertNotIn("from astrmai.memory.contracts.memory_query import MemoryWriteRequest", content)
 
 
 if __name__ == "__main__":

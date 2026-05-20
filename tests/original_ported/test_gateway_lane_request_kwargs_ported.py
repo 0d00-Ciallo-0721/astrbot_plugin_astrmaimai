@@ -94,7 +94,9 @@ class GatewayLaneRequestKwargsTests(unittest.TestCase):
         asyncio.run(_run())
 
         self.assertIn("session_id", fake_context.calls[0])
-        self.assertTrue(str(fake_context.calls[0]["session_id"]).endswith("@@astrmai:bg:memory:v1"))
+        session_id = str(fake_context.calls[0]["session_id"])
+        self.assertIn("@@astrmai:bg:memory:", session_id)
+        self.assertTrue(session_id.endswith("memory_global_summary:v1:text"))
 
     def test_fallback_model_recomputes_request_kwargs_from_actual_provider(self):
         fake_context = _FakeContext()

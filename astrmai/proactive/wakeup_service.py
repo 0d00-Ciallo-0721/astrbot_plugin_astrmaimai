@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import inspect
 import time
 
 from astrbot.api import logger
 
+from ..infrastructure.context_economy import PromptTemplateId
 from ..memory.contracts.memory_query import MemoryQuery
 from .dispatcher import ProactiveMessageIntent
 from .rhythm import evaluate_proactive_rhythm
 
 
 class WakeupService:
-    def __init__(self, context, state_engine, persistence, call_background_lane, config, dispatcher=None, memory_engine=None):
+    def __init__(self, context, state_engine, persistence, call_background_lane, config, dispatcher=None, memory_engine=None, prompt_registry=None):
         self.context = context
         self.state_engine = state_engine
         self.persistence = persistence
@@ -18,54 +20,154 @@ class WakeupService:
         self.config = config
         self.dispatcher = dispatcher
         self.memory_engine = memory_engine
+        self.prompt_registry = prompt_registry
 
-    async def run_once(self):
-        active_states = self.state_engine.get_active_states()
-        now = time.time()
+    async def build_signal(self, chat_id: str, now: float | None = None) -> dict:
+        now = time.time() if now is None else float(now)
+        state = None
+        if self.state_engine is not None and hasattr(self.state_engine, "get_state"):
+            try:
+                state = self.state_engine.get_state(chat_id)
+                if inspect.isawaitable(state):
+                    state = await state
+            except Exception as exc:
+                logger.debug(f"[Life] proactive wakeup state lookup degraded for {chat_id}: {exc}")
+        if state is None and self.state_engine is not None and hasattr(self.state_engine, "get_active_states"):
+            try:
+                for candidate in self.state_engine.get_active_states() or []:
+                    if str(getattr(candidate, "chat_id", "") or "") == str(chat_id or ""):
+                        state = candidate
+                        break
+            except Exception as exc:
+                logger.debug(f"[Life] proactive wakeup active state scan degraded for {chat_id}: {exc}")
+        if state is None:
+            return {"eligible": False, "reason": "state_unavailable", "chat_id": str(chat_id or "")}
+        if hasattr(state, "lock") and getattr(state, "lock").locked():
+            return {"eligible": False, "reason": "state_locked", "chat_id": str(chat_id or ""), "state": state}
+        if not getattr(state, "chat_id", None):
+            return {"eligible": False, "reason": "missing_chat_id", "chat_id": str(chat_id or ""), "state": state}
+
         silence_threshold = self.config.life.silence_threshold
         energy_threshold = self.config.life.wakeup_min_energy
         wakeup_cost = self.config.life.wakeup_cost
         wakeup_cooldown = self.config.life.wakeup_cooldown
+        next_wakeup_timestamp = float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0)
+        minutes_silent = 999.0
+        if getattr(state, "last_reply_time", 0) > 0:
+            minutes_silent = (now - float(getattr(state, "last_reply_time", 0) or 0.0)) / 60.0
+        if minutes_silent == 999.0:
+            return {
+                "eligible": False,
+                "candidate_present": False,
+                "reason": "never_replied",
+                "chat_id": str(chat_id or ""),
+                "state": state,
+                "next_wakeup_timestamp": next_wakeup_timestamp,
+            }
+        if minutes_silent <= silence_threshold:
+            return {
+                "eligible": False,
+                "candidate_present": False,
+                "reason": "silence_threshold_not_reached",
+                "chat_id": str(chat_id or ""),
+                "state": state,
+                "minutes_silent": minutes_silent,
+                "next_wakeup_timestamp": next_wakeup_timestamp,
+            }
+        if float(getattr(state, "energy", 0.0) or 0.0) <= float(energy_threshold or 0.0):
+            return {
+                "eligible": False,
+                "candidate_present": False,
+                "reason": "energy_too_low",
+                "chat_id": str(chat_id or ""),
+                "state": state,
+                "minutes_silent": minutes_silent,
+                "energy": float(getattr(state, "energy", 0.0) or 0.0),
+                "next_wakeup_timestamp": next_wakeup_timestamp,
+            }
+        if now < next_wakeup_timestamp:
+            return {
+                "eligible": False,
+                "candidate_present": True,
+                "reason": "cooldown",
+                "chat_id": str(chat_id or ""),
+                "state": state,
+                "minutes_silent": minutes_silent,
+                "energy": float(getattr(state, "energy", 0.0) or 0.0),
+                "wakeup_cost": float(wakeup_cost or 0.0),
+                "wakeup_cooldown": float(wakeup_cooldown or 0.0),
+                "next_wakeup_timestamp": next_wakeup_timestamp,
+            }
+        return {
+            "eligible": True,
+            "candidate_present": True,
+            "reason": "silence_threshold_reached",
+            "chat_id": str(chat_id or ""),
+            "state": state,
+            "minutes_silent": minutes_silent,
+            "energy": float(getattr(state, "energy", 0.0) or 0.0),
+            "wakeup_cost": float(wakeup_cost or 0.0),
+            "wakeup_cooldown": float(wakeup_cooldown or 0.0),
+            "next_wakeup_timestamp": next_wakeup_timestamp,
+        }
 
-        for state in active_states:
-            if hasattr(state, "lock") and state.lock.locked():
-                continue
-            if not getattr(state, "chat_id", None):
-                continue
+    async def run_for_chat(self, chat_id: str, signal: dict | None = None, now: float | None = None) -> dict:
+        now = time.time() if now is None else float(now)
+        signal = dict(signal or await self.build_signal(chat_id, now=now))
+        if not signal.get("eligible", False):
+            return {
+                "chat_id": str(chat_id or ""),
+                "performed": False,
+                "allowed": False,
+                "reason": str(signal.get("reason", "") or "ineligible"),
+            }
+        state = signal.get("state")
+        wakeup_cost = float(signal.get("wakeup_cost", getattr(self.config.life, "wakeup_cost", 0.0)) or 0.0)
+        wakeup_cooldown = float(signal.get("wakeup_cooldown", getattr(self.config.life, "wakeup_cooldown", 0.0)) or 0.0)
+        intent = await self.build_wakeup_intent(state, wakeup_cost, wakeup_cooldown)
+        if not intent:
+            return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "intent_unavailable"}
+        if not self.dispatcher:
+            logger.debug("[Life] proactive wakeup skipped: dispatcher unavailable")
+            return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "dispatcher_unavailable"}
 
-            minutes_silent = 999
-            if getattr(state, "last_reply_time", 0) > 0:
-                minutes_silent = (now - state.last_reply_time) / 60
-
-            if not (minutes_silent > silence_threshold and state.energy > energy_threshold and minutes_silent != 999):
-                continue
-            if now < getattr(state, "next_wakeup_timestamp", 0):
-                continue
-
-            intent = await self.build_wakeup_intent(state, wakeup_cost, wakeup_cooldown)
-            if not intent:
-                continue
-            if not self.dispatcher:
-                logger.debug("[Life] proactive wakeup skipped: dispatcher unavailable")
-                continue
-
-            async def _on_complete(reply_sent: bool, reply_preview: str, *, target_state=state) -> None:
-                if not reply_sent:
-                    logger.info(f"[Life] proactive wakeup skipped by planner: {getattr(target_state, 'chat_id', '')}")
-                    return
-                try:
-                    await self.state_engine.consume_energy(target_state.chat_id, amount=wakeup_cost)
-                except TypeError:
-                    await self.state_engine.consume_energy(target_state.chat_id)
-                target_state.next_wakeup_timestamp = time.time() + wakeup_cooldown
-                logger.info(f"[Life] proactive wakeup sent via main chain: {str(reply_preview or '')[:80]}")
-
+        async def _on_complete(reply_sent: bool, reply_preview: str, *, target_state=state) -> None:
+            if not reply_sent:
+                logger.info(f"[Life] proactive wakeup skipped by planner: {getattr(target_state, 'chat_id', '')}")
+                return
             try:
-                decision = await self.dispatcher.dispatch(intent, on_complete=_on_complete)
-                if not decision.allowed:
-                    logger.debug(f"[Life] proactive wakeup blocked: {decision.blocked_reason}")
-            except Exception as exc:
-                logger.error(f"[Life] proactive wakeup dispatch failed: {exc}")
+                await self.state_engine.consume_energy(target_state.chat_id, amount=wakeup_cost)
+            except TypeError:
+                await self.state_engine.consume_energy(target_state.chat_id)
+            target_state.next_wakeup_timestamp = time.time() + wakeup_cooldown
+            logger.info(f"[Life] proactive wakeup sent via main chain: {str(reply_preview or '')[:80]}")
+
+        try:
+            decision = await self.dispatcher.dispatch(intent, on_complete=_on_complete)
+            if not decision.allowed:
+                logger.debug(f"[Life] proactive wakeup blocked: {decision.blocked_reason}")
+            return {
+                "chat_id": str(chat_id or ""),
+                "performed": bool(decision.allowed),
+                "allowed": bool(decision.allowed),
+                "reason": str(decision.blocked_reason or signal.get("reason", "")),
+                "intent_id": str(getattr(decision, "intent_id", "") or ""),
+            }
+        except Exception as exc:
+            logger.error(f"[Life] proactive wakeup dispatch failed: {exc}")
+            return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "dispatch_failed"}
+
+    async def run_once(self):
+        active_states = self.state_engine.get_active_states()
+        now = time.time()
+        for state in active_states:
+            chat_id = str(getattr(state, "chat_id", "") or "")
+            if not chat_id:
+                continue
+            signal = await self.build_signal(chat_id, now=now)
+            if signal.get("state") is None:
+                signal["state"] = state
+            await self.run_for_chat(chat_id, signal=signal, now=now)
 
     async def build_wakeup_intent(self, state, wakeup_cost: float, wakeup_cooldown: float) -> ProactiveMessageIntent | None:
         chat_id = str(getattr(state, "chat_id", "") or "")
@@ -110,6 +212,18 @@ class WakeupService:
             parts.append(f"Style hint: {str(style)[:120]}")
         if memory_hint:
             parts.append(f"Optional private memory hint, do not quote directly: {memory_hint[:180]}")
+        if self.prompt_registry is not None:
+            envelope = self.prompt_registry.render_template(
+                PromptTemplateId.PROACTIVE_WAKEUP_OPENING,
+                {
+                    "time_bucket": rhythm.time_bucket,
+                    "persona_summary": summary,
+                    "persona_style": style,
+                    "memory_hint": memory_hint,
+                    "guidance_text": "\n".join(parts),
+                },
+            )
+            return envelope.prompt
         return "\n".join(parts)
 
     async def _recall_light_memory(self, chat_id: str, query: str) -> str:

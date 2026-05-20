@@ -26,7 +26,9 @@ class _SyntheticExternalEvent:
     def __init__(self, data: dict[str, Any]):
         self._data = dict(data or {})
         self._extra = dict(self._data.get("extra", {}) or {})
-        self.message_str = str(self._data.get("message_str", "") or "")
+        if "is_external_bot_reply" in self._data and "is_external_bot_reply" not in self._extra:
+            self._extra["is_external_bot_reply"] = bool(self._data.get("is_external_bot_reply"))
+        self.message_str = str(self._data.get("message_str", self._data.get("content", "")) or "")
         self.timestamp = float(self._data.get("timestamp", time.time()) or time.time())
         self.unified_msg_origin = str(self._data.get("unified_msg_origin", "") or "")
         self.message_obj = self._data.get("message_obj")
@@ -66,6 +68,7 @@ class AttentionGate:
         frequency_controller=None,
         private_chat_manager=None,
         runtime_coordinator=None,
+        chat_loop_kernel=None,
     ):
         self.state_engine = state_engine
         self.judge = judge
@@ -77,6 +80,9 @@ class AttentionGate:
         self.frequency_controller = frequency_controller
         self.private_chat_manager = private_chat_manager
         self.runtime_coordinator = runtime_coordinator
+        self.chat_loop_kernel = chat_loop_kernel
+        self.dialogue_store = getattr(state_engine, "dialogue_store", None)
+        self.context_compaction = getattr(state_engine, "context_compaction", None)
 
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
@@ -270,6 +276,31 @@ class AttentionGate:
                 logger.debug(f"[AttentionGate] runtime activity mark degraded: {exc}")
         return now
 
+    async def _record_dialogue_segment_from_event(self, chat_id: str, event: AstrMessageEvent) -> None:
+        store = getattr(self, "dialogue_store", None)
+        if not store:
+            return
+        try:
+            await store.append_segment(
+                chat_id,
+                event_id=self._build_message_id(event),
+                speaker_id=str(getattr(event, "get_sender_id", lambda: "")() or ""),
+                speaker_name=str(getattr(event, "get_sender_name", lambda: "")() or ""),
+                content=str(getattr(event, "message_str", "") or ""),
+                role="user",
+                message_kind="image" if self._is_image_only(event) else "text",
+                is_bot=False,
+                reply_target_sender_id=self._extract_reply_target(event)[0],
+                reply_target_sender_name=self._extract_reply_target(event)[1],
+                is_at_bot=self._is_at_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
+                is_reply_to_bot=self._is_reply_to_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
+                has_direct_vision=bool(event.get_extra("direct_vision_urls", []) or event.get_extra("extracted_image_urls", [])),
+                is_image_only=self._is_image_only(event),
+                timestamp=float(getattr(event, "timestamp", time.time()) or time.time()),
+            )
+        except Exception as exc:
+            logger.debug(f"[AttentionGate] dialogue segment record degraded: {exc}")
+
     def _ensure_global_msg_cache(self):
         if not isinstance(self._global_message_cache, collections.OrderedDict):
             self._global_message_cache = collections.OrderedDict()
@@ -282,6 +313,37 @@ class AttentionGate:
         sender_id = str(event.get_sender_id() or "")
         timestamp = float(getattr(event, "timestamp", 0.0) or 0.0)
         return f"{sender_id}:{timestamp}:{preview_text(str(getattr(event, 'message_str', '') or ''), 40)}"
+
+    async def _append_dialogue_segment(self, event: AstrMessageEvent) -> None:
+        store = getattr(self, "dialogue_store", None)
+        if store is None:
+            return
+        chat_id = str(getattr(event, "unified_msg_origin", "") or "")
+        if not chat_id:
+            return
+        content = str(getattr(event, "message_str", "") or "").strip()
+        if not content and not (event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls")):
+            return
+        try:
+            await store.append_segment(
+                chat_id,
+                event_id=self._build_message_id(event),
+                speaker_id=str(event.get_sender_id() or ""),
+                speaker_name=str(event.get_sender_name() or ""),
+                content=content,
+                role="user",
+                message_kind="image" if bool(event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls")) and not content else ("mixed" if bool(event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls")) else "text"),
+                is_bot=False,
+                reply_target_sender_id=self._extract_reply_target(event)[0],
+                reply_target_sender_name=self._extract_reply_target(event)[1],
+                is_at_bot=self._is_at_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
+                is_reply_to_bot=self._is_reply_to_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
+                has_direct_vision=bool(event.get_extra("direct_vision_urls") or []),
+                is_image_only=self._is_image_only(event),
+                timestamp=float(getattr(event, "timestamp", 0.0) or time.time()),
+            )
+        except Exception as exc:
+            logger.debug(f"[AttentionGate] dialogue segment append degraded: {exc}")
 
     def _compute_debounce_delay(self, session: SessionContext, is_private: bool, is_strong_wakeup: bool) -> float:
         return self.window_buffer.compute_debounce_delay(session, is_private, is_strong_wakeup)
@@ -419,8 +481,22 @@ class AttentionGate:
         del bot_name, event
         return str(content or "").strip()
 
+    def bind_chat_loop_kernel(self, chat_loop_kernel) -> None:
+        self.chat_loop_kernel = chat_loop_kernel
+
     async def inject_external_event(self, chat_id: str, event_data: dict):
         event = _SyntheticExternalEvent(dict(event_data or {}, unified_msg_origin=chat_id))
+        source = str(event.get_extra("astrmai_loop_source", "") or "").strip()
+        if not source:
+            if event.get_extra("astrmai_is_proactive_event", False):
+                source = "proactive_dispatcher"
+            elif event.get_extra("is_external_bot_reply", False):
+                source = "external_result_bridge"
+        if source:
+            event.set_extra("astrmai_loop_source", source)
+        if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "tick"):
+            tick = await self.chat_loop_kernel.tick(chat_id=chat_id, trigger="external", event=event)
+            return tick.dispatch_result
         return await self.process_event(event)
 
     async def _format_and_filter_messages(self, events: List[AstrMessageEvent]):
@@ -487,7 +563,7 @@ class AttentionGate:
 
         if is_private and self.private_chat_manager and not is_strong_wakeup:
             try:
-                await self.private_chat_manager.signal_new_message(sender_id, msg_str)
+                await self.private_chat_manager.signal_new_message(sender_id, msg_str, chat_id=chat_id)
             except Exception as exc:
                 logger.debug(f"[AttentionGate] private chat wait signal degraded: {exc}")
             return "PRIVATE_WAIT"
@@ -509,6 +585,7 @@ class AttentionGate:
             return repeater_result
 
         await self._record_event_activity(chat_id, event, sender_id)
+        await self._append_dialogue_segment(event)
 
         async with session.lock:
             session.accumulation_pool.append(event)
@@ -596,6 +673,14 @@ class AttentionGate:
             turn_context.attention.is_fast_mode = False
             turn_context.attention.focus_reason = focus_thread.focus_reason
             turn_context.attention.root_reason = focus_thread.root_reason
+            if self.context_compaction is not None:
+                self._fire_background_task(
+                    self.context_compaction.schedule_compaction_evaluation(
+                        chat_id,
+                        focus_context=focus_thread,
+                        message_source="user",
+                    )
+                )
             should_skip_judge = bool(
                 focus_candidate.is_direct_wakeup
                 or focus_candidate.is_at_bot

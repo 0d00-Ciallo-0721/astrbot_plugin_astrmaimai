@@ -45,6 +45,19 @@ async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
     group_wait_result = "NONE"
     if event.get_group_id() and runtime.group_reply_wait_manager:
         group_wait_result = runtime.group_reply_wait_manager.handle_incoming_message(event)
+        if getattr(runtime, "chat_loop_kernel", None) is not None:
+            if group_wait_result == "RESUME":
+                await runtime.chat_loop_kernel.resume_wait(
+                    scope.chat_id,
+                    "group_wait_resumed",
+                    resume_target_id=scope.sender_id,
+                    resume_source="group_reply_wait_manager",
+                )
+            elif group_wait_result == "EXPIRED":
+                await runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
+            group_wait_info = runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
+            if group_wait_info:
+                await runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
 
     if getattr(runtime.config.global_settings, "debug_mode", False):
         sender_name = event.get_sender_name()
@@ -61,7 +74,15 @@ async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
             return
 
     await runtime.evolution.record_user_message(event)
-    status = await runtime.attention_gate.process_event(event)
+    if getattr(runtime, "chat_loop_kernel", None) is not None:
+        tick_result = await runtime.chat_loop_kernel.tick(
+            chat_id=scope.chat_id,
+            trigger="message",
+            event=event,
+        )
+        status = tick_result.dispatch_result
+    else:
+        status = await runtime.attention_gate.process_event(event)
     is_direct_call = is_direct_call_event(event)
     debug_trace(event, "ingress.after_attention", status=status, direct_call=is_direct_call)
 

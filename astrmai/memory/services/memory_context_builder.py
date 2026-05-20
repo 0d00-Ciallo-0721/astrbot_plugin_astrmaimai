@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ..contracts.memory_query import MemoryCandidate
+from .memory_scoring import DEFAULT_MEMORY_SCORING
 
 
 class MemoryContextBuilder:
@@ -16,11 +17,11 @@ class MemoryContextBuilder:
         ranked = sorted(
             candidates,
             key=lambda item: (
-                item.relevance_score * 0.45
-                + item.importance * 0.25
-                + item.confidence * 0.15
-                + item.recency_score * 0.1
-                - (0.25 if item.status == "stale" else 0.0)
+                item.relevance_score * DEFAULT_MEMORY_SCORING.search_weight
+                + item.importance * DEFAULT_MEMORY_SCORING.search_importance_weight
+                + item.confidence * DEFAULT_MEMORY_SCORING.search_confidence_weight
+                + item.recency_score * DEFAULT_MEMORY_SCORING.search_recency_weight
+                - (DEFAULT_MEMORY_SCORING.search_stale_penalty if item.status == "stale" else 0.0)
             ),
             reverse=True,
         )

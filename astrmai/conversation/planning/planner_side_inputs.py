@@ -14,8 +14,11 @@ from ..contracts.turn_context import ensure_turn_context
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.prompt_envelope import PromptEnvelope
 from .tools.pfc_tools import (
+    CustomFaceCatalogQueryTool,
     ConstructAtEventTool,
+    GroupSignTool,
     MemeResonanceTool,
+    MessageEmojiLikeTool,
     MessageReactionTool,
     OmniPerceptionTool,
     ProactiveLikeTool,
@@ -70,6 +73,7 @@ class PlannerSideInputMixin:
         "proactive_meme",
         "proactive_like_action",
         "message_reaction_action",
+        "message_emoji_like_action",
     }
     GUARDED_CHAT_TOOL_NAMES = {
         "proactive_poke",
@@ -79,6 +83,8 @@ class PlannerSideInputMixin:
         "wait_and_listen",
         "omni_perception_query",
         "self_lore_query",
+        "custom_face_catalog_query",
+        "group_sign_action",
         "topic_hijack_action",
         "space_transition_action",
         "regret_and_withdraw_action",
@@ -96,7 +102,10 @@ class PlannerSideInputMixin:
         "SpaceTransitionTool": "space_transition_action",
         "RegretAndWithdrawTool": "regret_and_withdraw_action",
         "MessageReactionTool": "message_reaction_action",
+        "MessageEmojiLikeTool": "message_emoji_like_action",
         "ProactiveLikeTool": "proactive_like_action",
+        "CustomFaceCatalogQueryTool": "custom_face_catalog_query",
+        "GroupSignTool": "group_sign_action",
     }
     TOOL_FAMILIES = {
         "wait_and_listen": {"wait"},
@@ -110,7 +119,10 @@ class PlannerSideInputMixin:
         "space_transition_action": {"private"},
         "regret_and_withdraw_action": {"withdraw"},
         "message_reaction_action": {"reaction"},
+        "message_emoji_like_action": {"reaction"},
         "proactive_like_action": {"reaction", "like"},
+        "custom_face_catalog_query": {"query", "meme"},
+        "group_sign_action": {"sign"},
     }
 
     @staticmethod
@@ -243,13 +255,17 @@ class PlannerSideInputMixin:
             SpaceTransitionTool(),
             RegretAndWithdrawTool(),
             MessageReactionTool(),
+            MessageEmojiLikeTool(),
             ProactiveLikeTool(db_service=self.context_engine.db),
+            CustomFaceCatalogQueryTool(),
+            GroupSignTool(),
         ]
 
     def _build_chat_tools(self, event: AstrMessageEvent):
         tools = [
             ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
             MessageReactionTool(),
+            MessageEmojiLikeTool(),
             ProactiveLikeTool(db_service=self.context_engine.db),
         ]
         if self._has_guarded_chat_intent(event):

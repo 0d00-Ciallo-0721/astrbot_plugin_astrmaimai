@@ -11,6 +11,32 @@ from ..adapters.plugin_api import PluginApiAdapter
 
 
 class AdminUiService:
+    SCHEDULER_SIGNAL_KEYS = {
+        "phase",
+        "next_tick_at",
+        "next_tick_delay",
+        "schedule_reason",
+        "scheduler_bucket",
+        "scheduler_score",
+        "starvation_age",
+        "fairness_penalty",
+        "maintenance_budget_state",
+        "selected_reason",
+        "not_selected_reason",
+        "poll_mode",
+        "due_rank",
+        "quota_bucket",
+        "quota_skip_reason",
+        "batch_plan",
+        "batch_fill_rate",
+        "batch_pressure",
+        "pressure_components",
+        "forced_promotion_eligible",
+        "starvation_tier",
+        "selection_cooldown_bias",
+        "missed_due_passes",
+    }
+
     def __init__(self, plugin_api: PluginApiAdapter, db_factory: Callable | None = None):
         self.plugin_api = plugin_api
         self.db_factory = db_factory
@@ -35,8 +61,19 @@ class AdminUiService:
         return getattr(runtime, "system2_planner", None) if runtime else None
 
     @staticmethod
+    def _gateway(runtime: Any) -> Any:
+        return getattr(runtime, "gateway", None) if runtime else None
+
+    @staticmethod
     def _proactive_task(runtime: Any) -> Any:
         return getattr(runtime, "proactive_task", None) if runtime else None
+
+    @staticmethod
+    def _chat_loop_kernel(runtime: Any) -> Any:
+        if runtime and getattr(runtime, "chat_loop_kernel", None) is not None:
+            return getattr(runtime, "chat_loop_kernel", None)
+        task = AdminUiService._proactive_task(runtime)
+        return getattr(task, "chat_loop_kernel", None) if task else None
 
     @staticmethod
     def _heartflow_manager(runtime: Any) -> Any:
@@ -47,6 +84,15 @@ class AdminUiService:
     def _heartflow_topic_digest_service(runtime: Any) -> Any:
         task = AdminUiService._proactive_task(runtime)
         return getattr(task, "heartflow_topic_digest_service", None) if task else None
+
+    @classmethod
+    def _scheduler_pending_signal_slice(cls, pending_signals: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(pending_signals or {})
+        return {
+            key: value
+            for key, value in payload.items()
+            if key in cls.SCHEDULER_SIGNAL_KEYS
+        }
 
     async def _safe_count(self, table: str, where: str = "", params: tuple = ()) -> int:
         if not self.db_factory:
@@ -140,6 +186,177 @@ class AdminUiService:
                 "total_canonical_memories": await self._safe_count("canonical_memories"),
             },
             "runtime_bound": runtime is not None,
+        }
+
+    @staticmethod
+    def _context_economy_snapshot(runtime: Any) -> dict[str, Any]:
+        gateway = AdminUiService._gateway(runtime)
+        if gateway and hasattr(gateway, "get_context_economy_stats"):
+            try:
+                snapshot = gateway.get_context_economy_stats()
+                return snapshot if isinstance(snapshot, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _template_metric_item(template_key: str, metric: dict[str, Any]) -> dict[str, Any]:
+        template_id, template_version = (template_key.rsplit("@", 1) + [""])[:2]
+        workload_families = dict(metric.get("workload_families", {}) or {})
+        return {
+            "template_key": template_key,
+            "template_id": template_id,
+            "template_version": template_version,
+            "workload_families": workload_families,
+            "call_count": int(metric.get("call_count", 0) or 0),
+            "lane_rotate_count": int(metric.get("lane_rotate_count", 0) or 0),
+            "fallback_count": int(metric.get("fallback_count", 0) or 0),
+            "primary_hit_rate": float(metric.get("primary_hit_rate", 0.0) or 0.0),
+            "provider_session_usage_rate": float(metric.get("provider_session_usage_rate", 0.0) or 0.0),
+            "provider_session_reuse_rate": float(metric.get("provider_session_reuse_rate", 0.0) or 0.0),
+            "cache_affinity_ready_rate": float(metric.get("cache_affinity_ready_rate", 0.0) or 0.0),
+            "avg_stable_prefix_length": float(metric.get("avg_stable_prefix_length", 0.0) or 0.0),
+            "avg_dynamic_payload_length": float(metric.get("avg_dynamic_payload_length", 0.0) or 0.0),
+            "actual_models": dict(metric.get("actual_models", {}) or {}),
+            "rotate_reasons": dict(metric.get("rotate_reasons", {}) or {}),
+        }
+
+    def _context_economy_templates(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        limit: int = 50,
+        template_id: str = "",
+        workload_family: str = "",
+        sort_by: str = "rotate",
+        sort_dir: str = "desc",
+    ) -> list[dict[str, Any]]:
+        templates = dict(snapshot.get("_templates", {}) or {})
+        items = [
+            self._template_metric_item(key, value if isinstance(value, dict) else {})
+            for key, value in templates.items()
+        ]
+        if template_id:
+            needle = str(template_id or "").strip().lower()
+            items = [item for item in items if needle in str(item["template_id"]).lower()]
+        if workload_family:
+            target_family = str(workload_family or "").strip()
+            items = [
+                item for item in items
+                if target_family in dict(item.get("workload_families", {}) or {})
+            ]
+        sort_key = str(sort_by or "rotate").strip().lower()
+        direction = str(sort_dir or "").strip().lower()
+        if sort_key not in {"rotate", "session_reuse", "calls"}:
+            sort_key = "rotate"
+        if direction not in {"asc", "desc"}:
+            direction = "asc" if sort_key == "session_reuse" else "desc"
+
+        def _sort_tuple(item: dict[str, Any]) -> tuple:
+            rotates = int(item.get("lane_rotate_count", 0) or 0)
+            calls = int(item.get("call_count", 0) or 0)
+            reuse = float(item.get("provider_session_reuse_rate", 0.0) or 0.0)
+            key = str(item.get("template_key", ""))
+            if sort_key == "session_reuse":
+                return (reuse, -rotates, -calls, key)
+            if sort_key == "calls":
+                return (-calls, -rotates, reuse, key)
+            return (-rotates, reuse, -calls, key)
+
+        items.sort(key=_sort_tuple)
+        default_direction = "asc" if sort_key == "session_reuse" else "desc"
+        if direction != default_direction:
+            items.reverse()
+        return items[: max(1, min(int(limit or 50), 200))]
+
+    @staticmethod
+    def _context_economy_workload_families(snapshot: dict[str, Any]) -> list[str]:
+        families: set[str] = set()
+        for metric in dict(snapshot.get("_templates", {}) or {}).values():
+            if not isinstance(metric, dict):
+                continue
+            for family in dict(metric.get("workload_families", {}) or {}).keys():
+                if family:
+                    families.add(str(family))
+        return sorted(families)
+
+    def _context_economy_overview(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        family_metrics = [
+            value
+            for key, value in snapshot.items()
+            if key != "_templates" and isinstance(value, dict)
+        ]
+        total_calls = sum(int(item.get("call_count", 0) or 0) for item in family_metrics)
+        total_rotates = sum(int(item.get("lane_rotate_count", 0) or 0) for item in family_metrics)
+        total_fallbacks = sum(int(item.get("fallback_count", 0) or 0) for item in family_metrics)
+        total_primary_hits = sum(
+            int(round(float(item.get("primary_hit_rate", 0.0) or 0.0) * int(item.get("call_count", 0) or 0)))
+            for item in family_metrics
+        )
+        total_provider_session_uses = sum(
+            int(round(float(item.get("provider_session_usage_rate", 0.0) or 0.0) * int(item.get("call_count", 0) or 0)))
+            for item in family_metrics
+        )
+        total_provider_session_reused = sum(
+            int(round(float(item.get("provider_session_reuse_rate", 0.0) or 0.0) * int(item.get("call_count", 0) or 0)))
+            for item in family_metrics
+        )
+        return {
+            "total_calls": total_calls,
+            "total_rotates": total_rotates,
+            "total_fallbacks": total_fallbacks,
+            "primary_hit_rate": round((total_primary_hits / total_calls), 4) if total_calls else 0.0,
+            "provider_session_usage_rate": round((total_provider_session_uses / total_calls), 4) if total_calls else 0.0,
+            "provider_session_reuse_rate": round((total_provider_session_reused / total_calls), 4) if total_calls else 0.0,
+            "template_count": len(dict(snapshot.get("_templates", {}) or {})),
+        }
+
+    async def context_economy_overview_view(self, limit: int = 20) -> dict[str, Any]:
+        runtime = self._runtime()
+        snapshot = self._context_economy_snapshot(runtime)
+        return {
+            "status": "ok",
+            "data": {
+                "overview": self._context_economy_overview(snapshot),
+                "templates": self._context_economy_templates(snapshot, limit=limit),
+            },
+            "runtime_bound": self._gateway(runtime) is not None,
+        }
+
+    async def context_economy_templates_view(
+        self,
+        limit: int = 50,
+        template_id: str | None = None,
+        workload_family: str | None = None,
+        sort_by: str = "rotate",
+        sort_dir: str | None = None,
+    ) -> dict[str, Any]:
+        runtime = self._runtime()
+        snapshot = self._context_economy_snapshot(runtime)
+        family_value = str(workload_family or "")
+        template_value = str(template_id or "")
+        items = self._context_economy_templates(
+            snapshot,
+            limit=limit,
+            template_id=template_value,
+            workload_family=family_value,
+            sort_by=sort_by,
+            sort_dir=str(sort_dir or ""),
+        )
+        total_items = self._context_economy_templates(
+            snapshot,
+            limit=200,
+            template_id=template_value,
+            workload_family=family_value,
+            sort_by=sort_by,
+            sort_dir=str(sort_dir or ""),
+        )
+        return {
+            "status": "ok",
+            "items": items,
+            "total": len(total_items),
+            "available_workload_families": self._context_economy_workload_families(snapshot),
+            "runtime_bound": self._gateway(runtime) is not None,
         }
 
     async def heartflow_status(self) -> dict[str, Any]:
@@ -237,10 +454,18 @@ class AdminUiService:
 
     async def recent_turn_traces(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
         planner = self._planner(self._runtime())
-        items = list(getattr(planner, "turn_trace_history", []) or [])
-        if chat_id:
-            items = [item for item in items if str(item.get("chat_id", "")) == chat_id]
-        items = items[-max(1, min(limit, 300)) :][::-1]
+        persistent_store = getattr(planner, "turn_trace_store", None) if planner else None
+        items: list[dict[str, Any]] = []
+        if persistent_store is not None and hasattr(persistent_store, "recent"):
+            try:
+                items = list(await persistent_store.recent(chat_id=chat_id, limit=limit))
+            except Exception:
+                items = []
+        if not items:
+            items = list(getattr(planner, "turn_trace_history", []) or [])
+            if chat_id:
+                items = [item for item in items if str(item.get("chat_id", "")) == chat_id]
+            items = items[-max(1, min(limit, 300)) :][::-1]
         return {"status": "ok", "items": items, "total": len(items), "runtime_bound": planner is not None}
 
     async def tools_status(self) -> dict[str, Any]:
@@ -334,6 +559,70 @@ class AdminUiService:
         task = self._proactive_task(self._runtime())
         data = task.describe_status() if task and hasattr(task, "describe_status") else {"running": False}
         return {"status": "ok", "data": data, "runtime_bound": task is not None}
+
+    async def scheduler_status_view(self) -> dict[str, Any]:
+        runtime = self._runtime()
+        task = self._proactive_task(runtime)
+        kernel = self._chat_loop_kernel(runtime)
+        proactive = task.describe_status() if task and hasattr(task, "describe_status") else {}
+        kernel_status = kernel.describe_status_sync() if kernel and hasattr(kernel, "describe_status_sync") else {}
+        overview = {
+            "scheduler_poll_mode": proactive.get("scheduler_poll_mode", ""),
+            "scheduler_poll_interval": proactive.get("scheduler_poll_interval", 0.0),
+            "due_chat_count": proactive.get("due_chat_count", 0),
+            "maintenance_budget_total": proactive.get("maintenance_budget_total", 0),
+            "maintenance_budget_remaining": proactive.get("maintenance_budget_remaining", 0),
+            "batch_fill_rate": proactive.get("batch_fill_rate", 0.0),
+            "forced_promotion_count": proactive.get("forced_promotion_count", 0),
+        }
+        return {
+            "status": "ok",
+            "data": {
+                "overview": overview,
+                "proactive": proactive,
+                "kernel": kernel_status,
+                "scheduler_policy": dict(kernel_status.get("scheduler_policy", {}) or {}),
+            },
+            "runtime_bound": bool(task or kernel),
+        }
+
+    async def scheduler_due_selection_view(self) -> dict[str, Any]:
+        runtime = self._runtime()
+        task = self._proactive_task(runtime)
+        kernel = self._chat_loop_kernel(runtime)
+        proactive = task.describe_status() if task and hasattr(task, "describe_status") else {}
+        kernel_status = kernel.describe_status_sync() if kernel and hasattr(kernel, "describe_status_sync") else {}
+        return {
+            "status": "ok",
+            "data": {
+                "report": dict(kernel_status.get("last_due_selection_report", {}) or {}),
+                "summary": dict(kernel_status.get("last_due_selection_summary", {}) or {}),
+                "poll_mode_transition": dict(proactive.get("poll_mode_transition", {}) or {}),
+            },
+            "runtime_bound": bool(task or kernel),
+        }
+
+    async def scheduler_chat_view(self, chat_id: str) -> dict[str, Any]:
+        runtime = self._runtime()
+        kernel = self._chat_loop_kernel(runtime)
+        if not kernel or not hasattr(kernel, "peek_loop_state"):
+            return {"status": "ok", "data": {}, "runtime_bound": False}
+        state = await kernel.peek_loop_state(chat_id)
+        if state is None:
+            return {
+                "status": "ok",
+                "data": {
+                    "chat_id": chat_id,
+                    "state_present": False,
+                    "scheduler_pending_signals": {},
+                },
+                "runtime_bound": True,
+            }
+        data = self._as_dict(state)
+        data["chat_id"] = chat_id
+        data["state_present"] = True
+        data["scheduler_pending_signals"] = self._scheduler_pending_signal_slice(data.get("pending_signals", {}))
+        return {"status": "ok", "data": data, "runtime_bound": True}
 
     async def proactive_intents(self, limit: int = 50) -> dict[str, Any]:
         task = self._proactive_task(self._runtime())

@@ -45,7 +45,10 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         "space_transition_action": "转私聊",
         "regret_and_withdraw_action": "撤回",
         "message_reaction_action": "互动反应",
+        "message_emoji_like_action": "消息表情回复",
         "proactive_like_action": "表达好感",
+        "custom_face_catalog_query": "查自定义表情",
+        "group_sign_action": "群签到",
     }
 
     def __init__(
@@ -84,6 +87,18 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.tool_trace_history: list[dict] = []
         self.turn_trace_history: list[dict] = []
         self.follow_up_cooldowns: dict[str, float] = {}
+        self.dialogue_store = getattr(getattr(self.context_engine, "db", None), "dialogue_store", None)
+        if self.dialogue_store is None:
+            self.dialogue_store = getattr(getattr(self.context_engine, "db_service", None), "dialogue_store", None)
+        self.context_compaction = getattr(getattr(self.context_engine, "db", None), "context_compaction", None)
+        if self.context_compaction is None:
+            self.context_compaction = getattr(getattr(self.context_engine, "db_service", None), "context_compaction", None)
+        self.turn_trace_store = getattr(getattr(self.context_engine, "db", None), "turn_trace_store", None)
+        if self.turn_trace_store is None:
+            self.turn_trace_store = getattr(getattr(self.context_engine, "db_service", None), "turn_trace_store", None)
+        self.prefix_caching_enabled = bool(getattr(getattr(gateway.config, "conversation", None), "enable_prefix_caching", True))
+        self._prefix_hash_history: dict[str, str] = {}
+        self._prefix_cold_summary_history: dict[str, str] = {}
         self.cognitive_loop = cognitive_loop or CognitiveLoop(
             gateway,
             memory_engine=memory_engine,
@@ -107,6 +122,158 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             config=gateway.config,
             runtime_coordinator=runtime_coordinator,
         )
+
+    async def _update_turn_trace_runtime(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        *,
+        prompt_envelope=None,
+        reply_text: str = "",
+    ) -> None:
+        turn_context = ensure_turn_context(event)
+        if prompt_envelope is not None:
+            turn_context.prompt_envelope = prompt_envelope
+        warm_summary = str(getattr(prompt_envelope, "warm_zone_summary", "") if prompt_envelope else "")
+        warm_quotes = str(getattr(prompt_envelope, "warm_zone_quotes", "") if prompt_envelope else "")
+        warm_transcript = str(getattr(prompt_envelope, "warm_zone_transcript", "") if prompt_envelope else "")
+        if not warm_transcript:
+            warm_transcript = "\n".join(part for part in (warm_summary, warm_quotes) if part).strip()
+        turn_context.attention.warm_transcript_preview = warm_transcript[:180]
+        turn_context.attention.warm_transcript_source = str(
+            getattr(prompt_envelope, "warm_zone_transcript_source", "") if prompt_envelope else ""
+        )
+        turn_context.attention.warm_summary_preview = warm_summary[:180]
+        turn_context.attention.warm_quotes_preview = warm_quotes[:180]
+        turn_context.attention.warm_topics_preview = str(
+            getattr(prompt_envelope, "warm_topics_preview", "") if prompt_envelope else ""
+        )[:180]
+        turn_context.attention.recent_transcript_preview = str(
+            getattr(prompt_envelope, "recent_transcript", "") if prompt_envelope else ""
+        )[:180]
+        turn_context.attention.recent_transcript_reason = str(
+            getattr(prompt_envelope, "recent_transcript_reason", "") if prompt_envelope else ""
+        )
+        turn_context.attention.recent_transcript_used = bool(
+            str(getattr(prompt_envelope, "recent_transcript", "") if prompt_envelope else "").strip()
+        )
+        turn_context.attention.reply_prompt_focus_anchor = str(
+            getattr(prompt_envelope, "focus_message_text", "")
+            or getattr(prompt_envelope, "raw_user_text", "")
+            or ""
+            if prompt_envelope
+            else ""
+        )[:180]
+        turn_context.attention.cold_summary_preview = ""
+        turn_context.continuity.dialogue_store_version = "v1"
+        turn_context.continuity.compaction_status = "unknown"
+        turn_context.continuity.compaction_eligibility_reason = ""
+        turn_context.continuity.recompact_armed = False
+        turn_context.continuity.focus_tail_overlap = False
+        turn_context.continuity.delta_old_segments = 0
+        turn_context.continuity.delta_old_message_load = 0.0
+        turn_context.continuity.delta_old_long_message_count = 0
+        turn_context.continuity.cold_summary_section_counts = {}
+        turn_context.continuity.message_count_since_last_compaction = 0
+        turn_context.continuity.next_eval_at_count = 80
+        turn_context.continuity.final_score = 0.0
+        turn_context.continuity.count_score = 0.0
+        turn_context.continuity.closure_score = 0.0
+        turn_context.continuity.tail_activity_score = 0.0
+        turn_context.continuity.topic_density_score = 0.0
+        turn_context.continuity.stability_score = 0.0
+        turn_context.continuity.benefit_score = 0.0
+        turn_context.continuity.is_forced = False
+        turn_context.continuity.is_safe_to_compact = False
+        turn_context.continuity.closure_signals = []
+        turn_context.continuity.tail_activity_signals = []
+        turn_context.continuity.topic_density_signals = []
+        turn_context.continuity.stability_signals = []
+        turn_context.continuity.benefit_signals = []
+        turn_context.continuity.forced_pending_message_delta = 0
+        turn_context.continuity.last_safe_window_seen_at_count = 0
+        turn_context.continuity.post_compaction_recovery_rounds = 0
+        turn_context.continuity.evaluation_count = 0
+        turn_context.continuity.current_message_count = 0
+        turn_context.continuity.queued_eval_node = 0
+        turn_context.continuity.pending_eval_nodes_count = 0
+        turn_context.continuity.pending_eval_nodes = []
+        turn_context.continuity.force_execute_on_next_safe_hook = False
+        turn_context.continuity.safe_hook_block_reason = ""
+        turn_context.continuity.last_hook_source = ""
+        turn_context.continuity.last_safe_hook_checked_at = 0
+        prefix_status = (
+            self.context_engine.get_last_prefix_status(chat_id)
+            if hasattr(self.context_engine, "get_last_prefix_status")
+            else {
+                "prefix_hash": "",
+                "prefix_stable": False,
+                "prefix_changed_reason": "unknown",
+            }
+        )
+        turn_context.continuity.prefix_hash = str(prefix_status.get("prefix_hash", "") or "")
+        turn_context.continuity.prefix_stable = bool(prefix_status.get("prefix_stable", False))
+        turn_context.continuity.prefix_changed_reason = str(prefix_status.get("prefix_changed_reason", "unknown") or "unknown")
+        if self.dialogue_store is not None:
+            try:
+                if hasattr(self.dialogue_store, "snapshot_counts"):
+                    counts = await self.dialogue_store.snapshot_counts(chat_id)
+                    turn_context.continuity.dialogue_store_version = f"segments:{counts.get('segments', 0)}"
+                    turn_context.continuity.compaction_status = "summary_ready" if counts.get("has_summary") else "summary_empty"
+                if hasattr(self.dialogue_store, "get_cold_summary"):
+                    cold_text = str(await self.dialogue_store.get_cold_summary(chat_id) or "")
+                    turn_context.attention.cold_summary_preview = cold_text[:180]
+                if hasattr(self.dialogue_store, "get_cold_summary_structure"):
+                    cold_structure = await self.dialogue_store.get_cold_summary_structure(chat_id)
+                    if cold_structure is not None and hasattr(cold_structure, "section_counts"):
+                        turn_context.continuity.cold_summary_section_counts = dict(cold_structure.section_counts())
+            except Exception:
+                pass
+        if self.context_compaction is not None and hasattr(self.context_compaction, "get_trace_status"):
+            try:
+                compaction_status = await self.context_compaction.get_trace_status(
+                    chat_id,
+                    focus_context=getattr(turn_context.attention, "focus_thread", None),
+                )
+                turn_context.continuity.compaction_status = str(compaction_status.get("state", "") or turn_context.continuity.compaction_status)
+                turn_context.continuity.compaction_eligibility_reason = str(compaction_status.get("eligibility_reason", "") or "")
+                turn_context.continuity.recompact_armed = bool(compaction_status.get("recompact_armed", False))
+                turn_context.continuity.focus_tail_overlap = bool(compaction_status.get("focus_tail_overlap", False))
+                turn_context.continuity.delta_old_segments = int(compaction_status.get("delta_old_segments", 0) or 0)
+                turn_context.continuity.delta_old_message_load = float(compaction_status.get("delta_old_message_load", 0.0) or 0.0)
+                turn_context.continuity.delta_old_long_message_count = int(compaction_status.get("delta_old_long_message_count", 0) or 0)
+                turn_context.continuity.message_count_since_last_compaction = int(compaction_status.get("message_count_since_last_compaction", 0) or 0)
+                turn_context.continuity.next_eval_at_count = int(compaction_status.get("next_eval_at_count", 80) or 80)
+                turn_context.continuity.final_score = float(compaction_status.get("final_score", 0.0) or 0.0)
+                turn_context.continuity.count_score = float(compaction_status.get("count_score", 0.0) or 0.0)
+                turn_context.continuity.closure_score = float(compaction_status.get("closure_score", 0.0) or 0.0)
+                turn_context.continuity.tail_activity_score = float(compaction_status.get("tail_activity_score", 0.0) or 0.0)
+                turn_context.continuity.topic_density_score = float(compaction_status.get("topic_density_score", 0.0) or 0.0)
+                turn_context.continuity.stability_score = float(compaction_status.get("stability_score", 0.0) or 0.0)
+                turn_context.continuity.benefit_score = float(compaction_status.get("benefit_score", 0.0) or 0.0)
+                turn_context.continuity.is_forced = bool(compaction_status.get("is_forced", False))
+                turn_context.continuity.is_safe_to_compact = bool(compaction_status.get("is_safe_to_compact", False))
+                turn_context.continuity.closure_signals = list(compaction_status.get("closure_signals", []) or [])
+                turn_context.continuity.tail_activity_signals = list(compaction_status.get("tail_activity_signals", []) or [])
+                turn_context.continuity.topic_density_signals = list(compaction_status.get("topic_density_signals", []) or [])
+                turn_context.continuity.stability_signals = list(compaction_status.get("stability_signals", []) or [])
+                turn_context.continuity.benefit_signals = list(compaction_status.get("benefit_signals", []) or [])
+                turn_context.continuity.forced_pending_message_delta = int(compaction_status.get("forced_pending_message_delta", 0) or 0)
+                turn_context.continuity.last_safe_window_seen_at_count = int(compaction_status.get("last_safe_window_seen_at_count", 0) or 0)
+                turn_context.continuity.post_compaction_recovery_rounds = int(compaction_status.get("post_compaction_recovery_rounds", 0) or 0)
+                turn_context.continuity.evaluation_count = int(compaction_status.get("evaluation_count", 0) or 0)
+                turn_context.continuity.current_message_count = int(compaction_status.get("current_message_count", 0) or 0)
+                turn_context.continuity.queued_eval_node = int(compaction_status.get("queued_eval_node", 0) or 0)
+                turn_context.continuity.pending_eval_nodes_count = int(compaction_status.get("pending_eval_nodes_count", 0) or 0)
+                turn_context.continuity.pending_eval_nodes = list(compaction_status.get("pending_eval_nodes", []) or [])
+                turn_context.continuity.force_execute_on_next_safe_hook = bool(compaction_status.get("force_execute_on_next_safe_hook", False))
+                turn_context.continuity.safe_hook_block_reason = str(compaction_status.get("safe_hook_block_reason", "") or "")
+                turn_context.continuity.last_hook_source = str(compaction_status.get("last_hook_source", "") or "")
+                turn_context.continuity.last_safe_hook_checked_at = int(compaction_status.get("last_safe_hook_checked_at", 0) or 0)
+            except Exception:
+                pass
+        if reply_text:
+            turn_context.continuity.conversation_summary = str(reply_text)[:180]
 
     @staticmethod
     def _merge_inner_monologue(existing: str, addition: str) -> str:
@@ -338,7 +505,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         }
         self.tool_trace_history = [*self.tool_trace_history, item][-300:]
 
-    def _remember_turn_trace(
+    async def _remember_turn_trace(
         self,
         chat_id: str,
         event: AstrMessageEvent,
@@ -363,6 +530,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_preview=str(reply_text or ""),
         )
         self.turn_trace_history = [*self.turn_trace_history, item][-300:]
+        if self.turn_trace_store is not None and hasattr(self.turn_trace_store, "append"):
+            try:
+                await self.turn_trace_store.append(item)
+            except Exception:
+                pass
 
     async def _record_expression_pattern_usage(self, event: AstrMessageEvent, chat_id: str, reply_text: str | None) -> None:
         reflector = getattr(self, "reflector", None)
@@ -531,6 +703,64 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         except (TypeError, ValueError):
             proactive.cooldown_seconds = 0.0
 
+    async def _append_dialogue_segment(self, event: AstrMessageEvent, reply_text: str) -> None:
+        store = getattr(self, "dialogue_store", None)
+        if store is None:
+            return
+        chat_id = str(event.unified_msg_origin or "")
+        if not chat_id:
+            return
+        content = str(reply_text or "").strip()
+        if not content:
+            return
+        try:
+            await store.append_segment(
+                chat_id,
+                event_id=f"reply:{chat_id}:{int(time.time() * 1000)}",
+                speaker_id=str(getattr(self.context, "bot_id", "") or getattr(self.gateway, "bot_id", "") or ""),
+                speaker_name=str(getattr(getattr(self.gateway.config, "system1", None), "nicknames", ["Bot"])[0] if getattr(getattr(self.gateway.config, "system1", None), "nicknames", None) else "Bot"),
+                content=content,
+                role="assistant",
+                message_kind="text",
+                is_bot=True,
+                timestamp=time.time(),
+            )
+        except Exception as exc:
+            logger.debug(f"[Planner] dialogue segment append degraded: {exc}")
+
+    async def _record_planner_dialogue_segment(self, event: AstrMessageEvent, chat_id: str, reply_text: str, *, focus_context=None) -> None:
+        store = getattr(self, "dialogue_store", None)
+        if store is None:
+            return
+        content = str(reply_text or "").strip()
+        if not content:
+            return
+        try:
+            await store.append_segment(
+                chat_id,
+                event_id=f"reply:{chat_id}:{int(time.time() * 1000)}",
+                speaker_id=str(getattr(self.context, "bot_id", "") or getattr(self.gateway, "bot_id", "") or ""),
+                speaker_name=str(getattr(getattr(self.gateway.config, "system1", None), "nicknames", ["Bot"])[0] if getattr(getattr(self.gateway.config, "system1", None), "nicknames", None) else "Bot"),
+                content=content,
+                role="assistant",
+                message_kind="text",
+                is_bot=True,
+                timestamp=time.time(),
+            )
+            if self.context_compaction is not None:
+                try:
+                    asyncio.create_task(
+                        self.context_compaction.schedule_compaction_evaluation(
+                            chat_id,
+                            focus_context=focus_context,
+                            message_source="assistant",
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug(f"[Planner] dialogue compaction degraded: {exc}")
+        except Exception as exc:
+            logger.debug(f"[Planner] dialogue segment append degraded: {exc}")
+
     async def _finalize_proactive_event(self, event: AstrMessageEvent, reply_text: str | None = None) -> None:
         if not bool(event.get_extra("astrmai_is_proactive_event", False)):
             return
@@ -656,7 +886,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             turn_context.cognitive.action_tier = "none"
             turn_context.cognitive.risk_flags = ["group_non_direct_budget_wait", "group_ambient_short_wait"]
             await self._finalize_proactive_event(event, None)
-            self._remember_turn_trace(chat_id, event, status="skipped_wait")
+            await self._remember_turn_trace(chat_id, event, status="skipped_wait")
             return ""
 
         cognitive_decision = None
@@ -729,7 +959,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                         else cognitive_decision.action
                     )
                     await self._finalize_proactive_event(event, None)
-                    self._remember_turn_trace(
+                    await self._remember_turn_trace(
                         chat_id,
                         event,
                         status=f"skipped_{skip_reason}",
@@ -826,6 +1056,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             style_variant=style_variant,
             proactive_recall=proactive_recall,
         )
+        await self._update_turn_trace_runtime(
+            event,
+            chat_id,
+            prompt_envelope=prompt_envelope,
+        )
 
         direct_vision_urls = list(
             dict.fromkeys(
@@ -844,6 +1079,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tools=tools,
             direct_vision_urls=direct_vision_urls,
         )
+        await self._record_planner_dialogue_segment(event, chat_id, reply_text, focus_context=focus_context)
+        await self._update_turn_trace_runtime(event, chat_id, prompt_envelope=prompt_envelope, reply_text=reply_text)
         await self._record_expression_pattern_usage(event, chat_id, reply_text)
         self._record_agency_reflection(chat_id, reply_text, tools, cognitive_decision)
         self._record_conversation_continuity(
@@ -896,7 +1133,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 signals=blocked_modes,
             )
 
-        self._remember_turn_trace(chat_id, event, status="executed", reply_text=reply_text)
+        await self._remember_turn_trace(chat_id, event, status="executed", reply_text=reply_text)
 
         logger.debug(
             f"[{event.unified_msg_origin}] [planning] exit | reply_sent={bool(event.get_extra('astrmai_reply_sent', False))}"

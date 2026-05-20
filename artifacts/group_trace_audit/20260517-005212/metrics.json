@@ -1,0 +1,22 @@
+{
+  "total_scenarios": 1,
+  "total_turns": 104,
+  "passed_turns": 104,
+  "failed_turns": 0,
+  "pass_rate": 1.0,
+  "worst_wait_next_node_scenario": "forced_compaction",
+  "earliest_cooldown_scenario": "forced_compaction",
+  "most_common_block_reason": "recent_dense_bot_exchange",
+  "most_unstable_score_signal": "tail_activity_score",
+  "block_reason_counts": {
+    "recent_dense_bot_exchange": 10,
+    "forced_waiting_for_safe_hook": 3
+  },
+  "score_averages": {
+    "closure_score": 0.3173076923076923,
+    "tail_activity_score": -4.4423076923076925,
+    "topic_density_score": 1.6153846153846154,
+    "stability_score": 0.6346153846153846,
+    "benefit_score": 2.923076923076923
+  }
+}

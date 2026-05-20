@@ -70,8 +70,8 @@ class _FakePrivateChatManager:
     def __init__(self):
         self.calls = []
 
-    async def signal_new_message(self, user_id, message_str):
-        self.calls.append((user_id, message_str))
+    async def signal_new_message(self, user_id, message_str, chat_id=""):
+        self.calls.append((user_id, message_str, chat_id))
 
 
 class _FakeRuntimeCoordinator:
@@ -146,7 +146,7 @@ class AttentionPrivateChatTests(unittest.TestCase):
         result = asyncio.run(_run())
 
         self.assertEqual(result, "PRIVATE_WAIT")
-        self.assertEqual(manager.calls, [("user-1", "hello")])
+        self.assertEqual(manager.calls, [("user-1", "hello", "default:FriendMessage:user-1")])
 
     def test_fast_wakeup_path_marks_runtime_activity(self):
         config = SimpleNamespace(

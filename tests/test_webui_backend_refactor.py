@@ -614,6 +614,260 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         digests = asyncio.run(service.heartflow_topic_digests())
         self.assertEqual(digests["items"][0]["source"], "heartflow_topic_digest")
 
+    def test_admin_service_exposes_context_economy_template_metrics(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Gateway:
+            def get_context_economy_stats(self):
+                return {
+                    "memory_global_summary": {
+                        "call_count": 4,
+                        "lane_rotate_count": 2,
+                        "fallback_count": 0,
+                        "primary_hit_rate": 1.0,
+                        "provider_session_usage_rate": 1.0,
+                        "provider_session_reuse_rate": 0.6667,
+                        "cache_affinity_ready_rate": 1.0,
+                        "avg_stable_prefix_length": 220.0,
+                        "avg_dynamic_payload_length": 64.0,
+                        "actual_models": {"model-a": 3},
+                        "rotate_reasons": {"template_version_changed": 1, "schema_changed": 1},
+                        "workload_families": {"memory_global_summary": 4},
+                    },
+                    "persona_summary": {
+                        "call_count": 5,
+                        "lane_rotate_count": 4,
+                        "fallback_count": 0,
+                        "primary_hit_rate": 0.8,
+                        "provider_session_usage_rate": 1.0,
+                        "provider_session_reuse_rate": 0.2,
+                        "cache_affinity_ready_rate": 1.0,
+                        "avg_stable_prefix_length": 310.0,
+                        "avg_dynamic_payload_length": 52.0,
+                        "actual_models": {"model-b": 5},
+                        "rotate_reasons": {"template_changed": 3, "schema_changed": 1},
+                        "workload_families": {"persona_summary": 5},
+                    },
+                    "_templates": {
+                        "memory_global_summary@v2": {
+                            "call_count": 2,
+                            "lane_rotate_count": 1,
+                            "fallback_count": 0,
+                            "primary_hit_rate": 1.0,
+                            "provider_session_usage_rate": 1.0,
+                            "provider_session_reuse_rate": 0.5,
+                            "cache_affinity_ready_rate": 1.0,
+                            "avg_stable_prefix_length": 220.0,
+                            "avg_dynamic_payload_length": 64.0,
+                            "actual_models": {"model-a": 2},
+                            "rotate_reasons": {"template_version_changed": 1, "schema_changed": 1},
+                            "workload_families": {"memory_global_summary": 2},
+                        },
+                        "persona_summary@v3": {
+                            "call_count": 5,
+                            "lane_rotate_count": 4,
+                            "fallback_count": 0,
+                            "primary_hit_rate": 0.8,
+                            "provider_session_usage_rate": 1.0,
+                            "provider_session_reuse_rate": 0.2,
+                            "cache_affinity_ready_rate": 1.0,
+                            "avg_stable_prefix_length": 310.0,
+                            "avg_dynamic_payload_length": 52.0,
+                            "actual_models": {"model-b": 5},
+                            "rotate_reasons": {"template_changed": 3, "schema_changed": 1},
+                            "workload_families": {"persona_summary": 5},
+                        }
+                    },
+                }
+
+        class _Runtime:
+            gateway = _Gateway()
+
+        class _Facade:
+            runtime = _Runtime()
+
+        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        overview = asyncio.run(service.context_economy_overview_view(limit=20))
+        templates = asyncio.run(service.context_economy_templates_view(limit=20))
+        filtered = asyncio.run(
+            service.context_economy_templates_view(
+                limit=20,
+                template_id="persona",
+                workload_family="persona_summary",
+                sort_by="session_reuse",
+                sort_dir="asc",
+            )
+        )
+        calls_sorted = asyncio.run(
+            service.context_economy_templates_view(
+                limit=20,
+                sort_by="calls",
+                sort_dir="desc",
+            )
+        )
+
+        self.assertEqual(overview["data"]["overview"]["total_calls"], 9)
+        self.assertEqual(overview["data"]["overview"]["total_rotates"], 6)
+        self.assertEqual(overview["data"]["overview"]["template_count"], 2)
+        self.assertAlmostEqual(overview["data"]["overview"]["provider_session_reuse_rate"], 0.4444, places=4)
+        self.assertEqual(overview["data"]["templates"][0]["template_id"], "persona_summary")
+        self.assertEqual(templates["items"][0]["template_id"], "persona_summary")
+        self.assertEqual(templates["items"][0]["template_version"], "v3")
+        self.assertEqual(templates["items"][0]["rotate_reasons"]["template_changed"], 3)
+        self.assertEqual(templates["items"][0]["provider_session_reuse_rate"], 0.2)
+        self.assertEqual(templates["items"][0]["workload_families"]["persona_summary"], 5)
+        self.assertEqual(templates["items"][1]["template_id"], "memory_global_summary")
+        self.assertEqual(filtered["items"][0]["template_id"], "persona_summary")
+        self.assertEqual(filtered["available_workload_families"], ["memory_global_summary", "persona_summary"])
+        self.assertEqual(calls_sorted["items"][0]["template_id"], "persona_summary")
+        self.assertEqual(calls_sorted["items"][1]["template_id"], "memory_global_summary")
+
+    def test_admin_service_exposes_scheduler_diagnostics_views(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Kernel:
+            def describe_status_sync(self):
+                return {
+                    "scheduler_policy": {
+                        "active_profile": "balanced",
+                        "available_profiles": ["dialogue_first", "balanced", "maintenance_friendly"],
+                    },
+                    "last_due_selection_summary": {
+                        "selected_count": 2,
+                        "batch_fill_rate": 0.5,
+                    },
+                    "last_due_selection_report": {
+                        "selected": ["chat-1", "chat-2"],
+                        "batch_plan": {"total_limit": 4, "maintenance_slots": 1},
+                        "quota_skip_counts": {"skipped_by_maintenance_quota": 1},
+                    },
+                }
+
+            async def peek_loop_state(self, chat_id):
+                return SimpleNamespace(
+                    chat_id=chat_id,
+                    phase="WAITING",
+                    next_tick_at=123.0,
+                    last_decision="WAIT",
+                    missed_due_passes=2,
+                    forced_promotion_count=1,
+                    pending_signals={
+                        "selected_reason": "selected_by_scheduler_score",
+                        "quota_skip_reason": "",
+                        "starvation_tier": "watch",
+                        "forced_promotion_eligible": False,
+                    },
+                )
+
+        class _Task:
+            chat_loop_kernel = _Kernel()
+
+            def describe_status(self):
+                return {
+                    "scheduler_poll_mode": "NORMAL",
+                    "scheduler_poll_interval": 10.0,
+                    "due_chat_count": 2,
+                    "maintenance_budget_total": 1,
+                    "maintenance_budget_remaining": 1,
+                    "batch_fill_rate": 0.5,
+                    "forced_promotion_count": 1,
+                    "scheduler_batch_plan": {"total_limit": 4, "maintenance_slots": 1},
+                    "quota_skip_counts": {"skipped_by_maintenance_quota": 1},
+                    "poll_mode_transition": {"previous": "FAST", "current": "NORMAL", "reason": "background_due_only"},
+                }
+
+        class _Runtime:
+            proactive_task = _Task()
+            chat_loop_kernel = proactive_task.chat_loop_kernel
+
+        class _Facade:
+            runtime = _Runtime()
+
+        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        status = asyncio.run(service.scheduler_status_view())
+        selection = asyncio.run(service.scheduler_due_selection_view())
+        chat = asyncio.run(service.scheduler_chat_view("chat-1"))
+
+        self.assertEqual(status["data"]["overview"]["scheduler_poll_mode"], "NORMAL")
+        self.assertEqual(status["data"]["scheduler_policy"]["active_profile"], "balanced")
+        self.assertEqual(selection["data"]["report"]["selected"], ["chat-1", "chat-2"])
+        self.assertEqual(selection["data"]["poll_mode_transition"]["current"], "NORMAL")
+        self.assertEqual(chat["data"]["phase"], "WAITING")
+        self.assertTrue(chat["data"]["state_present"])
+        self.assertEqual(chat["data"]["scheduler_pending_signals"]["selected_reason"], "selected_by_scheduler_score")
+
+    def test_scheduler_chat_view_is_read_only_when_state_missing(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        kernel_mod = importlib.import_module("astrmai.conversation.loop.chat_loop_kernel")
+
+        class _Runtime:
+            chat_loop_kernel = kernel_mod.ChatLoopKernel(runtime_coordinator=SimpleNamespace())
+            proactive_task = SimpleNamespace(chat_loop_kernel=chat_loop_kernel)
+
+        class _Facade:
+            runtime = _Runtime()
+
+        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+
+        async def _run():
+            before = _Runtime.chat_loop_kernel.describe_status_sync()["tracked_chats"]
+            view = await service.scheduler_chat_view("chat-missing")
+            after = _Runtime.chat_loop_kernel.describe_status_sync()["tracked_chats"]
+            return before, view, after
+
+        before, view, after = asyncio.run(_run())
+
+        self.assertEqual(before, 0)
+        self.assertEqual(after, 0)
+        self.assertTrue(view["runtime_bound"])
+        self.assertFalse(view["data"]["state_present"])
+        self.assertEqual(view["data"]["chat_id"], "chat-missing")
+        self.assertEqual(view["data"]["scheduler_pending_signals"], {})
+
+    def test_cognition_routes_expose_context_economy_endpoints(self):
+        path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "routes" / "cognition_routes.py"
+        content = path.read_text(encoding="utf-8")
+        self.assertIn('@router.get("/context-economy")', content)
+        self.assertIn('@router.get("/context-economy/templates")', content)
+        self.assertIn('@router.get("/scheduler/status")', content)
+        self.assertIn('@router.get("/scheduler/due-selection")', content)
+        self.assertIn('@router.get("/scheduler/chats/{chat_id}")', content)
+
+    def test_dashboard_cognition_tab_renders_context_economy_panel(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "astrmai" / "webui" / "frontend" / "pages" / "dashboard" / "index.html").read_text(encoding="utf-8")
+        js = (root / "astrmai" / "webui" / "frontend" / "js" / "pages" / "dashboard.js").read_text(encoding="utf-8")
+        self.assertIn("Context Economy", html)
+        self.assertIn("contextEconomyTemplates", html)
+        self.assertIn("contextEconomyFilterText", html)
+        self.assertIn("contextEconomyWorkloadFamily", html)
+        self.assertIn("contextEconomyQuickView", html)
+        self.assertIn("contextEconomySortBy", html)
+        self.assertIn("Scheduler Diagnostics", html)
+        self.assertIn("Scheduler Overview", html)
+        self.assertIn("Batch / Backpressure", html)
+        self.assertIn("Chat Loop Drill-down", html)
+        self.assertIn("schedulerChatId", html)
+        self.assertIn("暂无 loop state。该 chat 尚未进入 scheduler 跟踪。", html)
+        self.assertIn("High Rotate", html)
+        self.assertIn("Low Reuse", html)
+        self.assertIn("High Traffic", html)
+        self.assertIn("快捷视图会切换模板排序", html)
+        self.assertIn('title="按 lane rotate 次数从高到低查看最不稳定的模板。"', html)
+        self.assertIn("/cognition/scheduler/status", js)
+        self.assertIn("/cognition/scheduler/due-selection", js)
+        self.assertIn("/cognition/scheduler/chats/", js)
+        self.assertIn("loadSchedulerChatLoop", js)
+        self.assertIn("schedulerStatus", js)
+        self.assertIn("/cognition/context-economy?limit=20", js)
+        self.assertIn("loadContextEconomyTemplates", js)
+        self.assertIn("setContextEconomyQuickView", js)
+        self.assertIn("/cognition/context-economy/templates?", js)
+        self.assertIn("provider_session_reuse_rate", html)
+
     def test_review_ui_service_is_canonical_first_and_degrades_to_readonly_when_runtime_missing(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.review_ui_service")
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -846,6 +1100,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("/cognition/recent-decisions", paths)
         self.assertIn("/cognition/recent-turns", paths)
         self.assertIn("/cognition/chats/{chat_id}/turns", paths)
+        self.assertIn("/cognition/scheduler/status", paths)
+        self.assertIn("/cognition/scheduler/due-selection", paths)
+        self.assertIn("/cognition/scheduler/chats/{chat_id}", paths)
         self.assertIn("/tools/status", paths)
         self.assertIn("/memory-feedback", paths)
         self.assertIn("/proactive/status", paths)

@@ -310,5 +310,64 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(call_count, 1)
         self.assertEqual(len(captured), 1)
+
+    def test_inject_external_event_routes_through_kernel_when_bound(self):
+        calls = []
+
+        class _Kernel:
+            async def tick(self, *, chat_id, trigger, event=None):
+                calls.append(
+                    (
+                        chat_id,
+                        trigger,
+                        getattr(event, "message_str", ""),
+                        event.get_extra("astrmai_loop_source") if hasattr(event, "get_extra") else None,
+                    )
+                )
+                return SimpleNamespace(dispatch_result="BUFFERED")
+
+        self.gate.bind_chat_loop_kernel(_Kernel())
+
+        result = asyncio.run(
+            self.gate.inject_external_event(
+                "default:GroupMessage:group-1",
+                {
+                    "message_str": "synthetic proactive nudge",
+                    "extra": {
+                        "astrmai_is_proactive_event": True,
+                        "astrmai_loop_source": "proactive_dispatcher",
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(result, "BUFFERED")
+        self.assertEqual(
+            calls,
+            [("default:GroupMessage:group-1", "external", "synthetic proactive nudge", "proactive_dispatcher")],
+        )
+
+    def test_inject_external_event_falls_back_to_process_event_without_kernel(self):
+        calls = []
+
+        async def _fake_process(event):
+            calls.append((event.unified_msg_origin, event.message_str, event.get_extra("astrmai_loop_source")))
+            return "ENGAGED"
+
+        self.gate.process_event = _fake_process
+
+        result = asyncio.run(
+            self.gate.inject_external_event(
+                "default:GroupMessage:group-1",
+                {
+                    "content": "external plugin reply",
+                    "is_external_bot_reply": True,
+                    "extra": {"astrmai_loop_source": "external_result_bridge"},
+                },
+            )
+        )
+
+        self.assertEqual(result, "ENGAGED")
+        self.assertEqual(calls, [("default:GroupMessage:group-1", "external plugin reply", "external_result_bridge")])
 if __name__ == "__main__":
     unittest.main()

@@ -79,4 +79,12 @@ class DreamMaintenanceMigratedTests(unittest.TestCase):
         self.assertTrue(result["jargon_suggestions"])
 
 
+    def test_select_session_bucket_prefers_previous_session_when_still_available(self):
+        selected = self.agent_mod.DreamAgent._select_session_bucket(
+            ["group-1", "group-2"],
+            preferred_session_id="group-2",
+        )
+        self.assertEqual(selected, "group-2")
+
+
 __all__ = ["DreamMaintenanceMigratedTests"]

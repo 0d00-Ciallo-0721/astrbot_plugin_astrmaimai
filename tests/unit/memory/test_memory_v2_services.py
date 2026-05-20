@@ -27,6 +27,13 @@ class _FakeEvent:
         return "sender-1"
 
 
+class _FakeThinkEvent(_FakeEvent):
+    def __init__(self, text="今天适合散步", think_level=None):
+        super().__init__(text)
+        if think_level is not None:
+            self.set_extra("astrmai_think_level", think_level)
+
+
 class MemoryV2ServiceTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -427,6 +434,147 @@ class MemoryV2ServiceTests(unittest.TestCase):
             retrieval = self.retrieval_mod.MemoryRetrievalService(store, engine=_Engine(memory_id))
             rows = await retrieval.retrieve(self.contracts.MemoryQuery(query="Alice", session_id="chat-1"))
             self.assertEqual(rows, [])
+
+        asyncio.run(run())
+
+    def test_instant_memory_gate_writes_directly_to_canonical_store(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            summarizer = summarizer_mod.ChatHistorySummarizer(
+                context=type("C", (), {})(),
+                gateway=type("G", (), {"config": _Config(), "context": type("GC", (), {})()})(),
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            await summarizer._try_instant_memorize("chat-1", "我叫小明", "好的")
+            rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
+            self.assertTrue(any("小明" in item.summary or "小明" in item.content for item in rows))
+
+        asyncio.run(run())
+
+    def test_instant_memory_llm_backfill_uses_runtime_think_level_signal(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            class _Gateway:
+                def __init__(self):
+                    self.calls = 0
+                    self.event = _FakeThinkEvent(think_level=2)
+                    self.context = type("GC", (), {"event": self.event})()
+                    self.config = _Config()
+
+                async def call_data_process_task(self, *args, **kwargs):
+                    self.calls += 1
+                    return {"worth": True, "fact": "用户想在周末去植物园散步"}
+
+            gateway = _Gateway()
+            summarizer = summarizer_mod.ChatHistorySummarizer(
+                context=type("C", (), {})(),
+                gateway=gateway,
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            await summarizer._try_instant_memorize("chat-1", "今天适合散步，我们周末去植物园吧", "好呀")
+            rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
+            self.assertEqual(gateway.calls, 1)
+            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
+            self.assertEqual(len(llm_rows), 1)
+            self.assertEqual(llm_rows[0].summary, "用户想在周末去植物园散步")
+            self.assertIsNotNone(await store.get_by_dedup_key("instant_gate_llm:chat-1:用户想在周末去植物园散步"))
+
+        asyncio.run(run())
+
+    def test_instant_memory_llm_backfill_respects_threshold_and_cooldown(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            class _Gateway:
+                def __init__(self, think_level):
+                    self.calls = 0
+                    self.event = _FakeThinkEvent(think_level=think_level)
+                    self.context = type("GC", (), {"event": self.event})()
+                    self.config = _Config()
+
+                async def call_data_process_task(self, *args, **kwargs):
+                    self.calls += 1
+                    return {"worth": True, "fact": "用户想找一家周末营业的咖啡馆"}
+
+            low_gateway = _Gateway(think_level=1)
+            low_summarizer = summarizer_mod.ChatHistorySummarizer(
+                context=type("C", (), {})(),
+                gateway=low_gateway,
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            await low_summarizer._try_instant_memorize("chat-1", "今天风有点大，想找个地方坐坐", "明白")
+            rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
+            self.assertEqual(low_gateway.calls, 0)
+            self.assertEqual([item for item in rows if item.source == "instant_gate_llm"], [])
+
+            high_gateway = _Gateway(think_level=3)
+            high_summarizer = summarizer_mod.ChatHistorySummarizer(
+                context=type("C", (), {})(),
+                gateway=high_gateway,
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            await high_summarizer._try_instant_memorize("chat-2", "今天风有点大，想找个地方坐坐", "明白")
+            await high_summarizer._try_instant_memorize("chat-2", "要不顺便看看附近的咖啡馆", "好")
+            rows = await store.list_candidates(session_id="chat-2", kinds=["fact"], limit=10)
+            self.assertEqual(high_gateway.calls, 1)
+            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
+            self.assertEqual(len(llm_rows), 1)
+
+        asyncio.run(run())
+
+    def test_search_prefers_fts_and_basic_terms_still_work(self):
+        async def run():
+            store, retrieval, writer, _injection, _tools, _maintenance = self._services()
+            await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content="Alice likes green bookmarks very much.",
+                    dedup_key="fts:green",
+                )
+            )
+            rows = await retrieval.retrieve(self.contracts.MemoryQuery(query="green bookmarks", session_id="chat-1"))
+            self.assertEqual(len(rows), 1)
+            self.assertIn("green bookmarks", rows[0].content)
+            raw = await store.search("green bookmarks", session_id="chat-1", top_k=1)
+            self.assertEqual(len(raw), 1)
 
         asyncio.run(run())
 

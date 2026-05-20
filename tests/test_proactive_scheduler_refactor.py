@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import importlib
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
+from tests.helpers.attention_stubs import install_attention_stubs
 
 
 def _install_proactive_stubs():
@@ -126,8 +128,509 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertIn("dream_ready", status)
         self.assertFalse(status["running"])
         self.assertIn("dream_scheduler", status)
+        self.assertIn("group_signin", status)
         self.assertIn("heartflow", status)
         self.assertFalse(status["heartflow"]["enabled"])
+        self.assertFalse(status["chat_loop_kernel_bound"])
+        self.assertEqual(status["heartbeat_mode"], "kernel_mediated")
+        self.assertTrue(status["private_wait_visible_in_heartbeat"])
+        self.assertTrue(status["heartflow_preview_readonly"])
+        self.assertEqual(status["dream_scope"], "global_throttle")
+        self.assertEqual(status["scheduler_poll_mode"], "FAST")
+        self.assertEqual(status["scheduler_poll_interval"], 5.0)
+        self.assertEqual(status["global_maintenance_interval"], 60.0)
+        self.assertEqual(status["due_chat_count"], 0)
+        self.assertEqual(status["skipped_not_due_count"], 0)
+        self.assertEqual(status["due_phase_mix"], {})
+        self.assertEqual(status["maintenance_budget_total"], 0)
+        self.assertEqual(status["maintenance_budget_used"], 0)
+        self.assertEqual(status["maintenance_budget_remaining"], 0)
+        self.assertEqual(status["scheduler_batch_limit"], 32)
+        self.assertEqual(status["scheduler_batch_plan"], {})
+        self.assertEqual(status["batch_fill_rate"], 0.0)
+        self.assertEqual(status["forced_promotion_count"], 0)
+        self.assertEqual(status["quota_skip_counts"], {})
+        self.assertEqual(status["scheduler_policy"], {})
+        self.assertEqual(status["kernel_due_selection_summary"], {})
+        self.assertFalse(status["busy_backpressure_active"])
+        self.assertFalse(status["maintenance_backpressure_active"])
+        self.assertEqual(status["last_selection_summary"], {})
+        self.assertEqual(status["poll_mode_transition"]["current"], "FAST")
+
+    def test_start_initializes_global_maintenance_clock(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+            call_proactive_task=lambda **kwargs: asyncio.sleep(0, result="ok"),
+        )
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+
+        async def _run():
+            await task.start()
+            await task.stop()
+
+        asyncio.run(_run())
+
+        self.assertGreater(task._last_global_maintenance_run, 0.0)
+
+    def test_loop_no_longer_uses_first_tick_continue_for_global_maintenance(self):
+        path = Path(self.mod.__file__)
+        content = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("if self._last_global_maintenance_run <= 0:", content)
+        self.assertNotIn("self._last_global_maintenance_run = now\n                    continue", content)
+
+    def test_chat_heartbeat_pass_routes_active_chats_through_kernel(self):
+        kernel_mod = importlib.import_module("astrmai.conversation.loop.chat_loop_kernel")
+
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+
+        gateway.call_proactive_task = _call_proactive_task
+
+        class _Coordinator:
+            async def list_active_chats(self):
+                return ["chat-1", "chat-2"]
+
+            async def get_activity_snapshot(self, chat_id):
+                if chat_id == "chat-1":
+                    return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+                return {"chat_id": chat_id, "executor_pending": 1, "wait_targets": ["u1"]}
+
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+            runtime_coordinator=_Coordinator(),
+        )
+        kernel = kernel_mod.ChatLoopKernel(runtime_coordinator=task.runtime_coordinator)
+        kernel.set_scheduler_profile_for_testing("maintenance_friendly")
+        task.bind_chat_loop_kernel(kernel)
+
+        async def _describe_due_selection(chat_ids, **kwargs):
+            return {
+                "selected": ["chat-1"],
+                "skipped_not_due": ["chat-2"],
+                "skipped_by_batch": [],
+                "score_breakdown": {"chat-1": {"scheduler_score": 11.0, "due_rank": 1}},
+                "due_phase_mix": {"MAINTENANCE": 1},
+                "poll_mode": "NORMAL",
+                "poll_mode_reason": "background_due_only",
+                "promotion_candidates": ["chat-1"],
+                "forced_promotions_selected": ["chat-1"],
+                "dialogue_selected": [],
+                "maintenance_selected": ["chat-1"],
+                "batch_plan": {
+                    "total_limit": 32,
+                    "promotion_slots": 1,
+                    "dialogue_slots": 12,
+                    "maintenance_slots": 12,
+                    "overflow_slots": 7,
+                },
+                "batch_fill_rate": 0.03125,
+                "batch_pressure": {"busy_ratio": 0.0, "maintenance_backlog_ratio": 1.0, "retry_pressure_count": 0},
+                "quota_skipped": {
+                    "skipped_by_dialogue_quota": [],
+                    "skipped_by_maintenance_quota": [],
+                    "skipped_by_promotion_overflow": [],
+                },
+                "quota_skip_counts": {
+                    "skipped_by_dialogue_quota": 0,
+                    "skipped_by_maintenance_quota": 0,
+                    "skipped_by_promotion_overflow": 0,
+                },
+                "maintenance_budget_total": 1,
+                "maintenance_budget_used": 0,
+                "maintenance_budget_remaining": 1,
+                "maintenance_blocked_by_budget": [],
+                "busy_backpressure_active": False,
+                "maintenance_backpressure_active": True,
+            }
+
+        kernel.describe_due_selection = _describe_due_selection
+
+        results = asyncio.run(task._run_chat_heartbeat_pass())
+
+        self.assertEqual(results, [{"chat_id": "chat-1", "action": "NOOP", "reason": "no_signal_ready"}])
+        status = task.describe_status()
+        self.assertEqual(status["due_chat_count"], 1)
+        self.assertEqual(status["skipped_not_due_count"], 1)
+        self.assertEqual(status["scheduler_poll_mode"], "NORMAL")
+        self.assertEqual(status["scheduler_poll_interval"], 10.0)
+        self.assertEqual(status["due_phase_mix"], {"MAINTENANCE": 1})
+        self.assertEqual(status["maintenance_budget_total"], 1)
+        self.assertEqual(status["maintenance_budget_remaining"], 1)
+        self.assertEqual(status["scheduler_batch_limit"], 32)
+        self.assertEqual(status["scheduler_batch_plan"]["maintenance_slots"], 12)
+        self.assertEqual(status["forced_promotion_count"], 1)
+        self.assertEqual(status["last_selection_summary"]["maintenance_selected_count"], 1)
+        self.assertTrue(status["maintenance_backpressure_active"])
+        self.assertEqual(status["scheduler_policy"]["active_profile"], "maintenance_friendly")
+        self.assertEqual(status["scheduler_policy"]["current"]["maintenance_batch_slots"], 6)
+        self.assertIn("forced_promotion_count", status["kernel_due_selection_summary"])
+        self.assertEqual(status["poll_mode_transition"]["previous"], "FAST")
+        self.assertEqual(status["poll_mode_transition"]["current"], "NORMAL")
+
+    def test_handle_chat_heartbeat_marks_observe_only_dispatch_mode(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+
+        gateway.call_proactive_task = _call_proactive_task
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+
+        decision = SimpleNamespace(action="NOOP", reason="no_signal_ready", metadata={})
+        snapshot = SimpleNamespace(executor_pending=0, wait_targets=[])
+
+        result = asyncio.run(task.handle_chat_heartbeat("chat-1", snapshot, decision))
+
+        self.assertEqual(decision.metadata["dispatch_mode"], "observe_only")
+        self.assertEqual(result["dispatch_mode"], "observe_only")
+
+    def test_bind_chat_loop_kernel_registers_signal_sources_and_bridges(self):
+        kernel_mod = importlib.import_module("astrmai.conversation.loop.chat_loop_kernel")
+
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+
+        gateway.call_proactive_task = _call_proactive_task
+        state_engine = SimpleNamespace(
+            get_active_states=lambda: [],
+            get_active_profiles=lambda: [],
+            apply_natural_decay=lambda state: None,
+            context_compaction=SimpleNamespace(),
+        )
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+            runtime_coordinator=SimpleNamespace(),
+        )
+        kernel = kernel_mod.ChatLoopKernel(runtime_coordinator=task.runtime_coordinator)
+
+        task.bind_chat_loop_kernel(kernel)
+        status = kernel.describe_status_sync()
+
+        self.assertTrue(status["dispatch_bridges"]["PROACTIVE_WAKEUP"])
+        self.assertTrue(status["dispatch_bridges"]["HEARTFLOW_EVALUATE"])
+        self.assertTrue(status["dispatch_bridges"]["DREAM_MAINTENANCE"])
+        self.assertTrue(status["dispatch_bridges"]["MEMORY_MAINTENANCE"])
+        self.assertTrue(status["dispatch_bridges"]["COMPACTION_EVALUATE"])
+
+    def test_bridge_handlers_are_kernel_mediated(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+
+        gateway.call_proactive_task = _call_proactive_task
+        wakeup_calls = []
+        heartflow_calls = []
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+                context_compaction=SimpleNamespace(maybe_compact=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True})),
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+        task.wakeup_service = SimpleNamespace(run_for_chat=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True}))
+        task.heartflow_manager = SimpleNamespace(tick_chat=lambda chat_id, snapshot=None: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True}))
+        task.memory_engine = SimpleNamespace(
+            summarizer=SimpleNamespace(
+                run_once_for_session=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True, "reason": "summarized"})
+            )
+        )
+        task.dream_scheduler = SimpleNamespace(run_once_for_session=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True}))
+        snapshot = SimpleNamespace(latest_activity={}, executor_pending=0, wait_targets=[])
+
+        async def _run():
+            wake = await task.handle_wakeup_signal("chat-1", snapshot, SimpleNamespace(action="PROACTIVE_WAKEUP", reason="wakeup_signal", metadata={}))
+            heart = await task.handle_heartflow_signal("chat-1", snapshot, SimpleNamespace(action="HEARTFLOW_EVALUATE", reason="heartflow_signal", metadata={}))
+            memory = await task.handle_memory_signal("chat-1", snapshot, SimpleNamespace(action="MEMORY_MAINTENANCE", reason="memory_signal", metadata={}))
+            dream = await task.handle_dream_signal("chat-1", snapshot, SimpleNamespace(action="DREAM_MAINTENANCE", reason="dream_signal", metadata={}))
+            comp = await task.handle_compaction_signal("chat-1", snapshot, SimpleNamespace(action="COMPACTION_EVALUATE", reason="compaction_signal", metadata={}))
+            return wake, heart, memory, dream, comp
+
+        wake, heart, memory, dream, comp = asyncio.run(_run())
+
+        self.assertEqual(wake["dispatch_mode"], "kernel_mediated")
+        self.assertEqual(heart["dispatch_mode"], "kernel_mediated")
+        self.assertEqual(memory["dispatch_mode"], "kernel_mediated")
+        self.assertEqual(dream["dispatch_mode"], "kernel_mediated")
+        self.assertEqual(comp["dispatch_mode"], "kernel_mediated")
+        self.assertEqual(memory["bridge"], "MEMORY_MAINTENANCE")
+        self.assertTrue(memory["result"]["performed"])
+        self.assertEqual(dream["result"]["throttle_scope"], "global")
+
+    def test_heartflow_cooldown_requires_visible_dispatch(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+
+        gateway.call_proactive_task = _call_proactive_task
+        cooldown_calls = []
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+        task.chat_loop_kernel = SimpleNamespace(
+            set_cooldown=lambda chat_id, action, until_ts, reason="": asyncio.sleep(
+                0,
+                result=cooldown_calls.append((chat_id, action, reason)),
+            )
+        )
+        snapshot = SimpleNamespace(latest_activity={}, executor_pending=0, wait_targets=[])
+
+        async def _run():
+            task.heartflow_manager = SimpleNamespace(
+                VISIBLE_CANDIDATE_COOLDOWN_SECONDS=900,
+                tick_chat=lambda chat_id, snapshot=None: asyncio.sleep(
+                    0,
+                    result={
+                        "chat_id": chat_id,
+                        "performed": True,
+                        "synthetic_event_queued": False,
+                        "visible_dispatch_performed": False,
+                    },
+                ),
+            )
+            hidden = await task.handle_heartflow_signal(
+                "chat-1",
+                snapshot,
+                SimpleNamespace(action="HEARTFLOW_EVALUATE", reason="heartflow_signal", metadata={}),
+            )
+            task.heartflow_manager = SimpleNamespace(
+                VISIBLE_CANDIDATE_COOLDOWN_SECONDS=900,
+                tick_chat=lambda chat_id, snapshot=None: asyncio.sleep(
+                    0,
+                    result={
+                        "chat_id": chat_id,
+                        "performed": True,
+                        "synthetic_event_queued": True,
+                        "visible_dispatch_performed": True,
+                    },
+                ),
+            )
+            visible = await task.handle_heartflow_signal(
+                "chat-1",
+                snapshot,
+                SimpleNamespace(action="HEARTFLOW_EVALUATE", reason="heartflow_signal", metadata={}),
+            )
+            return hidden, visible
+
+        hidden, visible = asyncio.run(_run())
+
+        self.assertEqual(hidden["cooldown_until"], 0.0)
+        self.assertFalse(hidden["visible_dispatch_performed"])
+        self.assertGreater(visible["cooldown_until"], 0.0)
+        self.assertTrue(visible["visible_dispatch_performed"])
+        self.assertEqual(cooldown_calls, [("chat-1", "heartflow", "heartflow_dispatch")])
+
+    def test_heartflow_preview_is_readonly(self):
+        manager_mod = importlib.import_module("astrmai.proactive.heartflow.manager")
+        models_mod = importlib.import_module("astrmai.proactive.heartflow.models")
+
+        manager = manager_mod.HeartflowManager(
+            runtime_coordinator=None,
+            state_engine=None,
+            memory_engine=None,
+            semaphore=None,
+            dispatcher=None,
+            config=SimpleNamespace(),
+        )
+        manager._sessions["chat-1"] = models_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=10.0,
+            last_activity_ts=100.0,
+            last_tick_ts=120.0,
+            expires_at=400.0,
+            tick_count=3,
+            topic_heat=0.4,
+            talk_frequency_adjust=1.2,
+        )
+        manager._pulses_by_chat["chat-1"] = []
+        manager._impulse_decisions_by_chat["chat-1"] = []
+        manager._action_decisions_by_chat["chat-1"] = []
+        snapshot = {
+            "latest_activity_ts": 100.0,
+            "recent_activity_count": 2,
+            "recent_activity_count_60s": 1,
+            "latest_activity_preview": "hello",
+        }
+        before_session = dataclasses.asdict(manager._sessions["chat-1"])
+        before_pulses = list(manager._pulses_by_chat["chat-1"])
+        before_impulses = list(manager._impulse_decisions_by_chat["chat-1"])
+        before_actions = list(manager._action_decisions_by_chat["chat-1"])
+
+        asyncio.run(manager.preview_chat("chat-1", snapshot=snapshot, now=180.0))
+
+        after_session = dataclasses.asdict(manager._sessions["chat-1"])
+        self.assertEqual(after_session, before_session)
+        self.assertEqual(manager._pulses_by_chat["chat-1"], before_pulses)
+        self.assertEqual(manager._impulse_decisions_by_chat["chat-1"], before_impulses)
+        self.assertEqual(manager._action_decisions_by_chat["chat-1"], before_actions)
+
+    def test_dream_scheduler_reports_global_throttle(self):
+        dream_mod = importlib.import_module("astrmai.proactive.dream_scheduler")
+        scheduler = dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=None,
+            config=SimpleNamespace(life=SimpleNamespace(dream_interval_min=1, dream_time_ranges=[])),
+            semaphore=asyncio.Semaphore(1),
+            dream_visible=False,
+        )
+        scheduler.dream_agent = object()
+        scheduler.dream_generator = object()
+        scheduler._last_dream_time = time.time()
+
+        eligibility = scheduler.describe_session_eligibility("chat-2", time.time())
+        result = asyncio.run(scheduler.run_once_for_session("chat-2"))
+
+        self.assertFalse(eligibility["eligible"])
+        self.assertEqual(eligibility["reason"], "dream_global_cooldown")
+        self.assertEqual(eligibility["throttle_scope"], "global")
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], "dream_global_cooldown")
+        self.assertEqual(result["throttle_scope"], "global")
 
     def test_group_profile_target_prefers_top_non_self_speaker(self):
         task = self.mod.ProactiveTask.__new__(self.mod.ProactiveTask)
@@ -152,6 +655,13 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "proactive" / "proactive_task.py"
         content = path.read_text(encoding="utf-8")
         self.assertNotIn("LegacyProactiveTask", content)
+
+    def test_scheduler_loop_no_longer_directly_runs_chat_services(self):
+        path = Path(__file__).resolve().parents[1] / "astrmai" / "proactive" / "proactive_task.py"
+        content = path.read_text(encoding="utf-8")
+        self.assertNotIn("await self.wakeup_service.run_once()", content)
+        self.assertNotIn("await self.heartflow_manager.tick()", content)
+        self.assertNotIn("self._fire_background_task(self.dream_scheduler.run_once())", content)
 
     def test_wakeup_routes_intent_through_dispatcher_before_energy_cost(self):
         wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
@@ -263,6 +773,77 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
 
         self.assertEqual([item.blocked_reason for item in decisions], ["quiet_hours", "quiet_hours"])
         self.assertTrue(all(item.safety_checks["quiet_hours"] for item in decisions))
+
+    def test_dispatcher_injects_proactive_events_through_kernel_bound_gate(self):
+        install_attention_stubs()
+        sys.modules.pop("astrmai.conversation.attention.gate", None)
+        gate_mod = importlib.import_module("astrmai.conversation.attention.gate")
+        gate_mod = importlib.reload(gate_mod)
+        calls = []
+
+        class _Kernel:
+            async def tick(self, *, chat_id, trigger, event=None):
+                calls.append(
+                    (
+                        chat_id,
+                        trigger,
+                        event.get_extra("astrmai_loop_source"),
+                        event.get_extra("astrmai_is_proactive_event"),
+                    )
+                )
+                return SimpleNamespace(dispatch_result="BUFFERED")
+
+        attention_gate = gate_mod.AttentionGate(
+            state_engine=SimpleNamespace(
+                config=SimpleNamespace(
+                    attention=SimpleNamespace(),
+                    system1=SimpleNamespace(wakeup_words=[], nicknames=["AstrMai"]),
+                    global_settings=SimpleNamespace(debug_mode=False),
+                )
+            ),
+            judge=SimpleNamespace(),
+            sensors=SimpleNamespace(),
+            system2_callback=None,
+        )
+        attention_gate.bind_chat_loop_kernel(_Kernel())
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+        original_eval = dispatcher_mod.evaluate_proactive_rhythm
+        dispatcher_mod.evaluate_proactive_rhythm = lambda config, now=None: SimpleNamespace(
+            quiet_hours=False,
+            time_bucket="day",
+            quiet_ranges=[],
+            base_frequency=0.7,
+            base_frequency_factor=1.0,
+        )
+        dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=0.9))),
+            runtime_coordinator=SimpleNamespace(get_activity_snapshot=lambda chat_id: asyncio.sleep(0, result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0})),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=[], wakeup_min_energy=0.6),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+        async def _run():
+            return await dispatcher.dispatch(
+                dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="group:10001",
+                    source="wakeup",
+                    reason="kernel route",
+                    guidance="say one short line",
+                    metadata={"group_id": "group:10001"},
+                )
+            )
+
+        try:
+            decision = asyncio.run(_run())
+        finally:
+            dispatcher_mod.evaluate_proactive_rhythm = original_eval
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(calls, [("group:10001", "external", "proactive_dispatcher", True)])
 
     def test_wakeup_quiet_hours_block_does_not_consume_energy_or_cooldown(self):
         wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")

@@ -90,6 +90,9 @@ def emit_legacy_prompt_envelope_extras(
     event.set_extra("astrmai_focus_thread_text", legacy_focus_thread_text)
     event.set_extra("astrmai_ambient_background_text", prompt_envelope.ambient_background_text)
     event.set_extra("astrmai_recent_transcript", prompt_envelope.recent_transcript)
+    event.set_extra("astrmai_recent_transcript_reason", getattr(prompt_envelope, "recent_transcript_reason", ""))
+    event.set_extra("astrmai_warm_zone_summary", getattr(prompt_envelope, "warm_zone_summary", ""))
+    event.set_extra("astrmai_warm_zone_quotes", getattr(prompt_envelope, "warm_zone_quotes", ""))
     event.set_extra("astrmai_near_context_priority", bool(prompt_envelope.near_context_priority))
     event.set_extra("astrmai_focus_thread_reason", prompt_envelope.focus_thread_reason)
     event.set_extra("astrmai_use_lane_history", bool(use_lane_history))
@@ -112,6 +115,9 @@ def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelo
     return PromptEnvelope(
         raw_user_text=raw_user_text,
         recent_transcript=str(event.get_extra("astrmai_recent_transcript", "") or "").strip(),
+        recent_transcript_reason=str(event.get_extra("astrmai_recent_transcript_reason", "") or "").strip(),
+        warm_zone_summary=str(event.get_extra("astrmai_warm_zone_summary", "") or "").strip(),
+        warm_zone_quotes=str(event.get_extra("astrmai_warm_zone_quotes", "") or "").strip(),
         last_assistant_reply="",
         focus_message_text=focus_message_text,
         direct_context_text=direct_context_text,

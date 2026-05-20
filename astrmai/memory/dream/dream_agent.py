@@ -56,7 +56,7 @@ class DreamAgent:
 
     async def run_dream_cycle(self, session_id: str = None) -> Optional[str]:
         if not session_id:
-            session_id = await self._pick_random_session()
+            session_id = await self._pick_random_session(preferred_session_id=getattr(self, "_last_session_id", None))
         if not session_id:
             logger.info("[DreamAgent] no eligible memory bucket, skipping this cycle")
             return None
@@ -101,7 +101,7 @@ class DreamAgent:
                         subsystem="bg",
                         task_family="dream",
                         scope_id=session_id or "global",
-                        scope_kind="global",
+                        scope_kind="chat" if session_id and session_id != "global" else "global",
                     ),
                     base_origin="",
                 )
@@ -391,7 +391,17 @@ class DreamAgent:
         )
         return session.exec(stmt).all()
 
-    async def _pick_random_session(self) -> Optional[str]:
+    @staticmethod
+    def _select_session_bucket(sessions: List[str], preferred_session_id: Optional[str] = None) -> Optional[str]:
+        normalized = [str(item or "").strip() for item in sessions if str(item or "").strip()]
+        if not normalized:
+            return None
+        preferred = str(preferred_session_id or "").strip()
+        if preferred and preferred in normalized:
+            return preferred
+        return random.choice(normalized)
+
+    async def _pick_random_session(self, preferred_session_id: Optional[str] = None) -> Optional[str]:
         from ...infrastructure.persistence import MemoryEvent
         from sqlmodel import select
 
@@ -409,8 +419,9 @@ class DreamAgent:
                     return [key for key, count in buckets.items() if count >= self.MIN_EVENTS_TO_DREAM]
 
             sessions = await asyncio.to_thread(_query)
-            if sessions:
-                return random.choice(sessions)
+            selected = self._select_session_bucket(sessions, preferred_session_id=preferred_session_id)
+            if selected:
+                return selected
         except Exception as exc:
             logger.warning(f"[DreamAgent] failed to choose session: {exc}")
         return None

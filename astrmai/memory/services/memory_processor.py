@@ -2,6 +2,7 @@ import json
 import re
 from typing import Any, Dict, List
 from astrbot.api import logger
+from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
 
 class MemoryProcessor:
@@ -12,6 +13,7 @@ class MemoryProcessor:
 # 位置: astrmai/memory/processor.py -> MemoryProcessor 类下
     def __init__(self, gateway):
         self.gateway = gateway
+        self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
         # [修改] 更新内部提示词模板，确保第一阶段输出 reflection 维度
         self.prompt_template = """你是一个专业的对话分析智能体和记忆提炼大脑。
 请阅读以下对话历史，提取其中具有长期记忆价值的信息（如用户的身份、偏好习惯、重要事件、约定、情感倾向等）。
@@ -57,20 +59,40 @@ JSON 格式要求：
 """
 
     # 位置: astrmai/memory/processor.py -> MemoryProcessor 类下
+    @staticmethod
+    def _memory_lane_key(session_id: str) -> LaneKey:
+        normalized = str(session_id or "").strip()
+        if normalized and normalized != "global":
+            return LaneKey(subsystem="bg", task_family="memory", scope_id=normalized, scope_kind="chat")
+        logger.warning("[MemoryProcessor] global scope fallback engaged; expected a concrete session_id for memory extraction")
+        return LaneKey(subsystem="bg", task_family="memory", scope_id="global", scope_kind="global")
+
     async def process_conversation(self, chat_history_text: str, session_id: str = "global") -> Dict[str, Any]:
         """[修改] 将对话文本处理为结构化记忆，分为事件与感想提取、节点提取两个阶段"""
         if not chat_history_text or not chat_history_text.strip():
             return self._get_default_structured_data()
-            
-        prompt = self.prompt_template.replace("{history}", chat_history_text)
+
+        summary_envelope = None
+        summary_prompt = self.prompt_template.replace("{history}", chat_history_text)
+        summary_system_prompt = ""
+        if self.prompt_registry is not None:
+            summary_envelope = self.prompt_registry.render_template(
+                PromptTemplateId.MEMORY_STRUCTURED_EXTRACTION,
+                {"history": chat_history_text},
+            )
+            summary_prompt = summary_envelope.prompt
+            summary_system_prompt = summary_envelope.system_prompt
         
         try:
+            lane_key = self._memory_lane_key(session_id)
             # 阶段一：提取事件与感想
             result = await self.gateway.call_data_process_task(
-                prompt,
+                prompt=summary_prompt,
+                system_prompt=summary_system_prompt,
                 is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=session_id or "global", scope_kind="global"),
+                lane_key=lane_key,
                 base_origin="",
+                template_envelope=summary_envelope,
             )
             
             data1 = {}
@@ -84,12 +106,23 @@ JSON 格式要求：
             # 阶段二：提取记忆节点
             if validated_data.get("key_facts"):
                 facts_text = "\n".join(validated_data["key_facts"])
+                node_envelope = None
                 node_prompt = self.node_prompt_template.replace("{facts}", facts_text)
+                node_system_prompt = ""
+                if self.prompt_registry is not None:
+                    node_envelope = self.prompt_registry.render_template(
+                        PromptTemplateId.MEMORY_NODE_EXTRACTION,
+                        {"facts": facts_text},
+                    )
+                    node_prompt = node_envelope.prompt
+                    node_system_prompt = node_envelope.system_prompt
                 node_result = await self.gateway.call_data_process_task(
-                    node_prompt,
+                    prompt=node_prompt,
+                    system_prompt=node_system_prompt,
                     is_json=True,
-                    lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=session_id or "global", scope_kind="global"),
+                    lane_key=lane_key,
                     base_origin="",
+                    template_envelope=node_envelope,
                 )
                 
                 node_data = {}

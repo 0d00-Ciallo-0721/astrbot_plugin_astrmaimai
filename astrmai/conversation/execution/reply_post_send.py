@@ -46,6 +46,29 @@ class ReplyPostSendMixin:
         del event, chat_id, user_text, assistant_text
         return
 
+    async def _ingest_memory_turn(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        memory_engine = getattr(self, "memory_engine", None)
+        summarizer = getattr(memory_engine, "summarizer", None) if memory_engine is not None else None
+        writer = getattr(summarizer, "ingest_committed_turn", None)
+        if writer is None:
+            return
+        try:
+            await writer(
+                chat_id,
+                user_text,
+                assistant_text,
+                source="reply_service.post_send",
+                is_proactive=bool(event.get_extra("astrmai_is_proactive_event", False)),
+            )
+        except Exception as exc:
+            logger.warning(f"[ReplyService] memory turn ingest failed: {exc}")
+
     def _resolve_post_send_tag(self, bypassed_tag: str | None) -> tuple[str, bool]:
         if not bypassed_tag:
             return "neutral", False
