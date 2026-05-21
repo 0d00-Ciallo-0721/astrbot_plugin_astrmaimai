@@ -522,6 +522,7 @@ class ConcurrentExecutor:
         last_failure_kind = "unknown"
         attempted_models: list[str] = []
         agent_models = self.gateway.get_agent_models()
+        selection_meta = dict(getattr(self.gateway, "_last_agent_model_selection", {}) or {})
         for index, provider_id in enumerate(agent_models):
             if not await self._check_pre_model_freshness(event, chat_id, "text execution"):
                 return None
@@ -563,6 +564,8 @@ class ConcurrentExecutor:
                     fatal=self._is_executor_failure_fatal(last_error),
                     will_retry_or_switch=index < len(agent_models) - 1,
                     error_preview=preview_text(last_error, 120),
+                    skipped_cooldown_models=list(selection_meta.get("skipped_cooldown_models", []) or []),
+                    cooldown_overridden=bool(selection_meta.get("cooldown_overridden", False)),
                 )
                 logger.warning(f"[{chat_id}] chat model {provider_id} failed, trying next: {exc}")
                 continue
@@ -575,6 +578,8 @@ class ConcurrentExecutor:
             attempted_models=attempted_models,
             last_failure_kind=last_failure_kind,
             fallback_triggered=True,
+            skipped_cooldown_models=list(selection_meta.get("skipped_cooldown_models", []) or []),
+            cooldown_overridden=bool(selection_meta.get("cooldown_overridden", False)),
         )
         logger.error(f"[{chat_id}] all chat models exhausted: {last_error}")
         if raise_on_exhaustion:
@@ -600,6 +605,7 @@ class ConcurrentExecutor:
         last_failure_kind = "unknown"
         attempted_models: list[str] = []
         agent_models = self.gateway.get_agent_models()
+        selection_meta = dict(getattr(self.gateway, "_last_agent_model_selection", {}) or {})
         for index, provider_id in enumerate(agent_models):
             if not await self._check_pre_model_freshness(event, chat_id, "tool execution"):
                 return None
@@ -660,6 +666,8 @@ class ConcurrentExecutor:
                     fatal=self._is_executor_failure_fatal(last_error),
                     will_retry_or_switch=index < len(agent_models) - 1,
                     error_preview=preview_text(last_error, 120),
+                    skipped_cooldown_models=list(selection_meta.get("skipped_cooldown_models", []) or []),
+                    cooldown_overridden=bool(selection_meta.get("cooldown_overridden", False)),
                 )
                 logger.warning(f"[{chat_id}] tool model {provider_id} failed, trying next: {exc}")
                 continue
@@ -672,6 +680,8 @@ class ConcurrentExecutor:
             attempted_models=attempted_models,
             last_failure_kind=last_failure_kind,
             fallback_triggered=True,
+            skipped_cooldown_models=list(selection_meta.get("skipped_cooldown_models", []) or []),
+            cooldown_overridden=bool(selection_meta.get("cooldown_overridden", False)),
         )
         logger.error(f"[{chat_id}] all tool models exhausted: {last_error}")
         if raise_on_exhaustion:

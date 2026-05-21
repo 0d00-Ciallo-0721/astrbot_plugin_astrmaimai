@@ -320,6 +320,11 @@ class GatewayLaneMixin:
             True,
             workload_policy=workload_policy,
         )
+        attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
+            lane_key.task_family,
+            primary_models,
+            attempt_queue,
+        )
         if not attempt_queue:
             raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
 
@@ -335,6 +340,7 @@ class GatewayLaneMixin:
         )
         lane_runtime_meta = self.lane_manager.get_runtime_meta(lane_umo)
         last_error = ""
+        last_raw_completion = ""
         attempted_models: List[str] = []
         for model_id in attempt_queue:
             attempted_models.append(model_id)
@@ -358,6 +364,7 @@ class GatewayLaneMixin:
                     timeout=self._api_timeout(),
                 )
                 reply_text = getattr(response, "completion_text", "") or ""
+                last_raw_completion = reply_text
                 if not reply_text.strip():
                     raise ValueError("empty_response")
                 stripped_reply = reply_text.strip()
@@ -425,6 +432,8 @@ class GatewayLaneMixin:
                         fallback_used=bool(model_id != workload_policy.primary_model),
                         protocol_passthrough=True,
                         protocol_type="terminal_yield" if "[TERMINAL_YIELD]:" in stripped_reply else "wait_signal",
+                        skipped_cooldown_models=list(skipped_cooldown_models),
+                        cooldown_overridden=bool(cooldown_overridden),
                     )
                     return result
                 safe_text, failure_kind = validate_visible_output_text(
@@ -493,6 +502,8 @@ class GatewayLaneMixin:
                     prefix_hash=workload_policy.stable_prefix_hash,
                     model_id=model_id,
                     fallback_used=bool(model_id != workload_policy.primary_model),
+                    skipped_cooldown_models=list(skipped_cooldown_models),
+                    cooldown_overridden=bool(cooldown_overridden),
                 )
                 if self._debug_mode():
                     trace_id = getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")
@@ -502,8 +513,29 @@ class GatewayLaneMixin:
                 return result
             except Exception as exc:
                 last_error = str(exc)
+                last_failure_kind = self._classify_failure_kind(last_error)
                 is_fatal = self._is_fatal_failure(last_error)
                 self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
+                cooldown_meta = self._open_model_cooldown(report_pool, model_id, f"{last_error} {last_raw_completion}")
+                append_trace_stage(
+                    event,
+                    "gateway_tool_call_failure",
+                    workload_family=workload_policy.family.value,
+                    lane_key=effective_lane_key.as_log_key(),
+                    lane_umo=lane_umo,
+                    prefix_hash=workload_policy.stable_prefix_hash,
+                    model_id=model_id,
+                    fallback_used=bool(model_id != workload_policy.primary_model),
+                    failure_kind=last_failure_kind.value,
+                    failure_reason=preview_text(last_error, 160),
+                    attempted_models=list(attempted_models),
+                    skipped_cooldown_models=list(skipped_cooldown_models),
+                    cooldown_overridden=bool(cooldown_overridden),
+                    model_cooldown_until=cooldown_meta.get("until", 0.0),
+                    cooldown_reason=cooldown_meta.get("reason", ""),
+                    raw_completion=last_raw_completion,
+                    will_retry_or_switch=bool(model_id != attempt_queue[-1]),
+                )
                 if is_fatal:
                     logger.error(f"[Gateway] fatal tool_loop failure {model_id}: {last_error[:120]}")
                 else:
@@ -516,5 +548,6 @@ class GatewayLaneMixin:
             last_failure_kind=self._classify_failure_kind(last_error).value if last_error else "unknown",
             attempted_models=attempted_models,
             model_id=attempted_models[-1] if attempted_models else "",
+            raw_completion=last_raw_completion,
             failure_reason=last_error,
         )

@@ -58,7 +58,12 @@ class GatewayTaskMixin:
             last_error = ""
             last_kind = "unknown"
             last_model_id = ""
-            for model_id in vision_models:
+            attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
+                "vision",
+                vision_models,
+                vision_models,
+            )
+            for model_id in attempt_queue:
                 attempted_models.append(model_id)
                 try:
                     result = await self.chat_in_lane_result(
@@ -82,19 +87,22 @@ class GatewayTaskMixin:
                     last_error = failure_reason
                     last_kind = self._classify_failure_kind(failure_reason).value
                     last_model_id = model_id
+                    self._open_model_cooldown("vision", model_id, failure_reason)
                     logger.warning(f"[Gateway] vision model {model_id} returned unusable result: {failure_reason}")
                 except LLMCascadeFailureException as exc:
                     last_error = exc.error_message
                     last_kind = exc.last_failure_kind
                     last_model_id = exc.model_id or model_id
+                    self._open_model_cooldown("vision", model_id, f"{exc.error_message} {exc.raw_completion}")
                     logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc.error_message}")
                 except Exception as exc:
                     last_error = str(exc)
                     last_kind = self._classify_failure_kind(last_error).value
                     last_model_id = model_id
+                    self._open_model_cooldown("vision", model_id, last_error)
                     logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc}")
             raise LLMCascadeFailureException(
-                f"vision model pool exhausted: {last_error}",
+                f"vision model pool exhausted: {last_error}; skipped_cooldown_models={skipped_cooldown_models}; cooldown_overridden={cooldown_overridden}",
                 pool_name="vision",
                 last_failure_kind=last_kind,
                 attempted_models=attempted_models,
@@ -125,7 +133,12 @@ class GatewayTaskMixin:
         last_error = ""
         last_kind = "unknown"
         last_model_id = ""
-        for model_id in vision_models:
+        attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
+            "vision",
+            vision_models,
+            vision_models,
+        )
+        for model_id in attempt_queue:
             attempted_models.append(model_id)
             try:
                 result = await self._elastic_call_result(
@@ -146,19 +159,22 @@ class GatewayTaskMixin:
                 last_error = failure_reason
                 last_kind = self._classify_failure_kind(failure_reason).value
                 last_model_id = result.model_id or model_id
+                self._open_model_cooldown("vision", model_id, failure_reason)
                 logger.warning(f"[Gateway] vision model {model_id} returned unusable result: {failure_reason}")
             except LLMCascadeFailureException as exc:
                 last_error = exc.error_message
                 last_kind = exc.last_failure_kind
                 last_model_id = exc.model_id or model_id
+                self._open_model_cooldown("vision", model_id, f"{exc.error_message} {exc.raw_completion}")
                 logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc.error_message}")
             except Exception as exc:
                 last_error = str(exc)
                 last_kind = self._classify_failure_kind(last_error).value
                 last_model_id = model_id
+                self._open_model_cooldown("vision", model_id, last_error)
                 logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc}")
         raise LLMCascadeFailureException(
-            f"vision model pool exhausted: {last_error}",
+            f"vision model pool exhausted: {last_error}; skipped_cooldown_models={skipped_cooldown_models}; cooldown_overridden={cooldown_overridden}",
             pool_name="vision",
             last_failure_kind=last_kind,
             attempted_models=attempted_models,
@@ -409,4 +425,10 @@ class GatewayTaskMixin:
     def get_agent_models(self) -> List[str]:
         primary = self.router.get_ranked_models("agent", self._agent_models())
         fallback = self.router.get_ranked_models("fallback", self._fallback_models())
-        return primary + [model_id for model_id in fallback if model_id not in primary]
+        attempt_queue = primary + [model_id for model_id in fallback if model_id not in primary]
+        filtered, skipped, overridden = self._filter_cooldown_attempt_queue("agent", primary, attempt_queue)
+        self._last_agent_model_selection = {
+            "skipped_cooldown_models": list(skipped),
+            "cooldown_overridden": bool(overridden),
+        }
+        return filtered

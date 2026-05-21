@@ -1,3 +1,4 @@
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from ..context_economy import WorkloadPolicy
@@ -6,6 +7,80 @@ from ..runtime.runtime_contracts import FailureKind
 
 
 class GatewayPolicyMixin:
+    def _cooldown_key(self, pool_name: str, model_id: str) -> tuple[str, str]:
+        return str(pool_name or ""), str(model_id or "")
+
+    def _cleanup_model_cooldowns(self) -> None:
+        now = time.time()
+        cooldowns = getattr(self, "_model_cooldowns", {})
+        for key, meta in list(cooldowns.items()):
+            if float(meta.get("until", 0.0) or 0.0) <= now:
+                cooldowns.pop(key, None)
+
+    def _model_cooldown_meta(self, pool_name: str, model_id: str) -> Dict[str, Any]:
+        self._cleanup_model_cooldowns()
+        cooldowns = getattr(self, "_model_cooldowns", {})
+        meta = cooldowns.get(self._cooldown_key(pool_name, model_id), {})
+        if not meta:
+            return {}
+        return dict(meta)
+
+    def _classify_cooldown_reason(self, error_message: str) -> str:
+        lowered = str(error_message or "").lower()
+        if any(keyword in lowered for keyword in ("429", "rate limit", "ratelimit", "too many requests")):
+            return "rate_limit"
+        if any(keyword in lowered for keyword in ("usage limit", "quota", "billing cycle")):
+            return "quota_exhausted"
+        if any(keyword in lowered for keyword in ("403", "permissiondenied", "permission denied")):
+            return "provider_permission_denied"
+        return ""
+
+    def _open_model_cooldown(self, pool_name: str, model_id: str, error_message: str) -> Dict[str, Any]:
+        reason = self._classify_cooldown_reason(error_message)
+        if not reason or not model_id:
+            return {}
+        if reason == "rate_limit":
+            duration = int(getattr(self.settings, "rate_limit_model_cooldown_sec", 120) or 120)
+        else:
+            duration = int(getattr(self.settings, "quota_model_cooldown_sec", 1800) or 1800)
+        if duration <= 0:
+            return {}
+        meta = {
+            "until": time.time() + duration,
+            "reason": reason,
+            "duration_sec": duration,
+        }
+        getattr(self, "_model_cooldowns", {})[self._cooldown_key(pool_name, model_id)] = meta
+        return dict(meta)
+
+    def _filter_cooldown_attempt_queue(
+        self,
+        pool_name: str,
+        primary_models: List[str],
+        attempt_queue: List[str],
+    ) -> tuple[List[str], List[Dict[str, Any]], bool]:
+        self._cleanup_model_cooldowns()
+        available: List[str] = []
+        skipped: List[Dict[str, Any]] = []
+        for model_id in attempt_queue:
+            report_pool = pool_name if model_id in primary_models else "fallback"
+            meta = self._model_cooldown_meta(report_pool, model_id)
+            if meta:
+                skipped.append(
+                    {
+                        "pool_name": report_pool,
+                        "model_id": model_id,
+                        "cooldown_until": meta.get("until", 0.0),
+                        "cooldown_reason": meta.get("reason", ""),
+                    }
+                )
+            else:
+                available.append(model_id)
+        if available or not attempt_queue:
+            return available, skipped, False
+        earliest = min(skipped, key=lambda item: float(item.get("cooldown_until", 0.0) or 0.0))
+        return [str(earliest.get("model_id", "") or attempt_queue[0])], skipped, True
+
     def _build_attempt_queue(
         self,
         pool_name: str,
@@ -70,7 +145,14 @@ class GatewayPolicyMixin:
         fatal_keywords = (
             "429",
             "ratelimit",
+            "rate limit",
             "too many requests",
+            "403",
+            "permissiondenied",
+            "permission denied",
+            "usage limit",
+            "quota",
+            "billing cycle",
             "invalid_request_error",
             "apitimeouterror",
             "request timed out",

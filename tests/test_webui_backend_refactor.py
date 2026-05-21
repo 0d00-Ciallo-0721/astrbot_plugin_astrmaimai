@@ -968,6 +968,36 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["stage"], "execution.executor.model_pool_exhausted")
         self.assertEqual(result["items"][0]["failure_evidence"]["failure_kind"], "provider_failure_text")
 
+    def test_chat_trace_events_exposes_gateway_tool_call_failure_evidence(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _RawTraceStore:
+            async def recent(self, *, chat_id: str, limit: int = 80):
+                return [{
+                    "chat_id": chat_id,
+                    "stage": "gateway_tool_call_failure",
+                    "failure_kind": "provider_failure_text",
+                    "attempted_models": ["model-a"],
+                    "raw_completion": "All chat models failed: PermissionDeniedError: Error code: 403",
+                }]
+
+        class _Planner:
+            raw_trace_store = _RawTraceStore()
+
+        class _Runtime:
+            system2_planner = _Planner()
+
+        class _Facade:
+            runtime = _Runtime()
+
+        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        result = asyncio.run(service.chat_trace_events("chat-1"))
+        evidence = result["items"][0]["failure_evidence"]
+        self.assertEqual(evidence["failure_kind"], "provider_failure_text")
+        self.assertEqual(evidence["attempted_models"], ["model-a"])
+        self.assertIn("PermissionDeniedError", evidence["raw_completion_preview"])
+
     def test_review_ui_service_is_canonical_first_and_degrades_to_readonly_when_runtime_missing(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.review_ui_service")
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")

@@ -134,6 +134,11 @@ class GatewayCallMixin:
                 use_fallback,
                 workload_policy=workload_policy,
             )
+            attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
+                pool_name,
+                primary_models,
+                attempt_queue,
+            )
             if not attempt_queue:
                 self._raise_cascade_failure(
                     pool_name=pool_name,
@@ -186,6 +191,7 @@ class GatewayCallMixin:
                         )
                         is_fatal = self._is_fatal_failure(last_error)
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
+                        self._open_model_cooldown(report_pool, model_id, last_error)
                         if is_fatal:
                             logger.error(f"[Gateway] fatal model failure {model_id}: {last_error[:120]}")
                             break
@@ -287,6 +293,7 @@ class GatewayCallMixin:
                         )
                         is_fatal = self._is_fatal_failure(last_error)
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
+                        self._open_model_cooldown(report_pool, model_id, f"{last_error} {raw_completion_text}")
                         if is_fatal:
                             logger.error(f"[Gateway] fatal model failure {model_id}: {last_error[:120]}")
                             break

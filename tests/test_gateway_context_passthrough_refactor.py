@@ -182,6 +182,228 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         conversation = asyncio.run(lane_manager.conversation_manager.get_conversation(lane_umo, conversation_id))
         self.assertEqual(conversation.history[-1]["content"], "tool-finished")
 
+    def test_tool_chat_in_lane_retries_wrapped_provider_failure_text(self):
+        class _WrappedFailureContext(_FakeContext):
+            async def tool_loop_agent(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs["chat_provider_id"] == "model-a":
+                    return _FakeResponse(
+                        "All chat models failed: PermissionDeniedError: Error code: 403 - "
+                        "{'error': {'message': \"You've reached your usage limit for this billing cycle.\"}}"
+                    )
+                return _FakeResponse("tool-ok")
+
+        class _TraceEvent:
+            def __init__(self):
+                self.extras = {}
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        fake_context = _WrappedFailureContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = _TraceEvent()
+
+        async def _run():
+            return await gateway.tool_chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                event=event,
+                prompt="look",
+                system_prompt="stable prompt",
+                tools=object(),
+                models=["model-a", "model-b"],
+                max_steps=5,
+                timeout=10,
+                prefix_hash="hash-1",
+            )
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result.text, "tool-ok")
+        self.assertEqual([call["chat_provider_id"] for call in fake_context.calls], ["model-a", "model-b"])
+        failures = [
+            record for record in event.get_extra("astrmai_trace_log", [])
+            if record.get("stage") == "gateway_tool_call_failure"
+        ]
+        self.assertEqual(failures[0]["failure_kind"], "provider_failure_text")
+        self.assertEqual(failures[0]["attempted_models"], ["model-a"])
+        self.assertIn("All chat models failed", failures[0]["raw_completion"])
+        self.assertTrue(failures[0]["will_retry_or_switch"])
+        self.assertGreater(failures[0]["model_cooldown_until"], 0)
+        self.assertEqual(failures[0]["cooldown_reason"], "quota_exhausted")
+
+    def test_tool_chat_in_lane_skips_cooldown_model_on_next_call(self):
+        class _WrappedFailureContext(_FakeContext):
+            async def tool_loop_agent(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs["chat_provider_id"] == "model-a":
+                    return _FakeResponse(
+                        "All chat models failed: PermissionDeniedError: Error code: 403 - "
+                        "{'error': {'message': \"You've reached your usage limit for this billing cycle.\"}}"
+                    )
+                return _FakeResponse("tool-ok")
+
+        class _TraceEvent:
+            def __init__(self):
+                self.extras = {}
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        fake_context = _WrappedFailureContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                rate_limit_model_cooldown_sec=120,
+                quota_model_cooldown_sec=1800,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+
+        async def _run_once(event):
+            return await gateway.tool_chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                event=event,
+                prompt="look",
+                system_prompt="stable prompt",
+                tools=object(),
+                models=["model-a", "model-b"],
+                max_steps=5,
+                timeout=10,
+                prefix_hash="hash-1",
+            )
+
+        first_event = _TraceEvent()
+        second_event = _TraceEvent()
+        first_result = asyncio.run(_run_once(first_event))
+        second_result = asyncio.run(_run_once(second_event))
+
+        self.assertEqual(first_result.text, "tool-ok")
+        self.assertEqual(second_result.text, "tool-ok")
+        self.assertEqual([call["chat_provider_id"] for call in fake_context.calls], ["model-a", "model-b", "model-b"])
+        successes = [
+            record for record in second_event.get_extra("astrmai_trace_log", [])
+            if record.get("stage") == "gateway_tool_call"
+        ]
+        self.assertEqual(successes[0]["skipped_cooldown_models"][0]["model_id"], "model-a")
+        self.assertFalse(successes[0]["cooldown_overridden"])
+
+    def test_tool_chat_in_lane_overrides_when_all_models_are_cooled(self):
+        class _RateLimitedContext(_FakeContext):
+            async def tool_loop_agent(self, **kwargs):
+                self.calls.append(kwargs)
+                return _FakeResponse("tool-ok")
+
+        class _TraceEvent:
+            def __init__(self):
+                self.extras = {}
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        fake_context = _RateLimitedContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                rate_limit_model_cooldown_sec=120,
+                quota_model_cooldown_sec=1800,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway._open_model_cooldown("dialog", "model-a", "Error code: 429 rate limit")
+        gateway._open_model_cooldown("dialog", "model-b", "Error code: 429 rate limit")
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = _TraceEvent()
+
+        async def _run():
+            return await gateway.tool_chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                event=event,
+                prompt="look",
+                system_prompt="stable prompt",
+                tools=object(),
+                models=["model-a", "model-b"],
+                max_steps=5,
+                timeout=10,
+                prefix_hash="hash-1",
+            )
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result.text, "tool-ok")
+        self.assertEqual(len(fake_context.calls), 1)
+        successes = [
+            record for record in event.get_extra("astrmai_trace_log", [])
+            if record.get("stage") == "gateway_tool_call"
+        ]
+        self.assertTrue(successes[0]["cooldown_overridden"])
+        self.assertEqual(
+            [item["model_id"] for item in successes[0]["skipped_cooldown_models"]],
+            ["model-a", "model-b"],
+        )
+
+    def test_get_agent_models_filters_runtime_cooldown_for_executor_entrypoint(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                rate_limit_model_cooldown_sec=120,
+                quota_model_cooldown_sec=1800,
+            ),
+            provider=SimpleNamespace(
+                agent_models=["model-a", "model-b"],
+                fallback_models=[],
+                task_models=[],
+                vision_models=[],
+            ),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway._open_model_cooldown("agent", "model-a", "Error code: 429 rate limit")
+
+        models = gateway.get_agent_models()
+
+        self.assertEqual(models, ["model-b"])
+        self.assertEqual(
+            gateway._last_agent_model_selection["skipped_cooldown_models"][0]["model_id"],
+            "model-a",
+        )
+        self.assertFalse(gateway._last_agent_model_selection["cooldown_overridden"])
+
 
 if __name__ == "__main__":
     unittest.main()

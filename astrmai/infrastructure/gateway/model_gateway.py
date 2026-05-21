@@ -33,6 +33,8 @@ class GlobalModelGateway(
         self.context_economy = ContextEconomyCenter()
         self.benchmark_sample_store = None
         self.lane_manager: Optional[LaneManager] = None
+        self._model_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_agent_model_selection: dict[str, Any] = {}
         self._global_semaphore = asyncio.Semaphore(self.settings.max_concurrent_llm_calls)
         logger.info(
             f"[Gateway] global concurrency limiter ready, max={self.settings.max_concurrent_llm_calls}"

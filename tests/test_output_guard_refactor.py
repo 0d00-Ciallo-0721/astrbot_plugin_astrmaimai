@@ -27,6 +27,14 @@ class OutputGuardRefactorTests(unittest.TestCase):
         self.assertEqual(safe_text, "")
         self.assertEqual(failure_kind, "provider_failure_text")
 
+    def test_validate_visible_output_text_classifies_wrapped_tool_loop_provider_error(self):
+        safe_text, failure_kind = self.guard_mod.validate_visible_output_text(
+            "All chat models failed: PermissionDeniedError: Error code: 403 - "
+            "{'error': {'message': \"You've reached your usage limit for this billing cycle.\"}}"
+        )
+        self.assertEqual(safe_text, "")
+        self.assertEqual(failure_kind, "provider_failure_text")
+
     def test_validate_visible_output_text_classifies_prompt_scaffold(self):
         safe_text, failure_kind = self.guard_mod.validate_visible_output_text("[RollingSummary]")
         self.assertEqual(safe_text, "")

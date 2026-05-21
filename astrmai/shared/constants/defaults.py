@@ -18,6 +18,8 @@ class GatewaySettings:
     llm_retries: int = 2
     backoff_factor: float = 1.5
     api_timeout: float = 15.0
+    rate_limit_model_cooldown_sec: int = 120
+    quota_model_cooldown_sec: int = 1800
     debug_mode: bool = False
     task_models: tuple[str, ...] = ()
     agent_models: tuple[str, ...] = ()
@@ -67,6 +69,8 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
             llm_retries=int(getattr(infra, "llm_retries", 2)),
             backoff_factor=float(getattr(infra, "backoff_factor", 1.5) or 1.5),
             api_timeout=float(getattr(infra, "api_timeout", 15.0) or 15.0),
+            rate_limit_model_cooldown_sec=int(getattr(infra, "rate_limit_model_cooldown_sec", 120) or 120),
+            quota_model_cooldown_sec=int(getattr(infra, "quota_model_cooldown_sec", 1800) or 1800),
             debug_mode=bool(getattr(global_settings, "debug_mode", False)),
             task_models=_tupleize(getattr(provider, "task_models", ())),
             agent_models=_tupleize(getattr(provider, "agent_models", ())),

@@ -29,6 +29,16 @@ PROVIDER_FAILURE_MARKERS = (
     "api 没有生成任何内容",
     "api 没有返回任何内容",
     "response:",
+    "all chat models failed",
+    "permissiondeniederror",
+    "permission denied",
+    "you've reached your usage limit",
+    "usage limit",
+    "quota",
+    "rate limit",
+    "too many requests",
+    "error code: 403",
+    "error code: 429",
 )
 
 PROMPT_SCAFFOLD_MARKERS = (

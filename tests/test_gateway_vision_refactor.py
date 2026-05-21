@@ -76,6 +76,86 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertEqual(result["description"], "a cat on the desk")
         self.assertEqual([call["chat_provider_id"] for call in context.calls], ["vision-a", "vision-b"])
 
+    def test_call_vision_task_skips_cooled_vision_model(self):
+        context = _VisionContext(
+            [
+                '{"description": "a cat on the desk", "emotion_tags": ["calm"]}',
+            ]
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    rate_limit_model_cooldown_sec=120,
+                    quota_model_cooldown_sec=1800,
+                ),
+                provider=SimpleNamespace(
+                    fallback_models=["fallback-a"],
+                    task_models=[],
+                    agent_models=[],
+                    vision_models=["vision-a", "vision-b"],
+                ),
+            ),
+        )
+        gateway._open_model_cooldown("vision", "vision-a", "Error code: 429 rate limit")
+
+        async def _run():
+            return await gateway.call_vision_task(
+                image_data="image.png",
+                prompt="Analyze",
+                system_prompt="Return JSON",
+            )
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result["description"], "a cat on the desk")
+        self.assertEqual([call["chat_provider_id"] for call in context.calls], ["vision-b"])
+
+    def test_call_vision_task_exhaustion_mentions_skipped_cooldown_models(self):
+        context = _VisionContext(
+            [
+                '{"description": "", "emotion_tags": []}',
+            ]
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(
+                    max_concurrent_llm_calls=2,
+                    llm_retries=0,
+                    backoff_factor=1.5,
+                    api_timeout=10,
+                    rate_limit_model_cooldown_sec=120,
+                    quota_model_cooldown_sec=1800,
+                ),
+                provider=SimpleNamespace(
+                    fallback_models=["fallback-a"],
+                    task_models=[],
+                    agent_models=[],
+                    vision_models=["vision-a", "vision-b"],
+                ),
+            ),
+        )
+        gateway._open_model_cooldown("vision", "vision-a", "Error code: 429 rate limit")
+
+        async def _run():
+            return await gateway.call_vision_task(
+                image_data="image.png",
+                prompt="Analyze",
+                system_prompt="Return JSON",
+            )
+
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(_run())
+
+        self.assertIn("skipped_cooldown_models", str(caught.exception))
+        self.assertIn("vision-a", str(caught.exception))
+        self.assertEqual([call["chat_provider_id"] for call in context.calls], ["vision-b"])
+
 
 if __name__ == "__main__":
     unittest.main()

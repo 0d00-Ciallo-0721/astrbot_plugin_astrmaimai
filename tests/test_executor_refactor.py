@@ -61,6 +61,20 @@ class _FakeGateway:
         }
 
 
+class _CooldownAwareFakeGateway(_FakeGateway):
+    def __init__(self, *, skipped_models, **kwargs):
+        super().__init__(**kwargs)
+        self.skipped_models = list(skipped_models)
+
+    def get_agent_models(self):
+        self._last_agent_model_selection = {
+            "skipped_cooldown_models": list(self.skipped_models),
+            "cooldown_overridden": False,
+        }
+        skipped_ids = {item["model_id"] for item in self.skipped_models}
+        return [model for model in self.models if model not in skipped_ids]
+
+
 class _FakeReplyService:
     def __init__(self):
         self.calls = []
@@ -282,6 +296,37 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertTrue(failure_records)
         self.assertEqual(failure_records[0]["failure_kind"], "prompt_scaffold_text")
 
+    def test_text_mode_uses_gateway_cooldown_filtered_agent_models(self):
+        gateway = _CooldownAwareFakeGateway(
+            models=["model-a", "model-b"],
+            skipped_models=[
+                {
+                    "pool_name": "agent",
+                    "model_id": "model-a",
+                    "cooldown_reason": "quota_exhausted",
+                    "cooldown_until": 123.0,
+                }
+            ],
+            chat_responses={"model-b": "second-ok"},
+        )
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system")
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result, "second-ok")
+        self.assertEqual([kwargs["models"][0] for mode, kwargs in gateway.calls if mode == "chat"], ["model-b"])
+
     def test_text_mode_records_pool_exhausted_summary_for_invalid_outputs(self):
         gateway = _FakeGateway(
             models=["model-a", "model-b"],
@@ -313,6 +358,41 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(exhausted[0]["attempted_models"], ["model-a", "model-b"])
         self.assertEqual(exhausted[0]["last_failure_kind"], "provider_failure_text")
         self.assertTrue(exhausted[0]["fallback_triggered"])
+
+    def test_text_mode_pool_exhausted_trace_includes_gateway_cooldown_skips(self):
+        gateway = _CooldownAwareFakeGateway(
+            models=["model-a", "model-b"],
+            skipped_models=[
+                {
+                    "pool_name": "agent",
+                    "model_id": "model-a",
+                    "cooldown_reason": "quota_exhausted",
+                    "cooldown_until": 123.0,
+                }
+            ],
+            chat_responses={"model-b": "request id: 2\nstatus code: 502"},
+        )
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system")
+
+        result = asyncio.run(_run())
+
+        self.assertIsNone(result)
+        trace_log = event.get_extra("astrmai_trace_log", [])
+        exhausted = [record for record in trace_log if record.get("stage") == "execution.executor.model_pool_exhausted"]
+        self.assertEqual(exhausted[0]["attempted_models"], ["model-b"])
+        self.assertEqual(exhausted[0]["skipped_cooldown_models"][0]["model_id"], "model-a")
+        self.assertFalse(exhausted[0]["cooldown_overridden"])
 
     def test_text_mode_failure_trace_marks_last_attempt_as_no_switch(self):
         gateway = _FakeGateway(

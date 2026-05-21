@@ -703,6 +703,18 @@
         "type": "int",
         "default": 3,
         "hint": "同一时间最多允许多少个模型请求同时进行。数值过大可能更容易触发限流。"
+      },
+      "rate_limit_model_cooldown_sec": {
+        "description": "模型触发 429/rate limit 后的运行期冷却时间（秒）",
+        "type": "int",
+        "default": 120,
+        "hint": "某个模型被限速后，后续请求会在这段时间内优先跳过它并尝试其他候选模型。"
+      },
+      "quota_model_cooldown_sec": {
+        "description": "模型触发 403/配额/权限失败后的运行期冷却时间（秒）",
+        "type": "int",
+        "default": 1800,
+        "hint": "某个模型出现配额、账单周期或权限失败后，后续请求会暂时跳过它；不会永久修改模型配置。"
       }
     }
   }
