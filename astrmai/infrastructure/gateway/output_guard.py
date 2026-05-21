@@ -240,6 +240,27 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "", speaker_name
     return ""
 
 
+def validate_visible_output_text(
+    text: str,
+    speaker_names: Iterable[str] | None = None,
+) -> tuple[str, str]:
+    normalized = normalize_guard_text(text)
+    if not normalized:
+        return "", "empty_response"
+    if looks_like_provider_failure_text(normalized):
+        return "", "provider_failure_text"
+
+    sanitized = sanitize_visible_reply_text(normalized, fallback_text="", speaker_names=speaker_names)
+    if sanitized:
+        return sanitized, ""
+
+    if looks_like_tool_protocol_text(normalized):
+        return "", "tool_protocol_text"
+    if looks_like_prompt_scaffold_text(normalized):
+        return "", "prompt_scaffold_text"
+    return "", "unsafe_or_empty_text"
+
+
 def is_safe_visible_text(text: str) -> bool:
     sanitized = sanitize_visible_reply_text(text, "")
     return bool(sanitized)

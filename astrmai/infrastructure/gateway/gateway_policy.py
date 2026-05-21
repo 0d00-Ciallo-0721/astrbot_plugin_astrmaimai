@@ -51,6 +51,12 @@ class GatewayPolicyMixin:
             return FailureKind.EMPTY_RESPONSE
         if "provider_failure_text" in lowered:
             return FailureKind.PROVIDER_FAILURE_TEXT
+        if "unsafe_or_empty_text" in lowered:
+            return FailureKind.UNSAFE_OR_EMPTY_TEXT
+        if "prompt_scaffold_text" in lowered:
+            return FailureKind.PROMPT_SCAFFOLD_TEXT
+        if "tool_protocol_text" in lowered:
+            return FailureKind.TOOL_PROTOCOL_TEXT
         if "json" in lowered:
             return FailureKind.JSON_DECODE_ERROR
         if "timeout" in lowered:

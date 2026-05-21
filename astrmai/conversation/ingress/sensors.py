@@ -1,4 +1,5 @@
 # astrmai/Heart/sensors.py
+import random
 import re
 import time
 from typing import List
@@ -122,7 +123,10 @@ class PreFilters:
                 # 探针：检测引用组件，并递归挖掘被引用消息中的图片
                 if isinstance(seg, Comp.Reply):
                     if hasattr(seg, 'chain'):
-                        reply_image_urls.extend(_scan_reply_chain(seg.chain))
+                        scanned_reply_images = _scan_reply_chain(seg.chain)
+                        if scanned_reply_images:
+                            has_payload = True
+                            reply_image_urls.extend(scanned_reply_images)
                     continue # 忽略引用组件对纯文本的干扰
                     
                 # 忽略艾特对纯文本的干扰
@@ -147,32 +151,60 @@ class PreFilters:
         direct_vision_urls = []
         
         if is_private and image_urls:
-            # 1. is_private: 私聊环境且存在图片
             direct_vision_urls.extend(image_urls)
         elif has_at_bot:
-            # 2. is_at_with_image: 群聊环境 + @Bot + 存在图片
             if image_urls:
                 direct_vision_urls.extend(image_urls)
-            # 3. is_reply_with_image: 群聊环境 + @Bot + 引用历史中存在图片
             if reply_image_urls:
                 direct_vision_urls.extend(reply_image_urls)
-                
-        # 一旦命中上述条件，进行去重并注入高优先级特权标志
+        
         if direct_vision_urls:
-            unique_direct_urls = list(dict.fromkeys(direct_vision_urls))
-            event.set_extra("direct_vision_urls", unique_direct_urls)
-            logger.debug(f"[AstrMai-Sensor] 👁️ 捕获主脑直通车视觉特征！提取直通 URL 数: {len(unique_direct_urls)}")
-        event.set_extra("astrmai_is_direct_vision_request", bool(direct_vision_urls))
+            direct_vision_urls = list(dict.fromkeys(direct_vision_urls))
+        vision_cfg = getattr(self.config, "vision", None)
+        vision_enabled = bool(getattr(vision_cfg, "enable_vision", True))
+        probability = getattr(vision_cfg, "image_recognition_probability", 1.0)
+        try:
+            probability = float(probability)
+        except (TypeError, ValueError):
+            probability = 1.0
+        probability = max(0.0, min(1.0, probability))
+
+        selected_direct = bool(direct_vision_urls)
+        vision_direct_skip_reason = ""
+        if direct_vision_urls and not vision_enabled:
+            selected_direct = False
+            vision_direct_skip_reason = "disabled"
+            logger.debug("[AstrMai-Sensor] vision direct path skipped: disabled")
+        elif direct_vision_urls and random.random() > probability:
+            selected_direct = False
+            vision_direct_skip_reason = "probability_gate"
+            logger.debug(
+                "[AstrMai-Sensor] vision direct path skipped by probability gate "
+                f"(p={probability:.2f}, candidates={len(direct_vision_urls)})"
+            )
+        elif direct_vision_urls:
+            event.set_extra("direct_vision_urls", direct_vision_urls)
+            logger.debug(
+                "[AstrMai-Sensor] vision direct path selected "
+                f"(urls={len(direct_vision_urls)}, probability={probability:.2f})"
+            )
+        else:
+            vision_direct_skip_reason = "not_direct_path"
+
+        event.set_extra("vision_direct_selected", selected_direct)
+        event.set_extra("vision_direct_skip_reason", vision_direct_skip_reason)
+        event.set_extra("astrmai_is_direct_vision_request", selected_direct)
         event.set_extra(
             "astrmai_is_passive_image_share",
-            bool(image_urls) and not bool(direct_vision_urls) and not is_private and not has_at_bot,
+            bool(image_urls) and not selected_direct and not is_private and not has_at_bot,
         )
         # ==========================================
 
         clean_text = " ".join(clean_text_parts).strip().lower()
         
-        # 记录提取的图片 URL，供后续模块备份足迹使用
-        event.set_extra("extracted_image_urls", image_urls)
+        # 记录提取到的所有图片足迹；reply-image 也应保留给后续主链使用
+        extracted_image_urls = list(dict.fromkeys(list(image_urls or []) + list(reply_image_urls or [])))
+        event.set_extra("extracted_image_urls", extracted_image_urls)
         
         # 3. 🚨 核心指令拦截防火墙 🚨
         if clean_text:

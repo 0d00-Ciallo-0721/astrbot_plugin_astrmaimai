@@ -649,6 +649,18 @@
         "type": "float",
         "default": 0.5,
         "hint": "用于控制看图频率。值越高，Bot 越容易主动处理图片。"
+      },
+      "use_native_main_reply_vision": {
+        "description": "主回复原生识图直通开关",
+        "type": "bool",
+        "default": false,
+        "hint": "仅当当前主回复模型支持原生图片输入时再开启；开启后若失败，会自动回退到现有转述链。"
+      },
+      "native_main_reply_failure_cooldown_sec": {
+        "description": "主回复原生识图失败后的会话冷却时间（秒）",
+        "type": "int",
+        "default": 180,
+        "hint": "主回复原生识图失败后，当前会话会在这段时间内暂时回退到转述链。"
       }
     }
   },

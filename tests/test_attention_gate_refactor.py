@@ -137,6 +137,19 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(focus_thread["core_events"], [bot_event, focus_event])
         self.assertEqual(focus_thread["ambient_events"], [unrelated])
 
+    def test_resolve_event_context_keeps_reply_image_footprints_without_direct_vision(self):
+        event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "",
+            extras={"extracted_image_urls": ["https://example.com/reply.jpg"]},
+        )
+
+        context = self.gate._resolve_event_context(event)
+
+        self.assertEqual(context["extracted_images"], ["https://example.com/reply.jpg"])
+        self.assertFalse(context["is_private"])
+
 
 
     def test_process_event_fast_mode_engages_on_direct_wakeup(self):
