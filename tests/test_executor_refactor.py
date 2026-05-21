@@ -12,25 +12,46 @@ from tests.helpers.executor_stubs import install_executor_stubs
 
 
 class _FakeGateway:
-    def __init__(self):
+    def __init__(self, *, chat_responses=None, tool_responses=None, models=None):
         self.calls = []
+        self.chat_responses = dict(chat_responses or {})
+        self.tool_responses = dict(tool_responses or {})
+        self.models = list(models or ["model-a"])
         self.config = SimpleNamespace(
             agent=SimpleNamespace(max_steps=5, timeout=10),
             infra=SimpleNamespace(api_timeout=15),
             global_settings=SimpleNamespace(debug_mode=False, enable_error_interception=False, admin_ids=[]),
             reply=SimpleNamespace(fallback_text="fallback"),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                image_recognition_probability=1.0,
+                use_native_main_reply_vision=False,
+                native_main_reply_failure_cooldown_sec=180,
+            ),
         )
 
     def get_agent_models(self):
-        return ["model-a"]
+        return list(self.models)
 
     async def chat_in_lane_result(self, **kwargs):
         self.calls.append(("chat", kwargs))
-        return SimpleNamespace(text="lane-text-reply")
+        model_id = kwargs["models"][0]
+        response = self.chat_responses.get(model_id, "lane-text-reply")
+        if callable(response):
+            response = response(kwargs)
+        if isinstance(response, Exception):
+            raise response
+        return SimpleNamespace(text=response)
 
     async def tool_chat_in_lane_result(self, **kwargs):
         self.calls.append(("tool", kwargs))
-        return SimpleNamespace(text="[TERMINAL_YIELD]: tool-finished")
+        model_id = kwargs["models"][0]
+        response = self.tool_responses.get(model_id, "[TERMINAL_YIELD]: tool-finished")
+        if callable(response):
+            response = response(kwargs)
+        if isinstance(response, Exception):
+            raise response
+        return SimpleNamespace(text=response)
 
     async def call_vision_task(self, **kwargs):
         self.calls.append(("vision", kwargs))
@@ -229,6 +250,276 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertNotIn("System note", model_prompt)
         self.assertNotIn("[Vision]", model_prompt)
         self.assertTrue(any(mode == "vision" for mode, _kwargs in gateway.calls))
+
+    def test_text_mode_switches_model_on_prompt_scaffold_output_and_traces_failure(self):
+        gateway = _FakeGateway(
+            models=["model-a", "model-b"],
+            chat_responses={
+                "model-a": "[RollingSummary]",
+                "model-b": "second-ok",
+            },
+        )
+        reply_service = _FakeReplyService()
+        evolution = _FakeEvolution()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=evolution,
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system")
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result, "second-ok")
+        self.assertEqual([kwargs["models"][0] for mode, kwargs in gateway.calls if mode == "chat"], ["model-a", "model-b"])
+        trace_log = event.get_extra("astrmai_trace_log", [])
+        failure_records = [record for record in trace_log if record.get("stage") == "execution.executor.model_failure"]
+        self.assertTrue(failure_records)
+        self.assertEqual(failure_records[0]["failure_kind"], "prompt_scaffold_text")
+
+    def test_text_mode_records_pool_exhausted_summary_for_invalid_outputs(self):
+        gateway = _FakeGateway(
+            models=["model-a", "model-b"],
+            chat_responses={
+                "model-a": "request id: 1\nstatus code: 500",
+                "model-b": "request id: 2\nstatus code: 502",
+            },
+        )
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system")
+
+        result = asyncio.run(_run())
+
+        self.assertIsNone(result)
+        self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "fallback")])
+        trace_log = event.get_extra("astrmai_trace_log", [])
+        exhausted = [record for record in trace_log if record.get("stage") == "execution.executor.model_pool_exhausted"]
+        self.assertTrue(exhausted)
+        self.assertEqual(exhausted[0]["attempted_models"], ["model-a", "model-b"])
+        self.assertEqual(exhausted[0]["last_failure_kind"], "provider_failure_text")
+        self.assertTrue(exhausted[0]["fallback_triggered"])
+
+    def test_text_mode_failure_trace_marks_last_attempt_as_no_switch(self):
+        gateway = _FakeGateway(
+            models=["model-a", "model-b"],
+            chat_responses={
+                "model-a": "[RollingSummary]",
+                "model-b": "request id: 2\nstatus code: 502",
+            },
+        )
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system")
+
+        result = asyncio.run(_run())
+
+        self.assertIsNone(result)
+        trace_log = event.get_extra("astrmai_trace_log", [])
+        failure_records = [record for record in trace_log if record.get("stage") == "execution.executor.model_failure"]
+        self.assertEqual(len(failure_records), 2)
+        self.assertTrue(failure_records[0]["will_retry_or_switch"])
+        self.assertFalse(failure_records[1]["will_retry_or_switch"])
+
+    def test_native_main_reply_vision_text_mode_passes_direct_images_without_relay_injection(self):
+        gateway = _FakeGateway()
+        gateway.config.vision.use_native_main_reply_vision = True
+        reply_service = _FakeReplyService()
+        evolution = _FakeEvolution()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=evolution,
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        async def _run():
+            return await executor.execute(
+                event,
+                "prompt",
+                "system",
+                direct_vision_urls=[temp_image.name],
+            )
+
+        try:
+            result = asyncio.run(_run())
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(result, "lane-text-reply")
+        mode, kwargs = gateway.calls[0]
+        self.assertEqual(mode, "chat")
+        self.assertEqual(kwargs["image_urls"], [temp_image.name])
+        self.assertEqual(kwargs["prompt"], "prompt")
+        self.assertEqual(event.get_extra("vision_main_reply_strategy"), "native_direct")
+        self.assertEqual(event.get_extra("vision_native_direct_outcome"), "success")
+        self.assertFalse(any(mode == "vision" for mode, _kwargs in gateway.calls))
+
+    def test_native_main_reply_vision_failure_falls_back_to_relay_and_opens_breaker(self):
+        gateway = _FakeGateway(
+            models=["model-a"],
+            chat_responses={
+                "model-a": lambda kwargs: (
+                    "request id: 1\nstatus code: 500" if kwargs.get("image_urls") else "lane-text-reply"
+                )
+            },
+        )
+        gateway.config.vision.use_native_main_reply_vision = True
+        gateway.config.vision.native_main_reply_failure_cooldown_sec = 90
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        async def _run():
+            return await executor.execute(
+                event,
+                "prompt",
+                "system",
+                direct_vision_urls=[temp_image.name],
+            )
+
+        try:
+            result = asyncio.run(_run())
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(result, "lane-text-reply")
+        chat_calls = [kwargs for mode, kwargs in gateway.calls if mode == "chat"]
+        self.assertEqual(len(chat_calls), 2)
+        self.assertEqual(chat_calls[0]["image_urls"], [temp_image.name])
+        self.assertIsNone(chat_calls[1]["image_urls"])
+        self.assertEqual(event.get_extra("vision_main_reply_strategy"), "native_direct")
+        self.assertEqual(event.get_extra("vision_native_direct_outcome"), "fallback_to_relay")
+        self.assertEqual(event.get_extra("vision_native_direct_fallback_reason"), "provider_failure_text")
+        self.assertGreater(float(event.get_extra("vision_native_direct_breaker_until", 0.0) or 0.0), 0.0)
+        self.assertTrue(any(mode == "vision" for mode, _kwargs in gateway.calls))
+
+    def test_native_main_reply_vision_tool_mode_passes_direct_images(self):
+        gateway = _FakeGateway()
+        gateway.config.vision.use_native_main_reply_vision = True
+        reply_service = _FakeReplyService()
+        evolution = _FakeEvolution()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=evolution,
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        async def _run():
+            return await executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[object()],
+                direct_vision_urls=[temp_image.name],
+            )
+
+        try:
+            result = asyncio.run(_run())
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(result, "tool-finished")
+        mode, kwargs = gateway.calls[0]
+        self.assertEqual(mode, "tool")
+        self.assertEqual(kwargs["image_urls"], [temp_image.name])
+        self.assertEqual(event.get_extra("vision_native_direct_outcome"), "success")
+
+    def test_native_main_reply_breaker_skips_native_retry_within_same_session(self):
+        gateway = _FakeGateway(
+            models=["model-a"],
+            chat_responses={
+                "model-a": lambda kwargs: (
+                    "request id: 1\nstatus code: 500" if kwargs.get("image_urls") else "lane-text-reply"
+                )
+            },
+        )
+        gateway.config.vision.use_native_main_reply_vision = True
+        gateway.config.vision.native_main_reply_failure_cooldown_sec = 180
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+        first_event = _FakeEvent()
+        second_event = _FakeEvent()
+
+        async def _run_once(ev):
+            return await executor.execute(
+                ev,
+                "prompt",
+                "system",
+                direct_vision_urls=[temp_image.name],
+            )
+
+        try:
+            first_result = asyncio.run(_run_once(first_event))
+            first_call_count = len(gateway.calls)
+            second_result = asyncio.run(_run_once(second_event))
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(first_result, "lane-text-reply")
+        self.assertEqual(second_result, "lane-text-reply")
+        additional_calls = gateway.calls[first_call_count:]
+        self.assertEqual([mode for mode, _kwargs in additional_calls], ["vision", "chat"])
+        self.assertEqual(second_event.get_extra("vision_main_reply_strategy"), "relay")
+        self.assertEqual(second_event.get_extra("vision_native_direct_outcome"), "breaker_open")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,10 @@ class _FakeContext:
         self.calls.append(kwargs)
         return _FakeResponse("ok")
 
+    async def tool_loop_agent(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeResponse("tool-ok")
+
 
 class GatewayContextPassthroughRefactorTests(unittest.TestCase):
     def setUp(self):
@@ -106,6 +110,77 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         self.assertEqual(fake_context.calls[0]["contexts"], [])
         self.assertEqual(len(fake_context.calls[1]["contexts"]), 2)
         self.assertEqual(fake_context.calls[1]["system_prompt"], "stable prompt")
+
+    def test_tool_chat_in_lane_passes_image_urls_to_tool_loop_agent(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = SimpleNamespace()
+
+        async def _run():
+            await gateway.tool_chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                event=event,
+                prompt="look",
+                system_prompt="stable prompt",
+                tools=object(),
+                models=["model-a"],
+                max_steps=5,
+                timeout=10,
+                image_urls=["https://example.com/vision.jpg"],
+                prefix_hash="hash-1",
+            )
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(fake_context.calls), 1)
+        self.assertEqual(fake_context.calls[0]["image_urls"], ["https://example.com/vision.jpg"])
+
+    def test_tool_chat_in_lane_passthroughs_terminal_yield_protocol(self):
+        class _ProtocolContext(_FakeContext):
+            async def tool_loop_agent(self, **kwargs):
+                self.calls.append(kwargs)
+                return _FakeResponse("[TERMINAL_YIELD]: tool-finished")
+
+        fake_context = _ProtocolContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = SimpleNamespace()
+
+        async def _run():
+            return await gateway.tool_chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                event=event,
+                prompt="look",
+                system_prompt="stable prompt",
+                tools=object(),
+                models=["model-a"],
+                max_steps=5,
+                timeout=10,
+                prefix_hash="hash-1",
+            )
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result.text, "[TERMINAL_YIELD]: tool-finished")
+        lane_umo = lane_manager.resolve_lane_umo("default:GroupMessage:group-1", lane_key)
+        conversation_id = asyncio.run(lane_manager.conversation_manager.get_curr_conversation_id(lane_umo))
+        conversation = asyncio.run(lane_manager.conversation_manager.get_conversation(lane_umo, conversation_id))
+        self.assertEqual(conversation.history[-1]["content"], "tool-finished")
 
 
 if __name__ == "__main__":

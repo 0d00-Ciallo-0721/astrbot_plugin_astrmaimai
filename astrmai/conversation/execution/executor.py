@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import time
 from typing import Any, Optional
 
 from astrbot.api import logger
@@ -25,21 +26,18 @@ except ImportError:  # pragma: no cover
 
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
+from ...infrastructure.gateway.output_guard import (
+    looks_like_provider_failure_text,
+    normalize_guard_text,
+    sanitize_visible_reply_text,
+    validate_visible_output_text,
+)
+from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 
 
 class ConcurrentExecutor:
-    _PROVIDER_ERROR_KEYWORDS = (
-        "request failed",
-        "error type",
-        "error message",
-        "api error",
-        "all chat models fail",
-        "connection error",
-        "notfounderror",
-        "exception:",
-    )
     def __init__(
         self,
         context,
@@ -58,6 +56,7 @@ class ConcurrentExecutor:
         self._chat_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
+        self._native_vision_breakers: dict[str, float] = {}
 
     def _build_vision_bundle(
         self,
@@ -105,6 +104,177 @@ class ConcurrentExecutor:
             return sanitized_event
         except Exception:
             return event
+
+    def _mark_vision_direct_state(
+        self,
+        event: AstrMessageEvent,
+        *,
+        invoked: bool,
+        outcome: str,
+        skip_reason: str = "",
+        details: str = "",
+        attempted_models: Optional[list[str]] = None,
+        failure_reason: str = "",
+        failure_kind: str = "",
+    ) -> None:
+        if hasattr(event, "set_extra"):
+            event.set_extra("vision_direct_invoked", invoked)
+            event.set_extra("vision_direct_outcome", outcome)
+            event.set_extra("vision_direct_skip_reason", skip_reason)
+            event.set_extra("vision_direct_attempted_models", list(attempted_models or []))
+            event.set_extra("vision_direct_failure_reason", failure_reason)
+            event.set_extra("vision_direct_failure_kind", failure_kind)
+        debug_trace(
+            event,
+            "execution.executor.vision_direct",
+            invoked=invoked,
+            outcome=outcome,
+            skip_reason=skip_reason,
+            details=details,
+            attempted_models=list(attempted_models or []),
+            failure_reason=failure_reason,
+            failure_kind=failure_kind,
+        )
+
+    def _mark_vision_main_reply_state(
+        self,
+        event: AstrMessageEvent,
+        *,
+        strategy: str,
+        selected: bool,
+        outcome: str,
+        breaker_until: float = 0.0,
+        fallback_reason: str = "",
+        details: str = "",
+    ) -> None:
+        if hasattr(event, "set_extra"):
+            event.set_extra("vision_main_reply_strategy", strategy)
+            event.set_extra("vision_native_direct_selected", selected)
+            event.set_extra("vision_native_direct_outcome", outcome)
+            event.set_extra("vision_native_direct_breaker_until", breaker_until)
+            event.set_extra("vision_native_direct_fallback_reason", fallback_reason)
+        debug_trace(
+            event,
+            "execution.executor.vision_main_reply",
+            strategy=strategy,
+            selected=selected,
+            outcome=outcome,
+            breaker_until=breaker_until,
+            fallback_reason=fallback_reason,
+            details=details,
+        )
+
+    def _native_main_reply_vision_enabled(self) -> bool:
+        vision_cfg = getattr(self.config, "vision", None)
+        return bool(getattr(vision_cfg, "use_native_main_reply_vision", False))
+
+    def _native_main_reply_breaker_until(self, chat_id: str) -> float:
+        now = time.time()
+        breaker_until = float(self._native_vision_breakers.get(chat_id, 0.0) or 0.0)
+        if breaker_until and breaker_until <= now:
+            self._native_vision_breakers.pop(chat_id, None)
+            return 0.0
+        return breaker_until
+
+    def _open_native_main_reply_breaker(self, chat_id: str) -> float:
+        vision_cfg = getattr(self.config, "vision", None)
+        cooldown = int(getattr(vision_cfg, "native_main_reply_failure_cooldown_sec", 180) or 180)
+        cooldown = max(1, cooldown)
+        breaker_until = time.time() + float(cooldown)
+        self._native_vision_breakers[chat_id] = breaker_until
+        return breaker_until
+
+    def _should_attempt_native_main_reply_vision(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        vision_bundle: VisionBundle,
+    ) -> tuple[bool, str, float]:
+        if not self._native_main_reply_vision_enabled():
+            return False, "disabled", 0.0
+        if not vision_bundle.direct_image_urls:
+            return False, str(event.get_extra("vision_direct_skip_reason", "") or "not_direct_path"), 0.0
+        breaker_until = self._native_main_reply_breaker_until(chat_id)
+        if breaker_until > time.time():
+            return False, "breaker_open", breaker_until
+        return True, "", 0.0
+
+    def _normalize_vision_result(
+        self,
+        result_dict: Any,
+    ) -> tuple[Optional[str], list[str], str]:
+        if not isinstance(result_dict, dict) or not result_dict:
+            return None, [], "empty_result"
+
+        raw_desc = result_dict.get("description", "")
+        sanitized_desc = sanitize_visible_reply_text(raw_desc, fallback_text="")
+        sanitized_desc = normalize_guard_text(sanitized_desc)
+        if not sanitized_desc:
+            return None, [], "empty_description"
+        if looks_like_provider_failure_text(raw_desc) or looks_like_provider_failure_text(sanitized_desc):
+            return None, [], "provider_failure_text"
+
+        raw_tags = result_dict.get("emotion_tags", [])
+        tags: list[str] = []
+        if isinstance(raw_tags, list):
+            for item in raw_tags:
+                cleaned = normalize_guard_text(item)
+                if not cleaned or looks_like_provider_failure_text(cleaned):
+                    continue
+                tags.append(cleaned)
+        elif isinstance(raw_tags, str):
+            cleaned = normalize_guard_text(raw_tags)
+            if cleaned and cleaned.lower() not in {"none", "null"} and not looks_like_provider_failure_text(cleaned):
+                tags.append(cleaned)
+
+        return sanitized_desc, tags, ""
+
+    def _classify_execution_failure_kind(self, error_message: Any) -> str:
+        if hasattr(error_message, "last_failure_kind"):
+            return str(getattr(error_message, "last_failure_kind", "") or "unknown")
+        classifier = getattr(self.gateway, "_classify_failure_kind", None)
+        if callable(classifier):
+            try:
+                return str(classifier(error_message).value)
+            except Exception:
+                pass
+        lowered = str(error_message).lower()
+        if "empty_response" in lowered:
+            return "empty_response"
+        if "provider_failure_text" in lowered:
+            return "provider_failure_text"
+        if "unsafe_or_empty_text" in lowered:
+            return "unsafe_or_empty_text"
+        if "prompt_scaffold_text" in lowered:
+            return "prompt_scaffold_text"
+        if "tool_protocol_text" in lowered:
+            return "tool_protocol_text"
+        if "json" in lowered:
+            return "json_decode_error"
+        if "timeout" in lowered:
+            return "timeout"
+        if "payload" in lowered or "validation error" in lowered:
+            return "bad_payload"
+        return "unknown"
+
+    def _extract_cascade_failure_meta(self, exc: Exception) -> tuple[list[str], str, str]:
+        attempted_models = list(getattr(exc, "attempted_models", []) or [])
+        failure_reason = str(
+            getattr(exc, "failure_reason", "")
+            or getattr(exc, "error_message", "")
+            or str(exc)
+        )
+        failure_kind = str(getattr(exc, "last_failure_kind", "") or self._classify_execution_failure_kind(failure_reason))
+        return attempted_models, failure_reason, failure_kind
+
+    def _is_executor_failure_fatal(self, error_message: str) -> bool:
+        is_fatal = getattr(self.gateway, "_is_fatal_failure", None)
+        if callable(is_fatal):
+            try:
+                return bool(is_fatal(error_message))
+            except Exception:
+                return False
+        return False
 
     async def _evaluate_execution_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
         if not self.runtime_coordinator:
@@ -195,6 +365,12 @@ class ConcurrentExecutor:
         vision_bundle: VisionBundle,
     ) -> tuple[str, str]:
         if not vision_bundle.direct_image_urls:
+            self._mark_vision_direct_state(
+                event,
+                invoked=False,
+                outcome="skipped",
+                skip_reason=str(event.get_extra("vision_direct_skip_reason", "") or "not_direct_path"),
+            )
             return model_prompt, system_prompt
 
         import aiohttp
@@ -205,7 +381,10 @@ class ConcurrentExecutor:
         from PIL import Image
 
         logger.info(f"[{chat_id}] vision direct path triggered in executor")
+        self._mark_vision_direct_state(event, invoked=True, outcome="skipped")
         vision_descriptions: list[str] = []
+        saw_invalid_output = False
+        saw_exception = False
         for url_or_path in vision_bundle.direct_image_urls:
             temp_file_path = None
             is_temp = False
@@ -243,16 +422,28 @@ class ConcurrentExecutor:
                         lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=chat_id),
                         base_origin=chat_id,
                     )
-                    if result_dict:
-                        desc = result_dict.get("description", "unknown image")
-                        tags = result_dict.get("emotion_tags", [])
-                        tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
-                        vision_line = f"我刚看到一张图片，画面是：{desc}。"
-                        if tags_str and tags_str.lower() not in {"", "none", "null"}:
-                            vision_line += f" 它给我的感觉是：{tags_str}。"
-                        vision_descriptions.append(vision_line)
+                    desc, tags, invalid_reason = self._normalize_vision_result(result_dict)
+                    if not desc:
+                        saw_invalid_output = True
+                        logger.warning(f"[{chat_id}] vision side-path invalid output: {invalid_reason}")
+                        continue
+                    tags_str = ", ".join(tags)
+                    vision_line = f"我刚看到一张图片，画面是：{desc}。"
+                    if tags_str and tags_str.lower() not in {"", "none", "null"}:
+                        vision_line += f" 它给我的感觉是：{tags_str}。"
+                    vision_descriptions.append(vision_line)
             except Exception as exc:
+                saw_exception = True
+                attempted_models, failure_reason, failure_kind = self._extract_cascade_failure_meta(exc)
                 logger.error(f"[{chat_id}] vision side-path failed: {exc}")
+                self._mark_vision_direct_state(
+                    event,
+                    invoked=True,
+                    outcome="exception",
+                    attempted_models=attempted_models,
+                    failure_reason=failure_reason,
+                    failure_kind=failure_kind,
+                )
             finally:
                 if is_temp and temp_file_path and os.path.exists(temp_file_path):
                     try:
@@ -267,6 +458,33 @@ class ConcurrentExecutor:
             )
             model_prompt += vision_inject
             system_prompt += vision_inject
+            self._mark_vision_direct_state(
+                event,
+                invoked=True,
+                outcome="success",
+                details=f"descriptions={len(vision_descriptions)}",
+            )
+        elif saw_invalid_output:
+            self._mark_vision_direct_state(
+                event,
+                invoked=True,
+                outcome="invalid_output",
+                details="all_descriptions_rejected",
+            )
+        elif saw_exception:
+            if not event.get_extra("vision_direct_failure_reason"):
+                self._mark_vision_direct_state(
+                    event,
+                    invoked=True,
+                    outcome="exception",
+                )
+        else:
+            self._mark_vision_direct_state(
+                event,
+                invoked=True,
+                outcome="exception",
+                details="no_usable_image_input",
+            )
         return model_prompt, system_prompt
 
     async def _check_pre_model_freshness(self, event: AstrMessageEvent, chat_id: str, label: str) -> bool:
@@ -289,11 +507,25 @@ class ConcurrentExecutor:
         )
         return reply_text
 
-    async def _run_text_mode(self, event: AstrMessageEvent, chat_id: str, api_prompt: str, system_prompt: str, runtime: dict[str, Any]) -> Optional[str]:
+    async def _run_text_mode(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        api_prompt: str,
+        system_prompt: str,
+        runtime: dict[str, Any],
+        *,
+        image_urls: Optional[list[str]] = None,
+        raise_on_exhaustion: bool = False,
+    ) -> Optional[str]:
         last_error = ""
-        for provider_id in self.gateway.get_agent_models():
+        last_failure_kind = "unknown"
+        attempted_models: list[str] = []
+        agent_models = self.gateway.get_agent_models()
+        for index, provider_id in enumerate(agent_models):
             if not await self._check_pre_model_freshness(event, chat_id, "text execution"):
                 return None
+            attempted_models.append(provider_id)
             try:
                 result = await self.gateway.chat_in_lane_result(
                     lane_key=runtime["dialog_lane_key"],
@@ -302,37 +534,76 @@ class ConcurrentExecutor:
                     system_prompt=system_prompt,
                     models=[provider_id],
                     prefix_hash=runtime["prefix_hash"],
+                    image_urls=image_urls,
                     use_fallback=False,
                     raw_user_text=runtime["raw_user_text"],
                 )
                 reply_text = result.text
-                if not reply_text:
-                    raise ValueError(f"model {provider_id} returned empty text")
-                if any(keyword in reply_text.lower() for keyword in self._PROVIDER_ERROR_KEYWORDS):
-                    raise RuntimeError(f"model surfaced backend error: {reply_text}")
+                safe_reply_text, failure_kind = validate_visible_output_text(reply_text)
+                if failure_kind:
+                    raise ValueError(failure_kind)
                 return await self._finalize_reply(
                     event,
                     chat_id,
                     runtime["bot_id"],
-                    reply_text,
+                    safe_reply_text,
                     trace_mode="chat",
                     model=provider_id,
                 )
             except Exception as exc:
                 last_error = str(exc)
+                last_failure_kind = self._classify_execution_failure_kind(last_error)
+                debug_trace(
+                    event,
+                    "execution.executor.model_failure",
+                    mode="chat",
+                    pool_name="agent",
+                    model=provider_id,
+                    failure_kind=last_failure_kind,
+                    fatal=self._is_executor_failure_fatal(last_error),
+                    will_retry_or_switch=index < len(agent_models) - 1,
+                    error_preview=preview_text(last_error, 120),
+                )
                 logger.warning(f"[{chat_id}] chat model {provider_id} failed, trying next: {exc}")
                 continue
 
+        debug_trace(
+            event,
+            "execution.executor.model_pool_exhausted",
+            mode="chat",
+            pool_name="agent",
+            attempted_models=attempted_models,
+            last_failure_kind=last_failure_kind,
+            fallback_triggered=True,
+        )
         logger.error(f"[{chat_id}] all chat models exhausted: {last_error}")
+        if raise_on_exhaustion:
+            raise RuntimeError(last_error or "chat model pool exhausted")
         await self._handle_fatal_fallback(event, chat_id, f"all chat models exhausted:\n{last_error}")
         return None
 
-    async def _run_tool_mode(self, event: AstrMessageEvent, chat_id: str, execution_event: AstrMessageEvent, api_prompt: str, system_prompt: str, tools: list[Any], runtime: dict[str, Any]) -> Optional[str]:
+    async def _run_tool_mode(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        execution_event: AstrMessageEvent,
+        api_prompt: str,
+        system_prompt: str,
+        tools: list[Any],
+        runtime: dict[str, Any],
+        *,
+        image_urls: Optional[list[str]] = None,
+        raise_on_exhaustion: bool = False,
+    ) -> Optional[str]:
         tool_set = ToolSet(tools)
         last_error = ""
-        for provider_id in self.gateway.get_agent_models():
+        last_failure_kind = "unknown"
+        attempted_models: list[str] = []
+        agent_models = self.gateway.get_agent_models()
+        for index, provider_id in enumerate(agent_models):
             if not await self._check_pre_model_freshness(event, chat_id, "tool execution"):
                 return None
+            attempted_models.append(provider_id)
             try:
                 result = await self.gateway.tool_chat_in_lane_result(
                     lane_key=runtime["dialog_lane_key"],
@@ -344,14 +615,13 @@ class ConcurrentExecutor:
                     models=[provider_id],
                     max_steps=runtime["max_steps"],
                     timeout=runtime["timeout"],
+                    image_urls=image_urls,
                     prefix_hash=runtime["prefix_hash"],
                     raw_user_text=runtime["raw_user_text"],
                 )
                 reply_text = result.text
                 if not reply_text:
                     raise ValueError("empty tool reply")
-                if any(keyword in reply_text.lower() for keyword in self._PROVIDER_ERROR_KEYWORDS):
-                    raise RuntimeError(f"tool model surfaced backend error: {reply_text}")
                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
                     debug_trace(event, "execution.executor.wait_signal", model=provider_id)
                     return None
@@ -366,20 +636,46 @@ class ConcurrentExecutor:
                         trace_mode="tool_terminal_yield",
                         model=provider_id,
                     )
+                safe_reply_text, failure_kind = validate_visible_output_text(reply_text)
+                if failure_kind:
+                    raise ValueError(failure_kind)
                 return await self._finalize_reply(
                     event,
                     chat_id,
                     runtime["bot_id"],
-                    reply_text,
+                    safe_reply_text,
                     trace_mode="tool",
                     model=provider_id,
                 )
             except Exception as exc:
                 last_error = str(exc)
+                last_failure_kind = self._classify_execution_failure_kind(last_error)
+                debug_trace(
+                    event,
+                    "execution.executor.model_failure",
+                    mode="tool",
+                    pool_name="agent",
+                    model=provider_id,
+                    failure_kind=last_failure_kind,
+                    fatal=self._is_executor_failure_fatal(last_error),
+                    will_retry_or_switch=index < len(agent_models) - 1,
+                    error_preview=preview_text(last_error, 120),
+                )
                 logger.warning(f"[{chat_id}] tool model {provider_id} failed, trying next: {exc}")
                 continue
 
+        debug_trace(
+            event,
+            "execution.executor.model_pool_exhausted",
+            mode="tool",
+            pool_name="agent",
+            attempted_models=attempted_models,
+            last_failure_kind=last_failure_kind,
+            fallback_triggered=True,
+        )
         logger.error(f"[{chat_id}] all tool models exhausted: {last_error}")
+        if raise_on_exhaustion:
+            raise RuntimeError(last_error or "tool model pool exhausted")
         await self._handle_fatal_fallback(
             event,
             chat_id,
@@ -426,13 +722,91 @@ class ConcurrentExecutor:
 
                     vision_bundle = self._build_vision_bundle(event, direct_vision_urls)
                     execution_event = self._build_sanitized_execution_event(event, vision_bundle)
-                    api_prompt, system_prompt = await self._inject_direct_vision_context(
+                    should_use_native, native_skip_reason, breaker_until = self._should_attempt_native_main_reply_vision(
+                        event,
+                        chat_id,
+                        vision_bundle,
+                    )
+                    if should_use_native:
+                        self._mark_vision_main_reply_state(
+                            event,
+                            strategy="native_direct",
+                            selected=True,
+                            outcome="skipped",
+                        )
+                        try:
+                            if tools is None or len(tools) == 0:
+                                result = await self._run_text_mode(
+                                    event,
+                                    chat_id,
+                                    prompt,
+                                    system_prompt,
+                                    runtime,
+                                    image_urls=vision_bundle.direct_image_urls,
+                                    raise_on_exhaustion=True,
+                                )
+                            else:
+                                result = await self._run_tool_mode(
+                                    event,
+                                    chat_id,
+                                    execution_event,
+                                    prompt,
+                                    system_prompt,
+                                    tools,
+                                    runtime,
+                                    image_urls=vision_bundle.direct_image_urls,
+                                    raise_on_exhaustion=True,
+                                )
+                            if result is not None:
+                                self._mark_vision_main_reply_state(
+                                    event,
+                                    strategy="native_direct",
+                                    selected=True,
+                                    outcome="success",
+                                    details=f"images={len(vision_bundle.direct_image_urls)}",
+                                )
+                            return result
+                        except Exception as exc:
+                            fallback_reason = self._classify_execution_failure_kind(str(exc))
+                            breaker_until = self._open_native_main_reply_breaker(chat_id)
+                            logger.warning(
+                                f"[{chat_id}] native main-reply vision failed; falling back to relay chain: {exc}"
+                            )
+                            self._mark_vision_main_reply_state(
+                                event,
+                                strategy="native_direct",
+                                selected=True,
+                                outcome="fallback_to_relay",
+                                breaker_until=breaker_until,
+                                fallback_reason=fallback_reason,
+                                details=preview_text(str(exc), 120),
+                            )
+                    else:
+                        outcome = "breaker_open" if native_skip_reason == "breaker_open" else "skipped"
+                        self._mark_vision_main_reply_state(
+                            event,
+                            strategy="relay",
+                            selected=False,
+                            outcome=outcome,
+                            breaker_until=breaker_until,
+                            fallback_reason=native_skip_reason,
+                        )
+
+                    api_prompt, relay_system_prompt = await self._inject_direct_vision_context(
                         event, chat_id, prompt, system_prompt, vision_bundle
                     )
 
                     if tools is None or len(tools) == 0:
-                        return await self._run_text_mode(event, chat_id, api_prompt, system_prompt, runtime)
-                    return await self._run_tool_mode(event, chat_id, execution_event, api_prompt, system_prompt, tools, runtime)
+                        return await self._run_text_mode(event, chat_id, api_prompt, relay_system_prompt, runtime)
+                    return await self._run_tool_mode(
+                        event,
+                        chat_id,
+                        execution_event,
+                        api_prompt,
+                        relay_system_prompt,
+                        tools,
+                        runtime,
+                    )
                 except Exception as exc:
                     logger.error(f"[{chat_id}] executor core crashed: {exc}")
                     await self._handle_fatal_fallback(event, chat_id, f"executor core exception:\n{exc}")

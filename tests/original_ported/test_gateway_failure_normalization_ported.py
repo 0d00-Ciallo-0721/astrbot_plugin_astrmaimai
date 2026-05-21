@@ -72,8 +72,15 @@ class GatewayFailureNormalizationTests(unittest.TestCase):
                 use_fallback=False,
             )
 
-        with self.assertRaises(self.gateway_mod.LLMCascadeFailureException):
+        try:
             asyncio.run(_run())
+        except Exception as exc:
+            self.assertEqual(exc.__class__.__name__, "LLMCascadeFailureException")
+            self.assertEqual(exc.last_failure_kind, "provider_failure_text")
+            self.assertEqual(exc.attempted_models, ["model-a"])
+            self.assertIn("request_id", exc.raw_completion.lower().replace(" ", "_"))
+        else:
+            self.fail("expected LLMCascadeFailureException")
 
     def test_lane_history_persists_sanitized_assistant_text(self):
         fake_context = _ScaffoldContext()

@@ -9,7 +9,7 @@ from ..runtime.lane_manager import LaneKey
 from ..runtime.runtime_contracts import LLMCallResult
 from ..runtime.trace_runtime import append_trace_stage, preview_text
 from .gateway_exceptions import LLMCascadeFailureException
-from .output_guard import sanitize_visible_reply_text
+from .output_guard import validate_visible_output_text
 from .provider_capabilities import infer_provider_capabilities
 
 
@@ -247,6 +247,7 @@ class GatewayLaneMixin:
         models: List[str],
         max_steps: int,
         timeout: int,
+        image_urls: Optional[List[str]] = None,
         prefix_hash: str = "",
         persona_id: str = "",
         raw_user_text: str = "",
@@ -262,6 +263,7 @@ class GatewayLaneMixin:
             models=models,
             max_steps=max_steps,
             timeout=timeout,
+            image_urls=image_urls,
             prefix_hash=prefix_hash,
             persona_id=persona_id,
             raw_user_text=raw_user_text,
@@ -280,6 +282,7 @@ class GatewayLaneMixin:
         models: List[str],
         max_steps: int,
         timeout: int,
+        image_urls: Optional[List[str]] = None,
         prefix_hash: str = "",
         persona_id: str = "",
         raw_user_text: str = "",
@@ -332,7 +335,9 @@ class GatewayLaneMixin:
         )
         lane_runtime_meta = self.lane_manager.get_runtime_meta(lane_umo)
         last_error = ""
+        attempted_models: List[str] = []
         for model_id in attempt_queue:
+            attempted_models.append(model_id)
             report_pool = lane_key.task_family if model_id in primary_models else "fallback"
             capabilities = infer_provider_capabilities(model_id)
             tool_kwargs = self._lane_request_kwargs(lane_umo, workload_policy)(model_id)
@@ -344,6 +349,7 @@ class GatewayLaneMixin:
                         prompt=prompt,
                         system_prompt=system_prompt,
                         contexts=history,
+                        image_urls=image_urls,
                         tools=tools,
                         max_steps=max_steps,
                         tool_call_timeout=timeout,
@@ -354,13 +360,79 @@ class GatewayLaneMixin:
                 reply_text = getattr(response, "completion_text", "") or ""
                 if not reply_text.strip():
                     raise ValueError("empty_response")
-                safe_text = sanitize_visible_reply_text(
+                stripped_reply = reply_text.strip()
+                if "[SYSTEM_WAIT_SIGNAL]" in stripped_reply or "[TERMINAL_YIELD]:" in stripped_reply:
+                    self.router.report_success(report_pool, model_id)
+                    usage = self._extract_usage(response)
+                    self._log_usage(
+                        report_pool,
+                        model_id,
+                        usage,
+                        {
+                            "lane_key": effective_lane_key.as_log_key(),
+                            "conversation_id": conversation_id,
+                            "prefix_hash": workload_policy.effective_prefix_hash,
+                            "provider": capabilities.provider_family,
+                            "workload_family": workload_policy.family.value,
+                            "template_id": workload_policy.template_id,
+                            "template_version": workload_policy.template_version,
+                        },
+                    )
+                    provider_session_id = str(tool_kwargs.get("session_id", "") or "")
+                    workload_trace = self.context_economy.build_trace(
+                        policy=workload_policy,
+                        lane_umo=lane_umo,
+                        actual_model=model_id,
+                        fallback_used=bool(model_id != workload_policy.primary_model),
+                        lane_rotated=bool(lane_runtime_meta.get("lane_rotated", False)),
+                        lane_rotate_reason=str(lane_runtime_meta.get("lane_rotate_reason", "") or ""),
+                        provider_family=capabilities.provider_family,
+                        provider_session_id=provider_session_id,
+                        provider_session_enabled=bool(provider_session_id),
+                        provider_cache_hint_enabled=bool("cache_control" in tool_kwargs),
+                    )
+                    result = self._build_success_result(
+                        text=stripped_reply,
+                        model_id=model_id,
+                        usage=usage,
+                        economy=workload_trace.as_dict(),
+                    )
+                    self.context_economy.record_trace(workload_trace)
+                    if "[TERMINAL_YIELD]:" in stripped_reply:
+                        terminal_content = stripped_reply.split("[TERMINAL_YIELD]:", 1)[1].strip()
+                        artifact = self._build_lane_artifact(result, terminal_content)
+                        await self.lane_manager.append_visible_reply_artifact(
+                            lane_key=effective_lane_key,
+                            base_origin=base_origin,
+                            raw_user_text=raw_user_text or prompt,
+                            artifact=artifact,
+                            token_usage=usage.get("total_tokens", 0),
+                            prefix_hash=workload_policy.effective_prefix_hash,
+                            model_id=model_id,
+                            persona_id=persona_id,
+                            template_id=workload_policy.template_id,
+                            schema_id=workload_policy.schema_id,
+                            persona_core_version=workload_policy.persona_core_version,
+                        )
+                    append_trace_stage(
+                        event,
+                        "gateway_tool_call",
+                        workload_family=workload_policy.family.value,
+                        lane_key=effective_lane_key.as_log_key(),
+                        lane_umo=lane_umo,
+                        prefix_hash=workload_policy.stable_prefix_hash,
+                        model_id=model_id,
+                        fallback_used=bool(model_id != workload_policy.primary_model),
+                        protocol_passthrough=True,
+                        protocol_type="terminal_yield" if "[TERMINAL_YIELD]:" in stripped_reply else "wait_signal",
+                    )
+                    return result
+                safe_text, failure_kind = validate_visible_output_text(
                     reply_text,
-                    fallback_text="",
                     speaker_names=self._bot_speaker_names(),
                 )
-                if not safe_text:
-                    raise ValueError("unsafe_or_empty_text")
+                if failure_kind:
+                    raise ValueError(failure_kind)
 
                 self.router.report_success(report_pool, model_id)
                 usage = self._extract_usage(response)
@@ -438,4 +510,11 @@ class GatewayLaneMixin:
                     logger.warning(f"[Gateway] tool_loop model {model_id} failed, trying next: {last_error}")
                 continue
 
-        raise LLMCascadeFailureException(f"tool_loop model pool exhausted: {last_error}")
+        raise LLMCascadeFailureException(
+            f"tool_loop model pool exhausted: {last_error}",
+            pool_name=lane_key.task_family,
+            last_failure_kind=self._classify_failure_kind(last_error).value if last_error else "unknown",
+            attempted_models=attempted_models,
+            model_id=attempted_models[-1] if attempted_models else "",
+            failure_reason=last_error,
+        )

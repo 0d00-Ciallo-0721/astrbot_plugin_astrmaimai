@@ -4,9 +4,37 @@ from astrbot.api import logger
 
 from ..context_economy import PromptEnvelope, WorkloadFamily
 from ..runtime.lane_manager import LaneKey
+from .gateway_exceptions import LLMCascadeFailureException
 
 
 class GatewayTaskMixin:
+    def _normalize_vision_failure_reason(self, result: Any) -> tuple[bool, str]:
+        if not isinstance(result, dict) or not result:
+            return False, "empty_result"
+        description = result.get("description", "")
+        if not isinstance(description, str) or not description.strip():
+            return False, "empty_description"
+        normalized = description.strip().lower()
+        if self._classify_failure_kind(description).value == "provider_failure_text":
+            return False, "provider_failure_text"
+        if normalized in {"none", "null", "unknown image", "unknown"}:
+            return False, "empty_description"
+        raw_tags = result.get("emotion_tags", [])
+        if raw_tags is None:
+            return True, ""
+        if isinstance(raw_tags, list):
+            cleaned_tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+            if raw_tags and not cleaned_tags:
+                return False, "invalid_emotion_tags"
+            if any(self._classify_failure_kind(tag).value == "provider_failure_text" for tag in cleaned_tags):
+                return False, "provider_failure_text"
+            return True, ""
+        if isinstance(raw_tags, str):
+            if raw_tags.strip() and self._classify_failure_kind(raw_tags).value == "provider_failure_text":
+                return False, "provider_failure_text"
+            return True, ""
+        return False, "invalid_emotion_tags"
+
     async def call_vision_task(
         self,
         image_data: str,
@@ -25,54 +53,118 @@ class GatewayTaskMixin:
             return {}
 
         image_urls = [image_data] if image_data else None
+        attempted_models: List[str] = []
         if lane_key and self.lane_manager:
-            result = await self.chat_in_lane_result(
-                lane_key=lane_key,
-                base_origin=base_origin,
+            last_error = ""
+            last_kind = "unknown"
+            last_model_id = ""
+            for model_id in vision_models:
+                attempted_models.append(model_id)
+                try:
+                    result = await self.chat_in_lane_result(
+                        lane_key=lane_key,
+                        base_origin=base_origin,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        models=[model_id],
+                        is_json=True,
+                        retry_penalty=0.5,
+                        image_urls=image_urls,
+                        use_fallback=False,
+                        prefix_hash=prefix_hash,
+                        persona_id=persona_id,
+                        template_envelope=template_envelope,
+                    )
+                    parsed = result.parsed_json or {}
+                    is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
+                    if is_valid:
+                        return parsed
+                    last_error = failure_reason
+                    last_kind = self._classify_failure_kind(failure_reason).value
+                    last_model_id = model_id
+                    logger.warning(f"[Gateway] vision model {model_id} returned unusable result: {failure_reason}")
+                except LLMCascadeFailureException as exc:
+                    last_error = exc.error_message
+                    last_kind = exc.last_failure_kind
+                    last_model_id = exc.model_id or model_id
+                    logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc.error_message}")
+                except Exception as exc:
+                    last_error = str(exc)
+                    last_kind = self._classify_failure_kind(last_error).value
+                    last_model_id = model_id
+                    logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc}")
+            raise LLMCascadeFailureException(
+                f"vision model pool exhausted: {last_error}",
+                pool_name="vision",
+                last_failure_kind=last_kind,
+                attempted_models=attempted_models,
+                model_id=last_model_id,
+                failure_reason=last_error,
+            )
+
+        workload_policy = self.context_economy.resolve_policy(
+            self.context_economy.build_request(
+                family=workload_family,
+                pool_name="vision",
                 prompt=prompt,
                 system_prompt=system_prompt,
                 models=vision_models,
-                is_json=True,
-                retry_penalty=0.5,
-                image_urls=image_urls,
-                use_fallback=False,
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
+                is_json=True,
+                scope_id="global",
+                scope_kind="global",
+                template_id=template_envelope.template_id if template_envelope else "",
+                template_version=template_envelope.template_version if template_envelope else "v1",
+                schema_id=template_envelope.schema_id if template_envelope else "",
+                stable_prefix_text=template_envelope.stable_prefix_text if template_envelope else "",
+                dynamic_payload_text=template_envelope.dynamic_payload_text if template_envelope else "",
                 template_envelope=template_envelope,
             )
-            return result.parsed_json or {}
-
-        result = await self._elastic_call_result(
-            pool_name="vision",
-            prompt=prompt,
-            system_prompt=system_prompt,
-            models=vision_models,
-            is_json=True,
-            retry_penalty=0.5,
-            image_urls=image_urls,
-            use_fallback=False,
-            workload_policy=self.context_economy.resolve_policy(
-                self.context_economy.build_request(
-                    family=workload_family,
+        )
+        last_error = ""
+        last_kind = "unknown"
+        last_model_id = ""
+        for model_id in vision_models:
+            attempted_models.append(model_id)
+            try:
+                result = await self._elastic_call_result(
                     pool_name="vision",
                     prompt=prompt,
                     system_prompt=system_prompt,
-                    models=vision_models,
-                    prefix_hash=prefix_hash,
-                    persona_id=persona_id,
+                    models=[model_id],
                     is_json=True,
-                    scope_id="global",
-                    scope_kind="global",
-                    template_id=template_envelope.template_id if template_envelope else "",
-                    template_version=template_envelope.template_version if template_envelope else "v1",
-                    schema_id=template_envelope.schema_id if template_envelope else "",
-                    stable_prefix_text=template_envelope.stable_prefix_text if template_envelope else "",
-                    dynamic_payload_text=template_envelope.dynamic_payload_text if template_envelope else "",
-                    template_envelope=template_envelope,
+                    retry_penalty=0.5,
+                    image_urls=image_urls,
+                    use_fallback=False,
+                    workload_policy=workload_policy,
                 )
-            ),
+                parsed = result.parsed_json or {}
+                is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
+                if is_valid:
+                    return parsed
+                last_error = failure_reason
+                last_kind = self._classify_failure_kind(failure_reason).value
+                last_model_id = result.model_id or model_id
+                logger.warning(f"[Gateway] vision model {model_id} returned unusable result: {failure_reason}")
+            except LLMCascadeFailureException as exc:
+                last_error = exc.error_message
+                last_kind = exc.last_failure_kind
+                last_model_id = exc.model_id or model_id
+                logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc.error_message}")
+            except Exception as exc:
+                last_error = str(exc)
+                last_kind = self._classify_failure_kind(last_error).value
+                last_model_id = model_id
+                logger.warning(f"[Gateway] vision model {model_id} failed, trying next: {exc}")
+        raise LLMCascadeFailureException(
+            f"vision model pool exhausted: {last_error}",
+            pool_name="vision",
+            last_failure_kind=last_kind,
+            attempted_models=attempted_models,
+            model_id=last_model_id,
+            failure_reason=last_error,
         )
-        return result.parsed_json or {}
 
     async def call_judge_task(self, prompt: str, system_prompt: str = "", template_envelope: Optional[PromptEnvelope] = None) -> Dict[str, Any]:
         workload_policy = self.context_economy.resolve_policy(

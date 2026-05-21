@@ -7,11 +7,32 @@ from astrbot.api import logger
 from ..context_economy import WorkloadPolicy
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
 from .gateway_exceptions import LLMCascadeFailureException
-from .output_guard import looks_like_provider_failure_text, sanitize_visible_reply_text
+from .output_guard import validate_visible_output_text
 from .provider_capabilities import infer_provider_capabilities
 
 
 class GatewayCallMixin:
+    def _raise_cascade_failure(
+        self,
+        *,
+        pool_name: str,
+        error_message: str,
+        last_failure_kind: str,
+        attempted_models: List[str],
+        model_id: str = "",
+        raw_completion: str = "",
+        failure_reason: str = "",
+    ) -> None:
+        raise LLMCascadeFailureException(
+            error_message,
+            pool_name=pool_name,
+            last_failure_kind=last_failure_kind,
+            attempted_models=attempted_models,
+            model_id=model_id,
+            raw_completion=raw_completion,
+            failure_reason=failure_reason,
+        )
+
     async def _record_benchmark_sample(
         self,
         *,
@@ -114,19 +135,28 @@ class GatewayCallMixin:
                 workload_policy=workload_policy,
             )
             if not attempt_queue:
-                raise LLMCascadeFailureException(f"未配置可用模型池: {pool_name}")
+                self._raise_cascade_failure(
+                    pool_name=pool_name,
+                    error_message=f"未配置可用模型池: {pool_name}",
+                    last_failure_kind=FailureKind.UNKNOWN.value,
+                    attempted_models=[],
+                    failure_reason="empty_model_pool",
+                )
 
             timeout_limit = self._api_timeout()
             max_retries = self._max_retries()
             backoff_factor = self._backoff_factor()
+            attempted_models: List[str] = []
             last_result = self._build_failure_result(
                 error_kind=FailureKind.UNKNOWN,
                 error_message="model queue not started",
             )
 
             for model_id in attempt_queue:
+                attempted_models.append(model_id)
                 report_pool = pool_name if model_id in primary_models else "fallback"
                 for attempt in range(max_retries + 1):
+                    raw_completion_text = ""
                     try:
                         llm_kwargs = self._build_request_kwargs(
                             model_id=model_id,
@@ -152,6 +182,7 @@ class GatewayCallMixin:
                             error_kind=self._classify_failure_kind(last_error),
                             error_message=last_error,
                             model_id=model_id,
+                            raw_completion="",
                         )
                         is_fatal = self._is_fatal_failure(last_error)
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
@@ -167,10 +198,9 @@ class GatewayCallMixin:
 
                     try:
                         content = getattr(response, "completion_text", "") or ""
+                        raw_completion_text = content
                         if not content.strip():
                             raise ValueError("empty_response")
-                        if looks_like_provider_failure_text(content):
-                            raise ValueError("provider_failure_text")
 
                         usage = self._extract_usage(response)
                         log_meta = dict(debug_meta or {})
@@ -210,13 +240,12 @@ class GatewayCallMixin:
                                 economy=economy_payload,
                             )
 
-                        safe_text = sanitize_visible_reply_text(
+                        safe_text, failure_kind = validate_visible_output_text(
                             content,
-                            fallback_text="",
                             speaker_names=self._bot_speaker_names(),
                         )
-                        if not safe_text:
-                            raise ValueError("unsafe_or_empty_text")
+                        if failure_kind:
+                            raise ValueError(failure_kind)
 
                         self.router.report_success(report_pool, model_id)
                         self._log_usage(report_pool, model_id, usage, log_meta)
@@ -254,6 +283,7 @@ class GatewayCallMixin:
                             error_kind=self._classify_failure_kind(last_error),
                             error_message=last_error,
                             model_id=model_id,
+                            raw_completion=raw_completion_text,
                         )
                         is_fatal = self._is_fatal_failure(last_error)
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
@@ -266,7 +296,15 @@ class GatewayCallMixin:
                         if attempt < max_retries:
                             await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
 
-            raise LLMCascadeFailureException(f"所有模型均失败: {last_result.error_message}")
+            self._raise_cascade_failure(
+                pool_name=pool_name,
+                error_message=f"所有模型均失败: {last_result.error_message}",
+                last_failure_kind=last_result.error_kind.value,
+                attempted_models=attempted_models,
+                model_id=last_result.model_id,
+                raw_completion=last_result.raw_completion,
+                failure_reason=last_result.error_message,
+            )
 
     async def _elastic_call(
         self,
