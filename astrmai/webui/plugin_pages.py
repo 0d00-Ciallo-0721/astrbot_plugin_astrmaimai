@@ -185,6 +185,14 @@ class AstrMaiAdminPageApi:
             limit=self._int(query.get("limit"), 50),
         )
 
+    async def chat_trace_events(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        path = self._path(request)
+        return await self._admin().chat_trace_events(
+            chat_id=str(path.get("chat_id", "")),
+            limit=self._int(query.get("limit"), 80),
+        )
+
     async def scheduler_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().scheduler_status_view()
 
@@ -549,6 +557,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/cognition/chats/{chat_id}/recent-decisions", api.chat_recent_decisions, "AstrMai chat 认知决策"),
         ("GET", "/cognition/recent-turns", api.recent_turns, "AstrMai recent turn context traces"),
         ("GET", "/cognition/chats/{chat_id}/turns", api.chat_recent_turns, "AstrMai chat turn context traces"),
+        ("GET", "/cognition/chats/{chat_id}/trace-events", api.chat_trace_events, "AstrMai chat raw trace events"),
         ("GET", "/cognition/scheduler/status", api.scheduler_status, "AstrMai scheduler status diagnostics"),
         ("GET", "/cognition/scheduler/due-selection", api.scheduler_due_selection, "AstrMai scheduler due selection diagnostics"),
         ("GET", "/cognition/scheduler/chats/{chat_id}", api.scheduler_chat, "AstrMai scheduler chat loop diagnostics"),

@@ -33,6 +33,8 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/recent-decisions", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/recent-turns", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/{{chat_id}}/turns", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/{{chat_id}}/trace-events", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/chats/<chat_id>/trace-events", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/status", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/due-selection", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/cognition/scheduler/chats/{{chat_id}}", paths)
