@@ -395,6 +395,23 @@ class AttentionGate:
             return await self._engage_immediately(event, chat_id, ["ALL"], fast_mode=False)
         return None
 
+    async def _apply_primary_mood_update(self, event: AstrMessageEvent, chat_id: str, msg_str: str) -> None:
+        if (
+            not msg_str.strip()
+            or bool(event.get_extra("astrmai_is_proactive_event", False))
+            or bool(event.get_extra("astrmai_primary_mood_applied", False))
+            or not hasattr(self.state_engine, "update_mood")
+        ):
+            return
+        try:
+            mood_tag, mood_value = await self.state_engine.update_mood(chat_id, msg_str)
+            event.set_extra("astrmai_primary_mood_applied", True)
+            event.set_extra("astrmai_primary_mood_tag", str(mood_tag or "neutral"))
+            event.set_extra("astrmai_primary_mood_value", float(mood_value))
+            event.set_extra("astrmai_primary_mood_source", "attention_ingress")
+        except Exception as exc:
+            logger.debug(f"[AttentionGate] primary mood update degraded: {exc}")
+
     def _is_simple_wakeup_payload(self, msg_str: str) -> bool:
         normalized = str(msg_str or "").strip()
         if not normalized:
@@ -535,6 +552,8 @@ class AttentionGate:
         debug_trace(event, "attention_ingress", chat_id=chat_id, sender_id=sender_id, preview=preview_text(msg_str, 80))
 
         session = await self._get_or_create_session(chat_id)
+
+        await self._apply_primary_mood_update(event, chat_id, msg_str)
 
         forced = await self._handle_force_engage(event, chat_id)
         if forced:

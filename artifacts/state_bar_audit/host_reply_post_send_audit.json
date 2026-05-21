@@ -1,0 +1,329 @@
+{
+  "status": "passed",
+  "reason": "host reply_post_send audit executed",
+  "model": "stub-model",
+  "cases": [
+    {
+      "case_id": "positive_short",
+      "text": "谢谢你呀，我真的好开心，贴贴。",
+      "direct_tag": "happy",
+      "direct_value": 0.52,
+      "host_tag": "happy",
+      "host_value": 0.52,
+      "post_send_tag": "happy",
+      "resolved_text_event_type": "emotional_support",
+      "effective_event_type": "emotional_support",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "happy",
+      "published_event_type": "emotional_support",
+      "expected_final_mood": 0.62,
+      "actual_final_mood": 0.62,
+      "expected_social_score": 1.61,
+      "actual_social_score": 1.61,
+      "expected_social_direction": "positive",
+      "actual_social_direction": "positive",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "hostile_short",
+      "text": "闭嘴，烦死了，你真讨厌。",
+      "direct_tag": "angry",
+      "direct_value": -0.7,
+      "host_tag": "angry",
+      "host_value": -0.7,
+      "post_send_tag": "angry",
+      "resolved_text_event_type": "rudeness",
+      "effective_event_type": "rudeness",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "angry",
+      "published_event_type": "rudeness",
+      "expected_final_mood": -0.7999999999999999,
+      "actual_final_mood": -0.7999999999999999,
+      "expected_social_score": -1.53,
+      "actual_social_score": -1.53,
+      "expected_social_direction": "negative",
+      "actual_social_direction": "negative",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "mixed_short",
+      "text": "谢谢你，但我还是有点难过。",
+      "direct_tag": "sad",
+      "direct_value": -0.45,
+      "host_tag": "sad",
+      "host_value": -0.45,
+      "post_send_tag": "sad",
+      "resolved_text_event_type": "normal_chat",
+      "effective_event_type": "normal_chat",
+      "mood_tag_remap_suppressed": true,
+      "published_mood_tag": "",
+      "published_event_type": "normal_chat",
+      "expected_final_mood": -0.55,
+      "actual_final_mood": -0.55,
+      "expected_social_score": 0.29,
+      "actual_social_score": 0.29,
+      "expected_social_direction": "positive",
+      "actual_social_direction": "positive",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "comfort_complaint_short",
+      "text": "抱抱，谢谢你愿意安慰我，但你刚才那句还是让我有点受伤。",
+      "direct_tag": "sad",
+      "direct_value": -0.45,
+      "host_tag": "sad",
+      "host_value": -0.45,
+      "post_send_tag": "sad",
+      "resolved_text_event_type": "emotional_support",
+      "effective_event_type": "normal_chat",
+      "mood_tag_remap_suppressed": true,
+      "published_mood_tag": "",
+      "published_event_type": "normal_chat",
+      "expected_final_mood": -0.55,
+      "actual_final_mood": -0.55,
+      "expected_social_score": 0.29,
+      "actual_social_score": 0.29,
+      "expected_social_direction": "positive",
+      "actual_social_direction": "positive",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "ambiguous_soft_affection_short",
+      "text": "晚安呀，早点休息，别太累了。",
+      "direct_tag": "neutral",
+      "direct_value": 0.0,
+      "host_tag": "neutral",
+      "host_value": 0.0,
+      "post_send_tag": "neutral",
+      "resolved_text_event_type": "greeting",
+      "effective_event_type": "greeting",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "neutral",
+      "published_event_type": "greeting",
+      "expected_final_mood": 0.0,
+      "actual_final_mood": 0.0,
+      "expected_social_score": 0.23,
+      "actual_social_score": 0.23,
+      "expected_social_direction": "positive",
+      "actual_social_direction": "positive",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "tool_intent_short",
+      "text": "帮我查一下明天上海天气。",
+      "direct_tag": "neutral",
+      "direct_value": 0.0,
+      "host_tag": "neutral",
+      "host_value": 0.0,
+      "post_send_tag": "neutral",
+      "resolved_text_event_type": "normal_chat",
+      "effective_event_type": "normal_chat",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "neutral",
+      "published_event_type": "normal_chat",
+      "expected_final_mood": 0.0,
+      "actual_final_mood": 0.0,
+      "expected_social_score": 0.36,
+      "actual_social_score": 0.36,
+      "expected_social_direction": "positive",
+      "actual_social_direction": "positive",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "sarcasm_short",
+      "text": "你可真行啊，又把事情搞砸了，真棒。",
+      "direct_tag": "angry",
+      "direct_value": -0.7,
+      "host_tag": "angry",
+      "host_value": -0.7,
+      "post_send_tag": "angry",
+      "resolved_text_event_type": "normal_chat",
+      "effective_event_type": "argument",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "angry",
+      "published_event_type": "argument",
+      "expected_final_mood": -0.7999999999999999,
+      "actual_final_mood": -0.7999999999999999,
+      "expected_social_score": -1.55,
+      "actual_social_score": -1.55,
+      "expected_social_direction": "negative",
+      "actual_social_direction": "negative",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "cold_distance_short",
+      "text": "哦，那你先忙吧，我就不打扰了。",
+      "direct_tag": "neutral",
+      "direct_value": 0.0,
+      "host_tag": "neutral",
+      "host_value": 0.0,
+      "post_send_tag": "neutral",
+      "resolved_text_event_type": "ignore",
+      "effective_event_type": "ignore",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "neutral",
+      "published_event_type": "ignore",
+      "expected_final_mood": 0.0,
+      "actual_final_mood": 0.0,
+      "expected_social_score": -0.26,
+      "actual_social_score": -0.26,
+      "expected_social_direction": "negative",
+      "actual_social_direction": "negative",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "perfunctory_brief_short",
+      "text": "哦，行吧，就这样。",
+      "direct_tag": "neutral",
+      "direct_value": 0.0,
+      "host_tag": "neutral",
+      "host_value": 0.0,
+      "post_send_tag": "neutral",
+      "resolved_text_event_type": "ignore",
+      "effective_event_type": "ignore",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "neutral",
+      "published_event_type": "ignore",
+      "expected_final_mood": 0.0,
+      "actual_final_mood": 0.0,
+      "expected_social_score": -0.34,
+      "actual_social_score": -0.34,
+      "expected_social_direction": "negative",
+      "actual_social_direction": "negative",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "mild_irritation_short",
+      "text": "行了，别说了，我知道了。",
+      "direct_tag": "neutral",
+      "direct_value": 0.0,
+      "host_tag": "neutral",
+      "host_value": 0.0,
+      "post_send_tag": "neutral",
+      "resolved_text_event_type": "ignore",
+      "effective_event_type": "ignore",
+      "mood_tag_remap_suppressed": false,
+      "published_mood_tag": "neutral",
+      "published_event_type": "ignore",
+      "expected_final_mood": 0.0,
+      "actual_final_mood": 0.0,
+      "expected_social_score": -0.46,
+      "actual_social_score": -0.46,
+      "expected_social_direction": "negative",
+      "actual_social_direction": "negative",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    },
+    {
+      "case_id": "long_mixed_balance_short",
+      "text": "谢谢你一直愿意听我说这些，我知道你是好意，但刚才那句还是让我有点失望和不舒服。",
+      "direct_tag": "sad",
+      "direct_value": -0.45,
+      "host_tag": "sad",
+      "host_value": -0.45,
+      "post_send_tag": "sad",
+      "resolved_text_event_type": "normal_chat",
+      "effective_event_type": "normal_chat",
+      "mood_tag_remap_suppressed": true,
+      "published_mood_tag": "",
+      "published_event_type": "normal_chat",
+      "expected_final_mood": -0.55,
+      "actual_final_mood": -0.55,
+      "expected_social_score": 0.29,
+      "actual_social_score": 0.29,
+      "expected_social_direction": "positive",
+      "actual_social_direction": "positive",
+      "social_score_amplitude_issue": "",
+      "host_results": [
+        {
+          "type": "plain",
+          "text": "(ghost)"
+        }
+      ],
+      "mood_matched": true,
+      "social_score_matched": true
+    }
+  ],
+  "all_matched": true,
+  "amplitude_issue_case_ids": [],
+  "publish_change_semantics_aligned": true
+}

@@ -56,6 +56,23 @@ class _FakeEvent:
         return self._extra.get(key, default)
 
 
+class _FakePrivateEvent(_FakeEvent):
+    def __init__(self, sender_id, sender_name, text, extras=None, components=None):
+        super().__init__(sender_id, sender_name, text, extras=extras, components=components)
+        self.unified_msg_origin = f"default:FriendMessage:{sender_id}"
+
+    def get_group_id(self):
+        return None
+
+
+class _FakePrivateChatManager:
+    def __init__(self):
+        self.calls = []
+
+    async def signal_new_message(self, user_id, message_str, chat_id=""):
+        self.calls.append((user_id, message_str, chat_id))
+
+
 class _SequenceJudge:
     def __init__(self, actions):
         self.actions = list(actions)
@@ -282,6 +299,91 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(turn_context.attention.retrieve_keys, ["ALL"])
         self.assertEqual([event.message_str for event in turn_context.attention.window_events], ["please answer"])
         self.assertEqual(len(captured), 1)
+
+    def test_router_applies_primary_mood_before_judge_once(self):
+        calls = []
+
+        async def _update_mood(chat_id, text):
+            calls.append((chat_id, text))
+            return "happy", 0.45
+
+        self.gate.state_engine.update_mood = _update_mood
+        self.gate.judge = _SequenceJudge(["PASS", "PASS"])
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent("user-1", "Alice", "need help")
+
+        async def _run():
+            first = await router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+            second = await router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+            return first, second
+
+        first, second = asyncio.run(_run())
+
+        self.assertEqual(first.action, "PASS")
+        self.assertEqual(second.action, "PASS")
+        self.assertEqual(calls, [("default:GroupMessage:group-1", "need help")])
+        self.assertTrue(focus.get_extra("astrmai_primary_mood_applied"))
+        self.assertEqual(focus.get_extra("astrmai_primary_mood_tag"), "happy")
+        self.assertAlmostEqual(focus.get_extra("astrmai_primary_mood_value"), 0.45)
+        self.assertEqual(focus.get_extra("astrmai_primary_mood_source"), "attention_pre_judge")
+
+    def test_process_event_applies_primary_mood_before_private_wait(self):
+        calls = []
+
+        async def _update_mood(chat_id, text):
+            calls.append((chat_id, text))
+            return "sad", -0.35
+
+        manager = _FakePrivateChatManager()
+        self.gate.private_chat_manager = manager
+        self.gate.state_engine.update_mood = _update_mood
+        event = _FakePrivateEvent("user-1", "Alice", "今天有点难受")
+
+        status = asyncio.run(self.gate.process_event(event))
+
+        self.assertEqual(status, "PRIVATE_WAIT")
+        self.assertEqual(calls, [("default:FriendMessage:user-1", "今天有点难受")])
+        self.assertEqual(manager.calls, [("user-1", "今天有点难受", "default:FriendMessage:user-1")])
+        self.assertTrue(event.get_extra("astrmai_primary_mood_applied"))
+        self.assertEqual(event.get_extra("astrmai_primary_mood_tag"), "sad")
+        self.assertAlmostEqual(event.get_extra("astrmai_primary_mood_value"), -0.35)
+        self.assertEqual(event.get_extra("astrmai_primary_mood_source"), "attention_ingress")
+
+    def test_process_event_applies_primary_mood_before_fast_wakeup_engage(self):
+        calls = []
+
+        async def _update_mood(chat_id, text):
+            calls.append((chat_id, text))
+            return "happy", 0.5
+
+        self.gate.state_engine.update_mood = _update_mood
+        event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "AstrMai",
+            extras={"wakeup": True},
+        )
+
+        status = asyncio.run(self.gate.process_event(event))
+
+        self.assertEqual(status, "ENGAGED")
+        self.assertEqual(calls, [("group-1", "AstrMai")])
+        self.assertTrue(event.get_extra("astrmai_primary_mood_applied"))
+        self.assertEqual(event.get_extra("astrmai_primary_mood_source"), "attention_ingress")
 
     def test_debounce_normalizes_merged_events_once(self):
         captured = []

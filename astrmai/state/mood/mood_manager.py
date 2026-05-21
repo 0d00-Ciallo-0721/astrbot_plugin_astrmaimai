@@ -1,7 +1,7 @@
 import ast
 import json
 import re
-from typing import Tuple
+from typing import Any, Tuple
 
 from astrbot.api import logger
 
@@ -10,18 +10,26 @@ from ...infrastructure.runtime.lane_manager import LaneKey
 
 
 MOOD_SYSTEM_PROMPT = """
-你是 AstrMai 的情绪分析器。
-请只根据当前文本、当前情绪值和好感度，返回一个 JSON：
+You are AstrMai's mood analyzer.
+Read the current user message and return only JSON:
 {"mood_tag": "happy|sad|angry|neutral|curious|surprise", "mood_value": float}
-不要输出任何额外解释。
+
+Rules:
+- Choose the dominant felt affect toward the bot in this turn.
+- Sarcasm, passive aggression, or mock praise are negative, not happy.
+- Mixed affect should not be flattened into happy if clear hurt, complaint, or tension is present.
+- Use neutral only for genuinely plain or procedural text.
+- Keep mood_value in [-1.0, 1.0].
+- Output JSON only.
 """
 
 
 class MoodManager:
     """
-    情绪管理器 (System 1)
-    职责: 调用 LLM 分析文本对机器人的情绪影响，输出情绪标签与数值变化。
+    Emotion analyzer for chat state updates.
     """
+
+    VALID_TAGS = {"happy", "sad", "angry", "neutral", "curious", "surprise"}
 
     def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
@@ -40,13 +48,143 @@ class MoodManager:
 
         if not self.emotion_mapping:
             self.emotion_mapping = {
-                "happy": "积极、开心、感谢",
-                "sad": "悲伤、遗憾、道歉",
-                "angry": "生气、抱怨、攻击",
-                "neutral": "平静、客观、陈述",
-                "curious": "好奇、提问、困惑",
-                "surprise": "惊讶、意外",
+                "happy": "positive, glad, relieved, affectionate",
+                "sad": "hurt, low, apologetic, disappointed",
+                "angry": "annoyed, hostile, blaming, rejecting",
+                "neutral": "plain, procedural, emotionally weak",
+                "curious": "wondering, asking, probing",
+                "surprise": "unexpected, startled, sudden turn",
             }
+
+    @staticmethod
+    def _extract_lane_text_result(result: Any) -> Any:
+        if result is None:
+            return None
+        for field in ("parsed_json", "text", "raw_completion", "completion_text", "response_text", "content"):
+            value = getattr(result, field, None)
+            if value:
+                return value
+        if isinstance(result, dict):
+            for field in ("parsed_json", "text", "raw_completion", "completion_text", "response_text", "content"):
+                value = result.get(field)
+                if value:
+                    return value
+        return None
+
+    def _parse_result_payload(self, result: Any) -> dict[str, Any]:
+        if isinstance(result, dict):
+            return dict(result)
+        raw_str = str(result or "").strip()
+        if not raw_str:
+            return {}
+        clean_str = re.sub(r"```(?:json)?", "", raw_str, flags=re.IGNORECASE).strip()
+        data: dict[str, Any] = {}
+        parsed_successfully = False
+
+        match = re.search(r"(\{.*\}|\[.*\])", clean_str, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+            try:
+                parsed_data = json.loads(json_str)
+                if isinstance(parsed_data, list) and parsed_data and isinstance(parsed_data[0], dict):
+                    data = parsed_data[0]
+                elif isinstance(parsed_data, dict):
+                    data = parsed_data
+                if data:
+                    parsed_successfully = True
+            except json.JSONDecodeError as exc:
+                logger.debug(f"[MoodManager] standard JSON parse failed, trying AST fallback: {exc}")
+                try:
+                    eval_data = ast.literal_eval(json_str)
+                    if isinstance(eval_data, list) and eval_data and isinstance(eval_data[0], dict):
+                        data = eval_data[0]
+                    elif isinstance(eval_data, dict):
+                        data = eval_data
+                    if data:
+                        parsed_successfully = True
+                except Exception:
+                    pass
+
+        if not parsed_successfully or ("mood_tag" not in data and "mood_value" not in data):
+            logger.debug(f"[MoodManager] structured parse failed, trying regex extraction: {clean_str[:80]}...")
+            tag_match = re.search(
+                r'(?:"|\')?mood_tag(?:"|\')?\s*[:：]\s*(?:"|\')?([a-zA-Z0-9_]+)(?:"|\')?',
+                clean_str,
+                re.IGNORECASE,
+            )
+            if tag_match:
+                data["mood_tag"] = tag_match.group(1).lower()
+
+            val_match = re.search(
+                r'(?:"|\')?mood_value(?:"|\')?\s*[:：]\s*([-+]?\d*\.?\d+)',
+                clean_str,
+                re.IGNORECASE,
+            )
+            if val_match:
+                try:
+                    data["mood_value"] = float(val_match.group(1))
+                except ValueError:
+                    pass
+        return data
+
+    def _normalize_result(self, data: dict[str, Any], current_mood: float) -> tuple[str, float] | None:
+        if not isinstance(data, dict):
+            return None
+        mood_tag = str(data.get("mood_tag", "") or "").strip().lower()
+        if not mood_tag and "mood_value" not in data:
+            return None
+        if mood_tag not in self.VALID_TAGS:
+            mood_tag = "neutral"
+        try:
+            mood_value = float(data.get("mood_value", current_mood))
+        except (TypeError, ValueError):
+            mood_value = float(current_mood)
+        mood_value = max(-1.0, min(1.0, mood_value))
+        return mood_tag or "neutral", mood_value
+
+    @staticmethod
+    def _fallback_analyze_local(text: str, current_mood: float) -> tuple[str, float]:
+        fallback_text = str(text or "").lower()
+        positive_hits = sum(
+            token in fallback_text
+            for token in ["哈哈", "谢谢", "喜欢", "开心", "贴贴", "好棒", "爱你", "抱抱", "辛苦了", "支持你", "太好了"]
+        )
+        sad_hits = sum(
+            token in fallback_text
+            for token in ["难过", "委屈", "失落", "对不起", "抱歉", "呜呜", "唉", "心累", "好惨", "低落"]
+        )
+        angry_hits = sum(
+            token in fallback_text
+            for token in ["闭嘴", "烦死", "滚", "气死", "讨厌", "废物", "搞砸", "有病", "受够", "离谱", "破防"]
+        )
+        sarcasm_hits = sum(
+            token in fallback_text
+            for token in ["可真行", "真棒", "谢谢你啊", "厉害了", "还真是", "真有你的", "真贴心"]
+        )
+        question_hits = sum(
+            token in fallback_text
+            for token in ["?", "？", "怎么", "什么", "为何", "为什么", "咋", "吗"]
+        )
+        procedural_intent_hits = sum(
+            token in fallback_text
+            for token in ["帮我", "查一下", "查一查", "告诉我", "记得吗", "天气", "几点", "怎么做", "安排", "提醒我"]
+        )
+
+        if sarcasm_hits and (angry_hits or sad_hits or any(token in fallback_text for token in ["搞砸", "又来", "还敢", "出事"])):
+            return "angry", max(-1.0, current_mood - 0.18)
+        if angry_hits >= 1 and angry_hits >= sad_hits:
+            return "angry", max(-1.0, current_mood - 0.2)
+        if sad_hits >= 1 and positive_hits == 0:
+            return "sad", max(-1.0, current_mood - 0.12)
+        if sad_hits >= 1 and positive_hits >= 1:
+            return "sad", max(-1.0, current_mood - 0.06)
+        if positive_hits >= 1:
+            return "happy", min(1.0, current_mood + 0.1)
+        if question_hits >= 1:
+            if procedural_intent_hits >= 1:
+                return "neutral", current_mood
+            return "curious", current_mood
+        return "neutral", current_mood
 
     async def analyze_mood(self, text: str, current_mood: float, user_affection: float = 0.0, chat_id: str = "") -> Tuple[str, float]:
         if not text or len(text) < 2:
@@ -54,11 +192,11 @@ class MoodManager:
 
         mapping_desc = ", ".join(f"{k}={v}" for k, v in self.emotion_mapping.items())
         prompt = (
-            f"当前情绪值: {current_mood:.2f}\n"
-            f"当前用户好感度: {user_affection:.2f}\n"
-            f"可用情绪标签: {mapping_desc}\n"
-            f"待分析文本: {text}\n"
-            "请只返回 JSON。"
+            f"Current mood value: {current_mood:.2f}\n"
+            f"Current user affection: {user_affection:.2f}\n"
+            f"Available mood tags: {mapping_desc}\n"
+            f"Text to analyze: {text}\n"
+            "Return JSON only."
         )
 
         try:
@@ -72,80 +210,20 @@ class MoodManager:
                     is_json=True,
                     use_fallback=False,
                 )
-                result = llm_result.parsed_json or {}
+                result = llm_result.parsed_json or self._extract_lane_text_result(llm_result)
             else:
                 result = await self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT)
 
-            if isinstance(result, dict):
-                data = result
-            else:
-                raw_str = str(result).strip()
-                clean_str = re.sub(r"```(?:json)?", "", raw_str, flags=re.IGNORECASE).strip()
-                data = {}
-                parsed_successfully = False
+            data = self._parse_result_payload(result)
+            normalized = self._normalize_result(data, current_mood)
+            if normalized is not None:
+                return normalized
+            logger.warning("[MoodManager] empty or invalid mood payload, falling back to local heuristic")
+            return self._fallback_analyze_local(text, current_mood)
 
-                match = re.search(r"(\{.*\}|\[.*\])", clean_str, re.DOTALL)
-                if match:
-                    json_str = match.group(1)
-                    try:
-                        parsed_data = json.loads(json_str)
-                        if isinstance(parsed_data, list) and parsed_data and isinstance(parsed_data[0], dict):
-                            data = parsed_data[0]
-                        elif isinstance(parsed_data, dict):
-                            data = parsed_data
-                        if data:
-                            parsed_successfully = True
-                    except json.JSONDecodeError as e:
-                        logger.debug(f"[MoodManager] 标准 JSON 解析失败，尝试 AST 容错解析: {e}")
-                        try:
-                            eval_data = ast.literal_eval(json_str)
-                            if isinstance(eval_data, list) and eval_data and isinstance(eval_data[0], dict):
-                                data = eval_data[0]
-                            elif isinstance(eval_data, dict):
-                                data = eval_data
-                            if data:
-                                parsed_successfully = True
-                        except Exception:
-                            pass
-
-                if not parsed_successfully or ("mood_tag" not in data and "mood_value" not in data):
-                    logger.debug(f"[MoodManager] 结构化解析失败，尝试正则提取: {clean_str[:50]}...")
-                    tag_match = re.search(
-                        r'(?:"|\')?mood_tag(?:"|\')?\s*[:：=]\s*(?:"|\')?([a-zA-Z0-9_]+)(?:"|\')?',
-                        clean_str,
-                        re.IGNORECASE,
-                    )
-                    if tag_match:
-                        data["mood_tag"] = tag_match.group(1).lower()
-
-                    val_match = re.search(
-                        r'(?:"|\')?mood_value(?:"|\')?\s*[:：=]\s*([-+]?\d*\.?\d+)',
-                        clean_str,
-                        re.IGNORECASE,
-                    )
-                    if val_match:
-                        try:
-                            data["mood_value"] = float(val_match.group(1))
-                        except ValueError:
-                            pass
-
-            mood_tag = data.get("mood_tag", "neutral")
-            mood_value = float(data.get("mood_value", current_mood))
-            mood_value = max(-1.0, min(1.0, mood_value))
-            return mood_tag, mood_value
-
-        except Exception as e:
-            logger.warning(f"[MoodManager] LLM 情绪分析失败，触发本地降级算法。原因: {e}")
-            fallback_text = text.lower()
-            if any(w in fallback_text for w in ["哈哈", "嘿嘿", "贴贴", "喜欢", "好棒", "谢谢", "开心", "做饭", "喵", "来啦"]):
-                return "happy", min(1.0, current_mood + 0.1)
-            if any(w in fallback_text for w in ["滚", "气死", "烦", "闭嘴", "傻", "笨", "打你", "饿"]):
-                return "angry", max(-1.0, current_mood - 0.2)
-            if any(w in fallback_text for w in ["呜呜", "难过", "惨", "抱歉", "对不起", "唉", "叹气"]):
-                return "sad", max(-1.0, current_mood - 0.1)
-            if any(w in fallback_text for w in ["?", "？", "啊", "怎么会", "啥", "什么"]):
-                return "surprise", current_mood
-            return "neutral", current_mood
+        except Exception as exc:
+            logger.warning(f"[MoodManager] LLM mood analysis failed, using local fallback. reason: {exc}")
+            return self._fallback_analyze_local(text, current_mood)
 
     async def analyze_text_mood(self, text: str, current_mood: float, user_affection: float = 0.0, chat_id: str = "") -> Tuple[str, float]:
         return await self.analyze_mood(text, current_mood, user_affection=user_affection, chat_id=chat_id)

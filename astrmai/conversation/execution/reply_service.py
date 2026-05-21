@@ -79,6 +79,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
         artifact = self._build_visible_reply_artifact(
             raw_text,
+            event=event,
             reply_mode=reply_mode,
             freshness_state=freshness_state,
             stale_reason=stale_reason,
@@ -86,10 +87,22 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         )
         if artifact.blocked:
             logger.debug(f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} reply blocked: {artifact.blocked_reason}")
+            await self._settle_no_send_affection(
+                event,
+                chat_id,
+                skipped_reason=str(artifact.blocked_reason or "blocked"),
+                anchor_event=anchor_event,
+            )
             return
         if freshness_state == FreshnessState.EXPIRED:
             logger.info(
                 f"[ReplyService] skipped stale reply for {chat_id}: {stale_reason} | preview={preview_text(artifact.visible_text, 80)!r}"
+            )
+            await self._settle_no_send_affection(
+                event,
+                chat_id,
+                skipped_reason="stale",
+                anchor_event=anchor_event,
             )
             return
 
@@ -105,6 +118,12 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
 
         at_targets = self._merge_wait_targets(event, pending_actions)
         if not await self._send_segments(event, chat_id, artifact, at_targets):
+            await self._settle_no_send_affection(
+                event,
+                chat_id,
+                skipped_reason="send_failed",
+                anchor_event=anchor_event,
+            )
             return
         await self._ingest_memory_turn(
             event,

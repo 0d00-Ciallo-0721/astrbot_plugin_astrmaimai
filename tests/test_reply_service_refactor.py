@@ -149,6 +149,75 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertLessEqual(len(artifact.segments), 2)
         self.assertEqual(artifact.metadata["delay_profile"], "proactive")
 
+    def test_guarded_stance_clamps_first_reply_length_and_trailing_question(self):
+        service = self._service(max_len=200)
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra("astrmai_stance", "guarded")
+        event.set_extra("astrmai_social_intent", "answer")
+        text = "I can help with that. Let me lay out the key point first. Do you want me to keep going?"
+
+        artifact = service._build_visible_reply_artifact(text, event=event)
+
+        self.assertTrue(artifact.metadata["stance_clamp_applied"])
+        self.assertEqual(artifact.metadata["stance"], "guarded")
+        self.assertEqual(artifact.metadata["stance_social_intent"], "answer")
+        self.assertLess(len(artifact.visible_text), len(text))
+        self.assertNotIn("Do you want me to keep going?", artifact.visible_text)
+
+    def test_neutral_stance_does_not_apply_first_reply_clamp(self):
+        service = self._service(max_len=200)
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra("astrmai_stance", "neutral")
+        text = "I can help with that. Let me lay out the key point first. Do you want me to keep going?"
+
+        artifact = service._build_visible_reply_artifact(text, event=event)
+
+        self.assertNotIn("stance_clamp_applied", artifact.metadata)
+        self.assertIn("Do you want me to keep going?", artifact.visible_text)
+
+    def test_guarded_boundary_uses_tighter_first_reply_caps_than_guarded_answer(self):
+        service = self._service(max_len=200)
+        text = "I can help with that. Let me lay out the key point first. Do you want me to keep going?"
+        guarded_answer = FakeEvent("user-1", "Alice", "question")
+        guarded_answer.set_extra("astrmai_stance", "guarded")
+        guarded_answer.set_extra("astrmai_social_intent", "answer")
+        guarded_boundary = FakeEvent("user-1", "Alice", "question")
+        guarded_boundary.set_extra("astrmai_stance", "guarded")
+        guarded_boundary.set_extra("astrmai_social_intent", "boundary")
+
+        answer_artifact = service._build_visible_reply_artifact(text, event=guarded_answer)
+        boundary_artifact = service._build_visible_reply_artifact(text, event=guarded_boundary)
+
+        self.assertTrue(boundary_artifact.metadata["stance_clamp_applied"])
+        self.assertEqual(boundary_artifact.metadata["stance_social_intent"], "boundary")
+        self.assertLess(boundary_artifact.metadata["stance_char_cap"], answer_artifact.metadata["stance_char_cap"])
+        self.assertLessEqual(len(boundary_artifact.visible_text), len(answer_artifact.visible_text))
+        self.assertLessEqual(boundary_artifact.metadata["stance_sentence_cap"], answer_artifact.metadata["stance_sentence_cap"])
+        self.assertEqual(boundary_artifact.metadata["stance_char_cap"], 28)
+        self.assertEqual(answer_artifact.metadata["stance_char_cap"], 38)
+
+    def test_cool_comfort_keeps_looser_cap_than_cool_answer_while_trimming_tail_question(self):
+        service = self._service(max_len=200)
+        text = "I hear you. Let me stay with the key part first. We can keep going gently. Do you want me to keep going?"
+        cool_answer = FakeEvent("user-1", "Alice", "question")
+        cool_answer.set_extra("astrmai_stance", "cool")
+        cool_answer.set_extra("astrmai_social_intent", "answer")
+        cool_comfort = FakeEvent("user-1", "Alice", "question")
+        cool_comfort.set_extra("astrmai_stance", "cool")
+        cool_comfort.set_extra("astrmai_social_intent", "comfort")
+
+        answer_artifact = service._build_visible_reply_artifact(text, event=cool_answer)
+        comfort_artifact = service._build_visible_reply_artifact(text, event=cool_comfort)
+
+        self.assertTrue(answer_artifact.metadata["stance_clamp_applied"])
+        self.assertTrue(comfort_artifact.metadata["stance_clamp_applied"])
+        self.assertEqual(comfort_artifact.metadata["stance_social_intent"], "comfort")
+        self.assertGreater(comfort_artifact.metadata["stance_char_cap"], answer_artifact.metadata["stance_char_cap"])
+        self.assertNotIn("Do you want me to keep going?", comfort_artifact.visible_text)
+        self.assertGreaterEqual(len(comfort_artifact.visible_text), len(answer_artifact.visible_text))
+        self.assertEqual(answer_artifact.metadata["stance_char_cap"], 60)
+        self.assertEqual(comfort_artifact.metadata["stance_char_cap"], 72)
+
     def test_successful_reply_feeds_memory_buffer_after_send(self):
         state_engine = FakeStateEngine()
         state_engine.config.reply.typing_speed_factor = 0.0
@@ -198,6 +267,32 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertNotIn(event.unified_msg_origin, summarizer._session_history_buffer)
 
+    def test_failed_send_triggers_light_no_send_affection_settlement(self):
+        state_engine = FakeStateEngine()
+        observed = {}
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+
+        async def _send_fail(*args, **kwargs):
+            return False
+
+        async def _capture_no_send_affection(**kwargs):
+            observed.update(kwargs)
+            return True
+
+        state_engine.settle_no_send_affection = _capture_no_send_affection
+        service._send_segments = _send_fail
+        event = FakeEvent("user-1", "Alice", "你这个废物")
+
+        asyncio.run(service.handle_reply(event, "visible reply", event.unified_msg_origin))
+
+        self.assertEqual(observed["user_id"], "user-1")
+        self.assertEqual(observed["group_id"], event.unified_msg_origin)
+        self.assertEqual(observed["message_text"], "你这个废物")
+        self.assertEqual(observed["skipped_reason"], "send_failed")
+
     def test_proactive_reply_does_not_feed_memory_buffer(self):
         state_engine = FakeStateEngine()
         summarizer = self._build_memory_summarizer(threshold=2)
@@ -213,6 +308,73 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         asyncio.run(service.handle_reply(event, "proactive-reply", event.unified_msg_origin))
 
         self.assertNotIn(event.unified_msg_origin, summarizer._session_history_buffer)
+
+    def test_post_send_affection_uses_anchor_message_text_for_event_classification(self):
+        state_engine = FakeStateEngine()
+        observed = {}
+
+        async def _capture_affection(**kwargs):
+            observed.update(kwargs)
+            return None
+
+        state_engine.calculate_and_update_affection = _capture_affection
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        class _PrivateEvent(FakeEvent):
+            def __init__(self, sender_id, sender_name, text):
+                super().__init__(sender_id, sender_name, text)
+                self.unified_msg_origin = "default:FriendMessage:user-1"
+
+            def get_group_id(self):
+                return None
+
+        event = _PrivateEvent("user-1", "Alice", "assistant-visible-reply")
+        anchor = _PrivateEvent("user-1", "Alice", "thank you, you are amazing")
+
+        asyncio.run(
+            service._settle_post_send(
+                event,
+                event.unified_msg_origin,
+                bypassed_tag="happy",
+                window_events=[event],
+                anchor_event=anchor,
+            )
+        )
+
+        self.assertEqual(observed["user_id"], "user-1")
+        self.assertEqual(observed["mood_tag"], "happy")
+        self.assertEqual(observed["message_text"], "thank you, you are amazing")
+
+    def test_post_send_proactive_event_does_not_mutate_affection_with_synthetic_text(self):
+        state_engine = FakeStateEngine()
+        observed = {"calls": 0}
+
+        async def _capture_affection(**kwargs):
+            observed["calls"] += 1
+            observed["payload"] = kwargs
+            return None
+
+        state_engine.calculate_and_update_affection = _capture_affection
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "你可以去关心一下她今天的状态")
+        event.set_extra("astrmai_is_proactive_event", True)
+
+        asyncio.run(
+            service._settle_post_send(
+                event,
+                event.unified_msg_origin,
+                bypassed_tag="happy",
+                window_events=[event],
+                anchor_event=None,
+            )
+        )
+
+        self.assertEqual(observed["calls"], 0)
 
 
 if __name__ == "__main__":

@@ -170,8 +170,8 @@ class RelationshipEngine:
     # 事件影响矩阵 (每种事件对四维的 raw delta)
     EVENT_MATRIX: Dict[str, Dict[str, float]] = {
         # event_type: {trust, familiarity, emotion_bond, respect}
-        RelationshipEvent.GREETING:          {"trust": 0.3, "familiarity": 0.8, "emotion_bond": 0.2, "respect": 0.1},
-        RelationshipEvent.NORMAL_CHAT:       {"trust": 0.5, "familiarity": 1.0, "emotion_bond": 0.3, "respect": 0.2},
+        RelationshipEvent.GREETING:          {"trust": 0.2, "familiarity": 0.6, "emotion_bond": 0.15, "respect": 0.05},
+        RelationshipEvent.NORMAL_CHAT:       {"trust": 0.4, "familiarity": 0.7, "emotion_bond": 0.2, "respect": 0.2},
         RelationshipEvent.HELPFUL_REPLY:     {"trust": 1.5, "familiarity": 0.5, "emotion_bond": 0.8, "respect": 1.2},
         RelationshipEvent.EMOTIONAL_SUPPORT: {"trust": 2.0, "familiarity": 0.8, "emotion_bond": 2.5, "respect": 0.5},
         RelationshipEvent.COMPLIMENT:        {"trust": 0.5, "familiarity": 0.3, "emotion_bond": 1.5, "respect": 0.8},
@@ -180,7 +180,7 @@ class RelationshipEngine:
         RelationshipEvent.GIFT:              {"trust": 0.8, "familiarity": 0.5, "emotion_bond": 2.0, "respect": 0.3},
 
         RelationshipEvent.INSULT:            {"trust": -3.0, "familiarity": 0.2, "emotion_bond": -4.0, "respect": -3.5},
-        RelationshipEvent.IGNORE:            {"trust": -0.5, "familiarity": -0.3, "emotion_bond": -1.0, "respect": -0.5},
+        RelationshipEvent.IGNORE:            {"trust": -0.3, "familiarity": -0.2, "emotion_bond": -0.5, "respect": -0.3},
         RelationshipEvent.ARGUMENT:          {"trust": -2.0, "familiarity": 0.5, "emotion_bond": -2.5, "respect": -1.5},
         RelationshipEvent.RUDENESS:          {"trust": -1.5, "familiarity": 0.1, "emotion_bond": -2.0, "respect": -2.5},
         RelationshipEvent.SPAM:              {"trust": 0.0, "familiarity": 0.1, "emotion_bond": -0.5, "respect": -1.5},
@@ -195,6 +195,34 @@ class RelationshipEngine:
         "sad": RelationshipEvent.EMOTIONAL_SUPPORT,
         "angry": RelationshipEvent.ARGUMENT,
     }
+
+    MIXED_AFFECT_SUPPORT_WORDS = {
+        "谢谢",
+        "感谢",
+        "多谢",
+        "抱歉",
+        "辛苦了",
+        "贴贴",
+    }
+    MIXED_AFFECT_DISTRESS_WORDS = {
+        "难过",
+        "委屈",
+        "失落",
+        "失望",
+        "心累",
+        "低落",
+        "烦",
+        "不舒服",
+        "受伤",
+        "还是有点",
+    }
+    MIXED_AFFECT_CONTRAST_WORDS = {"但", "但是", "可是", "不过", "只是"}
+    SOFT_APPROACH_WORDS = {"晚安", "早点休息", "有空吗", "在吗", "别太累了"}
+    COLD_DISTANCE_WORDS = {"先忙吧", "不打扰了", "你先忙", "回头再说"}
+    PERFUNCTORY_BRIEF_WORDS = {"行吧", "哦，那算了", "哦那算了", "就这样吧", "就这样", "知道了", "嗯行"}
+    MILD_IRRITATION_WORDS = {"行了", "别说了", "我知道了", "不用再说了", "够了"}
+    COLD_DISMISSIVE_WORDS = {*COLD_DISTANCE_WORDS, *PERFUNCTORY_BRIEF_WORDS, *MILD_IRRITATION_WORDS, "随你"}
+    TOOL_INTENT_HINT_WORDS = {"帮我", "查一下", "查一查", "告诉我", "提醒我", "天气", "几点", "怎么做", "安排", "记得吗"}
 
     # 衰减参数
     DECAY_INTERVAL_HOURS = 24     # 每 24 小时衰减一次
@@ -427,9 +455,13 @@ class RelationshipEngine:
             return RelationshipEvent.INSULT
 
         # 粗鲁检测
-        rude_words = {"闭嘴", "别说了", "无语", "恶心", "讨厌你"}
+        rude_words = {"闭嘴", "无语", "恶心", "讨厌你"}
         if any(w in lower for w in rude_words):
             return RelationshipEvent.RUDENESS
+
+        # 冷淡而非 hostile
+        if any(w in lower for w in self.COLD_DISMISSIVE_WORDS):
+            return RelationshipEvent.IGNORE
 
         # 夸奖检测
         compliment_words = {"好棒", "太强了", "厉害", "牛逼", "赞", "佩服", "漂亮", "可爱"}
@@ -442,7 +474,7 @@ class RelationshipEngine:
             return RelationshipEvent.EMOTIONAL_SUPPORT
 
         # 问好检测
-        greeting_words = {"早上好", "晚上好", "你好", "嗨", "hello", "hi"}
+        greeting_words = {"早上好", "晚上好", "你好", "嗨", "hello", "hi", *self.SOFT_APPROACH_WORDS}
         if any(w in lower for w in greeting_words):
             return RelationshipEvent.GREETING
 
@@ -455,6 +487,49 @@ class RelationshipEngine:
             return RelationshipEvent.SPAM
 
         return RelationshipEvent.NORMAL_CHAT
+
+    @staticmethod
+    def _contains_any(text: str, tokens: set[str]) -> bool:
+        return any(token in text for token in tokens)
+
+    def should_preserve_normal_chat_for_message(self, text: str, mood_tag: str) -> bool:
+        normalized_text = str(text or "").lower()
+        normalized_tag = str(mood_tag or "").strip().lower()
+        if normalized_tag not in {"sad", "angry"}:
+            return False
+        return self._contains_any(normalized_text, self.MIXED_AFFECT_SUPPORT_WORDS) and self._contains_any(
+            normalized_text,
+            self.MIXED_AFFECT_DISTRESS_WORDS,
+        )
+
+    def should_soften_support_event_for_message(self, text: str, event_type: str) -> bool:
+        normalized_text = str(text or "").lower()
+        if event_type != RelationshipEvent.EMOTIONAL_SUPPORT:
+            return False
+        return (
+            self._contains_any(normalized_text, self.MIXED_AFFECT_SUPPORT_WORDS)
+            and self._contains_any(normalized_text, self.MIXED_AFFECT_DISTRESS_WORDS)
+            and self._contains_any(normalized_text, self.MIXED_AFFECT_CONTRAST_WORDS)
+        )
+
+    def normal_chat_affection_intensity_bias(self, text: str, mood_tag: str) -> float:
+        normalized_text = str(text or "").lower()
+        normalized_tag = str(mood_tag or "").strip().lower()
+        if self._contains_any(normalized_text, self.TOOL_INTENT_HINT_WORDS):
+            return 1.0
+        if normalized_tag in {"sad", "angry"} and self.should_preserve_normal_chat_for_message(normalized_text, normalized_tag):
+            return 0.8
+        return 1.0
+
+    def ignore_affection_intensity_bias(self, text: str) -> float:
+        normalized_text = str(text or "").lower()
+        if self._contains_any(normalized_text, self.MILD_IRRITATION_WORDS):
+            return 1.35
+        if self._contains_any(normalized_text, self.COLD_DISTANCE_WORDS):
+            return 0.75
+        if self._contains_any(normalized_text, self.PERFUNCTORY_BRIEF_WORDS):
+            return 1.0
+        return 1.0
 
     def get_all_vectors(self) -> Dict[str, Dict]:
         """获取所有关系向量的字典快照 (用于持久化)"""

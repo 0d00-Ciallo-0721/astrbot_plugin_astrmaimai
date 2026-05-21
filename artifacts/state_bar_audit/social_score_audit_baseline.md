@@ -1,0 +1,97 @@
+# Social Score Audit Baseline
+
+- audit mode: `static_and_host_chain_semantics`
+- issue cases: `none`
+- mixed affect score: `0.2900`
+- mixed affect remap suppressed: `True`
+- verdict: social_score direction stays aligned on obvious positive and negative text, and mixed affect no longer escalates into an overly strong support-style uplift
+
+## Cases
+- `positive_gratitude` (夸奖 / 贴近)
+  - mood tag: `happy`
+  - text event: `emotional_support`
+  - effective event: `emotional_support`
+  - remap suppressed: `False`
+  - social_score: `1.6100`
+  - direction/band: `positive` / `strong`
+  - issue: `none`
+- `mixed_affect` (感谢里带受伤)
+  - mood tag: `sad`
+  - text event: `normal_chat`
+  - effective event: `normal_chat`
+  - remap suppressed: `True`
+  - social_score: `0.2900`
+  - direction/band: `positive` / `light`
+  - issue: `none`
+- `comfort_with_complaint` (安慰里带抱怨)
+  - mood tag: `sad`
+  - text event: `emotional_support`
+  - effective event: `normal_chat`
+  - remap suppressed: `True`
+  - social_score: `0.2900`
+  - direction/band: `positive` / `light`
+  - issue: `none`
+- `ambiguous_soft_affection` (关系暧昧但不明确示好)
+  - mood tag: `neutral`
+  - text event: `greeting`
+  - effective event: `greeting`
+  - remap suppressed: `False`
+  - social_score: `0.2300`
+  - direction/band: `positive` / `light`
+  - issue: `none`
+- `hostile_direct` (明确负向)
+  - mood tag: `angry`
+  - text event: `rudeness`
+  - effective event: `rudeness`
+  - remap suppressed: `False`
+  - social_score: `-1.5300`
+  - direction/band: `negative` / `strong`
+  - issue: `none`
+- `cold_distance` (冷淡疏离)
+  - mood tag: `neutral`
+  - text event: `ignore`
+  - effective event: `ignore`
+  - remap suppressed: `False`
+  - social_score: `-0.2600`
+  - direction/band: `negative` / `light`
+  - issue: `none`
+- `perfunctory_brief` (敷衍收口)
+  - mood tag: `neutral`
+  - text event: `ignore`
+  - effective event: `ignore`
+  - remap suppressed: `False`
+  - social_score: `-0.3400`
+  - direction/band: `negative` / `light`
+  - issue: `none`
+- `mild_irritation` (轻微不耐烦)
+  - mood tag: `neutral`
+  - text event: `ignore`
+  - effective event: `ignore`
+  - remap suppressed: `False`
+  - social_score: `-0.4600`
+  - direction/band: `negative` / `light`
+  - issue: `none`
+- `tool_intent` (工具意图)
+  - mood tag: `neutral`
+  - text event: `normal_chat`
+  - effective event: `normal_chat`
+  - remap suppressed: `False`
+  - social_score: `0.3600`
+  - direction/band: `positive` / `light`
+  - issue: `none`
+- `sarcasm` (阴阳怪气)
+  - mood tag: `angry`
+  - text event: `normal_chat`
+  - effective event: `argument`
+  - remap suppressed: `False`
+  - social_score: `-1.5500`
+  - direction/band: `negative` / `strong`
+  - issue: `none`
+- `long_mixed_balance` (长文本正负信号混杂)
+  - mood tag: `sad`
+  - text event: `normal_chat`
+  - effective event: `normal_chat`
+  - remap suppressed: `True`
+  - social_score: `0.2900`
+  - direction/band: `positive` / `light`
+  - issue: `none`

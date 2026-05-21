@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AstrMai Direct Fixture Harness</title>
+  <link rel="stylesheet" href="http://127.0.0.1:8766/pages/admin/style.css">
+</head>
+<body>
+  <div id="app" class="admin-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Fixture Bridge Stub</p>
+        <h1>AstrMai 管理台直开验收页</h1>
+      </div>
+      <div class="topbar-actions">
+        <span id="bridge-status" class="status-pill">Bridge 初始化中</span>
+        <button id="refresh-button" class="ghost-button" type="button">刷新当前页</button>
+      </div>
+    </header>
+
+    <nav id="tabs" class="tabs" aria-label="AstrMai 管理导航"></nav>
+
+    <main id="content" class="content">
+      <section class="empty-state">
+        <h2>正在连接 Fixture Bridge</h2>
+        <p>该页面通过开发态 bridge stub 直连 fixture server，用于绕开 AstrBot 宿主页 iframe 边界。</p>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="modal-root" class="modal-root" hidden></div>
+  </div>
+
+  <script>
+  (function () {
+    const fixtureBase = "http://127.0.0.1:8765";
+    const activeProfile = "admin_full";
+    let authTokenPromise = null;
+    function normalizeEndpoint(endpoint) {
+      const clean = String(endpoint || "").replace(/^\/+/, "");
+      return clean.startsWith("admin/") ? clean.slice("admin/".length) : clean;
+    }
+    async function authToken() {
+      if (!authTokenPromise) {
+        authTokenPromise = fetch(new URL("/api/auth/login", fixtureBase).toString(), {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({ password: "astrmai_admin" }),
+        })
+          .then((response) => response.json())
+          .then((payload) => payload.token || "");
+      }
+      return authTokenPromise;
+    }
+    async function request(method, endpoint, payload) {
+      const mapped = normalizeEndpoint(endpoint);
+      const url = new URL(`/api/${mapped}`, fixtureBase);
+      if (method === "GET" && payload && typeof payload === "object") {
+        Object.entries(payload).forEach(([key, value]) => {
+          if (value === undefined || value === null || value === "") return;
+          url.searchParams.set(key, String(value));
+        });
+      }
+      const token = await authToken();
+      const options = {
+        method,
+        headers: {
+          "content-type": "application/json",
+          "Authorization": token ? `Bearer ${token}` : "",
+        },
+      };
+      if (method !== "GET") {
+        options.body = JSON.stringify(payload || {});
+      }
+      const response = await fetch(url.toString(), options);
+      return response.json();
+    }
+    window.AstrBotPluginPage = {
+      ready: async () => ({ status: "ok", mode: "fixture_stub", profile: activeProfile }),
+      apiGet: async (endpoint, params) => request("GET", endpoint, params || {}),
+      apiPost: async (endpoint, body) => request("POST", endpoint, body || {}),
+    };
+  })();
+  </script>
+  <script defer src="http://127.0.0.1:8766/pages/admin/app.js"></script>
+</body>
+</html>

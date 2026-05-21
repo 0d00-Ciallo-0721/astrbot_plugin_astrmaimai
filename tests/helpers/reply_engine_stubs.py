@@ -114,6 +114,9 @@ class FakeStateEngine:
     async def calculate_and_update_affection(self, **kwargs):
         return None
 
+    async def settle_no_send_affection(self, **kwargs):
+        return False
+
 
 class FakeEvent:
     def __init__(self, sender_id, sender_name, text):

@@ -3,14 +3,9 @@ from typing import Dict, Any
 
 from ..adapters.plugin_api import PluginApiAdapter
 from ..auth import get_current_user
-from ..paths import default_config_path, default_schema_path
 from ..services.settings_ui_service import SettingsUiService
 
 router = APIRouter()
-
-# Paths using env vars with AstrBot data/plugin-root fallbacks.
-CONFIG_PATH = default_config_path()
-SCHEMA_PATH = default_schema_path()
 
 @router.get("")
 async def get_config(user: str = Depends(get_current_user)):

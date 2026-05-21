@@ -62,6 +62,23 @@ def test_tool_decision_trace_records_filter_steps():
     assert trace.removed_by_cooldown == ["proactive_meme"]
 
 
+def test_tool_decision_trace_records_stance_filtered_tools():
+    trace = ToolDecisionTrace(requested_tier="chat", final_tier="chat")
+
+    trace.initial_tools = ["proactive_meme", "proactive_poke", "message_reaction_action"]
+    trace.record_step(
+        "action_modifier.stance",
+        ["proactive_meme", "proactive_poke", "message_reaction_action"],
+        ["message_reaction_action"],
+        "stance_guarded_guard",
+        category="stance",
+    )
+
+    assert trace.filter_reasons == ["stance_guarded_guard"]
+    assert trace.filter_steps[0]["removed"] == ["proactive_meme", "proactive_poke"]
+    assert trace.removed_by_stance == ["proactive_meme", "proactive_poke"]
+
+
 def test_turn_trace_summary_hides_inner_monologue_and_prompt_text():
     context = TurnContext()
     context.perception.chat_id = "chat-1"
@@ -100,6 +117,7 @@ def test_turn_trace_summary_hides_inner_monologue_and_prompt_text():
     ]
     context.tools.removed_by_energy = ["full_tier"]
     context.tools.removed_by_cooldown = ["proactive_meme"]
+    context.tools.removed_by_stance = ["construct_at_event"]
     context.prompt_envelope = SimpleNamespace(
         focus_message_text="Alice: hello there",
         system_prompt="secret system prompt",
@@ -137,6 +155,7 @@ def test_turn_trace_summary_hides_inner_monologue_and_prompt_text():
     assert summary["side_inputs"]["timings"][1]["ok"] is False
     assert summary["tools"]["removed_by_energy"] == ["full_tier"]
     assert summary["tools"]["removed_by_cooldown"] == ["proactive_meme"]
+    assert summary["tools"]["removed_by_stance"] == ["construct_at_event"]
     assert "secret private thought" not in rendered
     assert "secret system prompt" not in rendered
     assert "secret user prompt" not in rendered

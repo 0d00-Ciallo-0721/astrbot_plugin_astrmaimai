@@ -217,6 +217,7 @@ class ToolDecisionTrace:
     removed_by_cooldown: list[str] = field(default_factory=list)
     removed_by_caution: list[str] = field(default_factory=list)
     removed_by_social_intent: list[str] = field(default_factory=list)
+    removed_by_stance: list[str] = field(default_factory=list)
 
     def record_step(
         self,
@@ -247,6 +248,7 @@ class ToolDecisionTrace:
             "cooldown": "removed_by_cooldown",
             "caution": "removed_by_caution",
             "social_intent": "removed_by_social_intent",
+            "stance": "removed_by_stance",
         }.get(str(category or ""))
         if bucket_name:
             bucket = getattr(self, bucket_name)
@@ -552,6 +554,7 @@ def build_turn_trace_summary(
             "removed_by_cooldown": list(tools.removed_by_cooldown or []),
             "removed_by_caution": list(tools.removed_by_caution or []),
             "removed_by_social_intent": list(tools.removed_by_social_intent or []),
+            "removed_by_stance": list(tools.removed_by_stance or []),
         },
     }
 

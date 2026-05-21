@@ -310,6 +310,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         posture = self._agency_posture_guidance(decision)
         if posture:
             guidance_lines.append(posture)
+        stance = str(getattr(decision, "stance", "") or "").strip().lower()
+        if stance in {"guarded", "cool"}:
+            guidance_lines.append("Keep this turn brief and avoid proactive expansion.")
+        elif stance == "warm":
+            guidance_lines.append("If it fits naturally, receive the emotion first and answer steadily.")
         if decision.style_policy:
             guidance_lines.append(f"表达倾向：{decision.style_policy}")
         if decision.forbid_history_continuation:
@@ -885,6 +890,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             turn_context.cognitive.social_intent = "observe"
             turn_context.cognitive.action_tier = "none"
             turn_context.cognitive.risk_flags = ["group_non_direct_budget_wait", "group_ambient_short_wait"]
+            await self._settle_no_send_relationship_event(
+                event,
+                chat_id,
+                skipped_reason="wait",
+            )
             await self._finalize_proactive_event(event, None)
             await self._remember_turn_trace(chat_id, event, status="skipped_wait")
             return ""
@@ -957,6 +967,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                         cognitive_decision.reply_need
                         if cognitive_decision.reply_need in {"wait", "ignore"}
                         else cognitive_decision.action
+                    )
+                    await self._settle_no_send_relationship_event(
+                        event,
+                        chat_id,
+                        skipped_reason=skip_reason,
                     )
                     await self._finalize_proactive_event(event, None)
                     await self._remember_turn_trace(

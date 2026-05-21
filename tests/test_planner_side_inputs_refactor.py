@@ -65,11 +65,11 @@ class _FakeSys3Router:
 
 
 class _FakeStateEngine:
-    def __init__(self, *, energy=0.8, mood=0.0, caution=0.4, social_score=0):
+    def __init__(self, *, energy=0.8, mood=0.0, caution=0.4, social_score=0, trust=0.0):
         self._state = SimpleNamespace(energy=energy, mood=mood, caution=caution)
         self._profile = SimpleNamespace(social_score=social_score)
         self.relationship_engine = SimpleNamespace(
-            get_or_create=lambda user_id: SimpleNamespace(social_score=social_score, trust=0.0)
+            get_or_create=lambda user_id: SimpleNamespace(social_score=social_score, trust=trust)
         )
 
     async def get_state(self, chat_id):
@@ -77,6 +77,9 @@ class _FakeStateEngine:
 
     async def get_user_profile(self, user_id):
         return self._profile
+
+    async def settle_no_send_affection(self, **kwargs):
+        return False
 
 
 class PlannerSideInputsRefactorTests(unittest.TestCase):
@@ -146,7 +149,12 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
     def _prepare_tool_mixin(self):
         mixin = self.side_inputs_mod.PlannerSideInputMixin()
-        mixin.gateway = SimpleNamespace(config=SimpleNamespace(persona=SimpleNamespace(persona_id="persona-1")))
+        mixin.gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                persona=SimpleNamespace(persona_id="persona-1"),
+                reply=SimpleNamespace(follow_up_probability=0.20),
+            )
+        )
         mixin.memory_engine = SimpleNamespace()
         mixin.context_engine = SimpleNamespace(db=SimpleNamespace())
         mixin.reply_engine = SimpleNamespace(config=SimpleNamespace(reply=SimpleNamespace(emotion_mapping=[])))
@@ -304,6 +312,130 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual([tool.name for tool in returned_tools], ["message_reaction_action", "message_emoji_like_action"])
         self.assertIs(returned_trace, cooldown_trace)
         self.assertEqual(set(cooldown_trace.removed_by_cooldown), {"proactive_meme", "proactive_like_action"})
+
+    def test_guarded_stance_filters_proactive_social_tools_and_records_trace(self):
+        modifier = self.expression_mod.ActionModifier()
+        tools = [
+            _Tool("proactive_meme"),
+            _Tool("proactive_poke"),
+            _Tool("construct_at_event"),
+            _Tool("message_reaction_action"),
+            _Tool("omni_perception_query"),
+        ]
+        trace = self.side_inputs_mod.ToolDecisionTrace() if hasattr(self.side_inputs_mod, "ToolDecisionTrace") else None
+        if trace is None:
+            from astrmai.conversation.contracts.turn_context import ToolDecisionTrace
+
+            trace = ToolDecisionTrace()
+
+        filtered = modifier.modify_tools(
+            tools,
+            state=SimpleNamespace(energy=0.8, mood=0.0, caution=0.0),
+            tool_tier="chat",
+            stance="guarded",
+            trace=trace,
+        )
+
+        self.assertEqual(
+            [tool.name for tool in filtered],
+            ["message_reaction_action", "omni_perception_query"],
+        )
+        self.assertEqual(
+            trace.removed_by_stance,
+            ["proactive_meme", "proactive_poke", "construct_at_event"],
+        )
+        self.assertTrue(any(step["stage"] == "action_modifier.stance" for step in trace.filter_steps))
+        self.assertIn("stance_guarded_guard", trace.filter_reasons)
+
+    def test_guarded_stance_records_removed_tools_in_dict_trace_fallback(self):
+        modifier = self.expression_mod.ActionModifier()
+        tools = [
+            _Tool("proactive_meme"),
+            _Tool("proactive_poke"),
+            _Tool("message_reaction_action"),
+        ]
+        trace = {}
+
+        filtered = modifier.modify_tools(
+            tools,
+            state=SimpleNamespace(energy=0.8, mood=0.0, caution=0.0),
+            tool_tier="chat",
+            stance="guarded",
+            trace=trace,
+        )
+
+        self.assertEqual([tool.name for tool in filtered], ["message_reaction_action"])
+        self.assertEqual(trace["removed_by_stance"], ["proactive_meme", "proactive_poke"])
+        self.assertEqual(trace["filter_steps"][0]["category"], "stance")
+
+    def test_low_trust_filters_real_intrusive_tools(self):
+        modifier = self.expression_mod.ActionModifier()
+        relationship_vec = SimpleNamespace(social_score=50, trust=-20.0)
+        tools = [
+            _Tool("proactive_poke"),
+            _Tool("construct_at_event"),
+            _Tool("space_transition_action"),
+            _Tool("topic_hijack_action"),
+            _Tool("proactive_like_action"),
+            _Tool("message_reaction_action"),
+            _Tool("message_emoji_like_action"),
+        ]
+        trace = {}
+
+        filtered = modifier.modify_tools(
+            tools,
+            relationship_vec=relationship_vec,
+            tool_tier="chat",
+            trace=trace,
+        )
+
+        self.assertEqual(
+            [tool.name for tool in filtered],
+            ["message_reaction_action", "message_emoji_like_action"],
+        )
+        self.assertIn("low_trust(-20)", trace["filter_reasons"])
+        self.assertIn("proactive_poke", trace["removed_by_hostility"])
+
+    def test_guarded_stance_scales_follow_up_probability(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.gateway.config.reply.follow_up_probability = 1.0
+        mixin.state_engine = _FakeStateEngine(energy=0.8)
+        event = _FakeEvent(message="能再帮我看一下吗")
+        event.set_extra("astrmai_think_level", 1)
+        event.set_extra("astrmai_focus_reason", "direct_reply")
+        event.set_extra("astrmai_reply_need", "reply")
+        event.set_extra("astrmai_action_tier", "chat")
+        event.set_extra("astrmai_social_intent", "answer")
+        event.set_extra("astrmai_stance", "guarded")
+
+        calls = {}
+
+        async def _llm(*args, **kwargs):
+            calls["called"] = True
+            return {"follow": True, "reason": "extra_detail"}
+
+        mixin.gateway.call_data_process_task = _llm
+        original_random = self.side_inputs_mod.random.random
+        self.side_inputs_mod.random.random = lambda: 0.30
+        try:
+            result = asyncio.run(
+                mixin._should_follow_up(
+                    "default:GroupMessage:group-1",
+                    "我先把关键点拎出来再一起看",
+                    event=event,
+                    tools=None,
+                    decision=None,
+                )
+            )
+        finally:
+            self.side_inputs_mod.random.random = original_random
+
+        self.assertIsNone(result)
+        self.assertNotIn("called", calls)
+        trace = event.get_extra("astrmai_turn_context").follow_up
+        self.assertIn("stance_guarded", trace.signals)
+        self.assertIn("follow_up_probability_scaled:0.35", trace.signals)
+        self.assertEqual(trace.skipped_reason, "probability_gate")
 
     def test_all_mode_plain_chat_loads_chat_tier_and_tool_intent_loads_full_pfc_tools(self):
         mixin = self._prepare_tool_mixin()

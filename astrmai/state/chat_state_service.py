@@ -150,6 +150,31 @@ class StateEngine:
             return RelationshipEvent.NORMAL_CHAT
         return self.relationship_engine.classify_interaction_type(message_text)
 
+    def _resolve_no_send_affection_event_type(
+        self,
+        message_text: str,
+        *,
+        skipped_reason: str = "",
+        attack_confidence: float = 0.0,
+        risk_flags: list[str] | None = None,
+    ) -> RelationshipEvent | None:
+        event_type = self._resolve_affection_event_type(message_text)
+        if event_type in {
+            RelationshipEvent.INSULT,
+            RelationshipEvent.RUDENESS,
+            RelationshipEvent.ARGUMENT,
+            RelationshipEvent.SPAM,
+        }:
+            return event_type
+
+        normalized_reason = str(skipped_reason or "").strip().lower()
+        risk_set = {str(flag or "").strip().lower() for flag in (risk_flags or []) if str(flag or "").strip()}
+        if normalized_reason in {"ignore", "blocked", "stale", "send_failed"} and (
+            attack_confidence >= 0.5 or "direct_attack_to_bot" in risk_set
+        ):
+            return RelationshipEvent.ARGUMENT
+        return None
+
     @property
     def chat_states(self) -> Dict[str, ChatState]:
         return self.chat_state_service.chat_states
@@ -202,18 +227,79 @@ class StateEngine:
         mood_tag: str,
         intensity: float = 1.0,
         message_text: str = "",
+        event_type: str | None = None,
     ):
         profile = await self.get_user_profile(user_id)
         old_score = profile.social_score
-        event_type = self._resolve_affection_event_type(message_text)
+        resolved_event_type = event_type or self._resolve_affection_event_type(message_text)
+        if (
+            event_type is None
+            and self.relationship_engine.should_soften_support_event_for_message(message_text, resolved_event_type)
+        ):
+            resolved_event_type = RelationshipEvent.NORMAL_CHAT
+        effective_mood_tag = mood_tag
+        if (
+            event_type is None
+            and resolved_event_type == RelationshipEvent.NORMAL_CHAT
+            and self.relationship_engine.should_preserve_normal_chat_for_message(message_text, mood_tag)
+        ):
+            effective_mood_tag = ""
+        effective_intensity = intensity
+        if resolved_event_type == RelationshipEvent.NORMAL_CHAT:
+            effective_intensity *= self.relationship_engine.normal_chat_affection_intensity_bias(
+                message_text,
+                mood_tag,
+            )
+        elif resolved_event_type == RelationshipEvent.IGNORE:
+            effective_intensity *= self.relationship_engine.ignore_affection_intensity_bias(message_text)
+        effective_event_type = (
+            self.relationship_engine.MOOD_TO_EVENT.get(effective_mood_tag, resolved_event_type)
+            if effective_mood_tag and resolved_event_type == RelationshipEvent.NORMAL_CHAT
+            else resolved_event_type
+        )
         new_score = self.relationship_engine.process_event(
             user_id=user_id,
-            event_type=event_type,
-            intensity=intensity,
-            mood_tag=mood_tag,
+            event_type=effective_event_type,
+            intensity=effective_intensity,
+            mood_tag=effective_mood_tag,
         )
         await self.user_profile_service.update_social_score(user_id, new_score)
-        await self.affection_router.publish_change(user_id, old_score, new_score, mood_tag, event_type)
+        await self.affection_router.publish_change(
+            user_id,
+            old_score,
+            new_score,
+            effective_mood_tag,
+            effective_event_type,
+        )
+
+    async def settle_no_send_affection(
+        self,
+        user_id: str,
+        group_id: str,
+        message_text: str,
+        *,
+        skipped_reason: str = "",
+        attack_confidence: float = 0.0,
+        risk_flags: list[str] | None = None,
+        intensity: float = 0.75,
+    ) -> bool:
+        event_type = self._resolve_no_send_affection_event_type(
+            message_text,
+            skipped_reason=skipped_reason,
+            attack_confidence=attack_confidence,
+            risk_flags=risk_flags,
+        )
+        if not event_type:
+            return False
+        await self.calculate_and_update_affection(
+            user_id=user_id,
+            group_id=group_id,
+            mood_tag="neutral",
+            intensity=intensity,
+            message_text=message_text,
+            event_type=event_type,
+        )
+        return True
 
     async def should_drop_by_energy(self, chat_id: str, msg_count: int) -> bool:
         state = await self.get_state(chat_id)

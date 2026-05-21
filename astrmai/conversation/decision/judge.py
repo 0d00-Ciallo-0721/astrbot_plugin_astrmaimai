@@ -27,6 +27,8 @@ class Judge:
         self.DEFAULT_HISTORY_LIMIT = 8
         self.NORMAL_HISTORY_MAX_AGE_SECONDS = 900.0
         self.WAKEUP_HISTORY_MAX_AGE_SECONDS = 1800.0
+        self.PRIMARY_MOOD_MICROADJUST_THRESHOLD = 0.15
+        self.PRIMARY_MOOD_MICROADJUST_SCALE = 0.25
 
 # ==========================================
     # [新增 P1-T1] 动态行为修饰器
@@ -511,9 +513,25 @@ class Judge:
                 except (ValueError, TypeError):
                     mood_delta = 0.0
                     
-                if mood_delta != 0.0:
-                    new_mood = await self.state_engine.atomic_update_mood(chat_id, delta=mood_delta)
-                    logger.debug(f"[{chat_id}] 😃 接收消息后情绪更新: {mood_tag} (变动 {mood_delta:+.2f} -> {new_mood:.2f})")
+                effective_mood_delta = mood_delta
+                primary_mood_applied = bool(
+                    focus_event is not None
+                    and hasattr(focus_event, "get_extra")
+                    and focus_event.get_extra("astrmai_primary_mood_applied", False)
+                )
+                if primary_mood_applied:
+                    if abs(effective_mood_delta) < self.PRIMARY_MOOD_MICROADJUST_THRESHOLD:
+                        effective_mood_delta = 0.0
+                    else:
+                        effective_mood_delta *= self.PRIMARY_MOOD_MICROADJUST_SCALE
+                if effective_mood_delta != 0.0:
+                    new_mood = await self.state_engine.atomic_update_mood(chat_id, delta=effective_mood_delta)
+                    if focus_event is not None and hasattr(focus_event, "set_extra"):
+                        focus_event.set_extra("astrmai_judge_mood_delta", effective_mood_delta)
+                    logger.debug(
+                        f"[{chat_id}] 😃 接收消息后情绪更新: {mood_tag} "
+                        f"(judge_delta {mood_delta:+.2f} -> applied {effective_mood_delta:+.2f} -> {new_mood:.2f})"
+                    )
                 
                 if "FriendMessage" in chat_id and plan.action in ["WAIT", "IGNORE"]:
                     plan.action = "REPLY"

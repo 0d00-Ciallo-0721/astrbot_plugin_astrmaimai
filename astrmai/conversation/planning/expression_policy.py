@@ -40,6 +40,13 @@ class ActionModifier:
         'message_reaction_action',
         'message_emoji_like_action',
     }
+    LOW_TRUST_TOOLS = {
+        'proactive_poke',
+        'construct_at_event',
+        'space_transition_action',
+        'topic_hijack_action',
+        'proactive_like_action',
+    }
 
     INTIMATE_THRESHOLD = 20
     HOSTILE_THRESHOLD = -20
@@ -64,7 +71,7 @@ class ActionModifier:
         return [str(getattr(tool, 'name', '') or '').strip() for tool in tools or [] if str(getattr(tool, 'name', '') or '').strip()]
 
     def _trace_filter_step(self, trace, stage: str, before: List[Any], after: List[Any], reason: str, category: str = "") -> None:
-        if not trace:
+        if trace is None:
             return
         before_names = self._tool_names(before)
         after_names = self._tool_names(after)
@@ -90,6 +97,7 @@ class ActionModifier:
                 "cooldown": "removed_by_cooldown",
                 "caution": "removed_by_caution",
                 "social_intent": "removed_by_social_intent",
+                "stance": "removed_by_stance",
             }.get(str(category or ""))
             if bucket_name:
                 bucket = trace.setdefault(bucket_name, [])
@@ -105,6 +113,7 @@ class ActionModifier:
         relationship_vec=None,
         tool_tier: str = "full",
         social_intent: str = "",
+        stance: str = "",
         cooldown_tags: List[str] | None = None,
         trace=None,
         return_trace: bool = False,
@@ -120,10 +129,15 @@ class ActionModifier:
         reasons: List[str] = []
         normalized_tier = str(tool_tier or "full").lower()
         normalized_intent = str(social_intent or "").lower()
+        normalized_stance = str(stance or "").lower()
         cooldown_set = {str(tag or "").strip() for tag in (cooldown_tags or []) if str(tag or "").strip()}
-        if trace:
-            trace.social_intent = str(social_intent or "")
-            trace.final_tier = str(tool_tier or "")
+        if trace is not None:
+            if hasattr(trace, "social_intent"):
+                trace.social_intent = str(social_intent or "")
+                trace.final_tier = str(tool_tier or "")
+            elif isinstance(trace, dict):
+                trace["social_intent"] = str(social_intent or "")
+                trace["final_tier"] = str(tool_tier or "")
 
         score = 0
         if relationship_vec:
@@ -157,9 +171,8 @@ class ActionModifier:
                     self._trace_filter_step(trace, "action_modifier.relationship", before, filtered, reason, "hostility")
 
                 if relationship_vec and getattr(relationship_vec, 'trust', 0.0) < -10:
-                    trust_tools = {'proactive_advice', 'schedule_reminder'}
                     before = list(filtered)
-                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in trust_tools]
+                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in self.LOW_TRUST_TOOLS]
                     reason = f'low_trust({relationship_vec.trust:.0f})'
                     reasons.append(reason)
                     self._trace_filter_step(trace, "action_modifier.trust", before, filtered, reason, "hostility")
@@ -186,9 +199,8 @@ class ActionModifier:
                     self._trace_filter_step(trace, "action_modifier.relationship", before, filtered, reason, "hostility")
 
                 if relationship_vec and getattr(relationship_vec, 'trust', 0.0) < -10:
-                    trust_tools = {'proactive_advice', 'schedule_reminder'}
                     before = list(filtered)
-                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in trust_tools]
+                    filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in self.LOW_TRUST_TOOLS]
                     reason = f'low_trust({relationship_vec.trust:.0f})'
                     reasons.append(reason)
                     self._trace_filter_step(trace, "action_modifier.trust", before, filtered, reason, "hostility")
@@ -227,6 +239,22 @@ class ActionModifier:
             reasons.append(reason)
             self._trace_filter_step(trace, "action_modifier.query_guard", before, filtered, reason, "social_intent")
 
+        if normalized_stance in {"guarded", "cool"}:
+            stance_blocked_tools = {
+                'proactive_meme',
+                'meme_resonance_action',
+                'proactive_poke',
+                'construct_at_event',
+                'proactive_like_action',
+                'space_transition_action',
+                'topic_hijack_action',
+            }
+            before = list(filtered)
+            filtered = [tool for tool in filtered if getattr(tool, 'name', '') not in stance_blocked_tools]
+            reason = f'stance_{normalized_stance}_guard'
+            reasons.append(reason)
+            self._trace_filter_step(trace, "action_modifier.stance", before, filtered, reason, "stance")
+
         cooldown_tools = {
             'meme': {'proactive_meme', 'meme_resonance_action'},
             'poke': {'proactive_poke'},
@@ -245,9 +273,14 @@ class ActionModifier:
             reasons.append(reason)
             self._trace_filter_step(trace, "action_modifier.cooldown", before, filtered, reason, "cooldown")
 
-        if trace:
-            trace.filtered_tools = self._tool_names(filtered)
-            trace.filter_reasons = list(dict.fromkeys([*getattr(trace, "filter_reasons", []), *reasons]))
+        if trace is not None:
+            filtered_names = self._tool_names(filtered)
+            if hasattr(trace, "filtered_tools"):
+                trace.filtered_tools = filtered_names
+                trace.filter_reasons = list(dict.fromkeys([*getattr(trace, "filter_reasons", []), *reasons]))
+            elif isinstance(trace, dict):
+                trace["filtered_tools"] = filtered_names
+                trace["filter_reasons"] = list(dict.fromkeys([*(trace.get("filter_reasons", []) or []), *reasons]))
 
         if reasons:
             logger.info(

@@ -1,0 +1,244 @@
+{
+  "title": "Pre-release Full Test Report",
+  "generated_at": "2026-05-21T01:28:31",
+  "overall_status": "failed",
+  "release_ready": false,
+  "static_gate": {
+    "status": "passed",
+    "compiled_count": 989,
+    "failures": [],
+    "duration_seconds": 2.622
+  },
+  "local_regression": {
+    "status": "passed",
+    "groups": [
+      {
+        "returncode": 0,
+        "stdout_tail": "",
+        "stderr_tail": "----------------------------------------------------------------------\nRan 73 tests in 1.172s\n\nOK",
+        "name": "state_and_reply_chain",
+        "module_count": 8,
+        "modules": [
+          "tests.test_state_services_refactor",
+          "tests.test_attention_gate_refactor",
+          "tests.test_reply_service_refactor",
+          "tests.test_planner_side_inputs_refactor",
+          "tests.test_planner_cognitive_loop_refactor",
+          "tests.test_think_level_policy_refactor",
+          "tests.test_state_bar_audit_refactor",
+          "tests.test_host_mood_chain_audit_refactor"
+        ],
+        "status": "passed",
+        "duration_seconds": 1.417
+      },
+      {
+        "returncode": 0,
+        "stdout_tail": "",
+        "stderr_tail": "----------------------------------------------------------------------\nRan 60 tests in 0.872s\n\nOK",
+        "name": "scheduler_and_proactive",
+        "module_count": 5,
+        "modules": [
+          "tests.test_chat_loop_kernel_refactor",
+          "tests.test_proactive_scheduler_refactor",
+          "tests.test_scheduler_benchmark_refactor",
+          "tests.test_chat_runtime_coordinator_refactor",
+          "tests.test_external_result_bridge_refactor"
+        ],
+        "status": "passed",
+        "duration_seconds": 1.079
+      },
+      {
+        "returncode": 0,
+        "stdout_tail": "",
+        "stderr_tail": "----------------------------------------------------------------------\nRan 55 tests in 1.427s\n\nOK",
+        "name": "memory_review_learning_persona",
+        "module_count": 10,
+        "modules": [
+          "tests.test_memory_refactor",
+          "tests.test_learning_refactor",
+          "tests.test_learning_event_collaboration_refactor",
+          "tests.test_persona_context_refactor",
+          "tests.regression.review.test_review_service_migrated",
+          "tests.unit.learning.test_jargon_pipeline_migrated",
+          "tests.unit.learning.test_message_recorder_migrated",
+          "tests.unit.learning.test_mining_helpers_migrated",
+          "tests.unit.memory.test_memory_contracts_migrated",
+          "tests.unit.memory.test_memory_v2_services"
+        ],
+        "status": "passed",
+        "duration_seconds": 7.314
+      },
+      {
+        "returncode": 0,
+        "stdout_tail": "",
+        "stderr_tail": "D:\\py2024\\Lib\\site-packages\\jieba\\_compat.py:18: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html\n  import pkg_resources\nD:\\py2024\\Lib\\site-packages\\pkg_resources\\__init__.py:3142: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('google')`.\nImplementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages\n  declare_namespace(pkg)\nD:\\py2024\\Lib\\site-packages\\pkg_resources\\__init__.py:3142: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('sphinxcontrib')`.\nImplementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages\n  declare_namespace(pkg)\n----------------------------------------------------------------------\nRan 68 tests in 7.562s\n\nOK",
+        "name": "webui_plugin_fixture",
+        "module_count": 4,
+        "modules": [
+          "tests.test_webui_backend_refactor",
+          "tests.test_plugin_pages_admin_refactor",
+          "tests.test_scheduler_fixture_refactor",
+          "tests.regression.suites.test_phase_p2_minimal_suite"
+        ],
+        "status": "passed",
+        "duration_seconds": 8.412
+      },
+      {
+        "returncode": 0,
+        "stdout_tail": "",
+        "stderr_tail": "D:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.Jargon, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.SocialRelation, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.VisualMemory, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.MemoryNode, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.DailyReflection, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.MemoryEvent, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.MemoryRetrievalTrace, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\nD:\\py2024\\Lib\\site-packages\\sqlmodel\\main.py:682: SAWarning: This declarative base already contains a class with the same class name and module name as astrmai.infrastructure.persistence.orm_models.CronSnapshot, and will be replaced in the string-lookup table.\n  DeclarativeMeta.__init__(cls, classname, bases, dict_, **kw)\n----------------------------------------------------------------------\nRan 74 tests in 3.098s\n\nOK",
+        "name": "umbrella_regression_suites",
+        "module_count": 3,
+        "modules": [
+          "tests.regression.suites.test_phase_p0_minimal_suite",
+          "tests.regression.suites.test_phase_p1_minimal_suite",
+          "tests.regression.suites.test_phase_p2_minimal_suite"
+        ],
+        "status": "passed",
+        "duration_seconds": 9.183
+      },
+      {
+        "returncode": 0,
+        "stdout_tail": "",
+        "stderr_tail": "----------------------------------------------------------------------\nRan 17 tests in 2.440s\n\nOK",
+        "name": "architecture_contracts",
+        "module_count": 4,
+        "modules": [
+          "tests.regression.architecture.test_directory_contracts_refactor",
+          "tests.regression.architecture.test_import_boundaries_refactor",
+          "tests.regression.architecture.test_memory_runtime_boundaries_refactor",
+          "tests.regression.architecture.test_shared_test_support_refactor"
+        ],
+        "status": "passed",
+        "duration_seconds": 2.55
+      }
+    ]
+  },
+  "real_provider_core": {
+    "status": "failed",
+    "mood_artifact": "artifacts\\release_validation\\state_bar_audit\\p10_2_p10_3_audit_baseline.json",
+    "host_ingress_artifact": "artifacts\\release_validation\\state_bar_audit\\host_mood_chain_audit.json",
+    "host_post_send_artifact": "artifacts\\release_validation\\state_bar_audit\\host_reply_post_send_audit.json",
+    "mood_live_status": "not_run",
+    "mood_live_reason": "live mood audit disabled; set ASTRMAI_ENABLE_LIVE_MOOD_AUDIT=1 to run",
+    "host_ingress_matched": false,
+    "host_post_send_matched": false
+  },
+  "provider_matrix": {
+    "status": "not_run",
+    "models": [],
+    "recommended_models": [],
+    "backup_models": [],
+    "not_recommended_models": []
+  },
+  "plugin_model_pool": {
+    "status": "not_run",
+    "distinct_fallback_available": false
+  },
+  "fallback_validation": {
+    "status": "not_run"
+  },
+  "scheduler_admin_smoke": {
+    "status": "passed",
+    "fixture_summary": {
+      "db_path": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\scheduler_fixture\\astrmai.db",
+      "config_path": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\scheduler_fixture\\config.json",
+      "persona_cache_path": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\scheduler_fixture\\persona_cache.json",
+      "direct_open_harness_path": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\scheduler_fixture\\direct_open_plugin_page.html",
+      "profile": "admin_full",
+      "table_counts": {
+        "UserProfile": 3,
+        "user_profiles": 3,
+        "MemoryEvent": 3,
+        "canonical_memories": 6,
+        "DailyReflection": 2,
+        "MemoryNode": 2
+      },
+      "runtime_snapshots": 6,
+      "scheduler_selected_count": 0,
+      "pending_review_count": 1,
+      "memory_event_count": 3,
+      "user_count": 3,
+      "acceptance_baseline_dir": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\pages_acceptance\\20260519T221500Z-astrbot-plugin-host-check"
+    },
+    "capability_overview": {
+      "scheduler": {
+        "profiles": [
+          "dialogue_first",
+          "balanced",
+          "maintenance_friendly"
+        ],
+        "default_profile": "balanced",
+        "fixture_profile": "admin_full"
+      },
+      "memory": {
+        "enabled": true
+      },
+      "persona": {
+        "cache_ready": true
+      }
+    },
+    "runtime_status": {
+      "lifecycle_started": true,
+      "boot_phase": "running",
+      "degraded_components": {},
+      "memory_initialized": true,
+      "proactive_started": true
+    },
+    "pending_review_count": 1,
+    "recent_review_count": 2,
+    "scheduler_benchmark_dir": "artifacts\\release_validation\\scheduler_benchmarks\\20260520T172831Z-pre_release",
+    "page_acceptance_artifacts": [
+      "2026-05-19T14-17-17Z-astrbot-plugin-scheduler",
+      "20260508_201823",
+      "20260511_101103",
+      "20260519T134829Z-astrbot-plugin-scheduler",
+      "20260519T135036Z-astrbot-plugin-scheduler",
+      "20260519T221500Z-astrbot-plugin-host-check",
+      "20260519T230500Z-direct-open-admin-full",
+      "20260520T001500Z-dual-channel-acceptance",
+      "debug-astrbot-plugin",
+      "debug-login-flow"
+    ],
+    "host_acceptance_baseline_dir": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\pages_acceptance\\20260519T221500Z-astrbot-plugin-host-check"
+  },
+  "business_smoke": {
+    "status": "failed",
+    "cases": [
+      {
+        "name": "group_at_bot_normal_qa",
+        "status": "failed",
+        "evidence": "host_mood_chain_audit"
+      },
+      {
+        "name": "negative_or_sarcasm_input",
+        "status": "failed",
+        "evidence": "host_reply_post_send_audit"
+      },
+      {
+        "name": "tool_memory_intent",
+        "status": "failed",
+        "evidence": "live_mood_semantic_audit + local planner regressions"
+      },
+      {
+        "name": "private_chat_energy_exception_and_mood_update",
+        "status": "failed",
+        "evidence": "host_reply_post_send_audit + state/reply tests"
+      },
+      {
+        "name": "scheduler_and_proactive",
+        "status": "passed",
+        "evidence": "fresh scheduler benchmark + fixture runtime diagnostics"
+      },
+      {
+        "name": "admin_console_pages",
+        "status": "passed",
+        "evidence": "existing browser acceptance artifacts + current fixture smoke"
+      }
+    ]
+  },
+  "artifact_paths": {
+    "json_path": "artifacts\\release_validation\\pre_release_full_test_report.json",
+    "markdown_path": "artifacts\\release_validation\\pre_release_full_test_report.md"
+  }
+}

@@ -40,6 +40,10 @@ class PlannerSideInputMixin:
         "inquire": 600.0,
         "answer": 600.0,
     }
+    FOLLOW_UP_STANCE_MULTIPLIERS = {
+        "guarded": 0.35,
+        "cool": 0.60,
+    }
     TOOL_INTENT_KEYWORDS = {
         "查一下",
         "搜一下",
@@ -393,6 +397,7 @@ class PlannerSideInputMixin:
         explicit_tool_intent = self._has_tool_intent(event)
         requested_tier = str(event.get_extra("astrmai_action_tier", "") if hasattr(event, "get_extra") else "").strip().lower()
         social_intent = str(event.get_extra("astrmai_social_intent", "") if hasattr(event, "get_extra") else "").strip().lower()
+        stance = str(event.get_extra("astrmai_stance", "") if hasattr(event, "get_extra") else "").strip().lower()
         think_level = None
         if hasattr(event, "get_extra"):
             try:
@@ -411,6 +416,7 @@ class PlannerSideInputMixin:
         turn_tools.removed_by_cooldown = []
         turn_tools.removed_by_caution = []
         turn_tools.removed_by_social_intent = []
+        turn_tools.removed_by_stance = []
         if bool(event.get_extra("astrmai_is_proactive_event", False)):
             if requested_tier in {"full", "sys3"} or explicit_tool_intent:
                 turn_tools.record_step(
@@ -543,6 +549,7 @@ class PlannerSideInputMixin:
             relationship_vec=relationship_vec,
             tool_tier=event.get_extra("astrmai_tool_tier", "full") if hasattr(event, "get_extra") else getattr(event, "astrmai_tool_tier", "full"),
             social_intent=social_intent,
+            stance=stance,
             cooldown_tags=event.get_extra("astrmai_agency_cooldown_tags", []) if hasattr(event, "get_extra") else [],
             trace=turn_tools,
         )
@@ -736,6 +743,50 @@ class PlannerSideInputMixin:
         snapshot.reason = str(reason or "")
         snapshot.cooldown_until = float(cooldown_until or 0.0)
 
+    async def _settle_no_send_relationship_event(
+        self,
+        event: AstrMessageEvent | None,
+        chat_id: str,
+        *,
+        skipped_reason: str,
+    ) -> None:
+        if event is None or not hasattr(event, "get_extra"):
+            return
+        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            return
+        if self.state_engine is None or not hasattr(self.state_engine, "settle_no_send_affection"):
+            return
+        sender_getter = getattr(event, "get_sender_id", None)
+        sender_id = str(sender_getter() or "").strip() if callable(sender_getter) else ""
+        if not sender_id:
+            return
+        focus_event = event.get_extra("astrmai_focus_event", None)
+        anchor_event = event.get_extra("astrmai_anchor_event", None)
+        for candidate in [focus_event, anchor_event, event]:
+            message_text = str(getattr(candidate, "message_str", "") or "").strip() if candidate is not None else ""
+            if message_text:
+                break
+        else:
+            message_text = ""
+        if not message_text:
+            return
+        risk_flags = event.get_extra("astrmai_risk_flags", []) or []
+        try:
+            attack_confidence = float(event.get_extra("astrmai_attack_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            attack_confidence = 0.0
+        try:
+            await self.state_engine.settle_no_send_affection(
+                user_id=sender_id,
+                group_id=chat_id,
+                message_text=message_text,
+                skipped_reason=skipped_reason,
+                attack_confidence=attack_confidence,
+                risk_flags=risk_flags,
+            )
+        except Exception as exc:
+            logger.debug(f"[Planner] no-send relationship settlement skipped: {exc}")
+
     def _follow_up_cooldown_until(self, chat_id: str, now: float | None = None) -> float:
         cooldowns = getattr(self, "follow_up_cooldowns", None)
         if not isinstance(cooldowns, dict):
@@ -892,6 +943,14 @@ class PlannerSideInputMixin:
             follow_up_probability = 0.20
         follow_up_probability = max(0.0, min(1.0, follow_up_probability))
         effective_probability = self._follow_up_probability_for_intent(follow_up_probability, social_intent)
+        stance = str(getattr(decision, "stance", "") if decision else "").strip().lower()
+        if not stance and event is not None and hasattr(event, "get_extra"):
+            stance = str(event.get_extra("astrmai_stance", "") or "").strip().lower()
+        stance_multiplier = self.FOLLOW_UP_STANCE_MULTIPLIERS.get(stance, 1.0)
+        if stance_multiplier < 1.0:
+            signals.append(f"stance_{stance}")
+            effective_probability = max(0.0, min(1.0, effective_probability * stance_multiplier))
+            signals.append(f"follow_up_probability_scaled:{stance_multiplier:.2f}")
         if effective_probability <= 0.0:
             signals.append("follow_up_disabled")
             _skip("follow_up_disabled", probability=effective_probability)

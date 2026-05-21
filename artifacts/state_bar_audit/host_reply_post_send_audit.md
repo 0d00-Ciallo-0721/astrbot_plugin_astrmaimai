@@ -1,0 +1,161 @@
+# Host Reply Post Send Audit
+
+- status: `passed`
+- model: `stub-model`
+- all matched: `True`
+
+## Cases
+- `positive_short`
+  - host tag: `happy`
+  - text event: `emotional_support`
+  - effective event: `emotional_support`
+  - mood remap suppressed: `False`
+  - expected final mood: `0.6200`
+  - actual final mood: `0.6200`
+  - expected social_score: `1.6100`
+  - actual social_score: `1.6100`
+  - expected social direction: `positive`
+  - actual social direction: `positive`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `hostile_short`
+  - host tag: `angry`
+  - text event: `rudeness`
+  - effective event: `rudeness`
+  - mood remap suppressed: `False`
+  - expected final mood: `-0.8000`
+  - actual final mood: `-0.8000`
+  - expected social_score: `-1.5300`
+  - actual social_score: `-1.5300`
+  - expected social direction: `negative`
+  - actual social direction: `negative`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `mixed_short`
+  - host tag: `sad`
+  - text event: `normal_chat`
+  - effective event: `normal_chat`
+  - mood remap suppressed: `True`
+  - expected final mood: `-0.5500`
+  - actual final mood: `-0.5500`
+  - expected social_score: `0.2900`
+  - actual social_score: `0.2900`
+  - expected social direction: `positive`
+  - actual social direction: `positive`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `comfort_complaint_short`
+  - host tag: `sad`
+  - text event: `emotional_support`
+  - effective event: `normal_chat`
+  - mood remap suppressed: `True`
+  - expected final mood: `-0.5500`
+  - actual final mood: `-0.5500`
+  - expected social_score: `0.2900`
+  - actual social_score: `0.2900`
+  - expected social direction: `positive`
+  - actual social direction: `positive`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `ambiguous_soft_affection_short`
+  - host tag: `neutral`
+  - text event: `greeting`
+  - effective event: `greeting`
+  - mood remap suppressed: `False`
+  - expected final mood: `0.0000`
+  - actual final mood: `0.0000`
+  - expected social_score: `0.2300`
+  - actual social_score: `0.2300`
+  - expected social direction: `positive`
+  - actual social direction: `positive`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `tool_intent_short`
+  - host tag: `neutral`
+  - text event: `normal_chat`
+  - effective event: `normal_chat`
+  - mood remap suppressed: `False`
+  - expected final mood: `0.0000`
+  - actual final mood: `0.0000`
+  - expected social_score: `0.3600`
+  - actual social_score: `0.3600`
+  - expected social direction: `positive`
+  - actual social direction: `positive`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `sarcasm_short`
+  - host tag: `angry`
+  - text event: `normal_chat`
+  - effective event: `argument`
+  - mood remap suppressed: `False`
+  - expected final mood: `-0.8000`
+  - actual final mood: `-0.8000`
+  - expected social_score: `-1.5500`
+  - actual social_score: `-1.5500`
+  - expected social direction: `negative`
+  - actual social direction: `negative`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `cold_distance_short`
+  - host tag: `neutral`
+  - text event: `ignore`
+  - effective event: `ignore`
+  - mood remap suppressed: `False`
+  - expected final mood: `0.0000`
+  - actual final mood: `0.0000`
+  - expected social_score: `-0.2600`
+  - actual social_score: `-0.2600`
+  - expected social direction: `negative`
+  - actual social direction: `negative`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `perfunctory_brief_short`
+  - host tag: `neutral`
+  - text event: `ignore`
+  - effective event: `ignore`
+  - mood remap suppressed: `False`
+  - expected final mood: `0.0000`
+  - actual final mood: `0.0000`
+  - expected social_score: `-0.3400`
+  - actual social_score: `-0.3400`
+  - expected social direction: `negative`
+  - actual social direction: `negative`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `mild_irritation_short`
+  - host tag: `neutral`
+  - text event: `ignore`
+  - effective event: `ignore`
+  - mood remap suppressed: `False`
+  - expected final mood: `0.0000`
+  - actual final mood: `0.0000`
+  - expected social_score: `-0.4600`
+  - actual social_score: `-0.4600`
+  - expected social direction: `negative`
+  - actual social direction: `negative`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`
+- `long_mixed_balance_short`
+  - host tag: `sad`
+  - text event: `normal_chat`
+  - effective event: `normal_chat`
+  - mood remap suppressed: `True`
+  - expected final mood: `-0.5500`
+  - actual final mood: `-0.5500`
+  - expected social_score: `0.2900`
+  - actual social_score: `0.2900`
+  - expected social direction: `positive`
+  - actual social direction: `positive`
+  - amplitude issue: `none`
+  - mood matched: `True`
+  - social matched: `True`

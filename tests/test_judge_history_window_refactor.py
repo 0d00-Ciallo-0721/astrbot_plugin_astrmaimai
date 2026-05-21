@@ -24,6 +24,16 @@ class _FakeGateway:
         return SimpleNamespace(parsed_json={"action": "IGNORE", "reason": "noop", "relevance": 0, "necessity": 0.0})
 
 
+class _ResultGateway(_FakeGateway):
+    def __init__(self, parsed_json):
+        super().__init__()
+        self._parsed_json = dict(parsed_json)
+
+    async def chat_in_lane_result(self, **kwargs):
+        self.prompts.append(kwargs["prompt"])
+        return SimpleNamespace(parsed_json=dict(self._parsed_json))
+
+
 class _FakeStateEngine:
     def __init__(self, persistence):
         self.persistence = persistence
@@ -36,6 +46,16 @@ class _FakeStateEngine:
 
     async def atomic_update_mood(self, chat_id, delta=0.0):
         return 0.0
+
+
+class _CaptureStateEngine(_FakeStateEngine):
+    def __init__(self, persistence):
+        super().__init__(persistence)
+        self.mood_updates = []
+
+    async def atomic_update_mood(self, chat_id, delta=0.0):
+        self.mood_updates.append((chat_id, delta))
+        return delta
 
 
 class _LegacyHistoryPersistence:
@@ -81,6 +101,9 @@ class _FakeWindowEvent:
 
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
+
+    def set_extra(self, key, value):
+        self._extra[key] = value
 
 
 class JudgeHistoryWindowRefactorTests(unittest.TestCase):
@@ -214,6 +237,72 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
         self.assertEqual(flattened, "look [image][@mention]")
         self.assertNotIn("[鍥剧墖]", flattened)
         self.assertNotIn("[@鏌愪汉]", flattened)
+
+
+    def test_primary_mood_prepass_turns_small_judge_delta_into_microadjust(self):
+        gateway = _ResultGateway(
+            {
+                "action": "REPLY",
+                "reason": "reply",
+                "thought": "go on",
+                "relevance": 8,
+                "necessity": 8.0,
+                "retrieve_keys": [],
+                "mood_tag": "happy",
+                "mood_delta": 0.1,
+            }
+        )
+        state_engine = _CaptureStateEngine(_LegacyHistoryPersistence())
+        judge = self.mod.Judge(gateway, state_engine, config=gateway.config)
+        focus_event = _FakeWindowEvent("FocusUser", "current message", time.time())
+        focus_event._extra["astrmai_primary_mood_applied"] = True
+
+        asyncio.run(
+            judge.evaluate(
+                chat_id="default:GroupMessage:group-1",
+                message="FocusUser: current message",
+                is_force_wakeup=False,
+                persona_summary="persona summary",
+                window_events_count=1,
+                window_events=[focus_event],
+                focus_event=focus_event,
+            )
+        )
+
+        self.assertEqual(state_engine.mood_updates, [])
+
+    def test_primary_mood_prepass_scales_large_judge_delta(self):
+        gateway = _ResultGateway(
+            {
+                "action": "REPLY",
+                "reason": "reply",
+                "thought": "go on",
+                "relevance": 8,
+                "necessity": 8.0,
+                "retrieve_keys": [],
+                "mood_tag": "angry",
+                "mood_delta": -0.4,
+            }
+        )
+        state_engine = _CaptureStateEngine(_LegacyHistoryPersistence())
+        judge = self.mod.Judge(gateway, state_engine, config=gateway.config)
+        focus_event = _FakeWindowEvent("FocusUser", "current message", time.time())
+        focus_event._extra["astrmai_primary_mood_applied"] = True
+
+        asyncio.run(
+            judge.evaluate(
+                chat_id="default:GroupMessage:group-1",
+                message="FocusUser: current message",
+                is_force_wakeup=False,
+                persona_summary="persona summary",
+                window_events_count=1,
+                window_events=[focus_event],
+                focus_event=focus_event,
+            )
+        )
+
+        self.assertEqual(state_engine.mood_updates, [("default:GroupMessage:group-1", -0.1)])
+        self.assertAlmostEqual(focus_event.get_extra("astrmai_judge_mood_delta"), -0.1)
 
 
 if __name__ == "__main__":

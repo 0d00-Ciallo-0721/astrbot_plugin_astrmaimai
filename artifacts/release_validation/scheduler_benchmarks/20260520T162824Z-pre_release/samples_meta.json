@@ -1,0 +1,16 @@
+{
+  "label": "pre_release",
+  "generated_at": 1779294504.6937697,
+  "scenario_names": [
+    "hot_dialogue_pressure",
+    "maintenance_backlog",
+    "busy_executor_pressure",
+    "retry_pressure_mix",
+    "forced_promotion_pressure"
+  ],
+  "profile_names": [
+    "dialogue_first",
+    "balanced",
+    "maintenance_friendly"
+  ]
+}

@@ -66,6 +66,125 @@ class ReplyArtifactMixin:
             logger.warning("[ReplyService] sanitized reply text before sending")
         return cleaned
 
+    @staticmethod
+    def _reply_stance(event: AstrMessageEvent | None) -> str:
+        if event is None or not hasattr(event, "get_extra"):
+            return ""
+        return str(event.get_extra("astrmai_stance", "") or "").strip().lower()
+
+    @staticmethod
+    def _reply_social_intent(event: AstrMessageEvent | None) -> str:
+        if event is None or not hasattr(event, "get_extra"):
+            return ""
+        return str(event.get_extra("astrmai_social_intent", "") or "").strip().lower()
+
+    @staticmethod
+    def _reply_sentence_chunks(text: str) -> List[str]:
+        if not text:
+            return []
+        chunks = re.findall(r".*?(?:[。！？!?]+(?:[\"'”’」』]*)|$)", str(text or "").strip(), re.DOTALL)
+        return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+
+    @staticmethod
+    def _looks_like_extension_question(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        if stripped.endswith(("?", "？")):
+            return True
+        return any(
+            marker in stripped.lower()
+            for marker in (
+                "要不要",
+                "还要",
+                "还想",
+                "可以吗",
+                "行吗",
+                "好吗",
+                "要吗",
+                "want to",
+                "do you want",
+                "would you like",
+                "can you",
+            )
+        )
+
+    @staticmethod
+    def _trim_text_with_cap(text: str, char_cap: int) -> str:
+        normalized = str(text or "").strip()
+        if len(normalized) <= char_cap:
+            return normalized
+        window = normalized[:char_cap]
+        split_positions = [window.rfind(token) for token in ("。", "！", "？", ".", "!", "?", "，", ",", "；", ";")]
+        best = max(split_positions)
+        if best >= max(12, char_cap // 2):
+            return window[: best + 1].strip()
+        return window.rstrip(" ,，;；") + "..."
+
+    @staticmethod
+    def _stance_first_reply_profile(stance: str, social_intent: str) -> tuple[int, int]:
+        intent = social_intent if social_intent in {"boundary", "observe", "answer", "comfort"} else "answer"
+        profiles = {
+            "guarded": {
+                "boundary": (1, 28),
+                "observe": (1, 32),
+                "answer": (1, 38),
+                "comfort": (2, 48),
+            },
+            "cool": {
+                "boundary": (1, 34),
+                "observe": (1, 40),
+                "answer": (2, 60),
+                "comfort": (2, 72),
+            },
+        }
+        return profiles[stance][intent]
+
+    def _apply_stance_first_reply_constraints(
+        self,
+        text: str,
+        *,
+        event: AstrMessageEvent | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        stance = self._reply_stance(event)
+        if stance not in {"guarded", "cool"}:
+            return text, {}
+
+        social_intent = self._reply_social_intent(event)
+        sentence_cap, char_cap = self._stance_first_reply_profile(stance, social_intent)
+        original = str(text or "").strip()
+        sentences = self._reply_sentence_chunks(original)
+        reasons: list[str] = []
+
+        if len(sentences) > 1 and self._looks_like_extension_question(sentences[-1]):
+            sentences = sentences[:-1]
+            reasons.append("trimmed_trailing_question")
+        if len(sentences) > sentence_cap:
+            sentences = sentences[:sentence_cap]
+            reasons.append("capped_sentence_count")
+
+        separator = "" if any(token in original for token in ("。", "！", "？")) else " "
+        constrained = separator.join(sentences).strip() if sentences else original
+        trimmed = self._trim_text_with_cap(constrained, char_cap)
+        if trimmed != constrained:
+            reasons.append("capped_character_count")
+        constrained = trimmed
+        constrained = re.sub(r"([!！~～])\1+", r"\1", constrained)
+        constrained = re.sub(r"\s{2,}", " ", constrained).strip()
+
+        if constrained == original:
+            return original, {}
+        return constrained, {
+            "stance_clamp_applied": True,
+            "stance_clamp_reason": ",".join(reasons) or "stance_first_reply_constraint",
+            "stance_before_len": len(original),
+            "stance_after_len": len(constrained),
+            "stance": stance,
+            "stance_social_intent": social_intent or "answer",
+            "stance_sentence_cap": sentence_cap,
+            "stance_char_cap": char_cap,
+        }
+
     def _single_segment(self, text: str) -> List[str]:
         cleaned = re.sub(r"^\n+|\n+$", "", text.strip())
         return [cleaned] if cleaned else []
@@ -115,6 +234,7 @@ class ReplyArtifactMixin:
         self,
         text: str,
         *,
+        event: AstrMessageEvent | None = None,
         reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP,
         freshness_state: FreshnessState = FreshnessState.FRESH,
         stale_reason: str = "",
@@ -142,6 +262,7 @@ class ReplyArtifactMixin:
             clean_text = self._clean_reply_content(text)
         if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE and policy.late_rewrite_allowed:
             clean_text = self._rewrite_late_reply(reply_mode, clean_text)
+        clean_text, stance_metadata = self._apply_stance_first_reply_constraints(clean_text, event=event)
         if not clean_text:
             return VisibleReplyArtifact(
                 visible_text="",
@@ -185,6 +306,7 @@ class ReplyArtifactMixin:
                 "segment_strategy": policy.segment_strategy,
                 "segment_reason": segment_reason,
                 "delay_profile": "proactive" if is_proactive else policy.send_delay_profile,
+                **stance_metadata,
             },
         )
 

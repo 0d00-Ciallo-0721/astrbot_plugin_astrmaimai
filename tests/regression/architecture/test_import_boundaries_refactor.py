@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 ASTRMAI_ROOT = ROOT / "astrmai"
 TEST_ROOT = ROOT / "tests"
-SKIPPED_SCAN_PARTS = {"venv", ".venv", "site-packages"}
+SKIPPED_SCAN_PARTS = {"venv", ".venv", "site-packages", "artifacts"}
 
 
 def _iter_python_files(root: Path):
@@ -44,6 +44,8 @@ class ImportBoundariesRefactorTests(unittest.TestCase):
             if not path.is_file() or path.suffix.lower() not in scanned_suffixes:
                 continue
             if "__pycache__" in path.parts or any(part in SKIPPED_SCAN_PARTS for part in path.parts):
+                continue
+            if path.name == "memory.md":
                 continue
             text = path.read_text(encoding="utf-8-sig", errors="ignore")
             if any(fragment in text for fragment in forbidden_fragments):

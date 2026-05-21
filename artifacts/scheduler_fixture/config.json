@@ -1,5 +1,9 @@
 {
   "global_settings": {
-    "webui_password": "astrmai_admin"
+    "webui_password": "astrmai_admin",
+    "fixture_profile": "admin_full"
+  },
+  "persona": {
+    "persona_id": "fixture-persona"
   }
 }

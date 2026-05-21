@@ -42,6 +42,25 @@ class AttentionDecisionRouter:
     ) -> AttentionDecision:
         if is_strong_wakeup or not self.gate.judge or not hasattr(self.gate.judge, "evaluate"):
             return AttentionDecision(action="PASS", raw_action="PASS", reason="skip_judge")
+        if (
+            focus_event is not None
+            and hasattr(focus_event, "get_extra")
+            and hasattr(focus_event, "set_extra")
+            and not bool(focus_event.get_extra("astrmai_is_proactive_event", False))
+            and not bool(focus_event.get_extra("astrmai_primary_mood_applied", False))
+            and hasattr(self.gate, "state_engine")
+            and hasattr(self.gate.state_engine, "update_mood")
+        ):
+            focus_text = str(getattr(focus_event, "message_str", "") or "").strip()
+            if focus_text:
+                try:
+                    mood_tag, mood_value = await self.gate.state_engine.update_mood(chat_id, focus_text)
+                    focus_event.set_extra("astrmai_primary_mood_applied", True)
+                    focus_event.set_extra("astrmai_primary_mood_tag", str(mood_tag or "neutral"))
+                    focus_event.set_extra("astrmai_primary_mood_value", float(mood_value))
+                    focus_event.set_extra("astrmai_primary_mood_source", "attention_pre_judge")
+                except Exception as exc:
+                    logger.debug(f"[AttentionGate] primary mood update degraded: {exc}")
         message = self.build_judge_window_message(events) or str(getattr(focus_event, "message_str", "") or "")
         try:
             result = await asyncio.wait_for(

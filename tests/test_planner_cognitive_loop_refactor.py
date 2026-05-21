@@ -232,6 +232,38 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
                 self.assertEqual(planner.turn_trace_history[0]["status"], f"skipped_{action}")
                 self.assertEqual(planner.turn_trace_history[0]["cognitive"]["action"], action)
 
+    def test_planner_settles_no_send_relationship_for_negative_ignore_turn(self):
+        observed = {}
+
+        class _StateEngine:
+            async def settle_no_send_affection(self, **kwargs):
+                observed.update(kwargs)
+                return True
+
+        decision = self.planner_mod.CognitiveDecision(
+            action="ignore",
+            reply_need="ignore",
+            intent="hold",
+            memory_policy="light",
+            social_intent="boundary",
+            action_tier="none",
+            risk_flags=["direct_attack_to_bot"],
+            attack_confidence=0.91,
+        )
+        planner = self._make_planner(decision)
+        planner.state_engine = _StateEngine()
+        planner.cognitive_loop = _FakeLoop(decision)
+        event = _FakeEvent(text="你这个废物闭嘴")
+        _install_focus_extras(event)
+
+        result = asyncio.run(planner.plan_and_execute(event, [event]))
+
+        self.assertEqual(result, "")
+        self.assertEqual(observed["user_id"], "user-1")
+        self.assertEqual(observed["group_id"], event.unified_msg_origin)
+        self.assertEqual(observed["message_text"], "你这个废物闭嘴")
+        self.assertEqual(observed["skipped_reason"], "ignore")
+
     def test_planner_routes_tool_call_decision_into_sys3_tool_mode(self):
         decision = self.planner_mod.CognitiveDecision(
             action="tool_call",
@@ -317,6 +349,7 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         guidance_text = "\n".join(envelope.guidance_lines)
         self.assertIn("克制反驳", guidance_text)
         self.assertIn("不辱骂", guidance_text)
+        self.assertIn("Keep this turn brief and avoid proactive expansion.", guidance_text)
         summary = planner.agency_runtime.summary(event.unified_msg_origin)
         self.assertIn("pushback", summary)
         self.assertIn("sharp_reply", summary)

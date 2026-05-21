@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+import os
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -73,6 +74,50 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         self.assertIn("from .routes import api_router", content)
         self.assertIn("app.include_router(api_router, prefix=\"/api\")", content)
+
+    def test_plugin_api_adapter_default_paths_follow_env_at_instantiation_time(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = str(Path(tmp_dir) / "config.json")
+            schema_path = str(Path(tmp_dir) / "schema.json")
+            persona_cache_path = str(Path(tmp_dir) / "persona.json")
+            original = {
+                "ASTRMAI_CONFIG_PATH": os.environ.get("ASTRMAI_CONFIG_PATH"),
+                "ASTRMAI_CONF_SCHEMA_PATH": os.environ.get("ASTRMAI_CONF_SCHEMA_PATH"),
+                "ASTRMAI_PERSONA_CACHE_PATH": os.environ.get("ASTRMAI_PERSONA_CACHE_PATH"),
+            }
+            try:
+                os.environ["ASTRMAI_CONFIG_PATH"] = config_path
+                os.environ["ASTRMAI_CONF_SCHEMA_PATH"] = schema_path
+                os.environ["ASTRMAI_PERSONA_CACHE_PATH"] = persona_cache_path
+                adapter = adapter_mod.PluginApiAdapter()
+            finally:
+                for key, value in original.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        self.assertEqual(adapter.config_path, config_path)
+        self.assertEqual(adapter.schema_path, schema_path)
+        self.assertEqual(adapter.persona_cache_path, persona_cache_path)
+
+    def test_auth_secret_follows_env_at_runtime(self):
+        auth_mod = importlib.import_module("astrmai.webui.backend.auth")
+        original = os.environ.get("ASTRMAI_WEBUI_SECRET")
+        try:
+            os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-one"
+            token = auth_mod.create_token("codex")
+            self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
+
+            os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-two"
+            with self.assertRaises(Exception):
+                auth_mod.verify_token(token)
+        finally:
+            if original is None:
+                os.environ.pop("ASTRMAI_WEBUI_SECRET", None)
+            else:
+                os.environ["ASTRMAI_WEBUI_SECRET"] = original
 
     def test_memory_ui_service_writes_real_schema_columns(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")

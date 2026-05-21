@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..paths import default_config_path, default_persona_cache_path, default_schema_path
@@ -30,9 +30,9 @@ def get_active_facade() -> Any:
 @dataclass(slots=True)
 class PluginApiAdapter:
     facade: Any = None
-    config_path: str = default_config_path()
-    schema_path: str = default_schema_path()
-    persona_cache_path: str = default_persona_cache_path()
+    config_path: str = field(default_factory=default_config_path)
+    schema_path: str = field(default_factory=default_schema_path)
+    persona_cache_path: str = field(default_factory=default_persona_cache_path)
 
     def __post_init__(self) -> None:
         if self.facade is None:

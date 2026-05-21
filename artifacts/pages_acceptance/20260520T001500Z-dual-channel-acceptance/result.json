@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-05-20T00:15:00+08:00",
+  "summary": "Dual-channel acceptance passed using AstrBot host mounting evidence plus admin_full direct-open fine-grained page validation.",
+  "channels": {
+    "host_mount": {
+      "status": "pass",
+      "evidence_dir": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\pages_acceptance\\20260519T221500Z-astrbot-plugin-host-check",
+      "checks": {
+        "host_reachable": "pass",
+        "plugin_route_opened": "pass",
+        "iframe_rendered": "pass",
+        "bridge_connected_visible": "pass",
+        "dashboard_render_visible": "pass",
+        "cognition_subtab_visible": "pass"
+      },
+      "blocked_followups": [
+        "scheduler_panel_structure",
+        "scheduler_polling_5s",
+        "empty_state_chat_drilldown"
+      ],
+      "blocker": {
+        "type": "iframe_runtime_boundary",
+        "message": "@chrome cannot enter AstrBot cross-process iframe.plugin-page-frame"
+      }
+    },
+    "direct_open_admin_full": {
+      "status": "pass",
+      "evidence_dir": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\pages_acceptance\\20260519T230500Z-direct-open-admin-full",
+      "fixture_profile": "admin_full",
+      "checks": {
+        "bridge_stub_connected": "pass",
+        "scheduler_panel_first_section": "pass",
+        "cognition_polling_stable": "pass",
+        "empty_state_drilldown": "pass",
+        "reviews_render": "pass",
+        "memories_render": "pass",
+        "users_render": "pass",
+        "persona_render": "pass"
+      }
+    }
+  },
+  "final_conclusion": {
+    "new_confirmed_page_logic_bugs": false,
+    "remaining_limit_is_tool_boundary": true,
+    "note": "Remaining host-page automation blind spot is caused by iframe tooling limits rather than a confirmed AstrMai page defect."
+  },
+  "recommended_strategy": [
+    "Use AstrBot host acceptance to verify integration mounting and bridge injection.",
+    "Use direct-open acceptance with admin_full seed to verify fine-grained page structure, polling, drill-down, and seeded content rendering."
+  ]
+}

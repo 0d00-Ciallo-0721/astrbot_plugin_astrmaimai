@@ -12,6 +12,58 @@ from ...state.relationship.affection_router import AffectionRouter
 
 
 class ReplyPostSendMixin:
+    @staticmethod
+    def _resolve_affection_message_text(event: AstrMessageEvent, anchor_event: AstrMessageEvent | None = None) -> str:
+        candidates = [
+            anchor_event,
+            event.get_extra("astrmai_focus_event", None),
+            event.get_extra("astrmai_focus_thread_root_event", None),
+            event.get_extra("astrmai_anchor_event", None),
+            event,
+        ]
+        for candidate in candidates:
+            text = str(getattr(candidate, "message_str", "") or "").strip() if candidate is not None else ""
+            if text:
+                return text
+        return ""
+
+    async def _settle_no_send_affection(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        *,
+        skipped_reason: str,
+        anchor_event: AstrMessageEvent | None = None,
+    ) -> None:
+        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            return
+        state_engine = getattr(self, "state_engine", None)
+        if state_engine is None or not hasattr(state_engine, "settle_no_send_affection"):
+            return
+        sender_id = str(event.get_sender_id() or "").strip() if hasattr(event, "get_sender_id") else ""
+        if not sender_id:
+            return
+        message_text = self._resolve_affection_message_text(event, anchor_event=anchor_event)
+        if not message_text:
+            return
+        attack_confidence = 0.0
+        try:
+            attack_confidence = float(event.get_extra("astrmai_attack_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            attack_confidence = 0.0
+        risk_flags = event.get_extra("astrmai_risk_flags", []) or []
+        try:
+            await state_engine.settle_no_send_affection(
+                user_id=sender_id,
+                group_id=chat_id,
+                message_text=message_text,
+                skipped_reason=skipped_reason,
+                attack_confidence=attack_confidence,
+                risk_flags=risk_flags,
+            )
+        except Exception as exc:
+            logger.warning(f"[ReplyService] no-send affection settlement failed: {exc}")
+
     async def _fetch_history(self, chat_id: str, anchor_text: str, anchor_event: AstrMessageEvent = None) -> list:
         del anchor_event
         fetch_count = getattr(self.config.attention, "bg_pool_size", 20) if self.config else 20
@@ -134,6 +186,7 @@ class ReplyPostSendMixin:
         anchor_event: AstrMessageEvent | None,
     ) -> None:
         tag, force_meme_flag = self._resolve_post_send_tag(bypassed_tag)
+        is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
         try:
             await self.state_engine.atomic_update_mood(chat_id, delta=0.0 if not bypassed_tag else (0.1 if tag == "happy" else -0.1 if tag in ["sad", "angry"] else 0.0))
             is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
@@ -143,20 +196,23 @@ class ReplyPostSendMixin:
                     chat_id=chat_id,
                     sender_name=str(event.get_sender_name() or ""),
                 )
-            target_user_id = await self._collect_affection_target(
-                event,
-                chat_id,
-                tag,
-                window_events=window_events,
-                anchor_event=anchor_event,
-            )
-            if target_user_id and hasattr(self.state_engine, "calculate_and_update_affection"):
-                await self.state_engine.calculate_and_update_affection(
-                    user_id=str(target_user_id),
-                    group_id=chat_id,
-                    mood_tag=tag,
-                    intensity=1.0,
+            if not is_proactive_event:
+                target_user_id = await self._collect_affection_target(
+                    event,
+                    chat_id,
+                    tag,
+                    window_events=window_events,
+                    anchor_event=anchor_event,
                 )
+                if target_user_id and hasattr(self.state_engine, "calculate_and_update_affection"):
+                    message_text = self._resolve_affection_message_text(event, anchor_event=anchor_event)
+                    await self.state_engine.calculate_and_update_affection(
+                        user_id=str(target_user_id),
+                        group_id=chat_id,
+                        mood_tag=tag,
+                        intensity=1.0,
+                        message_text=message_text,
+                    )
         except Exception as exc:
             logger.warning(f"[ReplyService] post-send settlement failed: {exc}")
             tag = "neutral"
