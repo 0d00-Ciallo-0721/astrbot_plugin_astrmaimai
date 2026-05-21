@@ -410,6 +410,35 @@ class ContextRuntimeWiringTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_chat_trace_events_prefers_raw_trace_store(self):
+        admin_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        raw_store_mod = importlib.import_module("astrmai.infrastructure.runtime.raw_trace_store")
+
+        async def run():
+            store = raw_store_mod.RawTraceEventStore(self.temp_dir.name, max_per_chat=50)
+            await store.append_many(
+                "chat-1",
+                [
+                    {
+                        "created_at": 456.0,
+                        "chat_id": "chat-1",
+                        "trace_id": "trace-1",
+                        "stage": "execution.executor.model_failure",
+                        "failure_kind": "provider_failure_text",
+                        "attempted_models": ["model-a", "model-b"],
+                    }
+                ],
+            )
+            runtime = SimpleNamespace(system2_planner=SimpleNamespace(turn_trace_history=[], turn_trace_store=None, raw_trace_store=store))
+            plugin_api = SimpleNamespace(get_runtime=lambda: runtime)
+            service = admin_mod.AdminUiService(plugin_api)
+            result = await service.chat_trace_events("chat-1", limit=10)
+            self.assertEqual(result["total"], 1)
+            self.assertEqual(result["items"][0]["stage"], "execution.executor.model_failure")
+            self.assertEqual(result["items"][0]["failure_evidence"]["failure_kind"], "provider_failure_text")
+
+        asyncio.run(run())
+
     def test_planner_trace_runtime_reads_store_fields_without_threadsafe_bridge(self):
         planner_mod = importlib.import_module("astrmai.conversation.planning.planner")
 

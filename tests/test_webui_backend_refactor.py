@@ -592,10 +592,11 @@ class WebuiBackendRefactorTests(unittest.TestCase):
     def test_admin_service_exposes_runtime_and_observability_summaries(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        raw_store_mod = importlib.import_module("astrmai.infrastructure.runtime.raw_trace_store")
 
         class _Planner:
-            cognitive_decision_history = [{"chat_id": "chat-1", "social_intent": "join"}]
-            tool_trace_history = [{"chat_id": "chat-1", "tool_tier": "chat", "tool_count": 2}]
+            cognitive_decision_history = [{"chat_id": "chat-1", "social_intent": "join", "failure_kind": "provider_failure_text", "attempted_models": ["model-a", "model-b"], "raw_completion": "request id: 1"}]
+            tool_trace_history = [{"chat_id": "chat-1", "tool_tier": "chat", "tool_count": 2, "protocol_passthrough": True, "protocol_type": "terminal_yield"}]
             turn_trace_history = [{"chat_id": "chat-1", "status": "executed", "tools": {"final_tier": "chat"}}]
 
         class _HeartflowManager:
@@ -621,42 +622,68 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             def list_digests(self, limit=50):
                 return [SimpleNamespace(chat_id="chat-1", timestamp=3.0, status="written", source="heartflow_topic_digest")][:limit]
 
-        class _Runtime:
-            system2_planner = _Planner()
-            proactive_task = SimpleNamespace(
-                heartflow_manager=_HeartflowManager(),
-                heartflow_topic_digest_service=_TopicDigestService(),
-            )
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                raw_store = raw_store_mod.RawTraceEventStore(tmp_dir, max_per_chat=50)
+                await raw_store.append_many(
+                    "chat-1",
+                    [
+                        {
+                            "created_at": 123.0,
+                            "chat_id": "chat-1",
+                            "trace_id": "trace-1",
+                            "stage": "execution.executor.model_failure",
+                            "failure_kind": "provider_failure_text",
+                            "attempted_models": ["model-a"],
+                        }
+                    ],
+                )
 
-            def build_diagnostics(self):
-                return {"status": {"lifecycle_started": True, "degraded_components": {}}}
+                class _Runtime:
+                    system2_planner = _Planner()
+                    proactive_task = SimpleNamespace(
+                        heartflow_manager=_HeartflowManager(),
+                        heartflow_topic_digest_service=_TopicDigestService(),
+                    )
 
-            def build_capability_overview_sync(self):
-                return {"proactive": {"enabled": True}}
+                    def build_diagnostics(self):
+                        return {"status": {"lifecycle_started": True, "degraded_components": {}}}
 
-        class _Facade:
-            runtime = _Runtime()
+                    def build_capability_overview_sync(self):
+                        return {"proactive": {"enabled": True}}
 
-            def get_runtime_diagnostics(self):
-                return self.runtime.build_diagnostics()
+                _Runtime.system2_planner.raw_trace_store = raw_store
 
-            async def get_capability_overview(self):
-                return self.runtime.build_capability_overview_sync()
+                class _Facade:
+                    runtime = _Runtime()
 
-        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
-        status = asyncio.run(service.runtime_status())
+                    def get_runtime_diagnostics(self):
+                        return self.runtime.build_diagnostics()
+
+                    async def get_capability_overview(self):
+                        return self.runtime.build_capability_overview_sync()
+
+                service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+                status = await service.runtime_status()
+                decisions = await service.recent_decisions(chat_id="chat-1")
+                tools = await service.recent_tool_traces(chat_id="chat-1")
+                turns = await service.recent_turn_traces(chat_id="chat-1")
+                trace_events = await service.chat_trace_events("chat-1")
+                impulses = await service.heartflow_impulses(chat_id="chat-1")
+                timeline = await service.heartflow_timeline(chat_id="chat-1")
+                digests = await service.heartflow_topic_digests()
+                return status, decisions, tools, turns, trace_events, impulses, timeline, digests
+
+        status, decisions, tools, turns, trace_events, impulses, timeline, digests = asyncio.run(_run())
         self.assertTrue(status["runtime_bound"])
-        decisions = asyncio.run(service.recent_decisions(chat_id="chat-1"))
         self.assertEqual(decisions["items"][0]["social_intent"], "join")
-        tools = asyncio.run(service.recent_tool_traces(chat_id="chat-1"))
+        self.assertEqual(decisions["items"][0]["failure_evidence"]["failure_kind"], "provider_failure_text")
         self.assertEqual(tools["items"][0]["tool_tier"], "chat")
-        turns = asyncio.run(service.recent_turn_traces(chat_id="chat-1"))
+        self.assertTrue(tools["items"][0]["failure_evidence"]["protocol_passthrough"])
         self.assertEqual(turns["items"][0]["tools"]["final_tier"], "chat")
-        impulses = asyncio.run(service.heartflow_impulses(chat_id="chat-1"))
+        self.assertEqual(trace_events["items"][0]["failure_evidence"]["failure_kind"], "provider_failure_text")
         self.assertTrue(impulses["items"][0]["visible_candidate_allowed"])
-        timeline = asyncio.run(service.heartflow_timeline(chat_id="chat-1"))
         self.assertEqual(timeline["items"][0]["kind"], "action")
-        digests = asyncio.run(service.heartflow_topic_digests())
         self.assertEqual(digests["items"][0]["source"], "heartflow_topic_digest")
 
     def test_admin_service_exposes_context_economy_template_metrics(self):
@@ -912,6 +939,34 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("setContextEconomyQuickView", js)
         self.assertIn("/cognition/context-economy/templates?", js)
         self.assertIn("provider_session_reuse_rate", html)
+        self.assertIn("chatTraceEvents", html)
+        self.assertIn("Raw Trace Events", html)
+        self.assertIn("summarizeFailureEvidence", js)
+        self.assertIn("/cognition/chats/${encodedChat}/trace-events?limit=40", js)
+
+    def test_chat_trace_events_falls_back_to_turn_trace_embedded_log(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Planner:
+            turn_trace_history = [{
+                "chat_id": "chat-1",
+                "status": "executed",
+                "astrmai_trace_log": [{"stage": "execution.executor.model_pool_exhausted", "last_failure_kind": "provider_failure_text", "attempted_models": ["model-a", "model-b"]}],
+            }]
+            raw_trace_store = None
+
+        class _Runtime:
+            system2_planner = _Planner()
+
+        class _Facade:
+            runtime = _Runtime()
+
+        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        result = asyncio.run(service.chat_trace_events("chat-1"))
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["stage"], "execution.executor.model_pool_exhausted")
+        self.assertEqual(result["items"][0]["failure_evidence"]["failure_kind"], "provider_failure_text")
 
     def test_review_ui_service_is_canonical_first_and_degrades_to_readonly_when_runtime_missing(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.review_ui_service")

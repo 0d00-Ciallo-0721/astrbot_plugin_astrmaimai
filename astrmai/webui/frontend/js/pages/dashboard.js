@@ -36,6 +36,7 @@ function dashboardPage() {
         chatTraceLoading: false,
         chatDecisions: [],
         chatToolCalls: [],
+        chatTraceEvents: [],
 
         async init() {
             window.addEventListener('hashchange', () => {
@@ -131,19 +132,38 @@ function dashboardPage() {
             this.activeTraceChat = chatId;
             this.chatDecisions = [];
             this.chatToolCalls = [];
+            this.chatTraceEvents = [];
             this.showChatTraceModal = true;
             this.chatTraceLoading = true;
             try {
                 const encodedChat = window.api.segment(chatId);
-                const [decisionRes, toolRes] = await Promise.all([
+                const [decisionRes, toolRes, traceRes] = await Promise.all([
                     window.api.get(`/cognition/chats/${encodedChat}/recent-decisions?limit=20`).catch(() => ({ items: [] })),
                     window.api.get(`/tools/chats/${encodedChat}/recent-calls?limit=20`).catch(() => ({ items: [] })),
+                    window.api.get(`/cognition/chats/${encodedChat}/trace-events?limit=40`).catch(() => ({ items: [] })),
                 ]);
                 this.chatDecisions = decisionRes.items || [];
                 this.chatToolCalls = toolRes.items || [];
+                this.chatTraceEvents = traceRes.items || [];
             } finally {
                 this.chatTraceLoading = false;
             }
+        },
+
+        summarizeFailureEvidence(item) {
+            const evidence = item?.failure_evidence || {};
+            const parts = [];
+            if (evidence.failure_kind) parts.push(`failure=${evidence.failure_kind}`);
+            if (Array.isArray(evidence.attempted_models) && evidence.attempted_models.length) {
+                parts.push(`models=${evidence.attempted_models.join(', ')}`);
+            }
+            if (evidence.protocol_passthrough) {
+                parts.push(`protocol=${evidence.protocol_type || 'passthrough'}`);
+            }
+            if (evidence.vision_failure_kind) {
+                parts.push(`vision=${evidence.vision_failure_kind}`);
+            }
+            return parts.join(' | ');
         },
 
         startPolling() {

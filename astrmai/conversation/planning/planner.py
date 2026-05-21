@@ -96,6 +96,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.turn_trace_store = getattr(getattr(self.context_engine, "db", None), "turn_trace_store", None)
         if self.turn_trace_store is None:
             self.turn_trace_store = getattr(getattr(self.context_engine, "db_service", None), "turn_trace_store", None)
+        self.raw_trace_store = getattr(getattr(self.context_engine, "db", None), "raw_trace_store", None)
+        if self.raw_trace_store is None:
+            self.raw_trace_store = getattr(getattr(self.context_engine, "db_service", None), "raw_trace_store", None)
         self.prefix_caching_enabled = bool(getattr(getattr(gateway.config, "conversation", None), "enable_prefix_caching", True))
         self._prefix_hash_history: dict[str, str] = {}
         self._prefix_cold_summary_history: dict[str, str] = {}
@@ -540,6 +543,29 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 await self.turn_trace_store.append(item)
             except Exception:
                 pass
+        if self.raw_trace_store is not None and hasattr(self.raw_trace_store, "append_many"):
+            try:
+                await self.raw_trace_store.append_many(chat_id, self._build_raw_trace_events(chat_id, event))
+            except Exception:
+                pass
+
+    def _build_raw_trace_events(self, chat_id: str, event: AstrMessageEvent) -> list[dict]:
+        if not hasattr(event, "get_extra"):
+            return []
+        trace_id = str(event.get_extra("astrmai_trace_id", "") or "")
+        trace_log = list(event.get_extra("astrmai_trace_log", []) or [])
+        created_at = time.time()
+        events: list[dict] = []
+        for item in trace_log:
+            payload = dict(item or {})
+            stage = str(payload.get("stage", "") or "")
+            if not stage:
+                continue
+            payload["chat_id"] = str(chat_id or "")
+            payload["trace_id"] = trace_id or str(payload.get("trace_id", "") or "")
+            payload["created_at"] = float(payload.get("created_at", created_at) or created_at)
+            events.append(payload)
+        return events
 
     async def _record_expression_pattern_usage(self, event: AstrMessageEvent, chat_id: str, reply_text: str | None) -> None:
         reflector = getattr(self, "reflector", None)

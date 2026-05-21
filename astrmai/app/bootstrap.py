@@ -26,6 +26,7 @@ from ..infrastructure.runtime.event_bus import EventBus
 from ..infrastructure.runtime.host_bridge import HostBridge
 from ..infrastructure.runtime.lane_manager import LaneManager
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
+from ..infrastructure.runtime.raw_trace_store import RawTraceEventStore
 from ..infrastructure.runtime.turn_trace_store import TurnTraceSampleStore
 from ..learning import (
     EvolutionManager,
@@ -116,6 +117,7 @@ class PluginBootstrap:
         db_service.memory_engine = memory_engine
         trace_cache_dir = Path(getattr(persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache"))
         db_service.turn_trace_store = TurnTraceSampleStore(trace_cache_dir)
+        db_service.raw_trace_store = RawTraceEventStore(trace_cache_dir)
         db_service.context_economy_benchmark_store = ContextEconomyBenchmarkSampleStore(trace_cache_dir)
         gateway.benchmark_sample_store = db_service.context_economy_benchmark_store
         if hasattr(memory_engine, "tool_service"):

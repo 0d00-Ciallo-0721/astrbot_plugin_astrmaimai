@@ -247,6 +247,15 @@ class ReplyAuditRecord:
     self_check_detail: dict[str, Any]
     gap_classification: str
     scenario_expected_phase: str
+    failure_kind: str
+    failure_reason: str
+    attempted_models: list[str]
+    raw_completion_preview: str
+    protocol_passthrough: bool
+    protocol_type: str
+    vision_failure_kind: str
+    vision_failure_reason: str
+    vision_attempted_models: list[str]
 
 
 @dataclass(slots=True)
@@ -614,6 +623,15 @@ class GroupTraceAuditRunner:
                 self_check_detail=dict(self_check["detail"]),
                 gap_classification=str(self_check.get("gap_classification", "") or ""),
                 scenario_expected_phase=message.expected_phase or "",
+                failure_kind=str((reply_result.raw or {}).get("failure_kind", "") or ""),
+                failure_reason=str((reply_result.raw or {}).get("failure_reason", "") or ""),
+                attempted_models=list((reply_result.raw or {}).get("attempted_models", []) or []),
+                raw_completion_preview=one_line((reply_result.raw or {}).get("raw_completion", ""), limit=240),
+                protocol_passthrough=bool((reply_result.raw or {}).get("protocol_passthrough", False)),
+                protocol_type=str((reply_result.raw or {}).get("protocol_type", "") or ""),
+                vision_failure_kind=str((reply_result.raw or {}).get("vision_failure_kind", "") or ""),
+                vision_failure_reason=str((reply_result.raw or {}).get("vision_failure_reason", "") or ""),
+                vision_attempted_models=list((reply_result.raw or {}).get("vision_attempted_models", []) or []),
             )
             records.append(
                 {
@@ -886,10 +904,22 @@ class GroupTraceAuditRunner:
         forced_records = [record for record in audit_records if "forced" in [tag.lower() for tag in list(scenario.tags or [])]]
         recovery_records = [record for record in audit_records if "recovery" in [tag.lower() for tag in list(scenario.tags or [])]]
         block_reason_counts: dict[str, int] = {}
+        failure_kind_counts: dict[str, int] = {}
+        protocol_passthrough_counts: dict[str, int] = {}
+        vision_failure_counts: dict[str, int] = {}
         for record in audit_records:
             reason = normalize_text(str(record.get("safe_hook_block_reason", "") or ""))
             if reason:
                 block_reason_counts[reason] = int(block_reason_counts.get(reason, 0) or 0) + 1
+            failure_kind = normalize_text(str(record.get("failure_kind", "") or ""))
+            if failure_kind:
+                failure_kind_counts[failure_kind] = int(failure_kind_counts.get(failure_kind, 0) or 0) + 1
+            if record.get("protocol_passthrough", False):
+                protocol_type = normalize_text(str(record.get("protocol_type", "") or "")) or "unknown"
+                protocol_passthrough_counts[protocol_type] = int(protocol_passthrough_counts.get(protocol_type, 0) or 0) + 1
+            vision_failure_kind = normalize_text(str(record.get("vision_failure_kind", "") or ""))
+            if vision_failure_kind:
+                vision_failure_counts[vision_failure_kind] = int(vision_failure_counts.get(vision_failure_kind, 0) or 0) + 1
         return {
             "scenario_id": scenario.scenario_id,
             "title": scenario.title,
@@ -903,6 +933,9 @@ class GroupTraceAuditRunner:
             "state_counts": {state: compact_states.count(state) for state in sorted({state for state in compact_states if state})},
             "first_state_turns": first_state_turns,
             "block_reason_counts": block_reason_counts,
+            "failure_kind_counts": failure_kind_counts,
+            "protocol_passthrough_counts": protocol_passthrough_counts,
+            "vision_failure_counts": vision_failure_counts,
             "last_reply_preview": one_line(str(audit_records[-1].get("reply_text", "") or "")) if audit_records else "",
             "last_fail_reasons": list(audit_records[-1].get("self_check_fail_reasons", []) or []) if audit_records else [],
             "failure_cards": failure_cards[:10],
@@ -942,6 +975,9 @@ def render_summary_markdown(summaries: list[dict[str, Any]], options: SummaryOpt
             f"- Worst WAIT_NEXT_NODE scenario: {metrics.get('worst_wait_next_node_scenario', '(none)')}",
             f"- Earliest COOLDOWN scenario: {metrics.get('earliest_cooldown_scenario', '(none)')}",
             f"- Most common block reason: {metrics.get('most_common_block_reason', '(none)')}",
+            f"- Failure kinds: {json.dumps(metrics.get('failure_kind_counts', {}), ensure_ascii=False)}",
+            f"- Protocol passthrough: {json.dumps(metrics.get('protocol_passthrough_counts', {}), ensure_ascii=False)}",
+            f"- Vision failures: {json.dumps(metrics.get('vision_failure_counts', {}), ensure_ascii=False)}",
             f"- Most unstable score bucket: {metrics.get('most_unstable_score_signal', '(none)')}",
             "",
         ]
@@ -962,6 +998,9 @@ def render_summary_markdown(summaries: list[dict[str, Any]], options: SummaryOpt
                 f"- Self-check failed turns: {item['self_check_failed_turns']}",
                 f"- States seen: {', '.join(item['states_seen']) or '(none)'}",
                 f"- State counts: {json.dumps(item['state_counts'], ensure_ascii=False)}",
+                f"- Failure kinds: {json.dumps(item.get('failure_kind_counts', {}), ensure_ascii=False)}",
+                f"- Protocol passthrough: {json.dumps(item.get('protocol_passthrough_counts', {}), ensure_ascii=False)}",
+                f"- Vision failures: {json.dumps(item.get('vision_failure_counts', {}), ensure_ascii=False)}",
                 f"- Last reply preview: {item['last_reply_preview'] or '(empty)'}",
                 f"- Last fail reasons: {', '.join(item['last_fail_reasons']) or '(none)'}",
                 "",
@@ -1354,6 +1393,9 @@ def build_metrics(summaries: list[dict[str, Any]], reply_records: list[dict[str,
     cooldown_candidates = [item for item in summaries if "COOLDOWN" in item.get("first_state_turns", {})]
     earliest_cooldown = min(cooldown_candidates, key=lambda item: int(item.get("first_state_turns", {}).get("COOLDOWN", 10**9) or 10**9), default={})
     block_reason_counts: dict[str, int] = {}
+    failure_kind_counts: dict[str, int] = {}
+    protocol_passthrough_counts: dict[str, int] = {}
+    vision_failure_counts: dict[str, int] = {}
     signal_names = ["closure_score", "tail_activity_score", "topic_density_score", "stability_score", "benefit_score"]
     evaluated_states = {"WAIT_NEXT_NODE", "FORCED_PENDING", "COOLDOWN", "COMPACT_NOW", "DEFERRED_FOR_STABILITY"}
     evaluated_records = [
@@ -1366,6 +1408,16 @@ def build_metrics(summaries: list[dict[str, Any]], reply_records: list[dict[str,
         reason = normalize_text(str(record.get("safe_hook_block_reason", "") or ""))
         if reason:
             block_reason_counts[reason] = int(block_reason_counts.get(reason, 0) or 0) + 1
+        failure_kind = normalize_text(str(record.get("failure_kind", "") or ""))
+        if failure_kind:
+            failure_kind_counts[failure_kind] = int(failure_kind_counts.get(failure_kind, 0) or 0) + 1
+        protocol_type = normalize_text(str(record.get("protocol_type", "") or ""))
+        if record.get("protocol_passthrough", False):
+            key = protocol_type or "unknown"
+            protocol_passthrough_counts[key] = int(protocol_passthrough_counts.get(key, 0) or 0) + 1
+        vision_failure_kind = normalize_text(str(record.get("vision_failure_kind", "") or ""))
+        if vision_failure_kind:
+            vision_failure_counts[vision_failure_kind] = int(vision_failure_counts.get(vision_failure_kind, 0) or 0) + 1
     for record in evaluated_records:
         for key in signal_names:
             signal_samples[key].append(float(record.get(key, 0.0) or 0.0))
@@ -1399,6 +1451,9 @@ def build_metrics(summaries: list[dict[str, Any]], reply_records: list[dict[str,
         "scenario_block_reason_counts": scenario_block_reason_counts,
         "evaluated_turn_count": len(evaluated_records),
         "block_reason_counts": block_reason_counts,
+        "failure_kind_counts": failure_kind_counts,
+        "protocol_passthrough_counts": protocol_passthrough_counts,
+        "vision_failure_counts": vision_failure_counts,
         "score_averages": averages,
         "score_ranges": ranges,
         "score_stddevs": stddevs,

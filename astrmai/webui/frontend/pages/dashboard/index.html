@@ -715,9 +715,9 @@
                 姝ｅ湪璇诲彇璇?chat 鐨勫喅绛栦笌宸ュ叿杞ㄨ抗...
             </div>
 
-            <div x-show="!chatTraceLoading" class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div x-show="!chatTraceLoading" class="grid grid-cols-1 xl:grid-cols-3 gap-6">
                 <div class="bg-slate-900/40 border border-white/5 rounded-lg p-4 max-h-[520px] overflow-auto">
-                    <h4 class="text-sm font-bold text-slate-300 mb-4">鏈€杩戜富瑙傚喅绛?/h4>
+                    <h4 class="text-sm font-bold text-slate-300 mb-4">最近主观决策</h4>
                     <template x-for="(decision, index) in chatDecisions" :key="index">
                         <div class="mb-3 rounded-lg bg-slate-800/60 border border-white/5 p-3 group" x-data="{ expanded: false }">
                             <div class="flex justify-between items-center gap-3 cursor-pointer" @click="expanded = !expanded">
@@ -730,22 +730,22 @@
                                     <i data-lucide="chevron-down" class="w-4 h-4 transition-transform" :class="expanded ? 'rotate-180' : ''"></i>
                                 </button>
                             </div>
-                            
+                            <div class="mt-2 text-[11px] text-amber-300 font-mono" x-show="summarizeFailureEvidence(decision)" x-text="summarizeFailureEvidence(decision)"></div>
                             <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
                                 <div class="flex justify-end mb-2">
                                     <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(decision)">
-                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 澶嶅埗
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制
                                     </button>
                                 </div>
                                 <div class="json-preview" x-text="formatJson(decision)"></div>
                             </div>
                         </div>
                     </template>
-                    <div x-show="chatDecisions.length === 0" class="text-sm text-slate-500">鏆傛棤璇?chat 鐨勫喅绛栬褰曘€?/div>
+                    <div x-show="chatDecisions.length === 0" class="text-sm text-slate-500">暂无该 chat 的决策记录。</div>
                 </div>
 
                 <div class="bg-slate-900/40 border border-white/5 rounded-lg p-4 max-h-[520px] overflow-auto">
-                    <h4 class="text-sm font-bold text-slate-300 mb-4">鏈€杩戝伐鍏疯建杩?/h4>
+                    <h4 class="text-sm font-bold text-slate-300 mb-4">最近工具轨迹</h4>
                     <template x-for="(call, index) in chatToolCalls" :key="index">
                         <div class="mb-3 rounded-lg bg-slate-800/60 border border-white/5 p-3" x-data="{ expanded: false }">
                             <div class="flex justify-between items-center gap-3 cursor-pointer" @click="expanded = !expanded">
@@ -762,18 +762,44 @@
                                     <i data-lucide="chevron-down" class="w-4 h-4 transition-transform" :class="expanded ? 'rotate-180' : ''"></i>
                                 </button>
                             </div>
-                            
+                            <div class="mt-2 text-[11px] text-emerald-300 font-mono" x-show="summarizeFailureEvidence(call)" x-text="summarizeFailureEvidence(call)"></div>
                             <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
                                 <div class="flex justify-end mb-2">
                                     <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(call)">
-                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 澶嶅埗
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制
                                     </button>
                                 </div>
                                 <div class="json-preview" x-text="formatJson(call)"></div>
                             </div>
                         </div>
                     </template>
-                    <div x-show="chatToolCalls.length === 0" class="text-sm text-slate-500">鏆傛棤璇?chat 鐨勫伐鍏疯建杩广€?/div>
+                    <div x-show="chatToolCalls.length === 0" class="text-sm text-slate-500">暂无该 chat 的工具轨迹。</div>
+                </div>
+
+                <div class="bg-slate-900/40 border border-white/5 rounded-lg p-4 max-h-[520px] overflow-auto">
+                    <h4 class="text-sm font-bold text-slate-300 mb-4">Raw Trace Events</h4>
+                    <template x-for="(trace, index) in chatTraceEvents" :key="index">
+                        <div class="mb-3 rounded-lg bg-slate-800/60 border border-white/5 p-3" x-data="{ expanded: false }">
+                            <div class="flex justify-between items-center gap-3 cursor-pointer" @click="expanded = !expanded">
+                                <div class="flex flex-col gap-1">
+                                    <span class="text-xs text-slate-500" x-text="trace.stage || '(unknown stage)'"></span>
+                                    <span class="text-[11px] text-cyan-300 font-mono" x-text="summarizeFailureEvidence(trace) || '-'"></span>
+                                </div>
+                                <button class="icon-btn ml-auto">
+                                    <i data-lucide="chevron-down" class="w-4 h-4 transition-transform" :class="expanded ? 'rotate-180' : ''"></i>
+                                </button>
+                            </div>
+                            <div x-show="expanded" x-cloak class="mt-3 border-t border-slate-700/50 pt-3">
+                                <div class="flex justify-end mb-2">
+                                    <button class="glass-btn px-3 py-1.5 text-xs" @click.stop="copyJson(trace)">
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i> 复制
+                                    </button>
+                                </div>
+                                <div class="json-preview" x-text="formatJson(trace)"></div>
+                            </div>
+                        </div>
+                    </template>
+                    <div x-show="chatTraceEvents.length === 0" class="text-sm text-slate-500">暂无该 chat 的 raw trace 事件。</div>
                 </div>
             </div>
         </div>

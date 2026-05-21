@@ -311,6 +311,42 @@ class AdminUiService:
             "template_count": len(dict(snapshot.get("_templates", {}) or {})),
         }
 
+    @staticmethod
+    def _safe_preview(value: Any, limit: int = 240) -> str:
+        text = str(value or "").replace("\r\n", "\n").strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)] + "..."
+
+    def _extract_failure_evidence(self, item: dict[str, Any]) -> dict[str, Any]:
+        item = dict(item or {})
+        attempted_models = list(item.get("attempted_models", []) or [])
+        raw_completion = self._safe_preview(item.get("raw_completion", ""))
+        failure_kind = str(item.get("failure_kind", "") or item.get("last_failure_kind", "") or "")
+        failure_reason = str(item.get("failure_reason", "") or item.get("error_message", "") or "")
+        protocol_passthrough = bool(item.get("protocol_passthrough", False))
+        protocol_type = str(item.get("protocol_type", "") or "")
+        vision_attempted_models = list(item.get("vision_direct_attempted_models", []) or [])
+        vision_failure_reason = str(item.get("vision_direct_failure_reason", "") or "")
+        vision_failure_kind = str(item.get("vision_direct_failure_kind", "") or "")
+        return {
+            "has_failure": bool(failure_kind or failure_reason or attempted_models or raw_completion),
+            "failure_kind": failure_kind,
+            "failure_reason": failure_reason,
+            "attempted_models": attempted_models,
+            "raw_completion_preview": raw_completion,
+            "protocol_passthrough": protocol_passthrough,
+            "protocol_type": protocol_type,
+            "vision_failure_kind": vision_failure_kind,
+            "vision_failure_reason": vision_failure_reason,
+            "vision_attempted_models": vision_attempted_models,
+        }
+
+    def _enrich_history_item(self, item: Any) -> dict[str, Any]:
+        payload = self._as_dict(item)
+        payload["failure_evidence"] = self._extract_failure_evidence(payload)
+        return payload
+
     async def context_economy_overview_view(self, limit: int = 20) -> dict[str, Any]:
         runtime = self._runtime()
         snapshot = self._context_economy_snapshot(runtime)
@@ -450,7 +486,12 @@ class AdminUiService:
         if chat_id:
             items = [item for item in items if str(item.get("chat_id", "")) == chat_id]
         items = items[-max(1, min(limit, 300)) :][::-1]
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": planner is not None}
+        return {
+            "status": "ok",
+            "items": [self._enrich_history_item(item) for item in items],
+            "total": len(items),
+            "runtime_bound": planner is not None,
+        }
 
     async def recent_turn_traces(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
         planner = self._planner(self._runtime())
@@ -466,7 +507,12 @@ class AdminUiService:
             if chat_id:
                 items = [item for item in items if str(item.get("chat_id", "")) == chat_id]
             items = items[-max(1, min(limit, 300)) :][::-1]
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": planner is not None}
+        return {
+            "status": "ok",
+            "items": [self._enrich_history_item(item) for item in items],
+            "total": len(items),
+            "runtime_bound": planner is not None,
+        }
 
     async def tools_status(self) -> dict[str, Any]:
         from ....conversation.planning.planner_side_inputs import PlannerSideInputMixin
@@ -487,7 +533,35 @@ class AdminUiService:
         if chat_id:
             items = [item for item in items if str(item.get("chat_id", "")) == chat_id]
         items = items[-max(1, min(limit, 300)) :][::-1]
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": planner is not None}
+        return {
+            "status": "ok",
+            "items": [self._enrich_history_item(item) for item in items],
+            "total": len(items),
+            "runtime_bound": planner is not None,
+        }
+
+    async def chat_trace_events(self, chat_id: str, limit: int = 80) -> dict[str, Any]:
+        planner = self._planner(self._runtime())
+        events: list[dict[str, Any]] = []
+        raw_trace_store = getattr(planner, "raw_trace_store", None) if planner else None
+        if raw_trace_store is not None and hasattr(raw_trace_store, "recent"):
+            try:
+                events = [dict(item or {}) for item in list(await raw_trace_store.recent(chat_id=chat_id, limit=limit))]
+            except Exception:
+                events = []
+        if not events:
+            turn_trace_result = await self.recent_turn_traces(chat_id=chat_id, limit=limit)
+            for item in list(turn_trace_result.get("items", []) or []):
+                trace_log = list(item.get("astrmai_trace_log", []) or item.get("trace_log", []) or [])
+                for event in trace_log:
+                    event_payload = dict(event or {})
+                    event_payload["chat_id"] = chat_id
+                    events.append(event_payload)
+        for event_payload in events:
+            event_payload["failure_evidence"] = self._extract_failure_evidence(event_payload)
+        events.sort(key=lambda item: float(item.get("created_at", item.get("timestamp", 0.0)) or 0.0), reverse=True)
+        events = events[: max(1, min(limit, 300))]
+        return {"status": "ok", "items": events, "total": len(events), "runtime_bound": planner is not None}
 
     async def tools_policy(self) -> dict[str, Any]:
         status = await self.tools_status()

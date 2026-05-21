@@ -32,6 +32,11 @@ async def list_chat_recent_turns(chat_id: str, limit: int = 50, user: str = Depe
     return await _service().recent_turn_traces(chat_id=chat_id, limit=limit)
 
 
+@router.get("/chats/{chat_id}/trace-events")
+async def list_chat_trace_events(chat_id: str, limit: int = 80, user: str = Depends(get_current_user)):
+    return await _service().chat_trace_events(chat_id=chat_id, limit=limit)
+
+
 @router.get("/context-economy")
 async def get_context_economy(limit: int = 20, user: str = Depends(get_current_user)):
     return await _service().context_economy_overview_view(limit=limit)
