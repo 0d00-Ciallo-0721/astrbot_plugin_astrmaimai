@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import time
 
+from .memory_scoring import compute_hot_score, scoring_from_config
 from .memory_index_projector import MemoryIndexProjector
 from .v2_store import MemoryV2Store
 
 
 class MemoryMaintenanceService:
-    def __init__(self, store: MemoryV2Store, index_projector: MemoryIndexProjector | None = None):
+    def __init__(self, store: MemoryV2Store, index_projector: MemoryIndexProjector | None = None, config=None):
         self.store = store
         self.index_projector = index_projector
+        self.config = config
+        self.scoring = scoring_from_config(config)
 
     async def apply_daily_decay(
         self,
@@ -77,6 +80,35 @@ class MemoryMaintenanceService:
         if not bool(policy.get("allow_protected_physical_delete", False)):
             protected = await self.store.list_canonical(limit=1, status="stale", kind="persona_lore")
             report["protected_skipped"] = int(protected.get("total", 0) or 0)
+        try:
+            maintenance_now = float(now or time.time())
+            stale_marked = 0
+            threshold = float(
+                policy.get(
+                    "maintenance_temporal_stale_hot_threshold",
+                    self.scoring.maintenance_temporal_stale_hot_threshold,
+                )
+            )
+            candidates = await self.store.list_candidates(
+                statuses=["active"],
+                include_inactive=False,
+                limit=int(policy.get("maintenance_temporal_scan_limit", 200)),
+            )
+            for candidate in candidates:
+                if candidate.status != "active":
+                    continue
+                if str(candidate.kind or "").strip().lower() == "fact":
+                    if float(candidate.importance or 0.0) >= float(policy.get("fact_aggressive_importance_max", 0.2)):
+                        continue
+                elif float(candidate.importance or 0.0) >= 0.4:
+                    continue
+                hot_score = compute_hot_score(candidate, now=maintenance_now, config=self.scoring)
+                if hot_score >= threshold:
+                    continue
+                stale_marked += await self.mark_stale(candidate.id, reason="maintenance_temporal_hot")
+            report["marked_stale"] += stale_marked
+        except Exception as exc:
+            report["errors"].append(f"temporal_hot_stale:{exc}")
         try:
             pending_cleanup = await self.store.purge_jargon_candidates(
                 statuses=("review_pending",),

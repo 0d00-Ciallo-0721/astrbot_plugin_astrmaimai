@@ -7,7 +7,7 @@ import time
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryCandidate, MemoryQuery
-from .memory_scoring import DEFAULT_MEMORY_SCORING, MemoryScoringConfig
+from .memory_scoring import DEFAULT_MEMORY_SCORING, MemoryScoringConfig, rerank_candidates, scoring_from_config
 from .expression_pattern_retrieval_policy import ExpressionPatternRetrievalPolicy
 from .jargon_retrieval_policy import JargonRetrievalPolicy
 from .v2_store import MemoryV2Store
@@ -17,7 +17,7 @@ class MemoryRetrievalService:
     def __init__(self, store: MemoryV2Store, engine=None, scoring: MemoryScoringConfig | None = None):
         self.store = store
         self.engine = engine
-        self.scoring = scoring or DEFAULT_MEMORY_SCORING
+        self.scoring = scoring or scoring_from_config(getattr(engine, "config", None)) or DEFAULT_MEMORY_SCORING
         self.jargon_policy = JargonRetrievalPolicy(store)
         self.expression_pattern_policy = ExpressionPatternRetrievalPolicy(store)
 
@@ -31,7 +31,6 @@ class MemoryRetrievalService:
                 metadata = {}
         content = str(getattr(result, "content", "") or "")
         memory_id = str(metadata.get("canonical_id") or metadata.get("id") or f"idx_{abs(hash(content))}")
-        created_at = float(metadata.get("create_time") or time.time())
         return MemoryCandidate(
             id=memory_id,
             kind=str(metadata.get("kind") or ("persona_lore" if metadata.get("session_id") == "__self_lore__" else "memory")),
@@ -43,12 +42,15 @@ class MemoryRetrievalService:
             importance=float(metadata.get("importance") or 0.5),
             confidence=0.75,
             relevance_score=float(getattr(result, "score", 0.0) or 0.0),
-            recency_score=1.0 / (1.0 + max(0.0, (time.time() - created_at) / 86400)),
+            recency_score=1.0,
             status=str(metadata.get("status") or "active"),
             visibility=str(metadata.get("visibility") or "auto_and_tool"),
-            created_at=created_at,
-            updated_at=created_at,
+            created_at=float(metadata.get("create_time") or 0.0),
+            updated_at=float(metadata.get("update_time") or 0.0),
             last_access_time=float(metadata.get("last_access_time") or 0.0),
+            access_count=int(metadata.get("access_count") or 0),
+            decay_score=float(metadata.get("decay_score") or 1.0),
+            metadata_hydrated=False,
             metadata=metadata,
         )
 
@@ -61,8 +63,21 @@ class MemoryRetrievalService:
         queries = [query.query]
         try:
             queries = await self._rewrite_queries(query)
-            candidates = await self._retrieve_queries(query, queries, top_k=max(int(query.top_k or 5) * 2, 8))
-            candidates = await self._rerank_candidates(query, candidates)
+            candidate_pool_limit = max(
+                int(query.top_k or 5) * max(int(self.scoring.deep_temporal_candidate_pool_factor or 4), 1),
+                max(int(self.scoring.deep_temporal_candidate_pool_min or 20), 1),
+            )
+            candidates = await self._retrieve_queries(query, queries, top_k=candidate_pool_limit)
+            candidates = await self._hydrate_candidate_metadata(candidates)
+            try:
+                candidates = rerank_candidates(candidates, config=self.scoring)
+            except Exception as exc:
+                logger.debug(f"[MemoryRetrievalService] temporal rerank degraded: {exc}")
+            llm_window = max(int(self.scoring.deep_temporal_llm_window or 8), 1)
+            temporal_top = candidates[:llm_window]
+            temporal_tail = candidates[llm_window:]
+            reranked = await self._rerank_candidates(query, temporal_top)
+            candidates = list(reranked) + list(temporal_tail)
             guidance = await self._compress_guidance(query, candidates[: max(int(query.top_k or 5), 1)])
             if guidance:
                 for item in candidates:
@@ -100,10 +115,8 @@ class MemoryRetrievalService:
                     continue
                 seen.add(item.id)
                 candidates.append(item)
-                if len(candidates) >= limit:
-                    break
             if len(candidates) >= limit:
-                break
+                continue
         return candidates[:limit]
 
     async def _retrieve_once(self, query: MemoryQuery) -> list[MemoryCandidate]:
@@ -235,12 +248,48 @@ class MemoryRetrievalService:
                 canon * self.scoring.canonical_weight
                 + hybrid_score * self.scoring.hybrid_weight
                 + float(item.importance or 0.0) * self.scoring.importance_weight
-                + float(item.recency_score or 0.0) * self.scoring.recency_weight
                 + float(item.confidence or 0.0) * self.scoring.confidence_weight
                 - (self.scoring.stale_penalty if item.status == "stale" else 0.0)
             )
         ranked = sorted(merged.values(), key=lambda item: item.relevance_score, reverse=True)
-        return ranked[: max(int(query.top_k or 5), 1)]
+        return ranked
+
+    async def _hydrate_candidate_metadata(self, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
+        pending_ids: list[str] = []
+        for item in candidates:
+            if (
+                float(item.created_at or 0.0) <= 0.0
+                or not str(item.kind or "").strip()
+                or float(item.importance or 0.0) <= 0.0
+                or float(item.last_access_time or 0.0) <= 0.0
+                or int(item.access_count or 0) < 0
+                or float(item.decay_score or 0.0) <= 0.0
+            ):
+                pending_ids.append(item.id)
+        if not pending_ids:
+            return candidates
+        meta_by_id = await self.store.batch_get_memory_meta(pending_ids)
+        for item in candidates:
+            payload = meta_by_id.get(item.id)
+            if not payload:
+                continue
+            if float(item.created_at or 0.0) <= 0.0:
+                item.created_at = float(payload.get("created_at") or 0.0)
+                if item.created_at > 0:
+                    item.recency_score = 1.0 / (1.0 + max(0.0, (time.time() - item.created_at) / 86400))
+            item.updated_at = float(payload.get("updated_at") or item.updated_at or 0.0)
+            item.last_access_time = float(payload.get("last_access_time") or item.last_access_time or 0.0)
+            item.importance = float(payload.get("importance") or item.importance or 0.5)
+            item.kind = str(payload.get("kind") or item.kind or "memory")
+            item.status = str(payload.get("status") or item.status or "active")
+            item.visibility = str(payload.get("visibility") or item.visibility or "auto_and_tool")
+            item.access_count = int(payload.get("access_count") or item.access_count or 0)
+            item.decay_score = float(payload.get("decay_score") or item.decay_score or 1.0)
+            merged_metadata = dict(payload.get("metadata") or {})
+            merged_metadata.update(dict(item.metadata or {}))
+            item.metadata = merged_metadata
+            item.metadata_hydrated = True
+        return candidates
 
     async def _rewrite_queries(self, query: MemoryQuery) -> list[str]:
         base_query = str(query.query or "").strip()

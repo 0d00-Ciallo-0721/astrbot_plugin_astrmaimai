@@ -87,7 +87,7 @@ class MemoryEngine:
         self.expression_pattern_service = ExpressionPatternService(self.v2_store, self.write_service)
         self.injection_service = MemoryInjectionService(self.retrieval_service, config=self.config)
         self.tool_service = MemoryToolService(self.retrieval_service, config=self.config)
-        self.maintenance_service = MemoryMaintenanceService(self.v2_store, self.index_projector)
+        self.maintenance_service = MemoryMaintenanceService(self.v2_store, self.index_projector, config=self.config)
         self.migration_service = MemoryMigrationService(
             self.v2_store,
             index_projector=self.index_projector,

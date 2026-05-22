@@ -368,7 +368,7 @@ class MemoryV2Store:
                 f"""
                 SELECT id, kind, source, summary, content, session_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score
                 FROM canonical_memories
                 WHERE id = ? AND status IN ({','.join('?' for _ in statuses)})
                 LIMIT 1
@@ -391,7 +391,7 @@ class MemoryV2Store:
                 f"""
                 SELECT id, kind, source, summary, content, session_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score
                 FROM canonical_memories
                 WHERE {where}
                 LIMIT 1
@@ -415,7 +415,7 @@ class MemoryV2Store:
                 f"""
                 SELECT id, kind, source, summary, content, session_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score
                 FROM canonical_memories
                 WHERE {where}
                 LIMIT 1
@@ -458,6 +458,9 @@ class MemoryV2Store:
             created_at=created_at,
             updated_at=float(row[12] or 0.0),
             last_access_time=float(row[13] or 0.0),
+            access_count=int(row[16] or 0) if len(row) > 16 else 0,
+            decay_score=float(row[17] or 1.0) if len(row) > 17 else 1.0,
+            metadata_hydrated=True,
             metadata=metadata,
         )
 
@@ -514,7 +517,7 @@ class MemoryV2Store:
                     f"""
                     SELECT cm.id, cm.kind, cm.source, cm.summary, cm.content, cm.session_id, cm.persona_id,
                            cm.tags, cm.importance, cm.confidence, cm.status, cm.create_time,
-                           cm.update_time, cm.last_access_time, cm.metadata, cm.visibility,
+                           cm.update_time, cm.last_access_time, cm.metadata, cm.visibility, cm.access_count, cm.decay_score,
                            bm25(canonical_fts) AS fts_score
                     FROM canonical_fts
                     JOIN canonical_memories cm ON cm.id = canonical_fts.memory_id
@@ -537,7 +540,7 @@ class MemoryV2Store:
                     f"""
                     SELECT id, kind, source, summary, content, session_id, persona_id,
                            tags, importance, confidence, status, create_time,
-                           update_time, last_access_time, metadata, visibility
+                           update_time, last_access_time, metadata, visibility, access_count, decay_score
                     FROM canonical_memories
                     WHERE {' AND '.join(where)}
                     ORDER BY update_time DESC
@@ -626,7 +629,7 @@ class MemoryV2Store:
                 f"""
                 SELECT id, kind, source, summary, content, session_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score
                 FROM canonical_memories
                 {where_sql}
                 ORDER BY update_time DESC
@@ -678,7 +681,7 @@ class MemoryV2Store:
                 f"""
                 SELECT id, kind, source, summary, content, session_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score
                 FROM canonical_memories
                 {where_sql}
                 ORDER BY update_time DESC
@@ -714,8 +717,51 @@ class MemoryV2Store:
             "created_at": candidate.created_at,
             "updated_at": candidate.updated_at,
             "last_access_time": candidate.last_access_time,
+            "access_count": candidate.access_count,
+            "decay_score": candidate.decay_score,
+            "metadata_hydrated": candidate.metadata_hydrated,
             "metadata": dict(candidate.metadata or {}),
         }
+
+    async def batch_get_memory_meta(self, memory_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = [str(item) for item in memory_ids if str(item).strip()]
+        if not ids:
+            return {}
+        await self.initialize()
+        placeholders = ",".join("?" for _ in ids)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, importance, status, visibility, create_time,
+                       update_time, last_access_time, access_count, decay_score, metadata
+                FROM canonical_memories
+                WHERE id IN ({placeholders})
+                """,
+                tuple(ids),
+            )
+            rows = await cursor.fetchall()
+        payload: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            metadata: Any = {}
+            try:
+                metadata = json.loads(row[10] or "{}")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+            except Exception:
+                metadata = {}
+            payload[str(row[0] or "")] = {
+                "kind": str(row[1] or ""),
+                "importance": float(row[2] or 0.5),
+                "status": str(row[3] or ACTIVE_STATUS),
+                "visibility": str(row[4] or "auto_and_tool"),
+                "created_at": float(row[5] or 0.0),
+                "updated_at": float(row[6] or 0.0),
+                "last_access_time": float(row[7] or 0.0),
+                "access_count": int(row[8] or 0),
+                "decay_score": float(row[9] or 1.0),
+                "metadata": metadata,
+            }
+        return payload
 
     async def mark_accessed(self, memory_ids: list[str]) -> None:
         ids = [str(item) for item in memory_ids if str(item).strip()]
@@ -1152,7 +1198,7 @@ class MemoryV2Store:
                 f"""
                 SELECT id, kind, source, summary, content, session_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score
                 FROM canonical_memories
                 WHERE {' AND '.join(where)}
                 ORDER BY update_time DESC

@@ -61,6 +61,9 @@ class MemoryCandidate:
     created_at: float = 0.0
     updated_at: float = 0.0
     last_access_time: float = 0.0
+    access_count: int = 0
+    decay_score: float = 1.0
+    metadata_hydrated: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

@@ -133,6 +133,17 @@ class MemoryConfig(BaseModel):
     prune_threshold: float = Field(default=0.2, description="记忆遗忘被物理剪枝的得分下限")
 
 
+    deep_temporal_alpha: float = Field(default=0.7)
+    deep_temporal_tau_seconds: float = Field(default=86400.0)
+    deep_temporal_lambda_default: float = Field(default=1.0)
+    deep_temporal_lambda_fact: float = Field(default=0.1)
+    deep_temporal_candidate_pool_factor: int = Field(default=4)
+    deep_temporal_candidate_pool_min: int = Field(default=20)
+    deep_temporal_llm_window: int = Field(default=8)
+    maintenance_hot_beta: float = Field(default=0.7)
+    maintenance_temporal_stale_hot_threshold: float = Field(default=0.35)
+
+
 class InfraConfig(BaseModel):
     llm_retries: int = Field(default=2)
     backoff_factor: float = Field(default=1.5)

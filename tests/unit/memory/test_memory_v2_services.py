@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -689,6 +690,265 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(rows[0].id, target_id)
             self.assertIn("bookmark", rows[0].metadata["deep_guidance"])
             self.assertEqual({item.id for item in rows}, {first_id, target_id})
+
+        asyncio.run(run())
+
+    def test_temporal_rerank_promotes_recent_relevant_memory_without_reviving_noise(self):
+        async def run():
+            scoring_mod = importlib.import_module("astrmai.memory.services.memory_scoring")
+            now = time.time()
+            old_strong = self.contracts.MemoryCandidate(
+                id="old-strong",
+                kind="topic",
+                source="unit",
+                summary="old strong",
+                content="old strong",
+                relevance_score=0.90,
+                created_at=now - 7 * 86400,
+                metadata_hydrated=True,
+            )
+            new_relevant = self.contracts.MemoryCandidate(
+                id="new-relevant",
+                kind="topic",
+                source="unit",
+                summary="new relevant",
+                content="new relevant",
+                relevance_score=0.80,
+                created_at=now - 3600,
+                metadata_hydrated=True,
+            )
+            new_noise = self.contracts.MemoryCandidate(
+                id="new-noise",
+                kind="topic",
+                source="unit",
+                summary="new noise",
+                content="new noise",
+                relevance_score=0.05,
+                created_at=now - 60,
+                metadata_hydrated=True,
+            )
+            ranked = scoring_mod.rerank_candidates([old_strong, new_relevant, new_noise], now=now)
+            self.assertEqual(ranked[0].id, "new-relevant")
+            self.assertEqual(ranked[-1].id, "new-noise")
+
+        asyncio.run(run())
+
+    def test_temporal_rerank_keeps_fact_resilient(self):
+        async def run():
+            scoring_mod = importlib.import_module("astrmai.memory.services.memory_scoring")
+            now = time.time()
+            fact = self.contracts.MemoryCandidate(
+                id="fact-old",
+                kind="fact",
+                source="unit",
+                summary="fact",
+                content="fact",
+                relevance_score=0.92,
+                created_at=now - 730 * 86400,
+                metadata_hydrated=True,
+            )
+            recent_topic = self.contracts.MemoryCandidate(
+                id="topic-new",
+                kind="topic",
+                source="unit",
+                summary="topic",
+                content="topic",
+                relevance_score=0.75,
+                created_at=now - 3600,
+                metadata_hydrated=True,
+            )
+            ranked = scoring_mod.rerank_candidates([recent_topic, fact], now=now)
+            self.assertEqual(ranked[1].id, "fact-old")
+            self.assertGreater(ranked[1].relevance_score, 0.6)
+
+        asyncio.run(run())
+
+    def test_deep_retrieval_hydrates_missing_metadata_before_rerank(self):
+        class _Gateway:
+            async def call_data_process_task(self, *args, **kwargs):
+                return {"ids": []}
+
+        class _HybridResult:
+            def __init__(self, memory_id):
+                self.content = "hydration candidate"
+                self.score = 0.6
+                self.metadata = {"id": memory_id, "kind": "memory"}
+
+        class _Engine:
+            def __init__(self):
+                self.gateway = _Gateway()
+
+            async def _search_memories(self, *args, **kwargs):
+                return [_HybridResult("mem-hydrated"), _HybridResult("mem-missing")]
+
+        async def run():
+            store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
+            retrieval = self.retrieval_mod.MemoryRetrievalService(store, engine=_Engine())
+
+            async def _fake_batch(ids):
+                return {
+                    "mem-hydrated": {
+                        "kind": "fact",
+                        "importance": 0.9,
+                        "status": "active",
+                        "visibility": "auto_and_tool",
+                        "created_at": 1000.0,
+                        "updated_at": 1100.0,
+                        "last_access_time": 1200.0,
+                        "access_count": 7,
+                        "decay_score": 0.8,
+                        "metadata": {"source": "hydrated"},
+                    }
+                }
+
+            store.batch_get_memory_meta = _fake_batch
+            candidates = [
+                self.contracts.MemoryCandidate(
+                    id="mem-hydrated",
+                    kind="memory",
+                    source="hybrid",
+                    summary="candidate",
+                    content="candidate",
+                    importance=0.5,
+                    relevance_score=0.7,
+                    created_at=0.0,
+                ),
+                self.contracts.MemoryCandidate(
+                    id="mem-missing",
+                    kind="memory",
+                    source="hybrid",
+                    summary="candidate",
+                    content="candidate",
+                    importance=0.5,
+                    relevance_score=0.6,
+                    created_at=0.0,
+                ),
+            ]
+            hydrated = await retrieval._hydrate_candidate_metadata(candidates)
+            by_id = {item.id: item for item in hydrated}
+            self.assertTrue(by_id["mem-hydrated"].metadata_hydrated)
+            self.assertEqual(by_id["mem-hydrated"].access_count, 7)
+            self.assertEqual(by_id["mem-hydrated"].kind, "fact")
+            self.assertFalse(by_id["mem-missing"].metadata_hydrated)
+            self.assertEqual(by_id["mem-missing"].created_at, 0.0)
+
+        asyncio.run(run())
+
+    def test_deep_retrieval_limits_llm_rerank_to_temporal_top_window(self):
+        class _Gateway:
+            def __init__(self):
+                self.candidate_batches = []
+
+            async def call_data_process_task(self, *args, **kwargs):
+                prompt = kwargs.get("prompt") if "prompt" in kwargs else (args[0] if args else "")
+                if "Rewrite the user memory search request" in prompt:
+                    return {"queries": []}
+                if "Rerank these memory candidates" in prompt:
+                    payload = prompt.split("Candidates: ", 1)[1]
+                    data = json.loads(payload)
+                    self.candidate_batches.append([item["id"] for item in data])
+                    return {"ids": list(reversed([item["id"] for item in data]))}
+                return {"guidance": "time first"}
+
+        class _Engine:
+            def __init__(self, gateway):
+                self.gateway = gateway
+
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            now = time.time()
+            ids = []
+            for index in range(20):
+                memory_id = await writer.write(
+                    self.contracts.MemoryWriteRequest(
+                        source="summary",
+                        kind="memory",
+                        session_id="chat-1",
+                        content=f"Candidate {index}",
+                        dedup_key=f"deep-window:{index}",
+                    )
+                )
+                ids.append(memory_id)
+            async with aiosqlite.connect(self.db_path) as db:
+                for index, memory_id in enumerate(ids):
+                    created_at = now - index * 86400
+                    await db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET create_time = ?, update_time = ?, importance = ?, access_count = ?, last_access_time = ?
+                        WHERE id = ?
+                        """,
+                        (created_at, created_at, 0.6, 1, created_at, memory_id),
+                    )
+                await db.commit()
+            gateway = _Gateway()
+            retrieval = self.retrieval_mod.MemoryRetrievalService(store, engine=_Engine(gateway))
+            rows = await retrieval.retrieve(
+                self.contracts.MemoryQuery(query="Candidate", session_id="chat-1", policy="deep", top_k=5)
+            )
+            self.assertEqual(len(gateway.candidate_batches), 1)
+            self.assertEqual(len(gateway.candidate_batches[0]), 8)
+            self.assertEqual(set(gateway.candidate_batches[0]), set(ids[:8]))
+            self.assertEqual(len(rows), 5)
+
+        asyncio.run(run())
+
+    def test_maintenance_temporal_hot_score_marks_low_heat_non_fact_stale(self):
+        async def run():
+            store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
+            writer = self.write_mod.MemoryWriteService(store)
+            config = type(
+                "_Config",
+                (),
+                {
+                    "memory": type(
+                        "_MemoryCfg",
+                        (),
+                        {
+                            "maintenance_hot_beta": 0.7,
+                            "maintenance_temporal_stale_hot_threshold": 0.35,
+                        },
+                    )()
+                },
+            )()
+            maintenance = self.maintenance_mod.MemoryMaintenanceService(store, config=config)
+            topic_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="topic",
+                    session_id="chat-1",
+                    content="cold topic memory",
+                    importance=0.2,
+                    dedup_key="topic:cold",
+                )
+            )
+            fact_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="fact",
+                    session_id="chat-1",
+                    content="durable fact memory",
+                    importance=0.8,
+                    dedup_key="fact:durable",
+                )
+            )
+            old_ts = time.time() - 40 * 86400
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET create_time = ?, update_time = ?, last_access_time = ?, access_count = 0
+                    WHERE id IN (?, ?)
+                    """,
+                    (old_ts, old_ts, old_ts, topic_id, fact_id),
+                )
+                await db.commit()
+            report = await maintenance.run_once(policy={"decay_rate": 0.0, "min_score": 0.0, "stale_grace_seconds": 365 * 86400})
+            topic = await store.get_canonical(topic_id, include_inactive=True)
+            fact = await store.get_canonical(fact_id, include_inactive=True)
+            self.assertGreaterEqual(report["marked_stale"], 1)
+            self.assertEqual(topic.status, "stale")
+            self.assertEqual(fact.status, "active")
 
         asyncio.run(run())
 
