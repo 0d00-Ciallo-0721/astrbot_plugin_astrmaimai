@@ -72,6 +72,20 @@ class MemoryCandidate:
 
 
 @dataclass(slots=True)
+class MemoryClaim:
+    subject_id: str
+    entity: str
+    attribute: str
+    value: str
+    polarity: str = "affirm"
+    certainty: float = 0.5
+    is_correction: bool = False
+    fact_scope: str = "medium_term"
+    source_text: str = ""
+    evidence_turn_id: str = ""
+
+
+@dataclass(slots=True)
 class MemoryInjectionTrace:
     trace_id: str
     policy: str = "light"
@@ -130,6 +144,7 @@ class InstantGateResult:
 
 __all__ = [
     "MemoryCandidate",
+    "MemoryClaim",
     "MemoryInjectionBundle",
     "MemoryInjectionTrace",
     "MemoryQuery",

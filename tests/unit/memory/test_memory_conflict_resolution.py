@@ -1,0 +1,79 @@
+import asyncio
+import importlib
+import sys
+import tempfile
+import unittest
+
+from tests.helpers import install_astrbot_stubs
+
+
+class MemoryConflictResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        install_astrbot_stubs(self.temp_dir.name)
+        for name in list(sys.modules):
+            if name.startswith("astrmai.memory.services.memory_"):
+                sys.modules.pop(name, None)
+        self.claim_mod = importlib.import_module("astrmai.memory.services.memory_claim_service")
+
+    def tearDown(self):
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    def test_explicit_correction_extracts_correction_claim(self):
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor()
+            claims = await extractor.extract(
+                user_text="I said it wrong, before 2 servers, now 3 servers",
+                subject_id="zlj",
+                turn_id="turn-1",
+            )
+            resolver = self.claim_mod.MemoryConflictResolver()
+            decision = resolver.resolve(claims)
+            return claims, decision
+
+        claims, decision = asyncio.run(run())
+        self.assertTrue(claims)
+        self.assertTrue(claims[0].is_correction)
+        self.assertEqual(claims[0].attribute, "server_count")
+        self.assertEqual(decision.action, "authority_override")
+
+    def test_short_term_state_does_not_override_authority(self):
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor()
+            claims = await extractor.extract(
+                user_text="today I feel anxious",
+                subject_id="zlj",
+                turn_id="turn-2",
+            )
+            resolver = self.claim_mod.MemoryConflictResolver()
+            return claims, resolver.resolve(claims)
+
+        claims, decision = asyncio.run(run())
+        self.assertTrue(claims)
+        self.assertEqual(claims[0].fact_scope, "short_term")
+        self.assertEqual(decision.action, "volatile_state_write")
+        self.assertTrue(decision.metadata["volatile_state"])
+
+    def test_uncertain_correction_degrades_to_plain_memory(self):
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor()
+            claims = await extractor.extract(
+                user_text="recently maybe not that many servers",
+                subject_id="zlj",
+                turn_id="turn-3",
+            )
+            resolver = self.claim_mod.MemoryConflictResolver()
+            return claims, resolver.resolve(claims)
+
+        claims, decision = asyncio.run(run())
+        if claims:
+            self.assertNotEqual(decision.action, "authority_override")
+        else:
+            self.assertEqual(decision.action, "plain_memory_write")
+
+
+if __name__ == "__main__":
+    unittest.main()

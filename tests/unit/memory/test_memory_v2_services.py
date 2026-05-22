@@ -578,6 +578,131 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_instant_memory_gate_authority_correction_uses_eav_key(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            gate = gate_mod.InstantMemoryGate(
+                gateway=type("G", (), {"config": _Config(), "context": type("GC", (), {})()})(),
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            request, payload = await gate._build_split_write_request(
+                source="instant_gate",
+                raw_text="I said it wrong, before 2 servers, now 3 servers",
+                extracted_fact="3 servers",
+                turn=self.contracts.CommittedMemoryTurn(
+                    turn_id="turn-auth-1",
+                    chat_id="chat-1",
+                    sender_id="zlj",
+                    user_text="I said it wrong, before 2 servers, now 3 servers",
+                    assistant_text="???",
+                    source="test",
+                    committed_at=2000.0,
+                ),
+                category="asset",
+            )
+            self.assertEqual(request.kind, "fact")
+            self.assertEqual(request.dedup_key, "zlj:asset:server_count")
+            self.assertEqual(payload["decision_action"], "authority_override")
+
+        asyncio.run(run())
+
+    def test_instant_memory_gate_short_term_state_degrades_to_topic(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            gate = gate_mod.InstantMemoryGate(
+                gateway=type("G", (), {"config": _Config(), "context": type("GC", (), {})()})(),
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            request, payload = await gate._build_split_write_request(
+                source="instant_gate",
+                raw_text="today I feel anxious",
+                extracted_fact="today I feel anxious",
+                turn=self.contracts.CommittedMemoryTurn(
+                    turn_id="turn-vol-1",
+                    chat_id="chat-1",
+                    sender_id="zlj",
+                    user_text="today I feel anxious",
+                    assistant_text="???",
+                    source="test",
+                    committed_at=3000.0,
+                ),
+                category="emotion",
+            )
+            self.assertEqual(request.kind, "topic")
+            self.assertTrue(request.metadata.get("volatile_state"))
+            self.assertEqual(payload["decision_action"], "volatile_state_write")
+
+        asyncio.run(run())
+
+    def test_instant_memory_gate_fallback_when_claim_extraction_fails(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            gate = gate_mod.InstantMemoryGate(
+                gateway=type("G", (), {"config": _Config(), "context": type("GC", (), {})()})(),
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+
+            async def _boom(*args, **kwargs):
+                raise RuntimeError("boom")
+
+            gate.claim_extractor.extract = _boom
+            request, payload = await gate._build_split_write_request(
+                source="instant_gate",
+                raw_text="????",
+                extracted_fact="??",
+                turn=self.contracts.CommittedMemoryTurn(
+                    turn_id="turn-fallback-1",
+                    chat_id="chat-1",
+                    sender_id="zlj",
+                    user_text="????",
+                    assistant_text="?",
+                    source="test",
+                    committed_at=4000.0,
+                ),
+                category="identity",
+            )
+            self.assertEqual(request.kind, "fact")
+            self.assertTrue(payload["fallback_used"])
+            self.assertEqual(payload["decision_action"], "legacy_fallback")
+
+        asyncio.run(run())
+
     def test_instant_memory_llm_backfill_uses_runtime_think_level_signal(self):
         async def run():
             store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
@@ -624,7 +749,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
             llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
             self.assertEqual(len(llm_rows), 1)
             self.assertEqual(llm_rows[0].summary, "用户想在周末去植物园散步")
-            self.assertIsNotNone(await store.get_by_dedup_key("instant_gate_llm:chat-1:用户想在周末去植物园散步"))
+            self.assertTrue((llm_rows[0].metadata or {}).get("fact_scope"))
 
         asyncio.run(run())
 

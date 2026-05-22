@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryWriteRequest
+from .memory_claim_service import MemoryClaimExtractor, MemoryConflictResolver
 from .memory_processor import MemoryProcessor
 from .topic_summarizer import TopicSummarizer
 
@@ -27,6 +28,8 @@ class SessionMemorySummarizer:
         self.msg_threshold = getattr(self.config.memory, "summary_threshold", 30)
         self.processor = MemoryProcessor(gateway)
         self.topic_summarizer = TopicSummarizer(gateway, config)
+        self.claim_extractor = MemoryClaimExtractor(gateway)
+        self.conflict_resolver = MemoryConflictResolver()
 
     async def extract_and_summarize_history(self, session_id: str, days: int = 1):
         plugin = getattr(self.context, "astrmai_plugin", None) or getattr(self.gateway.context, "astrmai", None)
@@ -146,24 +149,53 @@ class SessionMemorySummarizer:
         event_id = f"evt_{datetime.datetime.now().strftime('%Y%m%d')}_{uuid4_short()}"
         canonical_id = ""
         if hasattr(self.engine, "write_service"):
+            claims = await self.claim_extractor.extract(
+                user_text="\n".join(valid_facts) if valid_facts else str(summary or ""),
+                assistant_text="",
+                subject_id=str(session_id or ""),
+                turn_id=event_id,
+                context_hint="session_memory_summarizer",
+            )
+            decision = self.conflict_resolver.resolve(claims)
+            metadata = {
+                "legacy_event_id": event_id,
+                "reflection": reflection,
+                "sentiment": sentiment,
+                "canonical_write": True,
+            }
+            kind = "topic" if valid_topics else "fact"
+            dedup_key = f"memory_summary:{session_id}:{event_id}"
+            if decision.metadata:
+                metadata.update(dict(decision.metadata))
+            if decision.action == "authority_override" and claims:
+                claim = claims[0]
+                kind = "fact"
+                metadata.update(
+                    {
+                        "authority_eav": True,
+                        "promotion_entity": claim.entity,
+                        "promotion_attribute": claim.attribute,
+                        "promotion_value": claim.value,
+                        "supports": [],
+                        "contradicts": [],
+                        "corrects": [],
+                    }
+                )
+                dedup_key = f"{claim.subject_id}:{claim.entity}:{claim.attribute}"
             canonical_id = await self.engine.write_service.write(
                 MemoryWriteRequest(
                     source="memory_summary",
-                    kind="topic" if valid_topics else "fact",
+                    kind=kind,
                     session_id=str(session_id),
+                    sender_id=str(claims[0].subject_id if claims else session_id),
                     persona_id=str(persona_id or ""),
                     content=final_content,
                     summary=str(summary or "")[:240],
                     tags=valid_topics,
                     importance=float(importance or 0.5),
                     confidence=0.8,
-                    metadata={
-                        "legacy_event_id": event_id,
-                        "reflection": reflection,
-                        "sentiment": sentiment,
-                        "canonical_write": True,
-                    },
-                    dedup_key=f"memory_summary:{session_id}:{event_id}",
+                    metadata=metadata,
+                    dedup_key=dedup_key,
                     source_ref=f"MemoryEvent:{event_id}",
                 )
             )

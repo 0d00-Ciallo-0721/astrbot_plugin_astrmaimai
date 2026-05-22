@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+from ...infrastructure.context_economy.prompt_templates import PromptTemplateId
+from ...infrastructure.runtime.lane_manager import LaneKey
+from ..contracts.memory_query import MemoryClaim
+from .claim_rules import (
+    ANXIETY_KEYWORDS,
+    ASCII_CORRECTION_HINTS,
+    ASCII_SHORT_TERM_HINTS,
+    SERVER_COUNT_PATTERN,
+    SERVER_KEYWORDS,
+)
+from .claim_rules_zh import (
+    ZH_ANXIETY_KEYWORDS,
+    ZH_CORRECTION_HINTS,
+    ZH_SERVER_COUNT_PATTERN,
+    ZH_SERVER_KEYWORDS,
+    ZH_SHORT_TERM_HINTS,
+)
+
+
+@dataclass(slots=True)
+class ResolutionDecision:
+    action: str
+    claims: list[MemoryClaim]
+    truth_score: float = 0.0
+    correction_strength: float = 0.0
+    metadata: dict[str, Any] | None = None
+
+
+class MemoryClaimExtractor:
+    def __init__(self, gateway=None):
+        self.gateway = gateway
+        self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None) if gateway else None
+
+    def _rule_extract(self, *, user_text: str, subject_id: str, turn_id: str) -> list[MemoryClaim]:
+        text = str(user_text or "").strip()
+        if not text:
+            return []
+        lowered = text.lower()
+        claims: list[MemoryClaim] = []
+        correction = any(hint in lowered for hint in ASCII_CORRECTION_HINTS) or any(hint in text for hint in ZH_CORRECTION_HINTS)
+        short_term = any(hint in lowered for hint in ASCII_SHORT_TERM_HINTS) or any(hint in text for hint in ZH_SHORT_TERM_HINTS)
+
+        if any(keyword in lowered for keyword in SERVER_KEYWORDS) or any(keyword in text for keyword in ZH_SERVER_KEYWORDS):
+            match = SERVER_COUNT_PATTERN.search(text) or ZH_SERVER_COUNT_PATTERN.search(text)
+            value = match.group(1) if match else ""
+            if value:
+                claims.append(
+                    MemoryClaim(
+                        subject_id=subject_id,
+                        entity="asset",
+                        attribute="server_count",
+                        value=value,
+                        polarity="affirm",
+                        certainty=0.85 if correction else 0.7,
+                        is_correction=correction,
+                        fact_scope="medium_term",
+                        source_text=text,
+                        evidence_turn_id=turn_id,
+                    )
+                )
+        if short_term and (any(keyword in lowered for keyword in ANXIETY_KEYWORDS) or any(keyword in text for keyword in ZH_ANXIETY_KEYWORDS)):
+            claims.append(
+                MemoryClaim(
+                    subject_id=subject_id,
+                    entity="emotion",
+                    attribute="anxiety_state",
+                    value="anxious",
+                    polarity="affirm",
+                    certainty=0.8,
+                    is_correction=correction,
+                    fact_scope="short_term",
+                    source_text=text,
+                    evidence_turn_id=turn_id,
+                )
+            )
+        return claims
+
+    async def extract(
+        self,
+        *,
+        user_text: str,
+        assistant_text: str = "",
+        subject_id: str = "",
+        turn_id: str = "",
+        context_hint: str = "",
+    ) -> list[MemoryClaim]:
+        claims = self._rule_extract(user_text=user_text, subject_id=subject_id, turn_id=turn_id)
+        if claims or not self.gateway or self.prompt_registry is None:
+            return claims
+        try:
+            envelope = self.prompt_registry.render_template(
+                PromptTemplateId.MEMORY_CONFLICT_CLAIM_EXTRACTION,
+                {
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "subject_id": subject_id,
+                    "turn_id": turn_id,
+                    "context_hint": context_hint,
+                },
+            )
+            response = await self.gateway.call_data_process_task(
+                prompt=envelope.prompt,
+                system_prompt=envelope.system_prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=subject_id or "global", scope_kind="chat"),
+                base_origin="",
+                template_envelope=envelope,
+            )
+            if isinstance(response, str):
+                response = json.loads(response)
+        except Exception:
+            return []
+        result: list[MemoryClaim] = []
+        for item in list((response or {}).get("claims", []) or []):
+            if not isinstance(item, dict):
+                continue
+            result.append(
+                MemoryClaim(
+                    subject_id=str(item.get("subject_id") or subject_id or "").strip(),
+                    entity=str(item.get("entity") or "").strip(),
+                    attribute=str(item.get("attribute") or "").strip(),
+                    value=str(item.get("value") or "").strip(),
+                    polarity=str(item.get("polarity") or "affirm").strip(),
+                    certainty=float(item.get("certainty") or 0.5),
+                    is_correction=bool(item.get("is_correction")),
+                    fact_scope=str(item.get("fact_scope") or "medium_term").strip(),
+                    source_text=str(item.get("source_text") or user_text).strip(),
+                    evidence_turn_id=str(item.get("evidence_turn_id") or turn_id).strip(),
+                )
+            )
+        return result
+
+
+class MemoryConflictResolver:
+    def resolve(self, claims: list[MemoryClaim]) -> ResolutionDecision:
+        if not claims:
+            return ResolutionDecision(action="plain_memory_write", claims=[], metadata={})
+        best = max(claims, key=lambda item: (item.certainty, item.is_correction))
+        truth_score = best.certainty
+        if best.is_correction:
+            truth_score += 0.15
+        if best.fact_scope == "short_term":
+            return ResolutionDecision(
+                action="volatile_state_write",
+                claims=claims,
+                truth_score=min(truth_score, 1.0),
+                correction_strength=0.7 if best.is_correction else 0.3,
+                metadata={"fact_scope": "short_term", "volatile_state": True},
+            )
+        if best.fact_scope in {"permanent", "medium_term"} and truth_score >= 0.85:
+            return ResolutionDecision(
+                action="authority_override",
+                claims=claims,
+                truth_score=min(truth_score, 1.0),
+                correction_strength=0.9 if best.is_correction else 0.6,
+                metadata={"fact_scope": best.fact_scope, "volatile_state": False},
+            )
+        if best.is_correction and truth_score >= 0.8:
+            return ResolutionDecision(
+                action="authority_override",
+                claims=claims,
+                truth_score=min(truth_score, 1.0),
+                correction_strength=0.9,
+                metadata={"fact_scope": best.fact_scope, "volatile_state": False},
+            )
+        return ResolutionDecision(
+            action="plain_memory_write",
+            claims=claims,
+            truth_score=min(truth_score, 1.0),
+            correction_strength=0.4 if best.is_correction else 0.1,
+            metadata={"fact_scope": best.fact_scope, "volatile_state": False},
+        )
+
+
+__all__ = ["MemoryClaimExtractor", "MemoryConflictResolver", "ResolutionDecision"]

@@ -9,6 +9,7 @@ from astrbot.api import logger
 from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.memory_query import CommittedMemoryTurn, InstantGateResult, MemoryWriteRequest
+from .memory_claim_service import MemoryClaimExtractor, MemoryConflictResolver
 
 
 class InstantMemoryGate:
@@ -26,6 +27,8 @@ class InstantMemoryGate:
         self.engine = engine
         self.config = config if config is not None else getattr(gateway, "config", None)
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
+        self.claim_extractor = MemoryClaimExtractor(gateway)
+        self.conflict_resolver = MemoryConflictResolver()
 
     async def process_committed_turn(self, turn: CommittedMemoryTurn) -> InstantGateResult:
         if turn.is_proactive:
@@ -45,28 +48,22 @@ class InstantMemoryGate:
             return InstantGateResult()
 
         category, extracted = matched
-        content = f"[即时记忆|{category}] 用户说：{text}"
-        memory_id = await self.engine.write_service.write(
-            MemoryWriteRequest(
-                source="instant_gate",
-                kind="fact",
-                session_id=str(turn.chat_id),
-                sender_id=str(turn.sender_id or ""),
-                persona_id=str(turn.persona_id or ""),
-                content=content,
-                summary=extracted[:240],
-                importance=0.85,
-                confidence=0.9,
-                metadata={"gate_category": category, "instant_write": True, "turn_id": str(turn.turn_id or ""), "authority_eav": True},
-                dedup_key=f"instant_gate:{turn.chat_id}:{category}:{extracted[:60]}",
-            )
+        content = f"[????|{category}] ????{text}"
+        request, payload = await self._build_split_write_request(
+            source="instant_gate",
+            raw_text=text,
+            extracted_fact=content,
+            turn=turn,
+            category=category,
         )
+        memory_id = await self.engine.write_service.write(request)
         await self._observe(
             turn,
             "gate_hit",
             reason=category,
             summary=extracted[:120],
             memory_id=str(memory_id or ""),
+            payload=payload,
         )
         return InstantGateResult(
             hit=bool(memory_id),
@@ -96,6 +93,132 @@ class InstantMemoryGate:
         if now - float(last_check or 0.0) < 120:
             return False
         return True
+
+    async def _build_split_write_request(
+        self,
+        *,
+        source: str,
+        raw_text: str,
+        extracted_fact: str,
+        turn: CommittedMemoryTurn,
+        category: str,
+    ) -> tuple[MemoryWriteRequest, dict[str, Any]]:
+        claims = []
+        decision = None
+        fallback_used = False
+        try:
+            claims = await self.claim_extractor.extract(
+                user_text=str(raw_text or ""),
+                assistant_text=str(extracted_fact or ""),
+                subject_id=str(turn.sender_id or turn.chat_id or ""),
+                turn_id=str(turn.turn_id or ""),
+                context_hint=source,
+            )
+            if claims:
+                decision = self.conflict_resolver.resolve(claims)
+        except Exception as exc:
+            logger.error(f"[Instant Gate Error] Claim processing failed: {exc}. Falling back to legacy routing.")
+
+        if claims and decision is not None:
+            primary_claim = claims[0]
+            if decision.action == "authority_override":
+                request = MemoryWriteRequest(
+                    source=source,
+                    kind="fact",
+                    session_id=str(turn.chat_id or ""),
+                    sender_id=str(turn.sender_id or ""),
+                    persona_id=str(turn.persona_id or ""),
+                    content=str(extracted_fact or raw_text or ""),
+                    summary=str(primary_claim.value or extracted_fact or "")[:240],
+                    importance=0.85 if source == "instant_gate" else 0.8,
+                    confidence=max(primary_claim.certainty, 0.8 if source == "instant_gate" else 0.72),
+                    metadata={
+                        "source": source,
+                        "authority_eav": True,
+                        "fact_scope": str(primary_claim.fact_scope or "medium_term"),
+                        "correction_strength": float(decision.truth_score or decision.correction_strength or 0.0),
+                        "promotion_entity": str(primary_claim.entity or ""),
+                        "promotion_attribute": str(primary_claim.attribute or ""),
+                        "promotion_value": str(primary_claim.value or ""),
+                        "supports": [],
+                        "contradicts": [],
+                        "corrects": [],
+                        "turn_id": str(turn.turn_id or ""),
+                        "gate_category": category,
+                        "instant_write": True,
+                    },
+                    dedup_key=f"{primary_claim.subject_id}:{primary_claim.entity}:{primary_claim.attribute}",
+                    created_at=float(turn.committed_at or 0.0),
+                )
+                return request, {
+                    "claim_count": len(claims),
+                    "decision_action": "authority_override",
+                    "fact_scope": str(primary_claim.fact_scope or "medium_term"),
+                    "volatile_state": False,
+                    "fallback_used": False,
+                }
+            if decision.action == "volatile_state_write" or str(primary_claim.fact_scope or "") == "short_term":
+                request = MemoryWriteRequest(
+                    source=source,
+                    kind="topic",
+                    session_id=str(turn.chat_id or ""),
+                    sender_id=str(turn.sender_id or ""),
+                    persona_id=str(turn.persona_id or ""),
+                    content=str(raw_text or ""),
+                    summary=str(primary_claim.value or extracted_fact or "")[:240],
+                    importance=0.7,
+                    confidence=max(primary_claim.certainty, 0.7),
+                    metadata={
+                        "source": f"{source}_degraded",
+                        "volatile_state": True,
+                        "fact_scope": "short_term",
+                        "correction_strength": float(decision.truth_score or decision.correction_strength or 0.0),
+                        "turn_id": str(turn.turn_id or ""),
+                        "gate_category": category,
+                        "instant_write": True,
+                    },
+                    dedup_key=f"volatile:{turn.chat_id}:{primary_claim.attribute}:{primary_claim.value[:40]}",
+                    created_at=float(turn.committed_at or 0.0),
+                )
+                return request, {
+                    "claim_count": len(claims),
+                    "decision_action": "volatile_state_write",
+                    "fact_scope": "short_term",
+                    "volatile_state": True,
+                    "fallback_used": False,
+                }
+
+        fallback_used = True
+        fallback_prefix = "instant_gate_llm" if source == "instant_gate_llm" else "instant_gate"
+        request = MemoryWriteRequest(
+            source=source,
+            kind="fact",
+            session_id=str(turn.chat_id or ""),
+            sender_id=str(turn.sender_id or ""),
+            persona_id=str(turn.persona_id or ""),
+            content=str(extracted_fact or raw_text or ""),
+            summary=str(extracted_fact or raw_text or "")[:240],
+            importance=0.85 if source == "instant_gate" else 0.8,
+            confidence=0.9 if source == "instant_gate" else 0.72,
+            metadata={
+                "source": f"{source}_legacy_fallback",
+                "fact_scope": "medium_term",
+                "metadata_hydrated": False,
+                "turn_id": str(turn.turn_id or ""),
+                "gate_category": category,
+                "instant_write": True,
+                "authority_eav": True,
+            },
+            dedup_key=f"{fallback_prefix}:{turn.chat_id}:{category}:{str(extracted_fact or raw_text or '')[:60]}",
+            created_at=float(turn.committed_at or 0.0),
+        )
+        return request, {
+            "claim_count": len(claims or []),
+            "decision_action": "legacy_fallback",
+            "fact_scope": "medium_term",
+            "volatile_state": False,
+            "fallback_used": fallback_used,
+        }
 
     @staticmethod
     def memory_lane_key(chat_id: str) -> LaneKey:
@@ -175,26 +298,20 @@ class InstantMemoryGate:
         if len(fact) < 4:
             await self._observe(turn, "backfill_skipped", reason="fact_too_short", summary="llm backfill fact too short")
             return InstantGateResult()
-        memory_id = await self.engine.write_service.write(
-            MemoryWriteRequest(
-                source="instant_gate_llm",
-                kind="fact",
-                session_id=str(turn.chat_id),
-                sender_id=str(turn.sender_id or ""),
-                persona_id=str(turn.persona_id or ""),
-                content=f"[即时记忆|llm_backfill] 用户说：{turn.user_text}",
-                summary=fact[:240],
-                importance=0.8,
-                confidence=0.72,
-                metadata={"gate_category": "llm_backfill", "instant_write": True, "turn_id": str(turn.turn_id or ""), "authority_eav": True},
-                dedup_key=f"instant_gate_llm:{turn.chat_id}:{fact[:60]}",
-            )
+        request, payload = await self._build_split_write_request(
+            source="instant_gate_llm",
+            raw_text=str(turn.user_text or ""),
+            extracted_fact=fact,
+            turn=turn,
+            category="llm_backfill",
         )
+        memory_id = await self.engine.write_service.write(request)
         await self._observe(
             turn,
             "backfill_success",
             summary=fact[:120],
             memory_id=str(memory_id or ""),
+            payload=payload,
         )
         return InstantGateResult(
             hit=bool(memory_id),

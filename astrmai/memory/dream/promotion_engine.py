@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 from ..contracts.memory_query import MemoryWriteRequest
+from ..services.memory_claim_service import MemoryClaim, MemoryConflictResolver
 
 
 class MemoryPromotionEngine:
@@ -13,6 +14,7 @@ class MemoryPromotionEngine:
 
     def __init__(self, memory_engine):
         self.memory_engine = memory_engine
+        self.conflict_resolver = MemoryConflictResolver()
 
     @staticmethod
     def normalize_authority_dedup_key(subject_id: str, entity: str, attribute: str) -> str:
@@ -101,12 +103,31 @@ class MemoryPromotionEngine:
         for (subject_id, entity, attribute, value), evidences in grouped.items():
             if len(evidences) < self.PROMOTION_THRESHOLD:
                 continue
+            decision = self.conflict_resolver.resolve(
+                [
+                    MemoryClaim(
+                        subject_id=subject_id,
+                        entity=entity,
+                        attribute=attribute,
+                        value=value,
+                        polarity="affirm",
+                        certainty=0.95,
+                        is_correction=False,
+                        fact_scope="medium_term",
+                        source_text=str(evidences[0].get("text") or ""),
+                        evidence_turn_id=str(evidences[0].get("turn_id") or ""),
+                    )
+                ]
+            )
+            if decision.action != "authority_override":
+                continue
             dedup_key = self.normalize_authority_dedup_key(subject_id, entity, attribute)
             metadata = {
                 "promotion_source": "dream_audit_pipeline",
                 "promotion_count": len(evidences),
                 "promotion_window_days": self.WINDOW_DAYS,
                 "authority_eav": True,
+                "fact_scope": decision.metadata.get("fact_scope", "medium_term") if decision.metadata else "medium_term",
                 "promotion_values": [value],
                 "evidence_turns": [{"turn_id": str(item.get("turn_id") or ""), "text": str(item.get("text") or "")[:200]} for item in evidences[:8]],
                 "promotion_entity": entity,

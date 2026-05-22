@@ -246,11 +246,15 @@ class MemoryRetrievalService:
         for item in merged.values():
             canon = float(item.metadata.get("_canon_score", 0.0))
             hybrid_score = float(item.metadata.get("_hybrid_score", 0.0))
+            conflict_penalty = 0.0
+            if (item.metadata or {}).get("corrected_by") or (item.metadata or {}).get("contradicted_by"):
+                conflict_penalty = 0.2
             item.relevance_score = (
                 canon * self.scoring.canonical_weight
                 + hybrid_score * self.scoring.hybrid_weight
                 + float(item.importance or 0.0) * self.scoring.importance_weight
                 + float(item.confidence or 0.0) * self.scoring.confidence_weight
+                - conflict_penalty
                 - (self.scoring.stale_penalty if item.status == "stale" else 0.0)
             )
         ranked = sorted(merged.values(), key=lambda item: item.relevance_score, reverse=True)

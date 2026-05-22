@@ -20,6 +20,7 @@ class PromptTemplateId(str, Enum):
     MEMORY_TOPIC_SUMMARY = "memory_topic_summary"
     MEMORY_GLOBAL_SUMMARY = "memory_global_summary"
     MEMORY_STRUCTURED_EXTRACTION = "memory_structured_extraction"
+    MEMORY_CONFLICT_CLAIM_EXTRACTION = "memory_conflict_claim_extraction"
     MEMORY_NODE_EXTRACTION = "memory_node_extraction"
     MEMORY_INSTANT_BACKFILL = "memory_instant_backfill"
     DREAM_GENERATION = "dream_generation"
@@ -203,6 +204,39 @@ def _render_memory_structured_extraction(payload: dict[str, Any], template_versi
             format_constraints="不要输出 JSON 之外的任何内容。",
         ),
         payload=PromptPayload(text=f"[对话历史]\n{str(payload.get('history', '') or '').strip()}"),
+    )
+
+
+def _render_memory_conflict_claim_extraction(payload: dict[str, Any], template_version: str) -> PromptEnvelope:
+    return PromptEnvelope(
+        template_id=PromptTemplateId.MEMORY_CONFLICT_CLAIM_EXTRACTION.value,
+        template_version=template_version or "v1",
+        schema_id="memory_conflict_claims_json",
+        shell=PromptShell(
+            system_prompt="You extract structured memory claims and detect natural-language corrections.",
+            role_framing="Focus on user-stated facts, corrections, reversals, and short-term states.",
+            task_rules=(
+                "Only extract high-value claims. Detect explicit corrections such as 'not X but Y', "
+                "'I said it wrong', 'I want to correct that', 'before... now...'. "
+                "Classify each claim into permanent, medium_term, or short_term. "
+                "If the statement is uncertain or hedged, lower certainty."
+            ),
+            output_schema=(
+                'Return JSON only: {"claims":[{"subject_id":"","entity":"","attribute":"","value":"","polarity":"affirm|negate",'
+                '"certainty":0.0,"is_correction":true,"fact_scope":"permanent|medium_term|short_term","source_text":"","evidence_turn_id":""}],'
+                '"has_correction":true,"correction_strength":0.0,"should_override_authority":false}'
+            ),
+            format_constraints="Output JSON only.",
+        ),
+        payload=PromptPayload(
+            text=(
+                f"[User Text]\n{str(payload.get('user_text', '') or '').strip()}\n\n"
+                f"[Assistant Text]\n{str(payload.get('assistant_text', '') or '').strip()}\n\n"
+                f"[Context Hint]\n{str(payload.get('context_hint', '') or '').strip()}\n\n"
+                f"[Subject Id]\n{str(payload.get('subject_id', '') or '').strip()}\n\n"
+                f"[Evidence Turn Id]\n{str(payload.get('turn_id', '') or '').strip()}"
+            )
+        ),
     )
 
 
@@ -531,6 +565,12 @@ class PromptTemplateRegistry:
                 default_version="v1",
                 schema_id="memory_summary_json",
                 renderer=_render_memory_structured_extraction,
+            ),
+            PromptTemplateId.MEMORY_CONFLICT_CLAIM_EXTRACTION.value: PromptTemplateSpec(
+                template_id=PromptTemplateId.MEMORY_CONFLICT_CLAIM_EXTRACTION.value,
+                default_version="v1",
+                schema_id="memory_conflict_claims_json",
+                renderer=_render_memory_conflict_claim_extraction,
             ),
             PromptTemplateId.MEMORY_NODE_EXTRACTION.value: PromptTemplateSpec(
                 template_id=PromptTemplateId.MEMORY_NODE_EXTRACTION.value,

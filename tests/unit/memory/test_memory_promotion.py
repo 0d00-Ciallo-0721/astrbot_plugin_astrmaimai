@@ -98,6 +98,44 @@ class MemoryPromotionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_promotion_engine_skips_short_term_state_like_anxiety(self):
+        async def run():
+            store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
+            writer = self.write_mod.MemoryWriteService(store)
+
+            class _Engine:
+                def __init__(self):
+                    self.v2_store = store
+                    self.write_service = writer
+
+            now = time.time()
+            for index in range(3):
+                await writer.write(
+                    self.contracts.MemoryWriteRequest(
+                        source="memory_summary",
+                        kind="topic",
+                        session_id="chat-1",
+                        sender_id="zlj",
+                        content="我今天特别焦虑",
+                        summary="今天特别焦虑",
+                        metadata={
+                            "promotion_entity": "emotion",
+                            "promotion_attribute": "anxiety_state",
+                            "promotion_value": "anxious",
+                            "turn_id": f"anx-{index}",
+                        },
+                        dedup_key=f"topic:anx:{index}",
+                        created_at=now - index * 3600,
+                    )
+                )
+
+            engine = _Engine()
+            promotion = self.promotion_mod.MemoryPromotionEngine(engine)
+            report = await promotion.run_audit("chat-1", {"detected_facts": []}, now=now)
+            self.assertEqual(report["promoted"], [])
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()
