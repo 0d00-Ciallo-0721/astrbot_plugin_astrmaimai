@@ -22,13 +22,17 @@ from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
 from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
 from .expression_pattern_service import ExpressionPatternService
+from .instant_memory_gate import InstantMemoryGate
 from .memory_index_projector import MemoryIndexProjector
 from .memory_injection_service import MemoryInjectionService
 from .memory_maintenance_service import MemoryMaintenanceService
 from .memory_migration_service import MemoryMigrationService
+from .memory_observer import MemoryObserver
 from .memory_retrieval_service import MemoryRetrievalService
+from .memory_turn_pipeline import MemoryTurnPipeline
 from .memory_tool_service import MemoryToolService
 from .memory_write_service import MemoryWriteService
+from .session_memory_summarizer import SessionMemorySummarizer
 from .v2_store import MemoryV2Store
 
 
@@ -64,7 +68,11 @@ class MemoryEngine:
         self.vec_retriever = None
         self.bm25_retriever = None
         self.retriever = None
-        self.summarizer = None
+        self.instant_gate = None
+        self.memory_pipeline = None
+        self.session_summarizer = None
+        self.memory_observer = None
+        self.observability_hub = None
 
         self._is_ready = False
         self._init_failures = 0
@@ -517,10 +525,46 @@ class MemoryEngine:
         return await self.recall_persona_lore(query=query, persona_id=persona_id, top_k=kwargs.get("top_k", 3))
 
     async def start_background_tasks(self):
-        from .summarizer import ChatHistorySummarizer
+        raw_trace_store = getattr(getattr(self, "db_service", None), "raw_trace_store", None)
+        self.memory_observer = MemoryObserver(
+            raw_trace_store,
+            observability_hub=getattr(self, "observability_hub", None),
+        )
+        self.session_summarizer = SessionMemorySummarizer(self.context, self.gateway, self, config=self.config)
+        self.instant_gate = InstantMemoryGate(self.gateway, self, config=self.config)
+        self.memory_pipeline = MemoryTurnPipeline(
+            context=self.context,
+            gateway=self.gateway,
+            engine=self,
+            session_summarizer=self.session_summarizer,
+            instant_gate=self.instant_gate,
+            event_bus=getattr(getattr(self, "db_service", None), "event_bus", None) or getattr(self.gateway, "event_bus", None),
+            config=self.config,
+            observer=self.memory_observer,
+        )
+        await self.memory_pipeline.start()
 
-        self.summarizer = ChatHistorySummarizer(self.context, self.gateway, self, config=self.config)
-        await self.summarizer.start()
+    async def run_memory_maintenance(self, chat_id: str) -> dict:
+        pipeline = getattr(self, "memory_pipeline", None)
+        if pipeline is None or not hasattr(pipeline, "run_maintenance_for_session"):
+            return {"performed": False, "reason": "memory_pipeline_unavailable"}
+        return await pipeline.run_maintenance_for_session(chat_id)
+
+    async def describe_memory_eligibility(self, chat_id: str) -> dict:
+        pipeline = getattr(self, "memory_pipeline", None)
+        if pipeline is None or not hasattr(pipeline, "describe_session_eligibility"):
+            return {
+                "eligible": False,
+                "candidate_present": False,
+                "reason": "memory_pipeline_unavailable",
+                "pending_messages": 0,
+                "history_size": 0,
+                "threshold_messages": 0,
+                "cooldown_until": 0.0,
+                "last_memory_run_at": 0.0,
+                "last_update": 0.0,
+            }
+        return await pipeline.describe_session_eligibility(chat_id)
 
     async def apply_daily_decay(self, decay_rate: float, days: int = 1) -> int:
         return await self.maintenance_service.apply_daily_decay(

@@ -30,6 +30,16 @@ const state = {
   dashboardTab: "overview",
   reviewTab: "pending",
   memoryTab: "events",
+  observabilityOverview: null,
+  observabilityTimeline: [],
+  observabilityFilters: {
+    chat_id: "",
+    domains: "",
+    levels: "",
+    kinds: "",
+    q: "",
+    tags: "",
+  },
   schedulerStatus: null,
   schedulerDueSelection: null,
   schedulerChatLoop: null,
@@ -108,6 +118,21 @@ function schedulerReport() {
 
 function schedulerOverview() {
   return state.schedulerStatus?.data?.overview || {};
+}
+
+function observabilityTimelinePath() {
+  const filters = state.observabilityFilters || {};
+  const params = new URLSearchParams({ limit: "80" });
+  if (filters.chat_id) params.set("chat_id", filters.chat_id);
+  if (filters.domains) params.set("domains", filters.domains);
+  if (filters.levels) params.set("levels", filters.levels);
+  if (filters.kinds) params.set("kinds", filters.kinds);
+  if (filters.q || filters.tags) {
+    if (filters.q) params.set("q", filters.q);
+    if (filters.tags) params.set("tags", filters.tags);
+    return `/cognition/observability/search?${params.toString()}`;
+  }
+  return `/cognition/observability/timeline?${params.toString()}`;
 }
 
 function clampPercent(value) {
@@ -427,14 +452,18 @@ function dashboardShell(body) {
 }
 
 async function renderDashboardOverview() {
-  const [snapshot, health, capabilities, models] = await Promise.all([
+  const [snapshot, health, capabilities, models, observabilityOverview] = await Promise.all([
     api.get("/dashboard").catch(() => ({})),
     api.get("/runtime/health").catch(() => ({})),
     api.get("/runtime/capabilities").catch(() => ({})),
     api.get("/runtime/models").catch(() => ({})),
+    api.get("/cognition/observability/overview").catch(() => ({})),
   ]);
+  state.observabilityOverview = observabilityOverview;
   const healthData = health.data || {};
   const running = Boolean(healthData.running);
+  const obs = observabilityOverview.data || {};
+  const obsSnapshot = obs.snapshot || {};
   dashboardShell(`
     <div class="health-strip ${running ? "ok" : "warn"}">
       <span class="status-dot ${running ? "ok" : "warn"}"></span>
@@ -453,6 +482,17 @@ async function renderDashboardOverview() {
       ${section("能力矩阵", "Capabilities", `<pre>${json(capabilities.data || capabilities)}</pre>`)}
       ${section("模型与健康诊断", "Models / Health", `<pre>${json({ models: models.data || models, health: healthData })}</pre>`)}
     </div>
+    ${section("Observability Overview", "统一观测摘要与最近异常。", `
+      <div class="grid">
+        ${metric("Retained Events", obsSnapshot.retained_events ?? 0)}
+        ${metric("Tracked Chats", obsSnapshot.retained_chats ?? 0)}
+        ${metric("Warnings", obsSnapshot.recent_warning_count ?? 0)}
+        ${metric("Errors", obsSnapshot.recent_error_count ?? 0)}
+      </div>
+      <pre>${json(obsSnapshot)}</pre>
+      <h4>Recent Observability Errors</h4>
+      <pre>${json(asItems(obs.recent_errors))}</pre>
+    `)}
   `);
 }
 
@@ -658,12 +698,15 @@ function renderSchedulerDiagnosticsSection() {
 }
 
 async function renderDashboardCognition() {
-  const [decisions, turns, schedulerStatus, schedulerDueSelection] = await Promise.all([
+  const [decisions, turns, schedulerStatus, schedulerDueSelection, observabilityOverview, unifiedTimeline] = await Promise.all([
     api.get("/cognition/recent-decisions?limit=50").catch(() => ({ items: [] })),
     api.get("/cognition/recent-turns?limit=50").catch(() => ({ items: [] })),
     api.get("/cognition/scheduler/status").catch(() => null),
     api.get("/cognition/scheduler/due-selection").catch(() => null),
+    api.get("/cognition/observability/overview").catch(() => ({})),
+    api.get(observabilityTimelinePath()).catch(() => ({ items: [] })),
   ]);
+  state.observabilityOverview = observabilityOverview;
   state.schedulerStatus = schedulerStatus;
   state.schedulerDueSelection = schedulerDueSelection;
   state.cache.turns = asItems(turns);
@@ -671,11 +714,25 @@ async function renderDashboardCognition() {
   if (!state.schedulerChatId && selectedSchedulerChats.length > 0) {
     state.schedulerChatId = selectedSchedulerChats[0];
   }
+  if (!state.observabilityFilters.chat_id && state.schedulerChatId) {
+    state.observabilityFilters.chat_id = state.schedulerChatId;
+  }
   if (state.schedulerChatId) {
     await loadSchedulerChatLoop(state.schedulerChatId);
   } else {
     state.schedulerChatLoop = null;
   }
+  const unifiedRows = asItems(unifiedTimeline).map((item, index) => `
+    <tr>
+      <td>${formatTime(item.timestamp)}</td>
+      <td>${escapeHtml(item.domain || "-")}</td>
+      <td>${escapeHtml(item.kind || "-")}</td>
+      <td>${escapeHtml(item.level || "-")}</td>
+      <td>${escapeHtml(item.title || "-")}</td>
+      <td>${escapeHtml(item.summary || "-")}</td>
+      <td class="row-actions"><button class="ghost-button" data-unified-detail="${index}" type="button">璇︽儏</button></td>
+    </tr>
+  `);
   const decisionRows = asItems(decisions).map((item) => `
     <tr>
       <td>${escapeHtml(item.chat_id || "-")}</td>
@@ -709,6 +766,7 @@ async function renderDashboardCognition() {
   });
   dashboardShell(`
     ${renderSchedulerDiagnosticsSection()}
+    ${section("Global Observability Timeline", "统一 scheduler / heartflow / cognition / memory 的全局观测流。", table(["Time", "Domain", "Kind", "Level", "Title", "Summary", "Action"], unifiedRows))}
     ${section("主动决策池 Cognition", "最近 CognitiveLoop 决策，支持按 chat 查看决策/工具轨迹。", table(["Chat", "意图", "动作层级", "姿态", "操作"], decisionRows))}
     ${section("Turn Context", "每轮心智状态摘要：感知、注意力、主观决策、工具决策和连续性来源。", table(["时间", "Chat", "Sender", "Judge", "Intent", "Budget", "Tier", "工具数", "Heartflow", "操作"], turnRows))}
   `);
@@ -723,6 +781,15 @@ async function renderDashboardCognition() {
   }));
   $$('[data-chat-trace]').forEach((button) => button.addEventListener("click", () => openChatTrace(button.dataset.chatTrace)));
   $$('[data-turn-detail]').forEach((button) => button.addEventListener("click", () => openTurnTrace(Number(button.dataset.turnDetail))));
+  $$('[data-unified-detail]').forEach((button) => button.addEventListener("click", () => {
+    const item = asItems(unifiedTimeline)[Number(button.dataset.unifiedDetail)] || {};
+    openModal("Unified Timeline Detail", `<pre>${json(item.raw || item.detail || {})}</pre>`);
+  }));
+}
+
+async function loadUnifiedTimeline(chatId) {
+  const buildUnifiedTimelinePath = (chatId) => `/cognition/chats/${segment(chatId)}/unified-timeline?limit=80&include=decision,tool,trace,memory`;
+  return api.get(buildUnifiedTimelinePath(chatId)).catch(() => ({ items: [] }));
 }
 
 function renderThinkLevelSummary(cognitive) {

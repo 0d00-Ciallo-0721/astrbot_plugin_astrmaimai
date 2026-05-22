@@ -59,8 +59,8 @@ class MemoryContractMigratedTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         install_astrbot_stubs(self.temp_dir.name)
-        sys.modules.pop("astrmai.memory.services.summarizer", None)
-        self.summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        sys.modules.pop("astrmai.memory.services.session_memory_summarizer", None)
+        self.summarizer_mod = importlib.import_module("astrmai.memory.services.session_memory_summarizer")
         self.summarizer_mod = importlib.reload(self.summarizer_mod)
         self.datamodels_mod = importlib.import_module("astrmai.infrastructure.persistence.orm_models")
 
@@ -93,7 +93,7 @@ class MemoryContractMigratedTests(unittest.TestCase):
             context=SimpleNamespace(),
         )
         context = SimpleNamespace(astrmai_plugin=SimpleNamespace(db_service=_FakeDBService(logs)))
-        summarizer = self.summarizer_mod.ChatHistorySummarizer(context, gateway, _FakeEngine())
+        summarizer = self.summarizer_mod.SessionMemorySummarizer(context, gateway, _FakeEngine())
 
         captured = {}
 
@@ -117,7 +117,7 @@ class MemoryContractMigratedTests(unittest.TestCase):
             config=SimpleNamespace(memory=SimpleNamespace(cleanup_interval=60, summary_threshold=2)),
             context=SimpleNamespace(),
         )
-        summarizer = self.summarizer_mod.ChatHistorySummarizer(SimpleNamespace(), gateway, _FakeEngine())
+        summarizer = self.summarizer_mod.SessionMemorySummarizer(SimpleNamespace(), gateway, _FakeEngine())
 
         recorded = {}
 
@@ -134,6 +134,17 @@ class MemoryContractMigratedTests(unittest.TestCase):
 
         self.assertEqual(recorded["session_id"], "chat-1")
         self.assertEqual(recorded["messages"], messages)
+
+    def test_compat_summarizer_module_still_reexports_chat_history_summarizer(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(memory=SimpleNamespace(cleanup_interval=60, summary_threshold=2)),
+            context=SimpleNamespace(),
+        )
+        instance = compat_mod.ChatHistorySummarizer(SimpleNamespace(), gateway, _FakeEngine())
+        self.assertIsNotNone(instance)
 
 
 __all__ = ["MemoryContractMigratedTests"]

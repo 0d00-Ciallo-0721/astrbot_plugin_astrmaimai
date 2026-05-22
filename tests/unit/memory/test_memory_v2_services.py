@@ -262,6 +262,34 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_store_concurrent_same_session_writes_do_not_raise_database_locked(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content="Alice concurrent lock test.",
+                    dedup_key="lock:chat-1",
+                )
+            )
+
+            async def _update():
+                return await store.update_memory(memory_id, summary="updated summary")
+
+            async def _delete():
+                return await store.soft_delete(memory_id, reason="concurrent-test")
+
+            results = await asyncio.gather(_update(), _delete(), return_exceptions=True)
+            candidate = await store.get_canonical(memory_id, include_inactive=True)
+            return results, candidate
+
+        results, candidate = asyncio.run(run())
+        self.assertFalse(any(isinstance(item, Exception) for item in results))
+        self.assertIsNotNone(candidate)
+        self.assertIn(candidate.status, {"active", "deleted"})
+
     def test_schema_migration_imports_legacy_documents_once(self):
         async def run():
             async with aiosqlite.connect(self.db_path) as db:
@@ -440,7 +468,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
     def test_instant_memory_gate_writes_directly_to_canonical_store(self):
         async def run():
             store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
-            summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
 
             class _Engine:
                 def __init__(self, write_service):
@@ -451,14 +479,21 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     cleanup_interval = 3600
                     summary_threshold = 30
 
-            summarizer = summarizer_mod.ChatHistorySummarizer(
-                context=type("C", (), {})(),
+            turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-1",
+                chat_id="chat-1",
+                user_text="我叫小明",
+                assistant_text="好的",
+                source="test",
+            )
+            gate = gate_mod.InstantMemoryGate(
                 gateway=type("G", (), {"config": _Config(), "context": type("GC", (), {})()})(),
                 engine=_Engine(writer),
                 config=_Config(),
             )
-            await summarizer._try_instant_memorize("chat-1", "我叫小明", "好的")
+            result = await gate.process_committed_turn(turn)
             rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
+            self.assertTrue(result.hit)
             self.assertTrue(any("小明" in item.summary or "小明" in item.content for item in rows))
 
         asyncio.run(run())
@@ -466,7 +501,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
     def test_instant_memory_llm_backfill_uses_runtime_think_level_signal(self):
         async def run():
             store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
-            summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
 
             class _Engine:
                 def __init__(self, write_service):
@@ -489,15 +524,23 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     return {"worth": True, "fact": "用户想在周末去植物园散步"}
 
             gateway = _Gateway()
-            summarizer = summarizer_mod.ChatHistorySummarizer(
-                context=type("C", (), {})(),
+            gate = gate_mod.InstantMemoryGate(
                 gateway=gateway,
                 engine=_Engine(writer),
                 config=_Config(),
             )
-            await summarizer._try_instant_memorize("chat-1", "今天适合散步，我们周末去植物园吧", "好呀")
+            turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-2",
+                chat_id="chat-1",
+                user_text="今天适合散步，我们周末去植物园吧",
+                assistant_text="好呀",
+                source="test",
+                think_level=2,
+            )
+            result = await gate.run_llm_backfill(turn)
             rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
             self.assertEqual(gateway.calls, 1)
+            self.assertTrue(result.hit)
             llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
             self.assertEqual(len(llm_rows), 1)
             self.assertEqual(llm_rows[0].summary, "用户想在周末去植物园散步")
@@ -508,7 +551,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
     def test_instant_memory_llm_backfill_respects_threshold_and_cooldown(self):
         async def run():
             store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
-            summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
 
             class _Engine:
                 def __init__(self, write_service):
@@ -531,26 +574,48 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     return {"worth": True, "fact": "用户想找一家周末营业的咖啡馆"}
 
             low_gateway = _Gateway(think_level=1)
-            low_summarizer = summarizer_mod.ChatHistorySummarizer(
-                context=type("C", (), {})(),
+            low_gate = gate_mod.InstantMemoryGate(
                 gateway=low_gateway,
                 engine=_Engine(writer),
                 config=_Config(),
             )
-            await low_summarizer._try_instant_memorize("chat-1", "今天风有点大，想找个地方坐坐", "明白")
+            low_turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-3",
+                chat_id="chat-1",
+                user_text="今天风有点大，想找个地方坐坐",
+                assistant_text="明白",
+                source="test",
+                think_level=1,
+            )
+            self.assertFalse(low_gate.should_run_llm_backfill(low_turn, session_rounds=0, last_check=0.0, now=100.0))
             rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
             self.assertEqual(low_gateway.calls, 0)
             self.assertEqual([item for item in rows if item.source == "instant_gate_llm"], [])
 
             high_gateway = _Gateway(think_level=3)
-            high_summarizer = summarizer_mod.ChatHistorySummarizer(
-                context=type("C", (), {})(),
+            high_gate = gate_mod.InstantMemoryGate(
                 gateway=high_gateway,
                 engine=_Engine(writer),
                 config=_Config(),
             )
-            await high_summarizer._try_instant_memorize("chat-2", "今天风有点大，想找个地方坐坐", "明白")
-            await high_summarizer._try_instant_memorize("chat-2", "要不顺便看看附近的咖啡馆", "好")
+            first_turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-4",
+                chat_id="chat-2",
+                user_text="今天风有点大，想找个地方坐坐",
+                assistant_text="明白",
+                source="test",
+                think_level=3,
+            )
+            second_turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-5",
+                chat_id="chat-2",
+                user_text="要不顺便看看附近的咖啡馆",
+                assistant_text="好",
+                source="test",
+                think_level=3,
+            )
+            await high_gate.run_llm_backfill(first_turn)
+            self.assertFalse(high_gate.should_run_llm_backfill(second_turn, session_rounds=5, last_check=100.0, now=101.0))
             rows = await store.list_candidates(session_id="chat-2", kinds=["fact"], limit=10)
             self.assertEqual(high_gateway.calls, 1)
             llm_rows = [item for item in rows if item.source == "instant_gate_llm"]

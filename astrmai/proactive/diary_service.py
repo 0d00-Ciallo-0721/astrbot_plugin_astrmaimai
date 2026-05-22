@@ -28,8 +28,8 @@ class DiaryService:
                 group_id = getattr(state, "chat_id", None)
                 if not group_id:
                     continue
-                if self.memory_engine and hasattr(self.memory_engine, "summarizer"):
-                    extract = getattr(self.memory_engine.summarizer, "extract_and_summarize_history", None)
+                if self.memory_engine and hasattr(self.memory_engine, "session_summarizer"):
+                    extract = getattr(self.memory_engine.session_summarizer, "extract_and_summarize_history", None)
                     if extract:
                         await extract(group_id, days=1)
 

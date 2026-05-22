@@ -147,7 +147,34 @@
 
         <!-- MEMORY DIAGNOSTICS TAB -->
         <template x-if="currentTab === 'diagnostics'">
-            <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            <div class="flex flex-col gap-6">
+                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                    <div class="glass-panel p-4">
+                        <div class="text-xs uppercase text-slate-500 mb-1">Instant Gate</div>
+                        <div class="text-lg font-bold text-slate-100" x-text="observabilityRuntime && observabilityRuntime.instant_gate_ready ? 'Ready' : 'Offline'"></div>
+                        <div class="text-xs text-slate-400 mt-2" x-text="`Last hit: ${formatDate((observabilityRuntime && observabilityRuntime.observer_status && observabilityRuntime.observer_status.last_gate_hit_at) || 0)}`"></div>
+                    </div>
+                    <div class="glass-panel p-4">
+                        <div class="text-xs uppercase text-slate-500 mb-1">Memory Pipeline</div>
+                        <div class="text-lg font-bold text-slate-100" x-text="observabilityRuntime && observabilityRuntime.memory_pipeline_ready ? 'Ready' : 'Offline'"></div>
+                        <div class="text-xs text-slate-400 mt-2" x-text="`Workers: ${(observabilityRuntime && observabilityRuntime.memory_pipeline_status && observabilityRuntime.memory_pipeline_status.active_worker_count) || 0}`"></div>
+                    </div>
+                    <div class="glass-panel p-4">
+                        <div class="text-xs uppercase text-slate-500 mb-1">Session Summarizer</div>
+                        <div class="text-lg font-bold text-slate-100" x-text="observabilityRuntime && observabilityRuntime.session_summarizer_ready ? 'Ready' : 'Offline'"></div>
+                        <div class="text-xs text-slate-400 mt-2" x-text="`Last success: ${formatDate((observabilityRuntime && observabilityRuntime.observer_status && observabilityRuntime.observer_status.last_summarize_success_at) || 0)}`"></div>
+                    </div>
+                    <div class="glass-panel p-4">
+                        <div class="text-xs uppercase text-slate-500 mb-1">Errors / Warnings</div>
+                        <div class="text-lg font-bold text-slate-100">
+                            <span x-text="(observabilityRuntime && observabilityRuntime.observer_status && observabilityRuntime.observer_status.recent_error_count) || 0"></span>
+                            <span class="text-slate-500 mx-1">/</span>
+                            <span x-text="(observabilityRuntime && observabilityRuntime.observer_status && observabilityRuntime.observer_status.recent_warning_count) || 0"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
                 <div class="glass-panel p-5">
                     <h3 class="font-bold text-slate-100 mb-4">Migration</h3>
                     <div class="flex flex-wrap gap-2 mb-4">
@@ -171,6 +198,80 @@
                     <h3 class="font-bold text-slate-100 mb-4">Maintenance</h3>
                     <button class="glass-btn px-3 py-2 text-xs mb-4" @click="runMaintenance()">Run once</button>
                     <pre class="text-xs bg-slate-950/70 border border-white/10 rounded p-3 max-h-[460px] overflow-auto" x-text="formatJson(maintenanceReport)"></pre>
+                </div>
+                </div>
+
+                <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_420px] gap-6">
+                    <div class="glass-panel p-5">
+                        <div class="flex items-center justify-between gap-3 mb-4">
+                            <h3 class="font-bold text-slate-100">Memory Events Feed</h3>
+                            <button class="glass-btn px-3 py-2 text-xs" @click="loadObservabilityEvents(); loadObservabilityErrors(); if (observabilityChatId) loadObservabilityChat();">Refresh</button>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+                            <input class="form-input" placeholder="chat_id" x-model="observabilityChatId" @change="loadObservabilityChat(); loadObservabilityEvents(); loadObservabilityErrors();">
+                            <select class="form-input" x-model="observabilityFilters.component" @change="loadObservabilityEvents()">
+                                <option value="">all components</option>
+                                <option value="instant_gate">instant_gate</option>
+                                <option value="memory_pipeline">memory_pipeline</option>
+                                <option value="session_summarizer">session_summarizer</option>
+                            </select>
+                            <select class="form-input" x-model="observabilityFilters.level" @change="loadObservabilityEvents()">
+                                <option value="">all levels</option>
+                                <option value="info">info</option>
+                                <option value="warning">warning</option>
+                                <option value="error">error</option>
+                            </select>
+                            <input class="form-input" type="number" min="1" max="200" x-model="observabilityFilters.limit" @change="loadObservabilityEvents(); loadObservabilityErrors();">
+                        </div>
+                        <div class="space-y-3 max-h-[520px] overflow-auto">
+                            <template x-for="item in observabilityEvents" :key="item.event_id">
+                                <div class="border border-white/10 rounded-lg p-3 bg-slate-900/40">
+                                    <div class="flex items-center justify-between gap-3 text-xs mb-2">
+                                        <div class="flex gap-2 items-center">
+                                            <span class="px-2 py-1 rounded bg-slate-800 text-slate-300" x-text="item.component"></span>
+                                            <span class="px-2 py-1 rounded"
+                                                  :class="item.level === 'error' ? 'bg-rose-500/20 text-rose-300' : (item.level === 'warning' ? 'bg-amber-500/20 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')"
+                                                  x-text="item.level"></span>
+                                            <span class="text-brand-300" x-text="item.stage"></span>
+                                        </div>
+                                        <span class="text-slate-500" x-text="formatDate(item.timestamp)"></span>
+                                    </div>
+                                    <div class="text-sm text-slate-200" x-text="item.summary || item.reason || '(no summary)'"></div>
+                                    <div class="mt-2 text-xs text-slate-500" x-text="item.chat_id"></div>
+                                </div>
+                            </template>
+                            <template x-if="!observabilityEvents.length">
+                                <div class="text-sm text-slate-500 py-10 text-center">No observability events yet.</div>
+                            </template>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-col gap-6">
+                        <div class="glass-panel p-5">
+                            <h3 class="font-bold text-slate-100 mb-4">Chat Drill-down</h3>
+                            <pre class="text-xs bg-slate-950/70 border border-white/10 rounded p-3 max-h-[260px] overflow-auto" x-text="formatJson(observabilityChatStatus)"></pre>
+                        </div>
+                        <div class="glass-panel p-5">
+                            <h3 class="font-bold text-slate-100 mb-4">Recent Errors</h3>
+                            <div class="space-y-3 max-h-[220px] overflow-auto">
+                                <template x-for="item in observabilityErrors" :key="item.event_id">
+                                    <div class="border border-white/10 rounded-lg p-3 bg-slate-900/40">
+                                        <div class="flex items-center justify-between gap-3 text-xs mb-2">
+                                            <span class="px-2 py-1 rounded"
+                                                  :class="item.level === 'error' ? 'bg-rose-500/20 text-rose-300' : 'bg-amber-500/20 text-amber-300'"
+                                                  x-text="item.level"></span>
+                                            <span class="text-slate-500" x-text="formatDate(item.timestamp)"></span>
+                                        </div>
+                                        <div class="text-sm text-slate-200" x-text="item.summary || item.reason || '(no summary)'"></div>
+                                        <div class="mt-2 text-xs text-slate-500" x-text="`${item.component} / ${item.stage}`"></div>
+                                    </div>
+                                </template>
+                                <template x-if="!observabilityErrors.length">
+                                    <div class="text-sm text-slate-500 py-6 text-center">No recent warnings or errors.</div>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </template>

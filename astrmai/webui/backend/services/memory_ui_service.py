@@ -17,6 +17,108 @@ class MemoryUiService:
         runtime = self.plugin_api.get_runtime() if self.plugin_api else None
         return getattr(runtime, "memory_engine", None) if runtime else None
 
+    async def runtime_status(self) -> dict[str, object]:
+        engine = self._memory_engine()
+        instant_gate = getattr(engine, "instant_gate", None) if engine else None
+        memory_pipeline = getattr(engine, "memory_pipeline", None) if engine else None
+        session_summarizer = getattr(engine, "session_summarizer", None) if engine else None
+        pipeline_status = (
+            memory_pipeline.describe_runtime_status()
+            if memory_pipeline is not None and hasattr(memory_pipeline, "describe_runtime_status")
+            else {}
+        )
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        observer_snapshot = (
+            await observer.runtime_snapshot(
+                instant_gate_ready=bool(instant_gate is not None),
+                memory_pipeline_ready=bool(memory_pipeline is not None),
+                session_summarizer_ready=bool(session_summarizer is not None),
+                pipeline_status=pipeline_status,
+            )
+            if observer is not None and hasattr(observer, "runtime_snapshot")
+            else {}
+        )
+        return {
+            "status": "ok",
+            "runtime_bound": bool(engine is not None),
+            "instant_gate_ready": bool(instant_gate is not None),
+            "memory_pipeline_ready": bool(memory_pipeline is not None),
+            "session_summarizer_ready": bool(session_summarizer is not None),
+            "memory_pipeline_status": dict(pipeline_status or {}),
+            "observer_status": dict(observer_snapshot or {}),
+        }
+
+    async def chat_buffer_status(self, chat_id: str) -> dict[str, object]:
+        engine = self._memory_engine()
+        memory_pipeline = getattr(engine, "memory_pipeline", None) if engine else None
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        if memory_pipeline is not None and hasattr(memory_pipeline, "describe_chat_buffer"):
+            data = memory_pipeline.describe_chat_buffer(chat_id)
+            if observer is not None and hasattr(observer, "chat_snapshot"):
+                data = await observer.chat_snapshot(
+                    chat_id=str(chat_id or ""),
+                    pipeline_buffer=data,
+                    worker_active=bool(getattr(memory_pipeline, "is_worker_active", lambda _: False)(chat_id)),
+                    limit=20,
+                )
+            return {
+                "status": "ok",
+                "runtime_bound": True,
+                "data": data,
+            }
+        return {
+            "status": "ok",
+            "runtime_bound": False,
+            "data": {
+                "chat_id": str(chat_id or ""),
+                "pending_messages": 0,
+                "last_update": 0.0,
+                "cooldown_until": 0.0,
+                "failures": 0,
+                "last_memory_run_at": 0.0,
+            },
+        }
+
+    async def observability_runtime(self) -> dict[str, object]:
+        return await self.runtime_status()
+
+    async def observability_chat(self, chat_id: str) -> dict[str, object]:
+        return await self.chat_buffer_status(chat_id)
+
+    async def observability_events(
+        self,
+        *,
+        chat_id: str = "",
+        component: str = "",
+        level: str = "",
+        limit: int = 50,
+    ) -> dict[str, object]:
+        engine = self._memory_engine()
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        if observer is not None and hasattr(observer, "recent_events"):
+            items = await observer.recent_events(
+                chat_id=str(chat_id or "") or None,
+                component=str(component or ""),
+                level=str(level or ""),
+                limit=limit,
+            )
+            formatter = getattr(observer, "format_timeline_item", None)
+            if callable(formatter):
+                items = [formatter(item) for item in list(items or [])]
+            return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
+        return {"status": "ok", "runtime_bound": False, "items": []}
+
+    async def observability_errors(self, *, chat_id: str = "", limit: int = 50) -> dict[str, object]:
+        engine = self._memory_engine()
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        if observer is not None and hasattr(observer, "recent_errors"):
+            items = await observer.recent_errors(chat_id=str(chat_id or "") or None, limit=limit)
+            formatter = getattr(observer, "format_timeline_item", None)
+            if callable(formatter):
+                items = [formatter(item) for item in list(items or [])]
+            return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
+        return {"status": "ok", "runtime_bound": False, "items": []}
+
     async def _columns(self, db, table: str) -> set[str]:
         async with db.execute(f"PRAGMA table_info({table})") as cursor:
             rows = await cursor.fetchall()

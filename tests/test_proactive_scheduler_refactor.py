@@ -451,8 +451,8 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         task.wakeup_service = SimpleNamespace(run_for_chat=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True}))
         task.heartflow_manager = SimpleNamespace(tick_chat=lambda chat_id, snapshot=None: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True}))
         task.memory_engine = SimpleNamespace(
-            summarizer=SimpleNamespace(
-                run_once_for_session=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True, "reason": "summarized"})
+            memory_pipeline=SimpleNamespace(
+                run_maintenance_for_session=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True, "reason": "summarized"})
             )
         )
         task.dream_scheduler = SimpleNamespace(run_once_for_session=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True}))

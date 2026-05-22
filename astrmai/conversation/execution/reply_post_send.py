@@ -6,6 +6,7 @@ from typing import Any, Sequence
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+from ...conversation.contracts.turn_context import get_turn_context
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...multimodal import MEMES_DIR, send_meme
 from ...state.relationship.affection_router import AffectionRouter
@@ -106,20 +107,45 @@ class ReplyPostSendMixin:
         assistant_text: str,
     ) -> None:
         memory_engine = getattr(self, "memory_engine", None)
-        summarizer = getattr(memory_engine, "summarizer", None) if memory_engine is not None else None
-        writer = getattr(summarizer, "ingest_committed_turn", None)
-        if writer is None:
+        pipeline = getattr(memory_engine, "memory_pipeline", None) if memory_engine is not None else None
+        instant_gate = getattr(memory_engine, "instant_gate", None) if memory_engine is not None else None
+        if pipeline is None or instant_gate is None:
             return
         try:
-            await writer(
-                chat_id,
-                user_text,
-                assistant_text,
+            turn = pipeline.build_turn(
+                chat_id=chat_id,
+                user_text=user_text,
+                assistant_text=assistant_text,
                 source="reply_service.post_send",
                 is_proactive=bool(event.get_extra("astrmai_is_proactive_event", False)),
+                think_level=self._resolve_memory_turn_think_level(event),
+                persona_id=self._resolve_memory_turn_persona_id(),
             )
+            record_result = await pipeline.record_turn(turn)
+            if not bool(record_result.get("performed")):
+                return
+            await pipeline.process_instant_gate(turn)
+            await pipeline.publish_turn_committed(turn)
         except Exception as exc:
             logger.warning(f"[ReplyService] memory turn ingest failed: {exc}")
+
+    def _resolve_memory_turn_think_level(self, event: AstrMessageEvent) -> int | None:
+        value = event.get_extra("astrmai_think_level", None) if hasattr(event, "get_extra") else None
+        if value is None:
+            try:
+                turn_context = get_turn_context(event)
+                if turn_context is not None:
+                    value = getattr(turn_context.cognitive, "think_level", None)
+            except Exception:
+                value = None
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_memory_turn_persona_id(self) -> str:
+        config = getattr(self, "config", None)
+        return str(getattr(getattr(config, "persona", None), "persona_id", "") or "")
 
     def _resolve_post_send_tag(self, bypassed_tag: str | None) -> tuple[str, bool]:
         if not bypassed_tag:

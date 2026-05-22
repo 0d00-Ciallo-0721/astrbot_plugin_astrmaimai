@@ -67,6 +67,37 @@ async def index_status(user: str = Depends(get_current_user)):
     return await _service().index_status()
 
 
+@router.get("/observability/runtime")
+async def observability_runtime(user: str = Depends(get_current_user)):
+    return await _service().observability_runtime()
+
+
+@router.get("/observability/chats/{chat_id}")
+async def observability_chat(chat_id: str, user: str = Depends(get_current_user)):
+    return await _service().observability_chat(chat_id)
+
+
+@router.get("/observability/events")
+async def observability_events(
+    chat_id: str = "",
+    component: str = "",
+    level: str = "",
+    limit: int = 50,
+    user: str = Depends(get_current_user),
+):
+    return await _service().observability_events(
+        chat_id=chat_id,
+        component=component,
+        level=level,
+        limit=limit,
+    )
+
+
+@router.get("/observability/errors")
+async def observability_errors(chat_id: str = "", limit: int = 50, user: str = Depends(get_current_user)):
+    return await _service().observability_errors(chat_id=chat_id, limit=limit)
+
+
 @router.post("/diagnostics/index/repair")
 async def repair_index(user: str = Depends(get_current_user)):
     return await _service().repair_index()

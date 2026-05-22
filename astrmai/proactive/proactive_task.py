@@ -520,11 +520,11 @@ class ProactiveTask:
     async def handle_memory_signal(self, chat_id: str, snapshot, decision) -> dict:
         decision.metadata["dispatch_mode"] = "kernel_mediated"
         decision.metadata["dispatch_bridge"] = "MEMORY_MAINTENANCE"
-        summarizer = getattr(self.memory_engine, "summarizer", None)
-        if summarizer is None or not hasattr(summarizer, "run_once_for_session"):
+        pipeline = getattr(self.memory_engine, "memory_pipeline", None)
+        if pipeline is None or not hasattr(pipeline, "run_maintenance_for_session"):
             result = {"performed": False, "reason": "memory_summarizer_unavailable"}
         else:
-            result = await summarizer.run_once_for_session(chat_id)
+            result = await pipeline.run_maintenance_for_session(chat_id)
         return {
             "chat_id": chat_id,
             "action": decision.action,

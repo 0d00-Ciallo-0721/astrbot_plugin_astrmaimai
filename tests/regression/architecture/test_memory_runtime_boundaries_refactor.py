@@ -36,6 +36,74 @@ def _call_target_expr(node: ast.AST) -> str:
 
 
 class MemoryRuntimeBoundariesRefactorTests(unittest.TestCase):
+    def test_summarizer_module_is_not_primary_runtime_implementation_host(self):
+        summarizer = (ASTRMAI_ROOT / "memory" / "services" / "summarizer.py").read_text(encoding="utf-8")
+        self.assertIn("compatibility facade", summarizer.lower())
+        self.assertIn("SessionMemorySummarizer", summarizer)
+        self.assertNotIn("class MemoryTurnPipeline", summarizer)
+
+    def test_reply_post_send_no_longer_calls_legacy_summarizer_ingest(self):
+        reply_post_send = (ASTRMAI_ROOT / "conversation" / "execution" / "reply_post_send.py").read_text(encoding="utf-8")
+        self.assertNotIn("summarizer.ingest_committed_turn", reply_post_send)
+        self.assertIn("memory_pipeline", reply_post_send)
+        self.assertIn("instant_gate", reply_post_send)
+        self.assertIn("publish_turn_committed", reply_post_send)
+
+    def test_proactive_memory_maintenance_no_longer_calls_legacy_summarizer(self):
+        proactive_task = (ASTRMAI_ROOT / "proactive" / "proactive_task.py").read_text(encoding="utf-8")
+        self.assertNotIn("summarizer.run_once_for_session", proactive_task)
+        self.assertIn("memory_pipeline", proactive_task)
+        self.assertIn("run_maintenance_for_session", proactive_task)
+
+    def test_runtime_code_does_not_read_memory_engine_summarizer_alias(self):
+        offenders = []
+        for path in _iter_python_files(ASTRMAI_ROOT):
+            if path == ENGINE_PATH:
+                continue
+            text = path.read_text(encoding="utf-8-sig", errors="ignore")
+            if "memory_engine.summarizer" in text:
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(offenders, [], "Production runtime should not read memory_engine.summarizer alias")
+
+    def test_memory_turn_pipeline_is_the_only_runtime_async_bridge(self):
+        reply_post_send = (ASTRMAI_ROOT / "conversation" / "execution" / "reply_post_send.py").read_text(encoding="utf-8")
+        event_bus = (ASTRMAI_ROOT / "infrastructure" / "runtime" / "event_bus.py").read_text(encoding="utf-8")
+        pipeline = (ASTRMAI_ROOT / "memory" / "services" / "memory_turn_pipeline.py").read_text(encoding="utf-8")
+        self.assertIn("TOPIC_MEMORY_TURN_COMMITTED", event_bus)
+        self.assertIn("memory.turn_committed", event_bus)
+        self.assertIn("publish_turn_committed", reply_post_send)
+        self.assertIn('subscribe(self.event_bus.TOPIC_MEMORY_TURN_COMMITTED', pipeline)
+
+    def test_memory_engine_runtime_wiring_exposes_new_components(self):
+        engine_text = ENGINE_PATH.read_text(encoding="utf-8")
+        self.assertIn("self.instant_gate = None", engine_text)
+        self.assertIn("self.memory_pipeline = None", engine_text)
+        self.assertIn("self.session_summarizer = None", engine_text)
+        self.assertIn("self.instant_gate = InstantMemoryGate", engine_text)
+        self.assertIn("self.memory_pipeline = MemoryTurnPipeline", engine_text)
+        self.assertIn("self.session_summarizer = SessionMemorySummarizer", engine_text)
+        self.assertNotIn("self.summarizer = self.memory_pipeline", engine_text)
+
+    def test_tests_do_not_heavily_depend_on_compat_summarizer_module(self):
+        offenders = []
+        allowed = {
+            ROOT / "tests" / "test_memory_refactor.py",
+            ROOT / "tests" / "test_reply_service_refactor.py",
+            ROOT / "tests" / "unit" / "memory" / "test_memory_contracts_migrated.py",
+            ROOT / "tests" / "regression" / "architecture" / "test_memory_runtime_boundaries_refactor.py",
+        }
+        for path in (ROOT / "tests").rglob("*.py"):
+            if path in allowed:
+                continue
+            text = path.read_text(encoding="utf-8-sig", errors="ignore")
+            if "astrmai.memory.services.summarizer" in text or "ChatHistorySummarizer" in text:
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(
+            offenders,
+            [],
+            "Only compat smoke tests should import the summarizer compat module",
+        )
+
     def test_runtime_code_does_not_call_memory_engine_recall_directly(self):
         offenders = []
         for path in _iter_python_files(ASTRMAI_ROOT):

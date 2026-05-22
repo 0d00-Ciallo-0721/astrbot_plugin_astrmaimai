@@ -228,6 +228,78 @@
                     </div>
                 </div>
             </template>
+
+            <template x-if="observabilityOverview && observabilityOverview.data">
+                <div class="glass-panel p-8">
+                    <div class="flex items-center justify-between mb-6">
+                        <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                            <i data-lucide="radar" class="w-5 h-5 text-cyan-400"></i>
+                            Observability Overview
+                        </h3>
+                        <button class="glass-btn px-3 py-2 text-xs" @click="openMemoryDrilldown(memoryObservabilityChatId)">
+                            Open Memory Diagnostics
+                        </button>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
+                        <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-4">
+                            <p class="text-xs text-slate-500 mb-1">Retained Events</p>
+                            <p class="font-mono text-white" x-text="observabilityOverview.data.snapshot.retained_events ?? 0"></p>
+                        </div>
+                        <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-4">
+                            <p class="text-xs text-slate-500 mb-1">Tracked Chats</p>
+                            <p class="font-mono text-white" x-text="observabilityOverview.data.snapshot.retained_chats ?? 0"></p>
+                        </div>
+                        <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-4">
+                            <p class="text-xs text-slate-500 mb-1">Warnings</p>
+                            <p class="font-mono text-white" x-text="observabilityOverview.data.snapshot.recent_warning_count ?? 0"></p>
+                        </div>
+                        <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-4">
+                            <p class="text-xs text-slate-500 mb-1">Errors</p>
+                            <p class="font-mono text-white" x-text="observabilityOverview.data.snapshot.recent_error_count ?? 0"></p>
+                        </div>
+                        <div class="rounded-lg bg-slate-900/50 border border-slate-700/40 p-4">
+                            <p class="text-xs text-slate-500 mb-1">Latest Event</p>
+                            <p class="font-mono text-white" x-text="formatTime(observabilityOverview.data.snapshot.latest_event_at ?? 0)"></p>
+                        </div>
+                    </div>
+                    <div class="mt-6 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px] gap-4">
+                        <div class="rounded-lg bg-slate-900/40 border border-slate-700/40 p-4">
+                            <div class="flex items-center justify-between gap-3 mb-3">
+                                <p class="text-sm font-semibold text-slate-300">Recent Observability Errors</p>
+                                <input class="form-input max-w-[220px]" placeholder="chat_id to drill down" x-model="memoryObservabilityChatId">
+                            </div>
+                            <template x-if="(observabilityOverview.data.recent_errors || []).length > 0">
+                                <div class="space-y-3">
+                                    <template x-for="item in observabilityOverview.data.recent_errors" :key="item.event_id">
+                                        <div class="rounded-lg border border-white/10 bg-slate-950/40 p-3">
+                                            <div class="flex items-center justify-between text-xs mb-2">
+                                                <span class="px-2 py-1 rounded bg-rose-500/20 text-rose-300" x-text="item.level"></span>
+                                                <span class="text-slate-500" x-text="formatTime(item.timestamp)"></span>
+                                            </div>
+                                            <p class="text-sm text-slate-200" x-text="item.display_title || item.title || item.kind"></p>
+                                            <p class="text-xs text-slate-500 mt-1" x-text="item.summary || item.reason || ''"></p>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                            <template x-if="!(observabilityOverview.data.recent_errors || []).length">
+                                <div class="text-sm text-slate-500">No recent observability warnings or errors.</div>
+                            </template>
+                        </div>
+                        <div class="rounded-lg bg-slate-900/40 border border-slate-700/40 p-4">
+                            <p class="text-sm font-semibold text-slate-300 mb-3">Domain Activity</p>
+                            <div class="space-y-2">
+                                <template x-for="entry in observabilityDomainCards()" :key="entry.key">
+                                    <div class="flex items-center justify-between text-xs text-slate-400">
+                                        <span x-text="entry.key"></span>
+                                        <span class="font-mono text-slate-200" x-text="entry.value"></span>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </template>
             
         </div>
     </div>
@@ -421,6 +493,106 @@
                             </div>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <div class="glass-panel p-8">
+                <div class="flex items-center justify-between gap-4 mb-6">
+                    <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                        <i data-lucide="git-commit-horizontal" class="w-5 h-5 text-cyan-400"></i>
+                        Global Observability Timeline
+                    </h3>
+                    <button class="glass-btn px-3 py-2 text-xs" @click="loadCognitionUnifiedTimeline()">
+                        Refresh Timeline
+                    </button>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
+                    <input
+                        x-model="cognitionTimelineChatId"
+                        type="text"
+                        class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500/50"
+                        placeholder="chat_id"
+                        @change="loadCognitionUnifiedTimeline(cognitionTimelineChatId)"
+                    />
+                    <select
+                        x-model="cognitionTimelineLevel"
+                        @change="loadCognitionUnifiedTimeline()"
+                        class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500/50"
+                    >
+                        <option value="">All Levels</option>
+                        <option value="info">info</option>
+                        <option value="warning">warning</option>
+                        <option value="error">error</option>
+                    </select>
+                    <input
+                        x-model="cognitionTimelineDomains"
+                        type="text"
+                        class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500/50"
+                        placeholder="domains: scheduler,memory"
+                        @change="loadCognitionUnifiedTimeline()"
+                    />
+                    <input
+                        x-model="cognitionTimelineKinds"
+                        type="text"
+                        class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500/50"
+                        placeholder="kinds: decision,trace"
+                        @change="loadCognitionUnifiedTimeline()"
+                    />
+                    <input
+                        x-model="cognitionTimelineQuery"
+                        type="text"
+                        class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500/50"
+                        placeholder="search q"
+                        @change="loadCognitionUnifiedTimeline()"
+                    />
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_220px] gap-3 mb-4">
+                    <input
+                        x-model="cognitionTimelineTags"
+                        type="text"
+                        class="bg-slate-900/70 border border-slate-700/60 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 focus:border-cyan-500/50"
+                        placeholder="tags: provider_failure_text"
+                        @change="loadCognitionUnifiedTimeline()"
+                    />
+                    <button class="glass-btn px-3 py-2 text-xs" @click="openChatTraceDetails(cognitionTimelineChatId)">
+                        Open Raw Trace Modal
+                    </button>
+                </div>
+                <div class="flex flex-wrap gap-2 mb-4">
+                    <button class="glass-btn px-3 py-2 text-xs" @click="applyTimelineQuickFilter('errors')">errors only</button>
+                    <button class="glass-btn px-3 py-2 text-xs" @click="applyTimelineQuickFilter('scheduler')">scheduler only</button>
+                    <button class="glass-btn px-3 py-2 text-xs" @click="applyTimelineQuickFilter('memory')">memory only</button>
+                    <button class="glass-btn px-3 py-2 text-xs" @click="applyTimelineQuickFilter('provider_failures')">provider failures</button>
+                    <button class="glass-btn px-3 py-2 text-xs" @click="clearTimelineFilters()">clear filters</button>
+                </div>
+                <div class="space-y-3 max-h-[520px] overflow-auto">
+                    <template x-for="(item, index) in cognitionUnifiedTimeline" :key="`${item.domain}-${item.kind}-${index}-${item.timestamp}`">
+                        <div class="rounded-lg border border-white/10 bg-slate-900/40 p-4">
+                            <div class="flex items-center justify-between gap-3 text-xs mb-2">
+                                <div class="flex items-center gap-2">
+                                    <span class="px-2 py-1 rounded bg-cyan-500/15 text-cyan-200" x-text="item.domain"></span>
+                                    <span class="px-2 py-1 rounded bg-slate-800 text-slate-300" x-text="item.kind"></span>
+                                    <span class="px-2 py-1 rounded"
+                                          :class="item.level === 'error' ? 'bg-rose-500/20 text-rose-300' : (item.level === 'warning' ? 'bg-amber-500/20 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')"
+                                          x-text="item.level"></span>
+                                    <span class="text-slate-500" x-text="item.source"></span>
+                                </div>
+                                <span class="text-slate-500" x-text="formatTime(item.timestamp)"></span>
+                            </div>
+                            <div class="text-sm font-semibold text-slate-100" x-text="item.title"></div>
+                            <div class="text-xs text-slate-400 mt-1" x-text="item.summary"></div>
+                            <div class="flex flex-wrap gap-2 mt-3">
+                                <button class="glass-btn px-2.5 py-1 text-[11px]" @click="openObservabilityItem(item)">Open Drill-down</button>
+                            </div>
+                            <details class="mt-3 text-xs">
+                                <summary class="cursor-pointer text-slate-500 hover:text-slate-300">View detail</summary>
+                                <pre class="mt-2 bg-slate-950/70 border border-white/10 rounded p-3 overflow-auto max-h-40" x-text="formatJson(item.raw || item.detail || {})"></pre>
+                            </details>
+                        </div>
+                    </template>
+                    <template x-if="cognitionUnifiedTimeline.length === 0">
+                        <div class="text-sm text-slate-500 py-10 text-center">No global observability timeline entries for the current filters.</div>
+                    </template>
                 </div>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4" x-show="contextEconomy">

@@ -97,6 +97,29 @@ class MemoryToolResult:
     warnings: List[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class CommittedMemoryTurn:
+    turn_id: str
+    chat_id: str
+    user_text: str
+    assistant_text: str
+    source: str = ""
+    is_proactive: bool = False
+    think_level: int | None = None
+    persona_id: str = ""
+    committed_at: float = 0.0
+    instant_gate_hit: bool = False
+    instant_memory_id: str = ""
+
+
+@dataclass(slots=True)
+class InstantGateResult:
+    hit: bool = False
+    memory_id: str = ""
+    category: str = ""
+    skip_backfill: bool = False
+
+
 __all__ = [
     "MemoryCandidate",
     "MemoryInjectionBundle",
@@ -104,4 +127,6 @@ __all__ = [
     "MemoryQuery",
     "MemoryToolResult",
     "MemoryWriteRequest",
+    "CommittedMemoryTurn",
+    "InstantGateResult",
 ]

@@ -102,123 +102,375 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertEqual(gateway.calls[0]["lane_key"].scope_id, "chat-42")
         self.assertEqual(gateway.calls[0]["lane_key"].scope_kind, "chat")
 
-    def test_chat_history_summarizer_describes_memory_candidate_from_buffer(self):
-        sys.modules.pop("astrmai.memory.services.summarizer", None)
-        summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
-        summarizer_mod = importlib.reload(summarizer_mod)
+    def test_memory_turn_pipeline_describes_eligibility_from_buffer(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
 
-        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None))
-        config = SimpleNamespace(memory=SimpleNamespace(summary_threshold=3, cleanup_interval=3600))
-        summarizer = summarizer_mod.ChatHistorySummarizer(
-            context=SimpleNamespace(astrmai_plugin=None),
-            gateway=gateway,
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=3, cleanup_interval=3600))),
             engine=SimpleNamespace(),
-            config=config,
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=3, cleanup_interval=3600)),
         )
-        summarizer._session_history_buffer["chat-1"] = {
+        pipeline._session_history_buffer["chat-1"] = {
             "buffer": ["u1", "a1", "u2", "a2", "u3", "a3"],
             "last_update": 1.0,
             "cooldown_until": 0.0,
             "failures": 0,
+            "last_run_at": 0.0,
         }
 
-        result = asyncio.run(summarizer.describe_session_eligibility("chat-1"))
+        result = asyncio.run(pipeline.describe_session_eligibility("chat-1"))
 
         self.assertTrue(result["eligible"])
         self.assertTrue(result["candidate_present"])
         self.assertEqual(result["reason"], "eligible")
         self.assertEqual(result["pending_messages"], 6)
 
-    def test_chat_history_summarizer_runs_once_for_session_when_threshold_reached(self):
-        sys.modules.pop("astrmai.memory.services.summarizer", None)
-        summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
-        summarizer_mod = importlib.reload(summarizer_mod)
+    def test_memory_turn_pipeline_maintenance_delegates_to_session_summarizer(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
 
-        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None))
-        config = SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))
-        summarizer = summarizer_mod.ChatHistorySummarizer(
-            context=SimpleNamespace(astrmai_plugin=None),
-            gateway=gateway,
-            engine=SimpleNamespace(),
-            config=config,
-        )
         calls = []
 
-        async def _fake_summarize_session(*, session_id, chat_history_text, persona_id=None, messages=None):
-            calls.append((session_id, chat_history_text))
+        class _SessionSummarizer:
+            async def summarize_session(self, session_id, chat_history_text, persona_id=None, messages=None):
+                calls.append((session_id, chat_history_text))
 
-        summarizer.summarize_session = _fake_summarize_session
-        summarizer._session_history_buffer["chat-2"] = {
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=_SessionSummarizer(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)),
+        )
+        pipeline._session_history_buffer["chat-2"] = {
             "buffer": ["u1", "a1", "u2", "a2"],
             "last_update": 1.0,
             "cooldown_until": 0.0,
             "failures": 0,
+            "last_run_at": 0.0,
         }
 
-        result = asyncio.run(summarizer.run_once_for_session("chat-2"))
+        result = asyncio.run(pipeline.run_maintenance_for_session("chat-2"))
 
         self.assertTrue(result["performed"])
         self.assertEqual(result["reason"], "summarized")
         self.assertEqual(calls[0][0], "chat-2")
-        self.assertEqual(summarizer._session_history_buffer["chat-2"]["buffer"], [])
 
-    def test_chat_history_summarizer_ingests_committed_turn_into_buffer(self):
-        sys.modules.pop("astrmai.memory.services.summarizer", None)
-        summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
-        summarizer_mod = importlib.reload(summarizer_mod)
+    def test_memory_turn_pipeline_record_turn_keeps_buffer_after_instant_hit(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
 
-        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None))
-        config = SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))
-        summarizer = summarizer_mod.ChatHistorySummarizer(
-            context=SimpleNamespace(astrmai_plugin=None),
-            gateway=gateway,
+        class _Gate:
+            async def process_committed_turn(self, turn):
+                return SimpleNamespace(hit=True, memory_id="mem-1", category="identity", skip_backfill=True)
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))),
             engine=SimpleNamespace(),
-            config=config,
+            session_summarizer=SimpleNamespace(),
+            instant_gate=_Gate(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)),
         )
 
-        result = asyncio.run(
-            summarizer.ingest_committed_turn(
-                "chat-3",
-                "Alice: hello",
-                "bot: hi",
+        async def _run():
+            turn = pipeline.build_turn(
+                chat_id="chat-3",
+                user_text="我叫小明",
+                assistant_text="好的",
                 source="test",
             )
-        )
+            result = await pipeline.record_turn(turn)
+            gate = await pipeline.process_instant_gate(turn)
+            return result, gate, turn
+
+        result, gate, turn = asyncio.run(_run())
 
         self.assertTrue(result["performed"])
-        self.assertEqual(result["reason"], "ingested")
+        self.assertTrue(gate.hit)
+        self.assertTrue(turn.instant_gate_hit)
         self.assertEqual(
-            summarizer._session_history_buffer["chat-3"]["buffer"],
-            ["用户/旁白：Alice: hello", "Bot：bot: hi"],
+            pipeline._session_history_buffer["chat-3"]["buffer"],
+            ["用户/旁白：我叫小明", "Bot：好的"],
         )
 
-    def test_chat_history_summarizer_ignores_proactive_turns(self):
-        sys.modules.pop("astrmai.memory.services.summarizer", None)
-        summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")
-        summarizer_mod = importlib.reload(summarizer_mod)
+    def test_memory_turn_pipeline_ignores_proactive_turns(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
 
-        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None))
-        config = SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))
-        summarizer = summarizer_mod.ChatHistorySummarizer(
-            context=SimpleNamespace(astrmai_plugin=None),
-            gateway=gateway,
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))),
             engine=SimpleNamespace(),
-            config=config,
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)),
         )
 
-        result = asyncio.run(
-            summarizer.ingest_committed_turn(
-                "chat-4",
-                "Alice: hello",
-                "bot: hi",
-                source="test",
-                is_proactive=True,
-            )
+        turn = pipeline.build_turn(
+            chat_id="chat-4",
+            user_text="hello",
+            assistant_text="hi",
+            source="test",
+            is_proactive=True,
         )
+        result = asyncio.run(pipeline.record_turn(turn))
 
         self.assertFalse(result["performed"])
         self.assertEqual(result["reason"], "proactive_ignored")
-        self.assertNotIn("chat-4", summarizer._session_history_buffer)
+
+    def test_memory_turn_pipeline_event_drop_still_keeps_buffered_turn(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+
+        class _EventBus:
+            TOPIC_MEMORY_TURN_COMMITTED = "memory.turn_committed"
+
+            def subscribe(self, *_args, **_kwargs):
+                return None
+
+            def unsubscribe(self, *_args, **_kwargs):
+                return None
+
+            async def publish_memory_turn_committed(self, _payload):
+                raise RuntimeError("queue dropped")
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=99, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            event_bus=_EventBus(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=99, cleanup_interval=3600)),
+        )
+
+        async def _run():
+            turn = pipeline.build_turn(
+                chat_id="chat-drop",
+                user_text="hello",
+                assistant_text="hi",
+                source="test",
+            )
+            record_result = await pipeline.record_turn(turn)
+            with self.assertRaises(RuntimeError):
+                await pipeline.publish_turn_committed(turn)
+            eligibility = await pipeline.describe_session_eligibility("chat-drop")
+            return record_result, eligibility
+
+        record_result, eligibility = asyncio.run(_run())
+        self.assertTrue(record_result["performed"])
+        self.assertEqual(
+            pipeline._session_history_buffer["chat-drop"]["buffer"],
+            ["用户/旁白：hello", "Bot：hi"],
+        )
+        self.assertTrue(eligibility["candidate_present"])
+        self.assertEqual(eligibility["reason"], "below_threshold")
+
+    def test_memory_turn_pipeline_idle_timeout_becomes_eligible_even_below_threshold(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600)),
+        )
+        pipeline._session_history_buffer["chat-idle"] = {
+            "buffer": ["u1", "a1"],
+            "last_update": 1.0,
+            "cooldown_until": 0.0,
+            "failures": 0,
+            "last_run_at": 0.0,
+        }
+
+        original_time = pipeline_mod.time.time
+        try:
+            pipeline_mod.time.time = lambda: 1.0 + pipeline.TURN_FORCE_SUMMARIZE_AFTER_SECONDS + 5.0
+            result = asyncio.run(pipeline.describe_session_eligibility("chat-idle"))
+        finally:
+            pipeline_mod.time.time = original_time
+
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["candidate_present"])
+        self.assertEqual(result["reason"], "idle_timeout")
+
+    def test_memory_turn_pipeline_queue_full_publish_does_not_drop_buffer(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+        bus_mod = importlib.import_module("astrmai.infrastructure.runtime.event_bus")
+        bus_mod = importlib.reload(bus_mod)
+
+        event_bus = bus_mod.EventBus()
+        event_bus.subscribers = {event_bus.TOPIC_MEMORY_TURN_COMMITTED: [lambda _payload: None]}
+        event_bus._workers_started = False
+        event_bus._background_tasks = set()
+        full_queue = asyncio.Queue(maxsize=1)
+        full_queue.put_nowait(("occupied", {}))
+        event_bus._event_queue = full_queue
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=99, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            event_bus=event_bus,
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=99, cleanup_interval=3600)),
+        )
+
+        async def _run():
+            turn = pipeline.build_turn(
+                chat_id="chat-queue-full",
+                user_text="hello",
+                assistant_text="hi",
+                source="test",
+            )
+            record_result = await pipeline.record_turn(turn)
+            await pipeline.publish_turn_committed(turn)
+            tasks = list(getattr(event_bus, "_background_tasks", set()) or set())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return record_result, turn
+
+        record_result, turn = asyncio.run(_run())
+        self.assertTrue(record_result["performed"])
+        self.assertFalse(turn.instant_gate_hit)
+        buffered = pipeline._session_history_buffer["chat-queue-full"]["buffer"]
+        self.assertEqual(len(buffered), 2)
+        self.assertIn("hello", buffered[0])
+        self.assertIn("hi", buffered[1])
+
+    def test_memory_turn_pipeline_sweep_loop_triggers_idle_timeout_maintenance(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600)),
+        )
+        pipeline._running = True
+        pipeline._session_history_buffer["chat-idle-sweep"] = {
+            "buffer": ["u1", "a1"],
+            "last_update": 1.0,
+            "cooldown_until": 0.0,
+            "failures": 0,
+            "last_run_at": 0.0,
+        }
+        maintenance_calls = []
+
+        async def _run_maintenance(chat_id):
+            maintenance_calls.append(chat_id)
+            pipeline._running = False
+            return {"performed": True, "reason": "summarized"}
+
+        sleep_calls = {"count": 0}
+        original_sleep = pipeline_mod.asyncio.sleep
+        original_time = pipeline_mod.time.time
+        try:
+            pipeline.run_maintenance_for_session = _run_maintenance
+
+            async def _fake_sleep(_seconds):
+                sleep_calls["count"] += 1
+                if sleep_calls["count"] > 1:
+                    raise asyncio.CancelledError()
+                return None
+
+            pipeline_mod.asyncio.sleep = _fake_sleep
+            pipeline_mod.time.time = lambda: 1.0 + pipeline.TURN_FORCE_SUMMARIZE_AFTER_SECONDS + 5.0
+            asyncio.run(pipeline._sweep_loop())
+        finally:
+            pipeline_mod.asyncio.sleep = original_sleep
+            pipeline_mod.time.time = original_time
+
+        self.assertEqual(maintenance_calls, ["chat-idle-sweep"])
+
+    def test_memory_turn_pipeline_maintenance_rolls_back_buffer_and_sets_cooldown_on_failure(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+
+        class _FailingSummarizer:
+            async def summarize_session(self, session_id, chat_history_text, persona_id=None, messages=None):
+                raise RuntimeError("summary failed")
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=_FailingSummarizer(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)),
+        )
+        pipeline._session_history_buffer["chat-fail"] = {
+            "buffer": ["u1", "a1", "u2", "a2"],
+            "last_update": 1.0,
+            "cooldown_until": 0.0,
+            "failures": 0,
+            "last_run_at": 0.0,
+        }
+
+        result = asyncio.run(pipeline.run_maintenance_for_session("chat-fail"))
+        session = pipeline._session_history_buffer["chat-fail"]
+
+        self.assertFalse(result["performed"])
+        self.assertEqual(result["reason"], "summary_failed")
+        self.assertEqual(session["buffer"], ["u1", "a1", "u2", "a2"])
+        self.assertEqual(session["failures"], 1)
+        self.assertGreater(session["cooldown_until"], 0.0)
+
+    def test_compat_summarizer_still_reexports_chat_history_summarizer(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(),
+            config=gateway.config,
+        )
+        self.assertIsNotNone(summarizer)
+
+    def test_compat_summarizer_describe_session_eligibility_forwards_to_pipeline(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        engine = SimpleNamespace(
+            memory_pipeline=SimpleNamespace(
+                describe_session_eligibility=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"eligible": True, "candidate_present": True, "reason": "eligible", "pending_messages": 2},
+                )
+            )
+        )
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=engine,
+            config=gateway.config,
+        )
+
+        result = asyncio.run(summarizer.describe_session_eligibility("chat-5"))
+
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["reason"], "eligible")
 
 
 if __name__ == "__main__":

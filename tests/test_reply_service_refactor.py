@@ -65,6 +65,61 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             config=config,
         )
 
+    def _build_memory_engine_runtime(self, *, threshold=2):
+        summarizer = self._build_memory_summarizer(threshold=threshold)
+
+        class _Pipeline:
+            def __init__(self, summarizer_ref):
+                self._session_history_buffer = {}
+                self._instant_llm_last_check = {}
+                self._summarizer = summarizer_ref
+
+            def build_turn(self, **kwargs):
+                return SimpleNamespace(**kwargs, instant_gate_hit=False, instant_memory_id="")
+
+            async def record_turn(self, turn):
+                if turn.is_proactive:
+                    return {"performed": False, "reason": "proactive_ignored", "pending_messages": 0}
+                self._session_history_buffer.setdefault(
+                    turn.chat_id,
+                    {"buffer": [], "last_update": 0.0, "cooldown_until": 0.0, "failures": 0, "last_run_at": 0.0},
+                )
+                session = self._session_history_buffer[turn.chat_id]
+                session["buffer"].extend([f"用户/旁白：{turn.user_text}", f"Bot：{turn.assistant_text}"])
+                session["last_update"] = time.time()
+                return {"performed": True, "reason": "recorded", "pending_messages": len(session["buffer"])}
+
+            async def process_instant_gate(self, turn):
+                return SimpleNamespace(hit=False, memory_id="")
+
+            async def publish_turn_committed(self, turn):
+                return None
+
+            async def describe_session_eligibility(self, chat_id):
+                session = self._session_history_buffer.get(chat_id) or {}
+                pending = len(session.get("buffer", []) or [])
+                threshold_messages = int(getattr(self._summarizer.config.memory, "summary_threshold", 2) or 2) * 2
+                eligible = pending > 0 and pending >= threshold_messages
+                return {
+                    "eligible": eligible,
+                    "candidate_present": pending > 0,
+                    "reason": "eligible" if eligible else ("below_threshold" if pending > 0 else "no_buffer"),
+                    "pending_messages": pending,
+                    "history_size": pending,
+                    "threshold_messages": threshold_messages,
+                    "cooldown_until": float(session.get("cooldown_until", 0.0) or 0.0),
+                    "last_memory_run_at": float(session.get("last_run_at", 0.0) or 0.0),
+                    "last_update": float(session.get("last_update", 0.0) or 0.0),
+                }
+
+        pipeline = _Pipeline(summarizer)
+        summarizer.engine.memory_pipeline = pipeline
+        return SimpleNamespace(
+            session_summarizer=summarizer,
+            memory_pipeline=pipeline,
+            instant_gate=SimpleNamespace(process_committed_turn=lambda turn: asyncio.sleep(0, result=SimpleNamespace(hit=False, memory_id=""))),
+        )
+
     def test_stale_reply_is_still_skipped(self):
         state_engine = FakeStateEngine()
         base_ts = time.time() - 12.0
@@ -221,11 +276,12 @@ class RefactoredReplyServiceTests(unittest.TestCase):
     def test_successful_reply_feeds_memory_buffer_after_send(self):
         state_engine = FakeStateEngine()
         state_engine.config.reply.typing_speed_factor = 0.0
-        summarizer = self._build_memory_summarizer(threshold=100)
+        memory_engine = self._build_memory_engine_runtime(threshold=100)
+        pipeline = memory_engine.memory_pipeline
         service = self.reply_mod.ReplyService(
             state_engine=state_engine,
             mood_manager=SimpleNamespace(),
-            memory_engine=SimpleNamespace(summarizer=summarizer),
+            memory_engine=memory_engine,
         )
         service._settle_post_send = _noop_post_send
 
@@ -234,10 +290,10 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         async def _run():
             await service.handle_reply(first, "reply-1", first.unified_msg_origin)
-            after_first = await summarizer.describe_session_eligibility(first.unified_msg_origin)
+            after_first = await pipeline.describe_session_eligibility(first.unified_msg_origin)
             await service.handle_reply(second, "reply-2", second.unified_msg_origin)
-            summarizer.config.memory.summary_threshold = 2
-            after_second = await summarizer.describe_session_eligibility(second.unified_msg_origin)
+            memory_engine.session_summarizer.config.memory.summary_threshold = 2
+            after_second = await pipeline.describe_session_eligibility(second.unified_msg_origin)
             return after_first, after_second
 
         after_first, after_second = asyncio.run(_run())
@@ -249,11 +305,12 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
     def test_failed_send_does_not_feed_memory_buffer(self):
         state_engine = FakeStateEngine()
-        summarizer = self._build_memory_summarizer(threshold=2)
+        memory_engine = self._build_memory_engine_runtime(threshold=2)
+        pipeline = memory_engine.memory_pipeline
         service = self.reply_mod.ReplyService(
             state_engine=state_engine,
             mood_manager=SimpleNamespace(),
-            memory_engine=SimpleNamespace(summarizer=summarizer),
+            memory_engine=memory_engine,
         )
 
         async def _send_fail(*args, **kwargs):
@@ -265,7 +322,7 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         asyncio.run(service.handle_reply(event, "will-not-write-memory", event.unified_msg_origin))
 
-        self.assertNotIn(event.unified_msg_origin, summarizer._session_history_buffer)
+        self.assertNotIn(event.unified_msg_origin, pipeline._session_history_buffer)
 
     def test_failed_send_triggers_light_no_send_affection_settlement(self):
         state_engine = FakeStateEngine()
@@ -295,11 +352,12 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
     def test_proactive_reply_does_not_feed_memory_buffer(self):
         state_engine = FakeStateEngine()
-        summarizer = self._build_memory_summarizer(threshold=2)
+        memory_engine = self._build_memory_engine_runtime(threshold=2)
+        pipeline = memory_engine.memory_pipeline
         service = self.reply_mod.ReplyService(
             state_engine=state_engine,
             mood_manager=SimpleNamespace(),
-            memory_engine=SimpleNamespace(summarizer=summarizer),
+            memory_engine=memory_engine,
         )
         service._settle_post_send = _noop_post_send
         event = FakeEvent("user-1", "Alice", "proactive-message")
@@ -307,7 +365,67 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         asyncio.run(service.handle_reply(event, "proactive-reply", event.unified_msg_origin))
 
-        self.assertNotIn(event.unified_msg_origin, summarizer._session_history_buffer)
+        self.assertNotIn(event.unified_msg_origin, pipeline._session_history_buffer)
+
+    def test_publish_turn_committed_failure_still_keeps_memory_buffer(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        memory_engine = self._build_memory_engine_runtime(threshold=100)
+        pipeline = memory_engine.memory_pipeline
+        published_turns = []
+
+        async def _publish_fail(turn):
+            published_turns.append(turn.chat_id)
+            raise RuntimeError("queue dropped")
+
+        pipeline.publish_turn_committed = _publish_fail
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            memory_engine=memory_engine,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "turn-publish-fail")
+
+        asyncio.run(service.handle_reply(event, "reply-visible", event.unified_msg_origin))
+
+        self.assertEqual(published_turns, [event.unified_msg_origin])
+        self.assertIn(event.unified_msg_origin, pipeline._session_history_buffer)
+        self.assertEqual(
+            pipeline._session_history_buffer[event.unified_msg_origin]["buffer"],
+            ["用户/旁白：Alice: turn-publish-fail", "Bot：reply-visible"],
+        )
+
+    def test_instant_gate_failure_does_not_break_visible_reply_or_buffer(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        memory_engine = self._build_memory_engine_runtime(threshold=100)
+        pipeline = memory_engine.memory_pipeline
+        sent = []
+
+        async def _instant_gate_fail(_turn):
+            raise RuntimeError("instant gate failed")
+
+        async def _capture_send(origin, reply_chain):
+            sent.append((origin, reply_chain))
+            return True
+
+        pipeline.process_instant_gate = _instant_gate_fail
+        state_engine.gateway.context.send_message = _capture_send
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            memory_engine=memory_engine,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "turn-instant-fail")
+
+        asyncio.run(service.handle_reply(event, "reply-visible", event.unified_msg_origin))
+
+        self.assertTrue(event.get_extra("astrmai_reply_sent", False))
+        self.assertTrue(sent)
+        self.assertIn(event.unified_msg_origin, pipeline._session_history_buffer)
+        self.assertEqual(len(pipeline._session_history_buffer[event.unified_msg_origin]["buffer"]), 2)
 
     def test_post_send_affection_uses_anchor_message_text_for_event_classification(self):
         state_engine = FakeStateEngine()

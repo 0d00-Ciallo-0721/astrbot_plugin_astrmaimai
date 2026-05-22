@@ -7,6 +7,7 @@ import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Callable
 
+from ....infrastructure.runtime.observability import RuntimeObservabilityHub
 from ..adapters.plugin_api import PluginApiAdapter
 
 
@@ -67,6 +68,10 @@ class AdminUiService:
     @staticmethod
     def _proactive_task(runtime: Any) -> Any:
         return getattr(runtime, "proactive_task", None) if runtime else None
+
+    @staticmethod
+    def _observability_hub(runtime: Any) -> Any:
+        return getattr(runtime, "observability_hub", None) if runtime else None
 
     @staticmethod
     def _chat_loop_kernel(runtime: Any) -> Any:
@@ -146,6 +151,240 @@ class AdminUiService:
             "data": await self.plugin_api.get_runtime_diagnostics(),
             "runtime_bound": self._runtime() is not None,
         }
+
+    @staticmethod
+    def _parse_filter_values(value: Any) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set)):
+            raw_items = value
+        else:
+            raw_items = str(value or "").split(",")
+        return {str(item).strip().lower() for item in raw_items if str(item).strip()}
+
+    async def memory_observability_overview(self) -> dict[str, Any]:
+        runtime = self._runtime()
+        engine = getattr(runtime, "memory_engine", None) if runtime else None
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        pipeline = getattr(engine, "memory_pipeline", None) if engine else None
+        instant_gate = getattr(engine, "instant_gate", None) if engine else None
+        session_summarizer = getattr(engine, "session_summarizer", None) if engine else None
+        pipeline_status = (
+            pipeline.describe_runtime_status()
+            if pipeline is not None and hasattr(pipeline, "describe_runtime_status")
+            else {}
+        )
+        snapshot = (
+            await observer.runtime_snapshot(
+                instant_gate_ready=bool(instant_gate is not None),
+                memory_pipeline_ready=bool(pipeline is not None),
+                session_summarizer_ready=bool(session_summarizer is not None),
+                pipeline_status=pipeline_status,
+            )
+            if observer is not None and hasattr(observer, "runtime_snapshot")
+            else {}
+        )
+        recent_errors = (
+            await observer.recent_errors(limit=10)
+            if observer is not None and hasattr(observer, "recent_errors")
+            else []
+        )
+        formatter = getattr(observer, "format_timeline_item", None) if observer is not None else None
+        if callable(formatter):
+            recent_errors = [formatter(item) for item in list(recent_errors or [])]
+        return {
+            "status": "ok",
+            "data": {
+                "snapshot": snapshot,
+                "recent_errors": list(recent_errors or []),
+            },
+            "runtime_bound": engine is not None,
+        }
+
+    async def observability_overview(self) -> dict[str, Any]:
+        runtime = self._runtime()
+        hub = self._observability_hub(runtime)
+        snapshot = await hub.global_snapshot() if hub is not None and hasattr(hub, "global_snapshot") else {}
+        recent_errors = await self.observability_errors(limit=12)
+        return {
+            "status": "ok",
+            "data": {
+                "snapshot": snapshot,
+                "recent_errors": list(recent_errors.get("items", []) or []),
+            },
+            "runtime_bound": hub is not None,
+        }
+
+    async def memory_observability_timeline(
+        self,
+        *,
+        chat_id: str | None = None,
+        component: str = "",
+        level: str = "",
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        runtime = self._runtime()
+        engine = getattr(runtime, "memory_engine", None) if runtime else None
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        items: list[dict[str, Any]] = []
+        formatter = getattr(observer, "format_timeline_item", None) if observer is not None else None
+        if observer is not None and hasattr(observer, "recent_events"):
+            items = await observer.recent_events(chat_id=chat_id, component=component, level=level, limit=limit)
+        else:
+            planner = self._planner(runtime)
+            raw_trace_store = getattr(planner, "raw_trace_store", None) if planner else None
+            if raw_trace_store is not None and hasattr(raw_trace_store, "recent"):
+                try:
+                    events = [dict(item or {}) for item in list(await raw_trace_store.recent(chat_id=chat_id, limit=limit))]
+                    items = [
+                        {
+                            "event_id": str(item.get("trace_id", "") or ""),
+                            "chat_id": str(item.get("chat_id", "") or ""),
+                            "component": str(item.get("memory_component", "") or ""),
+                            "stage": str(item.get("memory_stage", "") or str(item.get("stage", "")).replace("memory.", "")),
+                            "level": str(item.get("level", "info") or "info"),
+                            "reason": str(item.get("reason", "") or ""),
+                            "summary": str(item.get("summary", "") or ""),
+                            "timestamp": float(item.get("created_at", 0.0) or 0.0),
+                            "payload": dict(item.get("payload", {}) or {}),
+                        }
+                        for item in events
+                        if str(item.get("stage", "") or "").startswith("memory.")
+                    ]
+                except Exception:
+                    items = []
+        if callable(formatter):
+            items = [formatter(item) for item in list(items or [])]
+        return {"status": "ok", "items": list(items or []), "total": len(items), "runtime_bound": engine is not None}
+
+    async def memory_observability_chat(self, chat_id: str) -> dict[str, Any]:
+        runtime = self._runtime()
+        engine = getattr(runtime, "memory_engine", None) if runtime else None
+        pipeline = getattr(engine, "memory_pipeline", None) if engine else None
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        buffer_payload = (
+            pipeline.describe_chat_buffer(chat_id)
+            if pipeline is not None and hasattr(pipeline, "describe_chat_buffer")
+            else {}
+        )
+        data = (
+            await observer.chat_snapshot(
+                chat_id=chat_id,
+                pipeline_buffer=buffer_payload,
+                worker_active=bool(getattr(pipeline, "is_worker_active", lambda _: False)(chat_id)),
+                limit=20,
+            )
+            if observer is not None and hasattr(observer, "chat_snapshot")
+            else {}
+        )
+        timeline = await self.memory_observability_timeline(chat_id=chat_id, limit=40)
+        errors = await self.memory_observability_errors(chat_id=chat_id, limit=20)
+        return {
+            "status": "ok",
+            "data": {
+                "chat": data,
+                "timeline": list(timeline.get("items", []) or []),
+                "errors": list(errors.get("items", []) or []),
+            },
+            "runtime_bound": engine is not None,
+        }
+
+    async def memory_observability_errors(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        runtime = self._runtime()
+        engine = getattr(runtime, "memory_engine", None) if runtime else None
+        observer = getattr(engine, "memory_observer", None) if engine else None
+        items = (
+            await observer.recent_errors(chat_id=chat_id, limit=limit)
+            if observer is not None and hasattr(observer, "recent_errors")
+            else []
+        )
+        formatter = getattr(observer, "format_timeline_item", None) if observer is not None else None
+        if callable(formatter):
+            items = [formatter(item) for item in list(items or [])]
+        return {"status": "ok", "items": list(items or []), "total": len(items), "runtime_bound": engine is not None}
+
+    async def observability_timeline(
+        self,
+        *,
+        chat_id: str | None = None,
+        domains: list[str] | None = None,
+        levels: list[str] | None = None,
+        kinds: list[str] | None = None,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        runtime = self._runtime()
+        hub = self._observability_hub(runtime)
+        if hub is None or not hasattr(hub, "recent"):
+            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
+        items = await hub.recent(
+            chat_id=chat_id,
+            domains=self._parse_filter_values(domains),
+            levels=self._parse_filter_values(levels),
+            kinds=self._parse_filter_values(kinds),
+            limit=max(1, min(int(limit or 80), 300)),
+        )
+        formatted = [hub.format_timeline_item(item) if hasattr(hub, "format_timeline_item") else dict(item or {}) for item in list(items or [])]
+        return {"status": "ok", "items": formatted, "total": len(formatted), "runtime_bound": True}
+
+    async def observability_chat(self, chat_id: str) -> dict[str, Any]:
+        runtime = self._runtime()
+        hub = self._observability_hub(runtime)
+        if hub is None:
+            return {"status": "ok", "data": {}, "runtime_bound": False}
+        snapshot = await hub.chat_snapshot(chat_id) if hasattr(hub, "chat_snapshot") else {}
+        timeline = await self.observability_timeline(chat_id=chat_id, limit=80)
+        errors = await self.observability_errors(chat_id=chat_id, limit=30)
+        scheduler = await self.scheduler_chat_view(chat_id)
+        memory = await self.memory_observability_chat(chat_id)
+        heartflow = await self.heartflow_chat(chat_id)
+        return {
+            "status": "ok",
+            "data": {
+                "chat": snapshot,
+                "timeline": list(timeline.get("items", []) or []),
+                "errors": list(errors.get("items", []) or []),
+                "scheduler": scheduler.get("data", {}),
+                "memory": memory.get("data", {}),
+                "heartflow": heartflow.get("data", {}),
+            },
+            "runtime_bound": True,
+        }
+
+    async def observability_errors(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        runtime = self._runtime()
+        hub = self._observability_hub(runtime)
+        if hub is None or not hasattr(hub, "recent_errors"):
+            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
+        items = await hub.recent_errors(chat_id=chat_id, limit=max(1, min(int(limit or 50), 300)))
+        formatted = [hub.format_timeline_item(item) if hasattr(hub, "format_timeline_item") else dict(item or {}) for item in list(items or [])]
+        return {"status": "ok", "items": formatted, "total": len(formatted), "runtime_bound": True}
+
+    async def observability_search(
+        self,
+        *,
+        q: str = "",
+        chat_id: str = "",
+        domains: list[str] | None = None,
+        kinds: list[str] | None = None,
+        levels: list[str] | None = None,
+        tags: list[str] | None = None,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        runtime = self._runtime()
+        hub = self._observability_hub(runtime)
+        if hub is None or not hasattr(hub, "search"):
+            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
+        items = await hub.search(
+            q=str(q or ""),
+            chat_id=str(chat_id or ""),
+            domains=self._parse_filter_values(domains),
+            kinds=self._parse_filter_values(kinds),
+            levels=self._parse_filter_values(levels),
+            tags=self._parse_filter_values(tags),
+            limit=max(1, min(int(limit or 80), 300)),
+        )
+        formatted = [hub.format_timeline_item(item) if hasattr(hub, "format_timeline_item") else dict(item or {}) for item in list(items or [])]
+        return {"status": "ok", "items": formatted, "total": len(formatted), "runtime_bound": True}
 
     async def runtime_capabilities(self) -> dict[str, Any]:
         return {
@@ -540,6 +779,33 @@ class AdminUiService:
             "runtime_bound": planner is not None,
         }
 
+    @staticmethod
+    def _timeline_item(
+        *,
+        domain: str = "",
+        kind: str,
+        timestamp: float,
+        chat_id: str,
+        title: str,
+        summary: str,
+        level: str = "info",
+        source: str = "",
+        detail: dict[str, Any] | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "domain": str(domain or ""),
+            "kind": kind,
+            "timestamp": float(timestamp or 0.0),
+            "chat_id": str(chat_id or ""),
+            "title": str(title or ""),
+            "summary": str(summary or ""),
+            "level": str(level or "info").lower() or "info",
+            "source": str(source or kind),
+            "detail": dict(detail or {}),
+            "raw": dict(raw or {}),
+        }
+
     async def chat_trace_events(self, chat_id: str, limit: int = 80) -> dict[str, Any]:
         planner = self._planner(self._runtime())
         events: list[dict[str, Any]] = []
@@ -562,6 +828,110 @@ class AdminUiService:
         events.sort(key=lambda item: float(item.get("created_at", item.get("timestamp", 0.0)) or 0.0), reverse=True)
         events = events[: max(1, min(limit, 300))]
         return {"status": "ok", "items": events, "total": len(events), "runtime_bound": planner is not None}
+
+    async def cognition_unified_timeline(
+        self,
+        *,
+        chat_id: str,
+        limit: int = 80,
+        include: list[str] | None = None,
+        level: str = "",
+    ) -> dict[str, Any]:
+        kind_filters = {item for item in self._parse_filter_values(include) if item in {"decision", "tool", "trace", "memory"}}
+        runtime = self._runtime()
+        hub = self._observability_hub(runtime)
+        if hub is None:
+            include_set = kind_filters or {"decision", "tool", "trace", "memory"}
+            safe_limit = max(1, min(int(limit or 80), 300))
+            normalized_level = str(level or "").strip().lower()
+            items: list[dict[str, Any]] = []
+            if "decision" in include_set:
+                decisions = await self.recent_decisions(chat_id=chat_id, limit=safe_limit)
+                for item in decisions.get("items", []) or []:
+                    items.append(
+                        self._timeline_item(
+                            domain="cognition",
+                            kind="decision",
+                            timestamp=float(item.get("created_at", item.get("timestamp", 0.0)) or 0.0),
+                            chat_id=str(item.get("chat_id", chat_id) or chat_id),
+                            title=str(item.get("social_intent") or item.get("decision") or "decision"),
+                            summary=self._safe_preview(item.get("failure_evidence", {}).get("failure_reason") or item.get("failure_evidence", {}).get("failure_kind") or item.get("reason") or item.get("summary") or ""),
+                            level="error" if item.get("failure_evidence", {}).get("has_failure") else "info",
+                            source="decision",
+                            detail={"memory_policy": item.get("memory_policy"), "tool_tier": item.get("tool_tier")},
+                            raw=item,
+                        )
+                    )
+            if "tool" in include_set:
+                tools = await self.recent_tool_traces(chat_id=chat_id, limit=safe_limit)
+                for item in tools.get("items", []) or []:
+                    evidence = item.get("failure_evidence", {}) or {}
+                    items.append(
+                        self._timeline_item(
+                            domain="cognition",
+                            kind="tool",
+                            timestamp=float(item.get("created_at", item.get("timestamp", 0.0)) or 0.0),
+                            chat_id=str(item.get("chat_id", chat_id) or chat_id),
+                            title=str(item.get("tool_tier") or item.get("protocol_type") or "tool"),
+                            summary=self._safe_preview(evidence.get("failure_reason") or evidence.get("failure_kind") or item.get("summary") or ""),
+                            level="error" if evidence.get("has_failure") else "info",
+                            source="tool",
+                            detail={"protocol_passthrough": evidence.get("protocol_passthrough"), "attempted_models": evidence.get("attempted_models", [])},
+                            raw=item,
+                        )
+                    )
+            if "trace" in include_set:
+                traces = await self.chat_trace_events(chat_id=chat_id, limit=safe_limit)
+                for item in traces.get("items", []) or []:
+                    evidence = item.get("failure_evidence", {}) or {}
+                    items.append(
+                        self._timeline_item(
+                            domain="cognition",
+                            kind="trace",
+                            timestamp=float(item.get("created_at", item.get("timestamp", 0.0)) or 0.0),
+                            chat_id=str(item.get("chat_id", chat_id) or chat_id),
+                            title=str(item.get("stage") or "trace"),
+                            summary=self._safe_preview(evidence.get("failure_reason") or evidence.get("failure_kind") or item.get("summary") or ""),
+                            level="error" if evidence.get("has_failure") else str(item.get("level", "info") or "info"),
+                            source="trace",
+                            detail={"failure_kind": evidence.get("failure_kind"), "attempted_models": evidence.get("attempted_models", [])},
+                            raw=item,
+                        )
+                    )
+            if "memory" in include_set:
+                memory = await self.memory_observability_timeline(chat_id=chat_id, limit=safe_limit)
+                for item in memory.get("items", []) or []:
+                    items.append(
+                        self._timeline_item(
+                            domain="memory",
+                            kind="memory",
+                            timestamp=float(item.get("timestamp", 0.0) or 0.0),
+                            chat_id=str(item.get("chat_id", chat_id) or chat_id),
+                            title=str(item.get("display_title") or item.get("stage") or "memory"),
+                            summary=self._safe_preview(item.get("summary") or item.get("reason") or ""),
+                            level=str(item.get("level", "info") or "info"),
+                            source=str(item.get("component") or "memory"),
+                            detail={"stage": item.get("stage"), "memory_id": item.get("memory_id")},
+                            raw=item,
+                        )
+                    )
+            items.sort(key=lambda item: float(item.get("timestamp", 0.0) or 0.0), reverse=True)
+            if normalized_level:
+                items = [item for item in items if str(item.get("level", "") or "").lower() == normalized_level]
+            items = items[:safe_limit]
+            return {"status": "ok", "items": items, "total": len(items), "runtime_bound": runtime is not None}
+        domain_filters = {"memory" if item == "memory" else "cognition" for item in kind_filters} if kind_filters else {"cognition", "memory"}
+        result = await self.observability_timeline(
+            chat_id=chat_id,
+            domains=list(domain_filters),
+            kinds=list(kind_filters) if kind_filters else ["decision", "tool", "trace", "action", "maintenance"],
+            levels=[level] if str(level or "").strip() else [],
+            limit=limit,
+        )
+        if kind_filters:
+            result["items"] = [item for item in list(result.get("items", []) or []) if str(item.get("kind", "") or "") in kind_filters]
+            result["total"] = len(result["items"])
+        return result
 
     async def tools_policy(self) -> dict[str, Any]:
         status = await self.tools_status()

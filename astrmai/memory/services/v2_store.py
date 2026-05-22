@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import time
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,51 @@ class MemoryV2Store:
         self.data_path = Path(data_path) if data_path else Path(db_path).parent
         self._initialized = False
         self.last_physical_delete_ids: list[str] = []
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks_guard = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_lock_scope(session_id: str) -> str:
+        clean = str(session_id or "").strip()
+        return clean if clean else "__global__"
+
+    async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        scope = self._normalize_lock_scope(session_id)
+        async with self._session_locks_guard:
+            lock = self._session_locks.get(scope)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[scope] = lock
+            return lock
+
+    async def _acquire_session_scopes(self, scopes: list[str]) -> AsyncExitStack:
+        stack = AsyncExitStack()
+        normalized = sorted({self._normalize_lock_scope(item) for item in scopes if self._normalize_lock_scope(item)})
+        for scope in normalized:
+            await stack.enter_async_context(await self._get_session_lock(scope))
+        return stack
+
+    async def _resolve_session_id_for_memory_id(self, memory_id: str) -> str:
+        await self.initialize()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT session_id FROM canonical_memories WHERE id = ? LIMIT 1", (memory_id,))
+            row = await cursor.fetchone()
+        return self._normalize_lock_scope(str(row[0] or "") if row else "")
+
+    async def _resolve_session_ids_for_memory_ids(self, memory_ids: list[str]) -> list[str]:
+        ids = [str(item) for item in memory_ids if str(item).strip()]
+        if not ids:
+            return ["__global__"]
+        await self.initialize()
+        placeholders = ",".join("?" for _ in ids)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"SELECT DISTINCT session_id FROM canonical_memories WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            rows = await cursor.fetchall()
+        scopes = [self._normalize_lock_scope(str(row[0] or "")) for row in rows if row is not None]
+        return scopes or ["__global__"]
 
     @staticmethod
     def _build_fts_query(text: str) -> str:
@@ -226,88 +273,89 @@ class MemoryV2Store:
         }:
             status = ACTIVE_STATUS
 
-        async with aiosqlite.connect(self.db_path) as db:
-            if dedup_key:
-                cursor = await db.execute(
-                    """
-                    SELECT id, content, summary, access_count
-                    FROM canonical_memories
-                    WHERE dedup_key = ? AND status IN ('active', 'stale', 'review_pending')
-                    LIMIT 1
-                    """,
-                    (dedup_key,),
-                )
-                row = await cursor.fetchone()
-                if row:
-                    memory_id = str(row[0])
-                    merged_content = str(request.content or row[1] or "")
-                    merged_summary = str(summary or row[2] or "")[:500]
-                    await db.execute(
+        async with await self._acquire_session_scopes([request.session_id]) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                if dedup_key:
+                    cursor = await db.execute(
                         """
-                        UPDATE canonical_memories
-                        SET content = ?, summary = ?, source = ?, kind = ?,
-                            importance = MAX(importance, ?),
-                            confidence = MAX(confidence, ?),
-                            status = ?,
-                            update_time = ?, last_access_time = ?,
-                            access_count = COALESCE(access_count, 0) + 1,
-                            tags = ?, metadata = ?, source_ref = ?, visibility = ?
-                        WHERE id = ?
+                        SELECT id, content, summary, access_count
+                        FROM canonical_memories
+                        WHERE dedup_key = ? AND status IN ('active', 'stale', 'review_pending')
+                        LIMIT 1
                         """,
-                        (
-                            merged_content,
-                            merged_summary,
-                            request.source,
-                            request.kind,
-                            float(request.importance or 0.5),
-                            float(request.confidence or 0.8),
-                            status,
-                            now,
-                            now,
-                            self._json_list(request.tags),
-                            self._json_dict(request.metadata),
-                            request.source_ref,
-                            visibility,
-                            memory_id,
-                        ),
+                        (dedup_key,),
                     )
-                    await self._sync_fts(db, memory_id)
-                    await db.commit()
-                    return memory_id
+                    row = await cursor.fetchone()
+                    if row:
+                        memory_id = str(row[0])
+                        merged_content = str(request.content or row[1] or "")
+                        merged_summary = str(summary or row[2] or "")[:500]
+                        await db.execute(
+                            """
+                            UPDATE canonical_memories
+                            SET content = ?, summary = ?, source = ?, kind = ?,
+                                importance = MAX(importance, ?),
+                                confidence = MAX(confidence, ?),
+                                status = ?,
+                                update_time = ?, last_access_time = ?,
+                                access_count = COALESCE(access_count, 0) + 1,
+                                tags = ?, metadata = ?, source_ref = ?, visibility = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                merged_content,
+                                merged_summary,
+                                request.source,
+                                request.kind,
+                                float(request.importance or 0.5),
+                                float(request.confidence or 0.8),
+                                status,
+                                now,
+                                now,
+                                self._json_list(request.tags),
+                                self._json_dict(request.metadata),
+                                request.source_ref,
+                                visibility,
+                                memory_id,
+                            ),
+                        )
+                        await self._sync_fts(db, memory_id)
+                        await db.commit()
+                        return memory_id
 
-            await db.execute(
-                """
-                INSERT INTO canonical_memories (
-                    id, session_id, persona_id, source, kind, content, summary,
-                    tags, importance, confidence, status, decay_score,
-                    create_time, update_time, last_access_time, access_count,
-                    metadata, dedup_key, source_ref, visibility
+                await db.execute(
+                    """
+                    INSERT INTO canonical_memories (
+                        id, session_id, persona_id, source, kind, content, summary,
+                        tags, importance, confidence, status, decay_score,
+                        create_time, update_time, last_access_time, access_count,
+                        metadata, dedup_key, source_ref, visibility
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        request.session_id,
+                        request.persona_id,
+                        request.source,
+                        request.kind,
+                        request.content,
+                        summary,
+                        self._json_list(request.tags),
+                        float(request.importance or 0.5),
+                        float(request.confidence or 0.8),
+                        status,
+                        now,
+                        now,
+                        now,
+                        self._json_dict(request.metadata),
+                        dedup_key,
+                        request.source_ref,
+                        visibility,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
-                """,
-                (
-                    memory_id,
-                    request.session_id,
-                    request.persona_id,
-                    request.source,
-                    request.kind,
-                    request.content,
-                    summary,
-                    self._json_list(request.tags),
-                    float(request.importance or 0.5),
-                    float(request.confidence or 0.8),
-                    status,
-                    now,
-                    now,
-                    now,
-                    self._json_dict(request.metadata),
-                    dedup_key,
-                    request.source_ref,
-                    visibility,
-                ),
-            )
-            await self._sync_fts(db, memory_id)
-            await db.commit()
+                await self._sync_fts(db, memory_id)
+                await db.commit()
         return memory_id
 
     async def get_by_id(self, memory_id: str, *, allow_stale: bool = False) -> MemoryCandidate | None:
@@ -674,19 +722,21 @@ class MemoryV2Store:
         if not ids:
             return
         await self.initialize()
-        now = self._now()
-        async with aiosqlite.connect(self.db_path) as db:
-            for memory_id in ids:
-                await db.execute(
-                    """
-                    UPDATE canonical_memories
-                    SET last_access_time = ?, access_count = COALESCE(access_count, 0) + 1,
-                        status = CASE WHEN status = 'stale' THEN 'active' ELSE status END
-                    WHERE id = ?
-                    """,
-                    (now, memory_id),
-                )
-            await db.commit()
+        scopes = await self._resolve_session_ids_for_memory_ids(ids)
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            now = self._now()
+            async with aiosqlite.connect(self.db_path) as db:
+                for memory_id in ids:
+                    await db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET last_access_time = ?, access_count = COALESCE(access_count, 0) + 1,
+                            status = CASE WHEN status = 'stale' THEN 'active' ELSE status END
+                        WHERE id = ?
+                        """,
+                        (now, memory_id),
+                    )
+                await db.commit()
 
     async def apply_decay(
         self,
@@ -849,54 +899,60 @@ class MemoryV2Store:
 
     async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """
-                UPDATE canonical_memories
-                SET status = 'deleted', deleted_reason = ?, update_time = ?
-                WHERE id = ?
-                """,
-                (reason, self._now(), memory_id),
-            )
-            await self._sync_fts(db, memory_id, delete_only=True)
-            await db.commit()
-            return cursor.rowcount
+        scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET status = 'deleted', deleted_reason = ?, update_time = ?
+                    WHERE id = ?
+                    """,
+                    (reason, self._now(), memory_id),
+                )
+                await self._sync_fts(db, memory_id, delete_only=True)
+                await db.commit()
+                return cursor.rowcount
 
     async def restore(self, memory_id: str, *, reason: str = "manual_restore") -> int:
         await self.initialize()
         now = self._now()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """
-                UPDATE canonical_memories
-                SET status = 'active',
-                    deleted_reason = '',
-                    decay_score = MAX(COALESCE(decay_score, 1.0), 0.5),
-                    update_time = ?,
-                    last_access_time = ?
-                WHERE id = ? AND status IN ('stale', 'deleted')
-                """,
-                (now, now, memory_id),
-            )
-            if cursor.rowcount:
-                await self._sync_fts(db, memory_id)
-            await db.commit()
-            return cursor.rowcount
+        scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET status = 'active',
+                        deleted_reason = '',
+                        decay_score = MAX(COALESCE(decay_score, 1.0), 0.5),
+                        update_time = ?,
+                        last_access_time = ?
+                    WHERE id = ? AND status IN ('stale', 'deleted')
+                    """,
+                    (now, now, memory_id),
+                )
+                if cursor.rowcount:
+                    await self._sync_fts(db, memory_id)
+                await db.commit()
+                return cursor.rowcount
 
     async def mark_stale(self, memory_id: str, *, reason: str = "manual_stale") -> int:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """
-                UPDATE canonical_memories
-                SET status = 'stale', deleted_reason = ?, update_time = ?
-                WHERE id = ? AND status = 'active'
-                """,
-                (reason, self._now(), memory_id),
-            )
-            await self._sync_fts(db, memory_id, delete_only=True)
-            await db.commit()
-            return cursor.rowcount
+        scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET status = 'stale', deleted_reason = ?, update_time = ?
+                    WHERE id = ? AND status = 'active'
+                    """,
+                    (reason, self._now(), memory_id),
+                )
+                await self._sync_fts(db, memory_id, delete_only=True)
+                await db.commit()
+                return cursor.rowcount
 
     async def soft_delete_by_filter(
         self,
@@ -918,52 +974,55 @@ class MemoryV2Store:
         if persona_id:
             where.append("persona_id = ?")
             params.append(persona_id)
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                f"SELECT id FROM canonical_memories WHERE {' AND '.join(where)}",
-                tuple(params),
-            )
-            ids = [str(row[0]) for row in await cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                await db.execute(
-                    f"""
-                    UPDATE canonical_memories
-                    SET status = 'deleted', deleted_reason = ?, update_time = ?
-                    WHERE id IN ({placeholders})
-                    """,
-                    (reason, self._now(), *ids),
+        scopes = [session_id or "__global__"]
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    f"SELECT id FROM canonical_memories WHERE {' AND '.join(where)}",
+                    tuple(params),
                 )
-                for memory_id in ids:
-                    await self._sync_fts(db, memory_id, delete_only=True)
-                await db.commit()
+                ids = [str(row[0]) for row in await cursor.fetchall()]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    await db.execute(
+                        f"""
+                        UPDATE canonical_memories
+                        SET status = 'deleted', deleted_reason = ?, update_time = ?
+                        WHERE id IN ({placeholders})
+                        """,
+                        (reason, self._now(), *ids),
+                    )
+                    for memory_id in ids:
+                        await self._sync_fts(db, memory_id, delete_only=True)
+                    await db.commit()
         return ids
 
     async def soft_delete_low_importance(self, *, threshold: float, reason: str = "low_importance") -> list[str]:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """
-                SELECT id FROM canonical_memories
-                WHERE status IN ('active', 'stale')
-                  AND importance < ?
-                """,
-                (float(threshold),),
-            )
-            ids = [str(row[0]) for row in await cursor.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                await db.execute(
-                    f"""
-                    UPDATE canonical_memories
-                    SET status = 'deleted', deleted_reason = ?, update_time = ?
-                    WHERE id IN ({placeholders})
+        async with await self._acquire_session_scopes(["__global__"]) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT id FROM canonical_memories
+                    WHERE status IN ('active', 'stale')
+                      AND importance < ?
                     """,
-                    (reason, self._now(), *ids),
+                    (float(threshold),),
                 )
-                for memory_id in ids:
-                    await self._sync_fts(db, memory_id, delete_only=True)
-                await db.commit()
+                ids = [str(row[0]) for row in await cursor.fetchall()]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    await db.execute(
+                        f"""
+                        UPDATE canonical_memories
+                        SET status = 'deleted', deleted_reason = ?, update_time = ?
+                        WHERE id IN ({placeholders})
+                        """,
+                        (reason, self._now(), *ids),
+                    )
+                    for memory_id in ids:
+                        await self._sync_fts(db, memory_id, delete_only=True)
+                    await db.commit()
         return ids
 
     async def mark_merged(self, memory_ids: list[str], *, superseded_by: str) -> int:
@@ -971,20 +1030,22 @@ class MemoryV2Store:
         if not ids:
             return 0
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
-            count = 0
-            for memory_id in ids:
-                cursor = await db.execute(
-                    """
-                    UPDATE canonical_memories
-                    SET status = 'merged', superseded_by = ?, update_time = ?
-                    WHERE id = ?
-                    """,
-                    (superseded_by, self._now(), memory_id),
-                )
-                count += cursor.rowcount
-            await db.commit()
-            return count
+        scopes = await self._resolve_session_ids_for_memory_ids(ids + ([superseded_by] if superseded_by else []))
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                count = 0
+                for memory_id in ids:
+                    cursor = await db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET status = 'merged', superseded_by = ?, update_time = ?
+                        WHERE id = ?
+                        """,
+                        (superseded_by, self._now(), memory_id),
+                    )
+                    count += cursor.rowcount
+                await db.commit()
+                return count
 
     async def find_ids_by_source_ref(self, source_ref: str) -> list[str]:
         await self.initialize()
@@ -1001,18 +1062,20 @@ class MemoryV2Store:
     async def update_content(self, memory_id: str, *, content: str, summary: str = "") -> int:
         await self.initialize()
         now = self._now()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """
-                UPDATE canonical_memories
-                SET content = ?, summary = ?, update_time = ?, status = 'active'
-                WHERE id = ? AND status IN ('active', 'stale')
-                """,
-                (content, summary or str(content or "")[:240], now, memory_id),
-            )
-            await self._sync_fts(db, memory_id)
-            await db.commit()
-            return cursor.rowcount
+        scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET content = ?, summary = ?, update_time = ?, status = 'active'
+                    WHERE id = ? AND status IN ('active', 'stale')
+                    """,
+                    (content, summary or str(content or "")[:240], now, memory_id),
+                )
+                await self._sync_fts(db, memory_id)
+                await db.commit()
+                return cursor.rowcount
 
     async def update_memory(
         self,
@@ -1066,14 +1129,16 @@ class MemoryV2Store:
             return 0
         columns = list(payload.keys())
         assignments = ", ".join(f"{column} = ?" for column in columns)
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                f"UPDATE canonical_memories SET {assignments} WHERE id = ?",
-                (*[payload[column] for column in columns], memory_id),
-            )
-            await self._sync_fts(db, memory_id)
-            await db.commit()
-            return cursor.rowcount
+        scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    f"UPDATE canonical_memories SET {assignments} WHERE id = ?",
+                    (*[payload[column] for column in columns], memory_id),
+                )
+                await self._sync_fts(db, memory_id)
+                await db.commit()
+                return cursor.rowcount
 
     async def list_projectable(self, *, session_id: str = "") -> list[MemoryCandidate]:
         await self.initialize()

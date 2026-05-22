@@ -193,6 +193,52 @@ class AstrMaiAdminPageApi:
             limit=self._int(query.get("limit"), 80),
         )
 
+    async def chat_unified_timeline(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        path = self._path(request)
+        include = [item.strip() for item in str(query.get("include") or "").split(",") if item.strip()]
+        return await self._admin().cognition_unified_timeline(
+            chat_id=str(path.get("chat_id", "")),
+            limit=self._int(query.get("limit"), 80),
+            level=str(query.get("level", "") or ""),
+            include=include,
+        )
+
+    async def observability_overview(self, request: Any) -> dict[str, Any]:
+        return await self._admin().observability_overview()
+
+    async def observability_timeline(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        return await self._admin().observability_timeline(
+            chat_id=str(query.get("chat_id", "") or "") or None,
+            domains=[item.strip() for item in str(query.get("domains") or "").split(",") if item.strip()],
+            levels=[item.strip() for item in str(query.get("levels") or "").split(",") if item.strip()],
+            kinds=[item.strip() for item in str(query.get("kinds") or "").split(",") if item.strip()],
+            limit=self._int(query.get("limit"), 80),
+        )
+
+    async def observability_chat(self, request: Any) -> dict[str, Any]:
+        return await self._admin().observability_chat(str(self._path(request).get("chat_id", "")))
+
+    async def observability_errors(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        return await self._admin().observability_errors(
+            chat_id=str(query.get("chat_id", "") or "") or None,
+            limit=self._int(query.get("limit"), 50),
+        )
+
+    async def observability_search(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        return await self._admin().observability_search(
+            q=str(query.get("q", "") or ""),
+            chat_id=str(query.get("chat_id", "") or ""),
+            domains=[item.strip() for item in str(query.get("domains") or "").split(",") if item.strip()],
+            kinds=[item.strip() for item in str(query.get("kinds") or "").split(",") if item.strip()],
+            levels=[item.strip() for item in str(query.get("levels") or "").split(",") if item.strip()],
+            tags=[item.strip() for item in str(query.get("tags") or "").split(",") if item.strip()],
+            limit=self._int(query.get("limit"), 80),
+        )
+
     async def scheduler_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().scheduler_status_view()
 
@@ -558,6 +604,12 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/cognition/recent-turns", api.recent_turns, "AstrMai recent turn context traces"),
         ("GET", "/cognition/chats/{chat_id}/turns", api.chat_recent_turns, "AstrMai chat turn context traces"),
         ("GET", "/cognition/chats/{chat_id}/trace-events", api.chat_trace_events, "AstrMai chat raw trace events"),
+        ("GET", "/cognition/chats/{chat_id}/unified-timeline", api.chat_unified_timeline, "AstrMai unified cognition timeline"),
+        ("GET", "/cognition/observability/overview", api.observability_overview, "AstrMai observability overview"),
+        ("GET", "/cognition/observability/timeline", api.observability_timeline, "AstrMai global observability timeline"),
+        ("GET", "/cognition/observability/chats/{chat_id}", api.observability_chat, "AstrMai chat observability"),
+        ("GET", "/cognition/observability/errors", api.observability_errors, "AstrMai observability errors"),
+        ("GET", "/cognition/observability/search", api.observability_search, "AstrMai observability search"),
         ("GET", "/cognition/scheduler/status", api.scheduler_status, "AstrMai scheduler status diagnostics"),
         ("GET", "/cognition/scheduler/due-selection", api.scheduler_due_selection, "AstrMai scheduler due selection diagnostics"),
         ("GET", "/cognition/scheduler/chats/{chat_id}", api.scheduler_chat, "AstrMai scheduler chat loop diagnostics"),

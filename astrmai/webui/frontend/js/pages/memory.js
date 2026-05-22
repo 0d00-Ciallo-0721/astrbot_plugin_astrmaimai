@@ -10,6 +10,12 @@
         migrationReport: null,
         indexStatus: null,
         maintenanceReport: null,
+        observabilityRuntime: null,
+        observabilityEvents: [],
+        observabilityErrors: [],
+        observabilityChatId: '',
+        observabilityChatStatus: null,
+        observabilityFilters: { component: '', level: '', limit: 50 },
         events: [],
         reflectionsMap: {},
         calendarDays: [],
@@ -133,6 +139,36 @@
         async loadDiagnostics() {
             this.migrationReport = await window.api.get('/memories/diagnostics/migrations');
             this.indexStatus = await window.api.get('/memories/diagnostics/index');
+            this.observabilityRuntime = await window.api.get('/memories/observability/runtime');
+            this.observabilityEvents = (await window.api.get(`/memories/observability/events?limit=${encodeURIComponent(this.observabilityFilters.limit)}`)).items || [];
+            this.observabilityErrors = (await window.api.get(`/memories/observability/errors?limit=${encodeURIComponent(this.observabilityFilters.limit)}`)).items || [];
+        },
+
+        async loadObservabilityEvents() {
+            const params = new URLSearchParams();
+            if (this.observabilityChatId) params.set('chat_id', this.observabilityChatId);
+            if (this.observabilityFilters.component) params.set('component', this.observabilityFilters.component);
+            if (this.observabilityFilters.level) params.set('level', this.observabilityFilters.level);
+            params.set('limit', String(this.observabilityFilters.limit || 50));
+            const result = await window.api.get(`/memories/observability/events?${params.toString()}`);
+            this.observabilityEvents = result.items || [];
+        },
+
+        async loadObservabilityErrors() {
+            const params = new URLSearchParams();
+            if (this.observabilityChatId) params.set('chat_id', this.observabilityChatId);
+            params.set('limit', String(this.observabilityFilters.limit || 50));
+            const result = await window.api.get(`/memories/observability/errors?${params.toString()}`);
+            this.observabilityErrors = result.items || [];
+        },
+
+        async loadObservabilityChat() {
+            if (!this.observabilityChatId) {
+                this.observabilityChatStatus = null;
+                return;
+            }
+            const result = await window.api.get(`/memories/observability/chats/${window.api.segment(this.observabilityChatId)}`);
+            this.observabilityChatStatus = result.data || null;
         },
 
         async runMigrationDryRun() {

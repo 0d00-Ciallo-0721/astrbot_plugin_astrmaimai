@@ -20,6 +20,7 @@ class EventBus:
         self.TOPIC_LEARNING_MESSAGE_RECORDED = "learning.message_recorded"
         self.TOPIC_LEARNING_BOT_REPLY_RECORDED = "learning.bot_reply_recorded"
         self.TOPIC_LEARNING_MINING_COMPLETED = "learning.mining_completed"
+        self.TOPIC_MEMORY_TURN_COMMITTED = "memory.turn_committed"
 
         # 基础信号定义
         self.abort_signal = asyncio.Event()     # 打断思考
@@ -72,6 +73,9 @@ class EventBus:
 
     async def publish_learning_mining_completed(self, payload: dict):
         await self.publish(self.TOPIC_LEARNING_MINING_COMPLETED, payload)
+
+    async def publish_memory_turn_committed(self, payload: dict):
+        await self.publish(self.TOPIC_MEMORY_TURN_COMMITTED, payload)
 
     # ==========================
     # 真正的 Pub/Sub 机制 (新增)

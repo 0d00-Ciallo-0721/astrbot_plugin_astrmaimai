@@ -25,6 +25,7 @@ from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordin
 from ..infrastructure.runtime.event_bus import EventBus
 from ..infrastructure.runtime.host_bridge import HostBridge
 from ..infrastructure.runtime.lane_manager import LaneManager
+from ..infrastructure.runtime.observability import RuntimeObservabilityHub
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
 from ..infrastructure.runtime.raw_trace_store import RawTraceEventStore
 from ..infrastructure.runtime.turn_trace_store import TurnTraceSampleStore
@@ -119,9 +120,12 @@ class PluginBootstrap:
         db_service.turn_trace_store = TurnTraceSampleStore(trace_cache_dir)
         db_service.raw_trace_store = RawTraceEventStore(trace_cache_dir)
         db_service.context_economy_benchmark_store = ContextEconomyBenchmarkSampleStore(trace_cache_dir)
+        observability_hub = RuntimeObservabilityHub(db_service.raw_trace_store)
+        db_service.observability_hub = observability_hub
         gateway.benchmark_sample_store = db_service.context_economy_benchmark_store
         if hasattr(memory_engine, "tool_service"):
             memory_engine.tool_service.db_service = db_service
+        memory_engine.observability_hub = observability_hub
         conversation_settings = getattr(runtime.config, "conversation", None)
         state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
         dialogue_store = None
@@ -165,6 +169,7 @@ class PluginBootstrap:
             gateway=gateway,
             lane_manager=lane_manager,
             event_bus=event_bus,
+            observability_hub=observability_hub,
             memory_engine=memory_engine,
             dialogue_store=dialogue_store,
             context_compaction=compaction,
@@ -265,6 +270,7 @@ class PluginBootstrap:
         kernel = ChatLoopKernel(
             runtime_coordinator=runtime.runtime_coordinator,
             message_handler=runtime.attention_gate.process_event if runtime.attention_gate is not None else None,
+            observability_hub=runtime.observability_hub,
         )
         kernel.bind_signal_sources(
             group_reply_wait_manager=runtime.group_reply_wait_manager,

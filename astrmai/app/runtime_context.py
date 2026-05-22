@@ -16,6 +16,7 @@ class CoreServices:
     gateway: Any = None
     lane_manager: Any = None
     event_bus: Any = None
+    observability_hub: Any = None
     memory_engine: Any = None
     dialogue_store: Any = None
     context_compaction: Any = None
@@ -165,6 +166,10 @@ class PluginRuntimeContext:
         return self.core.memory_engine
 
     @property
+    def observability_hub(self) -> Any:
+        return self.core.observability_hub
+
+    @property
     def state_engine(self) -> Any:
         return self.core.state_engine
 
@@ -303,6 +308,7 @@ class PluginRuntimeContext:
             "components": {
                 "gateway": self.gateway is not None,
                 "memory_engine": self.memory_engine is not None,
+                "observability_hub": self.observability_hub is not None,
                 "state_engine": self.state_engine is not None,
                 "attention_gate": self.attention_gate is not None,
                 "planner": self.system2_planner is not None,

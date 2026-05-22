@@ -13,6 +13,15 @@ function dashboardPage() {
         schedulerDueSelection: null,
         schedulerChatLoop: null,
         schedulerChatId: '',
+        observabilityOverview: null,
+        memoryObservabilityChatId: '',
+        cognitionUnifiedTimeline: [],
+        cognitionTimelineChatId: '',
+        cognitionTimelineLevel: '',
+        cognitionTimelineDomains: '',
+        cognitionTimelineKinds: '',
+        cognitionTimelineQuery: '',
+        cognitionTimelineTags: '',
         contextEconomy: null,
         contextEconomyTemplates: [],
         contextEconomyAvailableFamilies: [],
@@ -71,6 +80,7 @@ function dashboardPage() {
                 if (this.currentTab === 'overview') {
                     promises.push(window.api.get('/dashboard').then(res => this.stats = res));
                     promises.push(window.api.get('/runtime/capabilities').catch(() => null).then(res => this.capabilities = res));
+                    promises.push(window.api.get('/cognition/observability/overview').catch(() => null).then(res => this.observabilityOverview = res));
                 } else if (this.currentTab === 'heartflow') {
                     promises.push(window.api.get('/heartflow/status').then(res => this.heartflowStatus = res));
                     promises.push(window.api.get('/heartflow/chats').then(res => this.heartflowChats = res.items || []));
@@ -84,11 +94,11 @@ function dashboardPage() {
                             if (!this.schedulerChatId && selected.length > 0) {
                                 this.schedulerChatId = selected[0];
                             }
-                            if (this.schedulerChatId) {
-                                await this.loadSchedulerChatLoop(this.schedulerChatId);
-                            }
+                            if (!this.cognitionTimelineChatId && this.schedulerChatId) this.cognitionTimelineChatId = this.schedulerChatId;
+                            if (this.schedulerChatId) await this.loadSchedulerChatLoop(this.schedulerChatId);
                         })
                     );
+                    promises.push(this.loadCognitionUnifiedTimeline());
                     promises.push(window.api.get('/cognition/context-economy?limit=20').catch(() => null).then(res => {
                         this.contextEconomy = res?.data?.overview || null;
                     }));
@@ -198,6 +208,53 @@ function dashboardPage() {
             return Object.entries(data).map(([key, value]) => ({ key, value }));
         },
 
+        observabilityDomainCards() {
+            const data = this.observabilityOverview?.data?.snapshot?.domain_counts || {};
+            return Object.entries(data).map(([key, value]) => ({ key, value }));
+        },
+
+        async openMemoryDrilldown(chatId = '') {
+            if (chatId) {
+                this.memoryObservabilityChatId = chatId;
+                location.hash = 'memories';
+                setTimeout(() => {
+                    try {
+                        const page = window.Alpine && window.Alpine.$data(document.querySelector('#page-memory'));
+                        if (page) {
+                            page.currentTab = 'diagnostics';
+                            page.observabilityChatId = chatId;
+                            page.loadDiagnostics();
+                            page.loadObservabilityChat();
+                            page.loadObservabilityEvents();
+                            page.loadObservabilityErrors();
+                        }
+                    } catch (e) {
+                        // best effort only
+                    }
+                }, 50);
+                return;
+            }
+            location.hash = 'memories';
+        },
+
+        async openObservabilityItem(item = null) {
+            const payload = item || {};
+            const domain = String(payload.domain || '');
+            const chatId = String(payload.chat_id || '');
+            if (domain === 'memory' && chatId) {
+                await this.openMemoryDrilldown(chatId);
+                return;
+            }
+            if (domain === 'heartflow' && chatId) {
+                this.currentTab = 'heartflow';
+                await this.loadAll();
+                return;
+            }
+            if (chatId) {
+                await this.openChatTraceDetails(chatId);
+            }
+        },
+
         formatJson(value) {
             try {
                 return JSON.stringify(value, null, 2);
@@ -236,6 +293,65 @@ function dashboardPage() {
             this.schedulerChatId = targetChat;
             const encodedChat = window.api.segment(targetChat);
             this.schedulerChatLoop = await window.api.get(`/cognition/scheduler/chats/${encodedChat}`).catch(() => null);
+        },
+
+        async loadCognitionUnifiedTimeline(chatId = null) {
+            const targetChat = (chatId ?? this.cognitionTimelineChatId ?? '').trim();
+            this.cognitionTimelineChatId = targetChat;
+            const params = new URLSearchParams({ limit: '80' });
+            if (targetChat) params.set('chat_id', targetChat);
+            if (this.cognitionTimelineLevel) params.set('levels', this.cognitionTimelineLevel);
+            if (this.cognitionTimelineDomains) params.set('domains', this.cognitionTimelineDomains);
+            if (this.cognitionTimelineKinds) params.set('kinds', this.cognitionTimelineKinds);
+            const query = (this.cognitionTimelineQuery || '').trim();
+            const tags = (this.cognitionTimelineTags || '').trim();
+            let result = null;
+            if (query || tags) {
+                if (query) params.set('q', query);
+                if (tags) params.set('tags', tags);
+                result = await window.api.get(`/cognition/observability/search?${params.toString()}`).catch(() => null);
+            } else {
+                result = await window.api.get(`/cognition/observability/timeline?${params.toString()}`).catch(() => null);
+            }
+            this.cognitionUnifiedTimeline = result?.items || [];
+        },
+
+        async applyTimelineQuickFilter(kind) {
+            if (kind === 'errors') {
+                this.cognitionTimelineLevel = 'error';
+                this.cognitionTimelineDomains = '';
+                this.cognitionTimelineKinds = '';
+                this.cognitionTimelineQuery = '';
+                this.cognitionTimelineTags = '';
+            } else if (kind === 'scheduler') {
+                this.cognitionTimelineDomains = 'scheduler';
+                this.cognitionTimelineLevel = '';
+                this.cognitionTimelineKinds = '';
+                this.cognitionTimelineQuery = '';
+                this.cognitionTimelineTags = '';
+            } else if (kind === 'memory') {
+                this.cognitionTimelineDomains = 'memory';
+                this.cognitionTimelineLevel = '';
+                this.cognitionTimelineKinds = '';
+                this.cognitionTimelineQuery = '';
+                this.cognitionTimelineTags = '';
+            } else if (kind === 'provider_failures') {
+                this.cognitionTimelineDomains = '';
+                this.cognitionTimelineLevel = 'error';
+                this.cognitionTimelineKinds = '';
+                this.cognitionTimelineQuery = 'provider_failure_text';
+                this.cognitionTimelineTags = '';
+            }
+            await this.loadCognitionUnifiedTimeline();
+        },
+
+        async clearTimelineFilters() {
+            this.cognitionTimelineLevel = '';
+            this.cognitionTimelineDomains = '';
+            this.cognitionTimelineKinds = '';
+            this.cognitionTimelineQuery = '';
+            this.cognitionTimelineTags = '';
+            await this.loadCognitionUnifiedTimeline();
         },
 
         contextEconomySortParams() {

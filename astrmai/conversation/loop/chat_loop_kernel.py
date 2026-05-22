@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from astrbot.api import logger
 
+from ...infrastructure.runtime.observability import RuntimeObservabilityHub
 from ...proactive.rhythm import evaluate_proactive_rhythm
 from .models import ChatLoopDecision, ChatLoopSnapshot, ChatLoopState, ChatLoopTickResult
 from .state_store import ChatLoopStateStore
@@ -156,11 +157,13 @@ class ChatLoopKernel:
         message_handler: MessageHandler | None = None,
         heartbeat_handler: HeartbeatHandler | None = None,
         state_store: ChatLoopStateStore | None = None,
+        observability_hub: RuntimeObservabilityHub | None = None,
     ) -> None:
         self.runtime_coordinator = runtime_coordinator
         self._message_handler = message_handler
         self._heartbeat_handler = heartbeat_handler
         self._state_store = state_store or ChatLoopStateStore()
+        self.observability_hub = observability_hub
         self._dispatch_bridges: dict[str, DispatchBridge] = {}
         self.group_reply_wait_manager = None
         self.private_chat_manager = None
@@ -696,6 +699,7 @@ class ChatLoopKernel:
         }
         self._update_quota_pressure_rounds(report)
         self._last_due_selection_report = report
+        self._emit_due_selection_observability(report)
         return report
 
     def _build_due_score_breakdown(
@@ -1348,7 +1352,7 @@ class ChatLoopKernel:
         service = self.memory_service
         if service is None:
             return {}
-        candidate = getattr(service, "summarizer", None)
+        candidate = getattr(service, "memory_pipeline", None)
         if candidate is None and hasattr(service, "describe_session_eligibility"):
             candidate = service
         if candidate is None or not hasattr(candidate, "describe_session_eligibility"):
@@ -2010,6 +2014,133 @@ class ChatLoopKernel:
             decision.metadata.get("scheduler_bucket", ""),
             decision.metadata.get("schedule_reason", ""),
             decision.metadata.get("signals_summary", {}),
+        )
+        self._emit_tick_observability(state, snapshot, decision, dispatch_result, pre_state_summary)
+
+    def _emit_due_selection_observability(self, report: dict[str, Any]) -> None:
+        hub = getattr(self, "observability_hub", None)
+        if hub is None:
+            return
+        selected = list(report.get("selected", []) or [])
+        skipped = list(report.get("skipped_by_batch", []) or [])
+        poll_mode = str(report.get("poll_mode", "") or "")
+        batch_plan = dict(report.get("batch_plan", {}) or {})
+        pressure = dict(report.get("batch_pressure", {}) or {})
+        common_detail = {
+            "poll_mode": poll_mode,
+            "batch_plan": batch_plan,
+            "batch_pressure": pressure,
+            "quota_skip_counts": dict(report.get("quota_skip_counts", {}) or {}),
+            "forced_promotions_selected": list(report.get("forced_promotions_selected", []) or []),
+            "selected": selected,
+            "skipped_by_batch": skipped,
+        }
+        asyncio.create_task(
+            hub.record(
+                domain="scheduler",
+                kind="heartbeat",
+                level="warning" if pressure else "info",
+                chat_id="",
+                title="Due selection committed",
+                summary=f"selected={len(selected)} skipped={len(skipped)} poll_mode={poll_mode or '-'}",
+                tags={
+                    "domain": "scheduler",
+                    "kind": "heartbeat",
+                    "level": "warning" if pressure else "info",
+                    "phase": "heartbeat",
+                    "action": "due_selection_committed",
+                    "scheduler_bucket": str(batch_plan.get("selected_bucket", "") or ""),
+                },
+                facets={
+                    "phase": "heartbeat",
+                    "action": "due_selection_committed",
+                    "poll_mode": poll_mode,
+                    "scheduler_bucket": str(batch_plan.get("selected_bucket", "") or ""),
+                },
+                detail=common_detail,
+                raw=dict(report or {}),
+            )
+        )
+
+    def _emit_tick_observability(
+        self,
+        state: ChatLoopState,
+        snapshot: ChatLoopSnapshot,
+        decision: ChatLoopDecision,
+        dispatch_result: Any,
+        pre_state_summary: dict[str, Any],
+    ) -> None:
+        hub = getattr(self, "observability_hub", None)
+        if hub is None:
+            return
+        action = str(decision.action or "").strip()
+        reason = str(decision.reason or "").strip()
+        metadata = dict(decision.metadata or {})
+        level = "info"
+        if bool(metadata.get("dispatch_failed", False)):
+            level = "error"
+        elif reason in {"maintenance_budget_blocked", "cooldown_blocked"} or bool(metadata.get("maintenance_blocked_by_budget", False)):
+            level = "warning"
+        kind = "heartbeat"
+        if action in {"COMPACTION_EVALUATE", "MEMORY_MAINTENANCE", "DREAM_MAINTENANCE"}:
+            kind = "maintenance"
+        elif action in {"PROACTIVE_WAKEUP", "HEARTFLOW_EVALUATE"}:
+            kind = "action"
+        elif action in {"WAIT", "RESUME_WAIT", "INTERRUPT_WAIT"}:
+            kind = "trace"
+        summary_bits = [f"action={action or '-'}", f"reason={reason or '-'}"]
+        if metadata.get("selected_reason"):
+            summary_bits.append(f"selected={metadata.get('selected_reason')}")
+        if metadata.get("quota_skip_reason"):
+            summary_bits.append(f"skip={metadata.get('quota_skip_reason')}")
+        if metadata.get("poll_mode"):
+            summary_bits.append(f"poll={metadata.get('poll_mode')}")
+        title = action.replace("_", " ").title() if action else "Scheduler tick"
+        asyncio.create_task(
+            hub.record(
+                domain="scheduler",
+                kind=kind,
+                level=level,
+                chat_id=str(state.chat_id or ""),
+                title=title,
+                summary=" | ".join(summary_bits),
+                tags={
+                    "domain": "scheduler",
+                    "kind": kind,
+                    "level": level,
+                    "chat_id": str(state.chat_id or ""),
+                    "phase": str(state.phase or ""),
+                    "action": action.lower(),
+                    "scheduler_bucket": str(metadata.get("scheduler_bucket", "") or ""),
+                },
+                facets={
+                    "phase": str(state.phase or ""),
+                    "action": action.lower(),
+                    "stage": str(snapshot.trigger_type or ""),
+                    "reason": reason,
+                    "selected_reason": str(metadata.get("selected_reason", "") or ""),
+                    "quota_skip_reason": str(metadata.get("quota_skip_reason", "") or ""),
+                    "poll_mode": str(metadata.get("poll_mode", "") or ""),
+                    "scheduler_bucket": str(metadata.get("scheduler_bucket", "") or ""),
+                },
+                detail={
+                    "snapshot_trigger_type": str(snapshot.trigger_type or ""),
+                    "next_tick_delay": float(decision.next_tick_delay or 0.0),
+                    "dispatch_result": dispatch_result if isinstance(dispatch_result, dict) else {},
+                    "pre_state_summary": dict(pre_state_summary or {}),
+                    "post_state_summary": self._summarize_state(state),
+                    "metadata": metadata,
+                },
+                raw={
+                    "chat_id": str(state.chat_id or ""),
+                    "trigger_type": str(snapshot.trigger_type or ""),
+                    "action": action,
+                    "reason": reason,
+                    "metadata": metadata,
+                    "pre_state_summary": dict(pre_state_summary or {}),
+                    "post_state_summary": self._summarize_state(state),
+                },
+            )
         )
 
     def _apply_wait_arm(

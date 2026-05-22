@@ -37,6 +37,78 @@ async def list_chat_trace_events(chat_id: str, limit: int = 80, user: str = Depe
     return await _service().chat_trace_events(chat_id=chat_id, limit=limit)
 
 
+@router.get("/chats/{chat_id}/unified-timeline")
+async def list_chat_unified_timeline(
+    chat_id: str,
+    limit: int = 80,
+    level: str = "",
+    include: str = "",
+    user: str = Depends(get_current_user),
+):
+    include_values = [item.strip() for item in str(include or "").split(",") if item.strip()]
+    return await _service().cognition_unified_timeline(
+        chat_id=chat_id,
+        limit=limit,
+        level=level,
+        include=include_values,
+    )
+
+
+@router.get("/observability/overview")
+async def get_observability_overview(user: str = Depends(get_current_user)):
+    return await _service().observability_overview()
+
+
+@router.get("/observability/timeline")
+async def get_observability_timeline(
+    chat_id: str = "",
+    domains: str = "",
+    levels: str = "",
+    kinds: str = "",
+    limit: int = 80,
+    user: str = Depends(get_current_user),
+):
+    return await _service().observability_timeline(
+        chat_id=str(chat_id or "") or None,
+        domains=[item.strip() for item in str(domains or "").split(",") if item.strip()],
+        levels=[item.strip() for item in str(levels or "").split(",") if item.strip()],
+        kinds=[item.strip() for item in str(kinds or "").split(",") if item.strip()],
+        limit=limit,
+    )
+
+
+@router.get("/observability/chats/{chat_id}")
+async def get_observability_chat(chat_id: str, user: str = Depends(get_current_user)):
+    return await _service().observability_chat(chat_id)
+
+
+@router.get("/observability/errors")
+async def get_observability_errors(chat_id: str = "", limit: int = 50, user: str = Depends(get_current_user)):
+    return await _service().observability_errors(chat_id=str(chat_id or "") or None, limit=limit)
+
+
+@router.get("/observability/search")
+async def get_observability_search(
+    q: str = "",
+    chat_id: str = "",
+    domains: str = "",
+    kinds: str = "",
+    levels: str = "",
+    tags: str = "",
+    limit: int = 80,
+    user: str = Depends(get_current_user),
+):
+    return await _service().observability_search(
+        q=q,
+        chat_id=chat_id,
+        domains=[item.strip() for item in str(domains or "").split(",") if item.strip()],
+        kinds=[item.strip() for item in str(kinds or "").split(",") if item.strip()],
+        levels=[item.strip() for item in str(levels or "").split(",") if item.strip()],
+        tags=[item.strip() for item in str(tags or "").split(",") if item.strip()],
+        limit=limit,
+    )
+
+
 @router.get("/context-economy")
 async def get_context_economy(limit: int = 20, user: str = Depends(get_current_user)):
     return await _service().context_economy_overview_view(limit=limit)

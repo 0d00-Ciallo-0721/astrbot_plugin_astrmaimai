@@ -339,6 +339,116 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(legacy_rows[0]["canonical_id"], "mem-ui-1")
         self.assertEqual(legacy_delete["mode"], "canonical_soft_delete")
 
+    def test_memory_ui_service_runtime_bound_canonical_actions_use_services_not_sql_fallback(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            calls = []
+
+            class _Maintenance:
+                async def soft_delete(self, memory_id, *, reason=""):
+                    calls.append(("soft_delete", memory_id, reason))
+                    return 1
+
+                async def restore(self, memory_id, *, reason=""):
+                    calls.append(("restore", memory_id, reason))
+                    return 1
+
+                async def mark_stale(self, memory_id, *, reason=""):
+                    calls.append(("mark_stale", memory_id, reason))
+                    return 1
+
+                async def mark_merged(self, memory_ids, *, superseded_by):
+                    calls.append(("mark_merged", tuple(memory_ids), superseded_by))
+                    return 1
+
+            class _Store:
+                async def get_canonical(self, memory_id, include_inactive=False):
+                    return SimpleNamespace(summary="old-summary", metadata={"meaning": "old meaning"})
+
+                async def update_memory(self, memory_id, **kwargs):
+                    calls.append(("update_memory", memory_id, kwargs))
+                    return 1
+
+            class _Engine:
+                maintenance_service = _Maintenance()
+                v2_store = _Store()
+                index_projector = None
+
+            class _Runtime:
+                memory_engine = _Engine()
+
+            class _Facade:
+                runtime = _Runtime()
+
+            service = service_mod.MemoryUiService(db_factory=lambda: None, plugin_api=adapter_mod.PluginApiAdapter(facade=_Facade()))
+            deleted = await service.delete_canonical("mem-1")
+            restored = await service.restore_canonical("mem-1")
+            staled = await service.mark_canonical_stale("mem-1")
+            merged = await service.merge_canonical("mem-1", "mem-2")
+            updated = await service.update_jargon("mem-1", {"meaning": "new meaning", "status": "active"})
+            return calls, deleted, restored, staled, merged, updated
+
+        calls, deleted, restored, staled, merged, updated = asyncio.run(_run())
+        self.assertTrue(deleted["runtime_bound"])
+        self.assertTrue(restored["runtime_bound"])
+        self.assertTrue(staled["runtime_bound"])
+        self.assertTrue(merged["runtime_bound"])
+        self.assertEqual(updated["status"], "ok")
+        self.assertEqual(
+            [item[0] for item in calls],
+            ["soft_delete", "restore", "mark_stale", "mark_merged", "update_memory"],
+        )
+
+    def test_memory_ui_service_runtime_bound_actions_can_run_with_maintenance_service_on_same_chat(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        store_mod = importlib.import_module("astrmai.memory.services.v2_store")
+        write_mod = importlib.import_module("astrmai.memory.services.memory_write_service")
+        maintenance_mod = importlib.import_module("astrmai.memory.services.memory_maintenance_service")
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = str(Path(tmp_dir) / "docs.db")
+                store = store_mod.MemoryV2Store(db_path, data_path=Path(tmp_dir))
+                writer = write_mod.MemoryWriteService(store)
+                maintenance = maintenance_mod.MemoryMaintenanceService(store)
+                memory_id = await writer.write(
+                    importlib.import_module("astrmai.memory.contracts.memory_query").MemoryWriteRequest(
+                        source="summary",
+                        kind="memory",
+                        session_id="chat-1",
+                        content="runtime-bound lock test",
+                        dedup_key="runtime-lock:chat-1",
+                    )
+                )
+
+                class _Engine:
+                    maintenance_service = maintenance
+                    v2_store = store
+                    index_projector = None
+
+                class _Runtime:
+                    memory_engine = _Engine()
+
+                class _Facade:
+                    runtime = _Runtime()
+
+                service = service_mod.MemoryUiService(db_factory=lambda: None, plugin_api=adapter_mod.PluginApiAdapter(facade=_Facade()))
+                results = await asyncio.gather(
+                    maintenance.mark_stale(memory_id, reason="maintenance"),
+                    service.delete_canonical(memory_id),
+                    return_exceptions=True,
+                )
+                candidate = await store.get_canonical(memory_id, include_inactive=True)
+                return results, candidate
+
+        results, candidate = asyncio.run(_run())
+        self.assertFalse(any(isinstance(item, Exception) for item in results))
+        self.assertIsNotNone(candidate)
+        self.assertIn(candidate.status, {"stale", "deleted"})
+
     def test_memory_ui_service_lists_and_reviews_canonical_jargon(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
 
@@ -455,6 +565,344 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         self.assertIn('@router.post("/jargon/{id}/approve")', content)
         self.assertIn('@router.post("/jargon/{id}/reject")', content)
+        self.assertIn('@router.get("/observability/runtime")', content)
+        self.assertIn('@router.get("/observability/chats/{chat_id}")', content)
+        self.assertIn('@router.get("/observability/events")', content)
+        self.assertIn('@router.get("/observability/errors")', content)
+
+    def test_memory_ui_service_runtime_status_prefers_new_memory_runtime_fields(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            class _Observer:
+                async def runtime_snapshot(self, **kwargs):
+                    return {
+                        "instant_gate_ready": kwargs["instant_gate_ready"],
+                        "memory_pipeline_ready": kwargs["memory_pipeline_ready"],
+                        "session_summarizer_ready": kwargs["session_summarizer_ready"],
+                        "pipeline_running": True,
+                        "sweep_task_running": True,
+                        "buffered_chats": 2,
+                        "tracked_chats": 3,
+                        "active_worker_count": 2,
+                        "active_worker_chats": ["chat-1", "chat-2"],
+                        "recent_error_count": 1,
+                        "recent_warning_count": 2,
+                        "last_gate_hit_at": 10.0,
+                        "last_backfill_success_at": 20.0,
+                        "last_summarize_success_at": 30.0,
+                        "last_summarize_failure_at": 40.0,
+                    }
+
+                async def chat_snapshot(self, **kwargs):
+                    return {
+                        "chat_id": kwargs["chat_id"],
+                        "pending_messages": 4,
+                        "cooldown_until": 0.0,
+                        "failures": 0,
+                        "last_update": 123.0,
+                        "last_memory_run_at": 120.0,
+                        "worker_active": True,
+                        "last_gate_stage": "gate_hit",
+                        "last_backfill_stage": "backfill_finished",
+                        "last_summarize_stage": "canonical_write_success",
+                        "recent_events": [{"event_id": "evt-1"}],
+                    }
+
+                async def recent_events(self, **kwargs):
+                    item = {"event_id": "evt-1", "component": "instant_gate", "stage": "gate_hit", "level": "info", "summary": "hit", "timestamp": 9.0, "chat_id": kwargs.get("chat_id") or "chat-1"}
+                    return [self.format_timeline_item(item)]
+
+                async def recent_errors(self, **kwargs):
+                    return [{"event_id": "evt-2", "component": "session_summarizer", "level": "error"}]
+
+                @staticmethod
+                def format_timeline_item(item):
+                    item = dict(item)
+                    item["display_title"] = "即时记忆命中" if item.get("stage") == "gate_hit" else item.get("stage", "")
+                    return item
+
+            class _Pipeline:
+                def describe_runtime_status(self):
+                    return {
+                        "running": True,
+                        "sweep_task_running": True,
+                        "buffered_chats": 2,
+                        "tracked_chats": 3,
+                        "active_worker_count": 2,
+                        "active_worker_chats": ["chat-1", "chat-2"],
+                    }
+
+                def describe_chat_buffer(self, chat_id):
+                    return {
+                        "chat_id": chat_id,
+                        "pending_messages": 4,
+                        "last_update": 123.0,
+                        "cooldown_until": 0.0,
+                        "failures": 0,
+                        "last_memory_run_at": 120.0,
+                    }
+
+                def is_worker_active(self, chat_id):
+                    return chat_id == "chat-1"
+
+            class _Runtime:
+                memory_engine = SimpleNamespace(
+                    instant_gate=SimpleNamespace(),
+                    memory_pipeline=_Pipeline(),
+                    session_summarizer=SimpleNamespace(),
+                    memory_observer=_Observer(),
+                )
+
+            class _Facade:
+                runtime = _Runtime()
+
+            service = service_mod.MemoryUiService(
+                db_factory=None,
+                plugin_api=adapter_mod.PluginApiAdapter(facade=_Facade()),
+            )
+            status = await service.runtime_status()
+            chat = await service.chat_buffer_status("chat-1")
+            events = await service.observability_events(chat_id="chat-1", component="instant_gate", level="info", limit=20)
+            errors = await service.observability_errors(chat_id="chat-1", limit=20)
+            return status, chat, events, errors
+
+        status, chat, events, errors = asyncio.run(_run())
+
+        self.assertTrue(status["runtime_bound"])
+        self.assertTrue(status["instant_gate_ready"])
+        self.assertTrue(status["memory_pipeline_ready"])
+        self.assertTrue(status["session_summarizer_ready"])
+        self.assertEqual(status["memory_pipeline_status"]["buffered_chats"], 2)
+        self.assertEqual(status["observer_status"]["recent_error_count"], 1)
+        self.assertEqual(chat["data"]["chat_id"], "chat-1")
+        self.assertEqual(chat["data"]["pending_messages"], 4)
+        self.assertTrue(chat["data"]["worker_active"])
+        self.assertEqual(events["items"][0]["component"], "instant_gate")
+        self.assertEqual(events["items"][0]["display_title"], "即时记忆命中")
+        self.assertEqual(errors["items"][0]["level"], "error")
+
+    def test_memory_diagnostics_tab_renders_observability_panels(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "astrmai" / "webui" / "frontend" / "pages" / "memories" / "index.html").read_text(encoding="utf-8")
+        js = (root / "astrmai" / "webui" / "frontend" / "js" / "pages" / "memory.js").read_text(encoding="utf-8")
+        self.assertIn("Memory Events Feed", html)
+        self.assertIn("Chat Drill-down", html)
+        self.assertIn("Recent Errors", html)
+        self.assertIn("Instant Gate", html)
+        self.assertIn("Memory Pipeline", html)
+        self.assertIn("Session Summarizer", html)
+        self.assertIn("observabilityRuntime", js)
+        self.assertIn("observabilityEvents", js)
+        self.assertIn("observabilityErrors", js)
+        self.assertIn("loadObservabilityEvents", js)
+        self.assertIn("loadObservabilityChat", js)
+
+    def test_admin_service_exposes_memory_observability_views(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            class _Observer:
+                async def runtime_snapshot(self, **kwargs):
+                    return {
+                        "instant_gate_ready": True,
+                        "memory_pipeline_ready": True,
+                        "session_summarizer_ready": True,
+                        "buffered_chats": 2,
+                        "active_worker_count": 1,
+                        "recent_error_count": 1,
+                        "recent_warning_count": 0,
+                    }
+
+                async def recent_errors(self, **kwargs):
+                    return [{"event_id": "evt-err", "component": "session_summarizer", "stage": "canonical_write_failed", "level": "error", "summary": "write failed", "timestamp": 10.0, "chat_id": "chat-1"}]
+
+                async def recent_events(self, **kwargs):
+                    item = {"event_id": "evt-1", "component": "instant_gate", "stage": "gate_hit", "level": "info", "summary": "hit", "timestamp": 9.0, "chat_id": kwargs.get("chat_id") or "chat-1"}
+                    return [self.format_timeline_item(item)]
+
+                async def chat_snapshot(self, **kwargs):
+                    return {"chat_id": kwargs["chat_id"], "pending_messages": 3, "worker_active": True, "recent_events": []}
+
+                @staticmethod
+                def format_timeline_item(item):
+                    item = dict(item)
+                    item["display_title"] = "即时记忆命中" if item.get("stage") == "gate_hit" else item.get("stage", "")
+                    return item
+
+            class _Pipeline:
+                def describe_runtime_status(self):
+                    return {"running": True, "buffered_chats": 2, "tracked_chats": 3, "active_worker_count": 1, "active_worker_chats": ["chat-1"], "sweep_task_running": True}
+
+                def describe_chat_buffer(self, chat_id):
+                    return {"chat_id": chat_id, "pending_messages": 3, "cooldown_until": 0.0, "failures": 0, "last_update": 5.0, "last_memory_run_at": 3.0}
+
+                def is_worker_active(self, chat_id):
+                    return chat_id == "chat-1"
+
+            class _Runtime:
+                memory_engine = SimpleNamespace(
+                    instant_gate=SimpleNamespace(),
+                    memory_pipeline=_Pipeline(),
+                    session_summarizer=SimpleNamespace(),
+                    memory_observer=_Observer(),
+                )
+
+            class _Facade:
+                runtime = _Runtime()
+
+            service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+            overview = await service.memory_observability_overview()
+            timeline = await service.memory_observability_timeline(chat_id="chat-1", component="instant_gate", level="info", limit=20)
+            chat = await service.memory_observability_chat("chat-1")
+            errors = await service.memory_observability_errors(chat_id="chat-1", limit=20)
+            return overview, timeline, chat, errors
+
+        overview, timeline, chat, errors = asyncio.run(_run())
+
+        self.assertTrue(overview["runtime_bound"])
+        self.assertEqual(overview["data"]["snapshot"]["buffered_chats"], 2)
+        self.assertEqual(overview["data"]["recent_errors"][0]["display_title"], "canonical_write_failed")
+        self.assertEqual(timeline["items"][0]["display_title"], "即时记忆命中")
+        self.assertEqual(chat["data"]["chat"]["chat_id"], "chat-1")
+        self.assertEqual(errors["items"][0]["level"], "error")
+
+    def test_admin_service_exposes_cognition_unified_timeline(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            class _Observer:
+                async def recent_events(self, **kwargs):
+                    return [{
+                        "event_id": "mem-1",
+                        "component": "instant_gate",
+                        "stage": "gate_hit",
+                        "level": "info",
+                        "summary": "memory hit",
+                        "timestamp": 40.0,
+                        "chat_id": kwargs.get("chat_id") or "chat-1",
+                    }]
+
+                @staticmethod
+                def format_timeline_item(item):
+                    item = dict(item)
+                    item["display_title"] = "即时记忆命中"
+                    return item
+
+            class _Planner:
+                cognitive_decision_history = [{"chat_id": "chat-1", "social_intent": "join", "timestamp": 10.0}]
+                tool_trace_history = [{"chat_id": "chat-1", "tool_tier": "chat", "timestamp": 20.0}]
+                turn_trace_history = []
+                raw_trace_store = None
+
+            class _Runtime:
+                system2_planner = _Planner()
+                memory_engine = SimpleNamespace(memory_observer=_Observer())
+
+            class _Facade:
+                runtime = _Runtime()
+
+            service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+            return await service.cognition_unified_timeline(chat_id="chat-1", include=["decision", "tool", "memory"], limit=20)
+
+        result = asyncio.run(_run())
+        self.assertEqual(result["items"][0]["kind"], "memory")
+        self.assertEqual(result["items"][1]["kind"], "tool")
+        self.assertEqual(result["items"][2]["kind"], "decision")
+        self.assertEqual(result["items"][0]["title"], "即时记忆命中")
+
+    def test_runtime_observability_hub_supports_recent_snapshot_and_search(self):
+        hub_mod = importlib.import_module("astrmai.infrastructure.runtime.observability")
+
+        async def _run():
+            hub = hub_mod.RuntimeObservabilityHub(raw_trace_store=None, max_recent_events=10, max_events_per_chat=5)
+            await hub.record(
+                domain="scheduler",
+                kind="heartbeat",
+                level="warning",
+                chat_id="chat-1",
+                title="Due selection committed",
+                summary="maintenance pressure",
+                tags={"phase": "heartbeat", "scheduler_bucket": "maintenance"},
+                facets={"action": "due_selection_committed", "stage": "tick"},
+            )
+            await hub.record(
+                domain="memory",
+                kind="maintenance",
+                level="error",
+                chat_id="chat-1",
+                title="Memory summarize failed",
+                summary="provider_failure_text",
+                tags={"component": "session_summarizer"},
+                facets={"reason": "provider_failure_text", "display_title": "summarize failed"},
+            )
+            recent = await hub.recent(chat_id="chat-1", limit=10)
+            errors = await hub.recent_errors(chat_id="chat-1", limit=10)
+            snapshot = await hub.global_snapshot()
+            chat = await hub.chat_snapshot("chat-1")
+            search = await hub.search(q="provider_failure_text", chat_id="chat-1", levels={"error"}, limit=10)
+            return recent, errors, snapshot, chat, search
+
+        recent, errors, snapshot, chat, search = asyncio.run(_run())
+        self.assertEqual(len(recent), 2)
+        self.assertEqual(errors[0]["domain"], "memory")
+        self.assertEqual(snapshot["domain_counts"]["scheduler"], 1)
+        self.assertEqual(snapshot["level_counts"]["error"], 1)
+        self.assertEqual(chat["retained_events"], 2)
+        self.assertEqual(search[0]["title"], "Memory summarize failed")
+
+    def test_admin_service_exposes_observability_views_and_search(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        hub_mod = importlib.import_module("astrmai.infrastructure.runtime.observability")
+
+        async def _run():
+            hub = hub_mod.RuntimeObservabilityHub(raw_trace_store=None, max_recent_events=20, max_events_per_chat=10)
+            await hub.record(
+                domain="scheduler",
+                kind="heartbeat",
+                level="warning",
+                chat_id="chat-1",
+                title="Due selection committed",
+                summary="batch pressure",
+                tags={"action": "due_selection_committed"},
+                facets={"poll_mode": "busy"},
+            )
+            await hub.record(
+                domain="heartflow",
+                kind="impulse",
+                level="info",
+                chat_id="chat-1",
+                title="Heartflow observe",
+                summary="observe",
+                tags={"source": "heartflow_manager"},
+                facets={"action": "observe"},
+            )
+
+            class _Runtime:
+                observability_hub = hub
+
+            class _Facade:
+                runtime = _Runtime()
+
+            service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+            overview = await service.observability_overview()
+            timeline = await service.observability_timeline(chat_id="chat-1", domains=["scheduler", "heartflow"], limit=20)
+            chat = await service.observability_chat("chat-1")
+            errors = await service.observability_errors(chat_id="chat-1", limit=20)
+            search = await service.observability_search(q="batch pressure", chat_id="chat-1", domains=["scheduler"], limit=20)
+            return overview, timeline, chat, errors, search
+
+        overview, timeline, chat, errors, search = asyncio.run(_run())
+        self.assertTrue(overview["runtime_bound"])
+        self.assertEqual(overview["data"]["snapshot"]["retained_events"], 2)
+        self.assertEqual(timeline["items"][0]["domain"], "heartflow")
+        self.assertEqual(chat["data"]["chat"]["chat_id"], "chat-1")
+        self.assertEqual(errors["items"][0]["domain"], "scheduler")
+        self.assertEqual(search["items"][0]["domain"], "scheduler")
 
     def test_settings_service_builds_effective_config_and_validates_schema(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -907,6 +1355,12 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn('@router.get("/scheduler/status")', content)
         self.assertIn('@router.get("/scheduler/due-selection")', content)
         self.assertIn('@router.get("/scheduler/chats/{chat_id}")', content)
+        self.assertIn('@router.get("/chats/{chat_id}/unified-timeline")', content)
+        self.assertIn('@router.get("/observability/overview")', content)
+        self.assertIn('@router.get("/observability/timeline")', content)
+        self.assertIn('@router.get("/observability/chats/{chat_id}")', content)
+        self.assertIn('@router.get("/observability/errors")', content)
+        self.assertIn('@router.get("/observability/search")', content)
 
     def test_dashboard_cognition_tab_renders_context_economy_panel(self):
         root = Path(__file__).resolve().parents[1]
@@ -943,6 +1397,20 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("Raw Trace Events", html)
         self.assertIn("summarizeFailureEvidence", js)
         self.assertIn("/cognition/chats/${encodedChat}/trace-events?limit=40", js)
+        self.assertIn("Observability Overview", html)
+        self.assertIn("Open Memory Diagnostics", html)
+        self.assertIn("observabilityOverview", js)
+        self.assertIn("memoryObservabilityChatId", js)
+        self.assertIn("openMemoryDrilldown", js)
+        self.assertIn("/cognition/observability/overview", js)
+        self.assertIn("Global Observability Timeline", html)
+        self.assertIn("cognitionUnifiedTimeline", js)
+        self.assertIn("loadCognitionUnifiedTimeline", js)
+        self.assertIn("/cognition/observability/timeline?", js)
+        self.assertIn("/cognition/observability/search?", js)
+        self.assertIn("applyTimelineQuickFilter", js)
+        self.assertIn("clearTimelineFilters", js)
+        self.assertIn("provider failures", html)
 
     def test_chat_trace_events_falls_back_to_turn_trace_embedded_log(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")

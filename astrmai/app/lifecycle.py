@@ -155,9 +155,9 @@ class PluginLifecycleManager:
         self.runtime.status.lifecycle_started = False
         self.runtime.set_boot_phase("shutdown.start")
 
-        summarizer = getattr(self.runtime.memory_engine, "summarizer", None)
-        if summarizer:
-            await summarizer.stop()
+        memory_pipeline = getattr(self.runtime.memory_engine, "memory_pipeline", None)
+        if memory_pipeline:
+            await memory_pipeline.stop()
 
         await self.stop_proactive_services()
         await self.stop_expression_governance_services()
