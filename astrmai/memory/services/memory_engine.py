@@ -229,16 +229,26 @@ class MemoryEngine:
         logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
         return True
 
-    async def add_memory(self, content: str, session_id: str, persona_id: str = None, importance: float = 0.8):
+    async def add_memory(
+        self,
+        content: str,
+        session_id: str,
+        persona_id: str = None,
+        importance: float = 0.8,
+        sender_id: str = "",
+        created_at: float = 0.0,
+    ):
         request = MemoryWriteRequest(
             source="legacy_add_memory",
             kind="persona_lore" if session_id == "__self_lore__" else "memory",
             session_id=str(session_id or ""),
+            sender_id=str(sender_id or ""),
             persona_id=str(persona_id or ""),
             content=str(content or ""),
             importance=float(importance or 0.8),
             confidence=0.8,
             source_ref="memory_engine.add_memory",
+            created_at=float(created_at or 0.0),
         )
         return await self.write_service.write(request)
 

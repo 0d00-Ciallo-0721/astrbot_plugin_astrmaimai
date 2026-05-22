@@ -30,6 +30,7 @@ class MemoryWriteRequest:
     kind: str
     session_id: str
     content: str
+    sender_id: str = ""
     persona_id: str = ""
     summary: str = ""
     tags: List[str] = field(default_factory=list)
@@ -40,6 +41,7 @@ class MemoryWriteRequest:
     source_ref: str = ""
     visibility: str = "auto_and_tool"
     status: str = "active"
+    created_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -50,6 +52,7 @@ class MemoryCandidate:
     summary: str
     content: str
     session_id: str = ""
+    sender_id: str = ""
     persona_id: str = ""
     tags: List[str] = field(default_factory=list)
     importance: float = 0.5
@@ -61,6 +64,7 @@ class MemoryCandidate:
     created_at: float = 0.0
     updated_at: float = 0.0
     last_access_time: float = 0.0
+    superseded_by: str = ""
     access_count: int = 0
     decay_score: float = 1.0
     metadata_hydrated: bool = False
@@ -106,6 +110,7 @@ class CommittedMemoryTurn:
     chat_id: str
     user_text: str
     assistant_text: str
+    sender_id: str = ""
     source: str = ""
     is_proactive: bool = False
     think_level: int | None = None

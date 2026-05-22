@@ -132,6 +132,7 @@ class DreamGenerator:
         delete_actions = []
         update_actions = []
         jargon_suggestions = []
+        detected_facts = []
         for line in str(dream_log).splitlines():
             normalized = line.strip()
             if not normalized:
@@ -152,6 +153,14 @@ class DreamGenerator:
                 elif "suggest_jargon_review" in normalized:
                     tags.append("jargon_review")
                     jargon_suggestions.append(normalized)
+            elif normalized.startswith("[fact]"):
+                payload = normalized.removeprefix("[fact]").strip()
+                try:
+                    item = json.loads(payload)
+                    if isinstance(item, dict):
+                        detected_facts.append(item)
+                except Exception:
+                    continue
         action_count = len(actions)
         summary = (
             f"session={session_id} 的 dream maintenance 完成，共执行 {action_count} 次维护动作。"
@@ -167,5 +176,6 @@ class DreamGenerator:
             "deletion_rationale": delete_actions[:4],
             "update_actions": update_actions[:4],
             "jargon_suggestions": jargon_suggestions[:4],
+            "detected_facts": detected_facts[:12],
             "tags": sorted(set(tags)),
         }

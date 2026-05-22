@@ -19,11 +19,26 @@ from .memory_scoring import DEFAULT_MEMORY_SCORING
 
 ACTIVE_STATUS = "active"
 STALE_STATUS = "stale"
+SUPERSEDED_STATUS = "superseded"
 DELETED_STATUS = "deleted"
 MERGED_STATUS = "merged"
 DEPRECATED_STATUS = "deprecated"
 REVIEW_PENDING_STATUS = "review_pending"
 REJECTED_STATUS = "rejected"
+
+
+class MemoryUpsertResult(dict):
+    @property
+    def memory_id(self) -> str:
+        return str(self.get("memory_id") or "")
+
+    @property
+    def superseded_old_ids(self) -> list[str]:
+        return list(self.get("superseded_old_ids") or [])
+
+    @property
+    def new_record_is_superseded(self) -> bool:
+        return bool(self.get("new_record_is_superseded", False))
 
 
 class MemoryV2Store:
@@ -127,6 +142,7 @@ class MemoryV2Store:
                 CREATE TABLE IF NOT EXISTS canonical_memories (
                     id TEXT PRIMARY KEY,
                     session_id TEXT DEFAULT '',
+                    sender_id TEXT DEFAULT '',
                     persona_id TEXT DEFAULT '',
                     source TEXT DEFAULT '',
                     kind TEXT DEFAULT '',
@@ -208,6 +224,7 @@ class MemoryV2Store:
         cursor = await db.execute("PRAGMA table_info(canonical_memories)")
         columns = {str(row[1]) for row in await cursor.fetchall()}
         migrations = {
+            "sender_id": "ALTER TABLE canonical_memories ADD COLUMN sender_id TEXT DEFAULT ''",
             "source_ref": "ALTER TABLE canonical_memories ADD COLUMN source_ref TEXT DEFAULT ''",
             "visibility": "ALTER TABLE canonical_memories ADD COLUMN visibility TEXT DEFAULT 'auto_and_tool'",
         }
@@ -254,17 +271,34 @@ class MemoryV2Store:
     def _json_dict(value: Any) -> str:
         return json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False)
 
-    async def upsert(self, request: MemoryWriteRequest) -> str:
+    @staticmethod
+    def _looks_like_authority_eav(dedup_key: str, request: MemoryWriteRequest) -> bool:
+        clean_key = str(dedup_key or "").strip()
+        if not clean_key or str(request.kind or "").strip().lower() != "fact":
+            return False
+        parts = [part.strip() for part in clean_key.split(":")]
+        if len(parts) != 3 or not all(parts):
+            return False
+        metadata = dict(request.metadata or {})
+        if bool(metadata.get("authority_eav")):
+            return True
+        source = str(request.source or "").strip().lower()
+        return source in {"instant_gate", "instant_gate_llm", "dream_audit_pipeline", "authority_backfill"}
+
+    async def upsert(self, request: MemoryWriteRequest) -> MemoryUpsertResult:
         await self.initialize()
         now = self._now()
         memory_id = f"mem_{uuid.uuid4().hex[:16]}"
         summary = request.summary or request.content[:240]
         dedup_key = request.dedup_key.strip()
+        sender_id = str(request.sender_id or "").strip()
+        created_at = float(request.created_at or 0.0) or now
         visibility = request.visibility if request.visibility in {"auto_and_tool", "tool_only", "maintenance_only"} else "auto_and_tool"
         status = str(request.status or ACTIVE_STATUS).strip() or ACTIVE_STATUS
         if status not in {
             ACTIVE_STATUS,
             STALE_STATUS,
+            SUPERSEDED_STATUS,
             DELETED_STATUS,
             MERGED_STATUS,
             DEPRECATED_STATUS,
@@ -272,10 +306,14 @@ class MemoryV2Store:
             REJECTED_STATUS,
         }:
             status = ACTIVE_STATUS
+        authority_eav = self._looks_like_authority_eav(dedup_key, request)
 
-        async with await self._acquire_session_scopes([request.session_id]) as _locks:
+        scopes = [request.session_id]
+        if sender_id:
+            scopes.append(f"sender:{sender_id}")
+        async with await self._acquire_session_scopes(scopes) as _locks:
             async with aiosqlite.connect(self.db_path) as db:
-                if dedup_key:
+                if dedup_key and not authority_eav:
                     cursor = await db.execute(
                         """
                         SELECT id, content, summary, access_count
@@ -321,21 +359,26 @@ class MemoryV2Store:
                         )
                         await self._sync_fts(db, memory_id)
                         await db.commit()
-                        return memory_id
+                        return MemoryUpsertResult(
+                            memory_id=memory_id,
+                            superseded_old_ids=[],
+                            new_record_is_superseded=False,
+                        )
 
                 await db.execute(
                     """
                     INSERT INTO canonical_memories (
-                        id, session_id, persona_id, source, kind, content, summary,
+                        id, session_id, sender_id, persona_id, source, kind, content, summary,
                         tags, importance, confidence, status, decay_score,
                         create_time, update_time, last_access_time, access_count,
                         metadata, dedup_key, source_ref, visibility
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?, 0, ?, ?, ?, ?)
                     """,
                     (
                         memory_id,
                         request.session_id,
+                        sender_id,
                         request.persona_id,
                         request.source,
                         request.kind,
@@ -345,7 +388,7 @@ class MemoryV2Store:
                         float(request.importance or 0.5),
                         float(request.confidence or 0.8),
                         status,
-                        now,
+                        created_at,
                         now,
                         now,
                         self._json_dict(request.metadata),
@@ -354,9 +397,31 @@ class MemoryV2Store:
                         visibility,
                     ),
                 )
-                await self._sync_fts(db, memory_id)
+                superseded_old_ids: list[str] = []
+                new_record_is_superseded = False
+                if authority_eav:
+                    superseded_old_ids = await self.mark_superseded_by_key(
+                        dedup_key,
+                        memory_id,
+                        created_at=created_at,
+                        sender_id=sender_id,
+                        session_id=request.session_id,
+                        db=db,
+                    )
+                    cursor = await db.execute(
+                        "SELECT status FROM canonical_memories WHERE id = ? LIMIT 1",
+                        (memory_id,),
+                    )
+                    row = await cursor.fetchone()
+                    new_record_is_superseded = str(row[0] or "") == SUPERSEDED_STATUS if row else False
+                if not new_record_is_superseded:
+                    await self._sync_fts(db, memory_id)
                 await db.commit()
-        return memory_id
+        return MemoryUpsertResult(
+            memory_id=memory_id,
+            superseded_old_ids=superseded_old_ids,
+            new_record_is_superseded=new_record_is_superseded,
+        )
 
     async def get_by_id(self, memory_id: str, *, allow_stale: bool = False) -> MemoryCandidate | None:
         await self.initialize()
@@ -366,9 +431,9 @@ class MemoryV2Store:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility, access_count, decay_score
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                 FROM canonical_memories
                 WHERE id = ? AND status IN ({','.join('?' for _ in statuses)})
                 LIMIT 1
@@ -389,9 +454,9 @@ class MemoryV2Store:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility, access_count, decay_score
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                 FROM canonical_memories
                 WHERE {where}
                 LIMIT 1
@@ -413,9 +478,9 @@ class MemoryV2Store:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility, access_count, decay_score
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                 FROM canonical_memories
                 WHERE {where}
                 LIMIT 1
@@ -425,21 +490,85 @@ class MemoryV2Store:
             row = await cursor.fetchone()
         return self._row_to_candidate(row) if row else None
 
+    async def mark_superseded_by_key(
+        self,
+        dedup_key: str,
+        new_memory_id: str,
+        *,
+        created_at: float,
+        sender_id: str = "",
+        session_id: str = "",
+        db=None,
+    ) -> list[str]:
+        clean_key = str(dedup_key or "").strip()
+        if not clean_key or not str(new_memory_id or "").strip():
+            return []
+        await self.initialize()
+        scopes = [session_id]
+        if sender_id:
+            scopes.append(f"sender:{sender_id}")
+
+        async def _apply(inner_db) -> list[str]:
+            covered_old_ids: list[str] = []
+            cursor = await inner_db.execute(
+                """
+                SELECT id, create_time
+                FROM canonical_memories
+                WHERE dedup_key = ? AND id != ? AND status IN ('active', 'stale')
+                ORDER BY create_time DESC, update_time DESC
+                """,
+                (clean_key, new_memory_id),
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                old_id = str(row[0] or "")
+                old_create_time = float(row[1] or 0.0)
+                if old_create_time < float(created_at or 0.0):
+                    await inner_db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET status = ?, superseded_by = ?, update_time = ?
+                        WHERE id = ?
+                        """,
+                        (SUPERSEDED_STATUS, new_memory_id, self._now(), old_id),
+                    )
+                    covered_old_ids.append(old_id)
+                else:
+                    await inner_db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET status = ?, superseded_by = ?, update_time = ?
+                        WHERE id = ?
+                        """,
+                        (SUPERSEDED_STATUS, old_id, self._now(), new_memory_id),
+                    )
+                    break
+            return covered_old_ids
+
+        if db is not None:
+            return await _apply(db)
+
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with aiosqlite.connect(self.db_path) as owned_db:
+                result = await _apply(owned_db)
+                await owned_db.commit()
+                return result
+
     def _row_to_candidate(self, row) -> MemoryCandidate:
         try:
-            tags = json.loads(row[7] or "[]")
+            tags = json.loads(row[8] or "[]")
             if not isinstance(tags, list):
                 tags = []
         except Exception:
             tags = []
         try:
-            metadata = json.loads(row[14] or "{}")
+            metadata = json.loads(row[15] or "{}")
             if not isinstance(metadata, dict):
                 metadata = {}
         except Exception:
             metadata = {}
         now = self._now()
-        created_at = float(row[11] or 0.0)
+        created_at = float(row[12] or 0.0)
         age_days = max(0.0, (now - created_at) / 86400) if created_at else 0.0
         return MemoryCandidate(
             id=str(row[0] or ""),
@@ -448,18 +577,20 @@ class MemoryV2Store:
             summary=str(row[3] or ""),
             content=str(row[4] or ""),
             session_id=str(row[5] or ""),
-            persona_id=str(row[6] or ""),
+            sender_id=str(row[6] or ""),
+            persona_id=str(row[7] or ""),
             tags=[str(item) for item in tags],
-            importance=float(row[8] or 0.5),
-            confidence=float(row[9] or 0.8),
+            importance=float(row[9] or 0.5),
+            confidence=float(row[10] or 0.8),
             recency_score=1.0 / (1.0 + age_days),
-            status=str(row[10] or ACTIVE_STATUS),
-            visibility=str(row[15] or "auto_and_tool"),
+            status=str(row[11] or ACTIVE_STATUS),
+            visibility=str(row[16] or "auto_and_tool"),
             created_at=created_at,
-            updated_at=float(row[12] or 0.0),
-            last_access_time=float(row[13] or 0.0),
-            access_count=int(row[16] or 0) if len(row) > 16 else 0,
-            decay_score=float(row[17] or 1.0) if len(row) > 17 else 1.0,
+            updated_at=float(row[13] or 0.0),
+            last_access_time=float(row[14] or 0.0),
+            superseded_by=str(row[19] or "") if len(row) > 19 else "",
+            access_count=int(row[17] or 0) if len(row) > 17 else 0,
+            decay_score=float(row[18] or 1.0) if len(row) > 18 else 1.0,
             metadata_hydrated=True,
             metadata=metadata,
         )
@@ -515,9 +646,9 @@ class MemoryV2Store:
             if fts_query:
                 cursor = await db.execute(
                     f"""
-                    SELECT cm.id, cm.kind, cm.source, cm.summary, cm.content, cm.session_id, cm.persona_id,
+                    SELECT cm.id, cm.kind, cm.source, cm.summary, cm.content, cm.session_id, cm.sender_id, cm.persona_id,
                            cm.tags, cm.importance, cm.confidence, cm.status, cm.create_time,
-                           cm.update_time, cm.last_access_time, cm.metadata, cm.visibility, cm.access_count, cm.decay_score,
+                           cm.update_time, cm.last_access_time, cm.metadata, cm.visibility, cm.access_count, cm.decay_score, cm.superseded_by,
                            bm25(canonical_fts) AS fts_score
                     FROM canonical_fts
                     JOIN canonical_memories cm ON cm.id = canonical_fts.memory_id
@@ -533,14 +664,14 @@ class MemoryV2Store:
                     candidate = self._row_to_candidate(row)
                     if candidate.id in exclude:
                         continue
-                    candidate.relevance_score = max(0.0, 1.0 - (float(row[16] or 0.0) if len(row) > 16 else 0.0))
+                    candidate.relevance_score = max(0.0, 1.0 - (float(row[20] or 0.0) if len(row) > 20 else 0.0))
                     candidates.append(candidate)
             else:
                 cursor = await db.execute(
                     f"""
-                    SELECT id, kind, source, summary, content, session_id, persona_id,
+                    SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                            tags, importance, confidence, status, create_time,
-                           update_time, last_access_time, metadata, visibility, access_count, decay_score
+                           update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                     FROM canonical_memories
                     WHERE {' AND '.join(where)}
                     ORDER BY update_time DESC
@@ -627,9 +758,9 @@ class MemoryV2Store:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility, access_count, decay_score
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                 FROM canonical_memories
                 {where_sql}
                 ORDER BY update_time DESC
@@ -679,9 +810,9 @@ class MemoryV2Store:
             total_row = await cursor.fetchone()
             cursor = await db.execute(
                 f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility, access_count, decay_score
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                 FROM canonical_memories
                 {where_sql}
                 ORDER BY update_time DESC
@@ -706,6 +837,7 @@ class MemoryV2Store:
             "summary": candidate.summary,
             "content": candidate.content,
             "session_id": candidate.session_id,
+            "sender_id": candidate.sender_id,
             "persona_id": candidate.persona_id,
             "tags": list(candidate.tags or []),
             "importance": candidate.importance,
@@ -717,6 +849,7 @@ class MemoryV2Store:
             "created_at": candidate.created_at,
             "updated_at": candidate.updated_at,
             "last_access_time": candidate.last_access_time,
+            "superseded_by": candidate.superseded_by,
             "access_count": candidate.access_count,
             "decay_score": candidate.decay_score,
             "metadata_hydrated": candidate.metadata_hydrated,
@@ -733,7 +866,7 @@ class MemoryV2Store:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, importance, status, visibility, create_time,
-                       update_time, last_access_time, access_count, decay_score, metadata
+                       update_time, last_access_time, access_count, decay_score, metadata, sender_id, superseded_by
                 FROM canonical_memories
                 WHERE id IN ({placeholders})
                 """,
@@ -760,6 +893,8 @@ class MemoryV2Store:
                 "access_count": int(row[8] or 0),
                 "decay_score": float(row[9] or 1.0),
                 "metadata": metadata,
+                "sender_id": str(row[11] or ""),
+                "superseded_by": str(row[12] or ""),
             }
         return payload
 
@@ -1196,9 +1331,9 @@ class MemoryV2Store:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 f"""
-                SELECT id, kind, source, summary, content, session_id, persona_id,
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
                        tags, importance, confidence, status, create_time,
-                       update_time, last_access_time, metadata, visibility, access_count, decay_score
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
                 FROM canonical_memories
                 WHERE {' AND '.join(where)}
                 ORDER BY update_time DESC

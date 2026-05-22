@@ -51,12 +51,13 @@ class InstantMemoryGate:
                 source="instant_gate",
                 kind="fact",
                 session_id=str(turn.chat_id),
+                sender_id=str(turn.sender_id or ""),
                 persona_id=str(turn.persona_id or ""),
                 content=content,
                 summary=extracted[:240],
                 importance=0.85,
                 confidence=0.9,
-                metadata={"gate_category": category, "instant_write": True, "turn_id": str(turn.turn_id or "")},
+                metadata={"gate_category": category, "instant_write": True, "turn_id": str(turn.turn_id or ""), "authority_eav": True},
                 dedup_key=f"instant_gate:{turn.chat_id}:{category}:{extracted[:60]}",
             )
         )
@@ -179,12 +180,13 @@ class InstantMemoryGate:
                 source="instant_gate_llm",
                 kind="fact",
                 session_id=str(turn.chat_id),
+                sender_id=str(turn.sender_id or ""),
                 persona_id=str(turn.persona_id or ""),
                 content=f"[即时记忆|llm_backfill] 用户说：{turn.user_text}",
                 summary=fact[:240],
                 importance=0.8,
                 confidence=0.72,
-                metadata={"gate_category": "llm_backfill", "instant_write": True, "turn_id": str(turn.turn_id or "")},
+                metadata={"gate_category": "llm_backfill", "instant_write": True, "turn_id": str(turn.turn_id or ""), "authority_eav": True},
                 dedup_key=f"instant_gate_llm:{turn.chat_id}:{fact[:60]}",
             )
         )

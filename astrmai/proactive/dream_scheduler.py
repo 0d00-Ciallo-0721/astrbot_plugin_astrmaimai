@@ -15,13 +15,15 @@ class DreamScheduler:
         self.dream_visible = dream_visible
         self.dream_agent = None
         self.dream_generator = None
+        self.promotion_engine = None
         self._db_service = None
         self._last_dream_time = 0.0
         self._dream_interval = getattr(getattr(config, "life", None), "dream_interval_min", 30) * 60
 
-    def bind_dependencies(self, dream_agent, dream_generator, db_service=None):
+    def bind_dependencies(self, dream_agent, dream_generator, db_service=None, promotion_engine=None):
         self.dream_agent = dream_agent
         self.dream_generator = dream_generator
+        self.promotion_engine = promotion_engine
         self._db_service = db_service
 
     def should_run(self, now_ts: float) -> bool:
@@ -90,6 +92,12 @@ class DreamScheduler:
                 session_id=session_id,
             )
             maintenance = self.dream_generator.build_maintenance_result(dream_log, session_id=session_id)
+            promotion_report = {}
+            if self.promotion_engine is not None and hasattr(self.promotion_engine, "run_audit"):
+                try:
+                    promotion_report = await self.promotion_engine.run_audit(str(session_id or ""), maintenance)
+                except Exception as exc:
+                    logger.debug(f"[DreamScheduler] promotion audit degraded: {exc}")
 
             if self.memory_engine and hasattr(self.memory_engine, "record_cognitive_feedback"):
                 try:
@@ -130,6 +138,7 @@ class DreamScheduler:
                 "session_id": str(session_id or ""),
                 "dream_visible": bool(dream_text and self.dream_visible),
                 "summary": str(maintenance.get("summary", "") or ""),
+                "promotion_report": promotion_report,
                 "throttle_scope": "global",
             }
 

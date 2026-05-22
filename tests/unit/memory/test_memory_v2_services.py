@@ -112,6 +112,85 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_eav_fact_newer_write_supersedes_older_fact(self):
+        async def run():
+            store, retrieval, writer, _injection, _tools, _maintenance = self._services()
+            older_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="目前有2台服务器",
+                    summary="2台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True, "promotion_entity": "asset", "promotion_attribute": "server_count", "promotion_value": "2"},
+                    created_at=1000.0,
+                )
+            )
+            newer_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="目前升级到3台服务器了",
+                    summary="3台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True, "promotion_entity": "asset", "promotion_attribute": "server_count", "promotion_value": "3"},
+                    created_at=2000.0,
+                )
+            )
+            older = await store.get_canonical(older_id, include_inactive=True)
+            newer = await store.get_canonical(newer_id, include_inactive=True)
+            self.assertEqual(older.status, "superseded")
+            self.assertEqual(older.superseded_by, newer_id)
+            self.assertEqual(newer.status, "active")
+            active = await store.get_by_dedup_key("zlj:asset:server_count", include_inactive=False)
+            self.assertIsNotNone(active)
+            self.assertEqual(active.id, newer_id)
+            self.assertEqual(active.status, "active")
+            self.assertNotEqual(active.id, older_id)
+
+        asyncio.run(run())
+
+    def test_eav_fact_older_backfill_is_immediately_superseded(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            active_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="目前升级到3台服务器了",
+                    summary="3台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True, "promotion_entity": "asset", "promotion_attribute": "server_count", "promotion_value": "3"},
+                    created_at=3000.0,
+                )
+            )
+            late_old_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="其实之前只有2台服务器",
+                    summary="2台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True, "promotion_entity": "asset", "promotion_attribute": "server_count", "promotion_value": "2"},
+                    created_at=1000.0,
+                )
+            )
+            active = await store.get_canonical(active_id, include_inactive=True)
+            late_old = await store.get_canonical(late_old_id, include_inactive=True)
+            self.assertEqual(active.status, "active")
+            self.assertEqual(late_old.status, "superseded")
+            self.assertEqual(late_old.superseded_by, active_id)
+
+        asyncio.run(run())
+
     def test_injection_trace_is_recorded_and_tool_excludes_injected_ids(self):
         async def run():
             _store, _retrieval, writer, injection, tools, _maintenance = self._services()

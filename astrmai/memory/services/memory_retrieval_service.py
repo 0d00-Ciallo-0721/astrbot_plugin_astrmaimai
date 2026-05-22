@@ -39,6 +39,7 @@ class MemoryRetrievalService:
             content=content,
             session_id=str(metadata.get("session_id") or query.session_id or ""),
             persona_id=str(metadata.get("persona_id") or query.persona_id or ""),
+            sender_id=str(metadata.get("sender_id") or ""),
             importance=float(metadata.get("importance") or 0.5),
             confidence=0.75,
             relevance_score=float(getattr(result, "score", 0.0) or 0.0),
@@ -48,6 +49,7 @@ class MemoryRetrievalService:
             created_at=float(metadata.get("create_time") or 0.0),
             updated_at=float(metadata.get("update_time") or 0.0),
             last_access_time=float(metadata.get("last_access_time") or 0.0),
+            superseded_by=str(metadata.get("superseded_by") or ""),
             access_count=int(metadata.get("access_count") or 0),
             decay_score=float(metadata.get("decay_score") or 1.0),
             metadata_hydrated=False,
@@ -194,7 +196,7 @@ class MemoryRetrievalService:
                 candidate = canonical
             if candidate.id in excluded:
                 continue
-            if candidate.status in {"deleted", "merged", "deprecated", "review_pending", "rejected"}:
+            if candidate.status in {"deleted", "merged", "deprecated", "review_pending", "rejected", "superseded"}:
                 continue
             if candidate.status == "stale" and not query.allow_stale:
                 continue
@@ -283,6 +285,8 @@ class MemoryRetrievalService:
             item.kind = str(payload.get("kind") or item.kind or "memory")
             item.status = str(payload.get("status") or item.status or "active")
             item.visibility = str(payload.get("visibility") or item.visibility or "auto_and_tool")
+            item.sender_id = str(payload.get("sender_id") or item.sender_id or "")
+            item.superseded_by = str(payload.get("superseded_by") or item.superseded_by or "")
             item.access_count = int(payload.get("access_count") or item.access_count or 0)
             item.decay_score = float(payload.get("decay_score") or item.decay_score or 1.0)
             merged_metadata = dict(payload.get("metadata") or {})

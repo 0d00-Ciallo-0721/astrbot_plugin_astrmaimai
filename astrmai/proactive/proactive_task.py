@@ -13,6 +13,7 @@ from ..learning.profiling.nickname_generator import NicknameGenerator
 from ..learning.profiling.profile_generator import ProfileGenerator
 from ..memory.dream.dream_agent import DreamAgent
 from ..memory.dream.dream_generator import DreamGenerator
+from ..memory.dream.promotion_engine import MemoryPromotionEngine
 from .decay_service import DecayService
 from .diary_service import DiaryService
 from .dream_scheduler import DreamScheduler
@@ -209,7 +210,13 @@ class ProactiveTask:
             memory_engine=self.memory_engine,
             config=self.config,
         )
-        self.dream_scheduler.bind_dependencies(self.dream_agent, self.dream_generator, db_service=self._db_service)
+        promotion_engine = MemoryPromotionEngine(self.memory_engine)
+        self.dream_scheduler.bind_dependencies(
+            self.dream_agent,
+            self.dream_generator,
+            db_service=self._db_service,
+            promotion_engine=promotion_engine,
+        )
 
     def _fire_background_task(self, coro):
         task = asyncio.create_task(coro)
