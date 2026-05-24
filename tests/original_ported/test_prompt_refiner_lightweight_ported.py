@@ -112,6 +112,7 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
             react_retriever=SimpleNamespace(retrieve=None),
         )
         event = _FakeEvent()
+        prompt_envelope = self.prompt_refiner_mod.PromptEnvelope()
 
         async def _run():
             return await refiner.refine_prompt(
@@ -119,6 +120,7 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
                 system_prompt="system prompt only",
                 prompt="wrapped prompt",
                 context={"disable_rag_injection": False},
+                prompt_envelope=prompt_envelope,
                 proactive_recall="proactive memory fragment",
             )
 
@@ -126,13 +128,17 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
 
         self.assertEqual(final_system_prompt, "system prompt only")
         self.assertEqual(len(memory_engine.retrieval_calls), 1)
-        self.assertIn("---对话记录---\nUser: why not?", final_prompt)
-        self.assertIn("---眼前正在对我说的---\nAlice: why not?", final_prompt)
-        self.assertIn("---前因---\nFocus block", final_prompt)
-        self.assertIn("---补充---\nRelated\nAstrMai: no, that is not allowed", final_prompt)
         self.assertIn("---记忆闪回", final_prompt)
         self.assertIn("earlier lore reminder", final_prompt)
         self.assertIn("proactive memory fragment", final_prompt)
+        self.assertIn("proactive memory fragment", prompt_envelope.background_memory_block)
+        self.assertIn("earlier lore reminder", prompt_envelope.background_memory_block)
+        self.assertEqual(prompt_envelope.memory_block, prompt_envelope.background_memory_block)
+        self.assertIn("proactive_recall", prompt_envelope.background_memory_sections)
+        self.assertIn("memory_injection", prompt_envelope.background_memory_sections)
+        self.assertEqual(prompt_envelope.background_memory_sections["proactive_recall"], "proactive memory fragment")
+        self.assertIn("earlier lore reminder", prompt_envelope.background_memory_sections["memory_injection"])
+        self.assertGreater(prompt_envelope.background_memory_rendered_chars, 0)
 
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertTrue(memory_decision.injected)

@@ -1,0 +1,11 @@
+{
+  "sample_path": "C:\\Users\\zlj\\Desktop\\mai\\astrmai_plugin_refactored_final\\artifacts\\prompt_metrics_compare\\20260523T104647Z-soft_background_check\\current_round3_context_economy_samples.jsonl",
+  "sample_count": 26,
+  "generated_at": 1779533221.3978717,
+  "filters": {
+    "start_ts": null,
+    "end_ts": null,
+    "workload_family": "",
+    "template_filter": ""
+  }
+}

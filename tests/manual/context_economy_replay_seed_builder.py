@@ -13,7 +13,7 @@ from astrmai.infrastructure.context_economy import PromptTemplateId, PromptTempl
 
 
 def _render_version(registry: PromptTemplateRegistry, template_id: PromptTemplateId, payload: dict) -> str:
-    return registry.render_template(template_id, payload).template_version
+    return registry.render_template(template_id.value, payload).template_version
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -32,6 +32,27 @@ class PromptEnvelope:
     thread_signature: str = ""
     state_block: str = ""
     memory_block: str = ""
+    background_memory_block: str = ""
+    background_memory_sections: dict[str, str] = field(default_factory=dict)
+    background_memory_budget_chars: int = 0
+    background_memory_trimmed_sections: list[str] = field(default_factory=list)
+    background_memory_rendered_chars: int = 0
+    background_memory_skipped_reason: str = ""
+    cognitive_drive_block: str = ""
+    soft_background_block: str = ""
+    soft_background_sections: dict[str, str] = field(default_factory=dict)
+    soft_background_budget_chars: int = 0
+    soft_background_trimmed_sections: list[str] = field(default_factory=list)
+    soft_background_rendered_chars: int = 0
+    soft_background_skipped_reason: str = ""
+    flex_context_budget_chars: int = 0
+    flex_context_trimmed_sections: list[str] = field(default_factory=list)
+    flex_context_protected_sections: list[str] = field(default_factory=list)
+    warm_context_rendered_chars: int = 0
+    recent_context_rendered_chars: int = 0
+    memory_context_rendered_chars: int = 0
+    situational_context_block: str = ""
+    planner_runtime_instruction_block: str = ""
     guidance_lines: list[str] = field(default_factory=list)
 
 

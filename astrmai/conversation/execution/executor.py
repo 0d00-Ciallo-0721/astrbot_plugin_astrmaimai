@@ -105,6 +105,17 @@ class ConcurrentExecutor:
         except Exception:
             return event
 
+    @staticmethod
+    def _sync_execution_event_trace(source_event: AstrMessageEvent, target_event: AstrMessageEvent) -> None:
+        if source_event is target_event:
+            return
+        if not hasattr(source_event, "get_extra") or not hasattr(target_event, "set_extra"):
+            return
+        for key in ("astrmai_request_trace", "astrmai_post_hook_system_hash"):
+            value = source_event.get_extra(key, None)
+            if value is not None:
+                target_event.set_extra(key, value)
+
     def _mark_vision_direct_state(
         self,
         event: AstrMessageEvent,
@@ -457,7 +468,6 @@ class ConcurrentExecutor:
                 + "\n".join(vision_descriptions)
             )
             model_prompt += vision_inject
-            system_prompt += vision_inject
             self._mark_vision_direct_state(
                 event,
                 invoked=True,
@@ -529,6 +539,7 @@ class ConcurrentExecutor:
             attempted_models.append(provider_id)
             try:
                 result = await self.gateway.chat_in_lane_result(
+                    event=event,
                     lane_key=runtime["dialog_lane_key"],
                     base_origin=chat_id,
                     prompt=api_prompt,
@@ -625,6 +636,7 @@ class ConcurrentExecutor:
                     prefix_hash=runtime["prefix_hash"],
                     raw_user_text=runtime["raw_user_text"],
                 )
+                self._sync_execution_event_trace(execution_event, event)
                 reply_text = result.text
                 if not reply_text:
                     raise ValueError("empty tool reply")

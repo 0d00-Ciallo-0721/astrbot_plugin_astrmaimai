@@ -1,0 +1,1 @@
+{"case_id": "dry_run_capability_only", "provider_family": "native_chat", "model": "kimi-k2.6", "endpoint_kind": "openai_compatible", "provider_supports_cache_hint": true, "provider_supports_usage_reporting": false, "provider_supports_session_id": false, "blocking_reason": "missing_api_key", "request_execution_possible": false}

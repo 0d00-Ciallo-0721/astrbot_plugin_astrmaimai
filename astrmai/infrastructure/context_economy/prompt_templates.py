@@ -154,11 +154,11 @@ def _render_memory_topic_summary(payload: dict[str, Any], template_version: str)
         shell=PromptShell(
             system_prompt="你是群聊话题摘要助手。",
             role_framing="你要为已经按话题分割的多个对话段各自生成一句简洁摘要。",
-            task_rules=f"当前共有 {segment_count} 个话题段，每个话题输出一句不超过 30 字的摘要，顺序必须严格对应输入顺序。",
+            task_rules="请为输入的每个话题段输出一句不超过 30 字的摘要，顺序必须严格对应输入顺序。",
             output_schema='严格返回 JSON 数组，例如 ["话题1摘要", "话题2摘要"]。',
             format_constraints="不要输出数组之外的任何解释。",
         ),
-        payload=PromptPayload(text=str(payload.get("combined_segments", "") or "").strip()),
+        payload=PromptPayload(text=f"[Segment Count]\n{segment_count}\n\n[Combined Segments]\n{str(payload.get('combined_segments', '') or '').strip()}"),
     )
 
 
@@ -286,9 +286,9 @@ def _render_dream_generation(payload: dict[str, Any], template_version: str) -> 
         schema_id="dream_text",
         shell=PromptShell(
             system_prompt="你是一个善于幻想与创作的写作助手，擅长用诗意的语言描述梦境。",
-            role_framing=f"请将内部梦境整理日志改写为 {persona_name} 的第一人称梦境日记。",
+            role_framing="请将内部梦境整理日志改写为第一人称梦境日记。",
             task_rules=(
-                f"整体风格为“{style}”。不要提及记忆整理、数据库、工具等技术词；"
+                "保持梦境氛围和诗意描写。不要提及记忆整理、数据库、工具等技术词；"
                 "把合并、删除、清理转化为梦境中的象征意象。"
             ),
             format_constraints=(

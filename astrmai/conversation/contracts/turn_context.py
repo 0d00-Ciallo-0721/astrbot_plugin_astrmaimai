@@ -112,8 +112,36 @@ class ContinuitySnapshot:
     delta_old_long_message_count: int = 0
     cold_summary_section_counts: dict[str, int] = field(default_factory=dict)
     prefix_hash: str = ""
+    semantic_system_hash: str = ""
+    semantic_system_length: int = 0
     prefix_stable: bool = False
     prefix_changed_reason: str = ""
+    system_prompt_length: int = 0
+    prompt_length: int = 0
+    gateway_system_hash: str = ""
+    gateway_prompt_hash: str = ""
+    provider_visible_system_hash: str = ""
+    provider_visible_prompt_hash: str = ""
+    post_hook_system_hash: str = ""
+    request_session_id: str = ""
+    request_cache_control: str = ""
+    request_provider_family: str = ""
+    request_model_id: str = ""
+    usage_input_tokens: int = 0
+    usage_input_cached: int = 0
+    usage_output_tokens: int = 0
+    cache_ready: bool = False
+    cache_hit: bool = False
+    cache_ready_reasons: list[str] = field(default_factory=list)
+    cache_hit_evidence_supported: bool = False
+    frozen_prefix_length: int = 0
+    semi_stable_length: int = 0
+    dynamic_prompt_length: int = 0
+    frozen_prefix_blocks: dict[str, int] = field(default_factory=dict)
+    semi_stable_blocks: dict[str, int] = field(default_factory=dict)
+    dynamic_prompt_blocks: dict[str, int] = field(default_factory=dict)
+    system_rules_items: list[dict[str, Any]] = field(default_factory=list)
+    system_rules_candidate_items: list[str] = field(default_factory=list)
     message_count_since_last_compaction: int = 0
     next_eval_at_count: int = 80
     final_score: float = 0.0
@@ -420,8 +448,36 @@ def build_turn_trace_summary(
             "delta_old_long_message_count": int(continuity.delta_old_long_message_count or 0),
             "cold_summary_section_counts": dict(continuity.cold_summary_section_counts or {}),
             "prefix_hash": continuity.prefix_hash,
+            "semantic_system_hash": continuity.semantic_system_hash,
+            "semantic_system_length": int(continuity.semantic_system_length or 0),
             "prefix_stable": bool(continuity.prefix_stable),
             "prefix_changed_reason": continuity.prefix_changed_reason,
+            "system_prompt_length": int(continuity.system_prompt_length or 0),
+            "prompt_length": int(continuity.prompt_length or 0),
+            "gateway_system_hash": continuity.gateway_system_hash,
+            "gateway_prompt_hash": continuity.gateway_prompt_hash,
+            "provider_visible_system_hash": continuity.provider_visible_system_hash,
+            "provider_visible_prompt_hash": continuity.provider_visible_prompt_hash,
+            "post_hook_system_hash": continuity.post_hook_system_hash,
+            "request_session_id": continuity.request_session_id,
+            "request_cache_control": continuity.request_cache_control,
+            "request_provider_family": continuity.request_provider_family,
+            "request_model_id": continuity.request_model_id,
+            "usage_input_tokens": int(continuity.usage_input_tokens or 0),
+            "usage_input_cached": int(continuity.usage_input_cached or 0),
+            "usage_output_tokens": int(continuity.usage_output_tokens or 0),
+            "cache_ready": bool(continuity.cache_ready),
+            "cache_hit": bool(continuity.cache_hit),
+            "cache_ready_reasons": list(continuity.cache_ready_reasons or []),
+            "cache_hit_evidence_supported": bool(continuity.cache_hit_evidence_supported),
+            "frozen_prefix_length": int(continuity.frozen_prefix_length or 0),
+            "semi_stable_length": int(continuity.semi_stable_length or 0),
+            "dynamic_prompt_length": int(continuity.dynamic_prompt_length or 0),
+            "frozen_prefix_blocks": dict(continuity.frozen_prefix_blocks or {}),
+            "semi_stable_blocks": dict(continuity.semi_stable_blocks or {}),
+            "dynamic_prompt_blocks": dict(continuity.dynamic_prompt_blocks or {}),
+            "system_rules_items": list(continuity.system_rules_items or []),
+            "system_rules_candidate_items": list(continuity.system_rules_candidate_items or []),
             "message_count_since_last_compaction": int(continuity.message_count_since_last_compaction or 0),
             "next_eval_at_count": int(continuity.next_eval_at_count or 80),
             "final_score": float(continuity.final_score or 0.0),

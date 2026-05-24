@@ -102,6 +102,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.prefix_caching_enabled = bool(getattr(getattr(gateway.config, "conversation", None), "enable_prefix_caching", True))
         self._prefix_hash_history: dict[str, str] = {}
         self._prefix_cold_summary_history: dict[str, str] = {}
+        self._provider_visible_system_hash_history: dict[str, str] = {}
         self.cognitive_loop = cognitive_loop or CognitiveLoop(
             gateway,
             memory_engine=memory_engine,
@@ -211,12 +212,26 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             else {
                 "prefix_hash": "",
                 "prefix_stable": False,
-                "prefix_changed_reason": "unknown",
+                "prefix_changed_reason": "unavailable_in_trace",
+                "frozen_prefix_length": 0,
+                "semi_stable_length": 0,
+                "frozen_prefix_blocks": {},
+                "semi_stable_blocks": {},
+                "system_rules_items": [],
+                "system_rules_candidate_items": [],
             }
         )
         turn_context.continuity.prefix_hash = str(prefix_status.get("prefix_hash", "") or "")
+        turn_context.continuity.semantic_system_hash = str(prefix_status.get("semantic_system_hash", "") or "")
+        turn_context.continuity.semantic_system_length = int(prefix_status.get("semantic_system_length", 0) or 0)
         turn_context.continuity.prefix_stable = bool(prefix_status.get("prefix_stable", False))
-        turn_context.continuity.prefix_changed_reason = str(prefix_status.get("prefix_changed_reason", "unknown") or "unknown")
+        turn_context.continuity.prefix_changed_reason = str(prefix_status.get("prefix_changed_reason", "") or "unavailable_in_trace")
+        turn_context.continuity.frozen_prefix_length = int(prefix_status.get("frozen_prefix_length", 0) or 0)
+        turn_context.continuity.semi_stable_length = int(prefix_status.get("semi_stable_length", 0) or 0)
+        turn_context.continuity.frozen_prefix_blocks = dict(prefix_status.get("frozen_prefix_blocks", {}) or {})
+        turn_context.continuity.semi_stable_blocks = dict(prefix_status.get("semi_stable_blocks", {}) or {})
+        turn_context.continuity.system_rules_items = list(prefix_status.get("system_rules_items", []) or [])
+        turn_context.continuity.system_rules_candidate_items = list(prefix_status.get("system_rules_candidate_items", []) or [])
         if self.dialogue_store is not None:
             try:
                 if hasattr(self.dialogue_store, "snapshot_counts"):
@@ -277,6 +292,48 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 pass
         if reply_text:
             turn_context.continuity.conversation_summary = str(reply_text)[:180]
+        request_trace = event.get_extra("astrmai_request_trace", {}) if hasattr(event, "get_extra") else {}
+        if isinstance(request_trace, dict):
+            turn_context.continuity.gateway_system_hash = str(request_trace.get("gateway_system_hash", "") or "")
+            turn_context.continuity.gateway_prompt_hash = str(request_trace.get("gateway_prompt_hash", "") or "")
+            turn_context.continuity.provider_visible_system_hash = str(request_trace.get("provider_visible_system_hash", "") or "")
+            turn_context.continuity.provider_visible_prompt_hash = str(request_trace.get("provider_visible_prompt_hash", "") or "")
+            turn_context.continuity.post_hook_system_hash = str(
+                event.get_extra("astrmai_post_hook_system_hash", "") if hasattr(event, "get_extra") else ""
+            ) or str(request_trace.get("post_hook_system_hash", "") or "")
+            turn_context.continuity.request_session_id = str(request_trace.get("request_session_id", "") or "")
+            turn_context.continuity.request_cache_control = str(request_trace.get("request_cache_control", "") or "")
+            turn_context.continuity.request_provider_family = str(request_trace.get("request_provider_family", "") or "")
+            turn_context.continuity.request_model_id = str(request_trace.get("request_model_id", "") or "")
+            turn_context.continuity.usage_input_tokens = int(request_trace.get("usage_input_tokens", 0) or 0)
+            turn_context.continuity.usage_input_cached = int(request_trace.get("usage_input_cached", 0) or 0)
+            turn_context.continuity.usage_output_tokens = int(request_trace.get("usage_output_tokens", 0) or 0)
+        cache_ready_reasons: list[str] = []
+        if str(turn_context.continuity.request_cache_control or "").strip():
+            cache_ready_reasons.append("explicit_cache_hint")
+        if str(turn_context.continuity.request_session_id or "").strip():
+            cache_ready_reasons.append("session_reuse")
+        if bool(turn_context.continuity.prefix_stable):
+            cache_ready_reasons.append("semantic_system_hash_stable")
+        provider_visible_history = getattr(self, "_provider_visible_system_hash_history", None)
+        if not isinstance(provider_visible_history, dict):
+            provider_visible_history = {}
+            self._provider_visible_system_hash_history = provider_visible_history
+        current_provider_visible_hash = str(turn_context.continuity.provider_visible_system_hash or "").strip()
+        previous_provider_visible_hash = str(provider_visible_history.get(chat_id, "") or "").strip()
+        if current_provider_visible_hash and previous_provider_visible_hash and current_provider_visible_hash == previous_provider_visible_hash:
+            cache_ready_reasons.append("provider_visible_hash_stable")
+        if current_provider_visible_hash:
+            provider_visible_history[chat_id] = current_provider_visible_hash
+        if bool(event.get_extra("astrmai_cache_affinity_enabled", False)):
+            cache_ready_reasons.append("cache_affinity_enabled")
+        cache_ready_reasons = list(dict.fromkeys(cache_ready_reasons))
+        turn_context.continuity.cache_ready_reasons = cache_ready_reasons
+        turn_context.continuity.cache_ready = bool(cache_ready_reasons)
+        turn_context.continuity.cache_hit = bool(int(turn_context.continuity.usage_input_cached or 0) > 0)
+        turn_context.continuity.cache_hit_evidence_supported = bool(
+            turn_context.continuity.cache_hit or event.get_extra("astrmai_cached_usage_supported", False)
+        )
 
     @staticmethod
     def _merge_inner_monologue(existing: str, addition: str) -> str:
@@ -325,17 +382,21 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         prompt_envelope.guidance_lines = self._dedupe_guidance_lines(guidance_lines)
 
     @staticmethod
-    def _adjust_expression_habits_for_behavior(expression_habits: str, decision: CognitiveDecision | None, cooldown_tags) -> str:
+    def _adjust_expression_habits_for_behavior(
+        expression_habits: str,
+        decision: CognitiveDecision | None,
+        cooldown_tags,
+    ) -> tuple[str, str]:
         text = str(expression_habits or "").strip()
         if not text:
-            return ""
+            return "", ""
         social_intent = str(getattr(decision, "social_intent", "") if decision else "").strip()
         cooldown_set = {str(tag or "").strip() for tag in (cooldown_tags or []) if str(tag or "").strip()}
         if social_intent in {"boundary", "pushback", "observe"} or "sharp_reply" in cooldown_set:
-            return ""
+            return "", ""
         if "long_reply" in cooldown_set:
-            return f"{text}\nKeep this turn short; avoid another long reply."
-        return text
+            return text, "Keep this turn short; avoid another long reply."
+        return text, ""
 
     @staticmethod
     def _agency_posture_guidance(decision: CognitiveDecision) -> str:
@@ -1032,11 +1093,17 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             think_decision.level,
             user_id=user_id,
         )
-        side_inputs["expression_habits"] = self._adjust_expression_habits_for_behavior(
-            side_inputs.get("expression_habits", ""),
+        stable_expression_habits, situational_style_append = self._adjust_expression_habits_for_behavior(
+            side_inputs.get("stable_expression_habits", ""),
             cognitive_decision,
             cooldown_tags,
         )
+        side_inputs["stable_expression_habits"] = stable_expression_habits
+        if situational_style_append:
+            current_style_cues = str(side_inputs.get("situational_style_cues", "") or "").strip()
+            side_inputs["situational_style_cues"] = "\n".join(
+                part for part in [current_style_cues, situational_style_append] if part
+            ).strip()
         tools = await self._build_execution_tools(
             chat_id,
             event,
@@ -1062,17 +1129,18 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             ]
             if str(part or "").strip()
         )
+        planner_reasoning = side_inputs.get("planner_reasoning", "")
         system_prompt, style_variant, proactive_recall = await self.context_engine.build_prompt(
             chat_id=chat_id,
             event_messages=context_events,
             prompt_envelope=prompt_envelope,
             retrieve_keys=retrieve_keys,
-            slang_patterns=side_inputs["slang_context"],
+            situational_style_cues=side_inputs.get("situational_style_cues", ""),
             sys1_thought=sys1_thought,
             goals_context=goals_context,
-            expression_habits=side_inputs["expression_habits"],
-            planner_reasoning=side_inputs["planner_reasoning"],
-            jargon_explanation=side_inputs["jargon_explanation"],
+            stable_expression_habits=side_inputs.get("stable_expression_habits", ""),
+            planner_reasoning=planner_reasoning,
+            stable_jargon_explanation=side_inputs.get("stable_jargon_explanation", ""),
             near_context_priority=near_context_priority,
             agency_context=agency_context,
         )
@@ -1080,15 +1148,25 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             proactive_recall = ""
         event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
 
-        system_prompt = await self._apply_private_jump_context(system_prompt, ctx, event, user_id)
-        system_prompt = self._append_mode_instructions(
-            system_prompt,
+        if prompt_envelope is not None:
+            prompt_envelope.cognitive_drive_block = agency_context or planner_reasoning or sys1_thought or goals_context
+            event.set_extra("astrmai_prompt_envelope", prompt_envelope)
+        await self._apply_private_jump_context(
+            ctx,
             event,
+            user_id,
+            prompt_envelope=prompt_envelope,
+        )
+
+        self._append_mode_instructions(
+            event,
+            prompt_envelope=prompt_envelope,
             is_tool_call_mode=is_tool_call_mode,
             is_all_mode=is_all_mode,
             is_fast_mode=is_fast_mode,
         )
 
+        prefix_status = self.context_engine.get_last_prefix_status(chat_id) if hasattr(self.context_engine, "get_last_prefix_status") else {}
         final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
             event=event,
             system_prompt=system_prompt,
@@ -1097,6 +1175,23 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             style_variant=style_variant,
             proactive_recall=proactive_recall,
         )
+        turn_context.continuity.system_prompt_length = len(final_system_prompt or "")
+        turn_context.continuity.prompt_length = len(final_prompt or "")
+        turn_context.continuity.frozen_prefix_length = int(prefix_status.get("frozen_prefix_length", 0) or 0)
+        turn_context.continuity.semi_stable_length = int(prefix_status.get("semi_stable_length", 0) or 0)
+        turn_context.continuity.dynamic_prompt_blocks = {
+            "cognitive_drive": len(getattr(prompt_envelope, "cognitive_drive_block", "") or ""),
+            "soft_background": int(getattr(prompt_envelope, "soft_background_rendered_chars", 0) or 0),
+            "situational_context": len(getattr(prompt_envelope, "situational_context_block", "") or ""),
+            "planner_runtime_instruction": len(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or ""),
+        }
+        turn_context.continuity.dynamic_prompt_length = (
+            int(turn_context.continuity.dynamic_prompt_blocks.get("cognitive_drive", 0) or 0)
+            + int(turn_context.continuity.dynamic_prompt_blocks.get("soft_background", 0) or 0)
+            + int(turn_context.continuity.dynamic_prompt_blocks.get("situational_context", 0) or 0)
+            + int(turn_context.continuity.dynamic_prompt_blocks.get("planner_runtime_instruction", 0) or 0)
+        )
+
         await self._update_turn_trace_runtime(
             event,
             chat_id,

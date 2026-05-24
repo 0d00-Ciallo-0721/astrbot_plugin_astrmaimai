@@ -111,6 +111,54 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         self.assertEqual(len(fake_context.calls[1]["contexts"]), 2)
         self.assertEqual(fake_context.calls[1]["system_prompt"], "stable prompt")
 
+    def test_chat_in_lane_result_records_request_trace_on_event(self):
+        class _TraceEvent:
+            def __init__(self):
+                self.extras = {}
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = _TraceEvent()
+
+        async def _run():
+            return await gateway.chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                prompt="hello",
+                system_prompt="stable prompt",
+                models=["claude-3-5-sonnet"],
+                prefix_hash="hash-1",
+                use_fallback=False,
+                event=event,
+            )
+
+        result = asyncio.run(_run())
+
+        request_trace = event.get_extra("astrmai_request_trace", {})
+        self.assertEqual(result.text, "ok")
+        self.assertTrue(request_trace["gateway_system_hash"])
+        self.assertTrue(request_trace["gateway_prompt_hash"])
+        self.assertEqual(request_trace["request_provider_family"], "anthropic")
+        self.assertEqual(request_trace["request_model_id"], "claude-3-5-sonnet")
+        self.assertEqual(request_trace["request_cache_control"], '{"type": "ephemeral"}')
+        self.assertEqual(request_trace["usage_input_tokens"], 10)
+        self.assertEqual(request_trace["usage_input_cached"], 6)
+        self.assertTrue(request_trace["provider_visible_system_hash"])
+        self.assertTrue(request_trace["provider_visible_prompt_hash"])
+
     def test_tool_chat_in_lane_passes_image_urls_to_tool_loop_agent(self):
         fake_context = _FakeContext()
         config = SimpleNamespace(

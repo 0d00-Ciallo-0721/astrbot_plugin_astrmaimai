@@ -128,6 +128,35 @@ class PlannerSideInputMixin:
         "custom_face_catalog_query": {"query", "meme"},
         "group_sign_action": {"sign"},
     }
+    MODE_INSTRUCTION_MAX_CHARS = 240
+    PRIVATE_JUMP_CONTEXT_MAX_CHARS = 360
+    PLANNER_RUNTIME_INSTRUCTION_MAX_CHARS = 480
+    PRIVATE_JUMP_MAX_HISTORY_MESSAGES = 2
+    PRIVATE_JUMP_MAX_MESSAGE_CHARS = 72
+    PRIVATE_JUMP_MAX_PRIVATE_MESSAGE_CHARS = 90
+    MODE_INSTRUCTION_MAX_LINES = 3
+
+    @staticmethod
+    def _truncate_runtime_instruction_text(text: str, limit: int) -> str:
+        cleaned = " ".join(str(text or "").split())
+        budget = max(0, int(limit or 0))
+        if not cleaned or budget <= 0:
+            return ""
+        if len(cleaned) <= budget:
+            return cleaned
+        if budget <= 3:
+            return cleaned[:budget]
+        return cleaned[: budget - 3].rstrip() + "..."
+
+    @classmethod
+    def _clamp_runtime_instruction_block(cls, prompt_envelope: PromptEnvelope | None) -> None:
+        if not isinstance(prompt_envelope, PromptEnvelope):
+            return
+        text = str(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or "").strip()
+        prompt_envelope.planner_runtime_instruction_block = cls._truncate_runtime_instruction_text(
+            text,
+            cls.PLANNER_RUNTIME_INSTRUCTION_MAX_CHARS,
+        )
 
     @staticmethod
     def _planner_side_input_text(
@@ -152,10 +181,14 @@ class PlannerSideInputMixin:
     async def _load_planning_side_inputs(self, chat_id: str, prompt_envelope: PromptEnvelope, window_lines: List[str], is_fast_mode: bool):
         if is_fast_mode:
             return {
+                # Deprecated compatibility mirrors for legacy readers outside the main reply chain.
                 "slang_context": "",
                 "goal_text": "",
                 "expression_habits": "",
                 "jargon_explanation": "",
+                "stable_expression_habits": "",
+                "situational_style_cues": "",
+                "stable_jargon_explanation": "",
                 "planner_reasoning": "",
             }
 
@@ -192,6 +225,9 @@ class PlannerSideInputMixin:
             "goal_text": goal_text,
             "expression_habits": expression_habits,
             "jargon_explanation": jargon_explanation,
+            "stable_expression_habits": expression_habits,
+            "situational_style_cues": slang_context,
+            "stable_jargon_explanation": jargon_explanation,
             "planner_reasoning": goal_text,
         }
 
@@ -560,14 +596,32 @@ class PlannerSideInputMixin:
         ]
         return tools
 
-    async def _apply_private_jump_context(self, system_prompt: str, ctx, event: AstrMessageEvent, user_id) -> str:
+    @staticmethod
+    def _append_planner_runtime_instruction(prompt_envelope: PromptEnvelope | None, text: str) -> None:
+        if not isinstance(prompt_envelope, PromptEnvelope):
+            return
+        existing = str(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or "").strip()
+        addition = str(text or "").strip()
+        if not addition:
+            return
+        prompt_envelope.planner_runtime_instruction_block = "\n\n".join(part for part in [existing, addition] if part).strip()
+        PlannerSideInputMixin._clamp_runtime_instruction_block(prompt_envelope)
+
+    async def _apply_private_jump_context(
+        self,
+        ctx,
+        event: AstrMessageEvent,
+        user_id,
+        *,
+        prompt_envelope: PromptEnvelope | None,
+    ) -> None:
         if event.get_group_id() or not ctx:
-            return system_prompt
+            return
         shared_dict = getattr(ctx, "shared_dict", {})
         jumps = shared_dict.get("astrmai_space_jumps", {})
         sender_id = str(user_id)
         if sender_id not in jumps:
-            return system_prompt
+            return
 
         jump_info = jumps[sender_id]
         try:
@@ -592,17 +646,25 @@ class PlannerSideInputMixin:
                             content = " ".join(text_parts) if text_parts else ""
                             if content:
                                 speaker = "群友" if role == "user" else "你"
-                                recent_msgs.append(f"[{speaker}]: {content}")
+                                clipped_content = self._truncate_runtime_instruction_text(
+                                    content,
+                                    self.PRIVATE_JUMP_MAX_MESSAGE_CHARS,
+                                )
+                                recent_msgs.append(f"[{speaker}]: {clipped_content}")
                         if recent_msgs:
-                            group_context_str = "\n".join(recent_msgs)
+                            group_context_str = "\n".join(recent_msgs[-self.PRIVATE_JUMP_MAX_HISTORY_MESSAGES :])
                     except Exception as exc:
                         logger.error(f"[Planner] 溯源群聊历史失败: {exc}")
 
+                private_message = self._truncate_runtime_instruction_text(
+                    str(jump_info["private_message"] or ""),
+                    self.PRIVATE_JUMP_MAX_PRIVATE_MESSAGE_CHARS,
+                )
                 sys_inject = (
                     "\n\n刚才我还在群聊"
                     + (f" (群号:{source_group_id})" if source_group_id else "")
                     + "里和大家说话，随后又主动私下对 ta 说了一句：\n"
-                    f"【我刚才的悄悄话】：{jump_info['private_message']}\n"
+                    f"【我刚才的悄悄话】：{private_message}\n"
                 )
                 if group_context_str:
                     sys_inject += f"\n【我切出来前群里的话题回顾】：\n{group_context_str}\n"
@@ -610,25 +672,42 @@ class PlannerSideInputMixin:
                     "\n对方现在这句，多半就是接着我刚才那次跨界私聊在回我。"
                     "我得把群里的前置话题和这句悄悄话一起接住，顺着私下交流的自然感继续聊下去。"
                 )
-                system_prompt += sys_inject
+                sys_inject = self._truncate_runtime_instruction_text(
+                    sys_inject,
+                    self.PRIVATE_JUMP_CONTEXT_MAX_CHARS,
+                )
+                self._append_planner_runtime_instruction(prompt_envelope, sys_inject)
                 logger.info(f"[Planner] 已触发跨界语境补偿，成功抓取群聊历史并注入到 {sender_id} 的私聊思考中。")
         finally:
             del jumps[sender_id]
-        return system_prompt
+        return
 
-    def _append_mode_instructions(self, system_prompt: str, event: AstrMessageEvent, *, is_tool_call_mode: bool, is_all_mode: bool, is_fast_mode: bool) -> str:
+    def _append_mode_instructions(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prompt_envelope: PromptEnvelope | None,
+        is_tool_call_mode: bool,
+        is_all_mode: bool,
+        is_fast_mode: bool,
+    ) -> None:
+        lines: list[str] = []
         if is_tool_call_mode:
-            system_prompt += (
-                "\n\n对方这次是在让我帮忙办事。"
+            lines.append(
+                "对方这次是在让我帮忙办事。"
                 "我先看看手边有哪些对应的子智能体工具能真去执行，"
                 "等拿到结果后，再用我自己的语气告诉 ta。"
             )
         if is_all_mode:
-            user_message = event.message_str
-            system_prompt += f'\n\n对方刚才说的是：“{user_message}”。我这轮就先接住这一条来回。'
+            user_message = self._truncate_runtime_instruction_text(getattr(event, "message_str", ""), 80)
+            lines.append(f'对方刚才说的是：“{user_message}”。我这轮就先接住这一条来回。')
         if is_fast_mode:
-            system_prompt += "\n\n有人在喊我，我得马上用简短直接的话接住这次呼唤，不绕远路。"
-        return system_prompt
+            lines.append("有人在喊我，我得马上用简短直接的话接住这次呼唤，不绕远路。")
+        if lines:
+            merged_lines = "\n".join(lines[: self.MODE_INSTRUCTION_MAX_LINES])
+            merged_lines = self._truncate_runtime_instruction_text(merged_lines, self.MODE_INSTRUCTION_MAX_CHARS)
+            self._append_planner_runtime_instruction(prompt_envelope, merged_lines)
+        return
 
     async def _should_follow_up_legacy(
         self,

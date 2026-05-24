@@ -18,6 +18,8 @@ from ...memory.persona.persona_summarizer import PersonaSummarizer
 class ContextEngine:
     """Builds the system prompt used by the conversation planner."""
 
+    COLD_SUMMARY_BACKGROUND_MAX_CHARS = 220
+
     def __init__(self, db: DatabaseService, persona_summarizer: PersonaSummarizer, config=None, context=None):
         self.db = db
         self.summarizer = persona_summarizer
@@ -36,14 +38,30 @@ class ContextEngine:
         if not self.prefix_caching_enabled:
             return {
                 "prefix_hash": "",
+                "semantic_system_hash": "",
+                "semantic_system_length": 0,
                 "prefix_stable": False,
                 "prefix_changed_reason": "disabled",
+                "frozen_prefix_length": 0,
+                "semi_stable_length": 0,
+                "frozen_prefix_blocks": {},
+                "semi_stable_blocks": {},
+                "system_rules_items": [],
+                "system_rules_candidate_items": [],
             }
         meta = dict(self._prefix_meta_by_chat.get(chat_id, {}) or {})
         return {
             "prefix_hash": str(meta.get("prefix_hash", "") or ""),
+            "semantic_system_hash": str(meta.get("semantic_system_hash", "") or ""),
+            "semantic_system_length": int(meta.get("semantic_system_length", 0) or 0),
             "prefix_stable": bool(meta.get("prefix_stable", False)),
-            "prefix_changed_reason": str(meta.get("prefix_changed_reason", "unknown") or "unknown"),
+            "prefix_changed_reason": str(meta.get("prefix_changed_reason", "") or "unavailable_in_trace"),
+            "frozen_prefix_length": int(meta.get("frozen_prefix_length", 0) or 0),
+            "semi_stable_length": int(meta.get("semi_stable_length", 0) or 0),
+            "frozen_prefix_blocks": dict(meta.get("frozen_prefix_blocks", {}) or {}),
+            "semi_stable_blocks": dict(meta.get("semi_stable_blocks", {}) or {}),
+            "system_rules_items": list(meta.get("system_rules_items", []) or []),
+            "system_rules_candidate_items": list(meta.get("system_rules_candidate_items", []) or []),
         }
 
     async def build_prompt(
@@ -52,15 +70,22 @@ class ContextEngine:
         event_messages: List[AstrMessageEvent],
         prompt_envelope: Optional[PromptEnvelope] = None,
         retrieve_keys: List[str] | None = None,
-        slang_patterns: str = "",
+        situational_style_cues: str = "",
         sys1_thought: str = "",
         goals_context: str = "",
-        expression_habits: str = "",
+        stable_expression_habits: str = "",
         planner_reasoning: str = "",
-        jargon_explanation: str = "",
+        stable_jargon_explanation: str = "",
         near_context_priority: bool = False,
         agency_context: str = "",
+        **legacy_kwargs: Any,
     ) -> tuple[str, str, str]:
+        if not situational_style_cues:
+            situational_style_cues = str(legacy_kwargs.pop("slang_patterns", "") or "")
+        if not stable_expression_habits:
+            stable_expression_habits = str(legacy_kwargs.pop("expression_habits", "") or "")
+        if not stable_jargon_explanation:
+            stable_jargon_explanation = str(legacy_kwargs.pop("jargon_explanation", "") or "")
         if isinstance(prompt_envelope, PromptEnvelope):
             near_context_priority = bool(prompt_envelope.near_context_priority)
 
@@ -73,9 +98,13 @@ class ContextEngine:
 
         role_block = self._build_role_block(persona_payload, valid_keys, is_fast_mode)
         style_block = self._build_style_block(persona_payload)
-        state_block = self._build_state_block(state)
-        behavior_rule_block = self._build_behavior_rule_block(prompt_envelope)
-        private_chat_block = await self._build_private_chat_block(chat_id, event_messages, is_fast_mode=is_fast_mode)
+        stable_state_block, dynamic_state_block = self._build_state_blocks(state)
+        stable_behavior_rule_block, dynamic_behavior_rule_block = self._build_behavior_rule_blocks(prompt_envelope)
+        stable_private_chat_block, dynamic_private_chat_block = await self._build_private_chat_blocks(
+            chat_id,
+            event_messages,
+            is_fast_mode=is_fast_mode,
+        )
         inner_voice_block = self._build_inner_voice_block(
             sys1_thought=sys1_thought,
             goals_context=goals_context,
@@ -89,74 +118,139 @@ class ContextEngine:
             is_fast_mode=is_fast_mode,
             near_context_priority=near_context_priority,
         )
-        expression_block = self._wrap_optional_block("语言习惯参考", expression_habits, enabled=not is_fast_mode and not near_context_priority)
-        slang_block = self._wrap_optional_block("群聊表达参考", slang_patterns, enabled=not is_fast_mode and not near_context_priority)
-        jargon_block = self._wrap_optional_block("群内黑话参考", jargon_explanation, enabled=not is_fast_mode and not near_context_priority)
+        stable_expression_block = self._wrap_optional_block(
+            "语言习惯参考",
+            stable_expression_habits,
+            enabled=not is_fast_mode and not near_context_priority,
+        )
+        stable_slang_block, dynamic_slang_block = self._build_slang_blocks(
+            situational_style_cues,
+            enabled=not is_fast_mode and not near_context_priority,
+        )
+        stable_jargon_block = self._wrap_optional_block(
+            "群内黑话参考",
+            stable_jargon_explanation,
+            enabled=not is_fast_mode and not near_context_priority,
+        )
+        dynamic_expression_block = ""
+        dynamic_jargon_block = ""
         style_variant = self._pick_reply_style(chat_id, is_fast_mode)
         cold_summary = await self._load_dialogue_cold_summary(chat_id)
+        compressed_cold_summary = self._compress_cold_summary_for_background(cold_summary)
+        persona_block = self._block("自我认知", role_block)
+        style_block_rendered = self._block("说话方式", style_block)
+        system_rules_block = self._system_rules_block()
+        system_rules_items = self._system_rules_items()
+        cold_summary_block = self._block("冷区背景摘要", compressed_cold_summary)
+        soft_background_sections = {
+            "cold_summary": cold_summary_block.strip() if cold_summary_block else "",
+            "stable_state": stable_state_block.strip() if stable_state_block else "",
+            "stable_behavior_rules": stable_behavior_rule_block.strip() if stable_behavior_rule_block else "",
+            "stable_private_chat": stable_private_chat_block.strip() if stable_private_chat_block else "",
+            "stable_expression": stable_expression_block.strip() if stable_expression_block else "",
+            "stable_slang": stable_slang_block.strip() if stable_slang_block else "",
+            "stable_jargon": stable_jargon_block.strip() if stable_jargon_block else "",
+        }
+        soft_background_block = "\n\n".join(
+            block for block in soft_background_sections.values() if block
+        )
+        frozen_prefix_blocks = {
+            "persona_core": len(persona_block or ""),
+            "style_block": len(style_block_rendered or ""),
+            "system_rules": len(system_rules_block or ""),
+        }
+        semi_stable_blocks = {
+            "cold_summary": len(cold_summary_block or ""),
+            "stable_state": len(stable_state_block or ""),
+            "stable_behavior_rules": len(stable_behavior_rule_block or ""),
+            "stable_private_chat": len(stable_private_chat_block or ""),
+            "stable_expression": len(stable_expression_block or ""),
+            "stable_slang": len(stable_slang_block or ""),
+            "stable_jargon": len(stable_jargon_block or ""),
+        }
 
         frozen_prefix = "\n\n".join(
             block
             for block in [
-                self._block("自我认知", role_block),
-                self._block("说话方式", style_block),
-                self._system_rules_block(),
-                self._block("冷区摘要", cold_summary),
+                persona_block,
+                style_block_rendered,
+                system_rules_block,
             ]
             if block
         )
-        semi_stable_block = "\n\n".join(
+        situational_context_block = "\n\n".join(
             block
             for block in [
-                state_block.strip() if state_block else "",
-                behavior_rule_block.strip() if behavior_rule_block else "",
-                private_chat_block.strip() if private_chat_block else "",
-                expression_block.strip() if expression_block else "",
-                slang_block.strip() if slang_block else "",
-                jargon_block.strip() if jargon_block else "",
+                dynamic_state_block.strip() if dynamic_state_block else "",
+                dynamic_behavior_rule_block.strip() if dynamic_behavior_rule_block else "",
+                dynamic_private_chat_block.strip() if dynamic_private_chat_block else "",
+                dynamic_expression_block.strip() if dynamic_expression_block else "",
+                dynamic_slang_block.strip() if dynamic_slang_block else "",
+                dynamic_jargon_block.strip() if dynamic_jargon_block else "",
             ]
             if block
         )
-        dynamic_block = "\n\n".join(
-            block
-            for block in [
-                inner_voice_block.strip() if inner_voice_block else "",
-            ]
-            if block
-        )
+        if isinstance(prompt_envelope, PromptEnvelope):
+            prompt_envelope.soft_background_block = soft_background_block.strip()
+            prompt_envelope.soft_background_sections = {
+                key: value
+                for key, value in soft_background_sections.items()
+                if value
+            }
+            prompt_envelope.soft_background_budget_chars = len(soft_background_block)
+            prompt_envelope.soft_background_trimmed_sections = []
+            prompt_envelope.soft_background_rendered_chars = len(soft_background_block)
+            prompt_envelope.soft_background_skipped_reason = ""
+            prompt_envelope.situational_context_block = situational_context_block.strip()
         if self.prefix_caching_enabled:
-            current_hash = hashlib.md5(frozen_prefix.encode("utf-8")).hexdigest()
+            semantic_system_text = frozen_prefix
+            semantic_system_hash = hashlib.md5(semantic_system_text.encode("utf-8")).hexdigest()
+            current_hash = semantic_system_hash
             previous_meta = dict(self._prefix_meta_by_chat.get(chat_id, {}) or {})
             previous_hash = str(previous_meta.get("prefix_hash", "") or "")
-            previous_cold_summary = str(previous_meta.get("cold_summary", "") or "")
             if not previous_hash:
                 prefix_stable = False
                 prefix_changed_reason = "first_seen"
             elif previous_hash == current_hash:
                 prefix_stable = True
                 prefix_changed_reason = ""
-            elif previous_cold_summary != cold_summary:
-                prefix_stable = False
-                prefix_changed_reason = "cold_summary_changed"
             else:
                 prefix_stable = False
                 prefix_changed_reason = "frozen_rules_or_persona_changed"
             self._prefix_hash_by_chat[chat_id] = current_hash
             self._prefix_meta_by_chat[chat_id] = {
                 "prefix_hash": current_hash,
+                "semantic_system_hash": semantic_system_hash,
+                "semantic_system_length": len(semantic_system_text),
                 "prefix_stable": prefix_stable,
                 "prefix_changed_reason": prefix_changed_reason,
-                "cold_summary": str(cold_summary or ""),
+                "frozen_prefix_length": len(frozen_prefix),
+                "semi_stable_length": len(soft_background_block),
+                "frozen_prefix_blocks": dict(frozen_prefix_blocks),
+                "semi_stable_blocks": dict(semi_stable_blocks),
+                "system_rules_items": list(system_rules_items),
+                "system_rules_candidate_items": [
+                    str(item.get("key", "") or "")
+                    for item in system_rules_items
+                    if str(item.get("default_target", "") or "") == "candidate_for_runtime_instruction"
+                ],
             }
         else:
             self._prefix_hash_by_chat.pop(chat_id, None)
             self._prefix_meta_by_chat[chat_id] = {
                 "prefix_hash": "",
+                "semantic_system_hash": "",
+                "semantic_system_length": 0,
                 "prefix_stable": False,
                 "prefix_changed_reason": "disabled",
-                "cold_summary": str(cold_summary or ""),
+                "frozen_prefix_length": 0,
+                "semi_stable_length": 0,
+                "frozen_prefix_blocks": {},
+                "semi_stable_blocks": {},
+                "system_rules_items": [],
+                "system_rules_candidate_items": [],
             }
-        system_prompt = "\n\n".join(block for block in [frozen_prefix, semi_stable_block, dynamic_block] if block)
+        system_prompt = frozen_prefix
         return (
             system_prompt.strip(),
             style_variant.strip(),
@@ -172,6 +266,41 @@ class ContextEngine:
         except Exception as exc:
             logger.debug(f"[{chat_id}] cold summary load failed: {exc}")
             return ""
+
+    def _compress_cold_summary_for_background(self, text: str) -> str:
+        normalized = " ".join(str(text or "").split())
+        if not normalized:
+            return ""
+        replacements = [
+            ("后来", ""),
+            ("然后", ""),
+            ("接着", ""),
+            ("当时", ""),
+            ("那天", ""),
+            ("当晚", ""),
+            ("之后", ""),
+            ("于是", ""),
+            ("她说", ""),
+            ("他说", ""),
+            ("我说", ""),
+        ]
+        for source, target in replacements:
+            normalized = normalized.replace(source, target)
+        fragments = []
+        for chunk in re.split(r"[。！？；;]+", normalized):
+            cleaned = " ".join(chunk.split()).strip("，,、 ")
+            if cleaned:
+                fragments.append(cleaned)
+            if len(fragments) >= 3:
+                break
+        if not fragments:
+            return ""
+        rendered = "；".join(fragments)
+        if len(rendered) <= self.COLD_SUMMARY_BACKGROUND_MAX_CHARS:
+            return rendered
+        if self.COLD_SUMMARY_BACKGROUND_MAX_CHARS <= 3:
+            return rendered[: self.COLD_SUMMARY_BACKGROUND_MAX_CHARS]
+        return rendered[: self.COLD_SUMMARY_BACKGROUND_MAX_CHARS - 3].rstrip() + "..."
 
     async def _load_persona_payload(self, chat_id: str, retrieve_keys: list[str], is_fast_mode: bool) -> dict[str, Any]:
         target_persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")
@@ -249,9 +378,15 @@ class ContextEngine:
         style = str(persona_payload.get("style", "") or "").strip()
         return style or "保持自然、简短、贴近聊天窗口的语气。"
 
-    async def _build_private_chat_block(self, chat_id: str, event_messages: list[AstrMessageEvent], *, is_fast_mode: bool) -> str:
+    async def _build_private_chat_blocks(
+        self,
+        chat_id: str,
+        event_messages: list[AstrMessageEvent],
+        *,
+        is_fast_mode: bool,
+    ) -> tuple[str, str]:
         if "FriendMessage" not in chat_id or not event_messages or is_fast_mode:
-            return ""
+            return "", ""
         user_id = str(event_messages[-1].get_sender_id() or "")
         bundle = None
         plugin = getattr(self.context, "astrmai_plugin", None) or getattr(self.context, "astrmai", None)
@@ -266,14 +401,14 @@ class ContextEngine:
         if not bundle:
             persistence = getattr(self.db, "persistence", None)
             if not persistence or not hasattr(persistence, "load_user_profile"):
-                return ""
+                return "", ""
             try:
                 profile = await persistence.load_user_profile(user_id)
             except Exception as exc:
                 logger.warning(f"[ContextEngine] private profile load failed: {exc}")
-                return ""
+                return "", ""
             if not profile:
-                return ""
+                return "", ""
 
             nickname = str(profile.get("nickname", "") or "").strip()
             raw_name = str(profile.get("name", "该用户") or "该用户")
@@ -295,20 +430,24 @@ class ContextEngine:
                 "structured_sections": structured_sections,
             }
 
-        lines = [
+        stable_lines = [
             f"我现在正在和 {bundle['display_name']} 私聊，要更专注地照看这段一对一交流。",
             f"我对 ta 的标签印象：{bundle['tags_text']}",
             f"我对 ta 的侧写理解：{bundle['analysis']}",
         ]
+        dynamic_lines: list[str] = []
         for section in bundle.get("structured_sections", []) or []:
             label = str(section.get("label", "") or "").strip()
             values = [str(item).strip() for item in (section.get("values", []) or []) if str(item).strip()]
             if label and values:
-                lines.append(f"[{label}] " + "；".join(values))
+                stable_lines.append(f"[{label}] " + "；".join(values))
         memory_points = [str(item).strip() for item in (bundle.get("memory_points", []) or []) if str(item).strip()]
         if memory_points:
-            lines.append("我还记得这些点：" + "；".join(memory_points))
-        return self._block("私聊上下文", "\n".join(lines))
+            dynamic_lines.append("这轮可参考的近期私聊记忆点：" + "；".join(memory_points))
+        return (
+            self._block("私聊上下文", "\n".join(stable_lines)),
+            self._block("当前私聊状态提示", "\n".join(dynamic_lines)),
+        )
 
     def _build_inner_voice_block(self, *, sys1_thought: str, goals_context: str, planner_reasoning: str, is_fast_mode: bool, agency_context: str = "") -> str:
         lines: list[str] = []
@@ -411,14 +550,33 @@ class ContextEngine:
             "我的表达底线：",
             "1. 我只说会真正发到聊天窗口里的自然话。",
             "2. 我不会在开头写自己的名字、角色名，或 assistant/user/system 这类前缀。",
-            "3. 眼前这条消息优先；更早的对话只帮我理解关系和避免重复，我不把旧聊天当剧本续写。",
-            "4. 我不会暴露系统、工具、提示词、JSON 或内部推理。",
-            "5. 动作描写我只会拿来做极短的自然补充，不写成舞台剧。",
-            "6. 遇到拿不准的事实，我会先依赖记忆或工具，不硬编。",
-            "7. 记忆内容只帮我理解当下，我会消化后用自己的话自然提及；我不直接复述记忆原文，也不暴露记忆闪回、注入、提示词这类机制。",
-            "8. 如果本轮系统提供了可用动作，我可以在自然的时机使用它们，但不暴露工具过程或机制。",
+            "3. 我不会暴露系统、工具、提示词、JSON 或内部推理。",
+            "4. 遇到拿不准的事实，我会先依赖记忆或工具，不硬编。",
+            "5. 记忆内容只帮我理解当下，我会消化后用自己的话自然提及；我不直接复述记忆原文，也不暴露记忆闪回、注入、提示词这类机制。",
         ]
         return "\n".join(rules)
+
+    def _system_rules_items(self) -> list[dict[str, Any]]:
+        items = [
+            ("visible_reply_only", "只输出会真正发到聊天窗口里的自然回复。", "keep_in_system"),
+            ("no_role_prefix", "不开头写自己的名字、角色名，或 assistant/user/system 前缀。", "keep_in_system"),
+            ("current_message_first", "先回应当前这条消息，历史只作背景不续写。", "candidate_for_runtime_instruction"),
+            ("no_protocol_leak", "不暴露 system、工具、提示词、JSON 或内部推理。", "keep_in_system"),
+            ("short_action_narration", "动作描写只做极短自然补充，不写成舞台剧。", "candidate_for_runtime_instruction"),
+            ("no_hard_fabrication", "拿不准事实时先依赖记忆或工具，不硬编。", "keep_in_system"),
+            ("memory_is_background", "记忆只作背景理解，不复述原文或机制。", "keep_in_system"),
+            ("tool_use_without_protocol", "系统提供动作时自然使用，但不暴露过程或机制。", "candidate_for_runtime_instruction"),
+        ]
+        result: list[dict[str, Any]] = []
+        for key, text, default_target in items:
+            result.append(
+                {
+                    "key": key,
+                    "length": len(str(text or "")),
+                    "default_target": default_target,
+                }
+            )
+        return result
 
     def _pick_reply_style(self, chat_id: str, is_fast_mode: bool) -> str:
         styles = [
@@ -444,26 +602,48 @@ class ContextEngine:
             return ""
         return self._block(title, content)
 
-    def _build_behavior_rule_block(self, prompt_envelope: Optional[PromptEnvelope]) -> str:
-        if not isinstance(prompt_envelope, PromptEnvelope):
-            return ""
-        mode = prompt_envelope.reply_mode
-        rules = ["我会先回应眼前这条消息，不突然另起话题。"]
-        if mode == mode.EMOTIONAL_SUPPORT:
-            rules.append("我会先把对方情绪接住，再决定要不要轻轻追问。")
-        elif mode == mode.PLAYFUL_INTERACTION:
-            rules.append("被逗到时我可以轻轻接梗，但不把每句话都演成剧本。")
-        elif mode == mode.IMAGE_REACTION:
-            rules.append("我会先短促回应看到的画面感，再决定要不要补一句。")
-        elif mode == mode.DIRECT_QUESTION:
-            rules.append("我会优先正面回答问题，不绕远。")
-        if prompt_envelope.freshness_state == prompt_envelope.freshness_state.STALE_BUT_SALVAGEABLE:
-            rules.append("如果消息已经偏旧，我会轻轻接回当前，不硬接旧梗。")
-        return self._block("此刻回应倾向", "\n".join(f"- {rule}" for rule in rules))
+    def _build_slang_blocks(self, slang_patterns: str, *, enabled: bool) -> tuple[str, str]:
+        if not enabled:
+            return "", ""
+        text = str(slang_patterns or "").strip()
+        if not text:
+            return "", ""
+        return "", self._block("群聊表达参考", text)
 
-    def _build_state_block(self, state: Optional[Any]) -> str:
+    def _build_behavior_rule_blocks(self, prompt_envelope: Optional[PromptEnvelope]) -> tuple[str, str]:
+        if not isinstance(prompt_envelope, PromptEnvelope):
+            return "", ""
+        stable_rules: list[str] = []
+        dynamic_rules: list[str] = []
+        stable_rule_candidates = [
+            "我会先回应眼前这条消息，不突然另起话题。",
+            "我会优先回应当前这条消息，不突然另起话题。",
+        ]
+        existing_runtime = str(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or "").strip()
+        if stable_rule_candidates:
+            addition = "\n".join(stable_rule_candidates)
+            prompt_envelope.planner_runtime_instruction_block = "\n\n".join(
+                part for part in [existing_runtime, addition] if part
+            ).strip()
+        mode = prompt_envelope.reply_mode
+        if mode == mode.EMOTIONAL_SUPPORT:
+            dynamic_rules.append("我会先把对方情绪接住，再决定要不要轻轻追问。")
+        elif mode == mode.PLAYFUL_INTERACTION:
+            dynamic_rules.append("被逗到时我可以轻轻接梗，但不把每句话都演成剧本。")
+        elif mode == mode.IMAGE_REACTION:
+            dynamic_rules.append("我会先短促回应看到的画面感，再决定要不要补一句。")
+        elif mode == mode.DIRECT_QUESTION:
+            dynamic_rules.append("我会优先正面回答问题，不绕远。")
+        if prompt_envelope.freshness_state == prompt_envelope.freshness_state.STALE_BUT_SALVAGEABLE:
+            dynamic_rules.append("如果消息已经偏旧，我会轻轻接回当前，不硬接旧梗。")
+        return (
+            self._block("稳定回应原则", "\n".join(f"- {rule}" for rule in stable_rules)),
+            self._block("此刻回应倾向", "\n".join(f"- {rule}" for rule in dynamic_rules)),
+        )
+
+    def _build_state_blocks(self, state: Optional[Any]) -> tuple[str, str]:
         if not state:
-            return "我现在心情平静，精力充足，所以可以自然接住当前对话。"
+            return "", "我现在心情平静，精力充足，所以可以自然接住当前对话。"
         mood_val = float(getattr(state, "mood", 0.0) or 0.0)
         mood_tag = "平静"
         if mood_val > 0.8:
@@ -475,7 +655,7 @@ class ContextEngine:
         elif mood_val < -0.3:
             mood_tag = "低落/冷淡"
         energy = float(getattr(state, "energy", 1.0) or 1.0)
-        return f"我现在心情偏{mood_tag}（情绪 {mood_val:.2f}），精力 {energy:.2f}；回复会跟着这个状态自然调整长短和语气。"
+        return "", f"我现在心情偏{mood_tag}（情绪 {mood_val:.2f}），精力 {energy:.2f}；回复会跟着这个状态自然调整长短和语气。"
 
     class FuzzyKeyMatcher:
         ALLOWED_KEYS = {"logic_style", "speech_style", "world_view", "timeline", "relations", "skills", "values", "secrets", "ALL", "CORE_ONLY"}

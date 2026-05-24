@@ -153,6 +153,49 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertEqual(payload["first_person_rewrite"], "summary fallback")
         self.assertEqual(payload["summary"], "summary fallback")
 
+    def test_persona_core_identity_template_and_fallback_use_same_expert_role_shell(self):
+        persistence = _FakePersistence()
+        gateway = _FakeGateway(["core summary"])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+
+        async def _run_template():
+            return await summarizer._call_persona_template(
+                self.persona_mod.PromptTemplateId.PERSONA_CORE_IDENTITY,
+                original_prompt="Long persona prompt for testing.",
+                cache_key="persona-template",
+                is_json=False,
+                fallback_prompt="fallback body",
+                fallback_system_prompt="你是一个资深的角色扮演设定提取专家。",
+            )
+
+        asyncio.run(_run_template())
+        template_call = gateway.calls[-1]
+        self.assertEqual(
+            template_call["kwargs"]["system_prompt"].split("\n\n")[0],
+            "你是一个资深的角色扮演设定提取专家。",
+        )
+
+        summarizer.prompt_registry = None
+        fallback_gateway = _FakeGateway(["core summary"])
+        summarizer.gateway = fallback_gateway
+
+        async def _run_fallback():
+            return await summarizer._call_persona_template(
+                self.persona_mod.PromptTemplateId.PERSONA_CORE_IDENTITY,
+                original_prompt="Long persona prompt for testing.",
+                cache_key="persona-fallback",
+                is_json=False,
+                fallback_prompt="fallback body",
+                fallback_system_prompt="你是一个资深的角色扮演设定提取专家。",
+            )
+
+        asyncio.run(_run_fallback())
+        fallback_call = fallback_gateway.calls[-1]
+        self.assertEqual(
+            fallback_call["kwargs"]["system_prompt"],
+            "你是一个资深的角色扮演设定提取专家。",
+        )
+
     def test_context_engine_prefers_first_person_rewrite_and_honors_disable_rag_injection(self):
         memory_engine = _FakeMemoryEngine()
 
@@ -217,24 +260,24 @@ class PersonaContextRefactorTests(unittest.TestCase):
         engine = self.context_mod.ContextEngine(db=db, persona_summarizer=summarizer)
 
         async def _run():
-            private_block = await engine._build_private_chat_block(
+            stable_private_block, dynamic_private_block = await engine._build_private_chat_blocks(
                 "default:FriendMessage:user-1",
                 [_FakePrivateEvent()],
                 is_fast_mode=False,
             )
-            return private_block, engine._system_rules_block()
+            return stable_private_block, dynamic_private_block, engine._system_rules_block()
 
-        private_block, rules_block = asyncio.run(_run())
+        private_block, dynamic_private_block, rules_block = asyncio.run(_run())
 
         self.assertIn("我现在正在和 小明（张三） 私聊", private_block)
         self.assertIn("我对 ta 的标签印象：熟人 / 夜猫子", private_block)
-        self.assertIn("我还记得这些点：昨晚聊过电影；会在半夜突然发消息", private_block)
+        self.assertIn("这轮可参考的近期私聊记忆点：昨晚聊过电影；会在半夜突然发消息", dynamic_private_block)
         self.assertIn("我的表达底线：", rules_block)
         self.assertIn("我只说会真正发到聊天窗口里的自然话。", rules_block)
         self.assertIn("我不直接复述记忆原文", rules_block)
         self.assertIn("不暴露记忆闪回、注入、提示词这类机制", rules_block)
-        self.assertIn("如果本轮系统提供了可用动作", rules_block)
-        self.assertIn("不暴露工具过程或机制", rules_block)
+        self.assertNotIn("如果本轮系统提供了可用动作", rules_block)
+        self.assertNotIn("不暴露工具过程或机制", rules_block)
         self.assertNotIn("不要在开头", rules_block)
 
     def test_context_engine_prefers_profile_prompt_bundle_from_state_engine(self):
@@ -266,17 +309,17 @@ class PersonaContextRefactorTests(unittest.TestCase):
         )
         engine = self.context_mod.ContextEngine(db=db, persona_summarizer=summarizer)
 
-        private_block = asyncio.run(
-            engine._build_private_chat_block(
+        stable_private_block, dynamic_private_block = asyncio.run(
+            engine._build_private_chat_blocks(
                 "default:FriendMessage:user-1",
                 [_FakePrivateEvent()],
                 is_fast_mode=False,
             )
         )
 
-        self.assertIn("阿明（张三）", private_block)
-        self.assertIn("偏好画像", private_block)
-        self.assertIn("昨晚聊过电影", private_block)
+        self.assertIn("阿明（张三）", stable_private_block)
+        self.assertIn("偏好画像", stable_private_block)
+        self.assertIn("昨晚聊过电影", dynamic_private_block)
 
     def test_context_engine_wraps_proactive_recall_as_internal_reference(self):
         memory_engine = _RecallMemoryEngine()
@@ -304,7 +347,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertEqual(memory_engine.calls, [])
         self.assertEqual(recall_block, "")
 
-    def test_context_engine_includes_agency_context_as_hidden_inner_drive(self):
+    def test_context_engine_keeps_agency_context_out_of_system_prompt(self):
         summarizer = SimpleNamespace(
             gateway=SimpleNamespace(
                 config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
@@ -325,7 +368,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
         engine.summarizer.get_summary = _summary
 
-        system_prompt, _, _ = asyncio.run(
+        system_prompt, _style_variant, proactive_recall = asyncio.run(
             engine.build_prompt(
                 chat_id="default:GroupMessage:group-1",
                 event_messages=[],
@@ -334,9 +377,320 @@ class PersonaContextRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("内在驱动：", system_prompt)
-        self.assertIn("本轮主观姿态：本轮姿态：克制反驳，最多一句。", system_prompt)
-        self.assertIn("以上内容只用于内在思考，不要直接对用户复述。", system_prompt)
+        self.assertNotIn("agency", system_prompt.lower())
+
+    def test_context_engine_pushes_dynamic_state_and_behavior_out_of_system_prompt(self):
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=_FakeDB(), persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope(
+            reply_mode=importlib.import_module("astrmai.conversation.contracts.prompt_envelope").ReplyMode.IMAGE_REACTION,
+        )
+
+        system_prompt, _style_variant, _proactive_recall = asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+            )
+        )
+
+        self.assertNotIn("此刻回应倾向", system_prompt)
+        self.assertNotIn("我现在心情", system_prompt)
+        self.assertIn("此刻回应倾向", envelope.situational_context_block)
+        self.assertIn("我现在心情", envelope.situational_context_block)
+        self.assertEqual(_proactive_recall, "")
+
+    def test_context_engine_moves_stable_expression_and_jargon_into_soft_background(self):
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=_FakeDB(), persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
+
+        system_prompt, _style_variant, _proactive_recall = asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+                stable_expression_habits="Use short fragments.\nKeep this turn short; avoid another long reply.",
+                situational_style_cues="群里最近会说：摸了、开摆",
+                stable_jargon_explanation="黑话说明：DDL 指截止时间",
+            )
+        )
+
+        self.assertNotIn("Use short fragments.", system_prompt)
+        self.assertNotIn("黑话说明：DDL 指截止时间", system_prompt)
+        self.assertNotIn("Keep this turn short; avoid another long reply.", system_prompt)
+        self.assertNotIn("我会先回应眼前这条消息，不突然另起话题。", system_prompt)
+        self.assertNotIn("我会优先回应当前这条消息，不突然另起话题。", system_prompt)
+        self.assertNotIn("群里最近会说：摸了、开摆", system_prompt)
+        self.assertIn("Use short fragments.", envelope.soft_background_block)
+        self.assertIn("黑话说明：DDL 指截止时间", envelope.soft_background_block)
+        self.assertIn("Keep this turn short; avoid another long reply.", envelope.soft_background_block)
+        self.assertIn("群里最近会说：摸了、开摆", envelope.situational_context_block)
+        self.assertNotIn("Keep this turn short; avoid another long reply.", envelope.situational_context_block)
+        self.assertIn("我会先回应眼前这条消息，不突然另起话题。", envelope.planner_runtime_instruction_block)
+        self.assertIn("我会优先回应当前这条消息，不突然另起话题。", envelope.planner_runtime_instruction_block)
+
+    def test_context_engine_no_longer_splits_expression_text_for_dynamic_turn_cues(self):
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=_FakeDB(), persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
+
+        system_prompt, _style_variant, _proactive_recall = asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+                stable_expression_habits="Use short fragments.\nKeep this turn short; avoid another long reply.",
+                situational_style_cues="群里最近会说：摸了、开摆",
+                stable_jargon_explanation="黑话说明：DDL 指截止时间",
+            )
+        )
+
+        self.assertNotIn("Keep this turn short; avoid another long reply.", system_prompt)
+        self.assertIn("Keep this turn short; avoid another long reply.", envelope.soft_background_block)
+        self.assertNotIn("Keep this turn short; avoid another long reply.", envelope.situational_context_block)
+        self.assertIn("群里最近会说：摸了、开摆", envelope.situational_context_block)
+
+    def test_context_engine_accepts_legacy_kwargs_as_compatibility_aliases(self):
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=_FakeDB(), persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
+
+        system_prompt, _style_variant, _proactive_recall = asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+                expression_habits="legacy habit",
+                slang_patterns="legacy slang",
+                jargon_explanation="legacy jargon",
+            )
+        )
+
+        self.assertNotIn("legacy habit", system_prompt)
+        self.assertNotIn("legacy jargon", system_prompt)
+        self.assertIn("legacy habit", envelope.soft_background_block)
+        self.assertIn("legacy jargon", envelope.soft_background_block)
+        self.assertIn("legacy slang", envelope.situational_context_block)
+        self.assertNotIn("legacy slang", system_prompt)
+
+    def test_context_engine_prefers_new_kwargs_over_legacy_aliases(self):
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=_FakeDB(), persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
+
+        system_prompt, _style_variant, _proactive_recall = asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+                stable_expression_habits="new habit",
+                situational_style_cues="new slang",
+                stable_jargon_explanation="new jargon",
+                expression_habits="legacy habit",
+                slang_patterns="legacy slang",
+                jargon_explanation="legacy jargon",
+            )
+        )
+
+        self.assertNotIn("new habit", system_prompt)
+        self.assertNotIn("new jargon", system_prompt)
+        self.assertNotIn("legacy habit", system_prompt)
+        self.assertNotIn("legacy jargon", system_prompt)
+        self.assertIn("new habit", envelope.soft_background_block)
+        self.assertIn("new jargon", envelope.soft_background_block)
+        self.assertNotIn("legacy habit", envelope.soft_background_block)
+        self.assertNotIn("legacy jargon", envelope.soft_background_block)
+        self.assertIn("new slang", envelope.situational_context_block)
+        self.assertNotIn("legacy slang", envelope.situational_context_block)
+
+    def test_context_engine_records_prefix_block_lengths_in_status(self):
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=_FakeDB(), persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
+
+        asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+                stable_expression_habits="Use short fragments.",
+                situational_style_cues="群里最近会说：摸了、开摆",
+                stable_jargon_explanation="黑话说明：DDL 指截止时间",
+            )
+        )
+
+        status = engine.get_last_prefix_status("default:GroupMessage:group-1")
+        self.assertEqual(status["prefix_changed_reason"], "first_seen")
+        self.assertTrue(status["semantic_system_hash"])
+        self.assertGreater(status["semantic_system_length"], 0)
+        self.assertGreater(status["frozen_prefix_length"], 0)
+        self.assertGreaterEqual(status["semi_stable_length"], 0)
+        self.assertIn("persona_core", status["frozen_prefix_blocks"])
+        self.assertIn("style_block", status["frozen_prefix_blocks"])
+        self.assertIn("system_rules", status["frozen_prefix_blocks"])
+        self.assertIn("cold_summary", status["semi_stable_blocks"])
+        self.assertIn("stable_expression", status["semi_stable_blocks"])
+        self.assertGreater(status["frozen_prefix_blocks"]["persona_core"], 0)
+        self.assertTrue(status["system_rules_items"])
+        self.assertIn("current_message_first", status["system_rules_candidate_items"])
+        self.assertIn(
+            "current_message_first",
+            {item["key"] for item in status["system_rules_items"]},
+        )
+
+    def test_context_engine_compresses_cold_summary_for_soft_background(self):
+        dialogue_store = SimpleNamespace(
+            get_cold_summary=lambda chat_id: asyncio.sleep(
+                0,
+                result="后来我们围绕考试焦虑聊了很多。然后她提到想把复习计划重新排一下。接着又说如果明天还有时间就继续补数学。最后还在想要不要找我再确认一次重点。",
+            )
+        )
+        db = _FakeDB()
+        db.dialogue_store = dialogue_store
+        summarizer = SimpleNamespace(
+            gateway=SimpleNamespace(
+                config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
+                context=SimpleNamespace(shared_dict={}),
+            )
+        )
+        engine = self.context_mod.ContextEngine(db=db, persona_summarizer=summarizer)
+
+        async def _summary(*args, **kwargs):
+            return {
+                "summary": "summary",
+                "first_person_rewrite": "I answer naturally.",
+                "style": "brief",
+                "shards": {},
+                "raw": "raw",
+                "is_full_ready": True,
+            }
+
+        engine.summarizer.get_summary = _summary
+        envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
+
+        asyncio.run(
+            engine.build_prompt(
+                chat_id="default:GroupMessage:group-1",
+                event_messages=[],
+                retrieve_keys=[],
+                prompt_envelope=envelope,
+            )
+        )
+
+        compressed = envelope.soft_background_sections.get("cold_summary", "")
+        self.assertIn("冷区背景摘要", compressed)
+        self.assertLessEqual(len(compressed), 240)
+        self.assertNotIn("后来我们围绕考试焦虑聊了很多。然后", compressed)
+        self.assertNotIn("最后还在想要不要找我再确认一次重点。", compressed)
 
 
 if __name__ == "__main__":

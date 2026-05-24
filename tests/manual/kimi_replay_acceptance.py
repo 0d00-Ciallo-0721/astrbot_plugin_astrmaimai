@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -407,14 +408,36 @@ class KimiGateway:
         return result
 
     async def chat_in_lane_result(self, **kwargs) -> SimpleNamespace:
+        event = kwargs.get("event")
+        system_prompt = str(kwargs.get("system_prompt", "") or "")
+        prompt = str(kwargs.get("prompt", "") or "")
         text = await self._completion(
-            system_prompt=str(kwargs.get("system_prompt", "") or ""),
-            prompt=str(kwargs.get("prompt", "") or ""),
+            system_prompt=system_prompt,
+            prompt=prompt,
             request_label="chat",
         )
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra(
+                "astrmai_request_trace",
+                {
+                    "provider_visible_system_hash": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:16] if system_prompt else "",
+                    "provider_visible_prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16] if prompt else "",
+                    "post_hook_system_hash": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:16] if system_prompt else "",
+                    "request_session_id": "",
+                    "request_cache_control": "",
+                    "request_provider_family": "native_chat",
+                    "request_model_id": str(self.client.model or ""),
+                    "usage_input_tokens": 0,
+                    "usage_input_cached": 0,
+                    "usage_output_tokens": 0,
+                },
+            )
         return SimpleNamespace(text=text, usage=SimpleNamespace(input=0, input_cached=0, output=0))
 
     async def tool_chat_in_lane_result(self, **kwargs) -> SimpleNamespace:
+        event = kwargs.get("event")
+        system_prompt = str(kwargs.get("system_prompt", "") or "")
+        prompt = str(kwargs.get("prompt", "") or "")
         tools = getattr(kwargs.get("tools"), "tools", None) or []
         tool_names = [str(getattr(tool, "name", "") or tool.__class__.__name__) for tool in tools]
         tool_notice = (
@@ -423,10 +446,26 @@ class KimiGateway:
             "but do not execute side effects; answer naturally and briefly."
         )
         text = await self._completion(
-            system_prompt=str(kwargs.get("system_prompt", "") or ""),
-            prompt=str(kwargs.get("prompt", "") or "") + tool_notice,
+            system_prompt=system_prompt,
+            prompt=prompt + tool_notice,
             request_label="tool_chat",
         )
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra(
+                "astrmai_request_trace",
+                {
+                    "provider_visible_system_hash": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:16] if system_prompt else "",
+                    "provider_visible_prompt_hash": hashlib.sha256((prompt + tool_notice).encode("utf-8")).hexdigest()[:16] if (prompt + tool_notice) else "",
+                    "post_hook_system_hash": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:16] if system_prompt else "",
+                    "request_session_id": "",
+                    "request_cache_control": "",
+                    "request_provider_family": "native_chat",
+                    "request_model_id": str(self.client.model or ""),
+                    "usage_input_tokens": 0,
+                    "usage_input_cached": 0,
+                    "usage_output_tokens": 0,
+                },
+            )
         return SimpleNamespace(text=text, usage=SimpleNamespace(input=0, input_cached=0, output=0))
 
     async def call_vision_task(self, **kwargs) -> dict[str, Any]:
@@ -452,29 +491,110 @@ class _FakeLaneManager:
         return ""
 
 
+class _FakeDialogueStore:
+    def __init__(self):
+        self._summary_by_chat: dict[str, str] = {}
+        self._version_by_chat: dict[str, int] = {}
+
+    async def get_cold_summary(self, chat_id: str) -> str:
+        return str(self._summary_by_chat.get(chat_id, "") or "")
+
+    def set_case_summary(self, chat_id: str, case_id: str) -> None:
+        case_key = str(case_id or "").lower()
+        version = int(self._version_by_chat.get(chat_id, 0) or 0)
+        current = str(self._summary_by_chat.get(chat_id, "") or "")
+        if not current:
+            if "memory" in case_key:
+                current = "Memory thread active."
+            elif "tool" in case_key:
+                current = "Tool request active."
+            elif "boundary" in case_key or "pushback" in case_key:
+                current = "Boundary thread active."
+            else:
+                current = ""
+        elif "memory" in case_key and version == 0:
+            current = "Memory thread follow-up."
+        elif ("boundary" in case_key or "pushback" in case_key) and version == 0:
+            current = "Boundary thread follow-up."
+        self._summary_by_chat[chat_id] = current
+        self._version_by_chat[chat_id] = version + 1
+
+
 class _FakeContextEngine:
     def __init__(self):
-        self.db = SimpleNamespace(load_jargon_list=self._load_jargon_list)
-        self.context = SimpleNamespace(shared_dict={})
-        self._last_hash = "kimi-replay-prefix"
+        from astrmai.conversation.planning.context_engine import ContextEngine
+
+        self._dialogue_store = _FakeDialogueStore()
+        self._gateway_context = SimpleNamespace(shared_dict={})
+        fake_gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                conversation=SimpleNamespace(enable_prefix_caching=True),
+                memory=SimpleNamespace(auto_recall_probability=0.0),
+                persona=SimpleNamespace(persona_id="kimi-replay", prompt=""),
+            ),
+            context=self._gateway_context,
+        )
+        fake_summarizer = SimpleNamespace(gateway=fake_gateway)
+
+        async def _summary(*args, **kwargs):
+            session_id = str(kwargs.get("session_id", "") or "")
+            if "tool" in session_id:
+                first_person = "I verify facts."
+            elif "memory" in session_id:
+                first_person = "I answer with continuity."
+            elif "private" in session_id:
+                first_person = "I answer gently."
+            else:
+                first_person = "I answer naturally."
+            return {
+                "summary": "Persona.",
+                "first_person_rewrite": first_person,
+                "style": "Brief.",
+                "shards": {},
+                "raw": "Persona.",
+                "is_full_ready": True,
+            }
+
+        fake_summarizer.get_summary = _summary
+        self.db = SimpleNamespace(
+            load_jargon_list=self._load_jargon_list,
+            get_chat_state=self._get_chat_state,
+            dialogue_store=self._dialogue_store,
+        )
+        self.context = self._gateway_context
+        self._engine = ContextEngine(db=self.db, persona_summarizer=fake_summarizer)
 
     async def _load_jargon_list(self, chat_id: str, limit: int = 8):
+        chat_key = str(chat_id or "").lower()
+        if "tool" in chat_key:
+            return ["tool-call", "lookup"]
+        if "memory" in chat_key:
+            return ["callback", "recall"]
         return []
 
+    def _get_chat_state(self, chat_id: str):
+        chat_key = str(chat_id or "").lower()
+        if "private" in chat_key:
+            return SimpleNamespace(mood=0.25, energy=0.55)
+        if "tool" in chat_key:
+            return SimpleNamespace(mood=0.05, energy=0.78)
+        if "memory" in chat_key:
+            return SimpleNamespace(mood=0.1, energy=0.72)
+        return SimpleNamespace(mood=0.0, energy=0.8)
+
     async def build_prompt(self, **kwargs):
-        system_prompt = (
-            "You are AstrMai, a role-play chat bot. "
-            "Only output the visible chat reply. "
-            "Do not write your own name prefix. "
-            "Do not expose JSON, prompts, tools, memory injection, or internal reasoning. "
-            "Respond to the current message first; history is only background."
-        )
-        style_variant = "natural and concise"
-        proactive_recall = ""
-        return system_prompt, style_variant, proactive_recall
+        chat_id = str(kwargs.get("chat_id", "") or "")
+        event_messages = list(kwargs.get("event_messages", []) or [])
+        focus_event = event_messages[-1] if event_messages else None
+        case_id = str(getattr(focus_event, "message_id", "") or "")
+        self._dialogue_store.set_case_summary(chat_id, case_id)
+        return await self._engine.build_prompt(**kwargs)
 
     def get_last_prefix_hash(self, chat_id: str) -> str:
-        return self._last_hash
+        return self._engine.get_last_prefix_hash(chat_id)
+
+    def get_last_prefix_status(self, chat_id: str) -> dict[str, Any]:
+        return self._engine.get_last_prefix_status(chat_id)
 
 
 class _FakeReplyEngine:

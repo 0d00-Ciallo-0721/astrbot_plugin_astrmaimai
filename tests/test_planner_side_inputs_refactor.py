@@ -102,19 +102,39 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             pass
 
     def test_mode_instructions_use_first_person_without_legacy_markers(self):
-        system_prompt = self.mixin._append_mode_instructions(
-            "base",
+        envelope = self.side_inputs_mod.PromptEnvelope()
+        result = self.mixin._append_mode_instructions(
             _FakeEvent(message="帮我查一下天气"),
+            prompt_envelope=envelope,
             is_tool_call_mode=True,
             is_all_mode=True,
             is_fast_mode=True,
         )
 
-        self.assertIn("对方这次是在让我帮忙办事。", system_prompt)
-        self.assertIn("对方刚才说的是：“帮我查一下天气”。我这轮就先接住这一条来回。", system_prompt)
-        self.assertIn("有人在喊我，我得马上用简短直接的话接住这次呼唤，不绕远路。", system_prompt)
-        self.assertNotIn(">>>", system_prompt)
-        self.assertNotIn("你现在的首要任务是", system_prompt)
+        self.assertIsNone(result)
+        self.assertIn("对方这次是在让我帮忙办事。", envelope.planner_runtime_instruction_block)
+        self.assertIn("对方刚才说的是：“帮我查一下天气”。我这轮就先接住这一条来回。", envelope.planner_runtime_instruction_block)
+        self.assertIn("有人在喊我，我得马上用简短直接的话接住这次呼唤，不绕远路。", envelope.planner_runtime_instruction_block)
+        self.assertNotIn(">>>", envelope.planner_runtime_instruction_block)
+        self.assertNotIn("你现在的首要任务是", envelope.planner_runtime_instruction_block)
+
+    def test_mode_instructions_write_into_runtime_instruction_block(self):
+        envelope = self.side_inputs_mod.PromptEnvelope()
+        self.mixin._append_mode_instructions(
+            _FakeEvent(message="请直接说重点"),
+            prompt_envelope=envelope,
+            is_tool_call_mode=True,
+            is_all_mode=True,
+            is_fast_mode=True,
+        )
+
+        self.assertIn("对方这次是在让我帮忙办事。", envelope.planner_runtime_instruction_block)
+        self.assertIn("对方刚才说的是：“请直接说重点”。我这轮就先接住这一条来回。", envelope.planner_runtime_instruction_block)
+        self.assertIn("有人在喊我，我得马上用简短直接的话接住这次呼唤，不绕远路。", envelope.planner_runtime_instruction_block)
+        self.assertLessEqual(
+            len(envelope.planner_runtime_instruction_block),
+            self.side_inputs_mod.PlannerSideInputMixin.PLANNER_RUNTIME_INSTRUCTION_MAX_CHARS,
+        )
 
     def test_private_jump_context_uses_first_person_memory_recall(self):
         ctx = type(
@@ -132,20 +152,102 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             },
         )()
 
+        event = _FakeEvent(group_id=None)
+        envelope = self.side_inputs_mod.PromptEnvelope()
+        event.set_extra("astrmai_prompt_envelope", envelope)
         result = asyncio.run(
             self.mixin._apply_private_jump_context(
-                "base prompt",
                 ctx,
-                _FakeEvent(group_id=None),
+                event,
                 "user-1",
+                prompt_envelope=envelope,
             )
         )
 
-        self.assertIn("刚才我还在群聊里和大家说话", result)
-        self.assertIn("【我刚才的悄悄话】：晚上再接着聊呀", result)
-        self.assertIn("对方现在这句，多半就是接着我刚才那次跨界私聊在回我。", result)
-        self.assertNotIn(">>>", result)
+        self.assertIsNone(result)
+        self.assertIn("刚才我还在群聊里和大家说话", envelope.planner_runtime_instruction_block)
+        self.assertIn("【我刚才的悄悄话】：晚上再接着聊呀", envelope.planner_runtime_instruction_block)
+        self.assertIn("对方现在这句，多半就是接着我刚才那次跨界私聊在回我。", envelope.planner_runtime_instruction_block)
         self.assertEqual(ctx.shared_dict["astrmai_space_jumps"], {})
+
+    def test_mode_instructions_truncate_long_user_message(self):
+        envelope = self.side_inputs_mod.PromptEnvelope()
+        long_message = "请你先把这段很长很长的原话完整复述一遍然后再解释" * 10
+        self.mixin._append_mode_instructions(
+            _FakeEvent(message=long_message),
+            prompt_envelope=envelope,
+            is_tool_call_mode=True,
+            is_all_mode=True,
+            is_fast_mode=True,
+        )
+
+        self.assertLessEqual(
+            len(envelope.planner_runtime_instruction_block),
+            self.side_inputs_mod.PlannerSideInputMixin.PLANNER_RUNTIME_INSTRUCTION_MAX_CHARS,
+        )
+        self.assertNotIn(long_message, envelope.planner_runtime_instruction_block)
+
+    def test_private_jump_context_clamps_long_history_and_message(self):
+        long_private_message = "晚上再接着聊呀" * 30
+        long_group_history = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "群聊内容" * 30}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "回复内容" * 30}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "更早的群聊内容" * 30}],
+            },
+        ]
+
+        class _ConversationManager:
+            async def get_curr_conversation_id(self, uid):
+                return "conv-1"
+
+            async def get_conversation(self, uid, curr_cid):
+                return SimpleNamespace(history=json.dumps(long_group_history, ensure_ascii=False))
+
+        ctx = type(
+            "Ctx",
+            (),
+            {
+                "shared_dict": {
+                    "astrmai_space_jumps": {
+                        "user-1": {
+                            "timestamp": time.time(),
+                            "private_message": long_private_message,
+                            "group_id": "group-1",
+                        }
+                    }
+                },
+                "conversation_manager": _ConversationManager(),
+            },
+        )()
+
+        event = _FakeEvent(group_id=None)
+        envelope = self.side_inputs_mod.PromptEnvelope()
+        event.set_extra("astrmai_prompt_envelope", envelope)
+        asyncio.run(
+            self.mixin._apply_private_jump_context(
+                ctx,
+                event,
+                "user-1",
+                prompt_envelope=envelope,
+            )
+        )
+
+        self.assertLessEqual(
+            len(envelope.planner_runtime_instruction_block),
+            self.side_inputs_mod.PlannerSideInputMixin.PLANNER_RUNTIME_INSTRUCTION_MAX_CHARS,
+        )
+        self.assertLessEqual(
+            envelope.planner_runtime_instruction_block.count("[群友]:") + envelope.planner_runtime_instruction_block.count("[你]:"),
+            self.side_inputs_mod.PlannerSideInputMixin.PRIVATE_JUMP_MAX_HISTORY_MESSAGES,
+        )
 
     def _prepare_tool_mixin(self):
         mixin = self.side_inputs_mod.PlannerSideInputMixin()

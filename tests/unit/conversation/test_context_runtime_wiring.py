@@ -262,6 +262,10 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             status = engine.get_last_prefix_status("chat-1")
             self.assertEqual(status["prefix_changed_reason"], "disabled")
             self.assertFalse(status["prefix_stable"])
+            self.assertEqual(status["frozen_prefix_length"], 0)
+            self.assertEqual(status["semi_stable_length"], 0)
+            self.assertEqual(status["frozen_prefix_blocks"], {})
+            self.assertEqual(status["semi_stable_blocks"], {})
 
         asyncio.run(run())
 
@@ -505,6 +509,8 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             planner.context_engine = SimpleNamespace(
                 get_last_prefix_status=lambda chat_id: {
                     "prefix_hash": "abc123",
+                    "semantic_system_hash": "semantic123",
+                    "semantic_system_length": 240,
                     "prefix_stable": True,
                     "prefix_changed_reason": "",
                 }
@@ -556,7 +562,140 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             self.assertEqual(turn_context.continuity.last_hook_source, "assistant")
             self.assertEqual(turn_context.continuity.last_safe_hook_checked_at, 96)
             self.assertEqual(turn_context.continuity.prefix_hash, "abc123")
+            self.assertEqual(turn_context.continuity.semantic_system_hash, "semantic123")
+            self.assertEqual(turn_context.continuity.semantic_system_length, 240)
             self.assertTrue(turn_context.continuity.prefix_stable)
+
+        asyncio.run(run())
+
+    def test_update_turn_trace_runtime_captures_request_trace_fields(self):
+        planner_mod = importlib.import_module("astrmai.conversation.planning.planner")
+
+        class DummyEvent:
+            def __init__(self):
+                self._extra = {
+                    "astrmai_request_trace": {
+                        "semantic_system_hash": "semantic8888",
+                        "semantic_system_length": 260,
+                        "gateway_system_hash": "gateway1111",
+                        "gateway_prompt_hash": "gateway2222",
+                        "provider_visible_system_hash": "syshash1111",
+                        "provider_visible_prompt_hash": "prompthash2222",
+                        "post_hook_system_hash": "posthook3333",
+                        "request_session_id": "session-abc",
+                        "request_cache_control": '{"type":"ephemeral"}',
+                        "request_provider_family": "anthropic",
+                        "request_model_id": "claude-3-5-sonnet",
+                        "usage_input_tokens": 900,
+                        "usage_input_cached": 700,
+                        "usage_output_tokens": 80,
+                    },
+                    "astrmai_cache_affinity_enabled": True,
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extra.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extra[key] = value
+
+        async def run():
+            planner = object.__new__(planner_mod.Planner)
+            planner.context_engine = SimpleNamespace(
+                get_last_prefix_status=lambda chat_id: {
+                    "prefix_hash": "",
+                    "semantic_system_hash": "semantic8888",
+                    "semantic_system_length": 260,
+                    "prefix_stable": False,
+                    "prefix_changed_reason": "first_seen",
+                    "frozen_prefix_length": 0,
+                    "semi_stable_length": 0,
+                    "frozen_prefix_blocks": {},
+                    "semi_stable_blocks": {},
+                    "system_rules_items": [],
+                    "system_rules_candidate_items": [],
+                }
+            )
+            planner.dialogue_store = None
+            planner.context_compaction = None
+            event = DummyEvent()
+            await planner._update_turn_trace_runtime(event, "chat-1", prompt_envelope=None, reply_text="ok")
+            turn_context = planner_mod.ensure_turn_context(event)
+            self.assertEqual(turn_context.continuity.semantic_system_hash, "semantic8888")
+            self.assertEqual(turn_context.continuity.semantic_system_length, 260)
+            self.assertEqual(turn_context.continuity.gateway_system_hash, "gateway1111")
+            self.assertEqual(turn_context.continuity.gateway_prompt_hash, "gateway2222")
+            self.assertEqual(turn_context.continuity.provider_visible_system_hash, "syshash1111")
+            self.assertEqual(turn_context.continuity.provider_visible_prompt_hash, "prompthash2222")
+            self.assertEqual(turn_context.continuity.post_hook_system_hash, "posthook3333")
+            self.assertEqual(turn_context.continuity.request_session_id, "session-abc")
+            self.assertEqual(turn_context.continuity.request_cache_control, '{"type":"ephemeral"}')
+            self.assertEqual(turn_context.continuity.request_provider_family, "anthropic")
+            self.assertEqual(turn_context.continuity.request_model_id, "claude-3-5-sonnet")
+            self.assertEqual(turn_context.continuity.usage_input_tokens, 900)
+            self.assertEqual(turn_context.continuity.usage_input_cached, 700)
+            self.assertEqual(turn_context.continuity.usage_output_tokens, 80)
+            self.assertTrue(turn_context.continuity.cache_ready)
+            self.assertTrue(turn_context.continuity.cache_hit)
+            self.assertTrue(turn_context.continuity.cache_hit_evidence_supported)
+            self.assertIn("explicit_cache_hint", turn_context.continuity.cache_ready_reasons)
+            self.assertIn("session_reuse", turn_context.continuity.cache_ready_reasons)
+            self.assertIn("cache_affinity_enabled", turn_context.continuity.cache_ready_reasons)
+
+        asyncio.run(run())
+
+    def test_update_turn_trace_runtime_marks_provider_visible_hash_stable_against_previous_turn(self):
+        planner_mod = importlib.import_module("astrmai.conversation.planning.planner")
+
+        class DummyEvent:
+            def __init__(self):
+                self._extra = {
+                    "astrmai_request_trace": {
+                        "gateway_system_hash": "gateway-new",
+                        "gateway_prompt_hash": "gateway-prompt",
+                        "provider_visible_system_hash": "provider-same",
+                        "provider_visible_prompt_hash": "prompt-same",
+                        "post_hook_system_hash": "provider-same",
+                        "request_session_id": "",
+                        "request_cache_control": "",
+                        "request_provider_family": "anthropic",
+                        "request_model_id": "claude-3-5-sonnet",
+                        "usage_input_tokens": 500,
+                        "usage_input_cached": 0,
+                        "usage_output_tokens": 60,
+                    }
+                }
+
+            def get_extra(self, key, default=None):
+                return self._extra.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extra[key] = value
+
+        async def run():
+            planner = object.__new__(planner_mod.Planner)
+            planner.context_engine = SimpleNamespace(
+                get_last_prefix_status=lambda chat_id: {
+                    "prefix_hash": "",
+                    "semantic_system_hash": "semantic9999",
+                    "semantic_system_length": 260,
+                    "prefix_stable": False,
+                    "prefix_changed_reason": "first_seen",
+                    "frozen_prefix_length": 0,
+                    "semi_stable_length": 0,
+                    "frozen_prefix_blocks": {},
+                    "semi_stable_blocks": {},
+                    "system_rules_items": [],
+                    "system_rules_candidate_items": [],
+                }
+            )
+            planner.dialogue_store = None
+            planner.context_compaction = None
+            planner._provider_visible_system_hash_history = {"chat-1": "provider-same"}
+            event = DummyEvent()
+            await planner._update_turn_trace_runtime(event, "chat-1", prompt_envelope=None, reply_text="ok")
+            turn_context = planner_mod.ensure_turn_context(event)
+            self.assertIn("provider_visible_hash_stable", turn_context.continuity.cache_ready_reasons)
 
         asyncio.run(run())
 

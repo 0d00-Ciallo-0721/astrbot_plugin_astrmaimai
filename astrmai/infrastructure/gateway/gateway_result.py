@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -16,6 +17,13 @@ except ImportError:
 
 
 class GatewayResultMixin:
+    @staticmethod
+    def _stable_hash_text(text: Any) -> str:
+        normalized = str(text or "")
+        if not normalized:
+            return ""
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
     def _read_usage_field(self, usage: Any, *names: str) -> int:
         if usage is None:
             return 0
@@ -42,6 +50,33 @@ class GatewayResultMixin:
             "total_tokens": input_tokens + output_tokens,
         }
 
+    def _build_cache_observation(
+        self,
+        usage: Dict[str, int],
+        debug_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        debug_meta = debug_meta or {}
+        cache_ready_reasons: list[str] = []
+        if str(debug_meta.get("request_cache_control", "") or "").strip():
+            cache_ready_reasons.append("explicit_cache_hint")
+        if str(debug_meta.get("request_session_id", "") or "").strip():
+            cache_ready_reasons.append("session_reuse")
+        if bool(debug_meta.get("prefix_stable", False)):
+            cache_ready_reasons.append("semantic_system_hash_stable")
+        if bool(debug_meta.get("provider_visible_hash_stable", False)):
+            cache_ready_reasons.append("provider_visible_hash_stable")
+        if bool(debug_meta.get("cache_affinity_enabled", False)):
+            cache_ready_reasons.append("cache_affinity_enabled")
+        cache_ready_reasons = list(dict.fromkeys(cache_ready_reasons))
+        input_cached = int((usage or {}).get("input_cached", 0) or 0)
+        cached_usage_supported = bool(debug_meta.get("cached_usage_supported", False) or input_cached > 0)
+        return {
+            "cache_ready": bool(cache_ready_reasons),
+            "cache_hit": bool(input_cached > 0),
+            "cache_ready_reasons": cache_ready_reasons,
+            "cache_hit_evidence_supported": cached_usage_supported,
+        }
+
     def _log_usage(
         self,
         pool_name: str,
@@ -53,8 +88,9 @@ class GatewayResultMixin:
         input_tokens = usage.get("input_tokens", 0)
         input_cached = usage.get("input_cached", 0)
         cache_rate = (input_cached / input_tokens) if input_tokens else 0.0
+        cache_observation = self._build_cache_observation(usage, debug_meta)
         logger.info(
-            "[GatewayUsage] pool=%s model=%s provider=%s lane_key=%s conversation_id=%s prefix_hash=%s input_tokens=%s input_cached=%s output_tokens=%s cache_rate=%.4f",
+            "[GatewayUsage] pool=%s model=%s provider=%s lane_key=%s conversation_id=%s prefix_hash=%s input_tokens=%s input_cached=%s output_tokens=%s cache_rate=%.4f cache_ready=%s cache_hit=%s cache_ready_reasons=%s",
             pool_name,
             model_id,
             debug_meta.get("provider", model_id),
@@ -65,6 +101,9 @@ class GatewayResultMixin:
             input_cached,
             usage.get("output_tokens", 0),
             cache_rate,
+            cache_observation.get("cache_ready", False),
+            cache_observation.get("cache_hit", False),
+            ",".join(cache_observation.get("cache_ready_reasons", []) or []),
         )
 
     def _build_success_result(

@@ -1,0 +1,10 @@
+{"kind": "case", "case_id": "poke_lightweight", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "normal_private", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "deep_memory", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "tool_intent", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "group_non_direct", "reply_preview": ""}
+{"kind": "case", "case_id": "pushback_strict", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "zh_group_non_direct", "reply_preview": ""}
+{"kind": "case", "case_id": "zh_memory_intent", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "zh_tool_intent", "reply_preview": "Brief offline reply."}
+{"kind": "case", "case_id": "zh_boundary_mild", "reply_preview": "Brief offline reply."}

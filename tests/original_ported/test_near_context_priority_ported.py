@@ -50,9 +50,9 @@ class NearContextPriorityPortedTests(unittest.TestCase):
                 chat_id="default:GroupMessage:group-1",
                 event_messages=[],
                 retrieve_keys=[],
-                slang_patterns="SLANG_BLOCK_SHOULD_DROP",
-                expression_habits="EXPRESSION_BLOCK_SHOULD_DROP",
-                jargon_explanation="JARGON_BLOCK_SHOULD_DROP",
+                situational_style_cues="SLANG_BLOCK_SHOULD_DROP",
+                stable_expression_habits="EXPRESSION_BLOCK_SHOULD_DROP",
+                stable_jargon_explanation="JARGON_BLOCK_SHOULD_DROP",
                 near_context_priority=True,
             )
 

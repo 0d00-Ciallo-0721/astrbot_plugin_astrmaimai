@@ -149,10 +149,14 @@ class PlanningInputLoader:
     ) -> dict[str, Any]:
         level = int(think_level or 0)
         result: dict[str, Any] = {
+            # Deprecated compatibility mirrors for legacy readers outside the main reply chain.
             "slang_context": "",
             "goal_text": "",
             "expression_habits": "",
             "jargon_explanation": "",
+            "stable_expression_habits": "",
+            "situational_style_cues": "",
+            "stable_jargon_explanation": "",
             "planner_reasoning": "",
             "goals_context": "",
             "tool_state": ToolStateInputs(),
@@ -191,6 +195,13 @@ class PlanningInputLoader:
         for item in loaded_items:
             self._record_timing(event, item)
             result[item.name] = item.value
+
+        result["stable_expression_habits"] = str(result.get("expression_habits", "") or "")
+        situational_style_parts = [
+            str(result.get("slang_context", "") or "").strip(),
+        ]
+        result["situational_style_cues"] = "\n".join(part for part in situational_style_parts if part).strip()
+        result["stable_jargon_explanation"] = str(result.get("jargon_explanation", "") or "")
 
         if level >= 2:
             goal_item = await self._run_timed(

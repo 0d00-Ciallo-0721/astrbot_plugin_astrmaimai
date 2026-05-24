@@ -260,7 +260,7 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         self.assertIn("我刚看到一张图片，画面是：一只在窗边打盹的猫。", model_prompt)
         self.assertIn("它给我的感觉是：安静, 柔软。", model_prompt)
-        self.assertIn("我刚看到一张图片，画面是：一只在窗边打盹的猫。", system_prompt)
+        self.assertEqual(system_prompt, "system")
         self.assertNotIn("System note", model_prompt)
         self.assertNotIn("[Vision]", model_prompt)
         self.assertTrue(any(mode == "vision" for mode, _kwargs in gateway.calls))

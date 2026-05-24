@@ -14,6 +14,51 @@ from .provider_capabilities import infer_provider_capabilities
 
 
 class GatewayLaneMixin:
+    @staticmethod
+    def _stringify_request_cache_control(value: Any) -> str:
+        if not value:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+
+    def _record_event_request_trace(
+        self,
+        event: Any,
+        *,
+        system_prompt: str,
+        prompt: str,
+        post_hook_system_prompt: str = "",
+        request_kwargs: Optional[Dict[str, Any]] = None,
+        provider_family: str = "",
+        model_id: str = "",
+        usage: Optional[Dict[str, int]] = None,
+    ) -> None:
+        if event is None or not hasattr(event, "set_extra") or not hasattr(event, "get_extra"):
+            return
+        existing_payload = event.get_extra("astrmai_request_trace", {})
+        if not isinstance(existing_payload, dict):
+            existing_payload = {}
+        trace_payload = {
+            **existing_payload,
+            "gateway_system_hash": self._stable_hash_text(system_prompt),
+            "gateway_prompt_hash": self._stable_hash_text(prompt),
+            "provider_visible_system_hash": existing_payload.get("provider_visible_system_hash", "") or self._stable_hash_text(system_prompt),
+            "provider_visible_prompt_hash": existing_payload.get("provider_visible_prompt_hash", "") or self._stable_hash_text(prompt),
+            "post_hook_system_hash": existing_payload.get("post_hook_system_hash", "") or self._stable_hash_text(post_hook_system_prompt or system_prompt),
+            "request_session_id": str((request_kwargs or {}).get("session_id", "") or ""),
+            "request_cache_control": self._stringify_request_cache_control((request_kwargs or {}).get("cache_control")),
+            "request_provider_family": str(provider_family or ""),
+            "request_model_id": str(model_id or ""),
+            "usage_input_tokens": int((usage or {}).get("input_tokens", 0) or 0),
+            "usage_input_cached": int((usage or {}).get("input_cached", 0) or 0),
+            "usage_output_tokens": int((usage or {}).get("output_tokens", 0) or 0),
+        }
+        event.set_extra("astrmai_request_trace", trace_payload)
+
     def _lane_debug_meta(
         self,
         lane_key: LaneKey,
@@ -106,6 +151,7 @@ class GatewayLaneMixin:
         persona_id: str = "",
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
+        event: Any = None,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -214,6 +260,18 @@ class GatewayLaneMixin:
         )
         result.economy = workload_trace.as_dict()
         self.context_economy.record_trace(workload_trace)
+        self._record_event_request_trace(
+            event,
+            system_prompt=system_prompt,
+            prompt=prompt,
+            request_kwargs={
+                "session_id": provider_session_id,
+                "cache_control": {"type": "ephemeral"} if (workload_policy.use_cache_hint and provider_caps.supports_cache_control) else None,
+            },
+            provider_family=result.provider_family or provider_caps.provider_family,
+            model_id=result.model_id or model_hint,
+            usage=result.usage,
+        )
 
         assistant_content = json.dumps(result.parsed_json, ensure_ascii=False) if is_json else result.text
         artifact = self._build_lane_artifact(result, assistant_content)
@@ -405,6 +463,15 @@ class GatewayLaneMixin:
                         economy=workload_trace.as_dict(),
                     )
                     self.context_economy.record_trace(workload_trace)
+                    self._record_event_request_trace(
+                        event,
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        request_kwargs=tool_kwargs,
+                        provider_family=capabilities.provider_family,
+                        model_id=model_id,
+                        usage=usage,
+                    )
                     if "[TERMINAL_YIELD]:" in stripped_reply:
                         terminal_content = stripped_reply.split("[TERMINAL_YIELD]:", 1)[1].strip()
                         artifact = self._build_lane_artifact(result, terminal_content)
@@ -479,6 +546,15 @@ class GatewayLaneMixin:
                     economy=workload_trace.as_dict(),
                 )
                 self.context_economy.record_trace(workload_trace)
+                self._record_event_request_trace(
+                    event,
+                    system_prompt=system_prompt,
+                    prompt=prompt,
+                    request_kwargs=tool_kwargs,
+                    provider_family=capabilities.provider_family,
+                    model_id=model_id,
+                    usage=usage,
+                )
                 artifact = self._build_lane_artifact(result, result.text)
                 await self.lane_manager.append_visible_reply_artifact(
                     lane_key=effective_lane_key,

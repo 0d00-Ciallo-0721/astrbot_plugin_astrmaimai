@@ -72,18 +72,18 @@ class PromptPrefixStabilityPortedTests(unittest.TestCase):
                 chat_id="default:GroupMessage:group-1",
                 event_messages=[],
                 retrieve_keys=[],
-                slang_patterns="fixed slang",
-                expression_habits="fixed habit",
-                jargon_explanation="fixed jargon",
+                situational_style_cues="fixed slang",
+                stable_expression_habits="fixed habit",
+                stable_jargon_explanation="fixed jargon",
             )
             hash1 = engine.get_last_prefix_hash("default:GroupMessage:group-1")
             prompt2 = await engine.build_prompt(
                 chat_id="default:GroupMessage:group-1",
                 event_messages=[],
                 retrieve_keys=[],
-                slang_patterns="fixed slang",
-                expression_habits="fixed habit",
-                jargon_explanation="fixed jargon",
+                situational_style_cues="fixed slang",
+                stable_expression_habits="fixed habit",
+                stable_jargon_explanation="fixed jargon",
             )
             hash2 = engine.get_last_prefix_hash("default:GroupMessage:group-1")
             return prompt1, prompt2, hash1, hash2
@@ -99,6 +99,7 @@ class PromptPrefixStabilityPortedTests(unittest.TestCase):
         self.assertEqual(proactive_recall1, proactive_recall2)
         self.assertNotIn("<CHAT_HISTORY>", system_prompt1)
         self.assertNotIn("[Tools]", system_prompt1)
+        self.assertNotIn("fixed slang", system_prompt1)
 
 
 if __name__ == "__main__":

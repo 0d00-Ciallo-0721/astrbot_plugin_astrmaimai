@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -89,6 +91,22 @@ class AstrMaiPlugin(Star):
             session_kind="astrbot_native",
             source="astrbot",
         )
+        if hasattr(event, "set_extra"):
+            normalized_system_prompt = str(getattr(request, "system_prompt", "") or "")
+            post_hook_hash = hashlib.sha256(normalized_system_prompt.encode("utf-8")).hexdigest()[:16] if normalized_system_prompt else ""
+            event.set_extra("astrmai_post_hook_system_hash", post_hook_hash)
+            existing_trace = event.get_extra("astrmai_request_trace", {}) if hasattr(event, "get_extra") else {}
+            if not isinstance(existing_trace, dict):
+                existing_trace = {}
+            existing_trace.update(
+                {
+                    "provider_visible_system_hash": post_hook_hash or str(existing_trace.get("provider_visible_system_hash", "") or ""),
+                    "post_hook_system_hash": post_hook_hash,
+                    "request_session_id": str(getattr(request, "session_id", "") or existing_trace.get("request_session_id", "") or ""),
+                    "request_cache_control": str(existing_trace.get("request_cache_control", "") or ""),
+                }
+            )
+            event.set_extra("astrmai_request_trace", existing_trace)
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
         async for result in handle_mai_help(self.facade, event):

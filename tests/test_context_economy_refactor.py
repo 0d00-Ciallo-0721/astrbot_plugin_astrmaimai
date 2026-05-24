@@ -317,6 +317,156 @@ class ContextEconomyPolicyTests(unittest.TestCase):
         self.assertEqual(envelope.template_version, "v3")
         self.assertEqual(envelope.schema_id, "text")
 
+    def test_dream_template_and_fallback_share_stable_system_shell_wording(self):
+        templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
+        templates_mod = importlib.reload(templates_mod)
+        registry = templates_mod.PromptTemplateRegistry()
+        envelope = registry.render_template(
+            templates_mod.PromptTemplateId.DREAM_GENERATION,
+            {
+                "persona_name": "Mai",
+                "style": "奇幻冒险",
+                "dream_log": "log",
+            },
+        )
+        self.assertEqual(
+            envelope.system_prompt.split("\n\n")[0],
+            "你是一个善于幻想与创作的写作助手，擅长用诗意的语言描述梦境。",
+        )
+
+    def test_memory_topic_summary_keeps_segment_count_out_of_system_prompt(self):
+        templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
+        templates_mod = importlib.reload(templates_mod)
+        registry = templates_mod.PromptTemplateRegistry()
+
+        envelope_two = registry.render_template(
+            templates_mod.PromptTemplateId.MEMORY_TOPIC_SUMMARY,
+            {
+                "segment_count": 2,
+                "combined_segments": "A\nB",
+            },
+        )
+        envelope_five = registry.render_template(
+            templates_mod.PromptTemplateId.MEMORY_TOPIC_SUMMARY,
+            {
+                "segment_count": 5,
+                "combined_segments": "A\nB\nC\nD\nE",
+            },
+        )
+
+        self.assertNotIn("当前共有 2 个话题段", envelope_two.system_prompt)
+        self.assertNotIn("当前共有 5 个话题段", envelope_five.system_prompt)
+        self.assertIn("[Segment Count]\n2", envelope_two.prompt)
+        self.assertIn("[Segment Count]\n5", envelope_five.prompt)
+        self.assertEqual(envelope_two.stable_prefix_text, envelope_five.stable_prefix_text)
+
+    def test_dream_generation_keeps_style_and_persona_name_out_of_system_prompt(self):
+        templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
+        templates_mod = importlib.reload(templates_mod)
+        registry = templates_mod.PromptTemplateRegistry()
+
+        envelope_a = registry.render_template(
+            templates_mod.PromptTemplateId.DREAM_GENERATION,
+            {
+                "persona_name": "Mai",
+                "style": "奇幻冒险",
+                "dream_log": "log-a",
+            },
+        )
+        envelope_b = registry.render_template(
+            templates_mod.PromptTemplateId.DREAM_GENERATION,
+            {
+                "persona_name": "Astra",
+                "style": "安静悬疑",
+                "dream_log": "log-b",
+            },
+        )
+
+        self.assertNotIn("Mai", envelope_a.system_prompt)
+        self.assertNotIn("Astra", envelope_b.system_prompt)
+        self.assertNotIn("奇幻冒险", envelope_a.system_prompt)
+        self.assertNotIn("安静悬疑", envelope_b.system_prompt)
+        self.assertIn("[Persona Name]\nMai", envelope_a.prompt)
+        self.assertIn("[Dream Style]\n奇幻冒险", envelope_a.prompt)
+        self.assertIn("[Persona Name]\nAstra", envelope_b.prompt)
+        self.assertIn("[Dream Style]\n安静悬疑", envelope_b.prompt)
+        self.assertEqual(envelope_a.stable_prefix_text, envelope_b.stable_prefix_text)
+
+    def test_cache_priority_hash_stays_stable_when_template_payload_parameters_change(self):
+        templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
+        templates_mod = importlib.reload(templates_mod)
+        center = self.center_mod.ContextEconomyCenter()
+
+        topic_env_a = center.templates.render_template(
+            templates_mod.PromptTemplateId.MEMORY_TOPIC_SUMMARY,
+            {"segment_count": 1, "combined_segments": "alpha"},
+        )
+        topic_env_b = center.templates.render_template(
+            templates_mod.PromptTemplateId.MEMORY_TOPIC_SUMMARY,
+            {"segment_count": 9, "combined_segments": "alpha\nbeta"},
+        )
+
+        req_a = center.build_request(
+            family=self.models_mod.WorkloadFamily.MEMORY_TOPIC_SUMMARY,
+            pool_name="task",
+            prompt=topic_env_a.prompt,
+            system_prompt=topic_env_a.system_prompt,
+            models=["model-a"],
+            scope_id="global",
+            template_envelope=topic_env_a,
+        )
+        req_b = center.build_request(
+            family=self.models_mod.WorkloadFamily.MEMORY_TOPIC_SUMMARY,
+            pool_name="task",
+            prompt=topic_env_b.prompt,
+            system_prompt=topic_env_b.system_prompt,
+            models=["model-a"],
+            scope_id="global",
+            template_envelope=topic_env_b,
+        )
+
+        policy_a = center.resolve_policy(req_a)
+        policy_b = center.resolve_policy(req_b)
+
+        self.assertEqual(policy_a.stable_prefix_hash, policy_b.stable_prefix_hash)
+        self.assertEqual(len(policy_a.stable_prefix_text), len(policy_b.stable_prefix_text))
+        self.assertNotEqual(len(policy_a.dynamic_payload_text), len(policy_b.dynamic_payload_text))
+
+        dream_env_a = center.templates.render_template(
+            templates_mod.PromptTemplateId.DREAM_GENERATION,
+            {"persona_name": "Mai", "style": "奇幻冒险", "dream_log": "log-a"},
+        )
+        dream_env_b = center.templates.render_template(
+            templates_mod.PromptTemplateId.DREAM_GENERATION,
+            {"persona_name": "Nova", "style": "冷调科幻", "dream_log": "log-b"},
+        )
+
+        dream_req_a = center.build_request(
+            family=self.models_mod.WorkloadFamily.DREAM_GENERATION,
+            pool_name="task",
+            prompt=dream_env_a.prompt,
+            system_prompt=dream_env_a.system_prompt,
+            models=["model-a"],
+            scope_id="global",
+            template_envelope=dream_env_a,
+        )
+        dream_req_b = center.build_request(
+            family=self.models_mod.WorkloadFamily.DREAM_GENERATION,
+            pool_name="task",
+            prompt=dream_env_b.prompt,
+            system_prompt=dream_env_b.system_prompt,
+            models=["model-a"],
+            scope_id="global",
+            template_envelope=dream_env_b,
+        )
+
+        dream_policy_a = center.resolve_policy(dream_req_a)
+        dream_policy_b = center.resolve_policy(dream_req_b)
+
+        self.assertEqual(dream_policy_a.stable_prefix_hash, dream_policy_b.stable_prefix_hash)
+        self.assertEqual(len(dream_policy_a.stable_prefix_text), len(dream_policy_b.stable_prefix_text))
+        self.assertNotEqual(len(dream_policy_a.dynamic_payload_text), len(dream_policy_b.dynamic_payload_text))
+
 
 class ContextEconomyGatewayTests(unittest.TestCase):
     def setUp(self):

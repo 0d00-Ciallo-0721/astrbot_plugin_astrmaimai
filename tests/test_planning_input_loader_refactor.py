@@ -209,7 +209,10 @@ def test_budgeted_prompt_inputs_respect_think_level(tmp_path):
     level_zero = asyncio.run(
         loader.load_prompt_inputs(level_zero_event, "chat-1", None, ["hello"], 0, user_id="user-1")
     )
-    assert level_zero["expression_habits"] == ""
+    assert level_zero["stable_expression_habits"] == ""
+    assert level_zero["situational_style_cues"] == ""
+    assert level_zero["stable_jargon_explanation"] == ""
+    assert level_zero["expression_habits"] == ""  # compatibility mirror
     assert planner.calls == []
     assert level_zero_event.get_extra("astrmai_side_input_timings")[0]["skipped_reason"] == "think_level_0"
 
@@ -217,15 +220,20 @@ def test_budgeted_prompt_inputs_respect_think_level(tmp_path):
     level_one = asyncio.run(
         loader.load_prompt_inputs(level_one_event, "chat-1", None, ["hello there"], 1, user_id="user-1")
     )
-    assert level_one["expression_habits"] == "expression habits"
+    assert level_one["stable_expression_habits"] == "expression habits"
+    assert level_one["situational_style_cues"] == ""
+    assert level_one["expression_habits"] == "expression habits"  # compatibility mirror
     assert level_one["tool_state"].state.energy == 0.7
 
     level_two_event = _Event()
     level_two = asyncio.run(
         loader.load_prompt_inputs(level_two_event, "chat-1", None, ["please analyze this"], 2, user_id="user-1")
     )
-    assert level_two["slang_context"] == ""
-    assert level_two["jargon_explanation"] == ""
+    assert level_two["stable_expression_habits"] == "expression habits"
+    assert level_two["situational_style_cues"] == ""
+    assert level_two["stable_jargon_explanation"] == ""
+    assert level_two["slang_context"] == ""  # compatibility mirror
+    assert level_two["jargon_explanation"] == ""  # compatibility mirror
     assert ("jargon", "chat-1", 8) not in planner.calls
     assert level_two["planner_reasoning"] == "keep current topic"
     assert level_two["goals_context"] == "goal context"
@@ -287,7 +295,8 @@ def test_memory_feedback_and_failures_degrade_without_blocking(tmp_path):
     result = asyncio.run(
         loader.load_prompt_inputs(failed_event, "chat-1", None, ["please analyze this"], 1, user_id="user-1")
     )
-    assert result["expression_habits"] == ""
+    assert result["stable_expression_habits"] == ""
+    assert result["expression_habits"] == ""  # compatibility mirror
     failed_timing = next(item for item in failed_event.get_extra("astrmai_side_input_timings") if item["name"] == "expression_habits")
     assert failed_timing["ok"] is False
     assert "RuntimeError" in failed_timing["error"]

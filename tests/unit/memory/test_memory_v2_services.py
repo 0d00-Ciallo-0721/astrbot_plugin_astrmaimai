@@ -828,6 +828,56 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_instant_memory_legacy_backfill_remains_user_only_compat_path(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            class _Gateway:
+                def __init__(self):
+                    self.calls = []
+                    self.config = _Config()
+
+                async def call_data_process_task(self, *args, **kwargs):
+                    self.calls.append({"args": args, "kwargs": kwargs})
+                    return {"worth": True, "fact": "用户想记住今天聊到的那家咖啡馆"}
+
+            gateway = _Gateway()
+            gate = gate_mod.InstantMemoryGate(
+                gateway=gateway,
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            gate.prompt_registry = None
+            turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-legacy-compat",
+                chat_id="chat-legacy",
+                user_text="今天聊到那家咖啡馆别忘了",
+                assistant_text="好",
+                source="test",
+                think_level=2,
+            )
+
+            result = await gate.run_llm_backfill(turn)
+
+            self.assertTrue(result.hit)
+            self.assertEqual(len(gateway.calls), 1)
+            self.assertFalse(gateway.calls[0]["kwargs"].get("system_prompt"))
+            rows = await store.list_candidates(session_id="chat-legacy", kinds=["fact"], limit=10)
+            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
+            self.assertEqual(len(llm_rows), 1)
+
+        asyncio.run(run())
+
     def test_search_prefers_fts_and_basic_terms_still_work(self):
         async def run():
             store, retrieval, writer, _injection, _tools, _maintenance = self._services()

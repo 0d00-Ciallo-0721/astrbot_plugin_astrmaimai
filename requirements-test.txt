@@ -1,0 +1,3 @@
+pytest==7.4.0
+nonebot2==2.4.4
+nonebug==0.4.3

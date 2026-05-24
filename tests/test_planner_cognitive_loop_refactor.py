@@ -311,9 +311,72 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         turn_trace = planner.turn_trace_history[0]
         self.assertEqual(turn_trace["status"], "executed")
         self.assertEqual(turn_trace["cognitive"]["memory_policy"], "none")
+        self.assertGreaterEqual(turn_trace["continuity"]["system_prompt_length"], 0)
+        self.assertGreaterEqual(turn_trace["continuity"]["prompt_length"], 0)
+        self.assertGreaterEqual(turn_trace["continuity"]["frozen_prefix_length"], 0)
         rendered_trace = str(turn_trace)
         self.assertNotIn("focus on this sentence first", rendered_trace)
         self.assertNotIn("final prompt", rendered_trace)
+
+    def test_planner_moves_long_reply_and_mode_runtime_instructions_to_prompt_blocks(self):
+        planner = self._make_planner(
+            self.planner_mod.CognitiveDecision(
+                action="reply",
+                intent="reply to current clue",
+                memory_policy="light",
+                social_intent="answer",
+                action_tier="none",
+            )
+        )
+        stable, dynamic = planner._adjust_expression_habits_for_behavior(
+            "Use short fragments.",
+            planner.cognitive_loop.decision,
+            ["long_reply"],
+        )
+        self.assertEqual(stable, "Use short fragments.")
+        self.assertEqual(dynamic, "Keep this turn short; avoid another long reply.")
+
+        decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="reply to current clue",
+            memory_policy="light",
+            social_intent="answer",
+            action_tier="sys3",
+        )
+        planner = self._make_planner(decision)
+        event = _FakeEvent(text="请直接说重点")
+        _install_focus_extras(event)
+        event.set_extra("retrieve_keys", ["ALL"])
+        event.set_extra("judge_action", "TOOL_CALL")
+
+        asyncio.run(planner.plan_and_execute(event, [event]))
+
+        envelope = planner.prompt_refiner.calls[0]["prompt_envelope"]
+        self.assertEqual(planner.executor.calls[0]["system_prompt"], "system prompt only")
+        self.assertIn("soft_background", planner.turn_trace_history[0]["continuity"]["dynamic_prompt_blocks"])
+        self.assertGreaterEqual(
+            planner.turn_trace_history[0]["continuity"]["dynamic_prompt_length"],
+            len(envelope.cognitive_drive_block),
+        )
+
+    def test_planner_uses_planner_reasoning_when_cognitive_drive_fallback_needs_it(self):
+        decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="reply to current clue",
+            memory_policy="light",
+            social_intent="answer",
+            action_tier="none",
+        )
+        planner = self._make_planner(decision)
+        planner._agency_posture_guidance = lambda *_args, **_kwargs: ""
+        event = _FakeEvent(text="继续这个点")
+        _install_focus_extras(event)
+
+        asyncio.run(planner.plan_and_execute(event, [event]))
+
+        envelope = event.get_extra("astrmai_prompt_envelope")
+        planner_reasoning = planner.context_engine.calls[0]["planner_reasoning"]
+        self.assertEqual(envelope.cognitive_drive_block, planner_reasoning)
 
     def test_planner_writes_agency_extras_and_reflection(self):
         decision = self.planner_mod.CognitiveDecision(

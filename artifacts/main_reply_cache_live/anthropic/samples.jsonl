@@ -1,0 +1,1 @@
+{"case_id": "dry_run_capability_only", "provider_family": "anthropic", "model": "kimi-k2.6", "endpoint_kind": "anthropic_messages", "provider_supports_cache_hint": true, "provider_supports_usage_reporting": true, "provider_supports_session_id": false, "blocking_reason": "missing_api_key", "request_execution_possible": false}

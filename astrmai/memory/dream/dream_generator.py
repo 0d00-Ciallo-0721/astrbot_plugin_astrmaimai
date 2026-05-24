@@ -91,7 +91,7 @@ class DreamGenerator:
                 result = await self.gateway.call_data_process_task(
                     prompt=prompt,
                     is_json=False,
-                    system_prompt="你是一个善于幻想与创作的写作助手，擅长用富有画面感的语言描写梦境。",
+                    system_prompt="你是一个善于幻想与创作的写作助手，擅长用诗意的语言描述梦境。",
                     lane_key=LaneKey(subsystem="bg", task_family="dream", scope_id=lane_scope_id, scope_kind=lane_scope_kind),
                     base_origin="",
                 )

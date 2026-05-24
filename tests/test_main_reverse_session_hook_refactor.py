@@ -113,7 +113,18 @@ class ReverseSessionMainHookTests(unittest.TestCase):
             provider_config={"reverse_provider": "gemini_reverse"},
         )
         plugin.context = SimpleNamespace(get_using_provider=lambda origin: provider)
-        event = SimpleNamespace(unified_msg_origin="platform:FriendMessage:user-1")
+        class _Event:
+            def __init__(self):
+                self.unified_msg_origin = "platform:FriendMessage:user-1"
+                self._extra = {"astrmai_request_trace": {"gateway_system_hash": "prehook1111"}}
+
+            def get_extra(self, key, default=None):
+                return self._extra.get(key, default)
+
+            def set_extra(self, key, value):
+                self._extra[key] = value
+
+        event = _Event()
         request = SimpleNamespace(system_prompt="base prompt", session_id="session-1")
 
         asyncio.run(plugin.inject_gemini_reverse_session(event, request))
@@ -122,6 +133,10 @@ class ReverseSessionMainHookTests(unittest.TestCase):
         self.assertIn("astrbot_reverse_session", request.system_prompt)
         self.assertIn("session_id=session-1", request.system_prompt)
         self.assertIn("session_scope=platform:FriendMessage:user-1", request.system_prompt)
+        trace = event.get_extra("astrmai_request_trace", {})
+        self.assertEqual(trace["request_session_id"], "session-1")
+        self.assertEqual(trace["post_hook_system_hash"], event.get_extra("astrmai_post_hook_system_hash"))
+        self.assertEqual(trace["provider_visible_system_hash"], event.get_extra("astrmai_post_hook_system_hash"))
 
 
 if __name__ == "__main__":
