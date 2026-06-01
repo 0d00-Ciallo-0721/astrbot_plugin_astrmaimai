@@ -917,5 +917,62 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertNotIn("anyone here", guidance.lower())
 
 
+    def test_dispatcher_history_reflects_queued_before_async_completion(self):
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+        stored_callback = []
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                stored_callback.append(event_data["extra"]["astrmai_proactive_completion_callback"])
+                return "BUFFERED"
+
+        dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=0.9))),
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=[], wakeup_min_energy=0.0),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="group:10001",
+                    source="wakeup",
+                    reason="async completion",
+                    guidance="say one short line",
+                    metadata={"group_id": "group:10001"},
+                )
+            )
+        )
+
+        self.assertTrue(decision.synthetic_event_queued)
+        self.assertFalse(decision.reply_sent)
+        self.assertEqual(decision.status, "queued")
+
+        history = dispatcher.list_intents(limit=1)[0]
+        self.assertTrue(history["decision"]["synthetic_event_queued"])
+        self.assertFalse(history["decision"]["reply_sent"])
+        self.assertEqual(history["decision"]["status"], "queued")
+        self.assertEqual(history["status"], "queued")
+
+        callback = stored_callback[0]
+        asyncio.run(callback(True, "hello world"))
+
+        history_after = dispatcher.list_intents(limit=1)[0]
+        self.assertTrue(history_after["decision"]["reply_sent"])
+        self.assertEqual(history_after["decision"]["reply_preview"], "hello world")
+        self.assertEqual(history_after["decision"]["status"], "sent")
+        self.assertEqual(history_after["status"], "sent")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 from dataclasses import asdict, dataclass, field
@@ -64,6 +65,7 @@ class ProactiveDispatcher:
         self._history: list[dict[str, Any]] = []
         self._cooldowns: dict[str, float] = {}
         self._callbacks: dict[str, CompletionCallback] = {}
+        self._dispatch_lock = asyncio.Lock()
 
     @staticmethod
     def _preview(text: Any, limit: int = 160) -> str:
@@ -171,7 +173,7 @@ class ProactiveDispatcher:
     def _remember(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> None:
         self._history = [*self._history, self._intent_record(intent, decision)][-self.HISTORY_LIMIT :]
 
-    def _update_history(self, intent_id: str, decision: ProactiveDispatchDecision) -> None:
+    async def _sync_history_for_dispatch(self, intent_id: str, decision: ProactiveDispatchDecision) -> None:
         for item in reversed(self._history):
             if str(item.get("decision", {}).get("intent_id", "")) != intent_id:
                 continue
@@ -192,18 +194,29 @@ class ProactiveDispatcher:
             "cooldown_chats": len(self._cooldowns),
         }
 
-    async def complete(self, intent_id: str, *, reply_sent: bool, reply_preview: str = "") -> None:
+    async def complete(self, intent_id: str, *, reply_sent: bool, reply_preview: str = "", synthetic_event_queued: bool | None = None) -> None:
         callback = self._callbacks.pop(intent_id, None)
         decision = None
+        cooldown_until = 0.0
         for item in reversed(self._history):
             payload = item.get("decision", {})
             if str(payload.get("intent_id", "")) == intent_id:
+                if synthetic_event_queued is not None:
+                    payload["synthetic_event_queued"] = bool(synthetic_event_queued)
                 payload["reply_sent"] = bool(reply_sent)
                 payload["reply_preview"] = self._preview(reply_preview, 120)
-                payload["status"] = "sent" if reply_sent else "skipped"
+                payload["status"] = "sent" if reply_sent else ("queued" if payload.get("synthetic_event_queued") else "skipped")
                 item["decision"] = payload
                 item["reply_sent"] = bool(reply_sent)
                 item["status"] = payload["status"]
+                if reply_sent:
+                    try:
+                        cooldown_seconds = float(item.get("intent", {}).get("cooldown", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        cooldown_seconds = 0.0
+                    if cooldown_seconds > 0:
+                        cooldown_until = time.time() + cooldown_seconds
+                        self._cooldowns[str(item.get("chat_id", "") or "")] = cooldown_until
                 decision = payload
                 break
         if callback:
@@ -214,6 +227,15 @@ class ProactiveDispatcher:
             logger.debug(f"[ProactiveDispatcher] completion updated: {intent_id} -> {decision.get('status')}")
 
     async def dispatch(
+        self,
+        intent: ProactiveMessageIntent,
+        *,
+        on_complete: CompletionCallback | None = None,
+    ) -> ProactiveDispatchDecision:
+        async with self._dispatch_lock:
+            return await self._dispatch_locked(intent, on_complete=on_complete)
+
+    async def _dispatch_locked(
         self,
         intent: ProactiveMessageIntent,
         *,
@@ -237,16 +259,22 @@ class ProactiveDispatcher:
         if not allowed:
             return decision
 
-        if intent.cooldown > 0:
-            self._cooldowns[intent.chat_id] = now + float(intent.cooldown)
         if on_complete:
             self._callbacks[intent.intent_id] = on_complete
 
         async def _completion(reply_sent: bool, reply_preview: str = "") -> None:
-            await self.complete(intent.intent_id, reply_sent=reply_sent, reply_preview=reply_preview)
+            decision.reply_sent = bool(reply_sent)
+            decision.reply_preview = self._preview(reply_preview, 120)
+            decision.status = "sent" if reply_sent else "skipped"
+            await self.complete(
+                intent.intent_id,
+                reply_sent=reply_sent,
+                reply_preview=reply_preview,
+                synthetic_event_queued=decision.synthetic_event_queued,
+            )
 
         event_data = {
-            "message_str": self._preview(intent.guidance, 240) or "A quiet moment may invite a short natural opening.",
+            "message_str": "",
             "timestamp": now,
             "sender_id": str(getattr(self.state_engine, "bot_id", "") or "astrmai"),
             "sender_name": str(getattr(getattr(self.config, "persona", None), "name", "") or "AstrMai"),
@@ -270,10 +298,23 @@ class ProactiveDispatcher:
                 "astrmai_force_engage": True,
             },
         }
-        result = await self.attention_gate.inject_external_event(intent.chat_id, event_data)
+        original_runtime_coordinator = getattr(self.attention_gate, "runtime_coordinator", None)
+        runtime_coordinator_detached = False
+        if hasattr(self.attention_gate, "runtime_coordinator"):
+            try:
+                setattr(self.attention_gate, "runtime_coordinator", None)
+                runtime_coordinator_detached = True
+            except Exception:
+                runtime_coordinator_detached = False
+        try:
+            result = await self.attention_gate.inject_external_event(intent.chat_id, event_data)
+        finally:
+            if runtime_coordinator_detached:
+                setattr(self.attention_gate, "runtime_coordinator", original_runtime_coordinator)
         decision.synthetic_event_queued = bool(result)
-        decision.status = "queued" if decision.synthetic_event_queued else "skipped"
-        self._update_history(intent.intent_id, decision)
+        if not decision.reply_sent:
+            decision.status = "queued" if decision.synthetic_event_queued else "skipped"
+        await self._sync_history_for_dispatch(intent.intent_id, decision)
         return decision
 
 
