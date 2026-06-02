@@ -42,6 +42,11 @@ class WarmContextBundle:
     quote_text: str = ""
     quote_event_ids: list[str] = field(default_factory=list)
     has_latest_assistant: bool = False
+    """Whether the latest assistant message is present in the selected quotes.
+
+    Recalculated by `_build_warm_quotes` after segment selection and
+    deduplication — do not rely on stale values set before that point.
+    """
     topic_preview: str = ""
 
 

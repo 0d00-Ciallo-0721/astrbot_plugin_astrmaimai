@@ -39,7 +39,9 @@ def score_focus_candidate(gate, candidate, normalized_events):
             reason = "same_sender_followup"
         break
 
-    recency_bonus = max(0, 90 - max(0, len(normalized_events) - candidate.index - 1) * 30)
+    latest_ts = normalized_events[-1].timestamp if normalized_events else candidate.timestamp
+    delta = max(0.0, (latest_ts - (candidate.timestamp or latest_ts))) if candidate.timestamp else 0.0
+    recency_bonus = max(0, 90 - int(delta * 5))
     score += recency_bonus
     return score, reason
 
@@ -70,15 +72,13 @@ def select_focus_event(gate, events, self_id: str, normalized_events=None):
         focus_event = events[-1]
         return focus_event, [event for event in events if event is not focus_event], "fallback_last_event"
 
-    best_candidate = max(
-        candidates,
-        key=lambda candidate: (
-            score_focus_candidate(gate, candidate, normalized_events)[0],
-            candidate.index,
-        ),
-    )
-    focus_reason = score_focus_candidate(gate, best_candidate, normalized_events)[1]
-    focus_event = best_candidate.event
+    scored = [
+        (score_focus_candidate(gate, candidate, normalized_events), candidate)
+        for candidate in candidates
+    ]
+    best = max(scored, key=lambda item: (item[0][0], item[1].index))
+    focus_reason = best[0][1]
+    focus_event = best[1].event
     return focus_event, [item for item in events if item is not focus_event], focus_reason
 
 

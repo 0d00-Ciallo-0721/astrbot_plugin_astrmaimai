@@ -191,13 +191,13 @@ class AttentionGate:
             "什么意思",
             "你刚刚",
             "刚刚说",
-            "这个",
-            "那个",
             "上一个",
             "上一句",
             "不是这个",
             "为啥",
             "咋",
+            "什么",
+            "啥",
             "啥意思",
             "不可以",
         ]
@@ -459,7 +459,7 @@ class AttentionGate:
         msg_hash = f"{msg_str}|{bool(extracted_images)}"
         if getattr(session, "last_message_hash", "") == msg_hash and msg_str.strip():
             session.repeat_count = int(getattr(session, "repeat_count", 0) or 0) + 1
-            if session.repeat_count >= 1:
+            if session.repeat_count >= 2:
                 return "repeater_echo"
         else:
             session.last_message_hash = msg_hash

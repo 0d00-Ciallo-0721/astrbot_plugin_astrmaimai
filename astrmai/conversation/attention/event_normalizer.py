@@ -18,6 +18,10 @@ class SessionContext:
     attention_window_ts: List[float] = field(default_factory=list)
     is_evaluating: bool = False
     last_active_time: float = field(default_factory=time.time)
+    last_message_hash: str = ""
+    repeat_count: int = 0
+    last_active_user_time: float = 0.0
+    last_window_open_ts: float = 0.0
 
 
 @dataclass
