@@ -466,6 +466,9 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         class _MemoryEngine:
             summarizer = _MemorySummarizer()
 
+            async def describe_session_eligibility(self, chat_id):
+                return await self.summarizer.describe_session_eligibility(chat_id)
+
         class _DreamScheduler:
             async def describe_session_eligibility(self, chat_id, now_ts):
                 return {"eligible": True, "reason": "eligible", "throttle_scope": "global"}
@@ -509,6 +512,9 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
 
         class _MemoryEngine:
             summarizer = _MemorySummarizer()
+
+            async def describe_session_eligibility(self, chat_id):
+                return await self.summarizer.describe_session_eligibility(chat_id)
 
         class _DreamScheduler:
             async def describe_session_eligibility(self, chat_id, now_ts):
@@ -957,15 +963,9 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.state.pending_signals["schedule_reason"], "proactive_wakeup")
 
     def test_message_entry_routes_through_kernel_after_guards(self):
-        calls = []
-
-        class _Kernel:
-            async def tick(self, *, chat_id, trigger, event=None):
-                calls.append((chat_id, trigger, event.message_str))
-                return SimpleNamespace(dispatch_result="BUFFERED")
-
-        async def _record_user_message(event):
-            calls.append(("record", event.unified_msg_origin))
+        # handle_global_message 已重构为仅处理 facade 级守卫和委托；
+        # kernel/record_user_message 调用已迁移至 PluginFacade.on_global_message。
+        facade_calls = []
 
         runtime = SimpleNamespace(
             config=SimpleNamespace(
@@ -975,12 +975,54 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
             group_reply_wait_manager=None,
             lifecycle=SimpleNamespace(manager=None),
             reflect_tracker=None,
-            evolution=SimpleNamespace(record_user_message=_record_user_message),
-            attention_gate=SimpleNamespace(process_event=lambda event: (_ for _ in ()).throw(AssertionError("attention gate should be wrapped by kernel"))),
-            host_bridge=SimpleNamespace(suppress_default_llm=lambda event: "(ghost)"),
-            chat_loop_kernel=_Kernel(),
+            evolution=SimpleNamespace(record_user_message=lambda event: None),
+            attention_gate=None,
+            host_bridge=None,
+            chat_loop_kernel=None,
         )
-        facade = SimpleNamespace(is_framework_command=lambda msg: False)
+
+        async def _handle_group_reply_wait(event, scope):
+            facade_calls.append(("handle_group_reply_wait", scope.chat_id))
+            return "NONE"
+
+        def _track_incoming(sender_id):
+            facade_calls.append(("track_incoming_user_activity", sender_id))
+
+        async def _try_consume_reflect_feedback(event):
+            facade_calls.append(("try_consume_reflect_feedback", event.get_sender_id()))
+            return None
+
+        async def _record_and_dispatch_attention(event, scope):
+            facade_calls.append(("record_and_dispatch_attention", scope.chat_id))
+            return "BUFFERED"
+
+        def _cancel_group_wait(event, result, status):
+            facade_calls.append(("cancel_group_wait_if_interrupted", status))
+
+        def _suppress(event, status, is_direct_call):
+            facade_calls.append(("suppress_default_llm_if_engaged", status, is_direct_call))
+            return None
+
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        def _check_message_scope_access(scope):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=_check_message_scope_access,
+            handle_group_reply_wait=_handle_group_reply_wait,
+            is_debug_mode=lambda: False,
+            track_incoming_user_activity=_track_incoming,
+            try_consume_reflect_feedback=_try_consume_reflect_feedback,
+            record_and_dispatch_attention=_record_and_dispatch_attention,
+            cancel_group_wait_if_interrupted=_cancel_group_wait,
+            suppress_default_llm_if_engaged=_suppress,
+        )
         event = _FakeEvent(
             umo="default:GroupMessage:group-1",
             sender_id="user-1",
@@ -990,13 +1032,18 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         )
 
         async def _run():
-            return [item async for item in self.message_entry_mod.handle_global_message(runtime, facade, event)]
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
 
         results = asyncio.run(_run())
 
         self.assertEqual(results, [])
-        self.assertIn(("record", "default:GroupMessage:group-1"), calls)
-        self.assertIn(("default:GroupMessage:group-1", "message", "normal message"), calls)
+        # 验证所有 facade 守卫均被调用
+        self.assertIn(("handle_group_reply_wait", "default:GroupMessage:group-1"), facade_calls)
+        self.assertIn(("track_incoming_user_activity", "user-1"), facade_calls)
+        self.assertIn(("try_consume_reflect_feedback", "user-1"), facade_calls)
+        self.assertIn(("record_and_dispatch_attention", "default:GroupMessage:group-1"), facade_calls)
+        self.assertIn(("cancel_group_wait_if_interrupted", "BUFFERED"), facade_calls)
+        self.assertIn(("suppress_default_llm_if_engaged", "BUFFERED", False), facade_calls)
 
     def test_message_entry_self_message_stops_before_kernel(self):
         calls = []
@@ -1019,7 +1066,35 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
             host_bridge=SimpleNamespace(suppress_default_llm=lambda event: "(ghost)"),
             chat_loop_kernel=_Kernel(),
         )
-        facade = SimpleNamespace(is_framework_command=lambda msg: False)
+        async def _handle_group_reply_wait(event, scope):
+            return "NONE"
+
+        async def _try_consume_reflect_feedback(event):
+            return None
+
+        async def _record_and_dispatch_attention(event, scope):
+            return "BUFFERED"
+
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        def _check_message_scope_access(scope):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=_check_message_scope_access,
+            handle_group_reply_wait=_handle_group_reply_wait,
+            is_debug_mode=lambda: False,
+            track_incoming_user_activity=lambda sender_id: None,
+            try_consume_reflect_feedback=_try_consume_reflect_feedback,
+            record_and_dispatch_attention=_record_and_dispatch_attention,
+            cancel_group_wait_if_interrupted=lambda event, result, status: None,
+            suppress_default_llm_if_engaged=lambda event, status, is_direct_call: None,
+        )
         event = _FakeEvent(
             umo="default:GroupMessage:group-1",
             sender_id="bot-1",
@@ -1030,7 +1105,7 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         )
 
         async def _run():
-            return [item async for item in self.message_entry_mod.handle_global_message(runtime, facade, event)]
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
 
         results = asyncio.run(_run())
 

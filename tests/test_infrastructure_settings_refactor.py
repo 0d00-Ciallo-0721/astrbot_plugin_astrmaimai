@@ -1,8 +1,10 @@
 import importlib
+import json
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
@@ -102,6 +104,46 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
         self.assertFalse(morning.quiet_hours)
         self.assertEqual(morning.time_bucket, "morning")
         self.assertGreater(quiet.base_frequency_factor, 1.0)
+
+    def test_proactive_rhythm_empty_quiet_hours_disables_quiet_mode(self):
+        rhythm_mod = importlib.import_module("astrmai.proactive.rhythm")
+        config = SimpleNamespace(
+            life=SimpleNamespace(proactive_quiet_hours=[]),
+            reply=SimpleNamespace(base_frequency=0.7),
+        )
+        quiet_ts = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+
+        quiet = rhythm_mod.evaluate_proactive_rhythm(config, now=quiet_ts)
+
+        self.assertFalse(quiet.quiet_hours)
+        self.assertEqual(quiet.quiet_ranges, ())
+
+    def test_proactive_rhythm_without_config_has_no_quiet_hours(self):
+        rhythm_mod = importlib.import_module("astrmai.proactive.rhythm")
+        quiet_ts = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+
+        quiet = rhythm_mod.evaluate_proactive_rhythm(None, now=quiet_ts)
+
+        self.assertFalse(quiet.quiet_hours)
+        self.assertEqual(quiet.quiet_ranges, ())
+
+    def test_astrmai_config_preserves_runtime_config_fields(self):
+        config_mod = importlib.import_module("config")
+
+        parsed = config_mod.AstrMaiConfig(
+            life={"proactive_quiet_hours": ["00:00-01:00"]},
+            global_settings={"webui_password": "secret"},
+        )
+
+        self.assertEqual(parsed.life.proactive_quiet_hours, ["00:00-01:00"])
+        self.assertEqual(parsed.global_settings.webui_password, "secret")
+
+    def test_project_schema_exposes_runtime_config_fields(self):
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+        self.assertIn("webui_password", schema["global_settings"]["items"])
+        self.assertIn("proactive_quiet_hours", schema["life"]["items"])
 
 
 class PersistenceBoundaryRefactorTests(unittest.TestCase):

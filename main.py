@@ -36,6 +36,7 @@ class AstrMaiPlugin(Star):
         self.config = AstrMaiConfig(**self.raw_config)
         self.runtime = build_runtime_context(context, self.config, self.raw_config)
         self.facade = PluginFacade(self.runtime)
+        self.runtime.bind_host_plugin(self)
         self._apply_runtime_compat()
         register_astrmai_admin_pages(context, self.facade)
         logger.info("[AstrMai] ✅ 入口层重构骨架已装配，当前业务能力仍由原始领域模块承接。")
@@ -107,8 +108,11 @@ class AstrMaiPlugin(Star):
                 }
             )
             event.set_extra("astrmai_request_trace", existing_trace)
+
     @filter.command("mai")
     async def mai_help(self, event: AstrMessageEvent):
+        if self.facade.check_command_access(event).should_stop:
+            return
         async for result in handle_mai_help(self.facade, event):
             yield result
 
@@ -127,6 +131,8 @@ class AstrMaiPlugin(Star):
 
     @filter.command("work")
     async def enter_sys3_direct(self, event: AstrMessageEvent):
+        if self.facade.check_command_access(event).should_stop:
+            return
         async for result in handle_work_mode(self.facade, event):
             yield result
 

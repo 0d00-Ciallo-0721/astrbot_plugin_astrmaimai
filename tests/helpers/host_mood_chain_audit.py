@@ -225,10 +225,56 @@ class _HostAuditEvent:
 
 
 class _Facade:
+    # NOTE: record_and_dispatch_attention 简化返回 "BUFFERED"——
+    # mood chain audit 关注 mood extras 而非 ghost suppression，
+    # 因此不需要按 @/Reply/私聊 分发状态。
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+
     def is_framework_command(self, msg: str) -> bool:
         return False
 
     async def update_user_stats(self, user_id: str):
+        return None
+
+    async def handle_poke(self, event):
+        from astrmai.presentation.dto.message_scope import IngressDecision
+        return IngressDecision.allow()
+
+    def check_message_scope_access(self, scope):
+        from astrmai.presentation.dto.message_scope import IngressDecision
+        return IngressDecision.allow()
+
+    async def handle_group_reply_wait(self, event, scope):
+        return "NONE"
+
+    def is_debug_mode(self) -> bool:
+        return False
+
+    def track_incoming_user_activity(self, sender_id: str) -> None:
+        pass
+
+    async def try_consume_reflect_feedback(self, event):
+        return None
+
+    async def record_and_dispatch_attention(self, event, scope):
+        await self.runtime.evolution.record_user_message(event)
+        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+            tick_result = await self.runtime.chat_loop_kernel.tick(
+                chat_id=scope.chat_id,
+                trigger="message",
+                event=event,
+            )
+            return tick_result.dispatch_result
+        return await self.runtime.attention_gate.process_event(event)
+
+    def cancel_group_wait_if_interrupted(self, event, result, status) -> None:
+        pass
+
+    def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
+        if status == "ENGAGED" or is_direct_call:
+            return self.runtime.host_bridge.suppress_default_llm(event)
         return None
 
 
@@ -367,7 +413,7 @@ async def _run_host_case(
         context=SimpleNamespace(),
         chat_loop_kernel=None,
     )
-    facade = _Facade()
+    facade = _Facade(runtime)
 
     mood_manager = importlib.import_module("astrmai.state.mood.mood_manager").MoodManager(gateway, config)
     direct_tag, direct_value = await mood_manager.analyze_mood(case["text"], 0.0, chat_id=f"direct:{case['case_id']}")
@@ -381,7 +427,7 @@ async def _run_host_case(
         group_id=case["case_id"],
         message=[comp_mod.At("bot-1"), comp_mod.Plain(case["text"])],
     )
-    results = await _collect_asyncgen(entry_mod.handle_global_message(runtime, facade, event))
+    results = await _collect_asyncgen(entry_mod.handle_global_message(facade, event))
     host_chat_id = str(event.get_group_id() or event.unified_msg_origin)
     state = await state_engine.get_state(host_chat_id)
     pending = list(getattr(attention_gate, "_background_tasks", set()) or [])
@@ -600,7 +646,7 @@ async def _run_host_post_send_case(
         context=SimpleNamespace(),
         chat_loop_kernel=None,
     )
-    facade = _Facade()
+    facade = _Facade(runtime)
     mood_manager = importlib.import_module("astrmai.state.mood.mood_manager").MoodManager(gateway, config)
     chat_id = f"default:FriendMessage:{case['sender_id']}"
     event = _HostAuditEvent(
@@ -613,7 +659,7 @@ async def _run_host_post_send_case(
     )
 
     direct_tag, direct_value = await mood_manager.analyze_mood(case["text"], 0.0, chat_id=f"direct_post:{case['case_id']}")
-    host_results = await _collect_asyncgen(entry_mod.handle_global_message(runtime, facade, event))
+    host_results = await _collect_asyncgen(entry_mod.handle_global_message(facade, event))
     host_tag = str(event.get_extra("astrmai_primary_mood_tag", "") or "")
     host_value = float(event.get_extra("astrmai_primary_mood_value", 0.0) or 0.0)
     event.set_extra("astrmai_bypass_mood_analysis", host_tag)

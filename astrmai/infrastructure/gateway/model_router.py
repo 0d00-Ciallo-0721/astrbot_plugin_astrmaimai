@@ -12,6 +12,7 @@
 """
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List
 
@@ -63,7 +64,8 @@ class ModelRouter:
 
     def __init__(self):
         self._pools: Dict[str, PoolState] = {}
-        self._sticky_primary: Dict[str, str] = {}
+        self._sticky_primary: "OrderedDict[str, str]" = OrderedDict()
+        self._sticky_primary_maxsize: int = 256
 
     # ------------------------------------------------------------------
     # 公共接口
@@ -249,7 +251,12 @@ class ModelRouter:
         sticky_slot = f"{pool_name}:{sticky_key}"
         current = self._sticky_primary.get(sticky_slot, "")
         if current in unique_models:
+            # 命中后移到末尾（LRU 语义）
+            self._sticky_primary.move_to_end(sticky_slot)
             return current
         preferred = sticky_preferred if sticky_preferred in unique_models else unique_models[0]
+        # 容量检查：超过上限时淘汰最早插入的条目
+        while len(self._sticky_primary) >= self._sticky_primary_maxsize:
+            self._sticky_primary.popitem(last=False)
         self._sticky_primary[sticky_slot] = preferred
         return preferred

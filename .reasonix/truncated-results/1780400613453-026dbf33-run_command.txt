@@ -1,0 +1,670 @@
+$ python -m pytest tests/ -q --ignore=tests/manual --ignore=tests/original_ported 2>&1
+[exit 1]
+.........................................................F.FF........... [ 11%]
+........................................................................ [ 23%]
+....................FF.................................................. [ 35%]
+........................................................................ [ 47%]
+........................................................................ [ 59%]
+..F................................................................s.... [ 71%]
+....................................F..........F........................ [ 83%]
+........................................................................ [ 95%]
+...........FFF..FF.........                                              [100%]
+================================== FAILURES ===================================
+_ CognitiveFeedbackRefactorTests.test_diary_service_writes_cognitive_feedback _
+
+self = <astrmai_plugin_refactored_final.tests.test_cognitive_feedback_refactor.CognitiveFeedbackRefactorTests testMethod=test_diary_service_writes_cognitive_feedback>
+
+    def test_diary_service_writes_cognitive_feedback(self):
+        class _Memory:
+            def __init__(self):
+                self.feedback_calls = []
+                self.memory_calls = []
+                self.summarizer = None
+    
+            async def get_recent_memories(self, group_id, hours=24):
+                return ["one recent memory"]
+    
+            async def record_cognitive_feedback(self, **kwargs):
+                self.feedback_calls.append(kwargs)
+    
+            async def add_memory(self, **kwargs):
+                self.memory_calls.append(kwargs)
+    
+        async def _call_background_lane(*args, **kwargs):
+            return "quiet diary summary"
+    
+        memory = _Memory()
+        service = self.diary_mod.DiaryService(
+            persistence=SimpleNamespace(load_persona_cache=lambda: {"persona-1": {"summary": "core persona"}}),
+            memory_engine=memory,
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="persona-1")),
+            call_background_lane=_call_background_lane,
+            semaphore=asyncio.Semaphore(1),
+        )
+    
+        asyncio.run(service.run_once([SimpleNamespace(chat_id="chat-1")]))
+    
+>       self.assertEqual(len(memory.feedback_calls), 1)
+E       AssertionError: 0 != 1
+
+tests\test_cognitive_feedback_refactor.py:257: AssertionError
+_ CognitiveFeedbackRefactorTests.test_dream_scheduler_writes_cognitive_feedback _
+
+self = <astrmai_plugin_refactored_final.tests.test_cognitive_feedback_refactor.CognitiveFeedbackRefactorTests testMethod=test_dream_scheduler_writes_cognitive_feedback>
+
+    def test_dream_scheduler_writes_cognitive_feedback(self):
+        class _Memory:
+            def __init__(self):
+                self.feedback_calls = []
+                self.memory_calls = []
+    
+            async def record_cognitive_feedback(self, **kwargs):
+                self.feedback_calls.append(kwargs)
+    
+            async def add_memory(self, **kwargs):
+                self.memory_calls.append(kwargs)
+    
+        class _Agent:
+            MIN_EVENTS_TO_DREAM = 5
+            _last_session_id = "chat-1"
+    
+            async def run_dream_cycle(self):
+                return "dream log"
+    
+        class _Generator:
+            async def generate(self, **kwargs):
+                return "dream text"
+    
+            def build_maintenance_result(self, dream_log, session_id="global"):
+                return {"summary": "merged memory", "tags": ["merge", "delete"]}
+    
+        memory = _Memory()
+        scheduler = self.dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=memory,
+            config=SimpleNamespace(life=SimpleNamespace(dream_interval_min=1, min_memory_events_to_dream=5, dream_time_ranges=[]), persona=SimpleNamespace(name="Mai")),
+            semaphore=asyncio.Semaphore(1),
+            dream_visible=False,
+        )
+        scheduler.bind_dependencies(_Agent(), _Generator())
+    
+>       asyncio.run(scheduler.run_once())
+
+tests\test_cognitive_feedback_refactor.py:221: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+astrmai\proactive\dream_scheduler.py:155: in run_once
+    return await self._run_for_session(None)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dream_scheduler.DreamScheduler object at 0x000001DED8E689D0>
+session_id = None
+
+    async def _run_for_session(self, session_id: str | None) -> dict:
+        if not self.dream_agent or not self.dream_generator:
+            return {"performed": False, "reason": "dependencies_unavailable", "session_id": str(session_id or ""), "throttle_scope": "global"}
+        async with self._bg_semaphore:
+            if session_id:
+                eligibility = self.describe_session_eligibility(session_id, time.time())
+                if not eligibility.get("eligible", False):
+                    return {
+                        "performed": False,
+                        "reason": str(eligibility.get("reason", "dream_global_cooldown") or "dream_global_cooldown"),
+                        "session_id": str(eligibility.get("session_id", session_id) or ""),
+                        "throttle_scope": "global",
+                    }
+            min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
+            self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
+>           dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
+E           TypeError: CognitiveFeedbackRefactorTests.test_dream_scheduler_writes_cognitive_feedback.<locals>._Agent.run_dream_cycle() got an unexpected keyword argument 'session_id'
+
+astrmai\proactive\dream_scheduler.py:91: TypeError
+_ CognitiveFeedbackRefactorTests.test_memory_engine_records_feedback_in_cache_and_filters_recall _
+
+self = <astrmai_plugin_refactored_final.tests.test_cognitive_feedback_refactor.CognitiveFeedbackRefactorTests testMethod=test_memory_engine_records_feedback_in_cache_and_filters_recall>
+
+    def test_memory_engine_records_feedback_in_cache_and_filters_recall(self):
+        engine = self._memory_engine()
+    
+        async def _offline():
+            return False
+    
+        engine._ensure_faiss_initialized = _offline
+    
+        async def _run():
+            await engine.record_cognitive_feedback(
+                session_id="chat-1",
+                source="agency",
+                summary="recently used meme twice",
+                guidance="avoid repeated meme",
+                tags=["meme"],
+            )
+            return await engine.get_cognitive_feedback("chat-1", limit=2)
+    
+>       signals = asyncio.run(_run())
+
+tests\test_cognitive_feedback_refactor.py:99: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+tests\test_cognitive_feedback_refactor.py:90: in _run
+    await engine.record_cognitive_feedback(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.memory.services.memory_engine.MemoryEngine object at 0x000001DED88C5E10>
+session_id = 'chat-1', source = 'agency', summary = 'recently used meme twice'
+guidance = 'avoid repeated meme', tags = ['meme'], importance = 0.5
+
+    async def record_cognitive_feedback(
+        self,
+        session_id: str,
+        source: str,
+        summary: str,
+        guidance: str = "",
+        tags: list[str] | None = None,
+        importance: float = 0.5,
+    ) -> None:
+        chat_id = str(session_id or "").strip()
+        clean_summary = str(summary or "").strip()
+        clean_guidance = str(guidance or "").strip()
+        if not chat_id or not (clean_summary or clean_guidance):
+            return
+        clean_source = str(source or "unknown").strip().lower() or "unknown"
+        clean_tags = self._normalize_feedback_tags(tags)
+        now = time.time()
+        signal = CognitiveFeedbackSignal(
+            source=clean_source,
+            chat_id=chat_id,
+            summary=clean_summary[:500],
+            guidance=clean_guidance[:500],
+            tags=clean_tags,
+            timestamp=now,
+            importance=float(importance or 0.5),
+        )
+        self._remember_cognitive_feedback(signal)
+>       await self.write_service.write(
+            MemoryWriteRequest(
+                source=signal.source,
+                kind="feedback",
+                session_id=chat_id,
+                content=self._format_cognitive_feedback_content(
+                    source=signal.source,
+                    summary=signal.summary,
+                    guidance=signal.guidance,
+                    tags=signal.tags,
+                ),
+                summary=signal.summary,
+                tags=signal.tags,
+                importance=signal.importance,
+                confidence=0.8,
+                metadata={"guidance": signal.guidance, "cognitive_feedback": True},
+                dedup_key=f"feedback:{chat_id}:{signal.source}:{signal.summary}:{signal.guidance}",
+                source_ref=f"cognitive_feedback:{signal.source}",
+                visibility="tool_only",
+            )
+        )
+E       AttributeError: 'MemoryEngine' object has no attribute 'write_service'
+
+astrmai\memory\services\memory_engine.py:375: AttributeError
+_ HostMoodChainAuditRefactorTests.test_host_message_entry_matches_direct_mood_result _
+
+self = <astrmai_plugin_refactored_final.tests.test_host_mood_chain_audit_refactor.HostMoodChainAuditRefactorTests testMethod=test_host_message_entry_matches_direct_mood_result>
+
+    def test_host_message_entry_matches_direct_mood_result(self):
+        from tests.helpers.host_mood_chain_audit import build_host_mood_chain_baseline
+    
+        payload = build_host_mood_chain_baseline(gateway_factory=lambda: _StubGateway())
+>       self.assertEqual(payload["status"], "passed")
+E       AssertionError: 'drift_detected' != 'passed'
+E       - drift_detected
+E       + passed
+
+tests\test_host_mood_chain_audit_refactor.py:32: AssertionError
+_ HostMoodChainAuditRefactorTests.test_host_reply_post_send_matches_expected_mood_and_social_score _
+
+self = <astrmai_plugin_refactored_final.tests.test_host_mood_chain_audit_refactor.HostMoodChainAuditRefactorTests testMethod=test_host_reply_post_send_matches_expected_mood_and_social_score>
+
+    def test_host_reply_post_send_matches_expected_mood_and_social_score(self):
+        from tests.helpers.host_mood_chain_audit import build_host_reply_post_send_baseline
+    
+        payload = build_host_reply_post_send_baseline(gateway_factory=lambda: _StubGateway())
+>       self.assertEqual(payload["status"], "passed")
+E       AssertionError: 'drift_detected' != 'passed'
+E       - drift_detected
+E       + passed
+
+tests\test_host_mood_chain_audit_refactor.py:43: AssertionError
+__________ StateRefactorTests.test_update_mood_keeps_delta_contract ___________
+
+self = <astrmai_plugin_refactored_final.tests.test_state_services_refactor.StateRefactorTests testMethod=test_update_mood_keeps_delta_contract>
+
+    def test_update_mood_keeps_delta_contract(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = self.state_mod.StateEngine(_FakePersistence(), SimpleNamespace(config=config), config=config)
+    
+        observed = {}
+    
+        async def _get_state(chat_id):
+            return SimpleNamespace(mood=0.2)
+    
+        async def _analyze(text, current_mood, user_affection=0.0, chat_id=None):
+            observed["text"] = text
+            observed["chat_id"] = chat_id
+            observed["current_mood"] = current_mood
+            return "happy", 0.6
+    
+        async def _atomic(chat_id, delta=0.0, absolute_val=None):
+            observed["delta"] = delta
+            return 0.6
+    
+        engine.get_state = _get_state
+        engine.mood_manager.analyze_mood = _analyze
+        engine.atomic_update_mood = _atomic
+    
+>       tag, final_mood = asyncio.run(engine.update_mood("chat-1", "hello"))
+
+tests\test_state_services_refactor.py:82: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+astrmai\state\chat_state_service.py:198: in update_mood
+    apply_natural_decay(state, self.config)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+state = namespace(mood=0.2)
+config = namespace(energy=namespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60), mood=namespace(decay_interval=3600, decay_rate=0.05), reply=namespace(emotion_mapping=[]))
+
+    def apply_natural_decay(state: Any, config: Any) -> None:
+        now = time.time()
+        is_dirty = False
+        minutes_silent = 999.0
+        if getattr(state, "last_reply_time", 0):
+            minutes_silent = (now - state.last_reply_time) / 60.0
+    
+        recovery_min = getattr(config.energy, "recovery_silence_min", 60)
+>       if minutes_silent > recovery_min and state.energy < 0.8:
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'energy'
+
+astrmai\state\mood\mood_decay.py:15: AttributeError
+_ PersistenceRegressionsMigratedTests.test_memory_engine_recall_accepts_and_forwards_top_k _
+
+self = <astrmai_plugin_refactored_final.tests.regression.persistence.test_persistence_regressions_migrated.PersistenceRegressionsMigratedTests testMethod=test_memory_engine_recall_accepts_and_forwards_top_k>
+
+    def test_memory_engine_recall_accepts_and_forwards_top_k(self):
+        engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        engine_mod = importlib.reload(engine_mod)
+    
+        calls = {}
+    
+        class _FakeRetriever:
+            async def search(self, query, k, session_id=None, persona_id=None):
+                calls["query"] = query
+                calls["k"] = k
+                calls["session_id"] = session_id
+                calls["persona_id"] = persona_id
+                return [SimpleNamespace(content="old memory", score=0.5)]
+    
+        config = SimpleNamespace(
+            provider=SimpleNamespace(embedding_models=[]),
+            memory=SimpleNamespace(recall_top_k=5),
+        )
+        gateway = SimpleNamespace(config=config)
+        engine = engine_mod.MemoryEngine(context=SimpleNamespace(), gateway=gateway, config=config)
+        engine.retriever = _FakeRetriever()
+    
+        async def _ready():
+            return True
+    
+        engine._ensure_faiss_initialized = _ready
+    
+>       result = asyncio.run(engine.recall("remember this", session_id="chat-1", top_k=3))
+
+tests\regression\persistence\test_persistence_regressions_migrated.py:152: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.memory.services.memory_engine.MemoryEngine object at 0x000001DEDB3DBB10>
+query = 'remember this', session_id = 'chat-1', persona_id = None, top_k = 3
+
+    async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None) -> str:
+        recall_top_k = top_k if top_k is not None else getattr(getattr(self.config, "memory", None), "recall_top_k", 5)
+        memory_query = MemoryQuery(
+            query=str(query or ""),
+            session_id=str(session_id or ""),
+            persona_id=str(persona_id or ""),
+            top_k=int(recall_top_k or 5),
+        )
+        candidates = [
+            item
+>           for item in await self.retrieval_service.retrieve(memory_query)
+            if not self._is_cognitive_feedback_content(item.content)
+        ]
+E       AttributeError: 'MemoryEngine' object has no attribute 'retrieval_service'
+
+astrmai\memory\services\memory_engine.py:527: AttributeError
+_ DecayServiceMigratedTests.test_run_once_persists_chat_decay_and_unifies_relationship_truth _
+
+self = <astrmai_plugin_refactored_final.tests.regression.state.test_decay_service_migrated.DecayServiceMigratedTests testMethod=test_run_once_persists_chat_decay_and_unifies_relationship_truth>
+
+    def test_run_once_persists_chat_decay_and_unifies_relationship_truth(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(
+                cost_per_reply=0.1,
+                min_reply_threshold=0.1,
+                daily_recovery=0.1,
+                recovery_silence_min=1,
+            ),
+            mood=SimpleNamespace(decay_interval=60, decay_rate=0.1),
+            reply=SimpleNamespace(emotion_mapping=[]),
+            evolution=SimpleNamespace(enable_relationship_engine=True),
+        )
+        persistence = _Persistence()
+        engine = StateEngine(persistence, SimpleNamespace(config=config), config=config)
+        service = DecayService(engine, None, config)
+    
+        async def _run():
+            state = await engine.get_state("group-1")
+            state.energy = 0.4
+            state.mood = 0.5
+            state.last_reply_time = 0.0
+            state.last_passive_decay_time = time.time() - 120.0
+    
+            profile = await engine.get_user_profile("user-1")
+            profile.last_access_time = 0.0
+            engine.relationship_engine.get_or_create("user-1").last_decay_time = 0.0
+    
+            await service.run_once()
+            return state, profile, engine.relationship_engine.get_social_score("user-1")
+    
+        state, profile, vector_score = asyncio.run(_run())
+    
+>       self.assertTrue(persistence.saved_states)
+E       AssertionError: [] is not true
+
+tests\regression\state\test_decay_service_migrated.py:88: AssertionError
+_ ChatStatePersistenceMigratedTests.test_chat_state_roundtrip_preserves_decay_fields _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_chat_state_persistence_migrated.ChatStatePersistenceMigratedTests testMethod=test_chat_state_roundtrip_preserves_decay_fields>
+
+    def test_chat_state_roundtrip_preserves_decay_fields(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    
+        async def _run():
+            persistence = _SqliteStatePersistence(Path(temp_dir.name) / "state.db")
+            state = ChatState(
+                chat_id="chat-1",
+                energy=0.4,
+                mood=0.6,
+                last_reset_date="2026-05-27",
+                total_replies=3,
+                last_reply_time=111.0,
+                last_passive_decay_time=222.0,
+            )
+            await persistence.save_chat_state("chat-1", state)
+            return await persistence.load_chat_state("chat-1")
+    
+        try:
+>           loaded = asyncio.run(_run())
+
+tests\unit\state\test_chat_state_persistence_migrated.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+tests\unit\state\test_chat_state_persistence_migrated.py:57: in _run
+    await persistence.save_chat_state("chat-1", state)
+astrmai\infrastructure\persistence\state_profile_persistence.py:38: in save_chat_state
+    await db.execute("""
+D:\py2024\Lib\site-packages\aiosqlite\core.py:223: in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+D:\py2024\Lib\site-packages\aiosqlite\core.py:160: in _execute
+    return await future
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+tx = <_queue.SimpleQueue object at 0x000001DEDCA6FE20>
+
+    def _connection_worker_thread(tx: _TxQueue):
+        """
+        Execute function calls on a separate thread.
+    
+        :meta private:
+        """
+        while True:
+            # Continues running until all queue items are processed,
+            # even after connection is closed (so we can finalize all
+            # futures)
+    
+            future, function = tx.get()
+    
+            try:
+                LOG.debug("executing %s", function)
+>               result = function()
+E               sqlite3.OperationalError: table chat_states has no column named last_reply_time
+
+D:\py2024\Lib\site-packages\aiosqlite\core.py:63: OperationalError
+_ ChatStatePersistenceMigratedTests.test_database_service_get_chat_state_preserves_decay_fields _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_chat_state_persistence_migrated.ChatStatePersistenceMigratedTests testMethod=test_database_service_get_chat_state_preserves_decay_fields>
+
+    def test_database_service_get_chat_state_preserves_decay_fields(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    
+        async def _prepare():
+            persistence = _SqliteStatePersistence(Path(temp_dir.name) / "state.db")
+            state = ChatState(
+                chat_id="chat-db",
+                energy=0.3,
+                mood=-0.4,
+                last_reset_date="2026-05-27",
+                total_replies=4,
+                last_reply_time=333.0,
+                last_passive_decay_time=444.0,
+            )
+            await persistence.save_chat_state("chat-db", state)
+            return persistence
+    
+        try:
+>           persistence = asyncio.run(_prepare())
+
+tests\unit\state\test_chat_state_persistence_migrated.py:87: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+tests\unit\state\test_chat_state_persistence_migrated.py:83: in _prepare
+    await persistence.save_chat_state("chat-db", state)
+astrmai\infrastructure\persistence\state_profile_persistence.py:38: in save_chat_state
+    await db.execute("""
+D:\py2024\Lib\site-packages\aiosqlite\core.py:223: in execute
+    cursor = await self._execute(self._conn.execute, sql, parameters)
+D:\py2024\Lib\site-packages\aiosqlite\core.py:160: in _execute
+    return await future
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+tx = <_queue.SimpleQueue object at 0x000001DEDB46D620>
+
+    def _connection_worker_thread(tx: _TxQueue):
+        """
+        Execute function calls on a separate thread.
+    
+        :meta private:
+        """
+        while True:
+            # Continues running until all queue items are processed,
+            # even after connection is closed (so we can finalize all
+            # futures)
+    
+            future, function = tx.get()
+    
+            try:
+                LOG.debug("executing %s", function)
+>               result = function()
+E               sqlite3.OperationalError: table chat_states has no column named last_reply_time
+
+D:\py2024\Lib\site-packages\aiosqlite\core.py:63: OperationalError
+_ ChatStatePersistenceMigratedTests.test_get_state_persists_daily_reset_on_first_load _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_chat_state_persistence_migrated.ChatStatePersistenceMigratedTests testMethod=test_get_state_persists_daily_reset_on_first_load>
+
+    def test_get_state_persists_daily_reset_on_first_load(self):
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        persistence = _ResetPersistence(
+            {
+                "chat_id": "chat-reset",
+                "energy": 0.4,
+                "mood": 0.6,
+                "group_config": {},
+                "last_reset_date": yesterday,
+                "total_replies": 2,
+                "last_reply_time": 10.0,
+                "last_passive_decay_time": 20.0,
+            }
+        )
+        service = ChatStateService(
+            persistence,
+            SimpleNamespace(
+                energy=SimpleNamespace(daily_recovery=0.2),
+                mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            ),
+        )
+    
+        state = asyncio.run(service.get_state("chat-reset"))
+    
+>       self.assertEqual(state.last_reset_date, datetime.date.today().isoformat())
+E       AssertionError: '2026-06-01' != '2026-06-02'
+E       - 2026-06-01
+E       ?          ^
+E       + 2026-06-02
+E       ?          ^
+
+tests\unit\state\test_chat_state_persistence_migrated.py:122: AssertionError
+_ RelationshipProfileRoundtripMigratedTests.test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_relationship_profile_roundtrip_migrated.RelationshipProfileRoundtripMigratedTests testMethod=test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score>
+
+    def test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = StateEngine(_ProfilePersistence(), SimpleNamespace(config=config), config=config)
+    
+        async def _run():
+            first_profile = await engine.get_user_profile("user-1")
+            first_trust = first_profile.relationship_vector["trust"]
+            initial_score = engine.relationship_engine.get_social_score("user-1")
+            updated_score = engine.relationship_engine.process_event(
+                "user-1",
+                RelationshipEvent.HELPFUL_REPLY,
+                intensity=1.0,
+            )
+            second_profile = await engine.get_user_profile("user-1")
+            return first_trust, second_profile, initial_score, updated_score
+    
+>       first_trust, second_profile, initial_score, updated_score = asyncio.run(_run())
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:71: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def _run():
+        first_profile = await engine.get_user_profile("user-1")
+>       first_trust = first_profile.relationship_vector["trust"]
+E       KeyError: 'trust'
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:61: KeyError
+_ RelationshipProfileRoundtripMigratedTests.test_relationship_vector_roundtrip_preserves_last_decay_time _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_relationship_profile_roundtrip_migrated.RelationshipProfileRoundtripMigratedTests testMethod=test_relationship_vector_roundtrip_preserves_last_decay_time>
+
+    def test_relationship_vector_roundtrip_preserves_last_decay_time(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    
+        async def _run():
+            persistence = _SqliteProfilePersistence(Path(temp_dir.name) / "state.db")
+            profile = UserProfile(
+                user_id="user-3",
+                name="tester",
+                social_score=12.0,
+                relationship_vector={
+                    "trust": 10.0,
+                    "familiarity": 11.0,
+                    "emotion_bond": 12.0,
+                    "respect": 13.0,
+                    "social_score": 11.4,
+                    "total_interactions": 3,
+                    "positive_streak": 2,
+                    "negative_streak": 0,
+                    "first_seen": 111.0,
+                    "last_interaction": 222.0,
+                    "last_decay_time": 123456.0,
+                },
+            )
+            await persistence.save_user_profile(profile)
+            loaded = await persistence.load_user_profile("user-3")
+            return loaded
+    
+        try:
+            loaded = asyncio.run(_run())
+        finally:
+            temp_dir.cleanup()
+    
+>       self.assertEqual(loaded["relationship_vector"]["last_decay_time"], 123456.0)
+E       KeyError: 'relationship_vector'
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:136: KeyError
+============================== warnings summary ===============================
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_debounce_normalizes_merged_events_once
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_judge_ignore_keeps_focus_as_window_only
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_judge_reply_action_maps_to_pass_through
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_judge_wait_keeps_batch_for_next_pass_without_sys2
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_judge_wait_keeps_batch_for_next_pass_without_sys2
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_process_event_coalesces_messages_while_debounce_is_open
+tests/test_attention_gate_refactor.py::RefactoredAttentionGateTests::test_strong_wakeup_skips_judge_gate
+  C:\Users\zlj\Desktop\mai\astrmai_plugin_refactored_final\astrmai\conversation\attention\gate.py:684: DeprecationWarning: emit_legacy_focus_thread_extras is deprecated since v2.0 (removal target: v3.0) — consume typed FocusThreadContext directly
+    emit_legacy_focus_thread_extras(focus_event, focus_thread, window_events=events)
+
+tests/test_cognitive_feedback_refactor.py::CognitiveFeedbackRefactorTests::test_agency_reflection_bridge_flushes_after_threshold
+  D:\py2024\Lib\site-packages\jieba\_compat.py:18: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
+    import pkg_resources
+
+tests/test_cognitive_feedback_refactor.py::CognitiveFeedbackRefactorTests::test_agency_reflection_bridge_flushes_after_threshold
+  D:\py2024\Lib\site-packages\pkg_resources\__init__.py:31
+
+[… truncated 21277 chars …]

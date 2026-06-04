@@ -12,9 +12,9 @@ class ReviewUiService:
         self.db_factory = db_factory
 
     def _pattern_service(self):
-        runtime = self.plugin_api.get_runtime() if hasattr(self.plugin_api, "get_runtime") else None
-        memory_engine = getattr(runtime, "memory_engine", None)
-        return getattr(memory_engine, "expression_pattern_service", None)
+        if self.plugin_api:
+            return self.plugin_api.get_expression_pattern_service()
+        return None
 
     def _runtime_bound(self) -> bool:
         return self._pattern_service() is not None

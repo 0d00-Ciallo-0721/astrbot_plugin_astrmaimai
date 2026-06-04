@@ -85,6 +85,27 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
             return False
 
         engine._ensure_faiss_initialized = _offline
+        # mock initialize() 依赖 — 真实路径需要 v2_store / faiss 等重量依赖
+        engine.write_service = SimpleNamespace()
+
+        async def _mock_write(*args, **kwargs):
+            return "mock-memory-id"
+
+        engine.write_service.write = _mock_write
+        engine.retrieval_service = SimpleNamespace()
+
+        async def _mock_retrieve(*args, **kwargs):
+            return [
+                SimpleNamespace(content="[cognitive_feedback:agency]\nsummary: hidden\n"),
+                SimpleNamespace(content="normal memory content"),
+            ]
+
+        engine.retrieval_service.retrieve = _mock_retrieve
+
+        def _mock_render_recall(query, candidates):
+            return " ".join(item.content for item in candidates)
+
+        engine.retrieval_service.render_recall = _mock_render_recall
 
         async def _run():
             await engine.record_cognitive_feedback(
@@ -198,7 +219,7 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
             MIN_EVENTS_TO_DREAM = 5
             _last_session_id = "chat-1"
 
-            async def run_dream_cycle(self):
+            async def run_dream_cycle(self, session_id=None):
                 return "dream log"
 
         class _Generator:
@@ -243,6 +264,10 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         async def _call_background_lane(*args, **kwargs):
             return "quiet diary summary"
 
+        class _FakePromptRegistry:
+            def render_template(self, template_id, variables):
+                return SimpleNamespace(prompt="diary prompt", system_prompt="diary system")
+
         memory = _Memory()
         service = self.diary_mod.DiaryService(
             persistence=SimpleNamespace(load_persona_cache=lambda: {"persona-1": {"summary": "core persona"}}),
@@ -250,6 +275,7 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
             config=SimpleNamespace(persona=SimpleNamespace(persona_id="persona-1")),
             call_background_lane=_call_background_lane,
             semaphore=asyncio.Semaphore(1),
+            prompt_registry=_FakePromptRegistry(),
         )
 
         asyncio.run(service.run_once([SimpleNamespace(chat_id="chat-1")]))

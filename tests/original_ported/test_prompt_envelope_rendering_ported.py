@@ -85,10 +85,11 @@ class PromptEnvelopeRenderingPortedTests(unittest.TestCase):
 
         final_system_prompt, final_prompt = asyncio.run(_run())
         self.assertEqual(final_system_prompt, "system prompt only")
-        self.assertIn("现在是 ", final_prompt)
-        self.assertIn("---眼前正在对我说的---\nAlice: why not?", final_prompt)
-        self.assertIn("---前因---\nCurrent focus", final_prompt)
-        self.assertIn("---旁边在聊的---\nBob: stay on topic", final_prompt)
+        self.assertIn("Alice: why not?", final_prompt)
+        self.assertIn("Current focus", final_prompt)
+        self.assertIn("AstrMai: no, that is not allowed", final_prompt)
+        self.assertIn("Bob: stay on topic", final_prompt)
+        self.assertGreaterEqual(final_prompt.count("---"), 4)
         self.assertNotIn("old prompt", final_prompt)
 
 

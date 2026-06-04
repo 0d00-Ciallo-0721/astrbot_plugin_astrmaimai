@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import threading
 import time
@@ -33,7 +34,7 @@ def check_message_dedup(event, ttl_seconds: float = 1.5) -> IngressDecision:
             sys._astrmai_global_debounce_cache.pop(key, None)
 
         if fingerprint in sys._astrmai_global_debounce_cache:
-            logger.warning(f"[AstrMai-Sensor] 极速防抖生效，已拦截 AstrBot 框架双发/分身消息: {msg_str[:15]}")
+            logger.warning(f"[AstrMai-Sensor] 极速防抖生效，已拦截 AstrBot 框架双发/分身消息: sha256={hashlib.sha256(msg_str.encode()).hexdigest()[:8]}")
             return IngressDecision.stop("duplicate_message")
 
         sys._astrmai_global_debounce_cache[fingerprint] = now

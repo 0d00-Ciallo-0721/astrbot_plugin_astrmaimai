@@ -406,7 +406,10 @@ class ContextRuntimeWiringTests(unittest.TestCase):
                 }
             )
             runtime = SimpleNamespace(system2_planner=SimpleNamespace(turn_trace_history=[], turn_trace_store=store))
-            plugin_api = SimpleNamespace(get_runtime=lambda: runtime)
+            plugin_api = SimpleNamespace(
+                get_runtime=lambda: runtime,
+                get_planner=lambda: runtime.system2_planner,
+            )
             service = admin_mod.AdminUiService(plugin_api)
             result = await service.recent_turn_traces(chat_id="chat-1", limit=10)
             self.assertEqual(result["total"], 1)
@@ -434,7 +437,10 @@ class ContextRuntimeWiringTests(unittest.TestCase):
                 ],
             )
             runtime = SimpleNamespace(system2_planner=SimpleNamespace(turn_trace_history=[], turn_trace_store=None, raw_trace_store=store))
-            plugin_api = SimpleNamespace(get_runtime=lambda: runtime)
+            plugin_api = SimpleNamespace(
+                get_runtime=lambda: runtime,
+                get_planner=lambda: runtime.system2_planner,
+            )
             service = admin_mod.AdminUiService(plugin_api)
             result = await service.chat_trace_events("chat-1", limit=10)
             self.assertEqual(result["total"], 1)

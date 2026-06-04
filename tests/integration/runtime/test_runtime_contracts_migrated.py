@@ -1,5 +1,6 @@
 import unittest
 
+from astrmai.app.runtime_facade_protocol import RuntimeFacadeProtocol
 from astrmai.infrastructure.runtime.runtime_contracts import (
     FailureKind,
     FocusThreadContext,
@@ -11,6 +12,9 @@ from astrmai.infrastructure.runtime.runtime_contracts import (
 
 
 class RuntimeContractsMigratedTests(unittest.TestCase):
+    def test_runtime_facade_protocol_exposes_apply_hot_config_contract(self):
+        self.assertTrue(hasattr(RuntimeFacadeProtocol, "apply_hot_config"))
+
     def test_focus_thread_context_all_thread_events_deduplicates(self):
         root = object()
         focus = object()

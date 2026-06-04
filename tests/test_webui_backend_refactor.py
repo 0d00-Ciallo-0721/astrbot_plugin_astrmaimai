@@ -11,6 +11,72 @@ from types import SimpleNamespace
 import aiosqlite
 
 
+class _RuntimeBackedFacade:
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    def get_planner(self):
+        return getattr(self.runtime, "system2_planner", None)
+
+    def get_gateway(self):
+        return getattr(self.runtime, "gateway", None)
+
+    def get_proactive_task(self):
+        return getattr(self.runtime, "proactive_task", None)
+
+    def get_observability_hub(self):
+        return getattr(self.runtime, "observability_hub", None)
+
+    def get_memory_engine(self):
+        return getattr(self.runtime, "memory_engine", None)
+
+    def get_runtime_coordinator(self):
+        return getattr(self.runtime, "runtime_coordinator", None)
+
+    def get_reflector(self):
+        return getattr(self.runtime, "reflector", None)
+
+    def get_runtime_config(self):
+        return getattr(self.runtime, "config", None)
+
+    def get_persona_summarizer(self):
+        return getattr(self.runtime, "persona_summarizer", None)
+
+    def get_state_engine(self):
+        return getattr(self.runtime, "state_engine", None)
+
+    def get_auto_check_task(self):
+        return getattr(self.runtime, "auto_check_task", None)
+
+    def get_reflect_tracker(self):
+        return getattr(self.runtime, "reflect_tracker", None)
+
+    def get_chat_loop_kernel(self):
+        kernel = getattr(self.runtime, "chat_loop_kernel", None)
+        if kernel is not None:
+            return kernel
+        task = self.get_proactive_task()
+        return getattr(task, "chat_loop_kernel", None) if task else None
+
+    def get_heartflow_manager(self):
+        task = self.get_proactive_task()
+        return getattr(task, "heartflow_manager", None) if task else None
+
+    def get_heartflow_topic_digest_service(self):
+        task = self.get_proactive_task()
+        return getattr(task, "heartflow_topic_digest_service", None) if task else None
+
+    def get_runtime_diagnostics(self):
+        builder = getattr(self.runtime, "build_diagnostics", None)
+        return builder() if callable(builder) else None
+
+    async def get_capability_overview(self):
+        builder = getattr(self.runtime, "build_capability_overview_sync", None)
+        if callable(builder):
+            return builder()
+        return None
+
+
 class WebuiBackendRefactorTests(unittest.TestCase):
     def test_dashboard_service_uses_adapter_and_db_factory(self):
         service_mod = importlib.import_module(
@@ -107,13 +173,17 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         original = os.environ.get("ASTRMAI_WEBUI_SECRET")
         try:
             os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-one"
+            # Reset cached key so env change takes effect
+            auth_mod._SECRET_KEY = None
             token = auth_mod.create_token("codex")
             self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
 
+            # Changing env after first access does NOT invalidate tokens —
+            # the key is now session-stable (security best practice).
             os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-two"
-            with self.assertRaises(Exception):
-                auth_mod.verify_token(token)
+            self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
         finally:
+            auth_mod._SECRET_KEY = None
             if original is None:
                 os.environ.pop("ASTRMAI_WEBUI_SECRET", None)
             else:
@@ -379,10 +449,10 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             class _Runtime:
                 memory_engine = _Engine()
 
-            class _Facade:
-                runtime = _Runtime()
-
-            service = service_mod.MemoryUiService(db_factory=lambda: None, plugin_api=adapter_mod.PluginApiAdapter(facade=_Facade()))
+            service = service_mod.MemoryUiService(
+                db_factory=lambda: None,
+                plugin_api=adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime())),
+            )
             deleted = await service.delete_canonical("mem-1")
             restored = await service.restore_canonical("mem-1")
             staled = await service.mark_canonical_stale("mem-1")
@@ -432,10 +502,10 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 class _Runtime:
                     memory_engine = _Engine()
 
-                class _Facade:
-                    runtime = _Runtime()
-
-                service = service_mod.MemoryUiService(db_factory=lambda: None, plugin_api=adapter_mod.PluginApiAdapter(facade=_Facade()))
+                service = service_mod.MemoryUiService(
+                    db_factory=lambda: None,
+                    plugin_api=adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime())),
+                )
                 results = await asyncio.gather(
                     maintenance.mark_stale(memory_id, reason="maintenance"),
                     service.delete_canonical(memory_id),
@@ -655,12 +725,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                     memory_observer=_Observer(),
                 )
 
-            class _Facade:
-                runtime = _Runtime()
-
             service = service_mod.MemoryUiService(
                 db_factory=None,
-                plugin_api=adapter_mod.PluginApiAdapter(facade=_Facade()),
+                plugin_api=adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime())),
             )
             status = await service.runtime_status()
             chat = await service.chat_buffer_status("chat-1")
@@ -750,10 +817,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                     memory_observer=_Observer(),
                 )
 
-            class _Facade:
-                runtime = _Runtime()
-
-            service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+            service = service_mod.AdminUiService(
+                adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+            )
             overview = await service.memory_observability_overview()
             timeline = await service.memory_observability_timeline(chat_id="chat-1", component="instant_gate", level="info", limit=20)
             chat = await service.memory_observability_chat("chat-1")
@@ -802,10 +868,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 system2_planner = _Planner()
                 memory_engine = SimpleNamespace(memory_observer=_Observer())
 
-            class _Facade:
-                runtime = _Runtime()
-
-            service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+            service = service_mod.AdminUiService(
+                adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+            )
             return await service.cognition_unified_timeline(chat_id="chat-1", include=["decision", "tool", "memory"], limit=20)
 
         result = asyncio.run(_run())
@@ -885,10 +950,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             class _Runtime:
                 observability_hub = hub
 
-            class _Facade:
-                runtime = _Runtime()
-
-            service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+            service = service_mod.AdminUiService(
+                adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+            )
             overview = await service.observability_overview()
             timeline = await service.observability_timeline(chat_id="chat-1", domains=["scheduler", "heartflow"], limit=20)
             chat = await service.observability_chat("chat-1")
@@ -951,18 +1015,12 @@ class WebuiBackendRefactorTests(unittest.TestCase):
     def test_plugin_api_apply_config_updates_bound_runtime(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
 
-        class _Runtime:
-            def __init__(self):
-                self.raw_config = {}
-                self.config = None
-                self.rebuilt = False
-
-            def rebuild_infrastructure_settings(self):
-                self.rebuilt = True
-
+        applied = None
         class _Facade:
-            def __init__(self):
-                self.runtime = _Runtime()
+            def apply_hot_config(self, config_dict, parsed_config):
+                nonlocal applied
+                applied = (config_dict, parsed_config)
+                return True
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             adapter = adapter_mod.PluginApiAdapter(
@@ -974,7 +1032,49 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             result = asyncio.run(adapter.apply_config({"reply": {"base_frequency": 0.2}}, {"reply.base_frequency"}))
             self.assertEqual(result["status"], "ok")
             self.assertTrue(result["runtime_bound"])
-            self.assertTrue(adapter.facade.runtime.rebuilt)
+            self.assertIsNotNone(applied)
+            self.assertEqual(applied[0]["reply"]["base_frequency"], 0.2)
+
+    def test_plugin_facade_apply_hot_config_refreshes_proactive_task_config_refs(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+
+        old_config = SimpleNamespace(reply=SimpleNamespace(base_frequency=0.7))
+        new_config = SimpleNamespace(reply=SimpleNamespace(base_frequency=0.2))
+        refreshed = []
+        previous_facade = adapter_mod.get_active_facade()
+
+        class _ProactiveTask:
+            def refresh_config(self, config):
+                refreshed.append(config)
+
+        class _Runtime:
+            raw_config = {}
+            config = old_config
+            proactive_task = _ProactiveTask()
+            background_tasks = set()
+            lifecycle = SimpleNamespace()
+
+            def bind_system2_callback(self, callback):
+                self.callback = callback
+
+            def rebuild_infrastructure_settings(self):
+                self.rebuilt = True
+
+            def sync_host_compat_attrs(self):
+                self.synced = True
+
+        try:
+            facade = facade_mod.PluginFacade(_Runtime())
+            result = facade.apply_hot_config({"reply": {"base_frequency": 0.2}}, new_config)
+
+            self.assertTrue(result)
+            self.assertIs(facade.runtime.config, new_config)
+            self.assertEqual(refreshed, [new_config])
+            self.assertTrue(facade.runtime.rebuilt)
+            self.assertTrue(facade.runtime.synced)
+        finally:
+            adapter_mod.set_active_facade(previous_facade)
 
     def test_persona_ui_service_exposes_readonly_slice_diagnostics(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -998,9 +1098,6 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             persona_summarizer = _Summarizer()
             memory_engine = object()
 
-        class _Facade:
-            runtime = _Runtime()
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             cache_path = Path(tmp_dir) / "persona.json"
             cache_path.write_text(
@@ -1021,7 +1118,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 encoding="utf-8",
             )
             adapter = adapter_mod.PluginApiAdapter(
-                facade=_Facade(),
+                facade=_RuntimeBackedFacade(_Runtime()),
                 config_path=str(Path(tmp_dir) / "config.json"),
                 schema_path=str(Path(tmp_dir) / "schema.json"),
                 persona_cache_path=str(cache_path),
@@ -1102,16 +1199,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
                 _Runtime.system2_planner.raw_trace_store = raw_store
 
-                class _Facade:
-                    runtime = _Runtime()
-
-                    def get_runtime_diagnostics(self):
-                        return self.runtime.build_diagnostics()
-
-                    async def get_capability_overview(self):
-                        return self.runtime.build_capability_overview_sync()
-
-                service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+                service = service_mod.AdminUiService(
+                    adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+                )
                 status = await service.runtime_status()
                 decisions = await service.recent_decisions(chat_id="chat-1")
                 tools = await service.recent_tool_traces(chat_id="chat-1")
@@ -1204,10 +1294,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         class _Runtime:
             gateway = _Gateway()
 
-        class _Facade:
-            runtime = _Runtime()
-
-        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        service = service_mod.AdminUiService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
         overview = asyncio.run(service.context_economy_overview_view(limit=20))
         templates = asyncio.run(service.context_economy_templates_view(limit=20))
         filtered = asyncio.run(
@@ -1302,10 +1391,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             proactive_task = _Task()
             chat_loop_kernel = proactive_task.chat_loop_kernel
 
-        class _Facade:
-            runtime = _Runtime()
-
-        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        service = service_mod.AdminUiService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
         status = asyncio.run(service.scheduler_status_view())
         selection = asyncio.run(service.scheduler_due_selection_view())
         chat = asyncio.run(service.scheduler_chat_view("chat-1"))
@@ -1327,10 +1415,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             chat_loop_kernel = kernel_mod.ChatLoopKernel(runtime_coordinator=SimpleNamespace())
             proactive_task = SimpleNamespace(chat_loop_kernel=chat_loop_kernel)
 
-        class _Facade:
-            runtime = _Runtime()
-
-        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        service = service_mod.AdminUiService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
 
         async def _run():
             before = _Runtime.chat_loop_kernel.describe_status_sync()["tracked_chats"]
@@ -1427,10 +1514,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         class _Runtime:
             system2_planner = _Planner()
 
-        class _Facade:
-            runtime = _Runtime()
-
-        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        service = service_mod.AdminUiService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
         result = asyncio.run(service.chat_trace_events("chat-1"))
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["items"][0]["stage"], "execution.executor.model_pool_exhausted")
@@ -1456,10 +1542,9 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         class _Runtime:
             system2_planner = _Planner()
 
-        class _Facade:
-            runtime = _Runtime()
-
-        service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        service = service_mod.AdminUiService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
         result = asyncio.run(service.chat_trace_events("chat-1"))
         evidence = result["items"][0]["failure_evidence"]
         self.assertEqual(evidence["failure_kind"], "provider_failure_text")
@@ -1706,6 +1791,136 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("/proactive/status", paths)
         self.assertIn("/learning/status", paths)
         self.assertIn("/chats/active", paths)
+
+
+    def test_heartflow_chats_uses_get_all_states_when_available(self):
+        """heartflow_chats() should prefer get_all_states() over _states."""
+        admin_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+
+        called_public = False
+        class _Manager:
+            def get_all_states(self):
+                nonlocal called_public
+                called_public = True
+                return {"chat-1": {"last_activity_ts": 100.0}}
+            def get_state(self, chat_id):
+                return {"last_activity_ts": 100.0}
+            def get_session(self, chat_id):
+                return {}
+            def get_latest_action_decision(self, chat_id):
+                return {}
+            def get_latest_impulse_decision(self, chat_id):
+                return {}
+
+        class _PluginApi:
+            def __init__(self):
+                self.facade = True
+                self._manager = _Manager()
+
+            def get_heartflow_manager(self):
+                return self._manager
+
+        service = admin_mod.AdminUiService(_PluginApi())
+        result = asyncio.run(service.heartflow_chats())
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["total"], 1)
+        self.assertTrue(called_public, "get_all_states() was not called")
+
+    def test_heartflow_chats_falls_back_to_states_when_get_all_states_missing(self):
+        """heartflow_chats() should fall back to _states when get_all_states is absent."""
+        admin_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+
+        class _Manager:
+            _states = {"chat-2": {"last_activity_ts": 200.0}}
+            def get_state(self, chat_id):
+                return self._states.get(chat_id, {})
+            def get_session(self, chat_id):
+                return {}
+            def get_latest_action_decision(self, chat_id):
+                return {}
+            def get_latest_impulse_decision(self, chat_id):
+                return {}
+
+        class _PluginApi:
+            def __init__(self):
+                self.facade = True
+                self._manager = _Manager()
+
+            def get_heartflow_manager(self):
+                return self._manager
+
+        service = admin_mod.AdminUiService(_PluginApi())
+        result = asyncio.run(service.heartflow_chats())
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["total"], 1)
+
+    def test_domain_services_have_explicit_signatures(self):
+        """All 7 domain services should define methods with explicit parameters."""
+        import inspect
+
+        modules = [
+            ("observabilityservice", "ObservabilityService"),
+            ("heartflowservice", "HeartflowService"),
+            ("chatruntimeservice", "ChatRuntimeService"),
+            ("schedulerservice", "SchedulerService"),
+            ("cognitionservice", "CognitionService"),
+            ("learningservice", "LearningService"),
+            ("toolsservice", "ToolsService"),
+        ]
+        for mod_name, cls_name in modules:
+            mod = importlib.import_module(f"astrmai.webui.backend.services.{mod_name}")
+            cls = getattr(mod, cls_name)
+            public_methods = [
+                m for m in dir(cls)
+                if not m.startswith("_") and callable(getattr(cls, m))
+                and m != "__init__"
+            ]
+            for method_name in public_methods:
+                sig = inspect.signature(getattr(cls, method_name))
+                params = list(sig.parameters.keys())
+                self.assertNotIn("args", params,
+                    f"{cls_name}.{method_name}() still uses *args")
+                self.assertNotIn("kwargs", params,
+                    f"{cls_name}.{method_name}() still uses **kwargs")
+                self.assertIn("self", params,
+                    f"{cls_name}.{method_name}() missing self")
+
+    def test_plugin_api_adapter_does_not_fallback_to_runtime_passthrough(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        planner = object()
+
+        class _Runtime:
+            system2_planner = planner
+
+        class _Facade:
+            runtime = _Runtime()
+
+        adapter = adapter_mod.PluginApiAdapter(facade=_Facade())
+        self.assertIsNone(adapter.get_planner())
+
+    def test_apply_hot_config_fallback_logs_warning(self):
+        """_apply_hot_config() should use facade.apply_hot_config when available."""
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        called_facade = False
+        class _Facade:
+            def apply_hot_config(self, config_dict, parsed_config):
+                nonlocal called_facade
+                called_facade = True
+                return True
+
+        adapter = adapter_mod.PluginApiAdapter(facade=_Facade())
+        result = adapter._apply_hot_config({"key": "val"}, object())
+        self.assertTrue(result)
+        self.assertTrue(called_facade, "facade.apply_hot_config not called")
+
+    def test_apply_hot_config_returns_false_when_no_facade(self):
+        """_apply_hot_config() should return False when facade is None."""
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        adapter = adapter_mod.PluginApiAdapter(facade=None)
+        result = adapter._apply_hot_config({}, object())
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

@@ -209,6 +209,10 @@ class ConversationContinuityStore:
             reply_preview=str(reply_preview or "")[:160],
             reply_need=str(reply_need or "reply"),
         )
+        # 设计意图：lightweight_event 和 wait/ignore 是非实质性轮次，
+        # 不应推进对话主题/目标状态机。仅记录轮次，不更新 state.current_topic、
+        # state.current_goal、state.goal_status、continuity_weight 等。
+        # 此行为是有意设计，非 bug（参见 TECHNICAL-DEBT-INVENTORY D22）。
         if lightweight_event or item.reply_need in {"wait", "ignore"}:
             return item
 

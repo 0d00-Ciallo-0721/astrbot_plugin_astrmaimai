@@ -131,7 +131,7 @@ class UserProfileService:
             self.user_profiles[user_id] = profile
             return profile
 
-    async def update_social_score(self, user_id: str, score: float) -> UserProfile:
+    async def update_social_score(self, user_id: str, score: float, relationship_vector: dict = None) -> UserProfile:
         async with self._get_user_lock(user_id):
             now = time.time()
             profile = self.user_profiles.get(user_id)
@@ -140,6 +140,10 @@ class UserProfileService:
                 profile = UserProfile(**data) if data else UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
                 self.user_profiles[user_id] = profile
             profile.social_score = score
+            if relationship_vector:
+                profile.relationship_vector = relationship_vector
+                meta = self._profile_metadata(profile)
+                meta["relationship_vector"] = relationship_vector
             self._touch_profile(profile, now=now)
             await self._save_profile(profile)
             return profile
@@ -497,5 +501,5 @@ class UserProfileService:
     async def flush_message_counters(self) -> None:
         dirty_profiles = [profile for profile in self.user_profiles.values() if getattr(profile, "is_dirty", False)]
         for profile in dirty_profiles:
-            await self._save_profile(profile)
             profile.is_dirty = False
+            await self._save_profile(profile)

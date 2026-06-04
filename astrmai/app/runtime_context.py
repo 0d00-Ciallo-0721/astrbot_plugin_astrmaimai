@@ -120,9 +120,24 @@ class PluginRuntimeContext:
     lifecycle: LifecycleServices = field(default_factory=LifecycleServices)
     status: RuntimeStatus = field(default_factory=RuntimeStatus)
     system2_callback: System2Callback | None = None
+    host_plugin_ref: Any = None
 
     def bind_system2_callback(self, callback: System2Callback) -> None:
         self.system2_callback = callback
+
+    def bind_host_plugin(self, host_plugin: Any) -> None:
+        import weakref
+        self.host_plugin_ref = weakref.ref(host_plugin)
+
+    def sync_host_compat_attrs(self) -> None:
+        ref = self.host_plugin_ref
+        if ref is None:
+            return
+        host_plugin = ref()
+        if host_plugin is None:
+            return
+        for name, value in export_legacy_attrs(self).items():
+            setattr(host_plugin, name, value)
 
     def rebuild_infrastructure_settings(self) -> None:
         self.infrastructure_settings = build_infrastructure_settings(self.config)

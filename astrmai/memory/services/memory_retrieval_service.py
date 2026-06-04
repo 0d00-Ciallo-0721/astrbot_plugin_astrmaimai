@@ -22,6 +22,33 @@ class MemoryRetrievalService:
         self.expression_pattern_policy = ExpressionPatternRetrievalPolicy(store)
 
     @staticmethod
+    def _trace_bucket(query: MemoryQuery) -> dict:
+        metadata = query.metadata if isinstance(query.metadata, dict) else {}
+        trace = metadata.get("_trace")
+        if not isinstance(trace, dict):
+            trace = {}
+            metadata["_trace"] = trace
+            query.metadata = metadata
+        return trace
+
+    @staticmethod
+    def _candidate_trace_payload(candidates, *, limit=8):
+        payload = []
+        for item in list(candidates or [])[:max(int(limit or 0), 0)]:
+            payload.append({
+                "id": str(getattr(item, "id", "") or ""),
+                "kind": str(getattr(item, "kind", "") or ""),
+                "status": str(getattr(item, "status", "") or ""),
+                "visibility": str(getattr(item, "visibility", "") or ""),
+                "relevance_score": round(float(getattr(item, "relevance_score", 0.0) or 0.0), 4),
+                "importance": round(float(getattr(item, "importance", 0.0) or 0.0), 4),
+                "confidence": round(float(getattr(item, "confidence", 0.0) or 0.0), 4),
+                "score_breakdown": (getattr(item, "metadata", {}) or {}).get("_score_breakdown"),
+                "summary_preview": str(getattr(item, "summary", "") or getattr(item, "content", "") or "")[:120],
+            })
+        return payload
+
+    @staticmethod
     def _result_to_candidate(result, query: MemoryQuery) -> MemoryCandidate:
         metadata = getattr(result, "metadata", {}) or {}
         if isinstance(metadata, str):
@@ -124,8 +151,15 @@ class MemoryRetrievalService:
     async def _retrieve_once(self, query: MemoryQuery) -> list[MemoryCandidate]:
         visibility_mode = str(query.metadata.get("visibility_mode") or "")
         query_layers = {str(item) for item in query.layers or [] if str(item).strip()}
+        trace = self._trace_bucket(query)
         if query.intent == "jargon" or query_layers == {"jargon"}:
-            return await self.jargon_policy.search(
+            trace.setdefault("search_steps", []).append({
+                "query": str(query.query or ""),
+                "layers": sorted(query_layers),
+                "visibility_mode": visibility_mode,
+                "allow_stale": bool(query.allow_stale),
+            })
+            results = await self.jargon_policy.search(
                 query=query.query,
                 session_id=query.session_id,
                 persona_id=query.persona_id,
@@ -133,8 +167,19 @@ class MemoryRetrievalService:
                 exclude_ids=query.exclude_ids,
                 allow_stale=query.allow_stale,
                 visibility_mode=visibility_mode,
+                trace=trace,
             )
+            last_step = trace["search_steps"][-1]
+            last_step["matched_terms"] = trace.pop("matched_terms", [])
+            last_step["top_k_scores"] = trace.pop("top_k_scores", [])
+            return results
         if query.intent == "expression_pattern" or query_layers == {"expression_pattern"}:
+            trace.setdefault("search_steps", []).append({
+                "query": str(query.query or ""),
+                "layers": sorted(query_layers),
+                "visibility_mode": visibility_mode,
+                "allow_stale": bool(query.allow_stale),
+            })
             return await self.expression_pattern_policy.search(
                 query=query.query,
                 session_id=query.session_id,
@@ -249,14 +294,23 @@ class MemoryRetrievalService:
             conflict_penalty = 0.0
             if (item.metadata or {}).get("corrected_by") or (item.metadata or {}).get("contradicted_by"):
                 conflict_penalty = 0.2
+            canon_weighted = canon * self.scoring.canonical_weight
+            hybrid_weighted = hybrid_score * self.scoring.hybrid_weight
+            importance_weighted = float(item.importance or 0.0) * self.scoring.importance_weight
+            confidence_weighted = float(item.confidence or 0.0) * self.scoring.confidence_weight
+            stale_penalty = self.scoring.stale_penalty if item.status == "stale" else 0.0
             item.relevance_score = (
-                canon * self.scoring.canonical_weight
-                + hybrid_score * self.scoring.hybrid_weight
-                + float(item.importance or 0.0) * self.scoring.importance_weight
-                + float(item.confidence or 0.0) * self.scoring.confidence_weight
-                - conflict_penalty
-                - (self.scoring.stale_penalty if item.status == "stale" else 0.0)
+                canon_weighted + hybrid_weighted + importance_weighted + confidence_weighted
+                - conflict_penalty - stale_penalty
             )
+            item.metadata["_score_breakdown"] = {
+                "canonical": round(canon_weighted, 4),
+                "hybrid": round(hybrid_weighted, 4),
+                "importance": round(importance_weighted, 4),
+                "confidence": round(confidence_weighted, 4),
+                "conflict_penalty": round(conflict_penalty, 4),
+                "stale_penalty": round(stale_penalty, 4),
+            }
         ranked = sorted(merged.values(), key=lambda item: item.relevance_score, reverse=True)
         return ranked
 

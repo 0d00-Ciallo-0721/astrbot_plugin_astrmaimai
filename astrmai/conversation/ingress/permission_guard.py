@@ -3,6 +3,11 @@ from __future__ import annotations
 from ...presentation.dto.message_scope import IngressDecision, MessageScope
 
 
+def check_command_access(runtime, event) -> IngressDecision:
+    scope = MessageScope.from_event(event)
+    return check_message_scope_access(runtime, scope)
+
+
 def check_message_scope_access(runtime, scope: MessageScope) -> IngressDecision:
     whitelist_ids = getattr(runtime.config.global_settings, "whitelist_ids", [])
     admin_ids = getattr(runtime.config.global_settings, "admin_ids", [])

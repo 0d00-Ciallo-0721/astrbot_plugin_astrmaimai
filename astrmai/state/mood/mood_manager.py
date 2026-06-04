@@ -1,3 +1,4 @@
+import asyncio
 import ast
 import json
 import re
@@ -201,18 +202,27 @@ class MoodManager:
 
         try:
             if chat_id and getattr(self.gateway, "lane_manager", None):
-                llm_result = await self.gateway.chat_in_lane_result(
-                    lane_key=LaneKey(subsystem="sys1", task_family="mood", scope_id=chat_id),
-                    base_origin=chat_id,
-                    prompt=prompt,
-                    system_prompt=MOOD_SYSTEM_PROMPT,
-                    models=getattr(self.config.provider, "task_models", []),
-                    is_json=True,
-                    use_fallback=False,
+                llm_result = await asyncio.wait_for(
+                    self.gateway.chat_in_lane_result(
+                        lane_key=LaneKey(subsystem="sys1", task_family="mood", scope_id=chat_id),
+                        base_origin=chat_id,
+                        prompt=prompt,
+                        system_prompt=MOOD_SYSTEM_PROMPT,
+                        models=getattr(self.config.provider, "task_models", []),
+                        is_json=True,
+                        use_fallback=False,
+                    ),
+                    timeout=30,
                 )
                 result = llm_result.parsed_json or self._extract_lane_text_result(llm_result)
             else:
-                result = await self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT)
+                try:
+                    result = await asyncio.wait_for(
+                        self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT),
+                        timeout=30,
+                    )
+                except TypeError:
+                    result = await self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT)
 
             data = self._parse_result_payload(result)
             normalized = self._normalize_result(data, current_mood)

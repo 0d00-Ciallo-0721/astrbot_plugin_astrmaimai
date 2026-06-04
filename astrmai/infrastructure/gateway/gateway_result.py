@@ -38,17 +38,53 @@ class GatewayResultMixin:
                     return 0
         return 0
 
+    def _has_usage_field(self, usage: Any, *names: str) -> bool:
+        if usage is None:
+            return False
+        for name in names:
+            value = getattr(usage, name, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(name)
+            if value is not None:
+                return True
+        return False
+
     def _extract_usage(self, resp: Any) -> Dict[str, int]:
         usage = getattr(resp, "usage", None)
         input_tokens = self._read_usage_field(usage, "input", "input_tokens", "prompt_tokens")
         input_cached = self._read_usage_field(usage, "input_cached", "cached_tokens")
         output_tokens = self._read_usage_field(usage, "output", "output_tokens", "completion_tokens")
+        cached_usage_supported = self._has_usage_field(
+            usage,
+            "input_cached",
+            "cached_tokens",
+            "cache_read_input_tokens",
+            "prompt_tokens_details",
+        )
         return {
             "input_tokens": input_tokens,
             "input_cached": input_cached,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "cached_usage_supported": bool(cached_usage_supported or input_cached > 0),
         }
+
+    def _enrich_cache_debug_meta(
+        self,
+        debug_meta: Optional[Dict[str, Any]],
+        *,
+        workload_policy: Any = None,
+        usage: Optional[Dict[str, int]] = None,
+        provider_visible_hash_stable: bool = False,
+    ) -> Dict[str, Any]:
+        meta = dict(debug_meta or {})
+        if workload_policy is not None:
+            meta.setdefault("cache_affinity_enabled", bool(getattr(workload_policy, "cache_affinity_enabled", False)))
+        if usage is not None:
+            meta.setdefault("cached_usage_supported", bool((usage or {}).get("cached_usage_supported", False)))
+        if provider_visible_hash_stable:
+            meta["provider_visible_hash_stable"] = True
+        return meta
 
     def _build_cache_observation(
         self,

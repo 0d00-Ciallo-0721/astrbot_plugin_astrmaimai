@@ -4,6 +4,7 @@ _EXPORTS = {
     "build_message_signature_text": ".dedupe",
     "check_message_dedup": ".dedupe",
     "check_framework_command": ".command_guard",
+    "check_command_access": ".permission_guard",
     "check_message_scope_access": ".permission_guard",
     "handle_poke_if_needed": ".poke_handler",
     "bridge_external_plugin_result": ".external_result_bridge",

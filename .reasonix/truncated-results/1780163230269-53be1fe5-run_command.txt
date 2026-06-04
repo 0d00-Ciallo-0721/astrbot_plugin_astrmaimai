@@ -1,0 +1,400 @@
+$ git -C . diff HEAD~1 --stat
+[exit 0]
+warning: in the working copy of 'astrmai/app/bootstrap.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/app/lifecycle.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/app/plugin_facade.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/app/runtime_context.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/attention/context_compaction.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/attention/focus_selector.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/attention/gate.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/attention/group_dialogue_store.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/attention/thread_builder.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/contracts/__init__.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/contracts/prompt_envelope.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/contracts/turn_context.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/execution/executor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/execution/outbound_error_policy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/ingress/command_guard.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/ingress/dedupe.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/ingress/external_result_bridge.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/ingress/permission_guard.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/ingress/poke_handler.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/ingress/sensors.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/planning/planner.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/planning/planner_prompt_context.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/planning/prompt_refiner.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/context_economy/center.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/context_economy/models.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/gateway/gateway_call.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/gateway/gateway_lane.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/gateway/gateway_result.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/persistence/database_memory.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/persistence/database_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/persistence/orm_models.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/persistence/persistence_schema.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/persistence/state_profile_persistence.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/runtime/lane_history.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/runtime/lane_manager.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/infrastructure/runtime/lane_transcript.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/contracts/retrieval_trace.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/dream/dream_agent.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/persona/persona_summarizer.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/retrieval/react_retriever.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/services/memory_context_builder.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/services/memory_engine.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/services/memory_injection_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/services/memory_retrieval_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/services/memory_write_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/memory/services/v2_store.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/presentation/dto/message_scope.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/presentation/events/message_entry.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/decay_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/dispatcher.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/dream_scheduler.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/heartflow/manager.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/proactive_task.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/rhythm.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/proactive/wakeup_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/state/chat_state_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/state/private_chat/private_chat_manager.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/state/relationship/relationship_engine.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/adapters/plugin_api.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes/__init__.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes/cognition_routes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes/config_routes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes/memory_routes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes/persona_routes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/routes/runtime_routes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/schemas.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/services/admin_ui_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/backend/services/persona_ui_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/frontend/js/pages/persona.js', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/frontend/pages/persona/index.html', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/webui/plugin_pages.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/workmode/cron_guard/heartbeat.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/original_ported/test_prompt_refiner_focus_layout_ported.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/regression/architecture/test_import_boundaries_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/regression/architecture/test_memory_runtime_boundaries_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/regression/attention/test_attention_focus_thread_selection_migrated.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/regression/memory/test_react_retriever_traces_migrated.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/regression/persistence/test_persistence_regressions_migrated.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/regression/state/test_state_engine_mood_migrated.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_context_economy_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_cron_guard_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_executor_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_external_result_bridge_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_gateway_context_passthrough_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_heartflow_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_main_reverse_session_hook_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_memory_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_persona_context_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_planner_cognitive_loop_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_plugin_pages_admin_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_presentation_commands_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_proactive_scheduler_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_sensors_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_webui_backend_refactor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/unit/conversation/test_context_runtime_wiring.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/unit/conversation/test_group_dialogue_store_and_compaction.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/unit/memory/test_memory_v2_services.py', LF will be replaced by CRLF the next time Git touches it
+ .../benchmark_summary.json                         |    25 +
+ .../benchmark_summary.md                           |    37 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ ...play_seed_samples_post_sys_cleanup_round3.jsonl |    41 +
+ artifacts/deep_checks/deep-check-summary.md        |   266 +
+ .../window-01-plugin-entry-and-bootstrap.md        |    51 +
+ .../deep_checks/window-02-conversation-mainline.md |    60 +
+ .../window-03-attention-and-compaction.md          |    44 +
+ ...ow-04-gateway-provider-runtime-observability.md |    57 +
+ artifacts/deep_checks/window-05-memory-system.md   |    52 +
+ .../window-06-state-relationship-private-chat.md   |    50 +
+ .../window-07-proactive-heartflow-cron.md          |    52 +
+ .../deep_checks/window-08-webui-admin-backend.md   |    48 +
+ .../window-09-presentation-and-ingress.md          |    54 +
+ .../window-10-architecture-boundaries.md           |    48 +
+ .../20260523-post_sys_cleanup_round3/metrics.json  |   145 +
+ .../reply_audit.jsonl                              |   411 +
+ .../20260523-post_sys_cleanup_round3/summary.md    |   264 +
+ .../trace_samples.json                             | 47747 +++++++++++++++++++
+ artifacts/main_reply_cache_audit/README.md         |    19 +
+ .../main_reply_cache_audit.json                    |  1886 +
+ .../main_reply_cache_audit.md                      |    85 +
+ .../main_reply_cache_live/anthropic/samples.jsonl  |     1 +
+ .../main_reply_cache_live/anthropic/summary.json   |    39 +
+ .../main_reply_cache_live/anthropic/summary.md     |    20 +
+ .../main_reply_cache_live/gemini/samples.jsonl     |     6 +
+ .../main_reply_cache_live/gemini/summary.json      |   202 +
+ artifacts/main_reply_cache_live/gemini/summary.md  |    36 +
+ .../native_chat/samples.jsonl                      |     6 +
+ .../main_reply_cache_live/native_chat/summary.json |   202 +
+ .../main_reply_cache_live/native_chat/summary.md   |    36 +
+ artifacts/main_reply_cache_live/samples.jsonl      |     6 +
+ artifacts/main_reply_cache_live/summary.json       |   193 +
+ artifacts/main_reply_cache_live/summary.md         |    27 +
+ .../native_chat/samples.jsonl                      |     1 +
+ .../native_chat/summary.json                       |    39 +
+ .../native_chat/summary.md                         |    20 +
+ .../anthropic/samples.jsonl                        |     1 +
+ .../anthropic/summary.json                         |    39 +
+ .../anthropic/summary.md                           |    20 +
+ .../gemini/samples.jsonl                           |     1 +
+ .../gemini/summary.json                            |    39 +
+ .../gemini/summary.md                              |    20 +
+ .../native_chat/samples.jsonl                      |     1 +
+ .../native_chat/summary.json                       |    39 +
+ .../native_chat/summary.md                         |    20 +
+ .../gemini/samples.jsonl                           |     2 +
+ .../gemini/summary.json                            |    99 +
+ .../gemini/summary.md                              |    32 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   170 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  1708 +
+ .../comparison_report.md                           |    45 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   170 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   250 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  1790 +
+ .../comparison_report.md                           |    58 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   250 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   250 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2101 +
+ .../comparison_report.md                           |    63 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   330 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   250 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2290 +
+ .../comparison_report.md                           |    64 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   346 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   250 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2323 +
+ .../comparison_report.md                           |    66 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   346 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   276 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2386 +
+ .../comparison_report.md                           |    69 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   356 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   296 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2396 +
+ .../comparison_report.md                           |    76 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   376 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   296 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2514 +
+ .../comparison_report.md                           |    76 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   736 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   296 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2514 +
+ .../comparison_report.md                           |    76 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   736 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   296 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2191 +
+ .../comparison_report.md                           |    71 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   736 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   296 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2191 +
+ .../comparison_report.md                           |    71 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   736 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   746 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2274 +
+ .../comparison_report.md                           |    69 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   746 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   746 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2274 +
+ .../comparison_report.md                           |    69 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   746 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   746 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2274 +
+ .../comparison_report.md                           |    69 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   746 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   746 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2274 +
+ .../comparison_report.md                           |    70 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   746 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   746 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2276 +
+ .../comparison_report.md                           |    77 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   746 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   786 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md                           |   144 +
+ .../samples_meta.json                              |    11 +
+ .../comparison_report.json                         |  2295 +
+ .../comparison_report.md                           |    83 +
+ .../current_round3_context_economy_samples.jsonl   |    26 +
+ .../current_trace_rows.json                        |   786 +
+ .../baseline_6d5ecde/run-1/report.jsonl            |    10 +
+ .../_tmp_replay/current_round3/run-1/report.jsonl  |    10 +
+ .../baseline_6d5ecde_context_economy_samples.jsonl |    26 +
+ .../baseline_trace_rows.json                       |   786 +
+ .../benchmark_summary.json                         |   717 +
+ .../benchmark_summary.md        
+
+[… truncated 9778 chars …]

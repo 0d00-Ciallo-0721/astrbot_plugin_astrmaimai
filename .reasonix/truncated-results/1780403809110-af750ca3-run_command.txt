@@ -1,0 +1,624 @@
+$ git diff -- astrmai/infrastructure/gateway/gateway_lane.py astrmai/infrastructure/gateway/gateway_call.py astrmai/infrastructure/gateway/model_router.py astrmai/infrastructure/runtime/lane_manager.py astrmai/infrastructure/runtime/lane_storage.py astrmai/conversation/attention/gate.py astrmai/conversation/attention/group_dialogue_store.py astrmai/conversation/attention/compaction_providers.py astrmai/conversation/planning/conversation_continuity.py astrmai/infrastructure/gateway/gateway_result.py astrmai/app/bootstrap.py 2>&1
+[exit 0]
+warning: in the working copy of 'astrmai/conversation/attention/compaction_providers.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'astrmai/conversation/planning/conversation_continuity.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/astrmai/app/bootstrap.py b/astrmai/app/bootstrap.py
+index 50b489a..2be4cff 100644
+--- a/astrmai/app/bootstrap.py
++++ b/astrmai/app/bootstrap.py
+@@ -97,10 +97,19 @@ class PluginBootstrap:
+         )
+         runtime.status.boot_logged = True
+ 
++    # ── D24/D25 NOTE ──────────────────────────────────────────────
++    # 以下两个方法因存在大量双向绑定（memory_engine ↔ db_service、
++    # gateway ↔ lane_manager ↔ compaction）不适合简单提取子方法。
++    # 提取需要引入中间 dataclass 承载返回值，属于独立重构窗口范围。
++    # 当前通过分段注释改善可导航性，完整拆分见 TECHNICAL-DEBT-INVENTORY。
++    # ────────────────────────────────────────────────────────────────
++
+     def _build_core_services(self, runtime: PluginRuntimeContext) -> CoreServices:
++        # ── 持久化 & 数据库 ──
+         embedding_models = getattr(runtime.config.provider, "embedding_models", [])
+         persistence = PersistenceManager()
+         db_service = DatabaseService(persistence)
++        # ── Gateway & Lane ──
+         gateway = GlobalModelGateway(
+             self.context,
+             runtime.config,
+@@ -112,8 +121,12 @@ class PluginBootstrap:
+             settings=runtime.infrastructure_settings.lane,
+         )
+         gateway.set_lane_manager(lane_manager)
++        # ── Memory Engine & 双向绑定 ──
+         event_bus = EventBus()
+         memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
++        # D26: 双向绑定  MemoryEngine ↔ DatabaseService
++        # 采用构造后注入避免循环导入；初始化顺序：memory_engine 先创建，再互相 back-link。
++        # 重构方向：引入 setter 延迟注入或 Protocol 接口打破循环。
+         memory_engine.db_service = db_service
+         db_service.memory_engine = memory_engine
+         trace_cache_dir = Path(getattr(persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache"))
+@@ -126,6 +139,7 @@ class PluginBootstrap:
+         if hasattr(memory_engine, "tool_service"):
+             memory_engine.tool_service.db_service = db_service
+         memory_engine.observability_hub = observability_hub
++        # ── State Engine & Dialogue Store ──
+         conversation_settings = getattr(runtime.config, "conversation", None)
+         state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
+         dialogue_store = None
+@@ -141,6 +155,7 @@ class PluginBootstrap:
+         gateway.dialogue_store = dialogue_store
+         gateway.db_service = db_service
+         state_engine.dialogue_store = dialogue_store
++        # ── Context Compaction ──
+         compaction = None
+         if runtime.feature_flags.context_compaction_enabled and dialogue_store is not None:
+             compaction = ContextCompactionEngine(
+@@ -155,6 +170,7 @@ class PluginBootstrap:
+         db_service.context_compaction = compaction
+         gateway.context_compaction = compaction
+         state_engine.context_compaction = compaction
++        # ── Judge / Sensors / Vision ──
+         judge = Judge(gateway, state_engine)
+         sensors = PreFilters(runtime.config)
+         visual_cortex = None
+@@ -282,6 +298,7 @@ class PluginBootstrap:
+         return kernel
+ 
+     def _build_lifecycle_stack(self, runtime: PluginRuntimeContext) -> LifecycleServices:
++        # ── Reflection Services ──
+         reflector = ExpressionReflector(
+             db_service=runtime.db_service,
+             gateway=runtime.gateway,
+@@ -294,6 +311,7 @@ class PluginBootstrap:
+         )
+         review_service = ExpressionReviewService(runtime.db_service)
+         review_dispatcher = ReviewDispatcher(self.context, reflect_tracker)
++        # ── Scheduled Tasks ──
+         auto_check_task = None
+         jargon_auto_check_task = None
+         try:
+diff --git a/astrmai/conversation/attention/compaction_providers.py b/astrmai/conversation/attention/compaction_providers.py
+index bbad08c..f6c0f7b 100644
+--- a/astrmai/conversation/attention/compaction_providers.py
++++ b/astrmai/conversation/attention/compaction_providers.py
+@@ -162,6 +162,12 @@ class CompactionProviderMixin:
+             except Exception as exc:
+                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
+                 request_kwargs.pop("session_id", None)
++                # 失效损坏的 remote session，防止下次复用（D6）
++                _lane_mgr = getattr(self.gateway, "lane_manager", None) if self.gateway else None
++                if _lane_mgr is not None:
++                    _lane_key = self._compaction_lane_key(chat_id)
++                    _lane_umo = _lane_mgr.resolve_lane_umo("", _lane_key)
++                    _lane_mgr.expire_remote_sessions_for_lane(_lane_umo)
+                 continue
+             content = getattr(response, "completion_text", response)
+             clipped = self._clip_summary(str(content or "").strip())
+@@ -258,6 +264,12 @@ class CompactionProviderMixin:
+             except Exception as exc:
+                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
+                 request_kwargs.pop("session_id", None)
++                # 失效损坏的 remote session，防止下次复用（D6）
++                _lane_mgr = getattr(self.gateway, "lane_manager", None) if self.gateway else None
++                if _lane_mgr is not None:
++                    _lane_key = self._compaction_lane_key(chat_id)
++                    _lane_umo = _lane_mgr.resolve_lane_umo("", _lane_key)
++                    _lane_mgr.expire_remote_sessions_for_lane(_lane_umo)
+                 continue
+             content = getattr(response, "completion_text", response)
+             rendered = str(content or "").strip()
+diff --git a/astrmai/conversation/attention/gate.py b/astrmai/conversation/attention/gate.py
+index e929790..58df5e5 100644
+--- a/astrmai/conversation/attention/gate.py
++++ b/astrmai/conversation/attention/gate.py
+@@ -83,6 +83,11 @@ class AttentionGate:
+         self.chat_loop_kernel = chat_loop_kernel
+         self.dialogue_store = getattr(state_engine, "dialogue_store", None)
+         self.context_compaction = getattr(state_engine, "context_compaction", None)
++        if self.context_compaction is None:
++            logger.warning(
++                "[AttentionGate] state_engine.context_compaction is None — "
++                "compaction evaluation will be disabled; segments may accumulate unboundedly"
++            )
+ 
+         self.focus_pools: Dict[str, SessionContext] = {}
+         self._pool_lock = asyncio.Lock()
+@@ -453,7 +458,7 @@ class AttentionGate:
+         return "THROTTLED" if should_drop else None
+ 
+     def _handle_repeater_echo(self, event: AstrMessageEvent, session: SessionContext, is_private: bool, extracted_images: list[Any], msg_str: str) -> str | None:
+-        del event
++        _ = event  # 参数保留用于接口一致性，方法体内仅使用 session 状态
+         if is_private:
+             return None
+         msg_hash = f"{msg_str}|{bool(extracted_images)}"
+@@ -467,7 +472,7 @@ class AttentionGate:
+         return None
+ 
+     async def _normalize_content_to_str(self, components: Any, depth: int = 0, event: AstrMessageEvent = None) -> str:
+-        del event
++        _ = event  # 参数保留用于递归接口一致性
+         if depth > 3:
+             return "[content depth exceeded]"
+         if components is None:
+@@ -495,7 +500,7 @@ class AttentionGate:
+         return f"[{sender}] {str(getattr(event, 'message_str', '') or '').strip()}".strip()
+ 
+     def _convert_interaction_to_narrative(self, content: str, bot_name: str, event: AstrMessageEvent = None) -> str:
+-        del bot_name, event
++        _ = (bot_name, event)  # 参数保留用于接口一致性
+         return str(content or "").strip()
+ 
+     def bind_chat_loop_kernel(self, chat_loop_kernel) -> None:
+diff --git a/astrmai/conversation/attention/group_dialogue_store.py b/astrmai/conversation/attention/group_dialogue_store.py
+index e670021..cd1375c 100644
+--- a/astrmai/conversation/attention/group_dialogue_store.py
++++ b/astrmai/conversation/attention/group_dialogue_store.py
+@@ -544,7 +544,9 @@ class GroupDialogueStore:
+             if used + estimate <= max_tokens or not selected:
+                 selected.append(latest_direct_user)
+                 used += estimate
+-        latest_assistant = next((segment for segment in reversed(segments) if segment.role == "assistant" or segment.is_bot), None)
++        # 限制扫描窗口为最近 64 条，避免大群积压时 O(n) 全量扫描（D21）
++        _scan_window = segments[-64:]
++        latest_assistant = next((segment for segment in reversed(_scan_window) if segment.role == "assistant" or segment.is_bot), None)
+         has_latest_assistant = bool(latest_assistant and latest_assistant in selected)
+         if latest_assistant is not None and not has_latest_assistant:
+             line = self._format_segment_line(latest_assistant)
+diff --git a/astrmai/conversation/planning/conversation_continuity.py b/astrmai/conversation/planning/conversation_continuity.py
+index c81c647..1ffdce0 100644
+--- a/astrmai/conversation/planning/conversation_continuity.py
++++ b/astrmai/conversation/planning/conversation_continuity.py
+@@ -209,6 +209,10 @@ class ConversationContinuityStore:
+             reply_preview=str(reply_preview or "")[:160],
+             reply_need=str(reply_need or "reply"),
+         )
++        # 设计意图：lightweight_event 和 wait/ignore 是非实质性轮次，
++        # 不应推进对话主题/目标状态机。仅记录轮次，不更新 state.current_topic、
++        # state.current_goal、state.goal_status、continuity_weight 等。
++        # 此行为是有意设计，非 bug（参见 TECHNICAL-DEBT-INVENTORY D22）。
+         if lightweight_event or item.reply_need in {"wait", "ignore"}:
+             return item
+ 
+diff --git a/astrmai/infrastructure/gateway/gateway_call.py b/astrmai/infrastructure/gateway/gateway_call.py
+index a1308f4..e7f6f3c 100644
+--- a/astrmai/infrastructure/gateway/gateway_call.py
++++ b/astrmai/infrastructure/gateway/gateway_call.py
+@@ -211,6 +211,10 @@ class GatewayCallMixin:
+                         usage = self._extract_usage(response)
+                         log_meta = dict(debug_meta or {})
+                         log_meta["provider"] = infer_provider_capabilities(model_id).provider_family
++                        if llm_kwargs.get("session_id"):
++                            log_meta["request_session_id"] = str(llm_kwargs["session_id"])
++                        if llm_kwargs.get("cache_control"):
++                            log_meta["request_cache_control"] = "ephemeral"
+ 
+                         if is_json:
+                             parsed_json = self._parse_json_completion(content)
+diff --git a/astrmai/infrastructure/gateway/gateway_lane.py b/astrmai/infrastructure/gateway/gateway_lane.py
+index 673d51b..8da2c04 100644
+--- a/astrmai/infrastructure/gateway/gateway_lane.py
++++ b/astrmai/infrastructure/gateway/gateway_lane.py
+@@ -42,14 +42,19 @@ class GatewayLaneMixin:
+         existing_payload = event.get_extra("astrmai_request_trace", {})
+         if not isinstance(existing_payload, dict):
+             existing_payload = {}
++        def _reuse_or_hash(key: str, fallback_text: str) -> str:
++            existing = existing_payload.get(key)
++            return existing if existing is not None else self._stable_hash_text(fallback_text)
++
++        _raw_sid = (request_kwargs or {}).get("session_id")
+         trace_payload = {
+             **existing_payload,
+             "gateway_system_hash": self._stable_hash_text(system_prompt),
+             "gateway_prompt_hash": self._stable_hash_text(prompt),
+-            "provider_visible_system_hash": existing_payload.get("provider_visible_system_hash", "") or self._stable_hash_text(system_prompt),
+-            "provider_visible_prompt_hash": existing_payload.get("provider_visible_prompt_hash", "") or self._stable_hash_text(prompt),
+-            "post_hook_system_hash": existing_payload.get("post_hook_system_hash", "") or self._stable_hash_text(post_hook_system_prompt or system_prompt),
+-            "request_session_id": str((request_kwargs or {}).get("session_id", "") or ""),
++            "provider_visible_system_hash": _reuse_or_hash("provider_visible_system_hash", system_prompt),
++            "provider_visible_prompt_hash": _reuse_or_hash("provider_visible_prompt_hash", prompt),
++            "post_hook_system_hash": _reuse_or_hash("post_hook_system_hash", post_hook_system_prompt or system_prompt),
++            "request_session_id": str(_raw_sid) if _raw_sid is not None else "",
+             "request_cache_control": self._stringify_request_cache_control((request_kwargs or {}).get("cache_control")),
+             "request_provider_family": str(provider_family or ""),
+             "request_model_id": str(model_id or ""),
+@@ -189,13 +194,20 @@ class GatewayLaneMixin:
+                 workload_policy=workload_policy,
+             )
+ 
+-        primary_models = self.router.get_ranked_models(
++        primary_models, attempt_queue = self._build_attempt_queue(
+             lane_key.task_family,
+             models,
+-            sticky_key=workload_policy.sticky_key if workload_policy.sticky_model else "",
+-            sticky_preferred=workload_policy.primary_model,
++            use_fallback,
++            workload_policy=workload_policy,
++        )
++        attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
++            lane_key.task_family,
++            primary_models,
++            attempt_queue,
+         )
+-        model_hint = primary_models[0] if primary_models else ""
++        if not attempt_queue:
++            raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
++        model_hint = attempt_queue[0]
+         lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
+             lane_key=effective_lane_key,
+             base_origin=base_origin,
+@@ -206,7 +218,7 @@ class GatewayLaneMixin:
+             schema_id=workload_policy.schema_id,
+             persona_core_version=workload_policy.persona_core_version,
+         )
+-        lane_runtime_meta = self.lane_manager.get_runtime_meta(lane_umo)
++        lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
+         seed_trace = self.context_economy.build_trace(
+             policy=workload_policy,
+             lane_umo=lane_umo,
+@@ -236,7 +248,13 @@ class GatewayLaneMixin:
+             record_economy=False,
+         )
+         if not result.model_id:
++            # 防御性回退：_elastic_call_result 成功路径必定设置 model_id；
++            # 到达此处说明 _build_success_result 未正确传递 model_id，属异常路径。
+             result.model_id = model_hint
++            logger.warning(
++                f"[Gateway] chat_in_lane_result: result.model_id unexpectedly empty "
++                f"(pool={lane_key.task_family}), falling back to attempt_queue[0]={model_hint}"
++            )
+         provider_caps = infer_provider_capabilities(result.model_id)
+         provider_session_id = ""
+         if workload_policy.use_provider_session and provider_caps.supports_remote_session:
+@@ -260,6 +278,18 @@ class GatewayLaneMixin:
+         )
+         result.economy = workload_trace.as_dict()
+         self.context_economy.record_trace(workload_trace)
++        append_trace_stage(
++            event,
++            "gateway_chat",
++            workload_family=workload_policy.family.value,
++            lane_key=effective_lane_key.as_log_key(),
++            lane_umo=lane_umo,
++            prefix_hash=workload_policy.stable_prefix_hash,
++            model_id=result.model_id or model_hint,
++            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
++            skipped_cooldown_models=list(skipped_cooldown_models),
++            cooldown_overridden=bool(cooldown_overridden),
++        )
+         self._record_event_request_trace(
+             event,
+             system_prompt=system_prompt,
+@@ -396,7 +426,7 @@ class GatewayLaneMixin:
+             schema_id=workload_policy.schema_id,
+             persona_core_version=workload_policy.persona_core_version,
+         )
+-        lane_runtime_meta = self.lane_manager.get_runtime_meta(lane_umo)
++        lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
+         last_error = ""
+         last_raw_completion = ""
+         attempted_models: List[str] = []
+@@ -429,20 +459,20 @@ class GatewayLaneMixin:
+                 if "[SYSTEM_WAIT_SIGNAL]" in stripped_reply or "[TERMINAL_YIELD]:" in stripped_reply:
+                     self.router.report_success(report_pool, model_id)
+                     usage = self._extract_usage(response)
+-                    self._log_usage(
+-                        report_pool,
+-                        model_id,
+-                        usage,
+-                        {
+-                            "lane_key": effective_lane_key.as_log_key(),
+-                            "conversation_id": conversation_id,
+-                            "prefix_hash": workload_policy.effective_prefix_hash,
+-                            "provider": capabilities.provider_family,
+-                            "workload_family": workload_policy.family.value,
+-                            "template_id": workload_policy.template_id,
+-                            "template_version": workload_policy.template_version,
+-                        },
+-                    )
++                    _tool_log_meta = {
++                        "lane_key": effective_lane_key.as_log_key(),
++                        "conversation_id": conversation_id,
++                        "prefix_hash": workload_policy.effective_prefix_hash,
++                        "provider": capabilities.provider_family,
++                        "workload_family": workload_policy.family.value,
++                        "template_id": workload_policy.template_id,
++                        "template_version": workload_policy.template_version,
++                    }
++                    if tool_kwargs.get("session_id"):
++                        _tool_log_meta["request_session_id"] = str(tool_kwargs["session_id"])
++                    if tool_kwargs.get("cache_control"):
++                        _tool_log_meta["request_cache_control"] = "ephemeral"
++                    self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                     provider_session_id = str(tool_kwargs.get("session_id", "") or "")
+                     workload_trace = self.context_economy.build_trace(
+                         policy=workload_policy,
+@@ -512,20 +542,20 @@ class GatewayLaneMixin:
+ 
+                 self.router.report_success(report_pool, model_id)
+                 usage = self._extract_usage(response)
+-                self._log_usage(
+-                    report_pool,
+-                    model_id,
+-                    usage,
+-                    {
+-                        "lane_key": effective_lane_key.as_log_key(),
+-                        "conversation_id": conversation_id,
+-                        "prefix_hash": workload_policy.effective_prefix_hash,
+-                        "provider": capabilities.provider_family,
+-                        "workload_family": workload_policy.family.value,
+-                        "template_id": workload_policy.template_id,
+-                        "template_version": workload_policy.template_version,
+-                    },
+-                )
++                _tool_log_meta = {
++                    "lane_key": effective_lane_key.as_log_key(),
++                    "conversation_id": conversation_id,
++                    "prefix_hash": workload_policy.effective_prefix_hash,
++                    "provider": capabilities.provider_family,
++                    "workload_family": workload_policy.family.value,
++                    "template_id": workload_policy.template_id,
++                    "template_version": workload_policy.template_version,
++                }
++                if tool_kwargs.get("session_id"):
++                    _tool_log_meta["request_session_id"] = str(tool_kwargs["session_id"])
++                if tool_kwargs.get("cache_control"):
++                    _tool_log_meta["request_cache_control"] = "ephemeral"
++                self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                 provider_session_id = str(tool_kwargs.get("session_id", "") or "")
+                 workload_trace = self.context_economy.build_trace(
+                     policy=workload_policy,
+diff --git a/astrmai/infrastructure/gateway/model_router.py b/astrmai/infrastructure/gateway/model_router.py
+index 578353e..c75a19a 100644
+--- a/astrmai/infrastructure/gateway/model_router.py
++++ b/astrmai/infrastructure/gateway/model_router.py
+@@ -12,6 +12,7 @@
+ """
+ 
+ import time
++from collections import OrderedDict
+ from dataclasses import dataclass, field
+ from typing import Dict, List
+ 
+@@ -63,7 +64,8 @@ class ModelRouter:
+ 
+     def __init__(self):
+         self._pools: Dict[str, PoolState] = {}
+-        self._sticky_primary: Dict[str, str] = {}
++        self._sticky_primary: "OrderedDict[str, str]" = OrderedDict()
++        self._sticky_primary_maxsize: int = 256
+ 
+     # ------------------------------------------------------------------
+     # 公共接口
+@@ -249,7 +251,12 @@ class ModelRouter:
+         sticky_slot = f"{pool_name}:{sticky_key}"
+         current = self._sticky_primary.get(sticky_slot, "")
+         if current in unique_models:
++            # 命中后移到末尾（LRU 语义）
++            self._sticky_primary.move_to_end(sticky_slot)
+             return current
+         preferred = sticky_preferred if sticky_preferred in unique_models else unique_models[0]
++        # 容量检查：超过上限时淘汰最早插入的条目
++        while len(self._sticky_primary) >= self._sticky_primary_maxsize:
++            self._sticky_primary.popitem(last=False)
+         self._sticky_primary[sticky_slot] = preferred
+         return preferred
+diff --git a/astrmai/infrastructure/runtime/lane_manager.py b/astrmai/infrastructure/runtime/lane_manager.py
+index a75d548..89e7772 100644
+--- a/astrmai/infrastructure/runtime/lane_manager.py
++++ b/astrmai/infrastructure/runtime/lane_manager.py
+@@ -1,6 +1,7 @@
+ import asyncio
++import time
+ from dataclasses import dataclass
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, Optional, Tuple
+ 
+ from ...shared.constants.defaults import LaneRuntimeSettings, build_infrastructure_settings
+ from .lane_history import LaneHistoryMixin
+@@ -62,9 +63,12 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
+         self.config = config
+         self.settings = settings or build_infrastructure_settings(config).lane
+         self._runtime_meta: Dict[str, Dict[str, Any]] = {}
+-        self._remote_sessions: Dict[str, str] = {}
++        self._remote_sessions: Dict[str, Tuple[str, float]] = {}
++        self._remote_sessions_ttl: float = 3600.0
++        self._remote_sessions_last_cleanup: float = 0.0
+         self._lane_locks: Dict[str, asyncio.Lock] = {}
+         self._lock = asyncio.Lock()
++        self._meta_lock = asyncio.Lock()
+ 
+     def get_policy(self, lane_key: LaneKey) -> LanePolicy:
+         return self.DEFAULT_POLICIES.get(
+@@ -82,7 +86,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
+                 self._lane_locks[lane_umo] = asyncio.Lock()
+             return self._lane_locks[lane_umo]
+ 
+-    def _should_rotate(
++    async def _should_rotate(
+         self,
+         lane_umo: str,
+         prompt_version: str,
+@@ -94,7 +98,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
+         persona_core_version: str = "",
+     ) -> bool:
+         return bool(
+-            self._rotation_reason(
++            await self._rotation_reason(
+                 lane_umo=lane_umo,
+                 prompt_version=prompt_version,
+                 prefix_hash=prefix_hash,
+@@ -106,7 +110,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
+             )
+         )
+ 
+-    def _rotation_reason(
++    async def _rotation_reason(
+         self,
+         lane_umo: str,
+         prompt_version: str,
+@@ -117,7 +121,8 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
+         schema_id: str = "",
+         persona_core_version: str = "",
+     ) -> str:
+-        meta = self._runtime_meta.get(lane_umo)
++        async with self._meta_lock:
++            meta = self._runtime_meta.get(lane_umo)
+         if not meta:
+             return ""
+         reasons = []
+@@ -140,9 +145,35 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
+ 
+     def get_remote_session_id(self, lane_umo: str, provider_family: str) -> str:
+         key = f"{provider_family}:{lane_umo}"
++        now = time.time()
++        # 惰性清理：每 300s 最多执行一次全量扫描
++        if now - self._remote_sessions_last_cleanup > 300.0:
++            self._cleanup_remote_sessions(now)
+         if key not in self._remote_sessions:
+-            self._remote_sessions[key] = lane_umo
+-        return self._remote_sessions[key]
+-
+-    def get_runtime_meta(self, lane_umo: str) -> Dict[str, Any]:
+-        return dict(self._runtime_meta.get(lane_umo, {}) or {})
++            self._remote_sessions[key] = (lane_umo, now)
++        else:
++            # 刷新时间戳，防止活跃条目被误淘汰
++            self._remote_sessions[key] = (self._remote_sessions[key][0], now)
++        return self._remote_sessions[key][0]
++
++    def _cleanup_remote_sessions(self, now: float) -> None:
++        expired = [
++            k for k, (_, ts) in self._remote_sessions.items()
++            if now - ts > self._remote_sessions_ttl
++        ]
++        for k in expired:
++            del self._remote_sessions[k]
++        self._remote_sessions_last_cleanup = now
++
++    def expire_remote_sessions_for_lane(self, lane_umo: str) -> int:
++        """lane 旋转时过期该 lane 的所有 remote session 映射，返回过期数量。"""
++        removed = 0
++        for key in list(self._remote_sessions.keys()):
++            if key.endswith(f":{lane_umo}"):
++                del self._remote_sessions[key]
++                removed += 1
++        return removed
++
++    async def get_runtime_meta(self, lane_umo: str) -> Dict[str, Any]:
++        async with self._meta_lock:
++            return dict(self._runtime_meta.get(lane_umo, {}) or {})
+diff --git a/astrmai/infrastructure/runtime/lane_storage.py b/astrmai/infrastructure/runtime/lane_storage.py
+index 628b5fb..565b697 100644
+--- a/astrmai/infrastructure/runtime/lane_storage.py
++++ b/astrmai/infrastructure/runtime/lane_storage.py
+@@ -2,6 +2,8 @@ from __future__ import annotations
+ 
+ from typing import Any, List, Optional
+ 
++from astrbot.api import logger
++
+ from .runtime_contracts import VisibleReplyArtifact
+ 
+ 
+@@ -33,7 +35,7 @@ class LaneStorageMixin:
+                     old_history = self._load_history(old_conversation)
+                 except Exception:
+                     old_history = []
+-                rotate_reason = self._rotation_reason(
++                rotate_reason = await self._rotation_reason(
+                     lane_umo=lane_umo,
+                     prompt_version=lane_key.prompt_version,
+                     prefix_hash=prefix_hash,
+@@ -43,7 +45,7 @@ class LaneStorageMixin:
+                     schema_id=schema_id,
+                     persona_core_version=persona_core_version,
+                 )
+-                rotate = self._should_rotate(
++                rotate = await self._should_rotate(
+                     lane_umo=lane_umo,
+                     prompt_version=lane_key.prompt_version,
+                     prefix_hash=prefix_hash,
+@@ -62,6 +64,15 @@ class LaneStorageMixin:
+                     title=self._build_title(lane_key),
+                     persona_id=persona_id or None,
+                 )
++                if rotate:
++                    expired_count = self.expire_remote_sessions_for_lane(lane_umo)
++                    if expired_count > 0:
++                        logger.warning(
++                            f"[Lane] rotation detected for {lane_umo}: "
++                            f"expired {expired_count} remote session mapping(s); "
++                            f"old sessions on provider side may still consume resources "
++                            f"(conversation_manager has no terminate API)"
++                        )
+                 if rotate and old_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+                     await self.save_lane_history(
+                         lane_key=lane_key,
+@@ -90,18 +101,19 @@ class LaneStorageMixin:
+                     token_usage=None,
+                 )
+ 
+-            self._runtime_meta[lane_umo] = {
+-                "conversation_id": conversation_id,
+-                "prompt_version": lane_key.prompt_version,
+-                "prefix_hash": prefix_hash,
+-                "model_id": model_id,
+-                "persona_id": persona_id,
+-                "template_id": template_id,
+-                "schema_id": schema_id,
+-                "persona_core_version": persona_core_version,
+-                "lane_rotated": bool(rotate),
+-                "lane_rotate_reason": rotate_reason,
+-            }
++            async with self._meta_lock:
++                self._runtime_meta[lane_umo] = {
++                    "conversation_id": conversation_id,
++                    "prompt_version": lane_key.prompt_version,
++                    "prefix_hash": prefix_hash,
++                    "model_id": model_id,
++                    "persona_id": persona_id,
++                    "template_id": template_id,
++                    "schema_id": schema_id,
++                    "persona_core_version": persona_core_version,
++                    "lane_rotated": bool(rotate),
++                    "lane_rotate_reason": rotate_reason,
++                }
+             return lane_umo, conversation_id, history, self.get_policy(lane_key)
+ 
+     async def save_lane_history(
+@@ -127,18 +139,19 @@ class LaneStorageMixin:
+             persona_id=persona_id or None,
+             token_usage=token_usage,
+         )
+-        self._runtime_meta[lane_umo] = {
+-            "conversation_id": conversation_id,
+-            "prompt_version": lane_key.prompt_version,
+-            "prefix_hash": prefix_hash,
+-            "model_id": model_id,
+-            "persona_id": persona_id,
+-            "template_id": template_id,
+-            "schema_id": schema_id,
+-            "persona_core_version": persona_core_version,
+-            "lane_rotated": False,
+-            "lane_rotate_reason": "",
+-        }
++        async with self._meta_lock:
++            self._runtime_meta[lane_umo] = {
++                "conversation_id": conversation_id,
++                "prompt_version": lane_key.prompt_version,
++                "prefix_hash": prefix_hash,
++                "model_id": model_id,
++                "persona_id": persona_id,
++                "template_id": template_id,
++                "schema_id": schema_id,
++                "persona_core_version": persona_core_version,
++                "lane_rotated": False,
++                "lane_rotate_reason": "",
++            }
+         return normalized
+ 
+     async def append_exchange(

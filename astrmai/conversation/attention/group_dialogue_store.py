@@ -544,7 +544,9 @@ class GroupDialogueStore:
             if used + estimate <= max_tokens or not selected:
                 selected.append(latest_direct_user)
                 used += estimate
-        latest_assistant = next((segment for segment in reversed(segments) if segment.role == "assistant" or segment.is_bot), None)
+        # 限制扫描窗口为最近 64 条，避免大群积压时 O(n) 全量扫描（D21）
+        _scan_window = segments[-64:]
+        latest_assistant = next((segment for segment in reversed(_scan_window) if segment.role == "assistant" or segment.is_bot), None)
         has_latest_assistant = bool(latest_assistant and latest_assistant in selected)
         if latest_assistant is not None and not has_latest_assistant:
             line = self._format_segment_line(latest_assistant)

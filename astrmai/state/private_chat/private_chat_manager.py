@@ -25,14 +25,35 @@ class PrivateChatManager:
         self._sessions: Dict[str, PrivateSession] = {}
         self._chat_to_user: Dict[str, str] = {}
         self._cleanup_lock = asyncio.Lock()
+        self._init_timeout(config)
 
+    @staticmethod
+    def _session_key(user_id: str, chat_id: str = "") -> str:
+        uid = str(user_id or "").strip()
+        cid = str(chat_id or "").strip()
+        if cid and ":FriendMessage:" in cid:
+            return f"{uid}::{cid}"
+        return uid
+
+    def _resolve_session(self, identifier: str):
+        session = self._sessions.get(identifier)
+        if session:
+            return session
+        if "::" not in identifier:
+            prefix = f"{identifier}::"
+            matching = [(k, v) for k, v in self._sessions.items() if k.startswith(prefix)]
+            if matching:
+                return max(matching, key=lambda kv: kv[1].last_message_time)[1]
+        return None
+
+    def _init_timeout(self, config) -> None:
         if config and hasattr(config, "private_chat"):
             self.timeout_sec = config.private_chat.wait_timeout_sec
         else:
             self.timeout_sec = self.DEFAULT_TIMEOUT_SEC
 
     async def signal_new_message(self, user_id: str, message_str: str = "", chat_id: str = ""):
-        session = self._get_or_create_session(user_id)
+        session = self._get_or_create_session(user_id, chat_id)
         self._bind_chat_session(chat_id, user_id)
         session.last_message_time = time.time()
         session.turn_count += 1
@@ -50,9 +71,13 @@ class PrivateChatManager:
         timeout: Optional[float] = None,
         chat_id: str = "",
     ) -> bool:
-        session = self._get_or_create_session(user_id)
+        session = self._get_or_create_session(user_id, chat_id)
         self._bind_chat_session(chat_id, user_id)
         wait_timeout = timeout if timeout is not None else self.timeout_sec
+
+        if session.pending_messages:
+            logger.debug(f"[PrivateChat] reusing buffered message for {user_id}")
+            return True
 
         session.new_message_event.clear()
         session.is_bot_waiting = True
@@ -69,7 +94,7 @@ class PrivateChatManager:
             session.is_bot_waiting = False
 
     def get_pending_messages(self, user_id: str) -> list:
-        session = self._sessions.get(user_id)
+        session = self._resolve_session(user_id)
         if not session:
             return []
         msgs = list(session.pending_messages)
@@ -77,7 +102,7 @@ class PrivateChatManager:
         return msgs
 
     def get_session_info(self, user_id: str) -> Optional[dict]:
-        session = self._sessions.get(user_id)
+        session = self._resolve_session(user_id)
         if not session:
             return None
         return {
@@ -95,12 +120,19 @@ class PrivateChatManager:
         return self.get_session_info(user_id)
 
     def close_session(self, user_id: str):
+        keys_to_close = []
         if user_id in self._sessions:
-            session = self._sessions.pop(user_id)
-            session.new_message_event.set()
-            stale_chat_ids = [chat_id for chat_id, mapped_user_id in self._chat_to_user.items() if mapped_user_id == user_id]
-            for chat_id in stale_chat_ids:
-                self._chat_to_user.pop(chat_id, None)
+            keys_to_close.append(user_id)
+        prefix = f"{user_id}::"
+        keys_to_close.extend(k for k in self._sessions if k.startswith(prefix))
+        for key in keys_to_close:
+            session = self._sessions.pop(key, None)
+            if session:
+                session.new_message_event.set()
+        stale_chat_ids = [chat_id for chat_id, mapped_user_id in self._chat_to_user.items() if mapped_user_id == user_id]
+        for chat_id in stale_chat_ids:
+            self._chat_to_user.pop(chat_id, None)
+        if keys_to_close:
             logger.debug(f"[PrivateChat] closed session for {user_id}")
 
     async def cleanup_stale_sessions(self, max_silence_min: float = 30.0):
@@ -116,13 +148,14 @@ class PrivateChatManager:
             if stale:
                 logger.debug(f"[PrivateChat] cleaned {len(stale)} stale sessions")
 
-    def _get_or_create_session(self, user_id: str) -> PrivateSession:
-        if user_id not in self._sessions:
+    def _get_or_create_session(self, user_id: str, chat_id: str = "") -> PrivateSession:
+        key = self._session_key(user_id, chat_id)
+        if key not in self._sessions:
             if len(self._sessions) >= self.MAX_SESSIONS:
                 oldest = min(self._sessions.items(), key=lambda x: x[1].last_message_time)
                 self.close_session(oldest[0])
-            self._sessions[user_id] = PrivateSession(user_id=user_id)
-        return self._sessions[user_id]
+            self._sessions[key] = PrivateSession(user_id=user_id)
+        return self._sessions[key]
 
     def _bind_chat_session(self, chat_id: str, user_id: str) -> None:
         chat_id = str(chat_id or "").strip()
@@ -138,8 +171,11 @@ class PrivateChatManager:
         mapped_user_id = str(self._chat_to_user.get(chat_id, "") or "").strip()
         if mapped_user_id:
             return mapped_user_id
-        if ":" in chat_id:
-            return str(chat_id.rsplit(":", 1)[-1] or "").strip()
+        if ":FriendMessage:" in chat_id:
+            suffix = f"::{chat_id}"
+            for key in self._sessions:
+                if key.endswith(suffix):
+                    return key
         return ""
 
 

@@ -1,4 +1,5 @@
 import aiosqlite
+import asyncio
 import json
 import os
 import time
@@ -74,6 +75,7 @@ class MemoryEngine:
         self.memory_observer = None
         self.observability_hub = None
 
+        self._faiss_lock = asyncio.Lock()
         self._is_ready = False
         self._init_failures = 0
         self._next_retry_time = 0.0
@@ -81,18 +83,7 @@ class MemoryEngine:
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
         self._disabled_cognitive_feedback_keys: set[tuple[str, str, str, str]] = set()
         self.v2_store = MemoryV2Store(self.db_path, data_path=self.data_path)
-        self.index_projector = MemoryIndexProjector(self)
-        self.write_service = MemoryWriteService(self.v2_store, self.index_projector)
-        self.retrieval_service = MemoryRetrievalService(self.v2_store, engine=self)
-        self.expression_pattern_service = ExpressionPatternService(self.v2_store, self.write_service)
-        self.injection_service = MemoryInjectionService(self.retrieval_service, config=self.config)
-        self.tool_service = MemoryToolService(self.retrieval_service, config=self.config)
-        self.maintenance_service = MemoryMaintenanceService(self.v2_store, self.index_projector, config=self.config)
-        self.migration_service = MemoryMigrationService(
-            self.v2_store,
-            index_projector=self.index_projector,
-            engine=self,
-        )
+        # Sub-components that depend on self are initialized in initialize()
 
     def _remember_learning_event(self, event_name: str, payload: dict | None) -> None:
         event_payload = dict(payload or {})
@@ -156,6 +147,18 @@ class MemoryEngine:
 
     async def initialize(self):
         await self.v2_store.initialize()
+        self.index_projector = MemoryIndexProjector(self)
+        self.write_service = MemoryWriteService(self.v2_store, self.index_projector)
+        self.retrieval_service = MemoryRetrievalService(self.v2_store, engine=self)
+        self.expression_pattern_service = ExpressionPatternService(self.v2_store, self.write_service)
+        self.injection_service = MemoryInjectionService(self.retrieval_service, config=self.config)
+        self.tool_service = MemoryToolService(self.retrieval_service, config=self.config)
+        self.maintenance_service = MemoryMaintenanceService(self.v2_store, self.index_projector, config=self.config)
+        self.migration_service = MemoryMigrationService(
+            self.v2_store,
+            index_projector=self.index_projector,
+            engine=self,
+        )
         await self.v2_store.import_legacy_documents()
         await self.v2_store.import_persona_cache()
         await self.import_legacy_memory_events()
@@ -197,37 +200,41 @@ class MemoryEngine:
             logger.error(f"[AstrMai] memory wakeup failed: no valid embedding model found [{models_str}]; retry in {backoff}s.")
             return False
 
-        try:
-            self.faiss_db = FaissVecDB(
-                doc_store_path=str(self.data_path / "docs.db"),
-                index_store_path=str(self.data_path / "vectors.index"),
-                embedding_provider=provider_instance,
-            )
-            await self.faiss_db.initialize()
-        except Exception as exc:
-            self._init_failures += 1
-            backoff = min(3600, 30 * (2 ** (self._init_failures - 1)))
-            self._next_retry_time = now + backoff
-            logger.error(f"[AstrMai] FaissVecDB initialization failed: {exc}; retry in {backoff}s.", exc_info=True)
-            return False
+        async with self._faiss_lock:
+            if self._is_ready:
+                return True
 
-        if not self.bm25_retriever:
-            self.bm25_retriever = BM25Retriever(self.db_path)
-            await self.bm25_retriever.initialize()
-
-        self.vec_retriever = VectorRetriever(self.faiss_db, self.config)
-        self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
-        self._is_ready = True
-        self._init_failures = 0
-        if not await self.v2_store.migration_applied("2_index_rebuild"):
             try:
-                rebuilt = await self.index_projector.rebuild_all()
-                await self.v2_store.record_migration("2_index_rebuild", status="applied", detail=f"rebuilt={rebuilt}")
+                self.faiss_db = FaissVecDB(
+                    doc_store_path=str(self.data_path / "docs.db"),
+                    index_store_path=str(self.data_path / "vectors.index"),
+                    embedding_provider=provider_instance,
+                )
+                await self.faiss_db.initialize()
             except Exception as exc:
-                await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])
-                logger.debug(f"[MemoryV2] index rebuild degraded: {exc}")
-        logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
-        return True
+                self._init_failures += 1
+                backoff = min(3600, 30 * (2 ** (self._init_failures - 1)))
+                self._next_retry_time = now + backoff
+                logger.error(f"[AstrMai] FaissVecDB initialization failed: {exc}; retry in {backoff}s.", exc_info=True)
+                return False
+
+            if not self.bm25_retriever:
+                self.bm25_retriever = BM25Retriever(self.db_path)
+                await self.bm25_retriever.initialize()
+
+            self.vec_retriever = VectorRetriever(self.faiss_db, self.config)
+            self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
+            self._is_ready = True
+            self._init_failures = 0
+            if not await self.v2_store.migration_applied("2_index_rebuild"):
+                try:
+                    rebuilt = await self.index_projector.rebuild_all()
+                    await self.v2_store.record_migration("2_index_rebuild", status="applied", detail=f"rebuilt={rebuilt}")
+                except Exception as exc:
+                    await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])
+                    logger.debug(f"[MemoryV2] index rebuild degraded: {exc}")
+            logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
+            return True
 
     async def add_memory(
         self,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from astrbot.api import logger
 
@@ -35,6 +35,8 @@ class CronHeartbeatGuard:
         for snap in snapshots:
             if snap.run_once and snap.run_at and snap.run_at < now:
                 await self.db_service.deactivate_cron_snapshot(snap.job_id)
+                continue
+            if not snap.job_id or not str(snap.job_id).strip():
                 continue
             if snap.job_id not in active_job_ids:
                 if await self._revive_job(cron_mgr, snap):
@@ -87,6 +89,8 @@ class CronHeartbeatGuard:
             if snap.run_once and snap.run_at and snap.run_at < now:
                 await self.db_service.deactivate_cron_snapshot(snap.job_id)
                 continue
+            if not snap.job_id or not str(snap.job_id).strip():
+                continue
             if snap.job_id not in active_job_ids:
                 await self._revive_job(cron_mgr, snap)
 
@@ -99,7 +103,7 @@ class CronHeartbeatGuard:
             id=snap.job_id,
             name=snap.name,
             cron_expression=snap.cron_expression,
-            run_at=datetime.fromtimestamp(snap.run_at) if snap.run_at else None,
+            run_at=datetime.fromtimestamp(snap.run_at, tz=timezone.utc) if snap.run_at else None,
             run_once=snap.run_once,
             payload=snap.payload,
         )

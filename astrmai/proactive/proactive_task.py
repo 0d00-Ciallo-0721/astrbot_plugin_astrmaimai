@@ -144,6 +144,25 @@ class ProactiveTask:
         self.dream_generator = DreamGenerator(gateway, config=self.config)
         self.dream_agent = None
 
+    def refresh_config(self, config) -> None:
+        self.config = config if config is not None else getattr(self.gateway, "config", None)
+        if self.gateway is not None:
+            self.gateway.config = self.config
+        for service_name in (
+            "proactive_dispatcher",
+            "wakeup_service",
+            "group_signin_service",
+            "decay_service",
+            "diary_service",
+            "dream_scheduler",
+            "heartflow_manager",
+            "dream_generator",
+            "dream_agent",
+        ):
+            service = getattr(self, service_name, None)
+            if service is not None and hasattr(service, "config"):
+                service.config = self.config
+
     async def _call_background_lane(
         self,
         task_family: str,
@@ -387,7 +406,7 @@ class ProactiveTask:
         async with self._bg_semaphore:
             for state in self.state_engine.get_active_states():
                 chat_id = str(getattr(state, "chat_id", "") or "")
-                if not chat_id or "FriendMessage" in chat_id:
+                if not chat_id or chat_id.startswith("FriendMessage:"):
                     continue
                 target = await self._select_group_profile_target(chat_id)
                 if not target:

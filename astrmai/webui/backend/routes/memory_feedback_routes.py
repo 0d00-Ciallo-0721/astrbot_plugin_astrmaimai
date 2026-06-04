@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
 from ..adapters.plugin_api import PluginApiAdapter
 from ..auth import get_current_user
 from ..db import get_db
-from ..services.admin_ui_service import AdminUiService
+from ..services.chatruntimeservice import ChatRuntimeService
 
 router = APIRouter()
 
 
-def _service() -> AdminUiService:
-    return AdminUiService(PluginApiAdapter(), get_db)
+def _service() -> ChatRuntimeService:
+    return ChatRuntimeService(PluginApiAdapter(), get_db)
 
 
 @router.get("")

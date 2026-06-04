@@ -32,6 +32,9 @@ async def bridge_external_plugin_result(runtime, event) -> None:
     if event.get_extra("astrmai_is_self_reply", False):
         return
 
+    if event.get_extra("astrmai_loop_source", "") == "external_result_bridge":
+        return
+
     reply_text = extract_external_reply_text(event.get_result())
     if not reply_text:
         return

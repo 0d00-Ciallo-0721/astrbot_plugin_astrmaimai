@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import types
 import unittest
 
@@ -54,10 +55,8 @@ class RefactoredExternalResultBridgeTests(unittest.TestCase):
         message_components_mod.Image = _Image
         sys.modules["astrbot.api.message_components"] = message_components_mod
 
-        bridge_mod = __import__(
-            "astrmai.conversation.ingress.external_result_bridge",
-            fromlist=["bridge_external_plugin_result"],
-        )
+        bridge_mod = importlib.import_module("astrmai.conversation.ingress.external_result_bridge")
+        bridge_mod = importlib.reload(bridge_mod)
         runtime = type(
             "Runtime",
             (),

@@ -55,15 +55,7 @@ class DiaryService:
                         template_envelope=envelope,
                     )
                 else:
-                    prompt = f"""{persona_injection}
-璇锋牴鎹互涓嬬兢鑱婃渶杩?4灏忔椂璁板繂锛屽啓涓€娈典粎渚涘唴閮ㄨ褰曠殑绠€鐭棩璁版憳瑕併€?缇よ亰ID: {group_id}
-鏈€杩戣蹇?
-{recent_text}
-
-瑕佹眰锛?- 100瀛椾互鍐?- 鍋忔€荤粨锛屼笉瑕佸儚鑱婂ぉ鍥炲
-- 鐩存帴杈撳嚭姝ｆ枃
-"""
-                    diary = await self._call_background_lane("diary", str(group_id), prompt)
+                    diary = None
 
                 if diary and self.memory_engine and hasattr(self.memory_engine, "record_cognitive_feedback"):
                     try:

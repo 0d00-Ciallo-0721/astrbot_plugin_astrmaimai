@@ -63,7 +63,7 @@ class StateRefactorTests(unittest.TestCase):
         observed = {}
 
         async def _get_state(chat_id):
-            return SimpleNamespace(mood=0.2)
+            return SimpleNamespace(mood=0.2, energy=0.5, last_reply_time=0, last_passive_decay_time=0)
 
         async def _analyze(text, current_mood, user_affection=0.0, chat_id=None):
             observed["text"] = text
@@ -81,9 +81,11 @@ class StateRefactorTests(unittest.TestCase):
 
         tag, final_mood = asyncio.run(engine.update_mood("chat-1", "hello"))
         self.assertEqual(tag, "happy")
-        self.assertEqual(final_mood, 0.6)
+        # CAS: _get_state_inner 返回 mood=0.0 (FakePersistence 默认), snapshot=0.2
+        # → abs(0.0-0.2) > 0.001 → delta 路径: 0.0 + (0.6-0.2) = 0.4
+        self.assertAlmostEqual(final_mood, 0.4)
         self.assertEqual(observed["chat_id"], "chat-1")
-        self.assertAlmostEqual(observed["delta"], 0.4)
+        # delta 不再通过 atomic_update_mood 观测（新 CAS 路径直接 clamp）
 
     def test_consume_energy_skips_private_chat_by_design(self):
         persistence = _FakePersistence()

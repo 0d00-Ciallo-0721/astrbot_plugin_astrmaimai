@@ -448,6 +448,8 @@ class CognitiveLoop:
             if not any(flag == "pushback_downgraded" for flag in risk_flags):
                 risk_flags.append("pushback_downgraded")
         action_tier = self._normalize_action_tier(data.get("action_tier"), action, social_intent)
+        if reply_need in {"wait", "ignore"} and action_tier != "none":
+            action_tier = "none"
         return CognitiveDecision(
             action=action,
             intent=str(data.get("intent", "") or "").strip(),

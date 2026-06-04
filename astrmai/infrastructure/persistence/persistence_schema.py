@@ -55,6 +55,8 @@ class PersistenceSchemaMixin:
                         group_config TEXT,
                         last_reset_date TEXT,
                         total_replies INTEGER,
+                        last_reply_time REAL DEFAULT 0,
+                        last_passive_decay_time REAL DEFAULT 0,
                         updated_at REAL
                     )
                 """)
@@ -84,6 +86,8 @@ class PersistenceSchemaMixin:
                     )
                 """)
                 for col_def in [
+                    "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
                     "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
@@ -164,6 +168,8 @@ class PersistenceSchemaMixin:
                         group_config TEXT,
                         last_reset_date TEXT,
                         total_replies INTEGER,
+                        last_reply_time REAL DEFAULT 0,
+                        last_passive_decay_time REAL DEFAULT 0,
                         updated_at REAL
                     )
                 """)
@@ -194,6 +200,8 @@ class PersistenceSchemaMixin:
                 """)
                 #  (ALTER TABLE ?
                 for col_def in [
+                    "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
                     "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",

@@ -1,6 +1,26 @@
+"""Legacy compatibility bridge — **deprecated since v2.0, removal target: v3.0**.
+
+This module serialises typed contract objects (FocusThreadContext, PromptEnvelope,
+VisibleReplyArtifact) into flat ``event.set_extra("astrmai_*", …)`` dicts consumed
+by the host plugin's legacy observer / debug infrastructure.
+
+**Migration path**: each consumer of these extras should migrate to the typed
+contract objects exported by ``astrmai.infrastructure.runtime.runtime_contracts``.
+No new ``astrmai_*`` extra keys should be added here.
+
+Current consumers (locked by architecture regression tests):
+  - ``astrmai/conversation/attention/gate.py``
+  - ``astrmai/conversation/execution/reply_artifact_builder.py``
+  - ``astrmai/conversation/execution/reply_service.py``
+  - ``astrmai/conversation/planning/planner_prompt_context.py``
+  - ``astrmai/conversation/planning/prompt_refiner.py``
+"""
+
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+import functools
+import warnings
+from typing import Any, Callable, Iterable, Optional
 
 from ..runtime.runtime_contracts import (
     FocusThreadContext,
@@ -12,6 +32,32 @@ from ..runtime.runtime_contracts import (
 )
 
 
+def deprecated(since: str = "", removal: str = "", replacement: str = ""):
+    """Mark a function as deprecated with a runtime warning.
+
+    Usage::
+
+        @deprecated(since="v2.0", removal="v3.0", replacement="Use contracts.X directly")
+        def old_func(...):
+            ...
+    """
+    def decorator(func: Callable):
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            msg = f"{func.__qualname__} is deprecated"
+            if since:
+                msg += f" since {since}"
+            if removal:
+                msg += f" (removal target: {removal})"
+            if replacement:
+                msg += f" — {replacement}"
+            warnings.warn(msg, DeprecationWarning, stacklevel=2)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@deprecated(since="v2.0", removal="v3.0", replacement="consume typed FocusThreadContext directly")
 def emit_legacy_focus_thread_extras(
     event: Any,
     focus_context: FocusThreadContext,
@@ -41,6 +87,7 @@ def emit_legacy_focus_thread_extras(
         event.set_extra("astrmai_window_events", list(window_events))
 
 
+@deprecated(since="v2.0", removal="v3.0", replacement="construct FocusThreadContext from contracts directly")
 def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -> FocusThreadContext:
     focus_event = event.get_extra("astrmai_focus_event", default_event or event)
     return FocusThreadContext(
@@ -65,6 +112,7 @@ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -
     )
 
 
+@deprecated(since="v2.0", removal="v3.0", replacement="consume typed PromptEnvelope directly")
 def emit_legacy_prompt_envelope_extras(
     event: Any,
     prompt_envelope: PromptEnvelope,
@@ -102,6 +150,7 @@ def emit_legacy_prompt_envelope_extras(
     event.set_extra("astrmai_thread_signature", prompt_envelope.thread_signature)
 
 
+@deprecated(since="v2.0", removal="v3.0", replacement="construct PromptEnvelope from contracts directly")
 def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelope:
     raw_user_text = str(event.get_extra("astrmai_raw_user_text", prompt) or prompt).strip()
     focus_message_text = str(
@@ -144,6 +193,7 @@ def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelo
     )
 
 
+@deprecated(since="v2.0", removal="v3.0", replacement="consume typed VisibleReplyArtifact directly")
 def emit_legacy_reply_runtime_extras(
     event: Any,
     artifact: Optional[VisibleReplyArtifact] = None,

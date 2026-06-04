@@ -221,8 +221,11 @@ class DreamAgent:
                         canonical_ids,
                         superseded_by=new_memory_id,
                     )
-            for event_id in event_ids:
-                await asyncio.to_thread(self._delete_event, event_id)
+            if event_ids:
+                logger.info(
+                    f"[DreamAgent] legacy merge skipped for {len(event_ids)} events; "
+                    f"canonical merge completed via {new_memory_id}"
+                )
             return f"已合并 {len(event_ids)} 条记忆为精华: {new_narrative[:50]}..."
         except Exception as exc:
             return f"合并失败: {exc}"
@@ -233,7 +236,30 @@ class DreamAgent:
         if not event_id or not new_narrative:
             return "参数缺失"
         try:
-            await asyncio.to_thread(self._update_event_narrative, event_id, new_narrative)
+            canonical_ids, _unresolved_legacy_ids = await self._resolve_canonical_ids([str(event_id or "")])
+            if canonical_ids and self.memory_engine and getattr(self.memory_engine, "v2_store", None):
+                updated = 0
+                for memory_id in canonical_ids:
+                    updated += await self.memory_engine.v2_store.update_content(
+                        str(memory_id),
+                        content=new_narrative,
+                        summary=new_narrative[:240],
+                    )
+                    if updated and getattr(self.memory_engine, "index_projector", None):
+                        await self.memory_engine.index_projector.project(str(memory_id))
+                if updated:
+                    if not self._is_canonical_memory_id(event_id):
+                        logger.info(
+                            f"[DreamAgent] legacy update skipped for {event_id}; "
+                            f"canonical {canonical_ids[0]} is now the source of truth"
+                        )
+                    return f"Updated memory {canonical_ids[0]}"
+                return f"Cannot update inactive memory {canonical_ids[0]}"
+            if not self._is_canonical_memory_id(event_id):
+                logger.info(
+                    f"[DreamAgent] legacy-only update for {event_id} — "
+                    f"no canonical mapping found, update deferred"
+                )
             if self.memory_engine:
                 finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
                 if finder:
@@ -245,7 +271,7 @@ class DreamAgent:
                         )
                         if getattr(self.memory_engine, "index_projector", None):
                             await self.memory_engine.index_projector.project(memory_id)
-            return f"已更新记忆 {event_id}"
+            return f"Updated memory {event_id}"
         except Exception as exc:
             return f"更新失败: {exc}"
 
@@ -255,13 +281,16 @@ class DreamAgent:
         if not event_id:
             return "参数缺失: event_id"
         try:
-            await asyncio.to_thread(self._delete_event, event_id)
+            logger.info(
+                f"[DreamAgent] legacy delete skipped for {event_id}; "
+                f"soft-deleting canonical by source_ref only"
+            )
             if self.memory_engine:
                 finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
                 if finder and getattr(self.memory_engine, "maintenance_service", None):
                     for memory_id in await finder(f"MemoryEvent:{event_id}"):
                         await self.memory_engine.maintenance_service.soft_delete(memory_id, reason=reason)
-            return f"已删除记忆 {event_id} (原因: {reason})"
+            return f"Deleted memory {event_id} (reason: {reason})"
         except Exception as exc:
             return f"删除失败: {exc}"
 

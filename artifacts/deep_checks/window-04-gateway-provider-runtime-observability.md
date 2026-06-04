@@ -31,7 +31,7 @@
 主要发现：
 1. `prefix_hash` / `semantic_system_hash` / `stable_prefix_hash` 口径不统一，同一请求内就会混用。
    - 依据：`astrmai/conversation/planning/context_engine.py:205` 把 `prefix_hash` 和 `semantic_system_hash` 都设成 `frozen_prefix` 的 MD5。
-   - 进一步依据：`astrmai/infrastructure/context_economy/center.py:438` 的 `stable_prefix_hash` 是 template/schema/persona + stable prefix 的 SHA1；`gateway_lane.py:439` 使用 `effective_prefix_hash`，`gateway_lane.py:491` 又写 `stable_prefix_hash`。
+   - 进一步依据：`astrmai/infrastructure/context_economy/center.py:440` 的 `stable_prefix_hash` 是 template/schema/persona + stable prefix 的 SHA1；`gateway_lane.py:439` 使用 `effective_prefix_hash`，`gateway_lane.py:491` 又写 `stable_prefix_hash`。
 2. gateway 侧的 `cache_ready` / `cache_ready_reasons` 观测失真。
    - 依据：`astrmai/infrastructure/gateway/gateway_result.py:53` 的 `_build_cache_observation()` 依赖 `request_cache_control`、`request_session_id`、`prefix_stable`、`provider_visible_hash_stable`、`cache_affinity_enabled`、`cached_usage_supported`。
    - 进一步依据：`astrmai/infrastructure/gateway/gateway_call.py:211` 和 `astrmai/infrastructure/gateway/gateway_lane.py:436` 的真实 `_log_usage()` 调用并没有把这些请求级字段完整并回去。

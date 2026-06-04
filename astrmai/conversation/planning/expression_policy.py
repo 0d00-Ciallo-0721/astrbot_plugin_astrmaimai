@@ -424,6 +424,18 @@ class ExpressionSelector:
                 review_status=review_status,
                 statuses=["active"] if review_status == "approved" else ["review_pending", "active"],
             )
+        legacy_pattern_loader = getattr(self.db, "get_patterns", None) if self.db else None
+        if callable(legacy_pattern_loader):
+            patterns = legacy_pattern_loader(
+                chat_id,
+                limit=limit,
+                only_checked=(review_status == "approved"),
+                include_rejected=False,
+                shared_scope=shared_scope,
+                think_level=think_level,
+                review_status=review_status,
+            )
+            return list(patterns or [])
         return []
 
     async def _fast_select(self, chat_id: str, context_text: str = '', shared_scope: Optional[str] = None, think_level: int = 0) -> tuple[str, list[Any]]:

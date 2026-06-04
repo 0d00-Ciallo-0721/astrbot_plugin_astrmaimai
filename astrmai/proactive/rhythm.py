@@ -6,6 +6,7 @@ from typing import Any
 
 
 DEFAULT_QUIET_HOURS = ("23:30-07:30",)
+_MISSING = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,8 +40,10 @@ def _minutes_from_hhmm(value: str) -> int | None:
 
 
 def _normalize_ranges(raw_ranges: Any) -> tuple[str, ...]:
-    if raw_ranges is None:
+    if raw_ranges is _MISSING:
         return DEFAULT_QUIET_HOURS
+    if raw_ranges is None:
+        return ()
     if isinstance(raw_ranges, str):
         items = [raw_ranges]
     else:
@@ -49,7 +52,7 @@ def _normalize_ranges(raw_ranges: Any) -> tuple[str, ...]:
         except TypeError:
             items = []
     normalized = tuple(str(item).strip() for item in items if str(item or "").strip())
-    return normalized or DEFAULT_QUIET_HOURS
+    return normalized
 
 
 def _in_range(now_minutes: int, item: str) -> bool:
@@ -77,11 +80,15 @@ def _time_bucket(now_minutes: int, quiet: bool) -> str:
 
 def evaluate_proactive_rhythm(config: Any = None, *, now: float | None = None) -> ProactiveRhythm:
     current = time.time() if now is None else float(now)
+    # NOTE: uses local time; containerized deployments should configure host TZ
     local = time.localtime(current)
     now_minutes = int(local.tm_hour) * 60 + int(local.tm_min)
-    life = getattr(config, "life", None)
+    life = getattr(config, "life", None) if config is not None else None
     reply = getattr(config, "reply", None)
-    ranges = _normalize_ranges(getattr(life, "proactive_quiet_hours", None))
+    if config is None:
+        ranges = ()
+    else:
+        ranges = _normalize_ranges(getattr(life, "proactive_quiet_hours", _MISSING))
     quiet = any(_in_range(now_minutes, item) for item in ranges)
     raw_frequency = getattr(reply, "base_frequency", 0.7)
     base_frequency = _clamp(float(0.7 if raw_frequency is None else raw_frequency))

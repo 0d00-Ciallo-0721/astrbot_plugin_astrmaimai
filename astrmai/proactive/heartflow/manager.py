@@ -284,7 +284,7 @@ class HeartflowManager:
         if not session:
             return None, None, None, None, None
         state = await self._build_chat_state(chat_id, snapshot, now=now, session=session)
-        pulse = self._build_pulse(state, snapshot, now=now, session=session)
+        pulse = self._build_pulse(state, now=now, session=session)
         action = self._build_action_decision(session, state, pulse, snapshot, now=now)
         decision = self._build_impulse_decision(session, state, pulse, snapshot, now=now)
         decision = self._apply_action_to_impulse_decision(action, decision)
@@ -447,12 +447,10 @@ class HeartflowManager:
     def _build_pulse(
         self,
         state: HeartflowChatState,
-        snapshot: dict,
         *,
         now: float,
         session: HeartflowSessionState | None = None,
     ) -> HeartflowPulse:
-        del snapshot
         pulse_type = "observe"
         social_intent = "observe"
         action_tier = "none"

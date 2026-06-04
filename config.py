@@ -17,6 +17,7 @@ class GlobalSettingsConfig(BaseModel):
     enable_private_chat: bool = Field(default=False)
     admin_ids: List[str] = Field(default=[])
     enable_error_interception: bool = Field(default=True)
+    webui_password: str = Field(default="", description="AstrMai WebUI 管理密码；留空表示未配置")
 
 
 class PersonaConfig(BaseModel):
@@ -91,6 +92,10 @@ class EvolutionConfig(BaseModel):
 
 
 class LifeConfig(BaseModel):
+    proactive_quiet_hours: List[str] = Field(
+        default_factory=lambda: ["23:30-07:30"],
+        description="主动开口安静时段列表，格式 HH:MM-HH:MM；留空表示关闭 quiet hours",
+    )
     silence_threshold: int = Field(default=120)
     wakeup_min_energy: float = Field(default=0.6)
     wakeup_cost: float = Field(default=0.2)

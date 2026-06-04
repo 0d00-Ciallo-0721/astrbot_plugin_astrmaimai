@@ -641,6 +641,24 @@ class ContextEngine:
             self._block("此刻回应倾向", "\n".join(f"- {rule}" for rule in dynamic_rules)),
         )
 
+    def _build_behavior_rule_block(self, prompt_envelope: Optional[PromptEnvelope]) -> str:
+        """Compat wrapper for older callers that expected a single bullet block."""
+        stable_block, dynamic_block = self._build_behavior_rule_blocks(prompt_envelope)
+        bullet_lines: list[str] = []
+        runtime_block = str(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or "")
+        for source in [runtime_block, stable_block, dynamic_block]:
+            for line in str(source or "").splitlines():
+                text = line.strip()
+                if not text:
+                    continue
+                if text.startswith("- "):
+                    text = text[2:].strip()
+                if text and text not in bullet_lines:
+                    bullet_lines.append(text)
+        if not bullet_lines:
+            return ""
+        return "\n".join(f"- {line}" for line in bullet_lines)
+
     def _build_state_blocks(self, state: Optional[Any]) -> tuple[str, str]:
         if not state:
             return "", "我现在心情平静，精力充足，所以可以自然接住当前对话。"

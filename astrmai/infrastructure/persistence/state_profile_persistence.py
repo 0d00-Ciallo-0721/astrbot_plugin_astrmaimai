@@ -11,18 +11,31 @@ from .orm_models import ChatState
 
 
 class StateProfilePersistenceMixin:
+    @staticmethod
+    def _relationship_vector_from_metadata(profile_metadata: Any) -> Dict[str, Any]:
+        if not isinstance(profile_metadata, dict):
+            return {}
+        relationship_vector = profile_metadata.get("relationship_vector", {})
+        return dict(relationship_vector) if isinstance(relationship_vector, dict) else {}
+
     async def load_chat_state(self, chat_id: str) -> Optional[Dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
             row = await cursor.fetchone()
             if row:
+                cursor2 = await db.execute("PRAGMA table_info(chat_states)")
+                cols_info = await cursor2.fetchall()
+                col_names = [c[1] for c in cols_info]
+                row_dict = dict(zip(col_names, row))
                 return {
-                    "chat_id": row[0],
-                    "energy": row[1],
-                    "mood": row[2],
-                    "group_config": json.loads(row[3]) if row[3] else {},
-                    "last_reset_date": row[4],
-                    "total_replies": row[5]
+                    "chat_id": row_dict.get("chat_id", chat_id),
+                    "energy": row_dict.get("energy", 0.5),
+                    "mood": row_dict.get("mood", 0.0),
+                    "group_config": json.loads(row_dict.get("group_config") or "{}"),
+                    "last_reset_date": row_dict.get("last_reset_date", ""),
+                    "total_replies": int(row_dict.get("total_replies") or 0),
+                    "last_reply_time": float(row_dict.get("last_reply_time") or 0.0),
+                    "last_passive_decay_time": float(row_dict.get("last_passive_decay_time") or 0.0),
                 }
         return None
 
@@ -31,9 +44,19 @@ class StateProfilePersistenceMixin:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO chat_states 
-                (chat_id, energy, mood, group_config, last_reset_date, total_replies, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (chat_id, state.energy, state.mood, config_json, state.last_reset_date, state.total_replies, time.time()))
+                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                chat_id,
+                state.energy,
+                state.mood,
+                config_json,
+                state.last_reset_date,
+                state.total_replies,
+                float(getattr(state, "last_reply_time", 0.0) or 0.0),
+                float(getattr(state, "last_passive_decay_time", 0.0) or 0.0),
+                time.time(),
+            ))
             await db.commit()
 
     async def load_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
@@ -45,6 +68,7 @@ class StateProfilePersistenceMixin:
                 cols_info = await cursor2.fetchall()
                 col_names = [c[1] for c in cols_info]
                 row_dict = dict(zip(col_names, row))
+                profile_metadata = json.loads(row_dict.get("profile_metadata") or "{}")
                 return {
                     "user_id": row_dict.get("user_id", ""),
                     "name": row_dict.get("name", "Unknown"),
@@ -54,7 +78,8 @@ class StateProfilePersistenceMixin:
                     "message_count_for_profiling": int(row_dict.get("message_count_for_profiling") or 0),
                     "last_persona_gen_time": float(row_dict.get("last_persona_gen_time") or 0.0),
                     "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
-                    "profile_metadata": json.loads(row_dict.get("profile_metadata") or "{}"),
+                    "profile_metadata": profile_metadata,
+                    "relationship_vector": self._relationship_vector_from_metadata(profile_metadata),
                     "identity": row_dict.get("identity", ""),
                     "tags": json.loads(row_dict.get("tags") or "[]"),
                     # Phase 8.1: 
@@ -84,6 +109,7 @@ class StateProfilePersistenceMixin:
             user_id = row_dict.get("user_id", "")
             if not user_id:
                 continue
+            profile_metadata = json.loads(row_dict.get("profile_metadata") or "{}")
             profiles[user_id] = {
                 "user_id": user_id,
                 "name": row_dict.get("name", "Unknown"),
@@ -93,7 +119,8 @@ class StateProfilePersistenceMixin:
                 "message_count_for_profiling": int(row_dict.get("message_count_for_profiling") or 0),
                 "last_persona_gen_time": float(row_dict.get("last_persona_gen_time") or 0.0),
                 "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
-                "profile_metadata": json.loads(row_dict.get("profile_metadata") or "{}"),
+                "profile_metadata": profile_metadata,
+                "relationship_vector": self._relationship_vector_from_metadata(profile_metadata),
                 "identity": row_dict.get("identity", ""),
                 "tags": json.loads(row_dict.get("tags") or "[]"),
                 "nickname": row_dict.get("nickname", ""),
@@ -110,7 +137,11 @@ class StateProfilePersistenceMixin:
 
     async def save_user_profile(self, profile: 'UserProfile'):
         footprints_json = json.dumps(profile.group_footprints, ensure_ascii=False)
-        profile_metadata_json = json.dumps(getattr(profile, "profile_metadata", {}) or {}, ensure_ascii=False)
+        profile_metadata = dict(getattr(profile, "profile_metadata", {}) or {})
+        relationship_vector = getattr(profile, "relationship_vector", {})
+        if isinstance(relationship_vector, dict) and relationship_vector:
+            profile_metadata["relationship_vector"] = dict(relationship_vector)
+        profile_metadata_json = json.dumps(profile_metadata, ensure_ascii=False)
         tags_json = json.dumps(profile.tags, ensure_ascii=False)
         memory_points_json = json.dumps(profile.memory_points, ensure_ascii=False)
         identity_points_json = json.dumps(getattr(profile, "identity_points", []), ensure_ascii=False)

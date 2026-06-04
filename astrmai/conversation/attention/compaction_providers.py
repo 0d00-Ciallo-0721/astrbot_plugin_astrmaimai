@@ -162,6 +162,12 @@ class CompactionProviderMixin:
             except Exception as exc:
                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
                 request_kwargs.pop("session_id", None)
+                # 失效损坏的 remote session，防止下次复用（D6）
+                _lane_mgr = getattr(self.gateway, "lane_manager", None) if self.gateway else None
+                if _lane_mgr is not None:
+                    _lane_key = self._compaction_lane_key(chat_id)
+                    _lane_umo = _lane_mgr.resolve_lane_umo("", _lane_key)
+                    _lane_mgr.expire_remote_sessions_for_lane(_lane_umo)
                 continue
             content = getattr(response, "completion_text", response)
             clipped = self._clip_summary(str(content or "").strip())
@@ -258,6 +264,12 @@ class CompactionProviderMixin:
             except Exception as exc:
                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
                 request_kwargs.pop("session_id", None)
+                # 失效损坏的 remote session，防止下次复用（D6）
+                _lane_mgr = getattr(self.gateway, "lane_manager", None) if self.gateway else None
+                if _lane_mgr is not None:
+                    _lane_key = self._compaction_lane_key(chat_id)
+                    _lane_umo = _lane_mgr.resolve_lane_umo("", _lane_key)
+                    _lane_mgr.expire_remote_sessions_for_lane(_lane_umo)
                 continue
             content = getattr(response, "completion_text", response)
             rendered = str(content or "").strip()

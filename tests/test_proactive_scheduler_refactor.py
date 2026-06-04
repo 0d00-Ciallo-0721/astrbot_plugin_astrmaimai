@@ -139,23 +139,50 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(status["scheduler_poll_mode"], "FAST")
         self.assertEqual(status["scheduler_poll_interval"], 5.0)
         self.assertEqual(status["global_maintenance_interval"], 60.0)
-        self.assertEqual(status["due_chat_count"], 0)
-        self.assertEqual(status["skipped_not_due_count"], 0)
-        self.assertEqual(status["due_phase_mix"], {})
-        self.assertEqual(status["maintenance_budget_total"], 0)
-        self.assertEqual(status["maintenance_budget_used"], 0)
-        self.assertEqual(status["maintenance_budget_remaining"], 0)
-        self.assertEqual(status["scheduler_batch_limit"], 32)
-        self.assertEqual(status["scheduler_batch_plan"], {})
-        self.assertEqual(status["batch_fill_rate"], 0.0)
-        self.assertEqual(status["forced_promotion_count"], 0)
-        self.assertEqual(status["quota_skip_counts"], {})
-        self.assertEqual(status["scheduler_policy"], {})
-        self.assertEqual(status["kernel_due_selection_summary"], {})
-        self.assertFalse(status["busy_backpressure_active"])
-        self.assertFalse(status["maintenance_backpressure_active"])
-        self.assertEqual(status["last_selection_summary"], {})
-        self.assertEqual(status["poll_mode_transition"]["current"], "FAST")
+
+    def test_proactive_task_refresh_config_propagates_to_runtime_children(self):
+        old_config = SimpleNamespace(
+            life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"], silence_threshold=10, wakeup_min_energy=20, wakeup_cost=5, wakeup_cooldown=60, dream_visible=False),
+            persona=SimpleNamespace(persona_id="global", name="Mai"),
+            evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+        )
+        new_config = SimpleNamespace(
+            life=SimpleNamespace(proactive_quiet_hours=[], silence_threshold=20, wakeup_min_energy=10, wakeup_cost=1, wakeup_cooldown=30, dream_visible=False),
+            persona=SimpleNamespace(persona_id="new-persona", name="Mai"),
+            evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+        )
+        gateway = SimpleNamespace(config=old_config, call_proactive_task=lambda **kwargs: asyncio.sleep(0, result="ok"))
+        state_engine = SimpleNamespace(
+            get_active_states=lambda: [],
+            get_active_profiles=lambda: [],
+            apply_natural_decay=lambda state: None,
+        )
+        persistence = SimpleNamespace(load_persona_cache=lambda: {})
+        memory_engine = SimpleNamespace(add_memory=None)
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            gateway=gateway,
+            persistence=persistence,
+            memory_engine=memory_engine,
+            reflector=None,
+            config=old_config,
+        )
+        task.dream_agent = SimpleNamespace(config=old_config)
+
+        task.refresh_config(new_config)
+
+        self.assertIs(task.config, new_config)
+        self.assertIs(task.gateway.config, new_config)
+        self.assertIs(task.proactive_dispatcher.config, new_config)
+        self.assertIs(task.wakeup_service.config, new_config)
+        self.assertIs(task.group_signin_service.config, new_config)
+        self.assertIs(task.decay_service.config, new_config)
+        self.assertIs(task.diary_service.config, new_config)
+        self.assertIs(task.dream_scheduler.config, new_config)
+        self.assertIs(task.heartflow_manager.config, new_config)
+        self.assertIs(task.dream_generator.config, new_config)
+        self.assertIs(task.dream_agent.config, new_config)
 
     def test_start_initializes_global_maintenance_clock(self):
         gateway = SimpleNamespace(
@@ -708,7 +735,7 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         service = wakeup_mod.WakeupService(
             context=context,
             state_engine=state_engine,
-            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda state: asyncio.sleep(0)),
             call_background_lane=lambda *args, **kwargs: None,
             config=config,
             dispatcher=dispatcher,

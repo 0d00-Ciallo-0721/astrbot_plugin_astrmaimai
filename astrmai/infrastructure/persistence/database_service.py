@@ -164,10 +164,19 @@ class DatabaseService(
             row = cursor.fetchone()
             if not row:
                 return None
-            state = ChatState(chat_id=row[0], energy=row[1], mood=row[2])
-            state.group_config = json.loads(row[3]) if row[3] else {}
-            state.last_reset_date = row[4]
-            state.total_replies = row[5]
+            cols_cursor = conn.execute("PRAGMA table_info(chat_states)")
+            col_names = [col[1] for col in cols_cursor.fetchall()]
+            row_dict = dict(zip(col_names, row))
+            state = ChatState(
+                chat_id=str(row_dict.get("chat_id", chat_id) or chat_id),
+                energy=float(row_dict.get("energy", 0.5) or 0.5),
+                mood=float(row_dict.get("mood", 0.0) or 0.0),
+            )
+            state.group_config = json.loads(row_dict.get("group_config") or "{}")
+            state.last_reset_date = str(row_dict.get("last_reset_date", "") or "")
+            state.total_replies = int(row_dict.get("total_replies") or 0)
+            state.last_reply_time = float(row_dict.get("last_reply_time") or 0.0)
+            state.last_passive_decay_time = float(row_dict.get("last_passive_decay_time") or 0.0)
             return state
 
     async def add_message_log_async(self, group_id: str, sender_id: str, sender_name: str, content: str):

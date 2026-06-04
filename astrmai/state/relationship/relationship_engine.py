@@ -241,6 +241,41 @@ class RelationshipEngine:
             self._vectors[user_id] = RelationshipVector()
         return self._vectors[user_id]
 
+    def has_vector(self, user_id: str) -> bool:
+        return user_id in self._vectors
+
+    def export_user_vector(self, user_id: str) -> dict:
+        vec = self._vectors.get(user_id)
+        return vec.to_dict() if vec else {}
+
+    def align_social_score(self, user_id: str, target_score: float) -> float:
+        vec = self.get_or_create(user_id)
+        remaining = max(-100.0, min(100.0, float(target_score or 0.0))) - vec.social_score
+        dimensions = ("trust", "familiarity", "emotion_bond", "respect")
+        weights = {"trust": 0.30, "familiarity": 0.20, "emotion_bond": 0.30, "respect": 0.20}
+        attempts = 0
+        while abs(remaining) > 1e-6 and attempts < len(dimensions):
+            adjustable = [d for d in dimensions if (remaining > 0 and getattr(vec, d, 0.0) < 100.0) or (remaining < 0 and getattr(vec, d, 0.0) > -100.0)]
+            if not adjustable:
+                break
+            adj_weight = sum(weights[d] for d in adjustable)
+            if adj_weight <= 0.0:
+                break
+            shared_delta = remaining / adj_weight
+            changed = False
+            for d in adjustable:
+                cur = getattr(vec, d, 0.0)
+                upd = max(-100.0, min(100.0, cur + shared_delta))
+                if upd != cur:
+                    setattr(vec, d, upd)
+                    changed = True
+            new_rem = max(-100.0, min(100.0, float(target_score or 0.0))) - vec.social_score
+            if not changed or abs(new_rem) >= abs(remaining):
+                break
+            remaining = new_rem
+            attempts += 1
+        return vec.social_score
+
     def load_from_profile(self, user_id: str, profile_data: Dict):
         """从 UserProfile 的 group_footprints 中恢复关系向量"""
         rel_data = profile_data.get("relationship_vector", {})

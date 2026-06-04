@@ -392,8 +392,10 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             return "", ""
         social_intent = str(getattr(decision, "social_intent", "") if decision else "").strip()
         cooldown_set = {str(tag or "").strip() for tag in (cooldown_tags or []) if str(tag or "").strip()}
-        if social_intent in {"boundary", "pushback", "observe"} or "sharp_reply" in cooldown_set:
+        if social_intent in {"boundary", "pushback", "observe"}:
             return "", ""
+        if "sharp_reply" in cooldown_set:
+            return text, "本轮避免尖锐或攻击性表达"
         if "long_reply" in cooldown_set:
             return text, "Keep this turn short; avoid another long reply."
         return text, ""
@@ -1055,16 +1057,28 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                         if cognitive_decision.reply_need in {"wait", "ignore"}
                         else cognitive_decision.action
                     )
-                    await self._settle_no_send_relationship_event(
-                        event,
-                        chat_id,
-                        skipped_reason=skip_reason,
-                    )
-                    await self._finalize_proactive_event(event, None)
+                    settle_exc = None
+                    try:
+                        await self._settle_no_send_relationship_event(
+                            event,
+                            chat_id,
+                            skipped_reason=skip_reason,
+                        )
+                        await self._finalize_proactive_event(event, None)
+                    except Exception as exc:
+                        settle_exc = exc
+                        logger.debug(f"[Planner] wait/ignore settle degraded: {exc}")
+                    try:
+                        await self._record_expression_pattern_usage(event, chat_id, None)
+                    except Exception as exc:
+                        logger.debug(f"[Planner] wait/ignore expression pattern degraded: {exc}")
+                    trace_status = f"skipped_{skip_reason}"
+                    if settle_exc is not None:
+                        trace_status += "_partial"
                     await self._remember_turn_trace(
                         chat_id,
                         event,
-                        status=f"skipped_{skip_reason}",
+                        status=trace_status,
                     )
                     return ""
                 if (cognitive_decision.action == "tool_call" or cognitive_decision.action_tier == "sys3") and self.sys3_router is not None:
@@ -1215,6 +1229,23 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tools=tools,
             direct_vision_urls=direct_vision_urls,
         )
+        # stale_drop / executor-failure: executor returned None, skip content-dependent
+        # post-processing and record agency/continuity with tools=None so action_taken="none".
+        if reply_text is None:
+            self._record_agency_reflection(chat_id, None, None, cognitive_decision)
+            self._record_conversation_continuity(
+                chat_id,
+                prompt_envelope,
+                None,
+                None,
+                cognitive_decision,
+                goal_summary=side_inputs.get("planner_reasoning", ""),
+                is_lightweight_event=bool(planning_context.get("is_lightweight_event", False)),
+            )
+            self._apply_turn_continuity_context(event, chat_id)
+            await self._remember_turn_trace(chat_id, event, status="stale_drop")
+            return None
+
         await self._record_planner_dialogue_segment(event, chat_id, reply_text, focus_context=focus_context)
         await self._update_turn_trace_runtime(event, chat_id, prompt_envelope=prompt_envelope, reply_text=reply_text)
         await self._record_expression_pattern_usage(event, chat_id, reply_text)

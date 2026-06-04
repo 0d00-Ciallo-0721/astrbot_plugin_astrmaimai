@@ -76,10 +76,18 @@ class DreamScheduler:
     async def _run_for_session(self, session_id: str | None) -> dict:
         if not self.dream_agent or not self.dream_generator:
             return {"performed": False, "reason": "dependencies_unavailable", "session_id": str(session_id or ""), "throttle_scope": "global"}
-        self._last_dream_time = time.time()
-        min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
-        self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
         async with self._bg_semaphore:
+            if session_id:
+                eligibility = self.describe_session_eligibility(session_id, time.time())
+                if not eligibility.get("eligible", False):
+                    return {
+                        "performed": False,
+                        "reason": str(eligibility.get("reason", "dream_global_cooldown") or "dream_global_cooldown"),
+                        "session_id": str(eligibility.get("session_id", session_id) or ""),
+                        "throttle_scope": "global",
+                    }
+            min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
+            self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
             dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
             if not dream_log:
                 return {"performed": False, "reason": "no_dream_log", "session_id": str(session_id or ""), "throttle_scope": "global"}
@@ -133,6 +141,7 @@ class DreamScheduler:
                     await self.context.send_message(target, MessageChain().message(dream_text))
                 except Exception as exc:
                     logger.warning(f"[DreamScheduler] dream push degraded: {exc}")
+            self._last_dream_time = time.time()
             return {
                 "performed": True,
                 "session_id": str(session_id or ""),
@@ -146,14 +155,6 @@ class DreamScheduler:
         return await self._run_for_session(None)
 
     async def run_once_for_session(self, session_id: str) -> dict:
-        eligibility = self.describe_session_eligibility(session_id, time.time())
-        if not eligibility.get("eligible", False):
-            return {
-                "performed": False,
-                "reason": str(eligibility.get("reason", "dream_global_cooldown") or "dream_global_cooldown"),
-                "session_id": str(eligibility.get("session_id", session_id) or ""),
-                "throttle_scope": "global",
-            }
         return await self._run_for_session(session_id)
 
     def _within_dream_time_range(self) -> bool:

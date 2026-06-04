@@ -311,6 +311,8 @@ class MemoryV2Store:
         scopes = [request.session_id]
         if sender_id:
             scopes.append(f"sender:{sender_id}")
+        if dedup_key and not authority_eav:
+            scopes.append(f"dedup:{dedup_key}")
         async with await self._acquire_session_scopes(scopes) as _locks:
             async with aiosqlite.connect(self.db_path) as db:
                 if dedup_key and not authority_eav:
@@ -664,7 +666,7 @@ class MemoryV2Store:
                     candidate = self._row_to_candidate(row)
                     if candidate.id in exclude:
                         continue
-                    candidate.relevance_score = max(0.0, 1.0 - (float(row[20] or 0.0) if len(row) > 20 else 0.0))
+                    candidate.relevance_score = 1.0 / (1.0 + max(0.0, (float(row[20] or 0.0) if len(row) > 20 else 0.0)))
                     candidates.append(candidate)
             else:
                 cursor = await db.execute(

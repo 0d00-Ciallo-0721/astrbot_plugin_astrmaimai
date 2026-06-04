@@ -48,15 +48,26 @@ class StateEngineMoodMigratedTests(unittest.TestCase):
     def test_update_mood_delegates_to_analyze_mood(self):
         config = SimpleNamespace(
             reply=SimpleNamespace(emotion_mapping=[]),
-            energy=SimpleNamespace(daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+            energy=SimpleNamespace(recovery_silence_min=60, daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
         )
         gateway = SimpleNamespace(config=config)
         engine = self.state_mod.StateEngine(SimpleNamespace(), gateway, config=config)
 
         observed = {}
 
-        async def _get_state(chat_id):
-            return SimpleNamespace(mood=0.2)
+        class _MockState:
+            mood = 0.2
+            energy = 0.5
+            last_reply_time = 0
+            last_passive_decay_time = 0
+            is_dirty = False
+
+        async def _get_state_inner(chat_id):
+            return _MockState()
+
+        async def _save_chat_state(chat_id, state):
+            observed['saved_mood'] = state.mood
 
         async def _analyze_mood(text, current_mood, user_affection=0.0, chat_id=None):
             observed['text'] = text
@@ -64,13 +75,9 @@ class StateEngineMoodMigratedTests(unittest.TestCase):
             observed['chat_id'] = chat_id
             return 'happy', 0.6
 
-        async def _atomic_update(chat_id, delta=0.0):
-            observed['delta'] = delta
-            return 0.6
-
-        engine.get_state = _get_state
+        engine.chat_state_service._get_state_inner = _get_state_inner
+        engine.chat_state_service.persistence.save_chat_state = _save_chat_state
         engine.mood_manager.analyze_mood = _analyze_mood
-        engine.atomic_update_mood = _atomic_update
 
         tag, final_mood = asyncio.run(engine.update_mood('chat-1', 'hello'))
 
@@ -79,33 +86,40 @@ class StateEngineMoodMigratedTests(unittest.TestCase):
         self.assertEqual(observed['text'], 'hello')
         self.assertEqual(observed['chat_id'], 'chat-1')
         self.assertAlmostEqual(observed['current_mood'], 0.2)
-        self.assertAlmostEqual(observed['delta'], 0.4)
+        self.assertAlmostEqual(observed['saved_mood'], 0.6)
 
     def test_update_mood_falls_back_for_legacy_mood_manager_signature(self):
         config = SimpleNamespace(
             reply=SimpleNamespace(emotion_mapping=[]),
-            energy=SimpleNamespace(daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+            energy=SimpleNamespace(recovery_silence_min=60, daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
         )
         gateway = SimpleNamespace(config=config)
         engine = self.state_mod.StateEngine(SimpleNamespace(), gateway, config=config)
 
         observed = {}
 
-        async def _get_state(chat_id):
-            return SimpleNamespace(mood=-0.1)
+        class _MockState:
+            mood = -0.1
+            energy = 0.5
+            last_reply_time = 0
+            last_passive_decay_time = 0
+            is_dirty = False
+
+        async def _get_state_inner(chat_id):
+            return _MockState()
+
+        async def _save_chat_state(chat_id, state):
+            observed['saved_mood'] = state.mood
 
         async def _legacy_analyze_mood(text, current_mood, user_affection=0.0):
             observed['text'] = text
             observed['current_mood'] = current_mood
             return 'neutral', 0.0
 
-        async def _atomic_update(chat_id, delta=0.0):
-            observed['delta'] = delta
-            return -0.1 + delta
-
-        engine.get_state = _get_state
+        engine.chat_state_service._get_state_inner = _get_state_inner
+        engine.chat_state_service.persistence.save_chat_state = _save_chat_state
         engine.mood_manager.analyze_mood = _legacy_analyze_mood
-        engine.atomic_update_mood = _atomic_update
 
         tag, final_mood = asyncio.run(engine.update_mood('chat-legacy', 'legacy hello'))
 
@@ -113,7 +127,7 @@ class StateEngineMoodMigratedTests(unittest.TestCase):
         self.assertEqual(final_mood, 0.0)
         self.assertEqual(observed['text'], 'legacy hello')
         self.assertAlmostEqual(observed['current_mood'], -0.1)
-        self.assertAlmostEqual(observed['delta'], 0.1)
+        self.assertAlmostEqual(observed['saved_mood'], 0.0)
 
 
 __all__ = ['StateEngineMoodMigratedTests']

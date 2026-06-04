@@ -18,6 +18,10 @@ class PreFilters:
         self.foreign_commands = set()
         self._commands_loaded = False 
 
+    async def load_foreign_commands(self):
+        """公开接口：异步动态加载系统内所有注册指令（D59：替代 hasattr 私有方法访问）"""
+        return await self._load_foreign_commands()
+
     async def _load_foreign_commands(self):
         """异步动态加载系统内所有注册指令"""
         if self._commands_loaded:

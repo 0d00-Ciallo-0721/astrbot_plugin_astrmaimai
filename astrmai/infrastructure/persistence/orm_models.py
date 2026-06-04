@@ -104,6 +104,7 @@ class UserProfile:
     speech_style_points: List[str] = field(default_factory=list)
     group_footprints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     profile_metadata: Dict[str, Any] = field(default_factory=dict)
+    relationship_vector: Dict[str, Any] = field(default_factory=dict)
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
 
@@ -193,6 +194,7 @@ class MemoryRetrievalTrace(SQLModel, table=True):
     query: str = Field(default="")
     planner_question: str = Field(default="")
     tool_calls: str = Field(default="[]")
+    trace_summary: str = Field(default="")
     selected_memory_ids: str = Field(default="[]")
     final_answer: str = Field(default="")
     source_layers: str = Field(default="[]")

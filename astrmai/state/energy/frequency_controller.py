@@ -14,6 +14,7 @@
 5. 冷场激励: 超过 silence_threshold 分钟无互动，Bot 主动开口概率略升
 6. 情绪加成: mood > 0.5 (兴奋) 略升频；mood < -0.5 (低落) 降频
 """
+import asyncio
 import time
 import random
 from typing import Dict, List
@@ -49,6 +50,7 @@ class FrequencyController:
     def __init__(self, config=None):
         self.config = config
         self._records: Dict[str, ChatReplyRecord] = {}
+        self._records_lock = asyncio.Lock()
 
         # 从配置加载参数（如果配置提供）
         if config and hasattr(config, 'reply'):

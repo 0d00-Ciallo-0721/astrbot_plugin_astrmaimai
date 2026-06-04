@@ -14,20 +14,19 @@ class MemoryUiService:
         self.plugin_api = plugin_api
 
     def _memory_engine(self):
-        runtime = self.plugin_api.get_runtime() if self.plugin_api else None
-        return getattr(runtime, "memory_engine", None) if runtime else None
+        return self.plugin_api.get_memory_engine() if self.plugin_api else None
 
     async def runtime_status(self) -> dict[str, object]:
         engine = self._memory_engine()
-        instant_gate = getattr(engine, "instant_gate", None) if engine else None
-        memory_pipeline = getattr(engine, "memory_pipeline", None) if engine else None
-        session_summarizer = getattr(engine, "session_summarizer", None) if engine else None
+        instant_gate = self.plugin_api.get_instant_gate() if self.plugin_api else None
+        memory_pipeline = self.plugin_api.get_memory_pipeline() if self.plugin_api else None
+        session_summarizer = self.plugin_api.get_session_summarizer() if self.plugin_api else None
         pipeline_status = (
             memory_pipeline.describe_runtime_status()
             if memory_pipeline is not None and hasattr(memory_pipeline, "describe_runtime_status")
             else {}
         )
-        observer = getattr(engine, "memory_observer", None) if engine else None
+        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
         observer_snapshot = (
             await observer.runtime_snapshot(
                 instant_gate_ready=bool(instant_gate is not None),
@@ -50,8 +49,8 @@ class MemoryUiService:
 
     async def chat_buffer_status(self, chat_id: str) -> dict[str, object]:
         engine = self._memory_engine()
-        memory_pipeline = getattr(engine, "memory_pipeline", None) if engine else None
-        observer = getattr(engine, "memory_observer", None) if engine else None
+        memory_pipeline = self.plugin_api.get_memory_pipeline() if self.plugin_api else None
+        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
         if memory_pipeline is not None and hasattr(memory_pipeline, "describe_chat_buffer"):
             data = memory_pipeline.describe_chat_buffer(chat_id)
             if observer is not None and hasattr(observer, "chat_snapshot"):
@@ -94,7 +93,7 @@ class MemoryUiService:
         limit: int = 50,
     ) -> dict[str, object]:
         engine = self._memory_engine()
-        observer = getattr(engine, "memory_observer", None) if engine else None
+        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
         if observer is not None and hasattr(observer, "recent_events"):
             items = await observer.recent_events(
                 chat_id=str(chat_id or "") or None,
@@ -102,20 +101,16 @@ class MemoryUiService:
                 level=str(level or ""),
                 limit=limit,
             )
-            formatter = getattr(observer, "format_timeline_item", None)
-            if callable(formatter):
-                items = [formatter(item) for item in list(items or [])]
+            items = [self.plugin_api.format_timeline_item(item) for item in list(items or [])]
             return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
         return {"status": "ok", "runtime_bound": False, "items": []}
 
     async def observability_errors(self, *, chat_id: str = "", limit: int = 50) -> dict[str, object]:
         engine = self._memory_engine()
-        observer = getattr(engine, "memory_observer", None) if engine else None
+        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
         if observer is not None and hasattr(observer, "recent_errors"):
             items = await observer.recent_errors(chat_id=str(chat_id or "") or None, limit=limit)
-            formatter = getattr(observer, "format_timeline_item", None)
-            if callable(formatter):
-                items = [formatter(item) for item in list(items or [])]
+            items = [self.plugin_api.format_timeline_item(item) for item in list(items or [])]
             return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
         return {"status": "ok", "runtime_bound": False, "items": []}
 
@@ -199,7 +194,7 @@ class MemoryUiService:
         offset: int = 0,
     ) -> dict:
         engine = self._memory_engine()
-        store = getattr(engine, "v2_store", None) if engine else None
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "list_canonical"):
             result = await store.list_canonical(
                 session_id=session_id,
@@ -245,27 +240,24 @@ class MemoryUiService:
 
     async def get_canonical(self, memory_id: str) -> dict:
         engine = self._memory_engine()
-        store = getattr(engine, "v2_store", None) if engine else None
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "get_canonical"):
             item = await store.get_canonical(memory_id, include_inactive=True)
             if not item:
                 return {"status": "not_found", "data": None, "runtime_bound": True}
-            return {"status": "ok", "data": store._candidate_to_dict(item), "runtime_bound": True}
-        async with self.db_factory() as db:
-            try:
-                async with db.execute("SELECT * FROM canonical_memories WHERE id = ?", (memory_id,)) as cursor:
-                    row = await cursor.fetchone()
-                return {
-                    "status": "ok" if row else "not_found",
-                    "data": self._canonical_row(row) if row else None,
-                    "runtime_bound": False,
-                }
-            except Exception:
-                return {"status": "not_found", "data": None, "runtime_bound": False}
+            return {"status": "ok", "data": self.plugin_api.candidate_to_dict(item), "runtime_bound": True}
+        from ..repositories import CanonicalMemoryRepository
+        repo = CanonicalMemoryRepository(self.db_factory)
+        row = await repo.get_by_id(memory_id)
+        return {
+            "status": "ok" if row else "not_found",
+            "data": self._canonical_row(row) if row else None,
+            "runtime_bound": False,
+        }
 
     async def delete_canonical(self, memory_id: str) -> dict:
         engine = self._memory_engine()
-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
         if maintenance and hasattr(maintenance, "soft_delete"):
             changed = await maintenance.soft_delete(memory_id, reason="webui")
             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
@@ -286,7 +278,7 @@ class MemoryUiService:
 
     async def restore_canonical(self, memory_id: str) -> dict:
         engine = self._memory_engine()
-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
         if maintenance and hasattr(maintenance, "restore"):
             changed = await maintenance.restore(memory_id, reason="webui")
             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
@@ -307,7 +299,7 @@ class MemoryUiService:
 
     async def mark_canonical_stale(self, memory_id: str) -> dict:
         engine = self._memory_engine()
-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
         if maintenance and hasattr(maintenance, "mark_stale"):
             changed = await maintenance.mark_stale(memory_id, reason="webui")
             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
@@ -330,7 +322,7 @@ class MemoryUiService:
         if not target_id:
             return {"status": "error", "message": "target_id required", "changed": False}
         engine = self._memory_engine()
-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
         if maintenance and hasattr(maintenance, "mark_merged"):
             changed = await maintenance.mark_merged([memory_id], superseded_by=target_id)
             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
@@ -393,52 +385,52 @@ class MemoryUiService:
 
     async def migration_report(self) -> dict:
         engine = self._memory_engine()
-        migration = getattr(engine, "migration_service", None) if engine else None
+        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
         if migration and hasattr(migration, "latest_report"):
             return {"status": "ok", "runtime_bound": True, "data": await migration.latest_report()}
-        store = getattr(engine, "v2_store", None) if engine else None
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "migration_report"):
             return {"status": "ok", "runtime_bound": True, "data": await store.migration_report()}
         return {"status": "ok", "runtime_bound": False, "data": {}}
 
     async def migration_dry_run(self, sources: list[str] | None = None) -> dict:
         engine = self._memory_engine()
-        migration = getattr(engine, "migration_service", None) if engine else None
+        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
         if not migration:
             return {"status": "ok", "runtime_bound": False, "data": {}}
         return {"status": "ok", "runtime_bound": True, "data": await migration.dry_run(import_sources=sources)}
 
     async def migration_execute(self, sources: list[str] | None = None) -> dict:
         engine = self._memory_engine()
-        migration = getattr(engine, "migration_service", None) if engine else None
+        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
         if not migration:
             return {"status": "ok", "runtime_bound": False, "data": {}}
         return {"status": "ok", "runtime_bound": True, "data": await migration.execute(import_sources=sources)}
 
     async def migration_verify(self) -> dict:
         engine = self._memory_engine()
-        migration = getattr(engine, "migration_service", None) if engine else None
+        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
         if not migration:
             return {"status": "ok", "runtime_bound": False, "data": {}}
         return {"status": "ok", "runtime_bound": True, "data": await migration.verify()}
 
     async def migration_repair(self, report: dict | None = None) -> dict:
         engine = self._memory_engine()
-        migration = getattr(engine, "migration_service", None) if engine else None
+        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
         if not migration:
             return {"status": "ok", "runtime_bound": False, "data": {}}
         return {"status": "ok", "runtime_bound": True, "data": await migration.repair(report)}
 
     async def index_status(self) -> dict:
         engine = self._memory_engine()
-        projector = getattr(engine, "index_projector", None) if engine else None
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
         if projector and hasattr(projector, "check_consistency"):
             return {"status": "ok", "runtime_bound": True, "data": await projector.check_consistency()}
         return {"status": "ok", "runtime_bound": False, "data": {}}
 
     async def rebuild_index(self, session_id: str = "") -> dict:
         engine = self._memory_engine()
-        projector = getattr(engine, "index_projector", None) if engine else None
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
         if not projector:
             return {"status": "ok", "changed": False, "runtime_bound": False, "rebuilt": 0}
         rebuilt = await (projector.rebuild_session(session_id) if session_id else projector.rebuild_all())
@@ -446,7 +438,7 @@ class MemoryUiService:
 
     async def repair_index(self) -> dict:
         engine = self._memory_engine()
-        projector = getattr(engine, "index_projector", None) if engine else None
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
         if not projector:
             return {"status": "ok", "changed": False, "runtime_bound": False, "data": {}}
         data = await projector.repair_consistency()
@@ -454,7 +446,7 @@ class MemoryUiService:
 
     async def run_maintenance(self, policy: dict | None = None) -> dict:
         engine = self._memory_engine()
-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
         if not maintenance or not hasattr(maintenance, "run_once"):
             return {"status": "ok", "runtime_bound": False, "data": {}}
         return {"status": "ok", "runtime_bound": True, "data": await maintenance.run_once(policy=policy or {})}
@@ -476,7 +468,7 @@ class MemoryUiService:
 
     async def list_jargon(self, *, status: str = "", group_id: str = "", query: str = ""):
         engine = self._memory_engine()
-        store = getattr(engine, "v2_store", None) if engine else None
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "list_canonical"):
             result = await store.list_canonical(kind="jargon", status=status, session_id=group_id, limit=200)
             items = [self._canonical_jargon_view(item) for item in result.get("items", [])]
@@ -558,7 +550,7 @@ class MemoryUiService:
             source_ref=f"webui_legacy_event:{event_id}",
         )
         engine = self._memory_engine()
-        writer = getattr(engine, "write_service", None) if engine else None
+        writer = self.plugin_api.get_write_service() if self.plugin_api else None
         if writer and hasattr(writer, "write"):
             canonical_id = await writer.write(request)
             return {
@@ -759,7 +751,7 @@ class MemoryUiService:
             status=status,
         )
         engine = self._memory_engine()
-        writer = getattr(engine, "write_service", None) if engine else None
+        writer = self.plugin_api.get_write_service() if self.plugin_api else None
         if writer and hasattr(writer, "write"):
             memory_id = await writer.write(request)
             return {"status": "ok", "id": memory_id, "canonical_id": memory_id, "legacy": False}
@@ -799,8 +791,8 @@ class MemoryUiService:
     async def update_jargon(self, jargon_id: str, data: dict) -> dict[str, str]:
         now = time.time()
         engine = self._memory_engine()
-        store = getattr(engine, "v2_store", None) if engine else None
-        projector = getattr(engine, "index_projector", None) if engine else None
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
         current = await store.get_canonical(str(jargon_id), include_inactive=True) if store and hasattr(store, "get_canonical") else None
         metadata = dict(getattr(current, "metadata", {}) or {})
         if not metadata:

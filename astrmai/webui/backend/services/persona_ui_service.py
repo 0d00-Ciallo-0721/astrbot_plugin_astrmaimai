@@ -22,10 +22,9 @@ class PersonaUiService:
 
     async def get_persona_slices(self) -> dict[str, Any]:
         cache = await self.plugin_api.read_persona_cache()
-        runtime = self.plugin_api.get_runtime()
-        persona_id = self._resolve_persona_id(runtime)
+        persona_id = self._resolve_persona_id(self.plugin_api)
         cache_key, payload = self._select_cache_payload(cache, persona_id)
-        pending_tasks = self._pending_tasks(runtime)
+        pending_tasks = self._pending_tasks(self.plugin_api)
         pending_task = cache_key in pending_tasks
         raw_text = str(payload.get("raw", "") or "")
         shards = payload.get("shards", {})
@@ -49,7 +48,7 @@ class PersonaUiService:
                 "pending_task_keys": pending_tasks,
                 "raw_length": len(raw_text),
                 "self_lore": {
-                    "available": bool(getattr(runtime, "memory_engine", None)),
+                    "available": self.plugin_api.get_memory_engine() is not None,
                     "persona_id": persona_id,
                     "source": "memory_engine.__self_lore__",
                 },
@@ -68,9 +67,10 @@ class PersonaUiService:
             "message": "Raw persona cache is read-only in AstrMai Web diagnostics; use AstrBot native persona management.",
         }
 
-    def _resolve_persona_id(self, runtime: Any) -> str:
+    def _resolve_persona_id(self, plugin_api: Any) -> str:
         try:
-            persona_id = getattr(getattr(getattr(runtime, "config", None), "persona", None), "persona_id", "")
+            config = plugin_api.get_runtime_config()
+            persona_id = getattr(getattr(config, "persona", None), "persona_id", "") if config else ""
             if persona_id:
                 return str(persona_id)
         except Exception:
@@ -98,8 +98,8 @@ class PersonaUiService:
         return persona_id or "global", {}
 
     @staticmethod
-    def _pending_tasks(runtime: Any) -> list[str]:
-        summarizer = getattr(runtime, "persona_summarizer", None)
+    def _pending_tasks(plugin_api: Any) -> list[str]:
+        summarizer = plugin_api.get_persona_summarizer()
         pending = getattr(summarizer, "pending_tasks", {}) or {}
         keys: list[str] = []
         for key, task in pending.items():

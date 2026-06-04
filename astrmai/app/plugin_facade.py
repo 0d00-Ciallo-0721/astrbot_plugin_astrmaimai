@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from astrbot.api import logger
 
+from ..presentation.dto.message_scope import IngressDecision
 from ..presentation.events.error_interceptor import intercept_and_notify_errors
 from ..presentation.events.message_entry import handle_global_message
 from ..presentation.events.result_sniffer import sniff_external_plugin_results
@@ -10,9 +11,10 @@ from ..infrastructure.runtime.lane_manager import LaneKey
 from ..shared.helpers.plugin_helpers import format_model_pool
 from .lifecycle import PluginLifecycleManager
 from .runtime_context import PluginRuntimeContext
+from .runtime_facade_protocol import RuntimeFacadeProtocol
 
 
-class PluginFacade:
+class PluginFacade(RuntimeFacadeProtocol):
     def __init__(self, runtime: PluginRuntimeContext):
         self.runtime = runtime
         self.lifecycle_manager = PluginLifecycleManager(runtime)
@@ -57,7 +59,7 @@ class PluginFacade:
         await run_startup_hook(self.runtime, self.lifecycle_manager)
 
     async def on_global_message(self, event):
-        async for result in handle_global_message(self.runtime, self, event):
+        async for result in handle_global_message(self, event):
             yield result
 
     async def sniff_external_plugin_results(self, event) -> None:
@@ -71,6 +73,101 @@ class PluginFacade:
 
     async def update_user_stats(self, user_id: str) -> None:
         await self.runtime.state_engine.increment_user_message_count(user_id)
+
+    # ── config hot-apply ────────────────────────────────────────────
+
+    def apply_hot_config(self, config_dict: dict, parsed_config) -> bool:
+        """热应用配置到运行时。返回 True 表示已应用。
+
+        这是 PluginApiAdapter._apply_hot_config 的首选路径——
+        实现后消除 fallback 路径的 WARNING。
+        """
+        self.runtime.raw_config = dict(config_dict)
+        self.runtime.config = parsed_config
+        if hasattr(self.runtime, "rebuild_infrastructure_settings"):
+            self.runtime.rebuild_infrastructure_settings()
+        proactive_task = getattr(self.runtime, "proactive_task", None)
+        if proactive_task is not None and hasattr(proactive_task, "refresh_config"):
+            proactive_task.refresh_config(parsed_config)
+        if hasattr(self.runtime, "sync_host_compat_attrs"):
+            self.runtime.sync_host_compat_attrs()
+        return True
+
+    # ── narrow-domain methods for ingress / message_entry ──
+
+    def check_command_access(self, event) -> IngressDecision:
+        from ..conversation.ingress.permission_guard import check_command_access as _check
+
+        return _check(self.runtime, event)
+
+    async def handle_poke(self, event) -> IngressDecision:
+        from ..conversation.ingress.poke_handler import handle_poke_if_needed
+
+        return await handle_poke_if_needed(self.runtime, event)
+
+    def check_message_scope_access(self, scope) -> IngressDecision:
+        from ..conversation.ingress.permission_guard import check_message_scope_access as _check
+
+        return _check(self.runtime, scope)
+
+    async def handle_group_reply_wait(self, event, scope) -> str:
+        if not event.get_group_id() or not self.runtime.group_reply_wait_manager:
+            return "NONE"
+        group_wait_result = self.runtime.group_reply_wait_manager.handle_incoming_message(event)
+        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+            if group_wait_result == "RESUME":
+                await self.runtime.chat_loop_kernel.resume_wait(
+                    scope.chat_id,
+                    "group_wait_resumed",
+                    resume_target_id=scope.sender_id,
+                    resume_source="group_reply_wait_manager",
+                )
+            elif group_wait_result == "EXPIRED":
+                await self.runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
+            group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
+            if group_wait_info:
+                await self.runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
+        return group_wait_result
+
+    def is_debug_mode(self) -> bool:
+        return getattr(self.runtime.config.global_settings, "debug_mode", False)
+
+    def track_incoming_user_activity(self, user_id: str) -> None:
+        if user_id and self.runtime.lifecycle.manager:
+            self.runtime.lifecycle.manager.track_task(self.update_user_stats(user_id))
+
+    async def try_consume_reflect_feedback(self, event):
+        if self.runtime.reflect_tracker:
+            return await self.runtime.reflect_tracker.try_consume_feedback(event)
+        return None
+
+    async def record_and_dispatch_attention(self, event, scope) -> str:
+        await self.runtime.evolution.record_user_message(event)
+        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+            tick_result = await self.runtime.chat_loop_kernel.tick(
+                chat_id=scope.chat_id,
+                trigger="message",
+                event=event,
+            )
+            return tick_result.dispatch_result
+        return await self.runtime.attention_gate.process_event(event)
+
+    def cancel_group_wait_if_interrupted(self, event, group_wait_result, status) -> None:
+        if (
+            event.get_group_id()
+            and self.runtime.group_reply_wait_manager
+            and group_wait_result != "RESUME"
+            and status in {"ENGAGED", "BUFFERED"}
+        ):
+            self.runtime.group_reply_wait_manager.cancel_wait(
+                event.unified_msg_origin,
+                reason=f"interrupted_by_{status.lower()}",
+            )
+
+    def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
+        if status == "ENGAGED" or is_direct_call:
+            return self.runtime.host_bridge.suppress_default_llm(event)
+        return None
 
     def get_runtime_diagnostics(self) -> dict:
         diagnostics = self.runtime.build_diagnostics()
@@ -117,6 +214,106 @@ class PluginFacade:
             f"🌱 Proactive Life: {proactive_state}\n"
             f"⚠️ Degraded: {degraded_text}"
         )
+
+    def get_planner(self):
+        return getattr(self.runtime, "system2_planner", None)
+
+    def get_gateway(self):
+        return getattr(self.runtime, "gateway", None)
+
+    def get_proactive_task(self):
+        return getattr(self.runtime, "proactive_task", None)
+
+    def get_observability_hub(self):
+        return getattr(self.runtime, "observability_hub", None)
+
+    def get_memory_engine(self):
+        return getattr(self.runtime, "memory_engine", None)
+
+    def get_runtime_coordinator(self):
+        return getattr(self.runtime, "runtime_coordinator", None)
+
+    def get_reflector(self):
+        return getattr(self.runtime, "reflector", None)
+
+    def get_runtime_config(self):
+        return getattr(self.runtime, "config", None)
+
+    def get_persona_summarizer(self):
+        return getattr(self.runtime, "persona_summarizer", None)
+
+    def get_state_engine(self):
+        return getattr(self.runtime, "state_engine", None)
+
+    def get_auto_check_task(self):
+        return getattr(self.runtime, "auto_check_task", None)
+
+    def get_reflect_tracker(self):
+        return getattr(self.runtime, "reflect_tracker", None)
+
+    def get_chat_loop_kernel(self):
+        kernel = getattr(self.runtime, "chat_loop_kernel", None)
+        if kernel is not None:
+            return kernel
+        task = self.get_proactive_task()
+        return getattr(task, "chat_loop_kernel", None) if task else None
+
+    def get_heartflow_manager(self):
+        task = self.get_proactive_task()
+        return getattr(task, "heartflow_manager", None) if task else None
+
+    def get_heartflow_topic_digest_service(self):
+        task = self.get_proactive_task()
+        return getattr(task, "heartflow_topic_digest_service", None) if task else None
+
+    def _memory_sub(self, attr: str):
+        engine = self.get_memory_engine()
+        return getattr(engine, attr, None) if engine else None
+
+    def get_v2_store(self):
+        return self._memory_sub("v2_store")
+
+    def get_memory_observer(self):
+        return self._memory_sub("memory_observer")
+
+    def get_memory_pipeline(self):
+        return self._memory_sub("memory_pipeline")
+
+    def get_maintenance_service(self):
+        return self._memory_sub("maintenance_service")
+
+    def get_migration_service(self):
+        return self._memory_sub("migration_service")
+
+    def get_index_projector(self):
+        return self._memory_sub("index_projector")
+
+    def get_write_service(self):
+        return self._memory_sub("write_service")
+
+    def get_session_summarizer(self):
+        return self._memory_sub("session_summarizer")
+
+    def get_instant_gate(self):
+        return self._memory_sub("instant_gate")
+
+    def candidate_to_dict(self, candidate):
+        store = self.get_v2_store()
+        if store and hasattr(store, "_candidate_to_dict"):
+            return store._candidate_to_dict(candidate)
+        return dict(candidate) if hasattr(candidate, "__dict__") else {}
+
+    def format_timeline_item(self, item):
+        observer = self.get_memory_observer()
+        if observer:
+            formatter = getattr(observer, "format_timeline_item", None)
+            if callable(formatter):
+                return formatter(item)
+        return item
+
+    def get_expression_pattern_service(self):
+        engine = self.get_memory_engine()
+        return getattr(engine, "expression_pattern_service", None) if engine else None
 
     def is_framework_command(self, msg: str) -> bool:
         if not msg:

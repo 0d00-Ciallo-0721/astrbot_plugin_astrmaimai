@@ -53,12 +53,19 @@ class ChatStateService:
         state.is_dirty = True
         return state
 
+    async def _persist_if_dirty(self, state: ChatState) -> None:
+        if not state.is_dirty:
+            return
+        await self.persistence.save_chat_state(state.chat_id, state)
+        state.is_dirty = False
+
     async def _get_state_inner(self, chat_id: str) -> ChatState:
         now = time.time()
         if chat_id in self.chat_states:
             state = self.chat_states[chat_id]
             self._touch_state(state, now)
             self._check_daily_reset(state)
+            await self._persist_if_dirty(state)
             return state
 
         data = await self.persistence.load_chat_state(chat_id)
@@ -68,7 +75,8 @@ class ChatStateService:
             state = self._create_default_state(chat_id)
 
         self._touch_state(state, now)
-        self._mark_dirty(state)
+        self._check_daily_reset(state)
+        await self._persist_if_dirty(state)
         self.chat_states[chat_id] = state
         return state
 
@@ -132,7 +140,16 @@ class StateEngine:
 
     async def _load_profile_with_relationship(self, user_id: str) -> UserProfile:
         profile = await self.user_profile_service.get_user_profile(user_id)
-        self.relationship_engine.load_from_profile(user_id, profile.__dict__)
+        had_runtime_vector = self.relationship_engine.has_vector(user_id)
+        if not had_runtime_vector:
+            self.relationship_engine.load_from_profile(user_id, profile.__dict__)
+        relationship_vector = self.relationship_engine.export_user_vector(user_id)
+        if relationship_vector:
+            profile.relationship_vector = relationship_vector
+            if had_runtime_vector:
+                profile.social_score = self.relationship_engine.get_social_score(user_id)
+            if isinstance(profile.profile_metadata, dict):
+                profile.profile_metadata["relationship_vector"] = dict(relationship_vector)
         return profile
 
     async def _resolve_mood_analysis(self, chat_id: str, text: str, snapshot_mood: float):
@@ -193,22 +210,47 @@ class StateEngine:
         return await self._load_profile_with_relationship(user_id)
 
     async def update_mood(self, chat_id: str, text: str):
-        current_state = await self.get_state(chat_id)
-        snapshot_mood = current_state.mood
+        # Phase 1: snapshot read with expected decay applied (lock held briefly)
+        state = await self.get_state(chat_id)
+        apply_natural_decay(state, self.config)
+        snapshot_mood = state.mood
+
+        # Phase 2: LLM analysis (no lock — parallel-safe, no blocking)
         tag, new_value = await self._resolve_mood_analysis(chat_id, text, snapshot_mood)
-        delta = new_value - snapshot_mood
-        final_mood = await self.atomic_update_mood(chat_id, delta=delta)
-        return tag, final_mood
+
+        # Phase 3: CAS write under lock
+        lock = self.chat_state_service._get_chat_lock(chat_id)
+        async with lock:
+            current_state = await self.chat_state_service._get_state_inner(chat_id)
+            current_mood = current_state.mood
+            apply_natural_decay(current_state, self.config)
+
+            if abs(current_mood - snapshot_mood) < 0.001:
+                try:
+                    current_state.mood = ChatStateService._clamp_mood(new_value)
+                except TypeError:
+                    current_state.mood = ChatStateService._clamp_mood(snapshot_mood + new_value)
+            else:
+                delta = new_value - snapshot_mood
+                current_state.mood = ChatStateService._clamp_mood(current_mood + delta)
+
+            current_state.is_dirty = True
+            await self.chat_state_service.persistence.save_chat_state(chat_id, current_state)
+            current_state.is_dirty = False
+            return tag, current_state.mood
 
     async def update_social_score_from_fact(self, user_id: str, impact_score: float):
-        profile = await self.get_user_profile(user_id)
-        profile.social_score += impact_score
-        profile.social_score = max(-100.0, min(100.0, profile.social_score))
-        profile.last_seen = time.time()
-        profile.is_dirty = True
+        profile = await self.user_profile_service.get_user_profile(user_id)
+        if not self.relationship_engine.has_vector(user_id):
+            self.relationship_engine.load_from_profile(user_id, profile.__dict__)
+        old_score = profile.social_score
+        new_score = max(-100.0, min(100.0, old_score + impact_score))
+        aligned_score = self.relationship_engine.align_social_score(user_id, new_score)
+        rel_vector = self.relationship_engine.export_user_vector(user_id)
+        await self.user_profile_service.update_social_score(user_id, aligned_score, rel_vector)
         logger.info(
-            f"[Social] user {profile.name}({user_id}) score {profile.social_score - impact_score:.1f} -> "
-            f"{profile.social_score:.1f} ({impact_score:+.1f})"
+            f"[Social] user {profile.name}({user_id}) score {old_score:.1f} -> "
+            f"{aligned_score:.1f} ({impact_score:+.1f})"
         )
 
     def get_active_states(self) -> List[ChatState]:
@@ -263,7 +305,8 @@ class StateEngine:
             intensity=effective_intensity,
             mood_tag=effective_mood_tag,
         )
-        await self.user_profile_service.update_social_score(user_id, new_score)
+        rel_vector = self.relationship_engine.export_user_vector(user_id)
+        await self.user_profile_service.update_social_score(user_id, new_score, rel_vector)
         await self.affection_router.publish_change(
             user_id,
             old_score,
@@ -357,10 +400,13 @@ class StateEngine:
 
     async def consume_energy(self, chat_id: str, amount: float | None = None):
         amount = self.energy_manager.get_reply_cost(amount)
+        # Design intent: private (FriendMessage) chats never consume energy.
+        # The energy economy is group-chat-only; private replies are always allowed.
         if "FriendMessage" in chat_id:
             return
         state = await self.chat_state_service.mark_energy_consumed(chat_id, amount)
         await self.persistence.save_chat_state(chat_id, state)
+        state.is_dirty = False
 
     async def get_user_profile_summary(self, user_id: str) -> UserProfileSummary:
         profile = await self.get_user_profile(user_id)

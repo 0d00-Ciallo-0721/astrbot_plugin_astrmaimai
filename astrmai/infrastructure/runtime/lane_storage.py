@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
+from astrbot.api import logger
+
 from .runtime_contracts import VisibleReplyArtifact
 
 
@@ -33,7 +35,7 @@ class LaneStorageMixin:
                     old_history = self._load_history(old_conversation)
                 except Exception:
                     old_history = []
-                rotate_reason = self._rotation_reason(
+                rotate_reason = await self._rotation_reason(
                     lane_umo=lane_umo,
                     prompt_version=lane_key.prompt_version,
                     prefix_hash=prefix_hash,
@@ -43,7 +45,7 @@ class LaneStorageMixin:
                     schema_id=schema_id,
                     persona_core_version=persona_core_version,
                 )
-                rotate = self._should_rotate(
+                rotate = await self._should_rotate(
                     lane_umo=lane_umo,
                     prompt_version=lane_key.prompt_version,
                     prefix_hash=prefix_hash,
@@ -62,6 +64,15 @@ class LaneStorageMixin:
                     title=self._build_title(lane_key),
                     persona_id=persona_id or None,
                 )
+                if rotate:
+                    expired_count = self.expire_remote_sessions_for_lane(lane_umo)
+                    if expired_count > 0:
+                        logger.warning(
+                            f"[Lane] rotation detected for {lane_umo}: "
+                            f"expired {expired_count} remote session mapping(s); "
+                            f"old sessions on provider side may still consume resources "
+                            f"(conversation_manager has no terminate API)"
+                        )
                 if rotate and old_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
                     await self.save_lane_history(
                         lane_key=lane_key,
@@ -90,18 +101,19 @@ class LaneStorageMixin:
                     token_usage=None,
                 )
 
-            self._runtime_meta[lane_umo] = {
-                "conversation_id": conversation_id,
-                "prompt_version": lane_key.prompt_version,
-                "prefix_hash": prefix_hash,
-                "model_id": model_id,
-                "persona_id": persona_id,
-                "template_id": template_id,
-                "schema_id": schema_id,
-                "persona_core_version": persona_core_version,
-                "lane_rotated": bool(rotate),
-                "lane_rotate_reason": rotate_reason,
-            }
+            async with self._meta_lock:
+                self._runtime_meta[lane_umo] = {
+                    "conversation_id": conversation_id,
+                    "prompt_version": lane_key.prompt_version,
+                    "prefix_hash": prefix_hash,
+                    "model_id": model_id,
+                    "persona_id": persona_id,
+                    "template_id": template_id,
+                    "schema_id": schema_id,
+                    "persona_core_version": persona_core_version,
+                    "lane_rotated": bool(rotate),
+                    "lane_rotate_reason": rotate_reason,
+                }
             return lane_umo, conversation_id, history, self.get_policy(lane_key)
 
     async def save_lane_history(
@@ -127,18 +139,19 @@ class LaneStorageMixin:
             persona_id=persona_id or None,
             token_usage=token_usage,
         )
-        self._runtime_meta[lane_umo] = {
-            "conversation_id": conversation_id,
-            "prompt_version": lane_key.prompt_version,
-            "prefix_hash": prefix_hash,
-            "model_id": model_id,
-            "persona_id": persona_id,
-            "template_id": template_id,
-            "schema_id": schema_id,
-            "persona_core_version": persona_core_version,
-            "lane_rotated": False,
-            "lane_rotate_reason": "",
-        }
+        async with self._meta_lock:
+            self._runtime_meta[lane_umo] = {
+                "conversation_id": conversation_id,
+                "prompt_version": lane_key.prompt_version,
+                "prefix_hash": prefix_hash,
+                "model_id": model_id,
+                "persona_id": persona_id,
+                "template_id": template_id,
+                "schema_id": schema_id,
+                "persona_core_version": persona_core_version,
+                "lane_rotated": False,
+                "lane_rotate_reason": "",
+            }
         return normalized
 
     async def append_exchange(

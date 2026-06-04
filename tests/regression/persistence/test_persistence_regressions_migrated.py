@@ -148,12 +148,26 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
             return True
 
         engine._ensure_faiss_initialized = _ready
+        # mock retrieval_service — 真实 initialize() 需要 v2_store / faiss 等重量依赖
+        engine.retrieval_service = SimpleNamespace()
+
+        async def _mock_retrieve(memory_query):
+            calls["query"] = memory_query.query
+            calls["k"] = memory_query.top_k
+            calls["session_id"] = memory_query.session_id
+            calls["persona_id"] = memory_query.persona_id
+            return [SimpleNamespace(content="old memory", score=0.5)]
+
+        engine.retrieval_service.retrieve = _mock_retrieve
+        engine.retrieval_service.render_recall = lambda query, candidates: " ".join(
+            item.content for item in candidates
+        )
 
         result = asyncio.run(engine.recall("remember this", session_id="chat-1", top_k=3))
 
         self.assertEqual(calls["k"], 3)
         self.assertEqual(calls["session_id"], "chat-1")
-        self.assertIn("remember this", result)
+        self.assertIn("old memory", result)
 
     def test_react_retriever_query_person_uses_profile_loader_and_nickname(self):
         react_mod = importlib.import_module("astrmai.memory.retrieval.react_retriever")

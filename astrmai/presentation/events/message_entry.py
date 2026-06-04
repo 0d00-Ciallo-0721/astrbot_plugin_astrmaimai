@@ -6,17 +6,15 @@ from astrbot.api import logger
 
 from ...conversation.ingress.command_guard import check_framework_command
 from ...conversation.ingress.dedupe import build_message_signature_text, check_message_dedup
-from ...conversation.ingress.permission_guard import check_message_scope_access
-from ...conversation.ingress.poke_handler import handle_poke_if_needed
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
 from ...presentation.dto.message_scope import MessageScope
 from ...shared.helpers.plugin_helpers import is_direct_call_event
 
 if TYPE_CHECKING:
-    from ...app.runtime_context import PluginRuntimeContext
+    from ...app.runtime_facade_protocol import RuntimeFacadeProtocol
 
 
-async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
+async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     scope = MessageScope.from_event(event)
     msg = event.message_str.strip() if event.message_str else ""
     msg_str = build_message_signature_text(event)
@@ -26,7 +24,7 @@ async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
         debug_trace(event, "ingress.stop", reason="duplicate_message")
         return
 
-    if (await handle_poke_if_needed(runtime, event)).should_stop:
+    if (await facade.handle_poke(event)).should_stop:
         debug_trace(event, "ingress.stop", reason="poke_event")
         return
 
@@ -34,7 +32,7 @@ async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
         debug_trace(event, "ingress.stop", reason="framework_command")
         return
 
-    if check_message_scope_access(runtime, scope).should_stop:
+    if facade.check_message_scope_access(scope).should_stop:
         debug_trace(event, "ingress.stop", reason="permission_guard")
         return
 
@@ -42,61 +40,25 @@ async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
         debug_trace(event, "ingress.stop", reason="self_message")
         return
 
-    group_wait_result = "NONE"
-    if event.get_group_id() and runtime.group_reply_wait_manager:
-        group_wait_result = runtime.group_reply_wait_manager.handle_incoming_message(event)
-        if getattr(runtime, "chat_loop_kernel", None) is not None:
-            if group_wait_result == "RESUME":
-                await runtime.chat_loop_kernel.resume_wait(
-                    scope.chat_id,
-                    "group_wait_resumed",
-                    resume_target_id=scope.sender_id,
-                    resume_source="group_reply_wait_manager",
-                )
-            elif group_wait_result == "EXPIRED":
-                await runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
-            group_wait_info = runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
-            if group_wait_info:
-                await runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
+    group_wait_result = await facade.handle_group_reply_wait(event, scope)
 
-    if getattr(runtime.config.global_settings, "debug_mode", False):
+    if facade.is_debug_mode():
         sender_name = event.get_sender_name()
         logger.info(f"[AstrMai-Sensor] 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
 
-    user_id = event.get_sender_id()
-    if user_id and runtime.lifecycle.manager:
-        runtime.lifecycle.manager.track_task(facade.update_user_stats(user_id))
+    facade.track_incoming_user_activity(event.get_sender_id())
 
-    if runtime.reflect_tracker:
-        review_feedback = await runtime.reflect_tracker.try_consume_feedback(event)
-        if review_feedback:
-            yield event.plain_result(review_feedback)
-            return
+    review_feedback = await facade.try_consume_reflect_feedback(event)
+    if review_feedback:
+        yield event.plain_result(review_feedback)
+        return
 
-    await runtime.evolution.record_user_message(event)
-    if getattr(runtime, "chat_loop_kernel", None) is not None:
-        tick_result = await runtime.chat_loop_kernel.tick(
-            chat_id=scope.chat_id,
-            trigger="message",
-            event=event,
-        )
-        status = tick_result.dispatch_result
-    else:
-        status = await runtime.attention_gate.process_event(event)
+    status = await facade.record_and_dispatch_attention(event, scope)
     is_direct_call = is_direct_call_event(event)
     debug_trace(event, "ingress.after_attention", status=status, direct_call=is_direct_call)
 
-    if (
-        event.get_group_id()
-        and runtime.group_reply_wait_manager
-        and group_wait_result != "RESUME"
-        and status in {"ENGAGED", "BUFFERED"}
-    ):
-        runtime.group_reply_wait_manager.cancel_wait(
-            event.unified_msg_origin,
-            reason=f"interrupted_by_{status.lower()}",
-        )
+    facade.cancel_group_wait_if_interrupted(event, group_wait_result, status)
 
-    if status == "ENGAGED" or is_direct_call:
-        ghost_message = runtime.host_bridge.suppress_default_llm(event)
+    ghost_message = facade.suppress_default_llm_if_engaged(event, status, is_direct_call)
+    if ghost_message is not None:
         yield event.plain_result(ghost_message)

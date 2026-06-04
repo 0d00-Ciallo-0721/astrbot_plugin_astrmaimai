@@ -140,6 +140,8 @@ class WakeupService:
             except TypeError:
                 await self.state_engine.consume_energy(target_state.chat_id)
             target_state.next_wakeup_timestamp = time.time() + wakeup_cooldown
+            target_state.is_dirty = True
+            await self.persistence.save_chat_state(target_state)
             logger.info(f"[Life] proactive wakeup sent via main chain: {str(reply_preview or '')[:80]}")
 
         try:

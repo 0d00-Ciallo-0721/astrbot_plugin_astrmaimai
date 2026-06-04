@@ -16,17 +16,23 @@ class DecayService:
         now = time.time()
 
         for state in self.state_engine.get_active_states():
-            self.state_engine.apply_natural_decay(state)
+            self.state_engine.apply_natural_decay(state)  # synchronous, no I/O
 
         for profile in self.state_engine.get_active_profiles():
             if now - getattr(profile, "last_access_time", 0) <= 86400:
                 continue
             old_score = profile.social_score
+            new_score = old_score
             if old_score > 10:
-                profile.social_score -= 1
+                new_score = max(-100.0, min(100.0, old_score - 1))
             elif old_score < -10:
-                profile.social_score += 1
-            if old_score != profile.social_score:
+                new_score = max(-100.0, min(100.0, old_score + 1))
+            if new_score != old_score:
+                if hasattr(self.state_engine, "relationship_engine"):
+                    aligned = self.state_engine.relationship_engine.align_social_score(profile.user_id, new_score)
+                    profile.social_score = aligned
+                else:
+                    profile.social_score = new_score
                 profile.is_dirty = True
                 profile.last_access_time = now
 

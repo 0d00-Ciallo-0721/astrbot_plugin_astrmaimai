@@ -126,21 +126,21 @@ def _install_extended_astrbot_stubs(data_dir: str) -> None:
     star_mod.Star = _Star
     api_mod.AstrBotConfig = dict
 
-    core_star_mod = types.ModuleType("astrbot.core.star")
+    core_star_mod = sys.modules["astrbot.core.star"]
     core_star_mod.__path__ = []
-    command_management_mod = types.ModuleType("astrbot.core.star.command_management")
+    command_management_mod = sys.modules["astrbot.core.star.command_management"]
     command_management_mod._collect_descriptors = lambda include_sub_commands=True: []
     command_management_mod.list_commands = lambda: []
 
-    tool_mod = types.ModuleType("astrbot.core.agent.tool")
+    tool_mod = sys.modules["astrbot.core.agent.tool"]
     tool_mod.ToolSet = _ToolSet
     tool_mod.FunctionTool = _FunctionTool
     tool_mod.ToolExecResult = _ToolExecResult
 
-    run_context_mod = types.ModuleType("astrbot.core.agent.run_context")
+    run_context_mod = sys.modules["astrbot.core.agent.run_context"]
     run_context_mod.ContextWrapper = _ContextWrapper
 
-    agent_context_mod = types.ModuleType("astrbot.core.astr_agent_context")
+    agent_context_mod = sys.modules["astrbot.core.astr_agent_context"]
     agent_context_mod.AstrAgentContext = _AstrAgentContext
 
     cron_tools_mod = types.ModuleType("astrbot.core.tools.cron_tools")
@@ -318,6 +318,47 @@ class HostMockValidationTests(unittest.TestCase):
                 async def enter_sys3_direct(self, event):
                     yield event.plain_result("mock-work")
 
+                async def handle_poke(self, event):
+                    from astrmai.presentation.dto.message_scope import IngressDecision
+                    return IngressDecision.allow()
+
+                def check_message_scope_access(self, scope):
+                    from astrmai.presentation.dto.message_scope import IngressDecision
+                    return IngressDecision.allow()
+
+                async def handle_group_reply_wait(self, event, scope):
+                    return "NONE"
+
+                def is_debug_mode(self) -> bool:
+                    return False
+
+                def track_incoming_user_activity(self, sender_id: str) -> None:
+                    pass
+
+                async def try_consume_reflect_feedback(self, event):
+                    return None
+
+                async def record_and_dispatch_attention(self, event, scope):
+                    if not event.get_group_id():
+                        calls.append(("attention", "private"))
+                        return "PRIVATE_WAIT"
+                    if any(isinstance(component, Comp.At) for component in event.message_obj.message):
+                        calls.append(("attention", "at"))
+                        return "ENGAGED"
+                    if any(isinstance(component, Comp.Reply) for component in event.message_obj.message):
+                        calls.append(("attention", "reply"))
+                        return "ENGAGED"
+                    calls.append(("attention", "group"))
+                    return "BUFFERED"
+
+                def cancel_group_wait_if_interrupted(self, event, result, status) -> None:
+                    pass
+
+                def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
+                    if status in ("ENGAGED", "PRIVATE_WAIT"):
+                        return "(ghost)"
+                    return None
+
             async def _record_user_message(event):
                 calls.append(("record_user_message", event.unified_msg_origin))
 
@@ -401,10 +442,10 @@ class HostMockValidationTests(unittest.TestCase):
                     text="/work test",
                 )
 
-                ordinary_results = await _collect_asyncgen(handle_global_message(runtime, facade, ordinary))
-                at_results = await _collect_asyncgen(handle_global_message(runtime, facade, at_event))
-                reply_results = await _collect_asyncgen(handle_global_message(runtime, facade, reply_event))
-                private_results = await _collect_asyncgen(handle_global_message(runtime, facade, private_event))
+                ordinary_results = await _collect_asyncgen(handle_global_message(facade, ordinary))
+                at_results = await _collect_asyncgen(handle_global_message(facade, at_event))
+                reply_results = await _collect_asyncgen(handle_global_message(facade, reply_event))
+                private_results = await _collect_asyncgen(handle_global_message(facade, private_event))
                 help_results = await _collect_asyncgen(handle_mai_help(facade, help_event))
                 work_results = await _collect_asyncgen(handle_work_mode(facade, work_event))
                 await asyncio.sleep(0)

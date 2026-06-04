@@ -170,6 +170,31 @@ class _FixtureFacade:
         self._review_items = [dict(item) for item in review_items]
         self.seed_summary = dict(seed_summary)
 
+    def get_planner(self) -> Any:
+        return getattr(self.runtime, "system2_planner", None)
+
+    def get_gateway(self) -> Any:
+        return getattr(self.runtime, "gateway", None)
+
+    def get_proactive_task(self) -> Any:
+        return getattr(self.runtime, "proactive_task", None)
+
+    def get_memory_engine(self) -> Any:
+        return getattr(self.runtime, "memory_engine", None)
+
+    def get_runtime_config(self) -> Any:
+        return getattr(self.runtime, "config", None)
+
+    def get_persona_summarizer(self) -> Any:
+        return getattr(self.runtime, "persona_summarizer", None)
+
+    def get_chat_loop_kernel(self) -> Any:
+        kernel = getattr(self.runtime, "chat_loop_kernel", None)
+        if kernel is not None:
+            return kernel
+        task = self.get_proactive_task()
+        return getattr(task, "chat_loop_kernel", None) if task else None
+
     def get_runtime_diagnostics(self) -> dict[str, Any]:
         return {
             "status": {

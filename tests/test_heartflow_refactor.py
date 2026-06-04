@@ -262,6 +262,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             now=now,
         )
         decision = manager._build_impulse_decision(
+            session,
             state,
             pulse,
             {"latest_activity_ts": now - 10, "wait_targets": [], "executor_pending": 0},
@@ -313,6 +314,7 @@ class HeartflowRefactorTests(unittest.TestCase):
         )
 
         decision = manager._build_impulse_decision(
+            session,
             state,
             pulse,
             {"latest_activity_ts": now - 1600, "wait_targets": [], "executor_pending": 0},
@@ -370,6 +372,7 @@ class HeartflowRefactorTests(unittest.TestCase):
         )
 
         decision = manager._build_impulse_decision(
+            manager._sessions["chat-1"],
             state,
             pulse,
             {"latest_activity_ts": now - 1500, "wait_targets": [], "executor_pending": 0},
@@ -423,6 +426,7 @@ class HeartflowRefactorTests(unittest.TestCase):
         )
 
         decision = manager._build_impulse_decision(
+            manager._sessions["chat-1"],
             state,
             pulse,
             {"latest_activity_ts": now - 1500, "wait_targets": [], "executor_pending": 0},
@@ -488,6 +492,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             urgency=0.86,
         )
         decision = manager._build_impulse_decision(
+            manager._sessions["chat-1"],
             state,
             pulse,
             {"latest_activity_ts": now - 1600, "wait_targets": [], "executor_pending": 0},
@@ -550,6 +555,17 @@ class HeartflowRefactorTests(unittest.TestCase):
     def test_heartflow_impulse_blocks_when_user_is_waiting_or_cooldown_hits(self):
         manager = self.heartflow_mod.HeartflowManager()
         now = time.time()
+        session = self.heartflow_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=now - 180,
+            last_activity_ts=now - 1600,
+            last_tick_ts=now,
+            expires_at=now - 1300,
+            tick_count=2,
+            topic_heat=0.55,
+            direct_relevance=0.4,
+        )
+        manager._sessions["chat-1"] = session
         state = self.heartflow_mod.HeartflowChatState(
             chat_id="chat-1",
             last_tick_ts=now,
@@ -575,6 +591,7 @@ class HeartflowRefactorTests(unittest.TestCase):
         )
 
         waiting = manager._build_impulse_decision(
+            session,
             state,
             pulse,
             {"latest_activity_ts": now - 1600, "wait_targets": ["user-1"], "executor_pending": 0},
@@ -592,6 +609,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             )
         )
         cooldown = manager._build_impulse_decision(
+            session,
             state,
             pulse,
             {"latest_activity_ts": now - 1600, "wait_targets": [], "executor_pending": 0},

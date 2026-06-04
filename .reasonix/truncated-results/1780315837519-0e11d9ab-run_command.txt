@@ -1,0 +1,695 @@
+$ python -m pytest tests/test_proactive_scheduler_refactor.py -q 2>&1
+[exit 1]
+FFFFFF..FF..F..F...                                                      [100%]
+================================== FAILURES ===================================
+_ ProactiveSchedulerRefactorTests.test_bind_chat_loop_kernel_registers_signal_sources_and_bridges _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_bind_chat_loop_kernel_registers_signal_sources_and_bridges>
+
+    def test_bind_chat_loop_kernel_registers_signal_sources_and_bridges(self):
+        kernel_mod = importlib.import_module("astrmai.conversation.loop.chat_loop_kernel")
+    
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+    
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+    
+        gateway.call_proactive_task = _call_proactive_task
+        state_engine = SimpleNamespace(
+            get_active_states=lambda: [],
+            get_active_profiles=lambda: [],
+            apply_natural_decay=lambda state: None,
+            context_compaction=SimpleNamespace(),
+        )
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+            runtime_coordinator=SimpleNamespace(),
+        )
+
+tests\test_proactive_scheduler_refactor.py:393: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C3CF67D0>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+---------------------------- Captured stdout setup ----------------------------
+06-01 20:10:35 [SUCCESS] nonebot | NoneBot is initializing...
+06-01 20:10:35 [INFO] nonebot | Current Env: prod
+__ ProactiveSchedulerRefactorTests.test_bridge_handlers_are_kernel_mediated ___
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_bridge_handlers_are_kernel_mediated>
+
+    def test_bridge_handlers_are_kernel_mediated(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+    
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+    
+        gateway.call_proactive_task = _call_proactive_task
+        wakeup_calls = []
+        heartflow_calls = []
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+                context_compaction=SimpleNamespace(maybe_compact=lambda chat_id: asyncio.sleep(0, result={"chat_id": chat_id, "performed": True})),
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+
+tests\test_proactive_scheduler_refactor.py:437: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C4F27A50>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_chat_heartbeat_pass_routes_active_chats_through_kernel _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_chat_heartbeat_pass_routes_active_chats_through_kernel>
+
+    def test_chat_heartbeat_pass_routes_active_chats_through_kernel(self):
+        kernel_mod = importlib.import_module("astrmai.conversation.loop.chat_loop_kernel")
+    
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+    
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+    
+        gateway.call_proactive_task = _call_proactive_task
+    
+        class _Coordinator:
+            async def list_active_chats(self):
+                return ["chat-1", "chat-2"]
+    
+            async def get_activity_snapshot(self, chat_id):
+                if chat_id == "chat-1":
+                    return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+                return {"chat_id": chat_id, "executor_pending": 1, "wait_targets": ["u1"]}
+    
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+            runtime_coordinator=_Coordinator(),
+        )
+
+tests\test_proactive_scheduler_refactor.py:239: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C4F10E10>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_dispatcher_blocks_wakeup_and_heartflow_during_quiet_hours _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_dispatcher_blocks_wakeup_and_heartflow_during_quiet_hours>
+
+    def test_dispatcher_blocks_wakeup_and_heartflow_during_quiet_hours(self):
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+        quiet_ts = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+        original_time = dispatcher_mod.time.time
+    
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                raise AssertionError("quiet hours should not inject proactive events")
+    
+        class _StateEngine:
+            async def get_state(self, chat_id):
+                return SimpleNamespace(energy=0.9)
+    
+>       dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=_StateEngine(),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"], wakeup_min_energy=0.6),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+tests\test_proactive_scheduler_refactor.py:742: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C4F1E250>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_dispatcher_history_reflects_queued_before_async_completion _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_dispatcher_history_reflects_queued_before_async_completion>
+
+    def test_dispatcher_history_reflects_queued_before_async_completion(self):
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+        stored_callback = []
+    
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                stored_callback.append(event_data["extra"]["astrmai_proactive_completion_callback"])
+                return "BUFFERED"
+    
+>       dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            state_engine=SimpleNamespace(get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=0.9))),
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=[], wakeup_min_energy=0.0),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+tests\test_proactive_scheduler_refactor.py:929: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C4DD8090>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_dispatcher_injects_proactive_events_through_kernel_bound_gate _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_dispatcher_injects_proactive_events_through_kernel_bound_gate>
+
+    def test_dispatcher_injects_proactive_events_through_kernel_bound_gate(self):
+        install_attention_stubs()
+        sys.modules.pop("astrmai.conversation.attention.gate", None)
+        gate_mod = importlib.import_module("astrmai.conversation.attention.gate")
+        gate_mod = importlib.reload(gate_mod)
+        calls = []
+    
+        class _Kernel:
+            async def tick(self, *, chat_id, trigger, event=None):
+                calls.append(
+                    (
+                        chat_id,
+                        trigger,
+                        event.get_extra("astrmai_loop_source"),
+                        event.get_extra("astrmai_is_proactive_event"),
+                    )
+                )
+                return SimpleNamespace(dispatch_result="BUFFERED")
+    
+        attention_gate = gate_mod.AttentionGate(
+            state_engine=SimpleNamespace(
+                config=SimpleNamespace(
+                    attention=SimpleNamespace(),
+                    system1=SimpleNamespace(wakeup_words=[], nicknames=["AstrMai"]),
+                    global_settings=SimpleNamespace(debug_mode=False),
+                )
+            ),
+            judge=SimpleNamespace(),
+            sensors=SimpleNamespace(),
+            system2_callback=None,
+        )
+        attention_gate.bind_chat_loop_kernel(_Kernel())
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+        original_eval = dispatcher_mod.evaluate_proactive_rhythm
+        dispatcher_mod.evaluate_proactive_rhythm = lambda config, now=None: SimpleNamespace(
+            quiet_hours=False,
+            time_bucket="day",
+            quiet_ranges=[],
+            base_frequency=0.7,
+            base_frequency_factor=1.0,
+        )
+>       dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=0.9))),
+            runtime_coordinator=SimpleNamespace(get_activity_snapshot=lambda chat_id: asyncio.sleep(0, result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0})),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=[], wakeup_min_energy=0.6),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+tests\test_proactive_scheduler_refactor.py:818: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C50BE0D0>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_handle_chat_heartbeat_marks_observe_only_dispatch_mode _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_handle_chat_heartbeat_marks_observe_only_dispatch_mode>
+
+    def test_handle_chat_heartbeat_marks_observe_only_dispatch_mode(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+    
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+    
+        gateway.call_proactive_task = _call_proactive_task
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+
+tests\test_proactive_scheduler_refactor.py:342: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C503FA50>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_heartflow_cooldown_requires_visible_dispatch _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_heartflow_cooldown_requires_visible_dispatch>
+
+    def test_heartflow_cooldown_requires_visible_dispatch(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+        )
+    
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+    
+        gateway.call_proactive_task = _call_proactive_task
+        cooldown_calls = []
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+
+tests\test_proactive_scheduler_refactor.py:502: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C5054050>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_proactive_task_exposes_local_scheduler_status _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_proactive_task_exposes_local_scheduler_status>
+
+    def test_proactive_task_exposes_local_scheduler_status(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+            call_proactive_task=None,
+        )
+    
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+    
+        gateway.call_proactive_task = _call_proactive_task
+        state_engine = SimpleNamespace(
+            get_active_states=lambda: [],
+            get_active_profiles=lambda: [],
+            apply_natural_decay=lambda state: None,
+        )
+        persistence = SimpleNamespace(load_persona_cache=lambda: {})
+        memory_engine = SimpleNamespace(add_memory=None)
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            gateway=gateway,
+            persistence=persistence,
+            memory_engine=memory_engine,
+            reflector=None,
+            config=gateway.config,
+        )
+
+tests\test_proactive_scheduler_refactor.py:117: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C4FEA2D0>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+_ ProactiveSchedulerRefactorTests.test_start_initializes_global_maintenance_clock _
+
+self = <astrmai_plugin_refactored_final.tests.test_proactive_scheduler_refactor.ProactiveSchedulerRefactorTests testMethod=test_start_initializes_global_maintenance_clock>
+
+    def test_start_initializes_global_maintenance_clock(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+            call_proactive_task=lambda **kwargs: asyncio.sleep(0, result="ok"),
+        )
+>       task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [],
+                apply_natural_decay=lambda state: None,
+            ),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+
+tests\test_proactive_scheduler_refactor.py:177: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\proactive\proactive_task.py:92: in __init__
+    self.proactive_dispatcher = ProactiveDispatcher(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.proactive.dispatcher.ProactiveDispatcher object at 0x000001C4C512B650>
+
+    def __init__(
+        self,
+        *,
+        attention_gate: Any = None,
+        runtime_coordinator: Any = None,
+        state_engine: Any = None,
+        config: Any = None,
+    ) -> None:
+        self.attention_gate = attention_gate
+        self.runtime_coordinator = runtime_coordinator
+        self.state_engine = state_engine
+        self.config = config
+        self._history: list[dict[str, Any]] = []
+        self._cooldowns: dict[str, float] = {}
+        self._callbacks: dict[str, CompletionCallback] = {}
+>       self._dispatch_lock = asyncio.Lock()
+E       NameError: name 'asyncio' is not defined
+
+astrmai\proactive\dispatcher.py:67: NameError
+============================== warnings summary ===============================
+tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_wakeup_routes_intent_through_dispatcher_before_energy_cost
+  D:\py2024\Lib\site-packages\_pytest\runner.py:139: RuntimeWarning: coroutine 'after_nonebot_init' was never awaited
+    item.funcargs = None  # type: ignore[attr-defined]
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_bind_chat_loop_kernel_registers_signal_sources_and_bridges
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_bridge_handlers_are_kernel_mediated
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_chat_heartbeat_pass_routes_active_chats_through_kernel
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_dispatcher_blocks_wakeup_and_heartflow_during_quiet_hours
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_dispatcher_history_reflects_queued_before_async_completion
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_dispatcher_injects_proactive_events_through_kernel_bound_gate
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_handle_chat_heartbeat_marks_observe_only_dispatch_mode
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_heartflow_cooldown_requires_visible_dispatch
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_proactive_task_exposes_local_scheduler_status
+FAILED tests/test_proactive_scheduler_refactor.py::ProactiveSchedulerRefactorTests::test_start_initializes_global_maintenance_clock
+10 failed, 9 passed, 1 warning in 1.81s

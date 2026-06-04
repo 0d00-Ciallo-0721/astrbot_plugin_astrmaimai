@@ -33,6 +33,7 @@ class GroupReplyWaitManager:
         self.message_budget = int(message_budget)
         self._states: Dict[str, GroupReplyWaitState] = {}
         self._timeout_tasks: Dict[str, asyncio.Task] = {}
+        self._states_lock = asyncio.Lock()
 
     def _cancel_timeout_task(self, chat_id: str) -> None:
         task = self._timeout_tasks.pop(str(chat_id), None)
@@ -49,7 +50,8 @@ class GroupReplyWaitManager:
         async def _expire_later():
             try:
                 await asyncio.sleep(self.timeout_sec)
-                state = self._states.pop(chat_id, None)
+                async with self._states_lock:
+                    state = self._states.pop(chat_id, None)
                 if state:
                     logger.info(f"[GroupWait] wait expired by timeout for chat={chat_id}")
             except asyncio.CancelledError:

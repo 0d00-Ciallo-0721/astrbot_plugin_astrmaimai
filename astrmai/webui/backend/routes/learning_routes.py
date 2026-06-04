@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..adapters.plugin_api import PluginApiAdapter
 from ..auth import get_current_user
 from ..db import get_db
-from ..services.admin_ui_service import AdminUiService
+from ..services.learningservice import LearningService
 
 router = APIRouter()
 
 
-def _service() -> AdminUiService:
-    return AdminUiService(PluginApiAdapter(), get_db)
+def _service() -> LearningService:
+    return LearningService(PluginApiAdapter(), get_db)
 
 
 @router.get("/status")

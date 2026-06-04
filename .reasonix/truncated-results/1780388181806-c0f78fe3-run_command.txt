@@ -1,0 +1,536 @@
+$ python -m pytest tests/unit/state tests/regression/state -q 2>&1
+[exit 1]
+FFFFFFFF.......FFFF                                                      [100%]
+================================== FAILURES ===================================
+_ ChatStatePersistenceMigratedTests.test_chat_state_roundtrip_preserves_decay_fields _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_chat_state_persistence_migrated.ChatStatePersistenceMigratedTests testMethod=test_chat_state_roundtrip_preserves_decay_fields>
+
+    def test_chat_state_roundtrip_preserves_decay_fields(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    
+        async def _run():
+            persistence = _SqliteStatePersistence(Path(temp_dir.name) / "state.db")
+            state = ChatState(
+                chat_id="chat-1",
+                energy=0.4,
+                mood=0.6,
+                last_reset_date="2026-05-27",
+                total_replies=3,
+                last_reply_time=111.0,
+                last_passive_decay_time=222.0,
+            )
+            await persistence.save_chat_state("chat-1", state)
+            return await persistence.load_chat_state("chat-1")
+    
+        try:
+            loaded = asyncio.run(_run())
+        finally:
+            temp_dir.cleanup()
+    
+>       self.assertEqual(loaded["last_reply_time"], 111.0)
+E       KeyError: 'last_reply_time'
+
+tests\unit\state\test_chat_state_persistence_migrated.py:65: KeyError
+---------------------------- Captured stdout setup ----------------------------
+06-02 16:16:18 [SUCCESS] nonebot | NoneBot is initializing...
+06-02 16:16:18 [INFO] nonebot | Current Env: prod
+------------------------------ Captured log call ------------------------------
+ERROR    astrbot:persistence_schema.py:149 [AstrMai-Infra] ? no such table: main.memoryevent
+_ ChatStatePersistenceMigratedTests.test_database_service_get_chat_state_preserves_decay_fields _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_chat_state_persistence_migrated.ChatStatePersistenceMigratedTests testMethod=test_database_service_get_chat_state_preserves_decay_fields>
+
+    def test_database_service_get_chat_state_preserves_decay_fields(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    
+        async def _prepare():
+            persistence = _SqliteStatePersistence(Path(temp_dir.name) / "state.db")
+            state = ChatState(
+                chat_id="chat-db",
+                energy=0.3,
+                mood=-0.4,
+                last_reset_date="2026-05-27",
+                total_replies=4,
+                last_reply_time=333.0,
+                last_passive_decay_time=444.0,
+            )
+            await persistence.save_chat_state("chat-db", state)
+            return persistence
+    
+        try:
+            persistence = asyncio.run(_prepare())
+            db_service = DatabaseService(SimpleNamespace(db_path=persistence.db_path))
+            loaded = db_service.get_chat_state("chat-db")
+        finally:
+            temp_dir.cleanup()
+    
+        self.assertIsNotNone(loaded)
+>       self.assertEqual(loaded.last_reply_time, 333.0)
+E       AssertionError: 0.0 != 333.0
+
+tests\unit\state\test_chat_state_persistence_migrated.py:94: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    astrbot:persistence_schema.py:149 [AstrMai-Infra] ? no such table: main.memoryevent
+_ ChatStatePersistenceMigratedTests.test_get_state_persists_daily_reset_on_first_load _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_chat_state_persistence_migrated.ChatStatePersistenceMigratedTests testMethod=test_get_state_persists_daily_reset_on_first_load>
+
+    def test_get_state_persists_daily_reset_on_first_load(self):
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        persistence = _ResetPersistence(
+            {
+                "chat_id": "chat-reset",
+                "energy": 0.4,
+                "mood": 0.6,
+                "group_config": {},
+                "last_reset_date": yesterday,
+                "total_replies": 2,
+                "last_reply_time": 10.0,
+                "last_passive_decay_time": 20.0,
+            }
+        )
+        service = ChatStateService(
+            persistence,
+            SimpleNamespace(
+                energy=SimpleNamespace(daily_recovery=0.2),
+                mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            ),
+        )
+    
+        state = asyncio.run(service.get_state("chat-reset"))
+    
+>       self.assertEqual(state.last_reset_date, datetime.date.today().isoformat())
+E       AssertionError: '2026-06-01' != '2026-06-02'
+E       - 2026-06-01
+E       ?          ^
+E       + 2026-06-02
+E       ?          ^
+
+tests\unit\state\test_chat_state_persistence_migrated.py:122: AssertionError
+_ PrivateChatManagerMigratedTests.test_group_chat_id_does_not_alias_friend_session_with_same_numeric_tail _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_private_chat_manager_migrated.PrivateChatManagerMigratedTests testMethod=test_group_chat_id_does_not_alias_friend_session_with_same_numeric_tail>
+
+    def test_group_chat_id_does_not_alias_friend_session_with_same_numeric_tail(self):
+        manager = PrivateChatManager()
+    
+        async def _run():
+            await manager.wait_for_new_message(
+                "12345",
+                timeout=0.01,
+                chat_id="default:FriendMessage:12345",
+            )
+    
+        try:
+            asyncio.run(_run())
+        except Exception:
+            pass
+    
+>       friend_info = manager.get_session_info_by_chat_id("default:FriendMessage:12345")
+
+tests\unit\state\test_private_chat_manager_migrated.py:41: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+astrmai\state\private_chat\private_chat_manager.py:99: in get_session_info_by_chat_id
+    return self.get_session_info(user_id)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.state.private_chat.private_chat_manager.PrivateChatManager object at 0x000002AE29FF1190>
+user_id = '12345'
+
+    def get_session_info(self, user_id: str) -> Optional[dict]:
+>       session = self._resolve_session(user_id)
+E       AttributeError: 'PrivateChatManager' object has no attribute '_resolve_session'
+
+astrmai\state\private_chat\private_chat_manager.py:84: AttributeError
+_ PrivateChatManagerMigratedTests.test_wait_for_new_message_uses_buffered_message_arrived_before_wait _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_private_chat_manager_migrated.PrivateChatManagerMigratedTests testMethod=test_wait_for_new_message_uses_buffered_message_arrived_before_wait>
+
+    def test_wait_for_new_message_uses_buffered_message_arrived_before_wait(self):
+        manager = PrivateChatManager()
+    
+        async def _run():
+            await manager.signal_new_message("user-1", "hello", chat_id="default:FriendMessage:user-1")
+            has_reply = await manager.wait_for_new_message(
+                "user-1",
+                timeout=0.01,
+                chat_id="default:FriendMessage:user-1",
+            )
+            pending = manager.get_pending_messages("user-1")
+            return has_reply, pending
+    
+>       has_reply, pending = asyncio.run(_run())
+
+tests\unit\state\test_private_chat_manager_migrated.py:21: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+tests\unit\state\test_private_chat_manager_migrated.py:13: in _run
+    has_reply = await manager.wait_for_new_message(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.state.private_chat.private_chat_manager.PrivateChatManager object at 0x000002AE29F73010>
+user_id = 'user-1', timeout = 0.01, chat_id = 'default:FriendMessage:user-1'
+
+    async def wait_for_new_message(
+        self,
+        user_id: str,
+        timeout: Optional[float] = None,
+        chat_id: str = "",
+    ) -> bool:
+>       session = self._get_or_create_session(user_id, chat_id)
+E       TypeError: PrivateChatManager._get_or_create_session() takes 2 positional arguments but 3 were given
+
+astrmai\state\private_chat\private_chat_manager.py:53: TypeError
+_ RelationshipProfileRoundtripMigratedTests.test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_relationship_profile_roundtrip_migrated.RelationshipProfileRoundtripMigratedTests testMethod=test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score>
+
+    def test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = StateEngine(_ProfilePersistence(), SimpleNamespace(config=config), config=config)
+    
+        async def _run():
+            first_profile = await engine.get_user_profile("user-1")
+            first_trust = first_profile.relationship_vector["trust"]
+            initial_score = engine.relationship_engine.get_social_score("user-1")
+            updated_score = engine.relationship_engine.process_event(
+                "user-1",
+                RelationshipEvent.HELPFUL_REPLY,
+                intensity=1.0,
+            )
+            second_profile = await engine.get_user_profile("user-1")
+            return first_trust, second_profile, initial_score, updated_score
+    
+>       first_trust, second_profile, initial_score, updated_score = asyncio.run(_run())
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:71: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def _run():
+        first_profile = await engine.get_user_profile("user-1")
+>       first_trust = first_profile.relationship_vector["trust"]
+E       KeyError: 'trust'
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:61: KeyError
+_ RelationshipProfileRoundtripMigratedTests.test_relationship_vector_roundtrip_preserves_last_decay_time _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_relationship_profile_roundtrip_migrated.RelationshipProfileRoundtripMigratedTests testMethod=test_relationship_vector_roundtrip_preserves_last_decay_time>
+
+    def test_relationship_vector_roundtrip_preserves_last_decay_time(self):
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    
+        async def _run():
+            persistence = _SqliteProfilePersistence(Path(temp_dir.name) / "state.db")
+            profile = UserProfile(
+                user_id="user-3",
+                name="tester",
+                social_score=12.0,
+                relationship_vector={
+                    "trust": 10.0,
+                    "familiarity": 11.0,
+                    "emotion_bond": 12.0,
+                    "respect": 13.0,
+                    "social_score": 11.4,
+                    "total_interactions": 3,
+                    "positive_streak": 2,
+                    "negative_streak": 0,
+                    "first_seen": 111.0,
+                    "last_interaction": 222.0,
+                    "last_decay_time": 123456.0,
+                },
+            )
+            await persistence.save_user_profile(profile)
+            loaded = await persistence.load_user_profile("user-3")
+            return loaded
+    
+        try:
+            loaded = asyncio.run(_run())
+        finally:
+            temp_dir.cleanup()
+    
+>       self.assertEqual(loaded["relationship_vector"]["last_decay_time"], 123456.0)
+E       KeyError: 'relationship_vector'
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:136: KeyError
+------------------------------ Captured log call ------------------------------
+ERROR    astrbot:persistence_schema.py:149 [AstrMai-Infra] ? no such table: main.memoryevent
+_ RelationshipProfileRoundtripMigratedTests.test_update_social_score_from_fact_keeps_runtime_vector_in_sync _
+
+self = <astrmai_plugin_refactored_final.tests.unit.state.test_relationship_profile_roundtrip_migrated.RelationshipProfileRoundtripMigratedTests testMethod=test_update_social_score_from_fact_keeps_runtime_vector_in_sync>
+
+    def test_update_social_score_from_fact_keeps_runtime_vector_in_sync(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = StateEngine(_ProfilePersistence(), SimpleNamespace(config=config), config=config)
+    
+        async def _run():
+            before = await engine.get_user_profile("user-2")
+            before_score = before.social_score
+            await engine.update_social_score_from_fact("user-2", 3.0)
+            after = await engine.get_user_profile("user-2")
+            return before_score, after.social_score, engine.relationship_engine.get_social_score("user-2")
+    
+>       before_score, after_score, vector_score = asyncio.run(_run())
+
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:94: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+tests\unit\state\test_relationship_profile_roundtrip_migrated.py:90: in _run
+    await engine.update_social_score_from_fact("user-2", 3.0)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <astrmai.state.chat_state_service.StateEngine object at 0x000002AE29FE5FD0>
+user_id = 'user-2', impact_score = 3.0
+
+    async def update_social_score_from_fact(self, user_id: str, impact_score: float):
+        profile = await self.get_user_profile(user_id)
+        old_score = profile.social_score
+        new_score = max(-100.0, min(100.0, old_score + impact_score))
+>       aligned_score = self.relationship_engine.align_social_score(user_id, new_score)
+E       AttributeError: 'RelationshipEngine' object has no attribute 'align_social_score'
+
+astrmai\state\chat_state_service.py:229: AttributeError
+_ DecayServiceMigratedTests.test_run_once_persists_chat_decay_and_unifies_relationship_truth _
+
+self = <astrmai_plugin_refactored_final.tests.regression.state.test_decay_service_migrated.DecayServiceMigratedTests testMethod=test_run_once_persists_chat_decay_and_unifies_relationship_truth>
+
+    def test_run_once_persists_chat_decay_and_unifies_relationship_truth(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(
+                cost_per_reply=0.1,
+                min_reply_threshold=0.1,
+                daily_recovery=0.1,
+                recovery_silence_min=1,
+            ),
+            mood=SimpleNamespace(decay_interval=60, decay_rate=0.1),
+            reply=SimpleNamespace(emotion_mapping=[]),
+            evolution=SimpleNamespace(enable_relationship_engine=True),
+        )
+        persistence = _Persistence()
+        engine = StateEngine(persistence, SimpleNamespace(config=config), config=config)
+        service = DecayService(engine, None, config)
+    
+        async def _run():
+            state = await engine.get_state("group-1")
+            state.energy = 0.4
+            state.mood = 0.5
+            state.last_reply_time = 0.0
+            state.last_passive_decay_time = time.time() - 120.0
+    
+            profile = await engine.get_user_profile("user-1")
+            profile.last_access_time = 0.0
+            engine.relationship_engine.get_or_create("user-1").last_decay_time = 0.0
+    
+            await service.run_once()
+            return state, profile, engine.relationship_engine.get_social_score("user-1")
+    
+        state, profile, vector_score = asyncio.run(_run())
+    
+>       self.assertTrue(persistence.saved_states)
+E       AssertionError: [] is not true
+
+tests\regression\state\test_decay_service_migrated.py:88: AssertionError
+_ StateEngineMoodMigratedTests.test_analyze_text_mood_alias_parses_markdown_wrapped_json _
+
+self = <astrmai_plugin_refactored_final.tests.regression.state.test_state_engine_mood_migrated.StateEngineMoodMigratedTests testMethod=test_analyze_text_mood_alias_parses_markdown_wrapped_json>
+
+        def test_analyze_text_mood_alias_parses_markdown_wrapped_json(self):
+            async def _call_mood_task(prompt, system_prompt=None):
+                return """```json
+    {"mood_tag": "sad", "mood_value": -0.2}
+    ```"""
+    
+            gateway = SimpleNamespace(
+                config=SimpleNamespace(reply=SimpleNamespace(emotion_mapping=[])),
+                call_mood_task=_call_mood_task,
+            )
+            manager = self.mood_mod.MoodManager(gateway)
+    
+            tag, mood_value = asyncio.run(manager.analyze_text_mood('hello', 0.1))
+    
+>           self.assertEqual(tag, 'sad')
+E           AssertionError: 'neutral' != 'sad'
+E           - neutral
+E           + sad
+
+tests\regression\state\test_state_engine_mood_migrated.py:45: AssertionError
+___ StateEngineMoodMigratedTests.test_update_mood_delegates_to_analyze_mood ___
+
+self = <astrmai_plugin_refactored_final.tests.regression.state.test_state_engine_mood_migrated.StateEngineMoodMigratedTests testMethod=test_update_mood_delegates_to_analyze_mood>
+
+    def test_update_mood_delegates_to_analyze_mood(self):
+        config = SimpleNamespace(
+            reply=SimpleNamespace(emotion_mapping=[]),
+            energy=SimpleNamespace(daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+        )
+        gateway = SimpleNamespace(config=config)
+        engine = self.state_mod.StateEngine(SimpleNamespace(), gateway, config=config)
+    
+        observed = {}
+    
+        async def _get_state(chat_id):
+            return SimpleNamespace(mood=0.2)
+    
+        async def _analyze_mood(text, current_mood, user_affection=0.0, chat_id=None):
+            observed['text'] = text
+            observed['current_mood'] = current_mood
+            observed['chat_id'] = chat_id
+            return 'happy', 0.6
+    
+        async def _atomic_update(chat_id, delta=0.0):
+            observed['delta'] = delta
+            return 0.6
+    
+        engine.get_state = _get_state
+        engine.mood_manager.analyze_mood = _analyze_mood
+        engine.atomic_update_mood = _atomic_update
+    
+>       tag, final_mood = asyncio.run(engine.update_mood('chat-1', 'hello'))
+
+tests\regression\state\test_state_engine_mood_migrated.py:75: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+astrmai\state\chat_state_service.py:198: in update_mood
+    apply_natural_decay(state, self.config)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+state = namespace(mood=0.2)
+config = namespace(reply=namespace(emotion_mapping=[]), energy=namespace(daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2))
+
+    def apply_natural_decay(state: Any, config: Any) -> None:
+        now = time.time()
+        is_dirty = False
+        minutes_silent = 999.0
+        if getattr(state, "last_reply_time", 0):
+            minutes_silent = (now - state.last_reply_time) / 60.0
+    
+        recovery_min = getattr(config.energy, "recovery_silence_min", 60)
+>       if minutes_silent > recovery_min and state.energy < 0.8:
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'energy'
+
+astrmai\state\mood\mood_decay.py:15: AttributeError
+_ StateEngineMoodMigratedTests.test_update_mood_falls_back_for_legacy_mood_manager_signature _
+
+self = <astrmai_plugin_refactored_final.tests.regression.state.test_state_engine_mood_migrated.StateEngineMoodMigratedTests testMethod=test_update_mood_falls_back_for_legacy_mood_manager_signature>
+
+    def test_update_mood_falls_back_for_legacy_mood_manager_signature(self):
+        config = SimpleNamespace(
+            reply=SimpleNamespace(emotion_mapping=[]),
+            energy=SimpleNamespace(daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+        )
+        gateway = SimpleNamespace(config=config)
+        engine = self.state_mod.StateEngine(SimpleNamespace(), gateway, config=config)
+    
+        observed = {}
+    
+        async def _get_state(chat_id):
+            return SimpleNamespace(mood=-0.1)
+    
+        async def _legacy_analyze_mood(text, current_mood, user_affection=0.0):
+            observed['text'] = text
+            observed['current_mood'] = current_mood
+            return 'neutral', 0.0
+    
+        async def _atomic_update(chat_id, delta=0.0):
+            observed['delta'] = delta
+            return -0.1 + delta
+    
+        engine.get_state = _get_state
+        engine.mood_manager.analyze_mood = _legacy_analyze_mood
+        engine.atomic_update_mood = _atomic_update
+    
+>       tag, final_mood = asyncio.run(engine.update_mood('chat-legacy', 'legacy hello'))
+
+tests\regression\state\test_state_engine_mood_migrated.py:110: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+D:\py2024\Lib\asyncio\runners.py:190: in run
+    return runner.run(main)
+D:\py2024\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+D:\py2024\Lib\asyncio\base_events.py:653: in run_until_complete
+    return future.result()
+astrmai\state\chat_state_service.py:198: in update_mood
+    apply_natural_decay(state, self.config)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+state = namespace(mood=-0.1)
+config = namespace(reply=namespace(emotion_mapping=[]), energy=namespace(daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2))
+
+    def apply_natural_decay(state: Any, config: Any) -> None:
+        now = time.time()
+        is_dirty = False
+        minutes_silent = 999.0
+        if getattr(state, "last_reply_time", 0):
+            minutes_silent = (now - state.last_reply_time) / 60.0
+    
+        recovery_min = getattr(config.energy, "recovery_silence_min", 60)
+>       if minutes_silent > recovery_min and state.energy < 0.8:
+E       AttributeError: 'types.SimpleNamespace' object has no attribute 'energy'
+
+astrmai\state\mood\mood_decay.py:15: AttributeError
+============================== warnings summary ===============================
+D:\py2024\Lib\site-packages\jieba\_compat.py:18
+  D:\py2024\Lib\site-packages\jieba\_compat.py:18: DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
+    import pkg_resources
+
+D:\py2024\Lib\site-packages\pkg_resources\__init__.py:3142
+  D:\py2024\Lib\site-packages\pkg_resources\__init__.py:3142: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('google')`.
+  Implementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages
+    declare_namespace(pkg)
+
+D:\py2024\Lib\site-packages\pkg_resources\__init__.py:3142
+  D:\py2024\Lib\site-packages\pkg_resources\__init__.py:3142: DeprecationWarning: Deprecated call to `pkg_resources.declare_namespace('sphinxcontrib')`.
+  Implementing implicit namespace packages (as specified in PEP 420) is preferred to `pkg_resources.declare_namespace`. See https://setuptools.pypa.io/en/latest/references/keywords.html#keyword-namespace-packages
+    declare_namespace(pkg)
+
+tests/regression/state/test_state_engine_mood_migrated.py::StateEngineMoodMigratedTests::test_update_mood_falls_back_for_legacy_mood_manager_signature
+  D:\py2024\Lib\site-packages\_pytest\runner.py:139: RuntimeWarning: coroutine 'after_nonebot_init' was never awaited
+    item.funcargs = None  # type: ignore[attr-defined]
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/unit/state/test_chat_state_persistence_migrated.py::ChatStatePersistenceMigratedTests::test_chat_state_roundtrip_preserves_decay_fields
+FAILED tests/unit/state/test_chat_state_persistence_migrated.py::ChatStatePersistenceMigratedTests::test_database_service_get_chat_state_preserves_decay_fields
+FAILED tests/unit/state/test_chat_state_persistence_migrated.py::ChatStatePersistenceMigratedTests::test_get_state_persists_daily_reset_on_first_load
+FAILED tests/unit/state/test_private_chat_manager_migrated.py::PrivateChatManagerMigratedTests::test_group_chat_id_does_not_alias_friend_session_with_same_numeric_tail
+FAILED tests/unit/state/test_private_chat_manager_migrated.py::PrivateChatManagerMigratedTests::test_wait_for_new_message_uses_buffered_message_arrived_before_wait
+FAILED tests/unit/state/test_relationship_profile_roundtrip_migrated.py::RelationshipProfileRoundtripMigratedTests::test_get_user_profile_does_not_rebuild_runtime_vector_from_social_score
+FAILED tests/unit/state/test_relationship_profile_roundtrip_migrated.py::RelationshipProfileRoundtripMigratedTests::test_relationship_vector_roundtrip_preserves_last_decay_time
+FAILED tests/unit/state/test_relationship_profile_roundtrip_migrated.py::RelationshipProfileRoundtripMigratedTests::test_update_social_score_from_fact_keeps_runtime_vector_in_sync
+FAILED tests/regression/state/test_decay_service_migrated.py::DecayServiceMigratedTests::test_run_once_persists_chat_decay_and_unifies_relationship_truth
+FAILED tests/regression/state/test_state_engine_mood_migrated.py::StateEngineMoodMigratedTests::test_analyze_text_mood_alias_parses_markdown_wrapped_json
+FAILED tests/regression/state/test_state_engine_mood_migrated.py::StateEngineMoodMigratedTests::test_update_mood_delegates_to_analyze_mood
+FAILED tests/regression/state/test_state_engine_mood_migrated.py::StateEngineMoodMigratedTests::test_update_mood_falls_back_for_legacy_mood_manager_signature
+12 failed, 7 passed, 4 warnings in 8.15s

@@ -211,6 +211,15 @@ class GatewayCallMixin:
                         usage = self._extract_usage(response)
                         log_meta = dict(debug_meta or {})
                         log_meta["provider"] = infer_provider_capabilities(model_id).provider_family
+                        if llm_kwargs.get("session_id"):
+                            log_meta["request_session_id"] = str(llm_kwargs["session_id"])
+                        if llm_kwargs.get("cache_control"):
+                            log_meta["request_cache_control"] = "ephemeral"
+                        log_meta = self._enrich_cache_debug_meta(
+                            log_meta,
+                            workload_policy=workload_policy,
+                            usage=usage,
+                        )
 
                         if is_json:
                             parsed_json = self._parse_json_completion(content)

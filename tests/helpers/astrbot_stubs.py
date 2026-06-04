@@ -1,3 +1,4 @@
+import os
 import sys
 import types
 
@@ -45,7 +46,18 @@ def install_astrbot_stubs(data_dir: str):
     agent_run_context_mod = types.ModuleType("astrbot.core.agent.run_context")
     agent_tool_mod = types.ModuleType("astrbot.core.agent.tool")
     astr_agent_context_mod = types.ModuleType("astrbot.core.astr_agent_context")
+    def _find_project_root(start: str) -> str:
+        cur = os.path.dirname(os.path.abspath(start))
+        while cur != os.path.dirname(cur):
+            if os.path.isfile(os.path.join(cur, "astrmai", "__init__.py")):
+                return cur
+            cur = os.path.dirname(cur)
+        raise FileNotFoundError("Cannot locate project root (astrmai/__init__.py not found)")
+
     fake_workmode_mod = types.ModuleType("astrmai.workmode")
+    fake_workmode_mod.__path__ = [
+        os.path.join(_find_project_root(__file__), "astrmai", "workmode")
+    ]  # 指向真实包目录，允许子模块导入
     db_mod = types.ModuleType("astrbot.core.db")
     db_mod.__path__ = []
     vec_db_mod = types.ModuleType("astrbot.core.db.vec_db")

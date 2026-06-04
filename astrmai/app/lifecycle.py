@@ -58,10 +58,10 @@ class PluginLifecycleManager:
 
     async def load_command_metadata(self) -> None:
         self.runtime.set_boot_phase("lifecycle.commands")
-        if not self.runtime.sensors or not hasattr(self.runtime.sensors, "_load_foreign_commands"):
+        if not self.runtime.sensors or not hasattr(self.runtime.sensors, "load_foreign_commands"):
             return
         try:
-            await self.runtime.sensors._load_foreign_commands()
+            await self.runtime.sensors.load_foreign_commands()
             self.runtime.status.foreign_commands_loaded = True
         except Exception as exc:
             self.runtime.mark_degraded("conversation.foreign_commands", str(exc))
@@ -155,36 +155,69 @@ class PluginLifecycleManager:
         self.runtime.status.lifecycle_started = False
         self.runtime.set_boot_phase("shutdown.start")
 
-        memory_pipeline = getattr(self.runtime.memory_engine, "memory_pipeline", None)
-        if memory_pipeline:
-            await memory_pipeline.stop()
+        try:
+            memory_pipeline = getattr(self.runtime.memory_engine, "memory_pipeline", None)
+            if memory_pipeline:
+                await memory_pipeline.stop()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Memory pipeline shutdown degraded: {exc}")
 
-        await self.stop_proactive_services()
-        await self.stop_expression_governance_services()
+        try:
+            await self.stop_proactive_services()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Proactive shutdown degraded: {exc}")
 
-        if self.runtime.cron_guard:
-            self.runtime.cron_guard.stop()
+        try:
+            await self.stop_expression_governance_services()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Expression governance shutdown degraded: {exc}")
 
-        tasks_to_wait = collect_background_tasks(*self.runtime.iter_task_owners())
+        try:
+            if self.runtime.cron_guard:
+                self.runtime.cron_guard.stop()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Cron guard shutdown degraded: {exc}")
 
-        self.stop_visual_services()
+        try:
+            tasks_to_wait = collect_background_tasks(*self.runtime.iter_task_owners())
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Shutdown task collection degraded: {exc}")
+            tasks_to_wait = []
 
-        if not tasks_to_wait:
-            self.runtime.set_boot_phase("shutdown.complete")
-            return
+        try:
+            self.stop_visual_services()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Visual shutdown degraded: {exc}")
 
-        logger.info(f"[AstrMai] 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
-        unique_tasks = [task for task in dict.fromkeys(tasks_to_wait) if task is not None]
-        for task in unique_tasks:
-            if not task.done():
-                task.cancel()
+        if tasks_to_wait:
+            logger.info(f"[AstrMai] 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
+            unique_tasks = [task for task in dict.fromkeys(tasks_to_wait) if task is not None]
+            for task in unique_tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                _, pending = await asyncio.wait(unique_tasks, timeout=3.0)
+                if pending:
+                    logger.warning(f"[AstrMai] {len(pending)} background tasks did not exit gracefully before timeout.")
+                else:
+                    logger.info("[AstrMai] all background tasks were cleaned up safely.")
+            except Exception as exc:
+                logger.warning(f"[AstrMai] Background task cleanup degraded: {exc}")
 
-        _, pending = await asyncio.wait(unique_tasks, timeout=3.0)
-        if pending:
-            logger.warning(f"[AstrMai] {len(pending)} background tasks did not exit gracefully before timeout.")
-        else:
-            logger.info("[AstrMai] all background tasks were cleaned up safely.")
+        self._reset_runtime_status_flags()
         self.runtime.set_boot_phase("shutdown.complete")
+
+    def _reset_runtime_status_flags(self) -> None:
+        """Reset startup-phase status flags to False.
+
+        is_running and lifecycle_started are reset directly in terminate()
+        before this method runs, so they are intentionally absent here.
+        """
+        self.runtime.status.memory_initialized = False
+        self.runtime.status.proactive_started = False
+        self.runtime.status.visual_started = False
+        self.runtime.status.cron_guard_started = False
+        self.runtime.status.foreign_commands_loaded = False
 
     async def stop_proactive_services(self) -> None:
         self.runtime.set_boot_phase("shutdown.proactive")

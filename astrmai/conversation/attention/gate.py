@@ -83,6 +83,11 @@ class AttentionGate:
         self.chat_loop_kernel = chat_loop_kernel
         self.dialogue_store = getattr(state_engine, "dialogue_store", None)
         self.context_compaction = getattr(state_engine, "context_compaction", None)
+        if self.context_compaction is None:
+            logger.warning(
+                "[AttentionGate] state_engine.context_compaction is None — "
+                "compaction evaluation will be disabled; segments may accumulate unboundedly"
+            )
 
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
@@ -453,7 +458,7 @@ class AttentionGate:
         return "THROTTLED" if should_drop else None
 
     def _handle_repeater_echo(self, event: AstrMessageEvent, session: SessionContext, is_private: bool, extracted_images: list[Any], msg_str: str) -> str | None:
-        del event
+        _ = event  # 参数保留用于接口一致性，方法体内仅使用 session 状态
         if is_private:
             return None
         msg_hash = f"{msg_str}|{bool(extracted_images)}"
@@ -467,7 +472,7 @@ class AttentionGate:
         return None
 
     async def _normalize_content_to_str(self, components: Any, depth: int = 0, event: AstrMessageEvent = None) -> str:
-        del event
+        _ = event  # 参数保留用于递归接口一致性
         if depth > 3:
             return "[content depth exceeded]"
         if components is None:
@@ -495,7 +500,7 @@ class AttentionGate:
         return f"[{sender}] {str(getattr(event, 'message_str', '') or '').strip()}".strip()
 
     def _convert_interaction_to_narrative(self, content: str, bot_name: str, event: AstrMessageEvent = None) -> str:
-        del bot_name, event
+        _ = (bot_name, event)  # 参数保留用于接口一致性
         return str(content or "").strip()
 
     def bind_chat_loop_kernel(self, chat_loop_kernel) -> None:

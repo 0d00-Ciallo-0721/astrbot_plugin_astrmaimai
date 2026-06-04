@@ -6,7 +6,12 @@ from astrbot.api.event import AstrMessageEvent
 
 from ...conversation.contracts.prompt_envelope import PromptEnvelope
 from ...conversation.contracts.turn_context import MemoryInjectionDecision, ensure_turn_context, get_turn_context
+import json
+
+from astrbot.api import logger
+
 from ..contracts.memory_query import MemoryInjectionBundle, MemoryInjectionTrace, MemoryQuery
+from ..contracts.retrieval_trace import RetrievalTrace
 from .memory_context_builder import MemoryContextBuilder
 from .memory_retrieval_service import MemoryRetrievalService
 
@@ -35,6 +40,57 @@ class MemoryInjectionService:
     def _preview(text: str, limit: int = 160) -> str:
         cleaned = " ".join(str(text or "").split())
         return cleaned if len(cleaned) <= limit else cleaned[: max(0, limit - 3)] + "..."
+
+    @staticmethod
+    def _build_trace_summary(query, trace_payload, trace, skip_reason):
+        selected = trace_payload.get("selected")
+        retrieved = trace_payload.get("retrieved")
+        return {
+            "tool": "auto_injection",
+            "policy": str(getattr(query, "policy", "") or ""),
+            "visibility_mode": str((getattr(query, "metadata", {}) or {}).get("visibility_mode") or ""),
+            "rewritten_queries": list(trace_payload.get("rewritten_queries") or []),
+            "retrieve_keys": list(getattr(query, "retrieve_keys", []) or []),
+            "search_steps": list(trace_payload.get("search_steps") or []),
+            "selected_ids": list(getattr(trace, "selected_ids", []) or []),
+            "selected_count": int(getattr(trace, "selected_count", 0) or 0),
+            "candidate_count": int(getattr(trace, "candidate_count", 0) or 0),
+            "retrieved_count": len(retrieved) if isinstance(retrieved, list) else 0,
+            "guidance_preview": str(trace_payload.get("guidance") or "")[:160],
+            "skip_reason": str(skip_reason or getattr(trace, "skip_reason", "") or ""),
+            "error": str(trace_payload.get("error") or ""),
+        }
+
+    async def _persist_trace(self, event, query, trace, selected, skip_reason=""):
+        engine = getattr(self.retrieval_service, "engine", None)
+        db_service = getattr(engine, "db_service", None) if engine else None
+        if not db_service or not hasattr(db_service, "save_retrieval_trace_async"):
+            return
+        trace_payload = dict((getattr(query, "metadata", {}) or {}).get("_trace", {}) or {})
+        tool_calls = [{
+            "tool": "auto_injection",
+            "query": str(getattr(query, "query", "") or ""),
+            "memory_ids": list(getattr(trace, "selected_ids", []) or []),
+            "search_steps": list(trace_payload.get("search_steps") or []),
+            "skip_reason": str(skip_reason or ""),
+        }]
+        try:
+            trace_summary = self._build_trace_summary(query, trace_payload, trace, skip_reason)
+            record = RetrievalTrace(
+                trace_id=getattr(trace, "trace_id", "") or "",
+                chat_id=str(getattr(event, "unified_msg_origin", "") or ""),
+                sender_name=str(event.get_sender_name() or "") if hasattr(event, "get_sender_name") else "",
+                query=str(getattr(query, "query", "") or ""),
+                planner_question=str(getattr(query, "query", "") or ""),
+                tool_calls=json.dumps(tool_calls, ensure_ascii=False),
+                trace_summary=json.dumps(trace_summary, ensure_ascii=False),
+                selected_memory_ids=json.dumps(list(getattr(trace, "selected_ids", []) or []), ensure_ascii=False),
+                source_layers=json.dumps(list(getattr(trace, "layers", []) or []), ensure_ascii=False),
+                confidence=max((float(getattr(item, "relevance_score", 0.0) or 0.0) for item in (selected or [])), default=0.0),
+            )
+            await db_service.save_retrieval_trace_async(record.to_orm_model())
+        except Exception:
+            pass
 
     @classmethod
     def has_memory_intent(cls, text: str) -> bool:
@@ -159,6 +215,7 @@ class MemoryInjectionService:
         ensure_turn_context(event).memory = decision
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_memory_injection_trace", trace)
+        await self._persist_trace(event=event, query=query, trace=trace, selected=selected)
         return MemoryInjectionBundle(
             rendered_prompt_block=rendered,
             items=selected,

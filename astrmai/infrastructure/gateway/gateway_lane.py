@@ -42,14 +42,19 @@ class GatewayLaneMixin:
         existing_payload = event.get_extra("astrmai_request_trace", {})
         if not isinstance(existing_payload, dict):
             existing_payload = {}
+        def _reuse_or_hash(key: str, fallback_text: str) -> str:
+            existing = existing_payload.get(key)
+            return existing if existing is not None else self._stable_hash_text(fallback_text)
+
+        _raw_sid = (request_kwargs or {}).get("session_id")
         trace_payload = {
             **existing_payload,
             "gateway_system_hash": self._stable_hash_text(system_prompt),
             "gateway_prompt_hash": self._stable_hash_text(prompt),
-            "provider_visible_system_hash": existing_payload.get("provider_visible_system_hash", "") or self._stable_hash_text(system_prompt),
-            "provider_visible_prompt_hash": existing_payload.get("provider_visible_prompt_hash", "") or self._stable_hash_text(prompt),
-            "post_hook_system_hash": existing_payload.get("post_hook_system_hash", "") or self._stable_hash_text(post_hook_system_prompt or system_prompt),
-            "request_session_id": str((request_kwargs or {}).get("session_id", "") or ""),
+            "provider_visible_system_hash": _reuse_or_hash("provider_visible_system_hash", system_prompt),
+            "provider_visible_prompt_hash": _reuse_or_hash("provider_visible_prompt_hash", prompt),
+            "post_hook_system_hash": _reuse_or_hash("post_hook_system_hash", post_hook_system_prompt or system_prompt),
+            "request_session_id": str(_raw_sid) if _raw_sid is not None else "",
             "request_cache_control": self._stringify_request_cache_control((request_kwargs or {}).get("cache_control")),
             "request_provider_family": str(provider_family or ""),
             "request_model_id": str(model_id or ""),
@@ -189,13 +194,20 @@ class GatewayLaneMixin:
                 workload_policy=workload_policy,
             )
 
-        primary_models = self.router.get_ranked_models(
+        primary_models, attempt_queue = self._build_attempt_queue(
             lane_key.task_family,
             models,
-            sticky_key=workload_policy.sticky_key if workload_policy.sticky_model else "",
-            sticky_preferred=workload_policy.primary_model,
+            use_fallback,
+            workload_policy=workload_policy,
         )
-        model_hint = primary_models[0] if primary_models else ""
+        attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
+            lane_key.task_family,
+            primary_models,
+            attempt_queue,
+        )
+        if not attempt_queue:
+            raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
+        model_hint = attempt_queue[0]
         lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
             lane_key=effective_lane_key,
             base_origin=base_origin,
@@ -206,7 +218,7 @@ class GatewayLaneMixin:
             schema_id=workload_policy.schema_id,
             persona_core_version=workload_policy.persona_core_version,
         )
-        lane_runtime_meta = self.lane_manager.get_runtime_meta(lane_umo)
+        lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
         seed_trace = self.context_economy.build_trace(
             policy=workload_policy,
             lane_umo=lane_umo,
@@ -236,7 +248,13 @@ class GatewayLaneMixin:
             record_economy=False,
         )
         if not result.model_id:
+            # 防御性回退：_elastic_call_result 成功路径必定设置 model_id；
+            # 到达此处说明 _build_success_result 未正确传递 model_id，属异常路径。
             result.model_id = model_hint
+            logger.warning(
+                f"[Gateway] chat_in_lane_result: result.model_id unexpectedly empty "
+                f"(pool={lane_key.task_family}), falling back to attempt_queue[0]={model_hint}"
+            )
         provider_caps = infer_provider_capabilities(result.model_id)
         provider_session_id = ""
         if workload_policy.use_provider_session and provider_caps.supports_remote_session:
@@ -260,6 +278,24 @@ class GatewayLaneMixin:
         )
         result.economy = workload_trace.as_dict()
         self.context_economy.record_trace(workload_trace)
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
+            event.set_extra(
+                "astrmai_cached_usage_supported",
+                bool((result.usage or {}).get("cached_usage_supported", False) or int((result.usage or {}).get("input_cached", 0) or 0) > 0),
+            )
+        append_trace_stage(
+            event,
+            "gateway_chat",
+            workload_family=workload_policy.family.value,
+            lane_key=effective_lane_key.as_log_key(),
+            lane_umo=lane_umo,
+            prefix_hash=workload_policy.stable_prefix_hash,
+            model_id=result.model_id or model_hint,
+            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
+            skipped_cooldown_models=list(skipped_cooldown_models),
+            cooldown_overridden=bool(cooldown_overridden),
+        )
         self._record_event_request_trace(
             event,
             system_prompt=system_prompt,
@@ -396,7 +432,7 @@ class GatewayLaneMixin:
             schema_id=workload_policy.schema_id,
             persona_core_version=workload_policy.persona_core_version,
         )
-        lane_runtime_meta = self.lane_manager.get_runtime_meta(lane_umo)
+        lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
         last_error = ""
         last_raw_completion = ""
         attempted_models: List[str] = []
@@ -429,20 +465,25 @@ class GatewayLaneMixin:
                 if "[SYSTEM_WAIT_SIGNAL]" in stripped_reply or "[TERMINAL_YIELD]:" in stripped_reply:
                     self.router.report_success(report_pool, model_id)
                     usage = self._extract_usage(response)
-                    self._log_usage(
-                        report_pool,
-                        model_id,
-                        usage,
-                        {
-                            "lane_key": effective_lane_key.as_log_key(),
-                            "conversation_id": conversation_id,
-                            "prefix_hash": workload_policy.effective_prefix_hash,
-                            "provider": capabilities.provider_family,
-                            "workload_family": workload_policy.family.value,
-                            "template_id": workload_policy.template_id,
-                            "template_version": workload_policy.template_version,
-                        },
+                    _tool_log_meta = {
+                        "lane_key": effective_lane_key.as_log_key(),
+                        "conversation_id": conversation_id,
+                        "prefix_hash": workload_policy.effective_prefix_hash,
+                        "provider": capabilities.provider_family,
+                        "workload_family": workload_policy.family.value,
+                        "template_id": workload_policy.template_id,
+                        "template_version": workload_policy.template_version,
+                    }
+                    if tool_kwargs.get("session_id"):
+                        _tool_log_meta["request_session_id"] = str(tool_kwargs["session_id"])
+                    if tool_kwargs.get("cache_control"):
+                        _tool_log_meta["request_cache_control"] = "ephemeral"
+                    _tool_log_meta = self._enrich_cache_debug_meta(
+                        _tool_log_meta,
+                        workload_policy=workload_policy,
+                        usage=usage,
                     )
+                    self._log_usage(report_pool, model_id, usage, _tool_log_meta)
                     provider_session_id = str(tool_kwargs.get("session_id", "") or "")
                     workload_trace = self.context_economy.build_trace(
                         policy=workload_policy,
@@ -463,6 +504,12 @@ class GatewayLaneMixin:
                         economy=workload_trace.as_dict(),
                     )
                     self.context_economy.record_trace(workload_trace)
+                    if event is not None and hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
+                        event.set_extra(
+                            "astrmai_cached_usage_supported",
+                            bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
+                        )
                     self._record_event_request_trace(
                         event,
                         system_prompt=system_prompt,
@@ -512,20 +559,25 @@ class GatewayLaneMixin:
 
                 self.router.report_success(report_pool, model_id)
                 usage = self._extract_usage(response)
-                self._log_usage(
-                    report_pool,
-                    model_id,
-                    usage,
-                    {
-                        "lane_key": effective_lane_key.as_log_key(),
-                        "conversation_id": conversation_id,
-                        "prefix_hash": workload_policy.effective_prefix_hash,
-                        "provider": capabilities.provider_family,
-                        "workload_family": workload_policy.family.value,
-                        "template_id": workload_policy.template_id,
-                        "template_version": workload_policy.template_version,
-                    },
+                _tool_log_meta = {
+                    "lane_key": effective_lane_key.as_log_key(),
+                    "conversation_id": conversation_id,
+                    "prefix_hash": workload_policy.effective_prefix_hash,
+                    "provider": capabilities.provider_family,
+                    "workload_family": workload_policy.family.value,
+                    "template_id": workload_policy.template_id,
+                    "template_version": workload_policy.template_version,
+                }
+                if tool_kwargs.get("session_id"):
+                    _tool_log_meta["request_session_id"] = str(tool_kwargs["session_id"])
+                if tool_kwargs.get("cache_control"):
+                    _tool_log_meta["request_cache_control"] = "ephemeral"
+                _tool_log_meta = self._enrich_cache_debug_meta(
+                    _tool_log_meta,
+                    workload_policy=workload_policy,
+                    usage=usage,
                 )
+                self._log_usage(report_pool, model_id, usage, _tool_log_meta)
                 provider_session_id = str(tool_kwargs.get("session_id", "") or "")
                 workload_trace = self.context_economy.build_trace(
                     policy=workload_policy,
@@ -546,6 +598,12 @@ class GatewayLaneMixin:
                     economy=workload_trace.as_dict(),
                 )
                 self.context_economy.record_trace(workload_trace)
+                if event is not None and hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
+                    event.set_extra(
+                        "astrmai_cached_usage_supported",
+                        bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
+                    )
                 self._record_event_request_trace(
                     event,
                     system_prompt=system_prompt,

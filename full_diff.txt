@@ -1,0 +1,1694 @@
+diff --git a/astrmai/app/plugin_facade.py b/astrmai/app/plugin_facade.py
+index f7fbe84..bf6f2fb 100644
+--- a/astrmai/app/plugin_facade.py
++++ b/astrmai/app/plugin_facade.py
+@@ -10,9 +10,10 @@ from ..infrastructure.runtime.lane_manager import LaneKey
+ from ..shared.helpers.plugin_helpers import format_model_pool
+ from .lifecycle import PluginLifecycleManager
+ from .runtime_context import PluginRuntimeContext
++from .runtime_facade_protocol import RuntimeFacadeProtocol
+ 
+ 
+-class PluginFacade:
++class PluginFacade(RuntimeFacadeProtocol):
+     def __init__(self, runtime: PluginRuntimeContext):
+         self.runtime = runtime
+         self.lifecycle_manager = PluginLifecycleManager(runtime)
+@@ -72,6 +73,67 @@ class PluginFacade:
+     async def update_user_stats(self, user_id: str) -> None:
+         await self.runtime.state_engine.increment_user_message_count(user_id)
+ 
++    # ── narrow-domain methods for ingress / message_entry ──
++
++    async def handle_group_reply_wait(self, event, scope) -> str:
++        if not event.get_group_id() or not self.runtime.group_reply_wait_manager:
++            return "NONE"
++        group_wait_result = self.runtime.group_reply_wait_manager.handle_incoming_message(event)
++        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
++            if group_wait_result == "RESUME":
++                await self.runtime.chat_loop_kernel.resume_wait(
++                    scope.chat_id,
++                    "group_wait_resumed",
++                    resume_target_id=scope.sender_id,
++                    resume_source="group_reply_wait_manager",
++                )
++            elif group_wait_result == "EXPIRED":
++                await self.runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
++            group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
++            if group_wait_info:
++                await self.runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
++        return group_wait_result
++
++    def is_debug_mode(self) -> bool:
++        return getattr(self.runtime.config.global_settings, "debug_mode", False)
++
++    def track_incoming_user_activity(self, user_id: str) -> None:
++        if user_id and self.runtime.lifecycle.manager:
++            self.runtime.lifecycle.manager.track_task(self.update_user_stats(user_id))
++
++    async def try_consume_reflect_feedback(self, event):
++        if self.runtime.reflect_tracker:
++            return await self.runtime.reflect_tracker.try_consume_feedback(event)
++        return None
++
++    async def record_and_dispatch_attention(self, event, scope) -> str:
++        await self.runtime.evolution.record_user_message(event)
++        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
++            tick_result = await self.runtime.chat_loop_kernel.tick(
++                chat_id=scope.chat_id,
++                trigger="message",
++                event=event,
++            )
++            return tick_result.dispatch_result
++        return await self.runtime.attention_gate.process_event(event)
++
++    def cancel_group_wait_if_interrupted(self, event, group_wait_result, status) -> None:
++        if (
++            event.get_group_id()
++            and self.runtime.group_reply_wait_manager
++            and group_wait_result != "RESUME"
++            and status in {"ENGAGED", "BUFFERED"}
++        ):
++            self.runtime.group_reply_wait_manager.cancel_wait(
++                event.unified_msg_origin,
++                reason=f"interrupted_by_{status.lower()}",
++            )
++
++    def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
++        if status == "ENGAGED" or is_direct_call:
++            return self.runtime.host_bridge.suppress_default_llm(event)
++        return None
++
+     def get_runtime_diagnostics(self) -> dict:
+         diagnostics = self.runtime.build_diagnostics()
+         diagnostics["models"] = {
+diff --git a/astrmai/conversation/ingress/__init__.py b/astrmai/conversation/ingress/__init__.py
+index a3b4496..a0ae766 100644
+--- a/astrmai/conversation/ingress/__init__.py
++++ b/astrmai/conversation/ingress/__init__.py
+@@ -4,6 +4,7 @@ _EXPORTS = {
+     "build_message_signature_text": ".dedupe",
+     "check_message_dedup": ".dedupe",
+     "check_framework_command": ".command_guard",
++    "check_command_access": ".permission_guard",
+     "check_message_scope_access": ".permission_guard",
+     "handle_poke_if_needed": ".poke_handler",
+     "bridge_external_plugin_result": ".external_result_bridge",
+diff --git a/astrmai/conversation/ingress/dedupe.py b/astrmai/conversation/ingress/dedupe.py
+index 3103554..0396562 100644
+--- a/astrmai/conversation/ingress/dedupe.py
++++ b/astrmai/conversation/ingress/dedupe.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import sys
+ import threading
+ import time
+@@ -33,7 +34,7 @@ def check_message_dedup(event, ttl_seconds: float = 1.5) -> IngressDecision:
+             sys._astrmai_global_debounce_cache.pop(key, None)
+ 
+         if fingerprint in sys._astrmai_global_debounce_cache:
+-            logger.warning(f"[AstrMai-Sensor] 极速防抖生效，已拦截 AstrBot 框架双发/分身消息: {msg_str[:15]}")
++            logger.warning(f"[AstrMai-Sensor] 极速防抖生效，已拦截 AstrBot 框架双发/分身消息: sha256={hashlib.sha256(msg_str.encode()).hexdigest()[:8]}")
+             return IngressDecision.stop("duplicate_message")
+ 
+         sys._astrmai_global_debounce_cache[fingerprint] = now
+diff --git a/astrmai/conversation/ingress/external_result_bridge.py b/astrmai/conversation/ingress/external_result_bridge.py
+index a2d41af..513cd32 100644
+--- a/astrmai/conversation/ingress/external_result_bridge.py
++++ b/astrmai/conversation/ingress/external_result_bridge.py
+@@ -32,6 +32,9 @@ async def bridge_external_plugin_result(runtime, event) -> None:
+     if event.get_extra("astrmai_is_self_reply", False):
+         return
+ 
++    if event.get_extra("astrmai_loop_source", "") == "external_result_bridge":
++        return
++
+     reply_text = extract_external_reply_text(event.get_result())
+     if not reply_text:
+         return
+diff --git a/astrmai/conversation/ingress/permission_guard.py b/astrmai/conversation/ingress/permission_guard.py
+index 1bfa98b..a21241e 100644
+--- a/astrmai/conversation/ingress/permission_guard.py
++++ b/astrmai/conversation/ingress/permission_guard.py
+@@ -3,6 +3,11 @@ from __future__ import annotations
+ from ...presentation.dto.message_scope import IngressDecision, MessageScope
+ 
+ 
++def check_command_access(runtime, event) -> IngressDecision:
++    scope = MessageScope.from_event(event)
++    return check_message_scope_access(runtime, scope)
++
++
+ def check_message_scope_access(runtime, scope: MessageScope) -> IngressDecision:
+     whitelist_ids = getattr(runtime.config.global_settings, "whitelist_ids", [])
+     admin_ids = getattr(runtime.config.global_settings, "admin_ids", [])
+diff --git a/astrmai/infrastructure/compat/legacy_compat.py b/astrmai/infrastructure/compat/legacy_compat.py
+index 2d8608e..587b7b3 100644
+--- a/astrmai/infrastructure/compat/legacy_compat.py
++++ b/astrmai/infrastructure/compat/legacy_compat.py
+@@ -1,6 +1,26 @@
++"""Legacy compatibility bridge — **deprecated since v2.0, removal target: v3.0**.
++
++This module serialises typed contract objects (FocusThreadContext, PromptEnvelope,
++VisibleReplyArtifact) into flat ``event.set_extra("astrmai_*", …)`` dicts consumed
++by the host plugin's legacy observer / debug infrastructure.
++
++**Migration path**: each consumer of these extras should migrate to the typed
++contract objects exported by ``astrmai.infrastructure.runtime.runtime_contracts``.
++No new ``astrmai_*`` extra keys should be added here.
++
++Current consumers (locked by architecture regression tests):
++  - ``astrmai/conversation/attention/gate.py``
++  - ``astrmai/conversation/execution/reply_artifact_builder.py``
++  - ``astrmai/conversation/execution/reply_service.py``
++  - ``astrmai/conversation/planning/planner_prompt_context.py``
++  - ``astrmai/conversation/planning/prompt_refiner.py``
++"""
++
+ from __future__ import annotations
+ 
+-from typing import Any, Iterable, Optional
++import functools
++import warnings
++from typing import Any, Callable, Iterable, Optional
+ 
+ from ..runtime.runtime_contracts import (
+     FocusThreadContext,
+@@ -12,6 +32,32 @@ from ..runtime.runtime_contracts import (
+ )
+ 
+ 
++def deprecated(since: str = "", removal: str = "", replacement: str = ""):
++    """Mark a function as deprecated with a runtime warning.
++
++    Usage::
++
++        @deprecated(since="v2.0", removal="v3.0", replacement="Use contracts.X directly")
++        def old_func(...):
++            ...
++    """
++    def decorator(func: Callable):
++        @functools.wraps(func)
++        def wrapper(*args: Any, **kwargs: Any) -> Any:
++            msg = f"{func.__qualname__} is deprecated"
++            if since:
++                msg += f" since {since}"
++            if removal:
++                msg += f" (removal target: {removal})"
++            if replacement:
++                msg += f" — {replacement}"
++            warnings.warn(msg, DeprecationWarning, stacklevel=2)
++            return func(*args, **kwargs)
++        return wrapper
++    return decorator
++
++
++@deprecated(since="v2.0", removal="v3.0", replacement="consume typed FocusThreadContext directly")
+ def emit_legacy_focus_thread_extras(
+     event: Any,
+     focus_context: FocusThreadContext,
+@@ -41,6 +87,7 @@ def emit_legacy_focus_thread_extras(
+         event.set_extra("astrmai_window_events", list(window_events))
+ 
+ 
++@deprecated(since="v2.0", removal="v3.0", replacement="construct FocusThreadContext from contracts directly")
+ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -> FocusThreadContext:
+     focus_event = event.get_extra("astrmai_focus_event", default_event or event)
+     return FocusThreadContext(
+@@ -65,6 +112,7 @@ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -
+     )
+ 
+ 
++@deprecated(since="v2.0", removal="v3.0", replacement="consume typed PromptEnvelope directly")
+ def emit_legacy_prompt_envelope_extras(
+     event: Any,
+     prompt_envelope: PromptEnvelope,
+@@ -102,6 +150,7 @@ def emit_legacy_prompt_envelope_extras(
+     event.set_extra("astrmai_thread_signature", prompt_envelope.thread_signature)
+ 
+ 
++@deprecated(since="v2.0", removal="v3.0", replacement="construct PromptEnvelope from contracts directly")
+ def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelope:
+     raw_user_text = str(event.get_extra("astrmai_raw_user_text", prompt) or prompt).strip()
+     focus_message_text = str(
+@@ -144,6 +193,7 @@ def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelo
+     )
+ 
+ 
++@deprecated(since="v2.0", removal="v3.0", replacement="consume typed VisibleReplyArtifact directly")
+ def emit_legacy_reply_runtime_extras(
+     event: Any,
+     artifact: Optional[VisibleReplyArtifact] = None,
+diff --git a/astrmai/presentation/events/message_entry.py b/astrmai/presentation/events/message_entry.py
+index 859ae14..b42fbd2 100644
+--- a/astrmai/presentation/events/message_entry.py
++++ b/astrmai/presentation/events/message_entry.py
+@@ -42,61 +42,25 @@ async def handle_global_message(runtime: PluginRuntimeContext, facade, event):
+         debug_trace(event, "ingress.stop", reason="self_message")
+         return
+ 
+-    group_wait_result = "NONE"
+-    if event.get_group_id() and runtime.group_reply_wait_manager:
+-        group_wait_result = runtime.group_reply_wait_manager.handle_incoming_message(event)
+-        if getattr(runtime, "chat_loop_kernel", None) is not None:
+-            if group_wait_result == "RESUME":
+-                await runtime.chat_loop_kernel.resume_wait(
+-                    scope.chat_id,
+-                    "group_wait_resumed",
+-                    resume_target_id=scope.sender_id,
+-                    resume_source="group_reply_wait_manager",
+-                )
+-            elif group_wait_result == "EXPIRED":
+-                await runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
+-            group_wait_info = runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
+-            if group_wait_info:
+-                await runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
+-
+-    if getattr(runtime.config.global_settings, "debug_mode", False):
++    group_wait_result = await facade.handle_group_reply_wait(event, scope)
++
++    if facade.is_debug_mode():
+         sender_name = event.get_sender_name()
+         logger.info(f"[AstrMai-Sensor] 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
+ 
+-    user_id = event.get_sender_id()
+-    if user_id and runtime.lifecycle.manager:
+-        runtime.lifecycle.manager.track_task(facade.update_user_stats(user_id))
+-
+-    if runtime.reflect_tracker:
+-        review_feedback = await runtime.reflect_tracker.try_consume_feedback(event)
+-        if review_feedback:
+-            yield event.plain_result(review_feedback)
+-            return
+-
+-    await runtime.evolution.record_user_message(event)
+-    if getattr(runtime, "chat_loop_kernel", None) is not None:
+-        tick_result = await runtime.chat_loop_kernel.tick(
+-            chat_id=scope.chat_id,
+-            trigger="message",
+-            event=event,
+-        )
+-        status = tick_result.dispatch_result
+-    else:
+-        status = await runtime.attention_gate.process_event(event)
++    facade.track_incoming_user_activity(event.get_sender_id())
++
++    review_feedback = await facade.try_consume_reflect_feedback(event)
++    if review_feedback:
++        yield event.plain_result(review_feedback)
++        return
++
++    status = await facade.record_and_dispatch_attention(event, scope)
+     is_direct_call = is_direct_call_event(event)
+     debug_trace(event, "ingress.after_attention", status=status, direct_call=is_direct_call)
+ 
+-    if (
+-        event.get_group_id()
+-        and runtime.group_reply_wait_manager
+-        and group_wait_result != "RESUME"
+-        and status in {"ENGAGED", "BUFFERED"}
+-    ):
+-        runtime.group_reply_wait_manager.cancel_wait(
+-            event.unified_msg_origin,
+-            reason=f"interrupted_by_{status.lower()}",
+-        )
+-
+-    if status == "ENGAGED" or is_direct_call:
+-        ghost_message = runtime.host_bridge.suppress_default_llm(event)
++    facade.cancel_group_wait_if_interrupted(event, group_wait_result, status)
++
++    ghost_message = facade.suppress_default_llm_if_engaged(event, status, is_direct_call)
++    if ghost_message is not None:
+         yield event.plain_result(ghost_message)
+diff --git a/astrmai/webui/backend/adapters/plugin_api.py b/astrmai/webui/backend/adapters/plugin_api.py
+index a865a90..8e7eca3 100644
+--- a/astrmai/webui/backend/adapters/plugin_api.py
++++ b/astrmai/webui/backend/adapters/plugin_api.py
+@@ -1,11 +1,14 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import os
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any
+ 
++_logger = logging.getLogger(__name__)
++
+ from ..paths import default_config_path, default_persona_cache_path, default_schema_path
+ 
+ ACTIVE_FACADE: Any = None
+@@ -38,6 +41,8 @@ class PluginApiAdapter:
+         if self.facade is None:
+             self.facade = get_active_facade()
+ 
++    # ── internal helpers ────────────────────────────────────────────
++
+     def _read_json(self, path: str) -> dict[str, Any]:
+         if not os.path.exists(path):
+             return {}
+@@ -83,6 +88,126 @@ class PluginApiAdapter:
+         os.replace(temp_path, path)
+         return backup_path
+ 
++    def _get_runtime(self) -> Any:
++        """Internal: access runtime through facade.  Prefer the narrow
++        facade accessors below — this method exists only for callers that
++        genuinely need the full runtime object (e.g. migration shims)."""
++        return getattr(self.facade, "runtime", None) if self.facade else None
++
++    # ── narrow facade accessors (preferred over _get_runtime) ───────
++
++    def get_planner(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "system2_planner", None) if runtime else None
++
++    def get_gateway(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "gateway", None) if runtime else None
++
++    def get_proactive_task(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "proactive_task", None) if runtime else None
++
++    def get_observability_hub(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "observability_hub", None) if runtime else None
++
++    def get_memory_engine(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "memory_engine", None) if runtime else None
++
++    def get_runtime_coordinator(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "runtime_coordinator", None) if runtime else None
++
++    def get_reflector(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "reflector", None) if runtime else None
++
++    def get_runtime_config(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "config", None) if runtime else None
++
++    def get_persona_summarizer(self) -> Any:
++        runtime = self._get_runtime()
++        return getattr(runtime, "persona_summarizer", None) if runtime else None
++
++    def get_chat_loop_kernel(self) -> Any:
++        runtime = self._get_runtime()
++        if runtime and getattr(runtime, "chat_loop_kernel", None) is not None:
++            return getattr(runtime, "chat_loop_kernel", None)
++        task = self.get_proactive_task()
++        return getattr(task, "chat_loop_kernel", None) if task else None
++
++    def get_heartflow_manager(self) -> Any:
++        task = self.get_proactive_task()
++        return getattr(task, "heartflow_manager", None) if task else None
++
++    def get_heartflow_topic_digest_service(self) -> Any:
++        task = self.get_proactive_task()
++        return getattr(task, "heartflow_topic_digest_service", None) if task else None
++
++
++    # ── memory sub-component accessors ────────────────────────────
++
++    def _memory_sub(self, attr: str) -> Any:
++        engine = self.get_memory_engine()
++        return getattr(engine, attr, None) if engine else None
++
++    def get_v2_store(self) -> Any:
++        return self._memory_sub("v2_store")
++
++    def get_memory_observer(self) -> Any:
++        return self._memory_sub("memory_observer")
++
++    def get_memory_pipeline(self) -> Any:
++        return self._memory_sub("memory_pipeline")
++
++    def get_maintenance_service(self) -> Any:
++        return self._memory_sub("maintenance_service")
++
++    def get_migration_service(self) -> Any:
++        return self._memory_sub("migration_service")
++
++    def get_index_projector(self) -> Any:
++        return self._memory_sub("index_projector")
++
++    def get_write_service(self) -> Any:
++        return self._memory_sub("write_service")
++
++    def get_session_summarizer(self) -> Any:
++        return self._memory_sub("session_summarizer")
++
++    def get_instant_gate(self) -> Any:
++        return self._memory_sub("instant_gate")
++
++    # ── safe wrappers for private/internal access ──────────────────
++
++    def candidate_to_dict(self, candidate: Any) -> dict[str, Any]:
++        """安全包装 store._candidate_to_dict，避免私有方法穿透"""
++        store = self.get_v2_store()
++        if store and hasattr(store, "_candidate_to_dict"):
++            return store._candidate_to_dict(candidate)
++        return dict(candidate) if hasattr(candidate, "__dict__") else {}
++
++    def format_timeline_item(self, item: Any) -> Any:
++        """安全包装 observer.format_timeline_item"""
++        observer = self.get_memory_observer()
++        if observer:
++            formatter = getattr(observer, "format_timeline_item", None)
++            if callable(formatter):
++                return formatter(item)
++        return item
++
++    def get_expression_pattern_service(self) -> Any:
++        """安全获取 expression_pattern_service"""
++        engine = self.get_memory_engine()
++        if engine:
++            return getattr(engine, "expression_pattern_service", None)
++        return None
++
++    # ── public API ──────────────────────────────────────────────────
++
+     async def get_runtime_diagnostics(self) -> dict[str, Any]:
+         if self.facade:
+             return self.facade.get_runtime_diagnostics()
+@@ -149,6 +274,36 @@ class PluginApiAdapter:
+         )
+         return any(any(key.startswith(prefix) for prefix in reload_prefixes) for key in changed_keys)
+ 
++    def _apply_hot_config(self, config_dict: dict[str, Any], parsed_config: Any) -> bool:
++        """Apply config to bound runtime via facade.  Returns True if applied.
++
++        **Hot-config contract for new services**:
++        The preferred path is ``facade.apply_hot_config(config_dict, parsed_config)``.
++        When adding a new runtime service that needs live config updates, implement
++        ``apply_hot_config`` on the service class itself (or on PluginFacade as a
++        dispatcher) rather than adding if-blocks to a central ``_refresh_live_config_refs``.
++        The old centralized method has been removed; each service owns its config refresh.
++
++        The fallback path below (direct ``runtime.raw_config`` / ``runtime.config`` mutation)
++        exists only for backward compatibility and should NOT be extended.
++        """
++        if not self.facade:
++            return False
++        if hasattr(self.facade, "apply_hot_config"):
++            return bool(self.facade.apply_hot_config(config_dict, parsed_config))
++        runtime = self._get_runtime()
++        if runtime is None:
++            return False
++        _logger.warning(
++            "_apply_hot_config: facade.apply_hot_config unavailable, "
++            "falling back to direct runtime mutation — this bypasses the facade barrier."
++        )
++        runtime.raw_config = dict(config_dict)
++        runtime.config = parsed_config
++        if hasattr(runtime, "rebuild_infrastructure_settings"):
++            runtime.rebuild_infrastructure_settings()
++        return True
++
+     async def apply_config(self, data: dict[str, Any] | None = None, changed_keys: set[str] | None = None) -> dict[str, Any]:
+         global APPLY_STATUS
+         config_data = data if data is not None else await self.read_config()
+@@ -168,13 +323,8 @@ class PluginApiAdapter:
+ 
+         reload_required = self._requires_reload(changed_keys or set())
+         runtime_bound = False
+-        if self.facade and getattr(self.facade, "runtime", None):
+-            runtime = self.facade.runtime
+-            runtime.raw_config = dict(config_data)
+-            runtime.config = parsed_config
+-            if hasattr(runtime, "rebuild_infrastructure_settings"):
+-                runtime.rebuild_infrastructure_settings()
+-            runtime_bound = True
++        if not reload_required:
++            runtime_bound = self._apply_hot_config(config_data, parsed_config)
+ 
+         APPLY_STATUS = {
+             "applied_at": time.time(),
+@@ -188,9 +338,6 @@ class PluginApiAdapter:
+     async def get_apply_status(self) -> dict[str, Any]:
+         return dict(APPLY_STATUS)
+ 
+-    def get_runtime(self) -> Any:
+-        return getattr(self.facade, "runtime", None) if self.facade else None
+-
+     async def read_persona_cache(self) -> dict[str, Any]:
+         return self._read_json(self.persona_cache_path)
+ 
+@@ -202,4 +349,8 @@ class PluginApiAdapter:
+         return config.get("global_settings", {}).get("webui_password", "astrmai_admin")
+ 
+ 
+-__all__ = ["PluginApiAdapter", "get_active_facade", "set_active_facade"]
++__all__ = [
++    "PluginApiAdapter",
++    "get_active_facade",
++    "set_active_facade",
++]
+diff --git a/astrmai/webui/backend/auth.py b/astrmai/webui/backend/auth.py
+index 1881e11..1f50303 100644
+--- a/astrmai/webui/backend/auth.py
++++ b/astrmai/webui/backend/auth.py
+@@ -1,23 +1,67 @@
++from __future__ import annotations
++
++import logging
++import os
++import secrets
++import sys
+ from datetime import datetime, timedelta
+-from typing import Optional
+-from jose import jwt, JWTError
+-from fastapi import HTTPException, Header
++from typing import Any, Optional
+ 
+-from .adapters.plugin_api import PluginApiAdapter
++from fastapi import HTTPException, Header
++from jose import JWTError, jwt
+ 
+ ALGORITHM = "HS256"
+ 
++_SECRET_KEY: str | None = None
++
+ 
+ def get_secret_key() -> str:
+-    import os
++    global _SECRET_KEY
++    if _SECRET_KEY is not None:
++        return _SECRET_KEY
++    _SECRET_KEY = os.getenv("ASTRMAI_WEBUI_SECRET", "")
++    if not _SECRET_KEY:
++        _SECRET_KEY = secrets.token_hex(32)
++        print(
++            "[astrmai-webui] WARNING: ASTRMAI_WEBUI_SECRET not set — "
++            "generated a random key for this session. "
++            "All previously issued tokens are now invalid. "
++            "Set ASTRMAI_WEBUI_SECRET in the environment for persistent keys.",
++            file=sys.stderr,
++        )
++    return _SECRET_KEY
++
++
++_password_adapter_factory: Any | None = None
++
++
++def set_password_adapter_factory(factory: Any) -> None:
++    """Inject a callable that returns an adapter with get_webui_password()."""
++    global _password_adapter_factory
++    _password_adapter_factory = factory
++
++
++def _default_password_adapter():
++    from .adapters.plugin_api import PluginApiAdapter, get_active_facade
++    facade = get_active_facade()
++    if facade is None:
++        logger = logging.getLogger(__name__)
++        logger.warning("auth: no active facade, password auth unavailable")
++        return None
++    return PluginApiAdapter(facade=facade)
+ 
+-    return os.getenv("ASTRMAI_WEBUI_SECRET", "super-secret-default-key")
+ 
+-def get_astrmai_password() -> str:
++def get_astrmai_password(adapter: Any | None = None) -> str:
++    if adapter is not None:
++        try:
++            return adapter.get_webui_password()
++        except Exception as exc:
++            print(f"Failed to read webui password from adapter: {exc}", file=sys.stderr)
+     try:
+-        return PluginApiAdapter().get_webui_password()
+-    except Exception as e:
+-        print(f"Failed to read webui password from config: {e}")
++        factory = _password_adapter_factory or _default_password_adapter
++        return factory().get_webui_password()
++    except Exception as exc:
++        print(f"Failed to read webui password from config: {exc}", file=sys.stderr)
+     return "astrmai_admin"
+ 
+ def create_token(sub: str, expire_hours: int = 24) -> str:
+diff --git a/astrmai/webui/backend/routes/chats_routes.py b/astrmai/webui/backend/routes/chats_routes.py
+index 600010d..1dde4eb 100644
+--- a/astrmai/webui/backend/routes/chats_routes.py
++++ b/astrmai/webui/backend/routes/chats_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.chatruntimeservice import ChatRuntimeService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> ChatRuntimeService:
++    return ChatRuntimeService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("/active")
+diff --git a/astrmai/webui/backend/routes/cognition_routes.py b/astrmai/webui/backend/routes/cognition_routes.py
+index db8ffde..f557624 100644
+--- a/astrmai/webui/backend/routes/cognition_routes.py
++++ b/astrmai/webui/backend/routes/cognition_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.cognitionservice import CognitionService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> CognitionService:
++    return CognitionService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("/recent-decisions")
+diff --git a/astrmai/webui/backend/routes/heartflow_routes.py b/astrmai/webui/backend/routes/heartflow_routes.py
+index 4b39423..94b8b32 100644
+--- a/astrmai/webui/backend/routes/heartflow_routes.py
++++ b/astrmai/webui/backend/routes/heartflow_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.heartflowservice import HeartflowService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> HeartflowService:
++    return HeartflowService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("/status")
+diff --git a/astrmai/webui/backend/routes/learning_routes.py b/astrmai/webui/backend/routes/learning_routes.py
+index d5109bf..0101195 100644
+--- a/astrmai/webui/backend/routes/learning_routes.py
++++ b/astrmai/webui/backend/routes/learning_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends, HTTPException
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.learningservice import LearningService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> LearningService:
++    return LearningService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("/status")
+diff --git a/astrmai/webui/backend/routes/memory_feedback_routes.py b/astrmai/webui/backend/routes/memory_feedback_routes.py
+index d6f5ce6..d92f897 100644
+--- a/astrmai/webui/backend/routes/memory_feedback_routes.py
++++ b/astrmai/webui/backend/routes/memory_feedback_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.chatruntimeservice import ChatRuntimeService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> ChatRuntimeService:
++    return ChatRuntimeService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("")
+diff --git a/astrmai/webui/backend/routes/proactive_routes.py b/astrmai/webui/backend/routes/proactive_routes.py
+index 5198d0c..7ab437a 100644
+--- a/astrmai/webui/backend/routes/proactive_routes.py
++++ b/astrmai/webui/backend/routes/proactive_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends, HTTPException
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.chatruntimeservice import ChatRuntimeService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> ChatRuntimeService:
++    return ChatRuntimeService(PluginApiAdapter(), get_db)
+ 
+ 
+ def _raise_if_error(result: dict):
+diff --git a/astrmai/webui/backend/routes/runtime_routes.py b/astrmai/webui/backend/routes/runtime_routes.py
+index 9bea66a..444860c 100644
+--- a/astrmai/webui/backend/routes/runtime_routes.py
++++ b/astrmai/webui/backend/routes/runtime_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.observabilityservice import ObservabilityService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> ObservabilityService:
++    return ObservabilityService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("/status")
+diff --git a/astrmai/webui/backend/routes/tools_routes.py b/astrmai/webui/backend/routes/tools_routes.py
+index 2a70017..c8ab10d 100644
+--- a/astrmai/webui/backend/routes/tools_routes.py
++++ b/astrmai/webui/backend/routes/tools_routes.py
+@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..auth import get_current_user
+ from ..db import get_db
+-from ..services.admin_ui_service import AdminUiService
++from ..services.toolsservice import ToolsService
+ 
+ router = APIRouter()
+ 
+ 
+-def _service() -> AdminUiService:
+-    return AdminUiService(PluginApiAdapter(), get_db)
++def _service() -> ToolsService:
++    return ToolsService(PluginApiAdapter(), get_db)
+ 
+ 
+ @router.get("/status")
+diff --git a/astrmai/webui/backend/services/admin_ui_service.py b/astrmai/webui/backend/services/admin_ui_service.py
+index d48665e..53096b1 100644
+--- a/astrmai/webui/backend/services/admin_ui_service.py
++++ b/astrmai/webui/backend/services/admin_ui_service.py
+@@ -43,7 +43,7 @@ class AdminUiService:
+         self.db_factory = db_factory
+ 
+     def _runtime(self) -> Any:
+-        return self.plugin_api.get_runtime()
++        return self.plugin_api._get_runtime()
+ 
+     @staticmethod
+     def _as_dict(value: Any) -> dict[str, Any]:
+@@ -189,9 +189,7 @@ class AdminUiService:
+             if observer is not None and hasattr(observer, "recent_errors")
+             else []
+         )
+-        formatter = getattr(observer, "format_timeline_item", None) if observer is not None else None
+-        if callable(formatter):
+-            recent_errors = [formatter(item) for item in list(recent_errors or [])]
++        recent_errors = [self.plugin_api.format_timeline_item(item) for item in list(recent_errors or [])]
+         return {
+             "status": "ok",
+             "data": {
+@@ -227,7 +225,6 @@ class AdminUiService:
+         engine = getattr(runtime, "memory_engine", None) if runtime else None
+         observer = getattr(engine, "memory_observer", None) if engine else None
+         items: list[dict[str, Any]] = []
+-        formatter = getattr(observer, "format_timeline_item", None) if observer is not None else None
+         if observer is not None and hasattr(observer, "recent_events"):
+             items = await observer.recent_events(chat_id=chat_id, component=component, level=level, limit=limit)
+         else:
+@@ -253,8 +250,7 @@ class AdminUiService:
+                     ]
+                 except Exception:
+                     items = []
+-        if callable(formatter):
+-            items = [formatter(item) for item in list(items or [])]
++        items = [self.plugin_api.format_timeline_item(item) for item in list(items or [])]
+         return {"status": "ok", "items": list(items or []), "total": len(items), "runtime_bound": engine is not None}
+ 
+     async def memory_observability_chat(self, chat_id: str) -> dict[str, Any]:
+@@ -298,9 +294,7 @@ class AdminUiService:
+             if observer is not None and hasattr(observer, "recent_errors")
+             else []
+         )
+-        formatter = getattr(observer, "format_timeline_item", None) if observer is not None else None
+-        if callable(formatter):
+-            items = [formatter(item) for item in list(items or [])]
++        items = [self.plugin_api.format_timeline_item(item) for item in list(items or [])]
+         return {"status": "ok", "items": list(items or []), "total": len(items), "runtime_bound": engine is not None}
+ 
+     async def observability_timeline(
+@@ -644,7 +638,14 @@ class AdminUiService:
+         if not manager:
+             return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
+         states = []
+-        for chat_id, state in getattr(manager, "_states", {}).items():
++        states_dict = getattr(manager, "get_all_states", None)
++        if callable(states_dict):
++            try:
++                states_dict = states_dict()
++            except Exception:
++                states_dict = {}
++        manager_states = states_dict if isinstance(states_dict, dict) else getattr(manager, "_states", {})
++        for chat_id, state in manager_states.items():
+             item = self._as_dict(state)
+             item["chat_id"] = chat_id
+             if hasattr(manager, "get_session"):
+diff --git a/astrmai/webui/backend/services/dashboard_service.py b/astrmai/webui/backend/services/dashboard_service.py
+index 0e18095..82ef366 100644
+--- a/astrmai/webui/backend/services/dashboard_service.py
++++ b/astrmai/webui/backend/services/dashboard_service.py
+@@ -1,71 +1,32 @@
+ from __future__ import annotations
+ 
+-import json
+ import os
+-import psutil
+-import sqlite3
+ from typing import Callable
+ 
++import psutil
++
+ from ..adapters.plugin_api import PluginApiAdapter
+ from ..paths import default_db_path
++from .dashboard_repository import DashboardRepository
+ 
+ 
+ class DashboardService:
+     def __init__(self, plugin_api: PluginApiAdapter, db_factory: Callable):
+         self.plugin_api = plugin_api
+-        self.db_factory = db_factory
+-
+-    async def _count_pending_expression_reviews(self, db) -> int:
+-        async with db.execute(
+-            """
+-            SELECT status, metadata
+-            FROM canonical_memories
+-            WHERE kind = 'expression_pattern'
+-            """
+-        ) as cursor:
+-            rows = await cursor.fetchall()
+-        count = 0
+-        for row in rows:
+-            status = str(row[0] or "").strip().lower()
+-            try:
+-                metadata = json.loads(row[1] or "{}")
+-            except Exception:
+-                metadata = {}
+-            review_status = str((metadata or {}).get("review_status") or "").strip().lower()
+-            if status == "review_pending" or review_status in {"pending", "revision_needed", "pending_human"}:
+-                count += 1
+-        return count
++        self._repo = DashboardRepository(db_factory)
+ 
+     async def get_snapshot(self) -> dict:
+         db_path = default_db_path()
+-        stats = {
++        counts = await self._repo.snapshot_counts()
++        return {
+             "db_size_kb": round((os.path.getsize(db_path) if os.path.exists(db_path) else 0) / 1024, 2),
+             "webui_mem_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 2),
+             "sys_cpu_percent": psutil.cpu_percent(interval=0.1),
+             "sys_mem_percent": psutil.virtual_memory().percent,
+-            "total_users": 0,
+-            "pending_reviews": 0,
+-            "total_memory_events": 0,
+-            "total_canonical_memories": 0,
+             "diagnostics": await self.plugin_api.get_runtime_diagnostics(),
+             "capabilities": await self.plugin_api.get_capability_overview(),
++            **counts,
+         }
+-        try:
+-            async with self.db_factory() as db:
+-                async with db.execute("SELECT COUNT(*) FROM UserProfile") as cursor:
+-                    stats["total_users"] = (await cursor.fetchone())[0]
+-                async with db.execute("SELECT COUNT(*) FROM MemoryEvent") as cursor:
+-                    stats["total_memory_events"] = (await cursor.fetchone())[0]
+-                try:
+-                    async with db.execute("SELECT COUNT(*) FROM canonical_memories") as cursor:
+-                        stats["total_canonical_memories"] = (await cursor.fetchone())[0]
+-                    stats["pending_reviews"] = await self._count_pending_expression_reviews(db)
+-                except sqlite3.OperationalError:
+-                    stats["total_canonical_memories"] = 0
+-                    stats["pending_reviews"] = 0
+-        except sqlite3.OperationalError:
+-            pass
+-        return stats
+ 
+ 
+ __all__ = ["DashboardService"]
+diff --git a/astrmai/webui/backend/services/memory_ui_service.py b/astrmai/webui/backend/services/memory_ui_service.py
+index ed09511..3fd77e0 100644
+--- a/astrmai/webui/backend/services/memory_ui_service.py
++++ b/astrmai/webui/backend/services/memory_ui_service.py
+@@ -14,20 +14,19 @@ class MemoryUiService:
+         self.plugin_api = plugin_api
+ 
+     def _memory_engine(self):
+-        runtime = self.plugin_api.get_runtime() if self.plugin_api else None
+-        return getattr(runtime, "memory_engine", None) if runtime else None
++        return self.plugin_api.get_memory_engine() if self.plugin_api else None
+ 
+     async def runtime_status(self) -> dict[str, object]:
+         engine = self._memory_engine()
+-        instant_gate = getattr(engine, "instant_gate", None) if engine else None
+-        memory_pipeline = getattr(engine, "memory_pipeline", None) if engine else None
+-        session_summarizer = getattr(engine, "session_summarizer", None) if engine else None
++        instant_gate = self.plugin_api.get_instant_gate() if self.plugin_api else None
++        memory_pipeline = self.plugin_api.get_memory_pipeline() if self.plugin_api else None
++        session_summarizer = self.plugin_api.get_session_summarizer() if self.plugin_api else None
+         pipeline_status = (
+             memory_pipeline.describe_runtime_status()
+             if memory_pipeline is not None and hasattr(memory_pipeline, "describe_runtime_status")
+             else {}
+         )
+-        observer = getattr(engine, "memory_observer", None) if engine else None
++        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
+         observer_snapshot = (
+             await observer.runtime_snapshot(
+                 instant_gate_ready=bool(instant_gate is not None),
+@@ -50,8 +49,8 @@ class MemoryUiService:
+ 
+     async def chat_buffer_status(self, chat_id: str) -> dict[str, object]:
+         engine = self._memory_engine()
+-        memory_pipeline = getattr(engine, "memory_pipeline", None) if engine else None
+-        observer = getattr(engine, "memory_observer", None) if engine else None
++        memory_pipeline = self.plugin_api.get_memory_pipeline() if self.plugin_api else None
++        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
+         if memory_pipeline is not None and hasattr(memory_pipeline, "describe_chat_buffer"):
+             data = memory_pipeline.describe_chat_buffer(chat_id)
+             if observer is not None and hasattr(observer, "chat_snapshot"):
+@@ -94,7 +93,7 @@ class MemoryUiService:
+         limit: int = 50,
+     ) -> dict[str, object]:
+         engine = self._memory_engine()
+-        observer = getattr(engine, "memory_observer", None) if engine else None
++        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
+         if observer is not None and hasattr(observer, "recent_events"):
+             items = await observer.recent_events(
+                 chat_id=str(chat_id or "") or None,
+@@ -102,20 +101,16 @@ class MemoryUiService:
+                 level=str(level or ""),
+                 limit=limit,
+             )
+-            formatter = getattr(observer, "format_timeline_item", None)
+-            if callable(formatter):
+-                items = [formatter(item) for item in list(items or [])]
++            items = [self.plugin_api.format_timeline_item(item) for item in list(items or [])]
+             return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
+         return {"status": "ok", "runtime_bound": False, "items": []}
+ 
+     async def observability_errors(self, *, chat_id: str = "", limit: int = 50) -> dict[str, object]:
+         engine = self._memory_engine()
+-        observer = getattr(engine, "memory_observer", None) if engine else None
++        observer = self.plugin_api.get_memory_observer() if self.plugin_api else None
+         if observer is not None and hasattr(observer, "recent_errors"):
+             items = await observer.recent_errors(chat_id=str(chat_id or "") or None, limit=limit)
+-            formatter = getattr(observer, "format_timeline_item", None)
+-            if callable(formatter):
+-                items = [formatter(item) for item in list(items or [])]
++            items = [self.plugin_api.format_timeline_item(item) for item in list(items or [])]
+             return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
+         return {"status": "ok", "runtime_bound": False, "items": []}
+ 
+@@ -199,7 +194,7 @@ class MemoryUiService:
+         offset: int = 0,
+     ) -> dict:
+         engine = self._memory_engine()
+-        store = getattr(engine, "v2_store", None) if engine else None
++        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+         if store and hasattr(store, "list_canonical"):
+             result = await store.list_canonical(
+                 session_id=session_id,
+@@ -245,12 +240,12 @@ class MemoryUiService:
+ 
+     async def get_canonical(self, memory_id: str) -> dict:
+         engine = self._memory_engine()
+-        store = getattr(engine, "v2_store", None) if engine else None
++        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+         if store and hasattr(store, "get_canonical"):
+             item = await store.get_canonical(memory_id, include_inactive=True)
+             if not item:
+                 return {"status": "not_found", "data": None, "runtime_bound": True}
+-            return {"status": "ok", "data": store._candidate_to_dict(item), "runtime_bound": True}
++            return {"status": "ok", "data": self.plugin_api.candidate_to_dict(item), "runtime_bound": True}
+         async with self.db_factory() as db:
+             try:
+                 async with db.execute("SELECT * FROM canonical_memories WHERE id = ?", (memory_id,)) as cursor:
+@@ -265,7 +260,7 @@ class MemoryUiService:
+ 
+     async def delete_canonical(self, memory_id: str) -> dict:
+         engine = self._memory_engine()
+-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
++        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+         if maintenance and hasattr(maintenance, "soft_delete"):
+             changed = await maintenance.soft_delete(memory_id, reason="webui")
+             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
+@@ -286,7 +281,7 @@ class MemoryUiService:
+ 
+     async def restore_canonical(self, memory_id: str) -> dict:
+         engine = self._memory_engine()
+-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
++        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+         if maintenance and hasattr(maintenance, "restore"):
+             changed = await maintenance.restore(memory_id, reason="webui")
+             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
+@@ -307,7 +302,7 @@ class MemoryUiService:
+ 
+     async def mark_canonical_stale(self, memory_id: str) -> dict:
+         engine = self._memory_engine()
+-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
++        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+         if maintenance and hasattr(maintenance, "mark_stale"):
+             changed = await maintenance.mark_stale(memory_id, reason="webui")
+             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
+@@ -330,7 +325,7 @@ class MemoryUiService:
+         if not target_id:
+             return {"status": "error", "message": "target_id required", "changed": False}
+         engine = self._memory_engine()
+-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
++        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+         if maintenance and hasattr(maintenance, "mark_merged"):
+             changed = await maintenance.mark_merged([memory_id], superseded_by=target_id)
+             return {"status": "ok", "changed": bool(changed), "runtime_bound": True}
+@@ -393,52 +388,52 @@ class MemoryUiService:
+ 
+     async def migration_report(self) -> dict:
+         engine = self._memory_engine()
+-        migration = getattr(engine, "migration_service", None) if engine else None
++        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
+         if migration and hasattr(migration, "latest_report"):
+             return {"status": "ok", "runtime_bound": True, "data": await migration.latest_report()}
+-        store = getattr(engine, "v2_store", None) if engine else None
++        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+         if store and hasattr(store, "migration_report"):
+             return {"status": "ok", "runtime_bound": True, "data": await store.migration_report()}
+         return {"status": "ok", "runtime_bound": False, "data": {}}
+ 
+     async def migration_dry_run(self, sources: list[str] | None = None) -> dict:
+         engine = self._memory_engine()
+-        migration = getattr(engine, "migration_service", None) if engine else None
++        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
+         if not migration:
+             return {"status": "ok", "runtime_bound": False, "data": {}}
+         return {"status": "ok", "runtime_bound": True, "data": await migration.dry_run(import_sources=sources)}
+ 
+     async def migration_execute(self, sources: list[str] | None = None) -> dict:
+         engine = self._memory_engine()
+-        migration = getattr(engine, "migration_service", None) if engine else None
++        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
+         if not migration:
+             return {"status": "ok", "runtime_bound": False, "data": {}}
+         return {"status": "ok", "runtime_bound": True, "data": await migration.execute(import_sources=sources)}
+ 
+     async def migration_verify(self) -> dict:
+         engine = self._memory_engine()
+-        migration = getattr(engine, "migration_service", None) if engine else None
++        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
+         if not migration:
+             return {"status": "ok", "runtime_bound": False, "data": {}}
+         return {"status": "ok", "runtime_bound": True, "data": await migration.verify()}
+ 
+     async def migration_repair(self, report: dict | None = None) -> dict:
+         engine = self._memory_engine()
+-        migration = getattr(engine, "migration_service", None) if engine else None
++        migration = self.plugin_api.get_migration_service() if self.plugin_api else None
+         if not migration:
+             return {"status": "ok", "runtime_bound": False, "data": {}}
+         return {"status": "ok", "runtime_bound": True, "data": await migration.repair(report)}
+ 
+     async def index_status(self) -> dict:
+         engine = self._memory_engine()
+-        projector = getattr(engine, "index_projector", None) if engine else None
++        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+         if projector and hasattr(projector, "check_consistency"):
+             return {"status": "ok", "runtime_bound": True, "data": await projector.check_consistency()}
+         return {"status": "ok", "runtime_bound": False, "data": {}}
+ 
+     async def rebuild_index(self, session_id: str = "") -> dict:
+         engine = self._memory_engine()
+-        projector = getattr(engine, "index_projector", None) if engine else None
++        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+         if not projector:
+             return {"status": "ok", "changed": False, "runtime_bound": False, "rebuilt": 0}
+         rebuilt = await (projector.rebuild_session(session_id) if session_id else projector.rebuild_all())
+@@ -446,7 +441,7 @@ class MemoryUiService:
+ 
+     async def repair_index(self) -> dict:
+         engine = self._memory_engine()
+-        projector = getattr(engine, "index_projector", None) if engine else None
++        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+         if not projector:
+             return {"status": "ok", "changed": False, "runtime_bound": False, "data": {}}
+         data = await projector.repair_consistency()
+@@ -454,7 +449,7 @@ class MemoryUiService:
+ 
+     async def run_maintenance(self, policy: dict | None = None) -> dict:
+         engine = self._memory_engine()
+-        maintenance = getattr(engine, "maintenance_service", None) if engine else None
++        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+         if not maintenance or not hasattr(maintenance, "run_once"):
+             return {"status": "ok", "runtime_bound": False, "data": {}}
+         return {"status": "ok", "runtime_bound": True, "data": await maintenance.run_once(policy=policy or {})}
+@@ -476,7 +471,7 @@ class MemoryUiService:
+ 
+     async def list_jargon(self, *, status: str = "", group_id: str = "", query: str = ""):
+         engine = self._memory_engine()
+-        store = getattr(engine, "v2_store", None) if engine else None
++        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+         if store and hasattr(store, "list_canonical"):
+             result = await store.list_canonical(kind="jargon", status=status, session_id=group_id, limit=200)
+             items = [self._canonical_jargon_view(item) for item in result.get("items", [])]
+@@ -558,7 +553,7 @@ class MemoryUiService:
+             source_ref=f"webui_legacy_event:{event_id}",
+         )
+         engine = self._memory_engine()
+-        writer = getattr(engine, "write_service", None) if engine else None
++        writer = self.plugin_api.get_write_service() if self.plugin_api else None
+         if writer and hasattr(writer, "write"):
+             canonical_id = await writer.write(request)
+             return {
+@@ -759,7 +754,7 @@ class MemoryUiService:
+             status=status,
+         )
+         engine = self._memory_engine()
+-        writer = getattr(engine, "write_service", None) if engine else None
++        writer = self.plugin_api.get_write_service() if self.plugin_api else None
+         if writer and hasattr(writer, "write"):
+             memory_id = await writer.write(request)
+             return {"status": "ok", "id": memory_id, "canonical_id": memory_id, "legacy": False}
+@@ -799,8 +794,8 @@ class MemoryUiService:
+     async def update_jargon(self, jargon_id: str, data: dict) -> dict[str, str]:
+         now = time.time()
+         engine = self._memory_engine()
+-        store = getattr(engine, "v2_store", None) if engine else None
+-        projector = getattr(engine, "index_projector", None) if engine else None
++        store = self.plugin_api.get_v2_store() if self.plugin_api else None
++        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+         current = await store.get_canonical(str(jargon_id), include_inactive=True) if store and hasattr(store, "get_canonical") else None
+         metadata = dict(getattr(current, "metadata", {}) or {})
+         if not metadata:
+diff --git a/astrmai/webui/backend/services/persona_ui_service.py b/astrmai/webui/backend/services/persona_ui_service.py
+index badb47e..adbc9a8 100644
+--- a/astrmai/webui/backend/services/persona_ui_service.py
++++ b/astrmai/webui/backend/services/persona_ui_service.py
+@@ -22,7 +22,7 @@ class PersonaUiService:
+ 
+     async def get_persona_slices(self) -> dict[str, Any]:
+         cache = await self.plugin_api.read_persona_cache()
+-        runtime = self.plugin_api.get_runtime()
++        runtime = self.plugin_api._get_runtime()
+         persona_id = self._resolve_persona_id(runtime)
+         cache_key, payload = self._select_cache_payload(cache, persona_id)
+         pending_tasks = self._pending_tasks(runtime)
+diff --git a/astrmai/webui/backend/services/review_ui_service.py b/astrmai/webui/backend/services/review_ui_service.py
+index 3191017..8b14889 100644
+--- a/astrmai/webui/backend/services/review_ui_service.py
++++ b/astrmai/webui/backend/services/review_ui_service.py
+@@ -12,9 +12,9 @@ class ReviewUiService:
+         self.db_factory = db_factory
+ 
+     def _pattern_service(self):
+-        runtime = self.plugin_api.get_runtime() if hasattr(self.plugin_api, "get_runtime") else None
+-        memory_engine = getattr(runtime, "memory_engine", None)
+-        return getattr(memory_engine, "expression_pattern_service", None)
++        if self.plugin_api:
++            return self.plugin_api.get_expression_pattern_service()
++        return None
+ 
+     def _runtime_bound(self) -> bool:
+         return self._pattern_service() is not None
+diff --git a/main.py b/main.py
+index a6325d0..e592d7a 100644
+--- a/main.py
++++ b/main.py
+@@ -10,6 +10,7 @@ try:
+     from .config import AstrMaiConfig
+     from .astrmai.app import PluginFacade, build_runtime_context, export_legacy_attrs
+     from .astrmai.presentation.commands import handle_mai_help, handle_work_mode
++    from .astrmai.conversation.ingress.permission_guard import check_command_access
+     from .astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
+     from .astrmai.webui.plugin_pages import register_astrmai_admin_pages
+ except ImportError:
+@@ -18,6 +19,7 @@ except ImportError:
+     from config import AstrMaiConfig
+     from astrmai.app import PluginFacade, build_runtime_context, export_legacy_attrs
+     from astrmai.presentation.commands import handle_mai_help, handle_work_mode
++    from astrmai.conversation.ingress.permission_guard import check_command_access
+     from astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
+     from astrmai.webui.plugin_pages import register_astrmai_admin_pages
+ 
+@@ -109,6 +111,8 @@ class AstrMaiPlugin(Star):
+             event.set_extra("astrmai_request_trace", existing_trace)
+     @filter.command("mai")
+     async def mai_help(self, event: AstrMessageEvent):
++        if check_command_access(self.runtime, event).should_stop:
++            return
+         async for result in handle_mai_help(self.facade, event):
+             yield result
+ 
+@@ -127,6 +131,8 @@ class AstrMaiPlugin(Star):
+ 
+     @filter.command("work")
+     async def enter_sys3_direct(self, event: AstrMessageEvent):
++        if check_command_access(self.runtime, event).should_stop:
++            return
+         async for result in handle_work_mode(self.facade, event):
+             yield result
+ 
+diff --git a/tests/helpers/astrbot_stubs.py b/tests/helpers/astrbot_stubs.py
+index 82eaff2..fd2cd82 100644
+--- a/tests/helpers/astrbot_stubs.py
++++ b/tests/helpers/astrbot_stubs.py
+@@ -1,3 +1,4 @@
++import os
+ import sys
+ import types
+ 
+@@ -45,7 +46,18 @@ def install_astrbot_stubs(data_dir: str):
+     agent_run_context_mod = types.ModuleType("astrbot.core.agent.run_context")
+     agent_tool_mod = types.ModuleType("astrbot.core.agent.tool")
+     astr_agent_context_mod = types.ModuleType("astrbot.core.astr_agent_context")
++    def _find_project_root(start: str) -> str:
++        cur = os.path.dirname(os.path.abspath(start))
++        while cur != os.path.dirname(cur):
++            if os.path.isfile(os.path.join(cur, "astrmai", "__init__.py")):
++                return cur
++            cur = os.path.dirname(cur)
++        raise FileNotFoundError("Cannot locate project root (astrmai/__init__.py not found)")
++
+     fake_workmode_mod = types.ModuleType("astrmai.workmode")
++    fake_workmode_mod.__path__ = [
++        os.path.join(_find_project_root(__file__), "astrmai", "workmode")
++    ]  # 指向真实包目录，允许子模块导入
+     db_mod = types.ModuleType("astrbot.core.db")
+     db_mod.__path__ = []
+     vec_db_mod = types.ModuleType("astrbot.core.db.vec_db")
+diff --git a/tests/helpers/host_mood_chain_audit.py b/tests/helpers/host_mood_chain_audit.py
+index 8d0d03c..fe76858 100644
+--- a/tests/helpers/host_mood_chain_audit.py
++++ b/tests/helpers/host_mood_chain_audit.py
+@@ -225,12 +225,37 @@ class _HostAuditEvent:
+ 
+ 
+ class _Facade:
++    # NOTE: record_and_dispatch_attention 简化返回 "BUFFERED"——
++    # mood chain audit 关注 mood extras 而非 ghost suppression，
++    # 因此不需要按 @/Reply/私聊 分发状态。
++
+     def is_framework_command(self, msg: str) -> bool:
+         return False
+ 
+     async def update_user_stats(self, user_id: str):
+         return None
+ 
++    async def handle_group_reply_wait(self, event, scope):
++        return "NONE"
++
++    def is_debug_mode(self) -> bool:
++        return False
++
++    def track_incoming_user_activity(self, sender_id: str) -> None:
++        pass
++
++    async def try_consume_reflect_feedback(self, event):
++        return None
++
++    async def record_and_dispatch_attention(self, event, scope):
++        return "BUFFERED"
++
++    def cancel_group_wait_if_interrupted(self, event, result, status) -> None:
++        pass
++
++    def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
++        return None
++
+ 
+ class _LifecycleManager:
+     def track_task(self, coro):
+diff --git a/tests/integration/host/test_host_mock_validation.py b/tests/integration/host/test_host_mock_validation.py
+index 4286c21..f610a36 100644
+--- a/tests/integration/host/test_host_mock_validation.py
++++ b/tests/integration/host/test_host_mock_validation.py
+@@ -126,21 +126,21 @@ def _install_extended_astrbot_stubs(data_dir: str) -> None:
+     star_mod.Star = _Star
+     api_mod.AstrBotConfig = dict
+ 
+-    core_star_mod = types.ModuleType("astrbot.core.star")
++    core_star_mod = sys.modules["astrbot.core.star"]
+     core_star_mod.__path__ = []
+-    command_management_mod = types.ModuleType("astrbot.core.star.command_management")
++    command_management_mod = sys.modules["astrbot.core.star.command_management"]
+     command_management_mod._collect_descriptors = lambda include_sub_commands=True: []
+     command_management_mod.list_commands = lambda: []
+ 
+-    tool_mod = types.ModuleType("astrbot.core.agent.tool")
++    tool_mod = sys.modules["astrbot.core.agent.tool"]
+     tool_mod.ToolSet = _ToolSet
+     tool_mod.FunctionTool = _FunctionTool
+     tool_mod.ToolExecResult = _ToolExecResult
+ 
+-    run_context_mod = types.ModuleType("astrbot.core.agent.run_context")
++    run_context_mod = sys.modules["astrbot.core.agent.run_context"]
+     run_context_mod.ContextWrapper = _ContextWrapper
+ 
+-    agent_context_mod = types.ModuleType("astrbot.core.astr_agent_context")
++    agent_context_mod = sys.modules["astrbot.core.astr_agent_context"]
+     agent_context_mod.AstrAgentContext = _AstrAgentContext
+ 
+     cron_tools_mod = types.ModuleType("astrbot.core.tools.cron_tools")
+@@ -318,6 +318,39 @@ class HostMockValidationTests(unittest.TestCase):
+                 async def enter_sys3_direct(self, event):
+                     yield event.plain_result("mock-work")
+ 
++                async def handle_group_reply_wait(self, event, scope):
++                    return "NONE"
++
++                def is_debug_mode(self) -> bool:
++                    return False
++
++                def track_incoming_user_activity(self, sender_id: str) -> None:
++                    pass
++
++                async def try_consume_reflect_feedback(self, event):
++                    return None
++
++                async def record_and_dispatch_attention(self, event, scope):
++                    if not event.get_group_id():
++                        calls.append(("attention", "private"))
++                        return "PRIVATE_WAIT"
++                    if any(isinstance(component, Comp.At) for component in event.message_obj.message):
++                        calls.append(("attention", "at"))
++                        return "ENGAGED"
++                    if any(isinstance(component, Comp.Reply) for component in event.message_obj.message):
++                        calls.append(("attention", "reply"))
++                        return "ENGAGED"
++                    calls.append(("attention", "group"))
++                    return "BUFFERED"
++
++                def cancel_group_wait_if_interrupted(self, event, result, status) -> None:
++                    pass
++
++                def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
++                    if status in ("ENGAGED", "PRIVATE_WAIT"):
++                        return "(ghost)"
++                    return None
++
+             async def _record_user_message(event):
+                 calls.append(("record_user_message", event.unified_msg_origin))
+ 
+diff --git a/tests/test_chat_loop_kernel_refactor.py b/tests/test_chat_loop_kernel_refactor.py
+index ffd9d9b..8f36352 100644
+--- a/tests/test_chat_loop_kernel_refactor.py
++++ b/tests/test_chat_loop_kernel_refactor.py
+@@ -466,6 +466,9 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
+         class _MemoryEngine:
+             summarizer = _MemorySummarizer()
+ 
++            async def describe_session_eligibility(self, chat_id):
++                return await self.summarizer.describe_session_eligibility(chat_id)
++
+         class _DreamScheduler:
+             async def describe_session_eligibility(self, chat_id, now_ts):
+                 return {"eligible": True, "reason": "eligible", "throttle_scope": "global"}
+@@ -510,6 +513,9 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
+         class _MemoryEngine:
+             summarizer = _MemorySummarizer()
+ 
++            async def describe_session_eligibility(self, chat_id):
++                return await self.summarizer.describe_session_eligibility(chat_id)
++
+         class _DreamScheduler:
+             async def describe_session_eligibility(self, chat_id, now_ts):
+                 return {"eligible": True, "reason": "eligible", "throttle_scope": "global"}
+@@ -957,15 +963,9 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
+         self.assertEqual(result.state.pending_signals["schedule_reason"], "proactive_wakeup")
+ 
+     def test_message_entry_routes_through_kernel_after_guards(self):
+-        calls = []
+-
+-        class _Kernel:
+-            async def tick(self, *, chat_id, trigger, event=None):
+-                calls.append((chat_id, trigger, event.message_str))
+-                return SimpleNamespace(dispatch_result="BUFFERED")
+-
+-        async def _record_user_message(event):
+-            calls.append(("record", event.unified_msg_origin))
++        # handle_global_message 已重构为仅处理 facade 级守卫和委托；
++        # kernel/record_user_message 调用已迁移至 PluginFacade.on_global_message。
++        facade_calls = []
+ 
+         runtime = SimpleNamespace(
+             config=SimpleNamespace(
+@@ -975,12 +975,44 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
+             group_reply_wait_manager=None,
+             lifecycle=SimpleNamespace(manager=None),
+             reflect_tracker=None,
+-            evolution=SimpleNamespace(record_user_message=_record_user_message),
+-            attention_gate=SimpleNamespace(process_event=lambda event: (_ for _ in ()).throw(AssertionError("attention gate should be wrapped by kernel"))),
+-            host_bridge=SimpleNamespace(suppress_default_llm=lambda event: "(ghost)"),
+-            chat_loop_kernel=_Kernel(),
++            evolution=SimpleNamespace(record_user_message=lambda event: None),
++            attention_gate=None,
++            host_bridge=None,
++            chat_loop_kernel=None,
++        )
++
++        async def _handle_group_reply_wait(event, scope):
++            facade_calls.append(("handle_group_reply_wait", scope.chat_id))
++            return "NONE"
++
++        def _track_incoming(sender_id):
++            facade_calls.append(("track_incoming_user_activity", sender_id))
++
++        async def _try_consume_reflect_feedback(event):
++            facade_calls.append(("try_consume_reflect_feedback", event.get_sender_id()))
++            return None
++
++        async def _record_and_dispatch_attention(event, scope):
++            facade_calls.append(("record_and_dispatch_attention", scope.chat_id))
++            return "BUFFERED"
++
++        def _cancel_group_wait(event, result, status):
++            facade_calls.append(("cancel_group_wait_if_interrupted", status))
++
++        def _suppress(event, status, is_direct_call):
++            facade_calls.append(("suppress_default_llm_if_engaged", status, is_direct_call))
++            return None
++
++        facade = SimpleNamespace(
++            is_framework_command=lambda msg: False,
++            handle_group_reply_wait=_handle_group_reply_wait,
++            is_debug_mode=lambda: False,
++            track_incoming_user_activity=_track_incoming,
++            try_consume_reflect_feedback=_try_consume_reflect_feedback,
++            record_and_dispatch_attention=_record_and_dispatch_attention,
++            cancel_group_wait_if_interrupted=_cancel_group_wait,
++            suppress_default_llm_if_engaged=_suppress,
+         )
+-        facade = SimpleNamespace(is_framework_command=lambda msg: False)
+         event = _FakeEvent(
+             umo="default:GroupMessage:group-1",
+             sender_id="user-1",
+@@ -995,8 +1027,13 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
+         results = asyncio.run(_run())
+ 
+         self.assertEqual(results, [])
+-        self.assertIn(("record", "default:GroupMessage:group-1"), calls)
+-        self.assertIn(("default:GroupMessage:group-1", "message", "normal message"), calls)
++        # 验证所有 facade 守卫均被调用
++        self.assertIn(("handle_group_reply_wait", "default:GroupMessage:group-1"), facade_calls)
++        self.assertIn(("track_incoming_user_activity", "user-1"), facade_calls)
++        self.assertIn(("try_consume_reflect_feedback", "user-1"), facade_calls)
++        self.assertIn(("record_and_dispatch_attention", "default:GroupMessage:group-1"), facade_calls)
++        self.assertIn(("cancel_group_wait_if_interrupted", "BUFFERED"), facade_calls)
++        self.assertIn(("suppress_default_llm_if_engaged", "BUFFERED", False), facade_calls)
+ 
+     def test_message_entry_self_message_stops_before_kernel(self):
+         calls = []
+@@ -1019,7 +1056,25 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
+             host_bridge=SimpleNamespace(suppress_default_llm=lambda event: "(ghost)"),
+             chat_loop_kernel=_Kernel(),
+         )
+-        facade = SimpleNamespace(is_framework_command=lambda msg: False)
++        async def _handle_group_reply_wait(event, scope):
++            return "NONE"
++
++        async def _try_consume_reflect_feedback(event):
++            return None
++
++        async def _record_and_dispatch_attention(event, scope):
++            return "BUFFERED"
++
++        facade = SimpleNamespace(
++            is_framework_command=lambda msg: False,
++            handle_group_reply_wait=_handle_group_reply_wait,
++            is_debug_mode=lambda: False,
++            track_incoming_user_activity=lambda sender_id: None,
++            try_consume_reflect_feedback=_try_consume_reflect_feedback,
++            record_and_dispatch_attention=_record_and_dispatch_attention,
++            cancel_group_wait_if_interrupted=lambda event, result, status: None,
++            suppress_default_llm_if_engaged=lambda event, status, is_direct_call: None,
++        )
+         event = _FakeEvent(
+             umo="default:GroupMessage:group-1",
+             sender_id="bot-1",
+diff --git a/tests/test_webui_backend_refactor.py b/tests/test_webui_backend_refactor.py
+index 7e5a3f1..3965598 100644
+--- a/tests/test_webui_backend_refactor.py
++++ b/tests/test_webui_backend_refactor.py
+@@ -107,13 +107,17 @@ class WebuiBackendRefactorTests(unittest.TestCase):
+         original = os.environ.get("ASTRMAI_WEBUI_SECRET")
+         try:
+             os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-one"
++            # Reset cached key so env change takes effect
++            auth_mod._SECRET_KEY = None
+             token = auth_mod.create_token("codex")
+             self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
+ 
++            # Changing env after first access does NOT invalidate tokens —
++            # the key is now session-stable (security best practice).
+             os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-two"
+-            with self.assertRaises(Exception):
+-                auth_mod.verify_token(token)
++            self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
+         finally:
++            auth_mod._SECRET_KEY = None
+             if original is None:
+                 os.environ.pop("ASTRMAI_WEBUI_SECRET", None)
+             else:
+@@ -1708,5 +1712,119 @@ class WebuiBackendRefactorTests(unittest.TestCase):
+         self.assertIn("/chats/active", paths)
+ 
+ 
++    def test_heartflow_chats_uses_get_all_states_when_available(self):
++        """heartflow_chats() should prefer get_all_states() over _states."""
++        admin_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
++
++        called_public = False
++        class _Manager:
++            def get_all_states(self):
++                nonlocal called_public
++                called_public = True
++                return {"chat-1": {"last_activity_ts": 100.0}}
++            def get_state(self, chat_id):
++                return {"last_activity_ts": 100.0}
++            def get_session(self, chat_id):
++                return {}
++            def get_latest_action_decision(self, chat_id):
++                return {}
++            def get_latest_impulse_decision(self, chat_id):
++                return {}
++
++        class _Runtime:
++            proactive_task = type("PT", (), {"heartflow_manager": _Manager()})()
++
++        class _PluginApi:
++            def _get_runtime(self):
++                return _Runtime()
++
++        service = admin_mod.AdminUiService(_PluginApi())
++        result = asyncio.run(service.heartflow_chats())
++        self.assertEqual(result["status"], "ok")
++        self.assertEqual(result["total"], 1)
++        self.assertTrue(called_public, "get_all_states() was not called")
++
++    def test_heartflow_chats_falls_back_to_states_when_get_all_states_missing(self):
++        """heartflow_chats() should fall back to _states when get_all_states is absent."""
++        admin_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
++
++        class _Manager:
++            _states = {"chat-2": {"last_activity_ts": 200.0}}
++            def get_state(self, chat_id):
++                return self._states.get(chat_id, {})
++            def get_session(self, chat_id):
++                return {}
++            def get_latest_action_decision(self, chat_id):
++                return {}
++            def get_latest_impulse_decision(self, chat_id):
++                return {}
++
++        class _Runtime:
++            proactive_task = type("PT", (), {"heartflow_manager": _Manager()})()
++
++        class _PluginApi:
++            def _get_runtime(self):
++                return _Runtime()
++
++        service = admin_mod.AdminUiService(_PluginApi())
++        result = asyncio.run(service.heartflow_chats())
++        self.assertEqual(result["status"], "ok")
++        self.assertEqual(result["total"], 1)
++
++    def test_domain_services_have_explicit_signatures(self):
++        """All 7 domain services should define methods with explicit parameters."""
++        import inspect
++
++        modules = [
++            ("observabilityservice", "ObservabilityService"),
++            ("heartflowservice", "HeartflowService"),
++            ("chatruntimeservice", "ChatRuntimeService"),
++            ("schedulerservice", "SchedulerService"),
++            ("cognitionservice", "CognitionService"),
++            ("learningservice", "LearningService"),
++            ("toolsservice", "ToolsService"),
++        ]
++        for mod_name, cls_name in modules:
++            mod = importlib.import_module(f"astrmai.webui.backend.services.{mod_name}")
++            cls = getattr(mod, cls_name)
++            public_methods = [
++                m for m in dir(cls)
++                if not m.startswith("_") and callable(getattr(cls, m))
++                and m != "__init__"
++            ]
++            for method_name in public_methods:
++                sig = inspect.signature(getattr(cls, method_name))
++                params = list(sig.parameters.keys())
++                self.assertNotIn("args", params,
++                    f"{cls_name}.{method_name}() still uses *args")
++                self.assertNotIn("kwargs", params,
++                    f"{cls_name}.{method_name}() still uses **kwargs")
++                self.assertIn("self", params,
++                    f"{cls_name}.{method_name}() missing self")
++
++    def test_apply_hot_config_fallback_logs_warning(self):
++        """_apply_hot_config() should use facade.apply_hot_config when available."""
++        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
++
++        called_facade = False
++        class _Facade:
++            def apply_hot_config(self, config_dict, parsed_config):
++                nonlocal called_facade
++                called_facade = True
++                return True
++
++        adapter = adapter_mod.PluginApiAdapter(facade=_Facade())
++        result = adapter._apply_hot_config({"key": "val"}, object())
++        self.assertTrue(result)
++        self.assertTrue(called_facade, "facade.apply_hot_config not called")
++
++    def test_apply_hot_config_returns_false_when_no_facade(self):
++        """_apply_hot_config() should return False when facade is None."""
++        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
++        adapter = adapter_mod.PluginApiAdapter(facade=None)
++        result = adapter._apply_hot_config({}, object())
++        self.assertFalse(result)
++
++
+ if __name__ == "__main__":
+     unittest.main()
