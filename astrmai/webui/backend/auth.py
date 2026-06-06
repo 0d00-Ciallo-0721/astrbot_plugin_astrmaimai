@@ -10,9 +10,27 @@ from typing import Any, Optional
 from fastapi import HTTPException, Header
 from jose import JWTError, jwt
 
-ALGORITHM = "HS256"
+def get_algorithm() -> str:
+    """Return JWT algorithm, configurable via ASTRMAI_WEBUI_JWT_ALGORITHM (default HS256)."""
+    return os.getenv("ASTRMAI_WEBUI_JWT_ALGORITHM", "HS256")
 
 _SECRET_KEY: str | None = None
+_TOKEN_EXPIRE_HOURS: int | None = None
+
+
+def get_token_expire_hours() -> int:
+    """Return token expiry in hours, configurable via ASTRMAI_WEBUI_TOKEN_EXPIRE_HOURS (default 24)."""
+    global _TOKEN_EXPIRE_HOURS
+    if _TOKEN_EXPIRE_HOURS is not None:
+        return _TOKEN_EXPIRE_HOURS
+    raw = os.getenv("ASTRMAI_WEBUI_TOKEN_EXPIRE_HOURS", "24")
+    try:
+        _TOKEN_EXPIRE_HOURS = max(1, int(raw))
+    except ValueError:
+        _TOKEN_EXPIRE_HOURS = 24
+        _logger = logging.getLogger(__name__)
+        _logger.warning("Invalid ASTRMAI_WEBUI_TOKEN_EXPIRE_HOURS=%r, using default 24", raw)
+    return _TOKEN_EXPIRE_HOURS
 
 
 def get_secret_key() -> str:
@@ -21,14 +39,14 @@ def get_secret_key() -> str:
         return _SECRET_KEY
     _SECRET_KEY = os.getenv("ASTRMAI_WEBUI_SECRET", "")
     if not _SECRET_KEY:
-        _SECRET_KEY = secrets.token_hex(32)
-        print(
-            "[astrmai-webui] WARNING: ASTRMAI_WEBUI_SECRET not set — "
-            "generated a random key for this session. "
-            "All previously issued tokens are now invalid. "
-            "Set ASTRMAI_WEBUI_SECRET in the environment for persistent keys.",
-            file=sys.stderr,
+        msg = (
+            "[astrmai-webui] FATAL: ASTRMAI_WEBUI_SECRET is not set. "
+            "A persistent secret key is required for JWT token signing. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\" "
+            "and set it as the ASTRMAI_WEBUI_SECRET environment variable."
         )
+        print(msg, file=sys.stderr)
+        raise RuntimeError("ASTRMAI_WEBUI_SECRET environment variable is required but not set")
     return _SECRET_KEY
 
 
@@ -49,6 +67,27 @@ def _default_password_adapter():
         logger.warning("auth: no active facade, password auth unavailable")
         return None
     return PluginApiAdapter(facade=facade)
+
+
+def check_webui_password(plaintext: str) -> bool:
+    """Verify plaintext password against stored scrypt hash."""
+    try:
+        factory = _password_adapter_factory or _default_password_adapter
+        pwd_adapter = factory()
+        if pwd_adapter is None:
+            logger = logging.getLogger(__name__)
+            logger.error("check_webui_password: no password adapter")
+            return False
+        if hasattr(pwd_adapter, "check_webui_password"):
+            return bool(pwd_adapter.check_webui_password(plaintext))
+        stored = pwd_adapter.get_webui_password()
+        if not stored:
+            return False
+        return secrets.compare_digest(plaintext, stored)
+    except Exception as exc:
+        logger = logging.getLogger(__name__)
+        logger.error("check_webui_password failed: %s", exc)
+        return False
 
 
 def get_astrmai_password(adapter: Any | None = None) -> str:
@@ -80,15 +119,17 @@ def get_astrmai_password(adapter: Any | None = None) -> str:
     logger.error(msg)
     raise RuntimeError(msg)
 
-def create_token(sub: str, expire_hours: int = 24) -> str:
+def create_token(sub: str, expire_hours: int | None = None) -> str:
+    if expire_hours is None:
+        expire_hours = get_token_expire_hours()
     expire = datetime.utcnow() + timedelta(hours=expire_hours)
     to_encode = {"sub": sub, "exp": expire}
-    encoded_jwt = jwt.encode(to_encode, get_secret_key(), algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, get_secret_key(), algorithm=get_algorithm())
     return encoded_jwt
 
 def verify_token(token: str) -> dict:
     try:
-        payload = jwt.decode(token, get_secret_key(), algorithms=[ALGORITHM])
+        payload = jwt.decode(token, get_secret_key(), algorithms=[get_algorithm()])
         return payload
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")

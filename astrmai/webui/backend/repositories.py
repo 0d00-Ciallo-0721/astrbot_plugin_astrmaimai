@@ -51,8 +51,27 @@ class UserProfileRepository:
                 row = await cursor.fetchone()
                 return self._parse_row(dict(row)) if row else None
 
+    _ALLOWED_COLUMNS: set[str] = {
+        "name", "nickname", "nickname_reason", "social_score", "identity",
+        "tags", "persona_analysis", "profile_metadata",
+        "memory_points", "identity_points", "preference_points",
+        "relationship_points", "speech_style_points",
+        "aliases", "persona_slices", "relationship_slices", "group_footprints",
+    }
+
+    @classmethod
+    def _validate_set_clauses(cls, set_clauses: str) -> None:
+        """Reject set_clauses containing unknown column names (SQL injection defense)."""
+        import re
+        # Extract column names from "col = ?, col2 = ?" pattern
+        columns = re.findall(r"(\w+)\s*=", set_clauses)
+        unknown = [c for c in columns if c not in cls._ALLOWED_COLUMNS]
+        if unknown:
+            raise ValueError(f"Disallowed column(s) in SET clause: {', '.join(unknown)}")
+
     async def update(self, user_id: str, set_clauses: str, params: list[Any]) -> bool:
         """Execute ``UPDATE user_profiles SET <set_clauses> WHERE user_id = ?``."""
+        self._validate_set_clauses(set_clauses)
         async with self.db_factory() as db:
             await db.execute(
                 f"UPDATE user_profiles SET {set_clauses} WHERE user_id = ?",
@@ -132,19 +151,14 @@ class CanonicalMemoryRepository:
                 return dict(row) if row else None
 
     async def update_status(
-        self, memory_id: str, status: str, *, reason: str = "", extra_sets: str = "", extra_params: tuple = ()
+        self, memory_id: str, status: str, *, reason: str = ""
     ) -> int:
-        """Atomically update status (and optional extra columns) for one memory."""
+        """Atomically update status for one memory."""
         now = time.time()
-        clauses = "status = ?, deleted_reason = ?, update_time = ?"
-        params: list[Any] = [status, reason, now]
-        if extra_sets:
-            clauses += ", " + extra_sets
-            params.extend(extra_params)
-        params.append(memory_id)
         async with self.db_factory() as db:
             cursor = await db.execute(
-                f"UPDATE canonical_memories SET {clauses} WHERE id = ?", tuple(params)
+                "UPDATE canonical_memories SET status = ?, deleted_reason = ?, update_time = ? WHERE id = ?",
+                (status, reason, now, memory_id),
             )
             await db.commit()
             return cursor.rowcount

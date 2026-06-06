@@ -301,13 +301,47 @@ class ReActRetriever:
         if isinstance(raw, dict):
             return raw
         if isinstance(raw, str):
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
+            chunk = self._extract_braced_json(raw)
+            if chunk:
                 try:
-                    return json.loads(match.group(0))
+                    return json.loads(chunk)
                 except json.JSONDecodeError:
                     pass
         return {}
+
+    @staticmethod
+    def _extract_braced_json(text: str):
+        """Extract the first complete JSON object from text by counting braces.
+
+        Braces inside JSON string literals are ignored so that values like
+        ``{"key": "text with { in it}"}`` are not miscounted.
+        """
+        start = text.find('{')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
 
     async def _save_trace(
         self,

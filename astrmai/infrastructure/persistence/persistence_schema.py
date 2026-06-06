@@ -57,6 +57,12 @@ class PersistenceSchemaMixin:
                         total_replies INTEGER,
                         last_reply_time REAL DEFAULT 0,
                         last_passive_decay_time REAL DEFAULT 0,
+                        total_messages INTEGER DEFAULT 0,
+                        judgment_mode TEXT DEFAULT 'single',
+                        last_msg_info TEXT DEFAULT '{}',
+                        last_access_time REAL DEFAULT 0,
+                        next_wakeup_timestamp REAL DEFAULT 0,
+                        is_dirty INTEGER DEFAULT 0,
                         updated_at REAL
                     )
                 """)
@@ -88,6 +94,12 @@ class PersistenceSchemaMixin:
                 for col_def in [
                     "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'",
+                    "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'",
+                    "ALTER TABLE chat_states ADD COLUMN last_access_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN next_wakeup_timestamp REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN is_dirty INTEGER DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
                     "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
@@ -140,6 +152,17 @@ class PersistenceSchemaMixin:
                         updated_at  REAL
                     )
                 """)
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS lastmessagemetadatadb (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id TEXT,
+                        sender_id TEXT,
+                        has_image INTEGER DEFAULT 0,
+                        image_urls TEXT DEFAULT '[]',
+                        vl_executed INTEGER DEFAULT 0,
+                        timestamp REAL
+                    )
+                """)
                 try:
                     db.execute("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''")
                 except Exception:
@@ -170,6 +193,12 @@ class PersistenceSchemaMixin:
                         total_replies INTEGER,
                         last_reply_time REAL DEFAULT 0,
                         last_passive_decay_time REAL DEFAULT 0,
+                        total_messages INTEGER DEFAULT 0,
+                        judgment_mode TEXT DEFAULT 'single',
+                        last_msg_info TEXT DEFAULT '{}',
+                        last_access_time REAL DEFAULT 0,
+                        next_wakeup_timestamp REAL DEFAULT 0,
+                        is_dirty INTEGER DEFAULT 0,
                         updated_at REAL
                     )
                 """)
@@ -202,6 +231,12 @@ class PersistenceSchemaMixin:
                 for col_def in [
                     "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'",
+                    "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'",
+                    "ALTER TABLE chat_states ADD COLUMN last_access_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN next_wakeup_timestamp REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN is_dirty INTEGER DEFAULT 0",
                     "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
                     "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
                     "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
@@ -252,6 +287,17 @@ class PersistenceSchemaMixin:
                         is_active   INTEGER DEFAULT 1,
                         created_at  REAL,
                         updated_at  REAL
+                    )
+                """)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS lastmessagemetadatadb (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id TEXT,
+                        sender_id TEXT,
+                        has_image INTEGER DEFAULT 0,
+                        image_urls TEXT DEFAULT '[]',
+                        vl_executed INTEGER DEFAULT 0,
+                        timestamp REAL
                     )
                 """)
                 try:

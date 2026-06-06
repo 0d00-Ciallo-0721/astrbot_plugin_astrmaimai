@@ -87,12 +87,17 @@ class DreamScheduler:
                         "throttle_scope": "global",
                     }
             min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
-            self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
-            dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
+            _original_min_events = self.dream_agent.MIN_EVENTS_TO_DREAM
+            try:
+                self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
+                dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
+            finally:
+                self.dream_agent.MIN_EVENTS_TO_DREAM = _original_min_events
             if not dream_log:
                 return {"performed": False, "reason": "no_dream_log", "session_id": str(session_id or ""), "throttle_scope": "global"}
 
-            session_id = getattr(self.dream_agent, "_last_session_id", "global")
+            if not session_id:
+                session_id = getattr(self.dream_agent, "_last_session_id", "global")
             persona_name = getattr(getattr(self.config, "persona", None), "name", "Mai")
             dream_text = await self.dream_generator.generate(
                 dream_log=dream_log,

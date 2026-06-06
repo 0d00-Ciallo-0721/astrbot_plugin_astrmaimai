@@ -44,7 +44,7 @@ class GatewayLaneMixin:
             existing_payload = {}
         def _reuse_or_hash(key: str, fallback_text: str) -> str:
             existing = existing_payload.get(key)
-            return existing if existing is not None else self._stable_hash_text(fallback_text)
+            return existing if existing else self._stable_hash_text(fallback_text)
 
         _raw_sid = (request_kwargs or {}).get("session_id")
         trace_payload = {
@@ -194,20 +194,9 @@ class GatewayLaneMixin:
                 workload_policy=workload_policy,
             )
 
-        primary_models, attempt_queue = self._build_attempt_queue(
-            lane_key.task_family,
-            models,
-            use_fallback,
-            workload_policy=workload_policy,
-        )
-        attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
-            lane_key.task_family,
-            primary_models,
-            attempt_queue,
-        )
-        if not attempt_queue:
+        if not models:
             raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
-        model_hint = attempt_queue[0]
+        model_hint = models[0]
         lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
             lane_key=effective_lane_key,
             base_origin=base_origin,
@@ -253,7 +242,7 @@ class GatewayLaneMixin:
             result.model_id = model_hint
             logger.warning(
                 f"[Gateway] chat_in_lane_result: result.model_id unexpectedly empty "
-                f"(pool={lane_key.task_family}), falling back to attempt_queue[0]={model_hint}"
+                f"(pool={lane_key.task_family}), falling back to models[0]={model_hint}"
             )
         provider_caps = infer_provider_capabilities(result.model_id)
         provider_session_id = ""
@@ -293,8 +282,8 @@ class GatewayLaneMixin:
             prefix_hash=workload_policy.stable_prefix_hash,
             model_id=result.model_id or model_hint,
             fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
-            skipped_cooldown_models=list(skipped_cooldown_models),
-            cooldown_overridden=bool(cooldown_overridden),
+            skipped_cooldown_models=list(result.skipped_cooldown_models),
+            cooldown_overridden=bool(result.cooldown_overridden),
         )
         self._record_event_request_trace(
             event,

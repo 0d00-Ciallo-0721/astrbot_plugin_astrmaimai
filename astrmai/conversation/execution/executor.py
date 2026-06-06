@@ -537,6 +537,16 @@ class ConcurrentExecutor:
             if not await self._check_pre_model_freshness(event, chat_id, "text execution"):
                 if hasattr(event, "set_extra"):
                     event.set_extra("astrmai_execution_status", "stale_drop")
+                debug_trace(
+                    event,
+                    "execution.executor.stale_drop",
+                    mode="chat",
+                    reason="freshness_expired",
+                    model=provider_id,
+                    pool_index=index,
+                    pool_size=len(agent_models),
+                    label="text execution",
+                )
                 return None
             attempted_models.append(provider_id)
             try:
@@ -623,6 +633,16 @@ class ConcurrentExecutor:
             if not await self._check_pre_model_freshness(event, chat_id, "tool execution"):
                 if hasattr(event, "set_extra"):
                     event.set_extra("astrmai_execution_status", "stale_drop")
+                debug_trace(
+                    event,
+                    "execution.executor.stale_drop",
+                    mode="tool",
+                    reason="freshness_expired",
+                    model=provider_id,
+                    pool_index=index,
+                    pool_size=len(agent_models),
+                    label="tool execution",
+                )
                 return None
             attempted_models.append(provider_id)
             try:

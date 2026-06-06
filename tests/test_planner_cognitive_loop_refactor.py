@@ -90,7 +90,7 @@ class _FakeLoop:
         self.decision = decision
         self.calls = []
 
-    async def decide(self, *, event, prompt_envelope=None):
+    async def decide(self, *, event, prompt_envelope=None, gate=None):
         self.calls.append((event, prompt_envelope))
         return self.decision
 

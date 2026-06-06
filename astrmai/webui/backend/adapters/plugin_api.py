@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -22,6 +24,7 @@ APPLY_STATUS: dict[str, Any] = {
     "reload_required": False,
     "error": "",
 }
+_apply_lock = threading.Lock()
 
 
 def set_active_facade(facade: Any) -> None:
@@ -68,26 +71,51 @@ class PluginApiAdapter:
 
     # 鈹€鈹€ internal helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
+    def _validate_path(self, path: str) -> str:
+        """Resolve and validate that *path* is within allowed directories.
+
+        Returns the resolved real path.  Raises ``ValueError`` if the path
+        escapes the plugin data or plugin root directories.
+        """
+        resolved = os.path.realpath(path)
+        data_root = os.path.realpath(os.path.dirname(self.config_path) or ".")
+        plugin_root = os.path.realpath(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        allowed_roots = {data_root, plugin_root}
+        resolved_norm = os.path.normpath(resolved)
+        for root in allowed_roots:
+            root_norm = os.path.normpath(root)
+            if resolved_norm == root_norm or resolved_norm.startswith(root_norm + os.sep):
+                return resolved
+        raise ValueError(
+            f"Path traversal detected: {path!r} resolves to {resolved!r}, "
+            f"which is outside allowed directories"
+        )
+
     def _read_json(self, path: str) -> dict[str, Any]:
-        if not os.path.exists(path):
+        safe_path = self._validate_path(path)
+        if not os.path.exists(safe_path):
             return {}
-        with open(path, "r", encoding="utf-8") as file:
+        with open(safe_path, "r", encoding="utf-8") as file:
             return json.load(file)
 
     def _write_json(self, path: str, data: dict[str, Any]) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as file:
+        safe_path = self._validate_path(path)
+        os.makedirs(os.path.dirname(safe_path) or ".", exist_ok=True)
+        with open(safe_path, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=4, ensure_ascii=False)
 
     def _backup_json_file(self, path: str, *, keep: int = 5) -> str:
-        if not os.path.exists(path):
+        safe_path = self._validate_path(path)
+        if not os.path.exists(safe_path):
             return ""
         timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
-        backup_path = f"{path}.{timestamp}.bak"
-        with open(path, "rb") as src, open(backup_path, "wb") as dst:
+        backup_path = f"{safe_path}.{timestamp}.bak"
+        with open(safe_path, "rb") as src, open(backup_path, "wb") as dst:
             dst.write(src.read())
-        directory = os.path.dirname(path) or "."
-        prefix = os.path.basename(path) + "."
+        directory = os.path.dirname(safe_path) or "."
+        prefix = os.path.basename(safe_path) + "."
         backups = sorted(
             [
                 os.path.join(directory, name)
@@ -105,12 +133,13 @@ class PluginApiAdapter:
         return backup_path
 
     def _write_json_atomic(self, path: str, data: dict[str, Any]) -> str:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        backup_path = self._backup_json_file(path)
-        temp_path = f"{path}.tmp"
+        safe_path = self._validate_path(path)
+        os.makedirs(os.path.dirname(safe_path) or ".", exist_ok=True)
+        backup_path = self._backup_json_file(safe_path)
+        temp_path = f"{safe_path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=4, ensure_ascii=False)
-        os.replace(temp_path, path)
+        os.replace(temp_path, safe_path)
         return backup_path
 
     def _call_facade(self, method_name: str, *args: Any) -> Any:
@@ -296,6 +325,8 @@ class PluginApiAdapter:
         schema_exists = os.path.exists(self.schema_path)
         config_mtime = os.path.getmtime(self.config_path) if config_exists else 0.0
         schema_mtime = os.path.getmtime(self.schema_path) if schema_exists else 0.0
+        with _apply_lock:
+            apply_snapshot = dict(APPLY_STATUS)
         return {
             "config_path": self.config_path,
             "schema_path": self.schema_path,
@@ -303,8 +334,8 @@ class PluginApiAdapter:
             "schema_exists": schema_exists,
             "config_mtime": config_mtime,
             "schema_mtime": schema_mtime,
-            "pending_apply": config_mtime > float(APPLY_STATUS.get("applied_at", 0.0) or 0.0),
-            "apply_status": dict(APPLY_STATUS),
+            "pending_apply": config_mtime > float(apply_snapshot.get("applied_at", 0.0) or 0.0),
+            "apply_status": apply_snapshot,
         }
 
     @staticmethod
@@ -349,29 +380,32 @@ class PluginApiAdapter:
 
             parsed_config = AstrMaiConfig(**config_data)
         except Exception as exc:
-            APPLY_STATUS = {
-                "applied_at": time.time(),
-                "status": "error",
-                "runtime_bound": self.facade is not None,
-                "reload_required": False,
-                "error": str(exc),
-            }
+            with _apply_lock:
+                APPLY_STATUS = {
+                    "applied_at": time.time(),
+                    "status": "error",
+                    "runtime_bound": self.facade is not None,
+                    "reload_required": False,
+                    "error": str(exc),
+                }
             return {"status": "error", "errors": [{"path": "config", "message": str(exc)}], **APPLY_STATUS}
 
         reload_required = self._requires_reload(changed_keys or set())
         runtime_bound = self._apply_hot_config(config_data, parsed_config)
 
-        APPLY_STATUS = {
-            "applied_at": time.time(),
-            "status": "ok",
-            "runtime_bound": runtime_bound,
-            "reload_required": reload_required,
-            "error": "",
-        }
+        with _apply_lock:
+            APPLY_STATUS = {
+                "applied_at": time.time(),
+                "status": "ok",
+                "runtime_bound": runtime_bound,
+                "reload_required": reload_required,
+                "error": "",
+            }
         return {"status": "ok", "runtime_bound": runtime_bound, "reload_required": reload_required}
 
     async def get_apply_status(self) -> dict[str, Any]:
-        return dict(APPLY_STATUS)
+        with _apply_lock:
+            return dict(APPLY_STATUS)
 
     async def read_persona_cache(self) -> dict[str, Any]:
         return self._read_json(self.persona_cache_path)
@@ -381,7 +415,45 @@ class PluginApiAdapter:
 
     def get_webui_password(self) -> str:
         config = self._read_json(self.config_path)
-        return config.get("global_settings", {}).get("webui_password", "") or ""
+        stored = config.get("global_settings", {}).get("webui_password", "") or ""
+        if not stored:
+            return ""
+        if stored.startswith("$scrypt$"):
+            return stored
+        # Plaintext detected — migrate to scrypt hash
+        import hashlib
+        import base64
+        salt = os.urandom(16)
+        hashed = hashlib.scrypt(
+            password=stored.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=0, dklen=32
+        )
+        encoded = (
+            "$scrypt$"
+            + base64.b64encode(salt).decode("ascii")
+            + "$"
+            + base64.b64encode(hashed).decode("ascii")
+        )
+        config.setdefault("global_settings", {})["webui_password"] = encoded
+        self._write_json_atomic(self.config_path, config)
+        _logger.warning("Migrated webui_password from plaintext to scrypt hash")
+        return encoded
+
+    def check_webui_password(self, plaintext: str) -> bool:
+        stored = self.get_webui_password()
+        if not stored:
+            return False
+        if not stored.startswith("$scrypt$"):
+            # Legacy plaintext — constant-time compare
+            return secrets.compare_digest(plaintext, stored)
+        import hashlib
+        import base64
+        _, salt_b64, hash_b64 = stored.split("$", 2)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        actual = hashlib.scrypt(
+            password=plaintext.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=0, dklen=32
+        )
+        return secrets.compare_digest(actual, expected)
 
 
 __all__ = [

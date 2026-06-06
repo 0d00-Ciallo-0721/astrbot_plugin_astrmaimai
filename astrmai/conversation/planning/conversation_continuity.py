@@ -57,18 +57,18 @@ class ConversationContinuityStore:
     def _normalize_topic_text(text: str) -> str:
         value = str(text or "").strip()
         if ":" in value:
-            value = value.split(":", 1)[1]
+            value = value.split(":", 1)[-1]
         if "：" in value:
-            value = value.split("：", 1)[1]
+            value = value.split("：", 1)[-1]
         return "".join(value.lower().split())
 
     @staticmethod
     def _ascii_word_tokens(text: str) -> set[str]:
         value = str(text or "").strip()
         if ":" in value:
-            value = value.split(":", 1)[1]
+            value = value.split(":", 1)[-1]
         if "：" in value:
-            value = value.split("：", 1)[1]
+            value = value.split("：", 1)[-1]
         return {token.lower() for token in re.findall(r"[A-Za-z0-9_]{3,}", value)}
 
     @classmethod

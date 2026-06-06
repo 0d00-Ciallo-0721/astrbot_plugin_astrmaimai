@@ -1,5 +1,6 @@
 import aiosqlite
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -64,6 +65,7 @@ class MemoryEngine:
         self.data_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai" / "memory"
         os.makedirs(self.data_path, exist_ok=True)
         self.db_path = str(self.data_path / "docs.db")
+        self.v2_db_path = str(self.data_path / "memory_v2.db")
 
         self.faiss_db = None
         self.vec_retriever = None
@@ -82,7 +84,7 @@ class MemoryEngine:
         self._learning_event_history = []
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
         self._disabled_cognitive_feedback_keys: set[tuple[str, str, str, str]] = set()
-        self.v2_store = MemoryV2Store(self.db_path, data_path=self.data_path)
+        self.v2_store = MemoryV2Store(self.v2_db_path, data_path=self.data_path, legacy_db_path=self.db_path)
         # Sub-components that depend on self are initialized in initialize()
 
     def _remember_learning_event(self, event_name: str, payload: dict | None) -> None:
@@ -117,21 +119,26 @@ class MemoryEngine:
         metadata.update(extra)
         return metadata
 
-    async def _run_documents_query(self, query: str, params: tuple = ()) -> list:
-        async with aiosqlite.connect(self.db_path) as db:
+    async def _run_documents_query(self, query: str, params: tuple = (), *, db_path: str | None = None) -> list:
+        target = str(db_path or self.db_path)
+        async with aiosqlite.connect(target) as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchall()
 
-    async def _execute_documents_write(self, query: str, params: tuple = ()) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+    async def _execute_documents_write(self, query: str, params: tuple = (), *, db_path: str | None = None) -> int:
+        target = str(db_path or self.db_path)
+        async with aiosqlite.connect(target) as db:
             cursor = await db.execute(query, params)
             await db.commit()
             return cursor.rowcount
 
-    async def _search_memories(self, query: str, *, top_k: int, session_id: str = None, persona_id: str = None):
+    async def search_memories(self, query: str, *, top_k: int, session_id: str = None, persona_id: str = None):
         if not await self._ensure_faiss_initialized():
             return []
         return await self.retriever.search(query, k=top_k, session_id=session_id, persona_id=persona_id)
+
+    # Backward-compatible alias — prefer search_memories() in new code.
+    _search_memories = search_memories
 
     @staticmethod
     def _filter_search_results(results, *, min_score: float) -> list:
@@ -218,10 +225,6 @@ class MemoryEngine:
                 logger.error(f"[AstrMai] FaissVecDB initialization failed: {exc}; retry in {backoff}s.", exc_info=True)
                 return False
 
-            if not self.bm25_retriever:
-                self.bm25_retriever = BM25Retriever(self.db_path)
-                await self.bm25_retriever.initialize()
-
             self.vec_retriever = VectorRetriever(self.faiss_db, self.config)
             self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
             self._is_ready = True
@@ -232,7 +235,7 @@ class MemoryEngine:
                     await self.v2_store.record_migration("2_index_rebuild", status="applied", detail=f"rebuilt={rebuilt}")
                 except Exception as exc:
                     await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])
-                    logger.debug(f"[MemoryV2] index rebuild degraded: {exc}")
+                    logger.warning(f"[MemoryV2] index rebuild degraded: {exc}")
             logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
             return True
 
@@ -330,8 +333,10 @@ class MemoryEngine:
         )
 
     def _remember_cognitive_feedback(self, signal: CognitiveFeedbackSignal) -> None:
-        items = [*self._cognitive_feedback_cache.get(signal.chat_id, []), signal]
-        self._cognitive_feedback_cache[signal.chat_id] = items[-32:]
+        items = self._cognitive_feedback_cache.setdefault(signal.chat_id, [])
+        items.append(signal)
+        if len(items) > 32:
+            del items[:-32]
 
     @staticmethod
     def _cognitive_feedback_key(signal: CognitiveFeedbackSignal) -> tuple[str, str, str, str]:
@@ -388,7 +393,10 @@ class MemoryEngine:
                 importance=signal.importance,
                 confidence=0.8,
                 metadata={"guidance": signal.guidance, "cognitive_feedback": True},
-                dedup_key=f"feedback:{chat_id}:{signal.source}:{signal.summary}:{signal.guidance}",
+                dedup_key=(
+                    f"feedback:{chat_id}:{signal.source}:"
+                    f"{hashlib.sha1(f'{signal.summary}|{signal.guidance}'.encode()).hexdigest()[:20]}"
+                ),
                 source_ref=f"cognitive_feedback:{signal.source}",
                 visibility="tool_only",
             )
@@ -417,49 +425,43 @@ class MemoryEngine:
             signals.append(item)
 
         try:
-            columns = [row[1] for row in await self._run_documents_query("PRAGMA table_info(documents)")]
-            if columns:
-                text_col = "page_content" if "page_content" in columns else ("content" if "content" in columns else "text")
-                where = [
-                    "json_extract(metadata, '$.session_id') = ?",
-                    f"{text_col} LIKE '[cognitive_feedback:%'",
-                ]
-                params: list[Any] = [chat_id]
-                if max_age_seconds is not None:
-                    where.append("json_extract(metadata, '$.create_time') >= ?")
-                    params.append(now - max_age_seconds)
-                rows = await self._run_documents_query(
-                    f"""
-                    SELECT {text_col}, metadata
-                    FROM documents
-                    WHERE {' AND '.join(where)}
-                    ORDER BY COALESCE(json_extract(metadata, '$.create_time'), 0) DESC
-                    LIMIT ?
-                    """,
-                    (*params, max(limit * 4, limit)),
+            where = ["kind = ?", "session_id = ?"]
+            params: list[Any] = ["feedback", chat_id]
+            if max_age_seconds is not None:
+                where.append("create_time >= ?")
+                params.append(now - max_age_seconds)
+            rows = await self._run_documents_query(
+                f"""
+                SELECT content, metadata, create_time
+                FROM canonical_memories
+                WHERE {' AND '.join(where)}
+                ORDER BY create_time DESC
+                LIMIT ?
+                """,
+                (*params, max(limit * 4, limit)),
+                db_path=self.v2_db_path,
+            )
+            for text, metadata_raw, create_time_raw in rows:
+                timestamp = float(create_time_raw or 0.0)
+                importance = 0.5
+                try:
+                    metadata = json.loads(metadata_raw or "{}") if isinstance(metadata_raw, str) else {}
+                    importance = float(metadata.get("importance") or 0.5)
+                except Exception:
+                    pass
+                parsed = self._parse_cognitive_feedback_content(
+                    str(text or ""),
+                    chat_id=chat_id,
+                    timestamp=timestamp,
+                    importance=importance,
                 )
-                for text, metadata_raw in rows:
-                    timestamp = 0.0
-                    importance = 0.5
-                    try:
-                        metadata = json.loads(metadata_raw or "{}") if isinstance(metadata_raw, str) else {}
-                        timestamp = float(metadata.get("create_time") or 0.0)
-                        importance = float(metadata.get("importance") or 0.5)
-                    except Exception:
-                        pass
-                    parsed = self._parse_cognitive_feedback_content(
-                        str(text or ""),
-                        chat_id=chat_id,
-                        timestamp=timestamp,
-                        importance=importance,
-                    )
-                    if not parsed:
-                        continue
-                    if source_filter and parsed.source not in source_filter:
-                        continue
-                    signals.append(parsed)
+                if not parsed:
+                    continue
+                if source_filter and parsed.source not in source_filter:
+                    continue
+                signals.append(parsed)
         except Exception as exc:
-            logger.debug(f"[MemoryEngine] cognitive feedback lookup degraded: {exc}")
+            logger.warning(f"[MemoryEngine] cognitive feedback lookup from canonical_memories degraded: {exc}")
 
         unique: list[CognitiveFeedbackSignal] = []
         seen: set[tuple[str, str, str]] = set()
@@ -514,18 +516,23 @@ class MemoryEngine:
             return "(no relevant persona lore found)"
         return "\n".join(f"[fact] {item.summary or item.content}" for item in candidates)
 
-    async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None) -> str:
+    async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None, layers: list[str] | None = None) -> str:
         recall_top_k = top_k if top_k is not None else getattr(getattr(self.config, "memory", None), "recall_top_k", 5)
         memory_query = MemoryQuery(
             query=str(query or ""),
             session_id=str(session_id or ""),
             persona_id=str(persona_id or ""),
+            layers=list(layers or []),
             top_k=int(recall_top_k or 5),
+            exclude_kinds=["feedback"],
         )
+        candidates = await self.retrieval_service.retrieve(memory_query)
+        # Safety net: exclude_kinds in MemoryQuery handles the v2_store path,
+        # but hybrid search results may still contain feedback items.  The
+        # content-based check catches those as a defense-in-depth measure.
         candidates = [
-            item
-            for item in await self.retrieval_service.retrieve(memory_query)
-            if not self._is_cognitive_feedback_content(item.content)
+            item for item in candidates
+            if not self._is_cognitive_feedback_content(getattr(item, "content", ""))
         ]
         if not candidates:
             return f"No relevant memory found for '{query}'."

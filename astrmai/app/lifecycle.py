@@ -51,6 +51,7 @@ class PluginLifecycleManager:
         await self.start_expression_governance_services()
         await self.start_proactive_services()
         await self.start_visual_services()
+        self.runtime.status.is_running = True
         self.start_background_services()
         await self.start_workmode_guard()
         self.runtime.status.lifecycle_started = True
@@ -151,10 +152,15 @@ class PluginLifecycleManager:
 
     async def terminate(self) -> None:
         logger.info("[AstrMai] 正在终止进程并卸载资源...")
-        self.runtime.status.is_running = False
-        self.runtime.status.lifecycle_started = False
         self.runtime.set_boot_phase("shutdown.start")
 
+        try:
+            await self._terminate_impl()
+        finally:
+            self._reset_runtime_status_flags()
+            self.runtime.set_boot_phase("shutdown.complete")
+
+    async def _terminate_impl(self) -> None:
         try:
             memory_pipeline = getattr(self.runtime.memory_engine, "memory_pipeline", None)
             if memory_pipeline:
@@ -204,15 +210,20 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.warning(f"[AstrMai] Background task cleanup degraded: {exc}")
 
-        self._reset_runtime_status_flags()
-        self.runtime.set_boot_phase("shutdown.complete")
-
     def _reset_runtime_status_flags(self) -> None:
-        """Reset startup-phase status flags to False.
+        """Reset all runtime status flags for a clean shutdown slate.
 
-        is_running and lifecycle_started are reset directly in terminate()
-        before this method runs, so they are intentionally absent here.
+        Called at the end of terminate() so all flags are consistently
+        managed in one place.
         """
+        # Runtime lifecycle flags
+        self.runtime.status.is_running = False
+        self.runtime.status.lifecycle_started = False
+        # Bootstrap / startup flags
+        self.runtime.status.bootstrap_completed = False
+        self.runtime.status.boot_logged = False
+        self.runtime.status.work_mode_enabled = False
+        # Subsystem initialization flags
         self.runtime.status.memory_initialized = False
         self.runtime.status.proactive_started = False
         self.runtime.status.visual_started = False

@@ -469,9 +469,7 @@ class PluginBootstrap:
             )
             if runtime.system2_planner is not None:
                 runtime.system2_planner.heartflow_manager = proactive_task.heartflow_manager
-            proactive_task.auto_check_task = None
-            proactive_task.reflect_tracker = None
-            proactive_task.review_dispatcher.reflect_tracker = None
+            self._nullify_proactive_refs(proactive_task)
             proactive_task.dream_scheduler.dream_visible = runtime.feature_flags.dream_visible
             proactive_task.set_db_service(runtime.db_service)
             proactive_task.bind_chat_loop_kernel(runtime.chat_loop_kernel)
@@ -479,6 +477,20 @@ class PluginBootstrap:
         except Exception as exc:
             self._record_optional_failure(runtime, "proactive.task", exc)
             return None
+
+    @staticmethod
+    def _nullify_proactive_refs(proactive_task: ProactiveTask) -> None:
+        """Clear cross-service references that are set during construction.
+
+        These attributes are owned by ProactiveTask but are currently
+        nullified here because the bootstrap phase wires lifecycle services
+        (auto_check_task, reflect_tracker) separately.  When ProactiveTask
+        grows a ``configure(deps: ProactiveDependencies)`` method these
+        assignments should move there.
+        """
+        proactive_task.auto_check_task = None
+        proactive_task.reflect_tracker = None
+        proactive_task.review_dispatcher.reflect_tracker = None
 
     def _bind_learning_collaboration(self, runtime: PluginRuntimeContext, evolution: EvolutionManager) -> None:
         if runtime.event_bus is None:

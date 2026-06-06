@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -66,7 +67,7 @@ class LifecycleServices:
 @dataclass(slots=True)
 class RuntimeStatus:
     boot_phase: str = "created"
-    is_running: bool = True
+    is_running: bool = False
     boot_logged: bool = False
     bootstrap_completed: bool = False
     lifecycle_started: bool = False
@@ -77,12 +78,14 @@ class RuntimeStatus:
     visual_started: bool = False
     cron_guard_started: bool = False
     degraded_components: dict[str, str] = field(default_factory=dict)
+    _degraded_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def set_phase(self, phase: str) -> None:
         self.boot_phase = phase
 
     def mark_degraded(self, component: str, reason: str) -> None:
-        self.degraded_components[component] = reason
+        with self._degraded_lock:
+            self.degraded_components[component] = reason
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -97,8 +100,12 @@ class RuntimeStatus:
             "proactive_started": self.proactive_started,
             "visual_started": self.visual_started,
             "cron_guard_started": self.cron_guard_started,
-            "degraded_components": dict(self.degraded_components),
+            "degraded_components": self._snapshot_degraded(),
         }
+
+    def _snapshot_degraded(self) -> dict[str, str]:
+        with self._degraded_lock:
+            return dict(self.degraded_components)
 
 
 @dataclass(slots=True)
@@ -287,6 +294,20 @@ class PluginRuntimeContext:
     @property
     def proactive_task(self) -> Any:
         return self.lifecycle.proactive_task
+
+    @property
+    def chat_loop_kernel_with_fallback(self) -> Any:
+        """Return the chat loop kernel, falling back to proactive_task's copy.
+
+        The primary kernel lives on ``self.chat_loop_kernel`` (set during
+        bootstrap).  When that is None the proactive task may still hold a
+        reference — this property encapsulates the fallback so callers do not
+        need to reach into ProactiveTask internals.
+        """
+        if self.chat_loop_kernel is not None:
+            return self.chat_loop_kernel
+        task = self.proactive_task
+        return getattr(task, "chat_loop_kernel", None) if task is not None else None
 
     def iter_task_owners(self) -> tuple[Any, ...]:
         return (

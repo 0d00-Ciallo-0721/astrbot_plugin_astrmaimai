@@ -88,7 +88,9 @@ class ChatStateService:
         today = datetime.date.today().isoformat()
         if state.last_reset_date != today:
             state.last_reset_date = today
-            state.energy = min(1.0, state.energy + self.config.energy.daily_recovery)
+            _energy_cfg = getattr(self.config, "energy", None)
+            daily_recovery = getattr(_energy_cfg, "daily_recovery", 0.05) if _energy_cfg else 0.05
+            state.energy = min(1.0, state.energy + daily_recovery)
             state.mood = 0.0
             self._mark_dirty(state)
 
@@ -222,8 +224,8 @@ class StateEngine:
         lock = self.chat_state_service._get_chat_lock(chat_id)
         async with lock:
             current_state = await self.chat_state_service._get_state_inner(chat_id)
-            current_mood = current_state.mood
             apply_natural_decay(current_state, self.config)
+            current_mood = current_state.mood
 
             if abs(current_mood - snapshot_mood) < 0.001:
                 try:

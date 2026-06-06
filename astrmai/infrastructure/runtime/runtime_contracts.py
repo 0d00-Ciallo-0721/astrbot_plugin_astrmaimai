@@ -66,6 +66,8 @@ class LLMCallResult:
     usage: dict[str, int] = field(default_factory=dict)
     raw_completion: str = ""
     economy: dict[str, Any] = field(default_factory=dict)
+    skipped_cooldown_models: list = field(default_factory=list)
+    cooldown_overridden: bool = False
 
 
 __all__ = [

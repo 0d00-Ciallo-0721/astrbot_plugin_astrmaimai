@@ -251,7 +251,7 @@ class SessionMemorySummarizer:
                     importance=min(0.8, max(0.4, float(importance or 0.4))),
                 )
             except Exception as exc:
-                logger.debug(f"[SessionMemorySummarizer] cognitive feedback write degraded: {exc}")
+                logger.warning(f"[SessionMemorySummarizer] cognitive feedback write degraded: {exc}")
                 await self._observe(session_id, "cognitive_feedback_degraded", level="warning", reason="cognitive_feedback_degraded", summary=str(exc))
 
     @staticmethod

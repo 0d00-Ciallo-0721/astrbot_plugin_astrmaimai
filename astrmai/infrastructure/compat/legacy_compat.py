@@ -87,6 +87,14 @@ def emit_legacy_focus_thread_extras(
         event.set_extra("astrmai_window_events", list(window_events))
 
 
+def _read_freshness_budget(event: Any) -> ReplyFreshnessBudget:
+    """Extract freshness_budget from stored focus context or return default."""
+    stored_focus = event.get_extra("astrmai_focus_thread_context", None)
+    if stored_focus and hasattr(stored_focus, "freshness_budget"):
+        return stored_focus.freshness_budget
+    return ReplyFreshnessBudget()
+
+
 @deprecated(since="v2.0", removal="v3.0", replacement="construct FocusThreadContext from contracts directly")
 def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -> FocusThreadContext:
     focus_event = event.get_extra("astrmai_focus_event", default_event or event)
@@ -108,7 +116,7 @@ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -
         reply_mode=ReplyMode(str(event.get_extra("astrmai_reply_mode", ReplyMode.CASUAL_FOLLOWUP.value) or ReplyMode.CASUAL_FOLLOWUP.value)),
         social_state=str(event.get_extra("astrmai_social_state", "") or ""),
         thread_signature=str(event.get_extra("astrmai_thread_signature", "") or ""),
-        freshness_budget=ReplyFreshnessBudget(),
+        freshness_budget=_read_freshness_budget(event),
     )
 
 

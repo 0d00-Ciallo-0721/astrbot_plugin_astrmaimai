@@ -1650,7 +1650,6 @@ class ContextCompactionEngine(CompactionProviderMixin):
             return ""
         return f"- {speaker}: {text}"
 
-    @staticmethod
     def _build_summary(self, drained_segments) -> str:
         lines: list[str] = []
         token_budget = 0

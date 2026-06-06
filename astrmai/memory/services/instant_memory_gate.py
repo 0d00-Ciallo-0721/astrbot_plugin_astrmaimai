@@ -260,7 +260,7 @@ class InstantMemoryGate:
                 base_origin="",
             )
         except Exception as exc:
-            logger.debug(f"[InstantMemoryGate] instant llm backfill degraded: {exc}")
+            logger.warning(f"[InstantMemoryGate] instant llm backfill degraded: {exc}")
             await self._observe(turn, "backfill_failed", level="error", reason="prompt_backfill_failed", summary=str(exc))
             return InstantGateResult()
         return await self._consume_llm_backfill_response(turn, response)
@@ -280,7 +280,7 @@ class InstantMemoryGate:
                 base_origin="",
             )
         except Exception as exc:
-            logger.debug(f"[InstantMemoryGate] legacy llm backfill degraded: {exc}")
+            logger.warning(f"[InstantMemoryGate] legacy llm backfill degraded: {exc}")
             await self._observe(turn, "backfill_failed", level="error", reason="legacy_backfill_failed", summary=str(exc))
             return InstantGateResult()
         return await self._consume_llm_backfill_response(turn, response)

@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 
 @dataclass(slots=True)
 class MemoryQuery:
+    """Query parameters for memory retrieval.
+
+    ``layers`` is an **inclusion** list of ``kind`` values to retrieve.
+    An empty list means "all kinds" (no filter).  Use ``exclude_kinds`` to
+    subtract specific kinds from the result set after layer filtering.
+
+    .. deprecated:: 2.x
+        ``include_feedback`` and ``retrieve_keys`` are declared for API
+        compatibility but are **not read** by any retrieval path.  Setting them
+        has no effect.  They will be removed in a future major version.
+    """
     query: str
     session_id: str = ""
     persona_id: str = ""
@@ -16,12 +28,31 @@ class MemoryQuery:
     think_level: int | None = None
     intent: str = ""
     time_window: float | None = None
+    exclude_kinds: List[str] = field(default_factory=list)
+    # DEPRECATED: not read by any retrieval path; setting has no effect.
     include_feedback: bool = False
     include_persona_lore: bool = False
     exclude_ids: List[str] = field(default_factory=list)
     allow_stale: bool = False
+    # DEPRECATED: not read by any retrieval path; setting has no effect.
     retrieve_keys: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.include_feedback:
+            warnings.warn(
+                "MemoryQuery.include_feedback is deprecated and has no effect. "
+                "It will be removed in a future major version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if self.retrieve_keys:
+            warnings.warn(
+                "MemoryQuery.retrieve_keys is deprecated and has no effect. "
+                "It will be removed in a future major version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass(slots=True)

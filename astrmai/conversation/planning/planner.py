@@ -1002,6 +1002,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             cognitive_decision = await self.cognitive_loop.decide(
                 event=event,
                 prompt_envelope=prompt_envelope,
+                gate=cognitive_gate,
             )
             if cognitive_decision:
                 cognitive_decision = self.behavior_tuning.apply(
@@ -1230,7 +1231,10 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             direct_vision_urls=direct_vision_urls,
         )
         # stale_drop / executor-failure: executor returned None, skip content-dependent
-        # post-processing and record agency/continuity with tools=None so action_taken="none".
+        # post-processing.  Keep tools=None so action_taken="none" — semantically
+        # correct because no tool was actually executed (tools were built but the
+        # executor dropped the request).  Recording "tool" would mislead downstream
+        # continuity logic into believing a tool call took place.
         if reply_text is None:
             self._record_agency_reflection(chat_id, None, None, cognitive_decision)
             self._record_conversation_continuity(

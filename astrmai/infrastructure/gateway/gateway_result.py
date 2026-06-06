@@ -150,6 +150,8 @@ class GatewayResultMixin:
         model_id: str = "",
         usage: Optional[Dict[str, int]] = None,
         economy: Optional[Dict[str, Any]] = None,
+        skipped_cooldown_models: Optional[List[Dict[str, Any]]] = None,
+        cooldown_overridden: bool = False,
     ) -> LLMCallResult:
         capabilities = infer_provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
@@ -161,6 +163,8 @@ class GatewayResultMixin:
             usage=usage or {},
             raw_completion=text,
             economy=dict(economy or {}),
+            skipped_cooldown_models=list(skipped_cooldown_models or []),
+            cooldown_overridden=bool(cooldown_overridden),
         )
 
     def _bot_speaker_names(self) -> List[str]:

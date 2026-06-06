@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import time
 import uuid
@@ -49,10 +50,12 @@ class MemoryV2Store:
     index is offline.
     """
 
-    def __init__(self, db_path: str, *, data_path: Path | None = None):
+    def __init__(self, db_path: str, *, data_path: Path | None = None, legacy_db_path: str | None = None):
         self.db_path = str(db_path)
         self.data_path = Path(data_path) if data_path else Path(db_path).parent
+        self.legacy_db_path = str(legacy_db_path) if legacy_db_path else None
         self._initialized = False
+        self._migrated_from_legacy = False
         self.last_physical_delete_ids: list[str] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_locks_guard = asyncio.Lock()
@@ -136,6 +139,7 @@ class MemoryV2Store:
         if self._initialized:
             return
         backup_dir = await self._backup_legacy_once()
+        await self._migrate_from_legacy_db()
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
@@ -254,6 +258,75 @@ class MemoryV2Store:
         except Exception as exc:
             logger.warning(f"[MemoryV2] legacy backup skipped: {exc}")
             return None
+
+    async def _migrate_from_legacy_db(self) -> None:
+        if self._migrated_from_legacy:
+            return
+        if not self.legacy_db_path or not os.path.isfile(self.legacy_db_path):
+            self._migrated_from_legacy = True
+            return
+        if os.path.isfile(self.db_path):
+            self._migrated_from_legacy = True
+            return
+        try:
+            legacy = aiosqlite.connect(self.legacy_db_path)
+            target = aiosqlite.connect(self.db_path)
+            async with legacy as leg_db, target as tgt_db:
+                cursor = await leg_db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='canonical_memories'"
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    self._migrated_from_legacy = True
+                    return
+                await tgt_db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS canonical_memories (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT DEFAULT '',
+                        sender_id TEXT DEFAULT '',
+                        persona_id TEXT DEFAULT '',
+                        source TEXT DEFAULT '',
+                        kind TEXT DEFAULT '',
+                        content TEXT DEFAULT '',
+                        summary TEXT DEFAULT '',
+                        tags TEXT DEFAULT '[]',
+                        importance REAL DEFAULT 0.5,
+                        confidence REAL DEFAULT 0.8,
+                        status TEXT DEFAULT 'active',
+                        decay_score REAL DEFAULT 1.0,
+                        create_time REAL DEFAULT 0,
+                        update_time REAL DEFAULT 0,
+                        last_access_time REAL DEFAULT 0,
+                        access_count INTEGER DEFAULT 0,
+                        superseded_by TEXT DEFAULT '',
+                        deleted_reason TEXT DEFAULT '',
+                        metadata TEXT DEFAULT '{}',
+                        dedup_key TEXT DEFAULT '',
+                        source_ref TEXT DEFAULT '',
+                        visibility TEXT DEFAULT 'auto_and_tool'
+                    )
+                    """
+                )
+                await tgt_db.execute("ATTACH DATABASE ? AS legacy_src", (self.legacy_db_path,))
+                await tgt_db.execute(
+                    "INSERT INTO main.canonical_memories SELECT * FROM legacy_src.canonical_memories"
+                )
+                await tgt_db.execute("DETACH DATABASE legacy_src")
+                await tgt_db.commit()
+            count = 0
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("SELECT COUNT(*) FROM canonical_memories")
+                row = await cursor.fetchone()
+                count = int(row[0]) if row else 0
+            logger.info(
+                f"[MemoryV2] migrated {count} canonical_memories rows from "
+                f"{self.legacy_db_path} → {self.db_path}"
+            )
+            self._migrated_from_legacy = True
+        except Exception as exc:
+            logger.warning(f"[MemoryV2] legacy migration skipped: {exc}")
+            self._migrated_from_legacy = True
 
     @staticmethod
     def _now() -> float:

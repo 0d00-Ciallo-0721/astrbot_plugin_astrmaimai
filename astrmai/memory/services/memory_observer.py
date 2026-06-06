@@ -124,7 +124,7 @@ class MemoryObserver:
                 }
             )
         except Exception as exc:
-            logger.debug(f"[MemoryObserver] raw trace append degraded: {exc}")
+            logger.warning(f"[MemoryObserver] raw trace append degraded: {exc}")
 
     async def _record_global_observability(self, event: dict[str, Any]) -> None:
         hub = self.observability_hub
@@ -162,7 +162,7 @@ class MemoryObserver:
                 raw=dict(formatted or {}),
             )
         except Exception as exc:
-            logger.debug(f"[MemoryObserver] global observability degraded: {exc}")
+            logger.warning(f"[MemoryObserver] global observability degraded: {exc}")
 
     @staticmethod
     def _infer_kind(event: dict[str, Any]) -> str:

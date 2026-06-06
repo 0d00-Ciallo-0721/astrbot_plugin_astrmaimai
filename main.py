@@ -48,12 +48,12 @@ class AstrMaiPlugin(Star):
     async def list_pending_expression_reviews(self, group_id: str = "", limit: int = 50):
         return await self.facade.list_pending_expression_reviews(group_id=group_id, limit=limit)
 
-    async def get_expression_review_detail(self, pattern_id: int):
+    async def get_expression_review_detail(self, pattern_id: str):
         return await self.facade.get_expression_review_detail(pattern_id)
 
     async def submit_expression_review(
         self,
-        pattern_id: int,
+        pattern_id: str,
         decision: str,
         reviewer_id: str,
         replacement_expression: str = "",

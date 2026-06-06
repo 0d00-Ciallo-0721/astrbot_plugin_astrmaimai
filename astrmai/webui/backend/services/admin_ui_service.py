@@ -573,97 +573,31 @@ class AdminUiService:
             "runtime_bound": self.plugin_api.facade is not None,
         }
 
+    # ── heartflow (delegated to HeartflowService) ──
+
     async def heartflow_status(self) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        data = manager.describe_status() if manager and hasattr(manager, "describe_status") else {"enabled": False}
-        return {"status": "ok", "data": data, "runtime_bound": manager is not None}
+        return await self._heartflow.heartflow_status()
 
     async def heartflow_chats(self) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        if not manager:
-            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
-        states = []
-        states_dict = getattr(manager, "get_all_states", None)
-        if callable(states_dict):
-            try:
-                states_dict = states_dict()
-            except Exception:
-                states_dict = {}
-        manager_states = states_dict if isinstance(states_dict, dict) else getattr(manager, "_states", {})
-        for chat_id, state in manager_states.items():
-            item = self._as_dict(state)
-            item["chat_id"] = chat_id
-            if hasattr(manager, "get_session"):
-                item["session"] = self._as_dict(manager.get_session(chat_id))
-            if hasattr(manager, "get_latest_action_decision"):
-                item["latest_action_decision"] = self._as_dict(manager.get_latest_action_decision(chat_id))
-            if hasattr(manager, "get_latest_impulse_decision"):
-                item["latest_impulse_decision"] = self._as_dict(manager.get_latest_impulse_decision(chat_id))
-            states.append(item)
-        states.sort(key=lambda item: float(item.get("last_activity_ts", 0.0) or 0.0), reverse=True)
-        return {"status": "ok", "items": states, "total": len(states), "runtime_bound": True}
+        return await self._heartflow.heartflow_chats()
 
     async def heartflow_chat(self, chat_id: str) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        state = manager.get_state(chat_id) if manager and hasattr(manager, "get_state") else None
-        session = manager.get_session(chat_id) if manager and hasattr(manager, "get_session") else None
-        pulse = manager.get_latest_pulse(chat_id) if manager and hasattr(manager, "get_latest_pulse") else None
-        decision = manager.get_latest_impulse_decision(chat_id) if manager and hasattr(manager, "get_latest_impulse_decision") else None
-        action = manager.get_latest_action_decision(chat_id) if manager and hasattr(manager, "get_latest_action_decision") else None
-        return {
-            "status": "ok",
-            "data": {
-                "state": self._as_dict(state),
-                "session": self._as_dict(session),
-                "latest_pulse": self._as_dict(pulse),
-                "latest_impulse_decision": self._as_dict(decision),
-                "latest_action_decision": self._as_dict(action),
-            },
-            "runtime_bound": manager is not None,
-        }
+        return await self._heartflow.heartflow_chat(chat_id)
 
     async def heartflow_impulses(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        if not manager or not hasattr(manager, "list_impulse_decisions"):
-            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
-        items = [self._as_dict(item) for item in manager.list_impulse_decisions(chat_id=chat_id, limit=limit)]
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": True}
+        return await self._heartflow.heartflow_impulses(chat_id=chat_id, limit=limit)
 
     async def heartflow_timeline(self, chat_id: str | None = None, limit: int = 80) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        if not manager or not hasattr(manager, "list_timeline"):
-            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
-        items = list(manager.list_timeline(chat_id=chat_id, limit=limit))
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": True}
+        return await self._heartflow.heartflow_timeline(chat_id=chat_id, limit=limit)
 
     async def heartflow_topic_digests(self, limit: int = 50) -> dict[str, Any]:
-        service = self.plugin_api.get_heartflow_topic_digest_service()
-        if not service or not hasattr(service, "list_digests"):
-            return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
-        items = [self._as_dict(item) for item in service.list_digests(limit=limit)]
-        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": True}
+        return await self._heartflow.heartflow_topic_digests(limit=limit)
 
     async def heartflow_hidden_context(self, chat_id: str) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        context = manager.get_hidden_context(chat_id) if manager and hasattr(manager, "get_hidden_context") else ""
-        return {"status": "ok", "data": {"chat_id": chat_id, "hidden_context": context}, "runtime_bound": manager is not None}
+        return await self._heartflow.heartflow_hidden_context(chat_id)
 
     async def clear_heartflow_cooldowns(self, chat_id: str) -> dict[str, Any]:
-        manager = self.plugin_api.get_heartflow_manager()
-        if not manager:
-            return {"status": "ok", "changed": False, "runtime_bound": False}
-        getattr(manager, "_pulses_by_chat", {}).pop(chat_id, None)
-        getattr(manager, "_impulse_decisions_by_chat", {}).pop(chat_id, None)
-        getattr(manager, "_action_decisions_by_chat", {}).pop(chat_id, None)
-        state = manager.get_state(chat_id) if hasattr(manager, "get_state") else None
-        if state:
-            state.cooldown_tags = []
-        session = manager.get_session(chat_id) if hasattr(manager, "get_session") else None
-        if session:
-            session.consecutive_observe_count = 0
-            session.consecutive_no_reply_count = 0
-            session.consecutive_prepare_count = 0
-        return {"status": "ok", "changed": True, "runtime_bound": True}
+        return await self._heartflow.clear_heartflow_cooldowns(chat_id)
 
     async def recent_decisions(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
         planner = self.plugin_api.get_planner()
@@ -1136,8 +1070,12 @@ class AdminUiService:
             changed = await coordinator.clear_runtime_state(chat_id)
         manager = self.plugin_api.get_heartflow_manager()
         if manager:
-            getattr(manager, "_pulses_by_chat", {}).pop(chat_id, None)
-            getattr(manager, "_impulse_decisions_by_chat", {}).pop(chat_id, None)
+            # P9-2: use hasattr guards instead of silent getattr().pop() on private attrs
+            for attr_name in ("_pulses_by_chat", "_impulse_decisions_by_chat"):
+                if hasattr(manager, attr_name):
+                    private_dict = getattr(manager, attr_name)
+                    if isinstance(private_dict, dict):
+                        private_dict.pop(chat_id, None)
             state = manager.get_state(chat_id) if hasattr(manager, "get_state") else None
             if state:
                 state.cooldown_tags = []

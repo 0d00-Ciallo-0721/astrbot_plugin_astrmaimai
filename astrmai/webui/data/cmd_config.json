@@ -163,6 +163,7 @@
         "::1"
     ],
     "dashboard": {
+        "_security_note": "⚠️ MD5 is cryptographically broken. If AstrBot dashboard auth supports it, replace this with a scrypt hash (see astrmai README security section). Default 'astrbot' should be changed on first deploy.",
         "enable": true,
         "username": "astrbot",
         "password": "77b90590a8945a7d36c963981a307dc9",

@@ -253,6 +253,8 @@ class GatewayCallMixin:
                                 model_id=model_id,
                                 usage=usage,
                                 economy=economy_payload,
+                                skipped_cooldown_models=skipped_cooldown_models,
+                                cooldown_overridden=cooldown_overridden,
                             )
 
                         safe_text, failure_kind = validate_visible_output_text(
@@ -291,6 +293,8 @@ class GatewayCallMixin:
                             model_id=model_id,
                             usage=usage,
                             economy=economy_payload,
+                            skipped_cooldown_models=skipped_cooldown_models,
+                            cooldown_overridden=cooldown_overridden,
                         )
                     except Exception as exc:
                         last_error = str(exc)

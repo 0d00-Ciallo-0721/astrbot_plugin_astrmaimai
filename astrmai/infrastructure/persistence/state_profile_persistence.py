@@ -7,10 +7,14 @@ from typing import Any, Dict, Optional
 
 import aiosqlite
 
-from .orm_models import ChatState
+from .orm_models import ChatState, LastMessageMetadata
 
 
 class StateProfilePersistenceMixin:
+    # Cached column names -- avoids PRAGMA table_info on every load
+    _chat_state_cols_cache: "list | None" = None
+    _user_profile_cols_cache: "list | None" = None
+
     @staticmethod
     def _relationship_vector_from_metadata(profile_metadata: Any) -> Dict[str, Any]:
         if not isinstance(profile_metadata, dict):
@@ -18,15 +22,28 @@ class StateProfilePersistenceMixin:
         relationship_vector = profile_metadata.get("relationship_vector", {})
         return dict(relationship_vector) if isinstance(relationship_vector, dict) else {}
 
+    async def _get_chat_state_cols(self, db) -> list:
+        if self._chat_state_cols_cache is None:
+            cursor = await db.execute("PRAGMA table_info(chat_states)")
+            cols_info = await cursor.fetchall()
+            self._chat_state_cols_cache = [c[1] for c in cols_info]
+        return self._chat_state_cols_cache
+
+    async def _get_user_profile_cols(self, db) -> list:
+        if self._user_profile_cols_cache is None:
+            cursor = await db.execute("PRAGMA table_info(user_profiles)")
+            cols_info = await cursor.fetchall()
+            self._user_profile_cols_cache = [c[1] for c in cols_info]
+        return self._user_profile_cols_cache
+
     async def load_chat_state(self, chat_id: str) -> Optional[Dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
             row = await cursor.fetchone()
             if row:
-                cursor2 = await db.execute("PRAGMA table_info(chat_states)")
-                cols_info = await cursor2.fetchall()
-                col_names = [c[1] for c in cols_info]
+                col_names = await self._get_chat_state_cols(db)
                 row_dict = dict(zip(col_names, row))
+                last_msg_info_raw = json.loads(row_dict.get("last_msg_info") or "{}")
                 return {
                     "chat_id": row_dict.get("chat_id", chat_id),
                     "energy": row_dict.get("energy", 0.5),
@@ -36,16 +53,37 @@ class StateProfilePersistenceMixin:
                     "total_replies": int(row_dict.get("total_replies") or 0),
                     "last_reply_time": float(row_dict.get("last_reply_time") or 0.0),
                     "last_passive_decay_time": float(row_dict.get("last_passive_decay_time") or 0.0),
+                    "total_messages": int(row_dict.get("total_messages") or 0),
+                    "judgment_mode": str(row_dict.get("judgment_mode") or "single"),
+                    "last_msg_info": LastMessageMetadata(
+                        sender_id=last_msg_info_raw.get("sender_id", ""),
+                        has_image=bool(last_msg_info_raw.get("has_image", False)),
+                        image_urls=last_msg_info_raw.get("image_urls", []),
+                        vl_executed=bool(last_msg_info_raw.get("vl_executed", False)),
+                    ),
+                    "last_access_time": float(row_dict.get("last_access_time") or 0.0),
+                    "next_wakeup_timestamp": float(row_dict.get("next_wakeup_timestamp") or 0.0),
+                    "is_dirty": bool(row_dict.get("is_dirty") or False),
                 }
         return None
 
     async def save_chat_state(self, chat_id: str, state: ChatState):
         config_json = json.dumps(state.group_config, ensure_ascii=False)
+        last_msg_info = getattr(state, "last_msg_info", None)
+        last_msg_info_json = json.dumps(
+            {
+                "sender_id": last_msg_info.sender_id if last_msg_info else "",
+                "has_image": last_msg_info.has_image if last_msg_info else False,
+                "image_urls": last_msg_info.image_urls if last_msg_info else [],
+                "vl_executed": last_msg_info.vl_executed if last_msg_info else False,
+            },
+            ensure_ascii=False,
+        )
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO chat_states 
-                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, total_messages, judgment_mode, last_msg_info, last_access_time, next_wakeup_timestamp, is_dirty, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 chat_id,
                 state.energy,
@@ -55,6 +93,12 @@ class StateProfilePersistenceMixin:
                 state.total_replies,
                 float(getattr(state, "last_reply_time", 0.0) or 0.0),
                 float(getattr(state, "last_passive_decay_time", 0.0) or 0.0),
+                int(getattr(state, "total_messages", 0) or 0),
+                str(getattr(state, "judgment_mode", "single") or "single"),
+                last_msg_info_json,
+                float(getattr(state, "last_access_time", 0.0) or 0.0),
+                float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0),
+                int(getattr(state, "is_dirty", False) or False),
                 time.time(),
             ))
             await db.commit()
@@ -64,9 +108,7 @@ class StateProfilePersistenceMixin:
             cursor = await db.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
             if row:
-                cursor2 = await db.execute("PRAGMA table_info(user_profiles)")
-                cols_info = await cursor2.fetchall()
-                col_names = [c[1] for c in cols_info]
+                col_names = await self._get_user_profile_cols(db)
                 row_dict = dict(zip(col_names, row))
                 profile_metadata = json.loads(row_dict.get("profile_metadata") or "{}")
                 return {

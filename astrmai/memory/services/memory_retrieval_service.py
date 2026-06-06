@@ -101,7 +101,7 @@ class MemoryRetrievalService:
             try:
                 candidates = rerank_candidates(candidates, config=self.scoring)
             except Exception as exc:
-                logger.debug(f"[MemoryRetrievalService] temporal rerank degraded: {exc}")
+                logger.warning(f"[MemoryRetrievalService] temporal rerank degraded: {exc}")
             llm_window = max(int(self.scoring.deep_temporal_llm_window or 8), 1)
             temporal_top = candidates[:llm_window]
             temporal_tail = candidates[llm_window:]
@@ -113,7 +113,7 @@ class MemoryRetrievalService:
                     item.metadata.setdefault("deep_guidance", guidance)
             return candidates[: max(int(query.top_k or 5), 1)]
         except Exception as exc:
-            logger.debug(f"[MemoryRetrievalService] deep retrieval degraded: {exc}")
+            logger.warning(f"[MemoryRetrievalService] deep retrieval degraded: {exc}")
             return await self._retrieve_queries(query, [query.query], top_k=query.top_k)
 
     async def _retrieve_queries(self, query: MemoryQuery, queries: list[str], *, top_k: int | None = None) -> list[MemoryCandidate]:
@@ -121,6 +121,10 @@ class MemoryRetrievalService:
         seen: set[str] = set()
         limit = max(int(top_k or query.top_k or 5), 1)
         for query_text in queries:
+            # NOTE: include_feedback and retrieve_keys are intentionally NOT
+            # copied — both are deprecated dead fields (see MemoryQuery
+            # docstring).  Copying them would trigger the DeprecationWarning
+            # on every scoped query creation.
             scoped_query = MemoryQuery(
                 query=query_text,
                 session_id=query.session_id,
@@ -132,11 +136,10 @@ class MemoryRetrievalService:
                 think_level=query.think_level,
                 intent=query.intent,
                 time_window=query.time_window,
-                include_feedback=query.include_feedback,
+                exclude_kinds=list(query.exclude_kinds or []),
                 include_persona_lore=query.include_persona_lore,
                 exclude_ids=list(query.exclude_ids or []),
                 allow_stale=query.allow_stale,
-                retrieve_keys=list(query.retrieve_keys or []),
                 metadata=dict(query.metadata or {}),
             )
             for item in await self._retrieve_once(scoped_query):
@@ -205,19 +208,23 @@ class MemoryRetrievalService:
         hybrid_task = self._hybrid_search(query, visibility_mode)
         canonical_results, hybrid_results = await asyncio.gather(canonical_task, hybrid_task, return_exceptions=True)
         if isinstance(canonical_results, Exception):
-            logger.debug(f"[MemoryRetrievalService] canonical search degraded: {canonical_results}")
+            logger.warning(f"[MemoryRetrievalService] canonical search degraded: {canonical_results}")
             canonical_results = []
         if isinstance(hybrid_results, Exception):
-            logger.debug(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
+            logger.warning(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
             hybrid_results = []
-        return self._fuse_candidates(canonical_results, hybrid_results, query)
+        candidates = self._fuse_candidates(canonical_results, hybrid_results, query)
+        exclude_kinds = {str(item) for item in query.exclude_kinds or [] if str(item).strip()}
+        if exclude_kinds:
+            candidates = [c for c in candidates if c.kind not in exclude_kinds]
+        return candidates
 
     async def _hybrid_search(self, query: MemoryQuery, visibility_mode: str) -> list[MemoryCandidate]:
-        if not self.engine or not hasattr(self.engine, "_search_memories"):
+        if not self.engine or not hasattr(self.engine, "search_memories"):
             return []
         try:
             session_id = "__self_lore__" if query.include_persona_lore or "persona_lore" in query.layers else query.session_id
-            results = await self.engine._search_memories(
+            results = await self.engine.search_memories(
                 query.query,
                 top_k=max(int(query.top_k or 5), 1),
                 session_id=session_id,
@@ -372,7 +379,7 @@ class MemoryRetrievalService:
             queries = response.get("queries", []) if isinstance(response, dict) else []
             cleaned = [str(item).strip() for item in queries if str(item).strip()]
         except Exception as exc:
-            logger.debug(f"[MemoryRetrievalService] deep query rewrite degraded: {exc}")
+            logger.warning(f"[MemoryRetrievalService] deep query rewrite degraded: {exc}")
             cleaned = []
         result = [base_query]
         for item in cleaned:
@@ -423,7 +430,7 @@ class MemoryRetrievalService:
             data = await self._call_deep_json(prompt)
             ranked_ids = [str(item) for item in data.get("ids", []) if str(item).strip()]
         except Exception as exc:
-            logger.debug(f"[MemoryRetrievalService] deep rerank degraded: {exc}")
+            logger.warning(f"[MemoryRetrievalService] deep rerank degraded: {exc}")
             ranked_ids = []
         if not ranked_ids:
             return candidates
@@ -447,7 +454,7 @@ class MemoryRetrievalService:
             data = await self._call_deep_json(prompt)
             return str(data.get("guidance") or "").strip()[:500]
         except Exception as exc:
-            logger.debug(f"[MemoryRetrievalService] deep compress degraded: {exc}")
+            logger.warning(f"[MemoryRetrievalService] deep compress degraded: {exc}")
             return ""
 
     @staticmethod

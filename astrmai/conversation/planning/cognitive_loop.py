@@ -64,8 +64,6 @@ class CognitiveLoop:
         "light_memory",
     }
     COMPLEXITY_HINTS = (
-        "?",
-        "？",
         "为什么",
         "为何",
         "怎么",
@@ -174,6 +172,13 @@ class CognitiveLoop:
         lowered = current_text.lower()
         if any(token in current_text or token in lowered for token in self.COMPLEXITY_HINTS):
             return CognitiveLoopGateDecision(True, "", ["legacy_complexity"], False)
+        # Single-char `?` / `？` are too noisy for COMPLEXITY_HINTS (match URLs,
+        # emoji, punctuation).  Only treat as complexity when the non-whitespace,
+        # non-question-mark text is non-trivial (≥ 3 chars).
+        compact = "".join(current_text.split())
+        meaningful = compact.replace("?", "").replace("？", "")
+        if ("?" in current_text or "？" in current_text) and len(meaningful) >= 3:
+            return CognitiveLoopGateDecision(True, "", ["legacy_complexity"], False)
         return CognitiveLoopGateDecision(False, "trivial_turn", ["trivial_turn"], False)
 
     async def decide(
@@ -181,9 +186,10 @@ class CognitiveLoop:
         *,
         event: AstrMessageEvent,
         prompt_envelope: PromptEnvelope | None = None,
+        gate: CognitiveLoopGateDecision | None = None,
     ) -> Optional[CognitiveDecision]:
-        gate = self.gate_decision(event, prompt_envelope)
-        self._write_gate_state(event, gate, ran=False)
+        if gate is None:
+            gate = self.gate_decision(event, prompt_envelope)
         if not gate.should_run:
             return None
         try:
@@ -232,7 +238,7 @@ class CognitiveLoop:
                 tool_name=tool_name,
                 tool_query=tool_query,
             )
-            final_prompt = self._build_finalize_prompt(event, prompt_envelope, data, observation)
+            final_prompt = self._build_finalize_prompt(prompt, data, observation)
             final_raw = await self.gateway.call_data_process_task(
                 final_prompt,
                 system_prompt=self.FINAL_SYSTEM_PROMPT,
@@ -402,13 +408,12 @@ class CognitiveLoop:
 
     def _build_finalize_prompt(
         self,
-        event: AstrMessageEvent,
-        prompt_envelope: PromptEnvelope | None,
+        initial_prompt: str,
         prior_data: dict[str, Any],
         observation: str,
     ) -> str:
         return (
-            f"{self._build_initial_prompt(event, prompt_envelope)}\n\n"
+            f"{initial_prompt}\n\n"
             "Previous tentative decision:\n"
             f"{json.dumps(prior_data, ensure_ascii=False)}\n\n"
             "Readonly observation:\n"
@@ -425,13 +430,51 @@ class CognitiveLoop:
         try:
             return json.loads(text)
         except Exception:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
+            chunk = self._extract_braced_json(text)
+            if chunk is None:
                 return {}
             try:
-                return json.loads(match.group(0))
+                return json.loads(chunk)
             except Exception:
                 return {}
+
+    @staticmethod
+    def _extract_braced_json(text: str) -> str | None:
+        r"""Extract the first complete JSON object from text by counting braces.
+
+        This handles nested objects/arrays correctly, unlike greedy
+        ``re.search(r"\{.*\}", text, re.DOTALL)`` which can match from the
+        first ``{`` to the last ``}`` and produce invalid JSON.
+
+        Braces inside JSON string literals are ignored so that values like
+        ``{"key": "text with { in it}"}`` are not miscounted.
+        """
+        start = text.find('{')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
 
     def _build_decision(self, data: dict[str, Any]) -> CognitiveDecision:
         action = self._normalize_action(data.get("action"))

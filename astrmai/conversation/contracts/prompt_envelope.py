@@ -7,6 +7,30 @@ from .focus_context import FreshnessState, ReplyMode
 
 @dataclass
 class PromptEnvelope:
+    # ── Prompt injection defense helpers ────────────────────────────
+    @staticmethod
+    def sanitize_user_input(text: str) -> str:
+        """Wrap user-supplied text in boundary tags to prevent prompt injection.
+
+        LLM system prompts should instruct the model to treat only content
+        inside ``<user_input>`` tags as the real user message.
+        """
+        if not text or not str(text).strip():
+            return str(text or "")
+        return f"<user_input>\n{text}\n</user_input>"
+
+    @staticmethod
+    def sanitize_memory_content(text: str) -> str:
+        """Wrap retrieved-memory content to prevent persistent prompt injection.
+
+        Malicious content stored in memory could contain pseudo-instructions.
+        This tagging allows the system prompt to instruct the model to treat
+        ``<retrieved_memory>`` content as reference only.
+        """
+        if not text or not str(text).strip():
+            return str(text or "")
+        return f"<retrieved_memory>\n{text}\n</retrieved_memory>"
+
     raw_user_text: str = ""
     recent_transcript: str = ""
     recent_transcript_source: str = ""

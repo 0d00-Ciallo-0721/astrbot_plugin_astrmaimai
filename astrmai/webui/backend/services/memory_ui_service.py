@@ -114,7 +114,14 @@ class MemoryUiService:
             return {"status": "ok", "runtime_bound": True, "items": list(items or [])}
         return {"status": "ok", "runtime_bound": False, "items": []}
 
+    _ALLOWED_TABLES = {"canonical_memories", "DailyReflection", "MemoryNode"}
+
+    def _validate_table(self, table: str) -> None:
+        if table not in self._ALLOWED_TABLES:
+            raise ValueError(f"Table {table!r} is not in the allowed whitelist")
+
     async def _columns(self, db, table: str) -> set[str]:
+        self._validate_table(table)
         async with db.execute(f"PRAGMA table_info({table})") as cursor:
             rows = await cursor.fetchall()
             return {str(row[1]) for row in rows}

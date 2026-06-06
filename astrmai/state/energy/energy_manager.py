@@ -14,6 +14,15 @@ class EnergyManager:
         return float(self.config.energy.cost_per_reply)
 
     def should_drop_by_energy(self, state: Any, msg_count: int) -> bool:
+        """Return True when the message should be dropped due to low energy.
+
+        .. note::
+            This method has a **side effect**: when it returns ``True``, it
+            also recovers a small amount of energy (``msg_count * cost_per_reply``)
+            and sets ``state.is_dirty = True`` so that the recovery is persisted.
+            Callers should be aware that ``state.energy`` may increase after
+            this call.
+        """
         current_energy = float(getattr(state, "energy", 1.0))
         min_threshold = float(self.config.energy.min_reply_threshold)
         if current_energy >= 0.5:

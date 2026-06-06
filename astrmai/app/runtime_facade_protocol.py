@@ -205,7 +205,11 @@ class RuntimeFacadeProtocol(Protocol):
     # ── system2 / sys3 entry ──
 
     async def enter_sys3_direct(self, event: Any) -> AsyncIterator[Any]:
-        """Execute a /work command via Sys3 direct entry (async generator)."""
+        """Execute a /work command via Sys3 direct entry.
+
+        This is an async generator — use ``async for`` to consume,
+        NOT ``await`` (which would silently return an unconsumed generator).
+        """
         ...
 
     async def update_user_stats(self, user_id: str) -> None:

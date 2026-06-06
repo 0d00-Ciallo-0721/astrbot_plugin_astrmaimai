@@ -31,7 +31,7 @@ class _SyntheticExternalEvent:
         self.message_str = str(self._data.get("message_str", self._data.get("content", "")) or "")
         self.timestamp = float(self._data.get("timestamp", time.time()) or time.time())
         self.unified_msg_origin = str(self._data.get("unified_msg_origin", "") or "")
-        self.message_obj = self._data.get("message_obj")
+        self.message_obj = self._data.get("message_obj")  # reserved for future use
 
     def get_sender_id(self):
         return str(self._data.get("sender_id", "") or "")
@@ -84,7 +84,7 @@ class AttentionGate:
         self.dialogue_store = getattr(state_engine, "dialogue_store", None)
         self.context_compaction = getattr(state_engine, "context_compaction", None)
         if self.context_compaction is None:
-            logger.warning(
+            logger.info(
                 "[AttentionGate] state_engine.context_compaction is None — "
                 "compaction evaluation will be disabled; segments may accumulate unboundedly"
             )

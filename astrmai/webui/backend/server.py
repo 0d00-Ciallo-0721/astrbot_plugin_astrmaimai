@@ -10,7 +10,7 @@ app = FastAPI(title="AstrMai WebUI")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8765"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

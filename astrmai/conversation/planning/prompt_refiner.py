@@ -861,8 +861,8 @@ class PromptRefiner:
         soft_background_block = str(flex_budget_meta.get("soft_background_text", "") or "").strip()
         effective_proactive_recall = memory_text
         injection = ""
-        prompt_envelope.memory_block = memory_text
-        prompt_envelope.background_memory_block = memory_text
+        prompt_envelope.memory_block = PromptEnvelope.sanitize_memory_content(memory_text)
+        prompt_envelope.background_memory_block = PromptEnvelope.sanitize_memory_content(memory_text)
         prompt_envelope.background_memory_sections = dict(memory_meta.get("sections", {}) or {})
         prompt_envelope.background_memory_budget_chars = int(flex_budget_meta.get("budget_chars", 0) or 0)
         prompt_envelope.background_memory_trimmed_sections = [
@@ -955,15 +955,17 @@ class PromptRefiner:
         final_prompt = "\n\n".join(section for section in sections if section).strip()
 
         if getattr(getattr(self.config, "global_settings", None), "debug_mode", False):
+            # Security: truncate user-facing text to 80 chars in debug logs
+            # to reduce risk of conversation content leak via log files.
             logger.debug(
                 f"[{event.unified_msg_origin}] PromptRefiner preview "
-                f"raw_user_text={raw_user_text[:120]!r} "
-                f"focus_message={focus_message_text[:160]!r} "
-                f"direct_context={direct_context_text[:120]!r} "
-                f"related_context={related_context_text[:120]!r} "
-                f"background={background_window_text[:120]!r} "
-                f"warm_transcript={warm_zone_transcript[:160]!r} "
-                f"recent_transcript={recent_transcript[:160]!r} "
+                f"raw_user_text={raw_user_text[:80]!r} "
+                f"focus_message={focus_message_text[:80]!r} "
+                f"direct_context={direct_context_text[:80]!r} "
+                f"related_context={related_context_text[:80]!r} "
+                f"background={background_window_text[:80]!r} "
+                f"warm_transcript={warm_zone_transcript[:80]!r} "
+                f"recent_transcript={recent_transcript[:80]!r} "
                 f"focus_reason={focus_reason!r} "
                 f"focus_thread_reason={focus_thread_reason!r} "
                 f"near_context_priority={near_context_priority}"

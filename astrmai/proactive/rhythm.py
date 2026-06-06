@@ -84,13 +84,19 @@ def evaluate_proactive_rhythm(config: Any = None, *, now: float | None = None) -
     local = time.localtime(current)
     now_minutes = int(local.tm_hour) * 60 + int(local.tm_min)
     life = getattr(config, "life", None) if config is not None else None
-    reply = getattr(config, "reply", None)
+    reply = getattr(config, "reply", None) if config is not None else None
     if config is None:
         ranges = ()
+    elif life is None:
+        ranges = DEFAULT_QUIET_HOURS
     else:
         ranges = _normalize_ranges(getattr(life, "proactive_quiet_hours", _MISSING))
     quiet = any(_in_range(now_minutes, item) for item in ranges)
-    raw_frequency = getattr(reply, "base_frequency", 0.7)
+
+    if reply is None:
+        raw_frequency = 0.7
+    else:
+        raw_frequency = getattr(reply, "base_frequency", 0.7)
     base_frequency = _clamp(float(0.7 if raw_frequency is None else raw_frequency))
     factor = _clamp(1.0 + (0.7 - base_frequency) * 0.25, 0.88, 1.12)
     return ProactiveRhythm(

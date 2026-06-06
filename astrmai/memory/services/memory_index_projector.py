@@ -51,7 +51,7 @@ class MemoryIndexProjector:
             metadata.update(dict(request.metadata or {}))
             await self.engine.retriever.add_memory(request.content, metadata)
         except Exception as exc:
-            logger.debug(f"[MemoryIndexProjector] projection degraded: {exc}")
+            logger.warning(f"[MemoryIndexProjector] projection degraded: {exc}")
 
     async def delete_projection(self, memory_id: str) -> int:
         return await self.cleanup_deleted([memory_id])
@@ -73,7 +73,7 @@ class MemoryIndexProjector:
                 )
                 await self._delete_fts_rows(doc_ids)
             except Exception as exc:
-                logger.debug(f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc}")
+                logger.warning(f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc}")
         return deleted
 
     async def rebuild_all(self) -> int:
@@ -188,7 +188,7 @@ class MemoryIndexProjector:
                 "SELECT id, metadata FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL"
             )
         except Exception as exc:
-            logger.debug(f"[MemoryIndexProjector] consistency scan degraded: {exc}")
+            logger.warning(f"[MemoryIndexProjector] consistency scan degraded: {exc}")
             return []
         result: list[tuple[int, str]] = []
         for row in rows:
@@ -216,7 +216,7 @@ class MemoryIndexProjector:
                     (doc_id,),
                 )
             except Exception as exc:
-                logger.debug(f"[MemoryIndexProjector] fts cleanup degraded for {doc_id}: {exc}")
+                logger.warning(f"[MemoryIndexProjector] fts cleanup degraded for {doc_id}: {exc}")
         return deleted
 
 

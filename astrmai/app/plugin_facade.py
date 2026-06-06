@@ -23,8 +23,8 @@ class PluginFacade(RuntimeFacadeProtocol):
             from ..webui.backend.adapters.plugin_api import set_active_facade
 
             set_active_facade(self)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Failed to register WebUI facade adapter: {exc}")
 
     async def list_pending_expression_reviews(self, group_id: str = "", limit: int = 50):
         return await self.runtime.review_service.list_pending_reviews(group_id=group_id or None, limit=limit)
@@ -252,11 +252,7 @@ class PluginFacade(RuntimeFacadeProtocol):
         return getattr(self.runtime, "reflect_tracker", None)
 
     def get_chat_loop_kernel(self):
-        kernel = getattr(self.runtime, "chat_loop_kernel", None)
-        if kernel is not None:
-            return kernel
-        task = self.get_proactive_task()
-        return getattr(task, "chat_loop_kernel", None) if task else None
+        return self.runtime.chat_loop_kernel_with_fallback
 
     def get_heartflow_manager(self):
         task = self.get_proactive_task()
@@ -357,19 +353,24 @@ class PluginFacade(RuntimeFacadeProtocol):
                 cmd_mgr = getattr(self.runtime.context, "command_manager", None)
                 if cmd_mgr and hasattr(cmd_mgr, "commands"):
                     registered_cmds.update([str(key).lower() for key in cmd_mgr.commands.keys()])
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"[AstrMai-Filter] Fallback command scan also failed: {exc}")
 
         try:
             extra_cmds = getattr(self.runtime.config.system1, "extra_command_list", [])
             if extra_cmds:
                 registered_cmds.update([str(command).lower() for command in extra_cmds])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[AstrMai-Filter] Extra command list scan failed: {exc}")
 
         return clean_cmd in registered_cmds
 
     async def enter_sys3_direct(self, event):
+        """Execute a /work command via Sys3 direct entry.
+
+        This is an async generator — use ``async for`` to consume,
+        NOT ``await`` (which would silently return an unconsumed generator).
+        """
         if not self.runtime.feature_flags.work_mode_enabled:
             yield event.plain_result("Sys3 work mode is disabled. Please enable it in WebUI first.")
             return

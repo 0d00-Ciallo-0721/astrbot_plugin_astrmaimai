@@ -11,7 +11,10 @@ class WorkCommandRequest:
     @classmethod
     def from_message(cls, message: str) -> "WorkCommandRequest":
         raw = str(message or "")
-        task_query = raw.replace("/work", "", 1).strip() if raw.startswith("/work") else raw.strip()
+        if raw == "/work" or raw.startswith("/work "):
+            task_query = raw.replace("/work", "", 1).strip()
+        else:
+            task_query = raw.strip()
         return cls(raw_message=raw, task_query=task_query)
 
     @property

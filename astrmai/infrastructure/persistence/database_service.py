@@ -11,10 +11,13 @@ from .database_jargon import JargonPersistenceMixin
 from .database_memory import MemoryPersistenceMixin
 from .database_profile_relation import ProfileRelationPersistenceMixin
 from .database_review import ReviewPersistenceMixin
-from .orm_models import ChatState, MessageLog
+from .orm_models import ChatState, LastMessageMetadata, MessageLog
 from .persistence_manager import PersistenceManager
 
 T = TypeVar("T")
+
+# Cache PRAGMA table_info(chat_states) result to avoid repeated schema queries
+_CHAT_STATES_COLUMNS: list[str] | None = None
 
 
 class DatabaseService(
@@ -164,8 +167,11 @@ class DatabaseService(
             row = cursor.fetchone()
             if not row:
                 return None
-            cols_cursor = conn.execute("PRAGMA table_info(chat_states)")
-            col_names = [col[1] for col in cols_cursor.fetchall()]
+            global _CHAT_STATES_COLUMNS
+            if _CHAT_STATES_COLUMNS is None:
+                cols_cursor = conn.execute("PRAGMA table_info(chat_states)")
+                _CHAT_STATES_COLUMNS = [col[1] for col in cols_cursor.fetchall()]
+            col_names = _CHAT_STATES_COLUMNS
             row_dict = dict(zip(col_names, row))
             state = ChatState(
                 chat_id=str(row_dict.get("chat_id", chat_id) or chat_id),
@@ -177,6 +183,18 @@ class DatabaseService(
             state.total_replies = int(row_dict.get("total_replies") or 0)
             state.last_reply_time = float(row_dict.get("last_reply_time") or 0.0)
             state.last_passive_decay_time = float(row_dict.get("last_passive_decay_time") or 0.0)
+            state.total_messages = int(row_dict.get("total_messages") or 0)
+            state.judgment_mode = str(row_dict.get("judgment_mode", "single") or "single")
+            last_msg_info_raw = json.loads(row_dict.get("last_msg_info") or "{}")
+            state.last_msg_info = LastMessageMetadata(
+                sender_id=last_msg_info_raw.get("sender_id", ""),
+                has_image=bool(last_msg_info_raw.get("has_image", False)),
+                image_urls=last_msg_info_raw.get("image_urls", []),
+                vl_executed=bool(last_msg_info_raw.get("vl_executed", False)),
+            )
+            state.last_access_time = float(row_dict.get("last_access_time") or 0.0)
+            state.next_wakeup_timestamp = float(row_dict.get("next_wakeup_timestamp") or 0.0)
+            state.is_dirty = bool(row_dict.get("is_dirty") or False)
             return state
 
     async def add_message_log_async(self, group_id: str, sender_id: str, sender_name: str, content: str):

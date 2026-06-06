@@ -11,17 +11,20 @@ def apply_natural_decay(state: Any, config: Any) -> None:
     if getattr(state, "last_reply_time", 0):
         minutes_silent = (now - state.last_reply_time) / 60.0
 
-    recovery_min = getattr(config.energy, "recovery_silence_min", 60)
+    _energy_cfg = getattr(config, "energy", None)
+    recovery_min = getattr(_energy_cfg, "recovery_silence_min", 60) if _energy_cfg else 60
     if minutes_silent > recovery_min and state.energy < 0.8:
         state.energy = min(0.8, state.energy + 0.1)
         is_dirty = True
 
-    last_decay = getattr(state, "last_passive_decay_time", 0) or now
-    if getattr(state, "last_passive_decay_time", 0) == 0:
+    last_decay = getattr(state, "last_passive_decay_time", None)
+    if last_decay is None or last_decay <= 0.0:
+        last_decay = now
         state.last_passive_decay_time = now
 
-    decay_interval = getattr(config.mood, "decay_interval", 3600)
-    decay_rate = getattr(config.mood, "decay_rate", 0.05)
+    _mood_cfg = getattr(config, "mood", None)
+    decay_interval = getattr(_mood_cfg, "decay_interval", 3600) if _mood_cfg else 3600
+    decay_rate = getattr(_mood_cfg, "decay_rate", 0.05) if _mood_cfg else 0.05
     elapsed = now - last_decay
     if decay_interval > 0 and elapsed >= decay_interval:
         decay_steps = int(elapsed / decay_interval)
