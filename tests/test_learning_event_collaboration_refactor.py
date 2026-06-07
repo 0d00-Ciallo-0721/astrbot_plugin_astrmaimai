@@ -123,6 +123,25 @@ class LearningEventCollaborationTests(unittest.TestCase):
         self.assertEqual(memory_engine.writes[0].kind, "jargon")
         self.assertEqual(memory_engine.writes[0].status, "review_pending")
 
+    def test_trigger_knowledge_update_publishes_topic_without_clearing_signal(self):
+        event_bus = self.bus_mod.EventBus()
+        event_bus._init_bus()
+        received = []
+
+        async def _capture(payload):
+            received.append(payload)
+
+        event_bus.subscribe(event_bus.TOPIC_KNOWLEDGE_UPDATED, _capture)
+
+        async def _run():
+            event_bus.trigger_knowledge_update()
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+
+        self.assertTrue(event_bus.knowledge_updated.is_set())
+        self.assertEqual(received, [{}])
+
 
 if __name__ == "__main__":
     unittest.main()

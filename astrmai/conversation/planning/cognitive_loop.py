@@ -75,7 +75,8 @@ class CognitiveLoop:
         "之前",
         "分析",
         "搜索",
-        "查",
+        "查一下",
+        "查下",
         "工具",
     )
     SYSTEM_PROMPT = (
@@ -177,7 +178,7 @@ class CognitiveLoop:
         # non-question-mark text is non-trivial (≥ 3 chars).
         compact = "".join(current_text.split())
         meaningful = compact.replace("?", "").replace("？", "")
-        if ("?" in current_text or "？" in current_text) and len(meaningful) >= 3:
+        if ("?" in compact or "？" in compact) and len(meaningful) >= 3:
             return CognitiveLoopGateDecision(True, "", ["legacy_complexity"], False)
         return CognitiveLoopGateDecision(False, "trivial_turn", ["trivial_turn"], False)
 

@@ -29,7 +29,7 @@ class PersonaSummarizer:
 
     def _compute_hash(self, text: str) -> str:
         """计算人设内容的 Hash 值，用于缓存 Key"""
-        return hashlib.md5(text.encode("utf-8")).hexdigest()
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def _persona_lane_key(self, cache_key: str) -> LaneKey:
         return LaneKey(subsystem="sys2", task_family="persona", scope_id=cache_key, scope_kind="global")

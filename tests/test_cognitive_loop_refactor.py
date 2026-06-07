@@ -184,6 +184,18 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
         direct_budget_event.set_extra("astrmai_think_level", 1)
         self.assertTrue(loop.should_run(direct_budget_event))
 
+        short_lookup_event = _FakeEvent("查一下")
+        self.assertTrue(loop.should_run(short_lookup_event))
+
+        broad_cha_event = _FakeEvent("别查了")
+        self.assertFalse(loop.should_run(broad_cha_event))
+
+        spaced_question_event = _FakeEvent("a ? b")
+        self.assertFalse(loop.should_run(spaced_question_event))
+
+        bare_question_event = _FakeEvent("？ ")
+        self.assertFalse(loop.should_run(bare_question_event))
+
     def test_cognitive_loop_skips_readonly_tool_step_below_think_level_three(self):
         gateway = _FakeGateway(
             [

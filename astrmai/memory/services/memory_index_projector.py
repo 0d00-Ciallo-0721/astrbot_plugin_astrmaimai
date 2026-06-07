@@ -13,6 +13,9 @@ class MemoryIndexProjector:
     def __init__(self, engine):
         self.engine = engine
 
+    def _documents_db_path(self) -> str | None:
+        return getattr(self.engine, "db_path", None)
+
     async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> None:
         if not memory_id or not getattr(self.engine, "retriever", None):
             return
@@ -65,11 +68,13 @@ class MemoryIndexProjector:
                 rows = await self.engine._run_documents_query(
                     "SELECT id FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
                     (memory_id,),
+                    db_path=self._documents_db_path(),
                 )
                 doc_ids = [row[0] for row in rows if row]
                 deleted += await self.engine._execute_documents_write(
                     "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
                     (memory_id,),
+                    db_path=self._documents_db_path(),
                 )
                 await self._delete_fts_rows(doc_ids)
             except Exception as exc:
@@ -160,6 +165,7 @@ class MemoryIndexProjector:
                   AND json_extract(metadata, '$.session_id') = ?
                 """,
                 (session_id,),
+                db_path=self._documents_db_path(),
             )
             deleted = await self.engine._execute_documents_write(
                 """
@@ -168,14 +174,17 @@ class MemoryIndexProjector:
                   AND json_extract(metadata, '$.session_id') = ?
                 """,
                 (session_id,),
+                db_path=self._documents_db_path(),
             )
             await self._delete_fts_rows([row[0] for row in rows if row])
             return deleted
         rows = await self.engine._run_documents_query(
-            "SELECT id FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL"
+            "SELECT id FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
+            db_path=self._documents_db_path(),
         )
         deleted = await self.engine._execute_documents_write(
-            "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL"
+            "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
+            db_path=self._documents_db_path(),
         )
         await self._delete_fts_rows([row[0] for row in rows if row])
         return deleted
@@ -185,7 +194,8 @@ class MemoryIndexProjector:
             return []
         try:
             rows = await self.engine._run_documents_query(
-                "SELECT id, metadata FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL"
+                "SELECT id, metadata FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
+                db_path=self._documents_db_path(),
             )
         except Exception as exc:
             logger.warning(f"[MemoryIndexProjector] consistency scan degraded: {exc}")
@@ -214,6 +224,7 @@ class MemoryIndexProjector:
                 deleted += await self.engine._execute_documents_write(
                     "DELETE FROM memories_fts WHERE doc_id = ?",
                     (doc_id,),
+                    db_path=self._documents_db_path(),
                 )
             except Exception as exc:
                 logger.warning(f"[MemoryIndexProjector] fts cleanup degraded for {doc_id}: {exc}")

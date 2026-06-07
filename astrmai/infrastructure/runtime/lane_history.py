@@ -15,10 +15,9 @@ from .lane_transcript import LaneTranscriptMixin
 
 
 class LaneHistoryMixin(LaneTranscriptMixin):
-    def _bot_speaker_names(self) -> List[str]:
+    @staticmethod
+    def _bot_speaker_names(nicknames: list) -> List[str]:
         names: List[str] = ["Bot"]
-        settings = getattr(self, "settings", None)
-        nicknames = getattr(settings, "nicknames", []) if settings else []
         if isinstance(nicknames, list):
             names.extend(str(name).strip() for name in nicknames if str(name).strip())
         return list(dict.fromkeys(names))
@@ -79,7 +78,9 @@ class LaneHistoryMixin(LaneTranscriptMixin):
             normalized = sanitize_visible_reply_text(
                 self._stringify_content(content),
                 fallback_text="",
-                speaker_names=self._bot_speaker_names(),
+                speaker_names=self._bot_speaker_names(
+                    getattr(getattr(self, "settings", None), "nicknames", []) if getattr(self, "settings", None) else []
+                ),
             )
             if not normalized:
                 return None
@@ -129,7 +130,9 @@ class LaneHistoryMixin(LaneTranscriptMixin):
             sanitized = sanitize_visible_reply_text(
                 self._stringify_content(content),
                 fallback_text="",
-                speaker_names=self._bot_speaker_names(),
+                speaker_names=self._bot_speaker_names(
+                    getattr(getattr(self, "settings", None), "nicknames", []) if getattr(self, "settings", None) else []
+                ),
             )
             if not sanitized:
                 return None

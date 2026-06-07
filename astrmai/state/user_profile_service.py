@@ -127,7 +127,7 @@ class UserProfileService:
             if not self._clean_text(profile.name):
                 profile.name = _DEFAULT_PROFILE_NAME
             profile.last_access_time = now
-            profile.is_dirty = True
+            profile.is_dirty = False
             self.user_profiles[user_id] = profile
             return profile
 
@@ -499,7 +499,15 @@ class UserProfileService:
         return self.get_profile_prompt_bundle(profile)
 
     async def flush_message_counters(self) -> None:
-        dirty_profiles = [profile for profile in self.user_profiles.values() if getattr(profile, "is_dirty", False)]
-        for profile in dirty_profiles:
-            profile.is_dirty = False
-            await self._save_profile(profile)
+        dirty_user_ids = [
+            user_id
+            for user_id, profile in self.user_profiles.items()
+            if getattr(profile, "is_dirty", False)
+        ]
+        for user_id in dirty_user_ids:
+            async with self._get_user_lock(user_id):
+                profile = self.user_profiles.get(user_id)
+                if profile is None or not getattr(profile, "is_dirty", False):
+                    continue
+                await self._save_profile(profile)
+                profile.is_dirty = False

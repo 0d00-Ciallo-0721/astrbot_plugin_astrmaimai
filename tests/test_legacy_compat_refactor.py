@@ -39,6 +39,33 @@ class LegacyCompatRefactorTests(unittest.TestCase):
         self.assertEqual(rebuilt.focus_message_text, "hello")
         self.assertEqual(rebuilt.direct_context_text, "focus line")
 
+    def test_read_focus_thread_context_from_dict_preserves_freshness_budget(self):
+        """回归 (w11): JSON序列化后 astrmai_focus_thread_context 降级为 dict 时,
+        freshness_budget 字段不应丢失。"""
+        compat_mod = importlib.import_module(
+            "astrmai.infrastructure.compat.legacy_compat"
+        )
+        event = _FakeEvent()
+        # Simulate JSON round-trip: FocusThreadContext dataclass → plain dict
+        event.set_extra("astrmai_focus_thread_context", {
+            "freshness_budget": {
+                "state": "expired",
+                "created_at": 1000.0,
+                "max_age_seconds": 3600.0,
+                "salvage_window_seconds": 300.0,
+                "latest_activity_ts": 900.0,
+                "stale_reason": "cache_expired",
+            },
+        })
+        event.set_extra("astrmai_focus_event", "focus-ev")
+        result = compat_mod.read_legacy_focus_thread_context(event)
+        fb = result.freshness_budget
+        self.assertEqual(fb.state.value, "expired")
+        self.assertEqual(fb.max_age_seconds, 3600.0)
+        self.assertEqual(fb.salvage_window_seconds, 300.0)
+        self.assertEqual(fb.latest_activity_ts, 900.0)
+        self.assertEqual(fb.stale_reason, "cache_expired")
+
 
 if __name__ == "__main__":
     unittest.main()

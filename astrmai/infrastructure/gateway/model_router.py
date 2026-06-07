@@ -167,11 +167,6 @@ class ModelRouter:
         state.consecutive_failures = 0
         state.health_score = min(HEALTH_MAX, state.health_score + SUCCESS_REWARD)
 
-        # 如果模型在冷却中但成功返回，则提前解除冷却
-        if state.cooldown_until > 0:
-            state.cooldown_until = 0.0
-            logger.info(f"[ModelRouter] model {model_id} succeeded during cooldown; isolation cleared early")
-
     def report_failure(self, pool_name: str, model_id: str, is_fatal: bool = False):
         """
         上报一次调用失败。

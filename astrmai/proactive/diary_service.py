@@ -22,7 +22,7 @@ class DiaryService:
             cache = self.persistence.load_persona_cache()
             persona_data = cache.get(persona_id, {})
             summary = persona_data.get("summary", "")
-            persona_injection = f"\n[浣犵殑鏍稿績浜鸿]: {summary}\n" if summary else ""
+            persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""
 
             for state in active_states:
                 group_id = getattr(state, "chat_id", None)
@@ -36,13 +36,14 @@ class DiaryService:
                 recent_memories = []
                 if self.memory_engine and hasattr(self.memory_engine, "get_recent_memories"):
                     recent_memories = await self.memory_engine.get_recent_memories(group_id, hours=24)
-                recent_text = "\n".join(str(item) for item in recent_memories[:12]) or "浠婂ぉ娌℃湁鏄捐憲浜嬩欢銆?"
+                recent_text = "\n".join(str(item) for item in recent_memories[:12]) or "今天没有显著事件。"
 
                 if self.prompt_registry is not None:
                     envelope = self.prompt_registry.render_template(
                         PromptTemplateId.PROACTIVE_DIARY_SUMMARY,
                         {
                             "persona_summary": summary,
+                            "persona_injection": persona_injection,
                             "chat_id": str(group_id),
                             "recent_text": recent_text,
                         },
@@ -72,7 +73,7 @@ class DiaryService:
                 if diary and self.memory_engine and hasattr(self.memory_engine, "add_memory"):
                     try:
                         await self.memory_engine.add_memory(
-                            content=f"[鍐呴儴鏃ヨ] {diary}",
+                            content=f"[内部日记] {diary}",
                             session_id=str(group_id),
                             importance=0.45,
                         )

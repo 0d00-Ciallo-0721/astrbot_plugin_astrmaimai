@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +35,18 @@ class RawTraceEventStore:
             "version": 1,
             "by_chat": dict(payload.get("by_chat", {}) or {}),
         }
-        self.path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+        serialized = json.dumps(normalized, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(self.base_dir),
+            delete=False,
+            prefix=f"{self.path.stem}.",
+            suffix=".tmp",
+        ) as tmp_file:
+            tmp_file.write(serialized)
+            tmp_path = Path(tmp_file.name)
+        os.replace(tmp_path, self.path)
 
     async def append(self, event: dict[str, Any]) -> None:
         chat_id = str(event.get("chat_id", "") or "")

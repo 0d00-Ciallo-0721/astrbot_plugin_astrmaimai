@@ -312,10 +312,10 @@ class ReplyArtifactMixin:
 
     def _merge_wait_targets(self, event: AstrMessageEvent, pending_actions: Sequence[dict[str, Any]] | None) -> list[str]:
         actions = list(pending_actions or event.get_extra("astrmai_pending_actions", []) or [])
+        existing = [str(target) for target in (event.get_extra("astrmai_wait_targets", []) or []) if str(target).strip()]
         at_targets = [str(action.get("target_id")) for action in actions if action.get("action") == "at" and str(action.get("target_id", "")).strip()]
         if not at_targets:
-            return list(event.get_extra("astrmai_wait_targets", []) or [])
-        existing = [str(target) for target in (event.get_extra("astrmai_wait_targets", []) or []) if str(target).strip()]
+            return existing
         merged = existing[:]
         for target_id in at_targets:
             if target_id not in merged:

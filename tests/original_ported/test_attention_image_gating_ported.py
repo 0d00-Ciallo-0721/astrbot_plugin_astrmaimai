@@ -104,7 +104,7 @@ class AttentionImageGatingTests(unittest.TestCase):
         )
         event = _FakeEvent(
             text="",
-            extras={"extracted_image_urls": ["https://example.com/passive.jpg"]},
+            extras={"extracted_image_urls": ["passive.jpg"]},
             group_id="group-1",
         )
 
@@ -121,8 +121,8 @@ class AttentionImageGatingTests(unittest.TestCase):
         event = _FakeEvent(
             text="@亚托莉 看这个",
             extras={
-                "extracted_image_urls": ["https://example.com/direct.jpg"],
-                "direct_vision_urls": ["https://example.com/direct.jpg"],
+                "extracted_image_urls": ["direct.jpg"],
+                "direct_vision_urls": ["direct.jpg"],
             },
             group_id="group-1",
         )

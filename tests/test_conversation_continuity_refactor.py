@@ -140,10 +140,26 @@ def test_conversation_continuity_wait_and_ignore_do_not_refresh_goal():
         now=1010.0,
     )
 
-    snapshot = store.snapshot("chat-1", now=1011.0)
+    store.record(
+        chat_id="chat-1",
+        focus_preview="Alice: second interruption",
+        goal_summary="still should not replace",
+        social_intent="observe",
+        action_taken="none",
+        reply_need="ignore",
+        now=1020.0,
+    )
+
+    snapshot = store.snapshot("chat-1", now=1021.0)
     assert snapshot["current_topic"] == "Alice: talk about homework plan"
     assert snapshot["current_goal"] == "help Alice sort the homework plan"
     assert snapshot["turn_count"] == 1
+    recent = store.recent("chat-1", now=1021.0)
+    assert len(recent) == 3
+    assert [item.reply_need for item in recent[-2:]] == ["wait", "ignore"]
+    summary = store.summary("chat-1", now=1021.0)
+    assert "unrelated interruption" in summary
+    assert "second interruption" in summary
 
 
 def test_conversation_continuity_weakens_after_soft_decay_and_avoids_forced_old_topic():
@@ -201,6 +217,10 @@ def test_conversation_continuity_lightweight_event_does_not_refresh_goal():
     assert snapshot["current_topic"] == "Alice: talk about homework plan"
     assert snapshot["current_goal"] == "help Alice sort the homework plan"
     assert snapshot["turn_count"] == 1
+    recent = store.recent("chat-1", now=1011.0)
+    assert len(recent) == 2
+    assert recent[-1].focus_preview == "Alice poked the bot"
+    assert "Alice poked the bot" in store.summary("chat-1", now=1011.0)
 
 
 def test_conversation_continuity_expires_after_ttl():

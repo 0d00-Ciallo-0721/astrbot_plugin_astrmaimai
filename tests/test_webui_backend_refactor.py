@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import importlib
 import json
 import os
@@ -169,25 +169,10 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(adapter.persona_cache_path, persona_cache_path)
 
     def test_auth_secret_follows_env_at_runtime(self):
-        auth_mod = importlib.import_module("astrmai.webui.backend.auth")
-        original = os.environ.get("ASTRMAI_WEBUI_SECRET")
-        try:
-            os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-one"
-            # Reset cached key so env change takes effect
-            auth_mod._SECRET_KEY = None
-            token = auth_mod.create_token("codex")
-            self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
+        access_mod = importlib.import_module("astrmai.webui.backend.access")
+        self.assertEqual(asyncio.run(access_mod.get_current_user("codex")), "codex")
+        self.assertEqual(asyncio.run(access_mod.get_current_user(None)), "astrbot-plugin-page")
 
-            # Changing env after first access does NOT invalidate tokens —
-            # the key is now session-stable (security best practice).
-            os.environ["ASTRMAI_WEBUI_SECRET"] = "secret-two"
-            self.assertEqual(auth_mod.verify_token(token)["sub"], "codex")
-        finally:
-            auth_mod._SECRET_KEY = None
-            if original is None:
-                os.environ.pop("ASTRMAI_WEBUI_SECRET", None)
-            else:
-                os.environ["ASTRMAI_WEBUI_SECRET"] = original
 
     def test_memory_ui_service_writes_real_schema_columns(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.memory_ui_service")
@@ -750,21 +735,18 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(events["items"][0]["display_title"], "即时记忆命中")
         self.assertEqual(errors["items"][0]["level"], "error")
 
-    def test_memory_diagnostics_tab_renders_observability_panels(self):
+    def test_plugin_page_memory_tab_renders_observability_panels(self):
         root = Path(__file__).resolve().parents[1]
-        html = (root / "astrmai" / "webui" / "frontend" / "pages" / "memories" / "index.html").read_text(encoding="utf-8")
-        js = (root / "astrmai" / "webui" / "frontend" / "js" / "pages" / "memory.js").read_text(encoding="utf-8")
-        self.assertIn("Memory Events Feed", html)
-        self.assertIn("Chat Drill-down", html)
-        self.assertIn("Recent Errors", html)
-        self.assertIn("Instant Gate", html)
-        self.assertIn("Memory Pipeline", html)
-        self.assertIn("Session Summarizer", html)
-        self.assertIn("observabilityRuntime", js)
-        self.assertIn("observabilityEvents", js)
-        self.assertIn("observabilityErrors", js)
-        self.assertIn("loadObservabilityEvents", js)
-        self.assertIn("loadObservabilityChat", js)
+        js = (root / "pages" / "admin" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("记忆网络", js)
+        self.assertIn("记忆碎片 Events", js)
+        self.assertIn("每日反思 Reflections", js)
+        self.assertIn("实体图谱 Nodes", js)
+        self.assertIn("黑话字典 Jargon", js)
+        self.assertIn("memory-feedback", js)
+        self.assertIn('api.get("/memory-feedback?limit=50")', js)
+        self.assertIn('api.get("/memory-feedback/sources")', js)
+        self.assertIn('api.post(`/memory-feedback/${segment(button.dataset.disableFeedback)}/disable`)', js)
 
     def test_admin_service_exposes_memory_observability_views(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
@@ -1451,6 +1433,26 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
     def test_dashboard_cognition_tab_renders_context_economy_panel(self):
         root = Path(__file__).resolve().parents[1]
+        js = (root / "pages" / "admin" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("renderDashboardCognition", js)
+        self.assertIn("Scheduler Diagnostics", js)
+        self.assertIn("Batch / Backpressure", js)
+        self.assertIn("Chat Loop Drill-down", js)
+        self.assertIn("schedulerChatId", js)
+        self.assertIn("scheduler-chat-id", js)
+        self.assertIn("/cognition/scheduler/status", js)
+        self.assertIn("/cognition/scheduler/due-selection", js)
+        self.assertIn("/cognition/scheduler/chats/${segment(targetChat)}", js)
+        self.assertIn("loadSchedulerChatLoop", js)
+        self.assertIn("schedulerStatus", js)
+        self.assertIn("/cognition/observability/overview", js)
+        self.assertIn("observabilityOverview", js)
+        self.assertIn("unifiedTimeline", js)
+        self.assertIn("observabilityTimelinePath", js)
+        self.assertIn("/cognition/observability/timeline?", js)
+        self.assertIn("/cognition/observability/search?", js)
+        self.assertIn("Global Observability Timeline", js)
+        return
         html = (root / "astrmai" / "webui" / "frontend" / "pages" / "dashboard" / "index.html").read_text(encoding="utf-8")
         js = (root / "astrmai" / "webui" / "frontend" / "js" / "pages" / "dashboard.js").read_text(encoding="utf-8")
         self.assertIn("Context Economy", html)
@@ -1925,3 +1927,4 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

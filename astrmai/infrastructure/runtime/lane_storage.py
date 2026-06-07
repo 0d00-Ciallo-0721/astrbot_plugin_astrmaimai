@@ -20,90 +20,88 @@ class LaneStorageMixin:
         persona_core_version: str = "",
     ) -> tuple[str, str, List[dict], LanePolicy]:
         lane_umo = self.resolve_lane_umo(base_origin, lane_key)
-        lane_lock = await self._get_lane_lock(lane_umo)
-        async with lane_lock:
-            conversation_id = await self.conversation_manager.get_curr_conversation_id(lane_umo)
-            rotate = False
-            old_history: List[dict] = []
-            if conversation_id:
-                try:
-                    old_conversation = await self.conversation_manager.get_conversation(
-                        lane_umo,
-                        conversation_id,
-                        create_if_not_exists=False,
-                    )
-                    old_history = self._load_history(old_conversation)
-                except Exception:
-                    old_history = []
-                rotate_reason = await self._rotation_reason(
-                    lane_umo=lane_umo,
-                    prompt_version=lane_key.prompt_version,
-                    prefix_hash=prefix_hash,
-                    model_id=model_id,
-                    persona_id=persona_id,
-                    template_id=template_id,
-                    schema_id=schema_id,
-                    persona_core_version=persona_core_version,
+        policy = self.get_policy(lane_key)
+        conversation_id = await self.conversation_manager.get_curr_conversation_id(lane_umo)
+        rotate = False
+        rotate_reason = ""
+        old_history: List[dict] = []
+        if conversation_id:
+            try:
+                old_conversation = await self.conversation_manager.get_conversation(
+                    lane_umo,
+                    conversation_id,
+                    create_if_not_exists=False,
                 )
-                rotate = await self._should_rotate(
-                    lane_umo=lane_umo,
-                    prompt_version=lane_key.prompt_version,
-                    prefix_hash=prefix_hash,
-                    model_id=model_id,
-                    persona_id=persona_id,
-                    template_id=template_id,
-                    schema_id=schema_id,
-                    persona_core_version=persona_core_version,
-                )
-            else:
-                rotate_reason = ""
-
-            if not conversation_id or rotate:
-                conversation_id = await self.conversation_manager.new_conversation(
-                    unified_msg_origin=lane_umo,
-                    title=self._build_title(lane_key),
-                    persona_id=persona_id or None,
-                )
-                if rotate:
-                    expired_count = self.expire_remote_sessions_for_lane(lane_umo)
-                    if expired_count > 0:
-                        logger.warning(
-                            f"[Lane] rotation detected for {lane_umo}: "
-                            f"expired {expired_count} remote session mapping(s); "
-                            f"old sessions on provider side may still consume resources "
-                            f"(conversation_manager has no terminate API)"
-                        )
-                if rotate and old_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
-                    await self.save_lane_history(
-                        lane_key=lane_key,
-                        lane_umo=lane_umo,
-                        conversation_id=conversation_id,
-                        history=[{"role": "assistant", "content": self._build_rolling_summary(old_history)}],
-                        prefix_hash=prefix_hash,
-                        model_id=model_id,
-                        persona_id=persona_id,
-                    )
-
-            conversation = await self.conversation_manager.get_conversation(
-                lane_umo,
-                conversation_id,
-                create_if_not_exists=True,
+                old_history = self._load_history(old_conversation)
+            except Exception:
+                old_history = []
+            rotate_reason = await self._rotation_reason(
+                lane_umo=lane_umo,
+                prompt_version=lane_key.prompt_version,
+                prefix_hash=prefix_hash,
+                model_id=model_id,
+                persona_id=persona_id,
+                template_id=template_id,
+                schema_id=schema_id,
+                persona_core_version=persona_core_version,
             )
-            loaded_history = self._load_history(conversation)
-            history = self._normalize_history(loaded_history, lane_key)
-            if loaded_history != history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+            rotate = bool(rotate_reason)
+
+        target_conversation_id = conversation_id
+        if not target_conversation_id or rotate:
+            target_conversation_id = await self.conversation_manager.new_conversation(
+                unified_msg_origin=lane_umo,
+                title=self._build_title(lane_key),
+                persona_id=persona_id or None,
+            )
+            if rotate:
+                expired_count = self.expire_remote_sessions_for_lane(lane_umo)
+                if expired_count > 0:
+                    logger.warning(
+                        f"[Lane] rotation detected for {lane_umo}: "
+                        f"expired {expired_count} remote session mapping(s); "
+                        f"old sessions on provider side may still consume resources "
+                        f"(conversation_manager has no terminate API)"
+                    )
+            if rotate and old_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
                 await self.conversation_manager.update_conversation(
                     unified_msg_origin=lane_umo,
-                    conversation_id=conversation_id,
-                    history=history,
+                    conversation_id=target_conversation_id,
+                    history=[{"role": "assistant", "content": self._build_rolling_summary(old_history)}],
                     title=self._build_title(lane_key),
                     persona_id=persona_id or None,
                     token_usage=None,
                 )
 
+        async def _load_and_normalize(curr_conversation_id: str) -> List[dict]:
+            conversation = await self.conversation_manager.get_conversation(
+                lane_umo,
+                curr_conversation_id,
+                create_if_not_exists=True,
+            )
+            loaded_history = self._load_history(conversation)
+            normalized_history = self._normalize_history(loaded_history, lane_key)
+            if loaded_history != normalized_history and (lane_key.subsystem, lane_key.task_family) == ("sys2", "dialog"):
+                await self.conversation_manager.update_conversation(
+                    unified_msg_origin=lane_umo,
+                    conversation_id=curr_conversation_id,
+                    history=normalized_history,
+                    title=self._build_title(lane_key),
+                    persona_id=persona_id or None,
+                    token_usage=None,
+                )
+            return normalized_history
+
+        history = await _load_and_normalize(target_conversation_id)
+        final_conversation_id = await self.conversation_manager.get_curr_conversation_id(lane_umo) or target_conversation_id
+        if final_conversation_id != target_conversation_id:
+            history = await _load_and_normalize(final_conversation_id)
+
+        lane_lock = await self._get_lane_lock(lane_umo)
+        async with lane_lock:
             async with self._meta_lock:
                 self._runtime_meta[lane_umo] = {
-                    "conversation_id": conversation_id,
+                    "conversation_id": final_conversation_id,
                     "prompt_version": lane_key.prompt_version,
                     "prefix_hash": prefix_hash,
                     "model_id": model_id,
@@ -114,7 +112,7 @@ class LaneStorageMixin:
                     "lane_rotated": bool(rotate),
                     "lane_rotate_reason": rotate_reason,
                 }
-            return lane_umo, conversation_id, history, self.get_policy(lane_key)
+        return lane_umo, final_conversation_id, history, policy
 
     async def save_lane_history(
         self,

@@ -232,6 +232,34 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
                 self.assertEqual(planner.turn_trace_history[0]["status"], f"skipped_{action}")
                 self.assertEqual(planner.turn_trace_history[0]["cognitive"]["action"], action)
 
+    def test_plan_and_execute_delegates_only_to_prepared_execution_chain(self):
+        planner = self._make_planner(
+            self.planner_mod.CognitiveDecision(
+                action="reply",
+                intent="delegate",
+                memory_policy="light",
+            )
+        )
+        event = _FakeEvent(text="delegate this turn")
+        seen = []
+
+        async def _fake_prepare(ev, events):
+            seen.append(("prepare", ev, list(events)))
+            return {"prepared": True}
+
+        async def _fake_continue(ev, prepared):
+            seen.append(("continue", ev, prepared))
+            return "delegated-ok"
+
+        planner._prepare_plan_context = _fake_prepare
+        planner._continue_plan_execution = _fake_continue
+
+        result = asyncio.run(planner.plan_and_execute(event, [event]))
+
+        self.assertEqual(result, "delegated-ok")
+        self.assertEqual([item[0] for item in seen], ["prepare", "continue"])
+        self.assertEqual(seen[1][2], {"prepared": True})
+
     def test_planner_settles_no_send_relationship_for_negative_ignore_turn(self):
         observed = {}
 

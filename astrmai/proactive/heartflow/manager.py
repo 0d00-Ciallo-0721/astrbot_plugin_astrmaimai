@@ -259,6 +259,46 @@ class HeartflowManager:
         for chat_id in expired:
             self._sessions.pop(chat_id, None)
 
+    def _latest_chat_timestamp(self, chat_id: str) -> float:
+        timestamps: list[float] = []
+        state = self._states.get(chat_id)
+        if state is not None:
+            timestamps.extend(
+                [
+                    float(getattr(state, "last_tick_ts", 0.0) or 0.0),
+                    float(getattr(state, "last_activity_ts", 0.0) or 0.0),
+                ]
+            )
+        for items in (
+            self._pulses_by_chat.get(chat_id, []),
+            self._impulse_decisions_by_chat.get(chat_id, []),
+            self._action_decisions_by_chat.get(chat_id, []),
+        ):
+            if items:
+                timestamps.append(float(getattr(items[-1], "timestamp", 0.0) or 0.0))
+        return max(timestamps, default=0.0)
+
+    def _cleanup_stale_chat_history(self, *, now: float) -> None:
+        expiry_seconds = float(self.ACTIVE_CHAT_TTL_SECONDS * 2)
+        stale_chat_ids: list[str] = []
+        for chat_id in (
+            set(self._states)
+            | set(self._pulses_by_chat)
+            | set(self._impulse_decisions_by_chat)
+            | set(self._action_decisions_by_chat)
+        ):
+            if not chat_id:
+                stale_chat_ids.append(chat_id)
+                continue
+            latest_ts = self._latest_chat_timestamp(chat_id)
+            if latest_ts <= 0 or now - latest_ts > expiry_seconds:
+                stale_chat_ids.append(chat_id)
+        for chat_id in stale_chat_ids:
+            self._states.pop(chat_id, None)
+            self._pulses_by_chat.pop(chat_id, None)
+            self._impulse_decisions_by_chat.pop(chat_id, None)
+            self._action_decisions_by_chat.pop(chat_id, None)
+
     async def _load_state_values(self, chat_id: str) -> tuple[float, float]:
         if not self.state_engine or not hasattr(self.state_engine, "get_state"):
             return 0.6, 0.0
@@ -324,8 +364,18 @@ class HeartflowManager:
         _, _, pulse, action, decision = await self._compute_chat_cycle(chat_id, snapshot=snapshot, now=now, persist_session=False)
         return self._build_preview_payload(chat_id, pulse, action, decision)
 
-    async def tick_chat(self, chat_id: str, snapshot: dict | None = None, now: float | None = None) -> dict[str, Any]:
+    async def tick_chat(
+        self,
+        chat_id: str,
+        snapshot: dict | None = None,
+        now: float | None = None,
+        *,
+        _cleanup: bool = True,
+    ) -> dict[str, Any]:
         now = time.time() if now is None else now
+        if _cleanup:
+            self._cleanup_sessions(now=now)
+            self._cleanup_stale_chat_history(now=now)
         if snapshot is None and self.runtime_coordinator and hasattr(self.runtime_coordinator, "get_activity_snapshot"):
             snapshot = await self.runtime_coordinator.get_activity_snapshot(chat_id)
         session, state, pulse, action, decision = await self._compute_chat_cycle(chat_id, snapshot=snapshot, now=now, persist_session=True)
@@ -359,6 +409,7 @@ class HeartflowManager:
         now = time.time() if now is None else now
         self._last_tick_time = now
         self._cleanup_sessions(now=now)
+        self._cleanup_stale_chat_history(now=now)
         try:
             chat_ids = await self.runtime_coordinator.list_active_chats(self.ACTIVE_CHAT_TTL_SECONDS)
         except Exception as exc:
@@ -370,7 +421,7 @@ class HeartflowManager:
                 snapshot = await self.runtime_coordinator.get_activity_snapshot(chat_id)
                 if not snapshot:
                     continue
-                await self.tick_chat(chat_id, snapshot=snapshot, now=now)
+                await self.tick_chat(chat_id, snapshot=snapshot, now=now, _cleanup=False)
             except Exception as exc:
                 logger.debug(f"[Heartflow] tick degraded for {chat_id}: {exc}")
 
@@ -500,10 +551,7 @@ class HeartflowManager:
         self,
         state: HeartflowChatState,
         session: HeartflowSessionState | None = None,
-        *,
-        now: float,
     ) -> tuple[float, dict[str, float]]:
-        del now
         topic_heat = float(getattr(session, "topic_heat", 0.0) or 0.0) if session else 0.0
         direct_relevance = float(getattr(session, "direct_relevance", 0.0) or 0.0) if session else 0.0
         insert_pressure = float(getattr(session, "insert_pressure", 0.0) or 0.0) if session else 0.0
@@ -547,7 +595,7 @@ class HeartflowManager:
         wait_targets = [str(item) for item in snapshot.get("wait_targets", []) or [] if str(item).strip()]
         executor_pending = self._int_snapshot(snapshot, "executor_pending")
         age_seconds = max(0.0, now - float(session.last_activity_ts or 0.0)) if session.last_activity_ts > 0 else self.ACTIVE_CHAT_TTL_SECONDS
-        visible_score, score_components = self._compute_visible_candidate_score(state, session, now=now)
+        visible_score, score_components = self._compute_visible_candidate_score(state, session)
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
         visible_threshold = rhythm.threshold(self.VISIBLE_CANDIDATE_SCORE_THRESHOLD)
         prepare_threshold = rhythm.threshold(self.PREPARE_CANDIDATE_SCORE_THRESHOLD)
@@ -675,7 +723,7 @@ class HeartflowManager:
         age_seconds = max(0.0, now - latest_ts) if latest_ts > 0 else self.ACTIVE_CHAT_TTL_SECONDS + 1.0
         wait_targets = [str(item) for item in snapshot.get("wait_targets", []) or [] if str(item).strip()]
         executor_pending = int(snapshot.get("executor_pending", 0) or 0)
-        visible_score, score_components = self._compute_visible_candidate_score(state, session, now=now)
+        visible_score, score_components = self._compute_visible_candidate_score(state, session)
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
         visible_threshold = rhythm.threshold(self.VISIBLE_CANDIDATE_SCORE_THRESHOLD)
         prepare_threshold = rhythm.threshold(self.PREPARE_CANDIDATE_SCORE_THRESHOLD)

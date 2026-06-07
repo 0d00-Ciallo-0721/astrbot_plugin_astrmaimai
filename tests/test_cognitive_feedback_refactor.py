@@ -284,6 +284,46 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertEqual(memory.feedback_calls[0]["source"], "diary")
         self.assertIn("quiet diary summary", memory.feedback_calls[0]["summary"])
 
+    def test_diary_service_writes_readable_chinese_memory_labels(self):
+        class _Memory:
+            def __init__(self):
+                self.feedback_calls = []
+                self.memory_calls = []
+
+            async def get_recent_memories(self, group_id, hours=24):
+                return []
+
+            async def record_cognitive_feedback(self, **kwargs):
+                self.feedback_calls.append(kwargs)
+
+            async def add_memory(self, **kwargs):
+                self.memory_calls.append(kwargs)
+
+        templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
+        registry = templates_mod.PromptTemplateRegistry()
+        captured_prompt = {}
+
+        async def _call_background_lane(*args, **kwargs):
+            captured_prompt["prompt"] = args[2]
+            return "quiet diary summary"
+
+        memory = _Memory()
+        service = self.diary_mod.DiaryService(
+            persistence=SimpleNamespace(load_persona_cache=lambda: {"persona-1": {"summary": "温柔陪伴型"}}),
+            memory_engine=memory,
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="persona-1")),
+            call_background_lane=_call_background_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=registry,
+        )
+
+        asyncio.run(service.run_once([SimpleNamespace(chat_id="chat-1")]))
+
+        self.assertIn("[你的核心人设]", captured_prompt["prompt"])
+        self.assertIn("温柔陪伴型", captured_prompt["prompt"])
+        self.assertIn("今天没有显著事件。", captured_prompt["prompt"])
+        self.assertEqual(memory.memory_calls[0]["content"], "[内部日记] quiet diary summary")
+
 
 if __name__ == "__main__":
     unittest.main()

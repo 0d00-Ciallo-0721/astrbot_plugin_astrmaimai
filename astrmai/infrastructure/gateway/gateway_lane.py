@@ -64,6 +64,85 @@ class GatewayLaneMixin:
         }
         event.set_extra("astrmai_request_trace", trace_payload)
 
+    async def _finalize_success_artifacts(
+        self,
+        event: Any,
+        result: LLMCallResult,
+        workload_trace: Any,
+        effective_lane_key: LaneKey,
+        base_origin: str,
+        raw_user_text: str,
+        prompt: str,
+        workload_policy: WorkloadPolicy,
+        persona_id: str,
+        history: Optional[List[Any]],
+        system_prompt: str,
+        *,
+        stage_name: str,
+        model_id: str,
+        usage: Dict[str, int],
+        provider_family: str,
+        request_kwargs: Dict[str, Any],
+        artifact_text: Optional[str] = None,
+        fallback_used: bool = False,
+        skipped_cooldown_models: tuple = (),
+        cooldown_overridden: bool = False,
+        lane_umo: str = "",
+        protocol_passthrough: Optional[str] = None,
+        protocol_type: Optional[str] = None,
+        debug_log_prefix: str = "",
+    ) -> None:
+        self.context_economy.record_trace(workload_trace)
+        if event is not None and hasattr(event, "set_extra"):
+            event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
+            event.set_extra(
+                "astrmai_cached_usage_supported",
+                bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
+            )
+        self._record_event_request_trace(
+            event,
+            system_prompt=system_prompt,
+            prompt=prompt,
+            request_kwargs=request_kwargs,
+            provider_family=provider_family,
+            model_id=model_id,
+            usage=usage,
+        )
+        if artifact_text:
+            artifact = self._build_lane_artifact(result, artifact_text)
+            await self.lane_manager.append_visible_reply_artifact(
+                lane_key=effective_lane_key,
+                base_origin=base_origin,
+                raw_user_text=raw_user_text or prompt,
+                artifact=artifact,
+                token_usage=usage.get("total_tokens", 0),
+                prefix_hash=workload_policy.effective_prefix_hash,
+                model_id=model_id,
+                persona_id=persona_id,
+                template_id=workload_policy.template_id,
+                schema_id=workload_policy.schema_id,
+                persona_core_version=workload_policy.persona_core_version,
+            )
+        trace_kwargs: Dict[str, Any] = {
+            "workload_family": workload_policy.family.value,
+            "lane_key": effective_lane_key.as_log_key(),
+            "lane_umo": lane_umo,
+            "prefix_hash": workload_policy.stable_prefix_hash,
+            "model_id": model_id,
+            "fallback_used": fallback_used,
+            "skipped_cooldown_models": list(skipped_cooldown_models),
+            "cooldown_overridden": bool(cooldown_overridden),
+        }
+        if protocol_passthrough is not None:
+            trace_kwargs["protocol_passthrough"] = protocol_passthrough
+        if protocol_type is not None:
+            trace_kwargs["protocol_type"] = protocol_type
+        append_trace_stage(event, stage_name, **trace_kwargs)
+        if self._debug_mode():
+            logger.debug(
+                f"[Gateway] {debug_log_prefix}lane={effective_lane_key.as_log_key()} raw_user_text={preview_text(raw_user_text or prompt, 120)!r} history_roles_tail={self._history_roles_tail(history)}"
+            )
+
     def _lane_debug_meta(
         self,
         lane_key: LaneKey,
@@ -266,57 +345,33 @@ class GatewayLaneMixin:
             provider_cache_hint_enabled=bool(workload_policy.use_cache_hint and provider_caps.supports_cache_control),
         )
         result.economy = workload_trace.as_dict()
-        self.context_economy.record_trace(workload_trace)
-        if event is not None and hasattr(event, "set_extra"):
-            event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
-            event.set_extra(
-                "astrmai_cached_usage_supported",
-                bool((result.usage or {}).get("cached_usage_supported", False) or int((result.usage or {}).get("input_cached", 0) or 0) > 0),
-            )
-        append_trace_stage(
-            event,
-            "gateway_chat",
-            workload_family=workload_policy.family.value,
-            lane_key=effective_lane_key.as_log_key(),
-            lane_umo=lane_umo,
-            prefix_hash=workload_policy.stable_prefix_hash,
-            model_id=result.model_id or model_hint,
-            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
-            skipped_cooldown_models=list(result.skipped_cooldown_models),
-            cooldown_overridden=bool(result.cooldown_overridden),
-        )
-        self._record_event_request_trace(
-            event,
-            system_prompt=system_prompt,
+        assistant_content = json.dumps(result.parsed_json, ensure_ascii=False) if is_json else result.text
+        await self._finalize_success_artifacts(
+            event=event,
+            result=result,
+            workload_trace=workload_trace,
+            effective_lane_key=effective_lane_key,
+            base_origin=base_origin,
+            raw_user_text=raw_user_text,
             prompt=prompt,
+            workload_policy=workload_policy,
+            persona_id=persona_id,
+            history=history,
+            system_prompt=system_prompt,
+            stage_name="gateway_chat",
+            model_id=result.model_id or model_hint,
+            usage=result.usage,
+            provider_family=result.provider_family or provider_caps.provider_family,
             request_kwargs={
                 "session_id": provider_session_id,
                 "cache_control": {"type": "ephemeral"} if (workload_policy.use_cache_hint and provider_caps.supports_cache_control) else None,
             },
-            provider_family=result.provider_family or provider_caps.provider_family,
-            model_id=result.model_id or model_hint,
-            usage=result.usage,
+            artifact_text=assistant_content,
+            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
+            skipped_cooldown_models=tuple(result.skipped_cooldown_models),
+            cooldown_overridden=bool(result.cooldown_overridden),
+            lane_umo=lane_umo,
         )
-
-        assistant_content = json.dumps(result.parsed_json, ensure_ascii=False) if is_json else result.text
-        artifact = self._build_lane_artifact(result, assistant_content)
-        await self.lane_manager.append_visible_reply_artifact(
-            lane_key=effective_lane_key,
-            base_origin=base_origin,
-            raw_user_text=raw_user_text or prompt,
-            artifact=artifact,
-            token_usage=result.usage.get("total_tokens", 0),
-            prefix_hash=workload_policy.effective_prefix_hash,
-            model_id=result.model_id or model_hint,
-            persona_id=persona_id,
-            template_id=workload_policy.template_id,
-            schema_id=workload_policy.schema_id,
-            persona_core_version=workload_policy.persona_core_version,
-        )
-        if self._debug_mode():
-            logger.debug(
-                f"[Gateway] lane={effective_lane_key.as_log_key()} raw_user_text={preview_text(raw_user_text or prompt, 120)!r} history_roles_tail={self._history_roles_tail(history)}"
-            )
         return result
 
     async def tool_chat_in_lane(
@@ -492,56 +547,38 @@ class GatewayLaneMixin:
                         usage=usage,
                         economy=workload_trace.as_dict(),
                     )
-                    self.context_economy.record_trace(workload_trace)
-                    if event is not None and hasattr(event, "set_extra"):
-                        event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
-                        event.set_extra(
-                            "astrmai_cached_usage_supported",
-                            bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
-                        )
-                    self._record_event_request_trace(
-                        event,
-                        system_prompt=system_prompt,
+                    await self._finalize_success_artifacts(
+                        event=event,
+                        result=result,
+                        workload_trace=workload_trace,
+                        effective_lane_key=effective_lane_key,
+                        base_origin=base_origin,
+                        raw_user_text=raw_user_text,
                         prompt=prompt,
-                        request_kwargs=tool_kwargs,
-                        provider_family=capabilities.provider_family,
+                        workload_policy=workload_policy,
+                        persona_id=persona_id,
+                        history=history,
+                        system_prompt=system_prompt,
+                        stage_name="gateway_tool_call",
                         model_id=model_id,
                         usage=usage,
-                    )
-                    if "[TERMINAL_YIELD]:" in stripped_reply:
-                        terminal_content = stripped_reply.split("[TERMINAL_YIELD]:", 1)[1].strip()
-                        artifact = self._build_lane_artifact(result, terminal_content)
-                        await self.lane_manager.append_visible_reply_artifact(
-                            lane_key=effective_lane_key,
-                            base_origin=base_origin,
-                            raw_user_text=raw_user_text or prompt,
-                            artifact=artifact,
-                            token_usage=usage.get("total_tokens", 0),
-                            prefix_hash=workload_policy.effective_prefix_hash,
-                            model_id=model_id,
-                            persona_id=persona_id,
-                            template_id=workload_policy.template_id,
-                            schema_id=workload_policy.schema_id,
-                            persona_core_version=workload_policy.persona_core_version,
-                        )
-                    append_trace_stage(
-                        event,
-                        "gateway_tool_call",
-                        workload_family=workload_policy.family.value,
-                        lane_key=effective_lane_key.as_log_key(),
-                        lane_umo=lane_umo,
-                        prefix_hash=workload_policy.stable_prefix_hash,
-                        model_id=model_id,
+                        provider_family=capabilities.provider_family,
+                        request_kwargs=tool_kwargs,
+                        artifact_text=stripped_reply.split("[TERMINAL_YIELD]:", 1)[1].strip() if "[TERMINAL_YIELD]:" in stripped_reply else None,
                         fallback_used=bool(model_id != workload_policy.primary_model),
+                        skipped_cooldown_models=tuple(skipped_cooldown_models),
+                        cooldown_overridden=bool(cooldown_overridden),
+                        lane_umo=lane_umo,
                         protocol_passthrough=True,
                         protocol_type="terminal_yield" if "[TERMINAL_YIELD]:" in stripped_reply else "wait_signal",
-                        skipped_cooldown_models=list(skipped_cooldown_models),
-                        cooldown_overridden=bool(cooldown_overridden),
+                        debug_log_prefix=f"trace={trace_id} tool-" if (trace_id := getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")) else "tool-",
                     )
                     return result
                 safe_text, failure_kind = validate_visible_output_text(
                     reply_text,
-                    speaker_names=self._bot_speaker_names(),
+                    speaker_names=self._bot_speaker_names(
+                        getattr(getattr(getattr(self, "config", None), "system1", None), "nicknames", [])
+                    ),
                 )
                 if failure_kind:
                     raise ValueError(failure_kind)
@@ -586,53 +623,30 @@ class GatewayLaneMixin:
                     usage=usage,
                     economy=workload_trace.as_dict(),
                 )
-                self.context_economy.record_trace(workload_trace)
-                if event is not None and hasattr(event, "set_extra"):
-                    event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
-                    event.set_extra(
-                        "astrmai_cached_usage_supported",
-                        bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
-                    )
-                self._record_event_request_trace(
-                    event,
-                    system_prompt=system_prompt,
+                await self._finalize_success_artifacts(
+                    event=event,
+                    result=result,
+                    workload_trace=workload_trace,
+                    effective_lane_key=effective_lane_key,
+                    base_origin=base_origin,
+                    raw_user_text=raw_user_text,
                     prompt=prompt,
-                    request_kwargs=tool_kwargs,
-                    provider_family=capabilities.provider_family,
+                    workload_policy=workload_policy,
+                    persona_id=persona_id,
+                    history=history,
+                    system_prompt=system_prompt,
+                    stage_name="gateway_tool_call",
                     model_id=model_id,
                     usage=usage,
-                )
-                artifact = self._build_lane_artifact(result, result.text)
-                await self.lane_manager.append_visible_reply_artifact(
-                    lane_key=effective_lane_key,
-                    base_origin=base_origin,
-                    raw_user_text=raw_user_text or prompt,
-                    artifact=artifact,
-                    token_usage=usage.get("total_tokens", 0),
-                    prefix_hash=workload_policy.effective_prefix_hash,
-                    model_id=model_id,
-                    persona_id=persona_id,
-                    template_id=workload_policy.template_id,
-                    schema_id=workload_policy.schema_id,
-                    persona_core_version=workload_policy.persona_core_version,
-                )
-                append_trace_stage(
-                    event,
-                    "gateway_tool_call",
-                    workload_family=workload_policy.family.value,
-                    lane_key=effective_lane_key.as_log_key(),
-                    lane_umo=lane_umo,
-                    prefix_hash=workload_policy.stable_prefix_hash,
-                    model_id=model_id,
+                    provider_family=capabilities.provider_family,
+                    request_kwargs=tool_kwargs,
+                    artifact_text=result.text,
                     fallback_used=bool(model_id != workload_policy.primary_model),
-                    skipped_cooldown_models=list(skipped_cooldown_models),
+                    skipped_cooldown_models=tuple(skipped_cooldown_models),
                     cooldown_overridden=bool(cooldown_overridden),
+                    lane_umo=lane_umo,
+                    debug_log_prefix=f"trace={trace_id} tool-" if (trace_id := getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")) else "tool-",
                 )
-                if self._debug_mode():
-                    trace_id = getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")
-                    logger.debug(
-                        f"[Gateway] trace={trace_id} tool-lane={effective_lane_key.as_log_key()} raw_user_text={preview_text(raw_user_text or prompt, 120)!r} history_roles_tail={self._history_roles_tail(history)}"
-                    )
                 return result
             except Exception as exc:
                 last_error = str(exc)

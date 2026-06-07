@@ -10,6 +10,10 @@ _logger = logging.getLogger(__name__)
 
 def current_db_path() -> str:
     raw = default_db_path()
+    # 如果用户显式设置了 ASTRMAI_DB_PATH，信任用户选择并跳过路径校验
+    if os.getenv("ASTRMAI_DB_PATH"):
+        return os.path.realpath(raw)
+
     resolved = os.path.realpath(raw)
     # Validate that the resolved path is within the plugin data directory
     data_root = os.path.realpath(str(plugin_data_path()))

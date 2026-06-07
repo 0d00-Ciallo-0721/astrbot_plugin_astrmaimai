@@ -19,8 +19,16 @@ class PerceptionBuilder:
         sender_name = str(getattr(event, "get_sender_name", lambda: "")() or "")
         text = str(getattr(event, "message_str", "") or "")
         rich_text = str(event.get_extra("astrmai_rich_text", text) if hasattr(event, "get_extra") else text)
-        direct_urls = list(event.get_extra("direct_vision_urls", []) or []) if hasattr(event, "get_extra") else []
-        extracted_urls = list(event.get_extra("extracted_image_urls", []) or []) if hasattr(event, "get_extra") else []
+        direct_urls = (
+            list(event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", [])) or [])
+            if hasattr(event, "get_extra")
+            else []
+        )
+        extracted_urls = (
+            list(event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", [])) or [])
+            if hasattr(event, "get_extra")
+            else []
+        )
         image_urls = list(dict.fromkeys(direct_urls + extracted_urls))
         is_direct, is_at_bot, is_reply_to_bot, is_name_only = self.gate._resolve_wakeup_flags(event, self_id, text)
 

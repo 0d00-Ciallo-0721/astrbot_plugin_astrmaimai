@@ -12,6 +12,8 @@ from .runtime_context import PluginRuntimeContext
 
 
 class PluginLifecycleManager:
+    SHUTDOWN_TASK_TIMEOUT: float = 3.0
+
     def __init__(self, runtime: PluginRuntimeContext):
         self.runtime = runtime
         self._background_tasks = runtime.background_tasks
@@ -202,7 +204,7 @@ class PluginLifecycleManager:
                 if not task.done():
                     task.cancel()
             try:
-                _, pending = await asyncio.wait(unique_tasks, timeout=3.0)
+                _, pending = await asyncio.wait(unique_tasks, timeout=self.SHUTDOWN_TASK_TIMEOUT)
                 if pending:
                     logger.warning(f"[AstrMai] {len(pending)} background tasks did not exit gracefully before timeout.")
                 else:

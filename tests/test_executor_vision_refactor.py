@@ -20,6 +20,7 @@ class _FakeGateway:
             infra=SimpleNamespace(api_timeout=15),
             global_settings=SimpleNamespace(debug_mode=False, enable_error_interception=False, admin_ids=[]),
             reply=SimpleNamespace(fallback_text="fallback"),
+            vision=SimpleNamespace(),
         )
 
     async def call_vision_task(self, **kwargs):
@@ -221,6 +222,31 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         self.assertEqual(event.get_extra("vision_direct_attempted_models"), ["vision-a", "vision-b"])
         self.assertEqual(event.get_extra("vision_direct_failure_reason"), "empty_description")
         self.assertEqual(len(gateway.calls), 1)
+
+    def test_remote_image_ref_is_ignored_when_remote_fetching_is_disabled(self):
+        executor, _gateway = self._executor({"description": "cat", "emotion_tags": []})
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor._inject_direct_vision_context(
+                event,
+                "default:GroupMessage:group-1",
+                "prompt",
+                "system",
+                self.executor_mod.VisionBundle(
+                    image_urls=["https://assets.example.com/cat.jpg"],
+                    direct_image_urls=["https://assets.example.com/cat.jpg"],
+                    is_direct_request=True,
+                    is_image_only=True,
+                    source="event_extra",
+                ),
+            )
+
+        model_prompt, system_prompt = asyncio.run(_run())
+
+        self.assertEqual(model_prompt, "prompt")
+        self.assertEqual(system_prompt, "system")
+        self.assertEqual(event.get_extra("vision_direct_outcome"), "exception")
 
 
 if __name__ == "__main__":

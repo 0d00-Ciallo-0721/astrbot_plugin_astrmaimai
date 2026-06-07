@@ -528,8 +528,11 @@ class ContextEconomyGatewayTests(unittest.TestCase):
         router.report_failure("task", "model-a", is_fatal=True)
         ranked3 = router.get_ranked_models("task", ["model-a", "model-b"], sticky_key="persona:1", sticky_preferred="model-a")
         self.assertEqual(ranked3[0], "model-b")
-
         pool = router._pools["task"]
+        cooldown_until = pool.models["model-a"].cooldown_until
+        router.report_success("task", "model-a")
+        self.assertEqual(pool.models["model-a"].cooldown_until, cooldown_until)
+
         pool.models["model-a"].cooldown_until = time.time() - 1
         ranked4 = router.get_ranked_models("task", ["model-a", "model-b"], sticky_key="persona:1", sticky_preferred="model-a")
         self.assertEqual(ranked4[0], "model-a")

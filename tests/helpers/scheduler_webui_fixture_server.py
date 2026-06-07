@@ -21,7 +21,6 @@ def main() -> None:
     os.environ["ASTRMAI_DB_PATH"] = str(FIXTURE_DB_PATH)
     os.environ["ASTRMAI_CONFIG_PATH"] = str(FIXTURE_CONFIG_PATH)
     os.environ["ASTRMAI_PERSONA_CACHE_PATH"] = str(FIXTURE_PERSONA_CACHE_PATH)
-    os.environ.setdefault("ASTRMAI_WEBUI_SECRET", "scheduler-fixture-secret")
 
     from astrmai.webui.backend.adapters.plugin_api import set_active_facade
 
@@ -34,7 +33,7 @@ def main() -> None:
     from fastapi.staticfiles import StaticFiles
     import uvicorn
     from astrmai.webui.backend.adapters.plugin_api import PluginApiAdapter
-    from astrmai.webui.backend.auth import get_current_user
+    from astrmai.webui.backend.access import get_current_user
     from astrmai.webui.backend.routes import api_router
     from astrmai.webui.backend.services.persona_ui_service import PersonaUiService
 
@@ -46,6 +45,7 @@ def main() -> None:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.dependency_overrides[get_current_user] = lambda: "fixture-admin"
     app.include_router(api_router, prefix="/api")
 
     @app.get("/api/persona/slices", tags=["fixture-dev"])
@@ -57,9 +57,9 @@ def main() -> None:
         )
         return await PersonaUiService(adapter).get_persona_slices()
 
-    backend_base_dir = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-    frontend_dir = _os.path.join(_os.path.dirname(backend_base_dir), "astrmai", "webui", "frontend")
-    app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="static")
+    repo_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    plugin_page_dir = _os.path.join(repo_root, "pages", "admin")
+    app.mount("/pages/admin", StaticFiles(directory=plugin_page_dir, html=True), name="plugin-pages-admin")
 
     uvicorn.run(
         app,

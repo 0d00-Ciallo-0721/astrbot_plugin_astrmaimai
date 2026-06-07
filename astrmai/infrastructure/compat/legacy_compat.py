@@ -90,7 +90,22 @@ def emit_legacy_focus_thread_extras(
 def _read_freshness_budget(event: Any) -> ReplyFreshnessBudget:
     """Extract freshness_budget from stored focus context or return default."""
     stored_focus = event.get_extra("astrmai_focus_thread_context", None)
-    if stored_focus and hasattr(stored_focus, "freshness_budget"):
+    if not stored_focus:
+        return ReplyFreshnessBudget()
+    # Guard: event system JSON serialization may degrade dataclass → dict
+    if isinstance(stored_focus, dict):
+        fb_dict = stored_focus.get("freshness_budget", {})
+        if isinstance(fb_dict, dict):
+            return ReplyFreshnessBudget(
+                state=FreshnessState(str(fb_dict.get("state", FreshnessState.FRESH.value))),
+                created_at=float(fb_dict.get("created_at", 0.0)),
+                max_age_seconds=float(fb_dict.get("max_age_seconds", 0.0)),
+                salvage_window_seconds=float(fb_dict.get("salvage_window_seconds", 0.0)),
+                latest_activity_ts=float(fb_dict.get("latest_activity_ts", 0.0)),
+                stale_reason=str(fb_dict.get("stale_reason", "")),
+            )
+        return ReplyFreshnessBudget()
+    if hasattr(stored_focus, "freshness_budget"):
         return stored_focus.freshness_budget
     return ReplyFreshnessBudget()
 
@@ -104,9 +119,7 @@ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -
         core_events=list(event.get_extra("astrmai_focus_thread_core_events", []) or []),
         related_events=list(event.get_extra("astrmai_focus_thread_related_events", []) or []),
         ambient_events=list(
-            event.get_extra("astrmai_focus_thread_ambient_events", [])
-            or event.get_extra("astrmai_background_events", [])
-            or []
+            event.get_extra("astrmai_focus_thread_ambient_events", []) or []
         ),
         focus_reason=str(event.get_extra("astrmai_focus_reason", "") or ""),
         root_reason=str(event.get_extra("astrmai_focus_thread_root_reason", "") or ""),

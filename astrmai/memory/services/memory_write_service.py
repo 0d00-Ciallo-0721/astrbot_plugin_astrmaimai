@@ -27,7 +27,7 @@ class MemoryWriteService:
             return ""
         dedup_key = str(request.dedup_key or "").strip()
         if not dedup_key:
-            digest = hashlib.sha1(
+            digest = hashlib.sha256(
                 f"{request.kind}|{request.session_id}|{request.persona_id}|{request.content}".encode("utf-8")
             ).hexdigest()[:24]
             dedup_key = f"{request.kind}:{request.session_id}:{request.persona_id}:{digest}"

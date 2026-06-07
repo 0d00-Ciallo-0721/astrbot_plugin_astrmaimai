@@ -23,8 +23,11 @@ class ChatRuntimeCoordinatorMigratedTests(unittest.TestCase):
 
         async def _run():
             first = await coordinator.try_acquire_executor("chat-1", max_pending=2)
-            second = await coordinator.try_acquire_executor("chat-1", max_pending=2)
+            second_task = asyncio.create_task(coordinator.try_acquire_executor("chat-1", max_pending=2))
+            await asyncio.sleep(0)
             third = await coordinator.try_acquire_executor("chat-1", max_pending=2)
+            await coordinator.release_executor("chat-1")
+            second = await second_task
             await coordinator.release_executor("chat-1")
             fourth = await coordinator.try_acquire_executor("chat-1", max_pending=2)
             return first, second, third, fourth
@@ -34,6 +37,7 @@ class ChatRuntimeCoordinatorMigratedTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertIsNone(third)
         self.assertIsNotNone(fourth)
+        asyncio.run(coordinator.release_executor("chat-1"))
 
     def test_wait_targets_are_de_duplicated(self):
         coordinator = ChatRuntimeCoordinator()

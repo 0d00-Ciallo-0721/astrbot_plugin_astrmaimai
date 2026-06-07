@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from astrbot.api import logger
@@ -8,6 +9,7 @@ from astrbot.api import logger
 class FollowupManager:
     def __init__(self, runtime):
         self.runtime = runtime
+        self._private_wait_tasks: dict[str, asyncio.Task] = {}
 
     def _resolve_followup_cooldown_seconds(self) -> float:
         attention = getattr(getattr(self.runtime, "config", None), "attention", None)
@@ -40,6 +42,30 @@ class FollowupManager:
         if getattr(self.runtime, "chat_loop_kernel", None) is not None:
             await self.runtime.chat_loop_kernel.sync_runtime_wait_targets(chat_id, targets, target_name)
 
+    async def _await_private_followup_reply(self, chat_id: str, sender_id: str) -> None:
+        current_task = asyncio.current_task()
+        try:
+            has_reply = await self.runtime.private_chat_manager.wait_for_new_message(sender_id, chat_id=chat_id)
+            if has_reply:
+                return
+            logger.info(f"[{chat_id}] private followup wait timed out")
+            if getattr(self.runtime, "chat_loop_kernel", None) is not None:
+                await self.runtime.chat_loop_kernel.expire_wait(chat_id, "private_wait_timeout")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(f"[{chat_id}] private followup wait task failed: {exc}")
+        finally:
+            if self._private_wait_tasks.get(chat_id) is current_task:
+                self._private_wait_tasks.pop(chat_id, None)
+
+    def _schedule_private_followup_wait(self, chat_id: str, sender_id: str) -> None:
+        existing = self._private_wait_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        task = asyncio.create_task(self._await_private_followup_reply(chat_id, sender_id))
+        self._private_wait_tasks[chat_id] = task
+
     async def finalize_after_reply(self, chat_id: str, main_event, reply_sent: bool) -> None:
         if not reply_sent:
             return
@@ -63,11 +89,7 @@ class FollowupManager:
                     },
                 )
             await self._mark_followup_cooldown(chat_id)
-            has_reply = await self.runtime.private_chat_manager.wait_for_new_message(sender_id, chat_id=chat_id)
-            if not has_reply:
-                logger.info(f"[{chat_id}] 私聊用户长时间未回复，会话已自然休眠。")
-                if getattr(self.runtime, "chat_loop_kernel", None) is not None:
-                    await self.runtime.chat_loop_kernel.expire_wait(chat_id, "private_wait_timeout")
+            self._schedule_private_followup_wait(chat_id, sender_id)
             return
 
         if main_event.get_group_id() and self.runtime.group_reply_wait_manager:

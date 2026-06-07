@@ -17,6 +17,7 @@ class EventBus:
 
     def _init_bus(self):
         self.TOPIC_AFFECTION_CHANGED = "affection_changed"
+        self.TOPIC_KNOWLEDGE_UPDATED = "knowledge_updated"
         self.TOPIC_LEARNING_MESSAGE_RECORDED = "learning.message_recorded"
         self.TOPIC_LEARNING_BOT_REPLY_RECORDED = "learning.bot_reply_recorded"
         self.TOPIC_LEARNING_MINING_COMPLETED = "learning.mining_completed"
@@ -63,7 +64,10 @@ class EventBus:
 
     def trigger_knowledge_update(self):
         self.knowledge_updated.set()
-        self.knowledge_updated.clear()
+        try:
+            asyncio.get_running_loop().create_task(self.publish(self.TOPIC_KNOWLEDGE_UPDATED))
+        except RuntimeError:
+            pass
 
     async def publish_learning_message_recorded(self, payload: dict):
         await self.publish(self.TOPIC_LEARNING_MESSAGE_RECORDED, payload)

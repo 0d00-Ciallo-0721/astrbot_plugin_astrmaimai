@@ -22,6 +22,13 @@ class MemoryRetrievalService:
         self.expression_pattern_policy = ExpressionPatternRetrievalPolicy(store)
 
     @staticmethod
+    def _resolved_session_id(query: MemoryQuery) -> str:
+        layer_set = {str(item) for item in query.layers or [] if str(item).strip()}
+        if query.include_persona_lore or "persona_lore" in layer_set:
+            return "__self_lore__"
+        return str(query.session_id or "")
+
+    @staticmethod
     def _trace_bucket(query: MemoryQuery) -> dict:
         metadata = query.metadata if isinstance(query.metadata, dict) else {}
         trace = metadata.get("_trace")
@@ -195,9 +202,10 @@ class MemoryRetrievalService:
             )
 
         limit = max(int(query.top_k or 5), 1)
+        resolved_session_id = self._resolved_session_id(query)
         canonical_task = self.store.search(
             query.query,
-            session_id=query.session_id,
+            session_id=resolved_session_id,
             persona_id=query.persona_id,
             layers=query.layers,
             top_k=limit,
@@ -223,11 +231,10 @@ class MemoryRetrievalService:
         if not self.engine or not hasattr(self.engine, "search_memories"):
             return []
         try:
-            session_id = "__self_lore__" if query.include_persona_lore or "persona_lore" in query.layers else query.session_id
             results = await self.engine.search_memories(
                 query.query,
                 top_k=max(int(query.top_k or 5), 1),
-                session_id=session_id,
+                session_id=self._resolved_session_id(query),
                 persona_id=query.persona_id or None,
             )
         except Exception as exc:
@@ -300,7 +307,7 @@ class MemoryRetrievalService:
             hybrid_score = float(item.metadata.get("_hybrid_score", 0.0))
             conflict_penalty = 0.0
             if (item.metadata or {}).get("corrected_by") or (item.metadata or {}).get("contradicted_by"):
-                conflict_penalty = 0.2
+                conflict_penalty = float(self.scoring.conflict_penalty or 0.0)
             canon_weighted = canon * self.scoring.canonical_weight
             hybrid_weighted = hybrid_score * self.scoring.hybrid_weight
             importance_weighted = float(item.importance or 0.0) * self.scoring.importance_weight

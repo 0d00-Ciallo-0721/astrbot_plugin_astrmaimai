@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from .auth_routes import router as auth_router
 from .chats_routes import router as chats_router
 from .cognition_routes import router as cognition_router
 from .config_routes import router as config_router
@@ -21,7 +20,6 @@ from .users_routes import router as users_router
 
 def build_api_router() -> APIRouter:
     router = APIRouter()
-    router.include_router(auth_router, prefix="/auth", tags=["auth"])
     router.include_router(config_router, prefix="/config", tags=["config"])
     router.include_router(review_router, prefix="/reviews", tags=["reviews"])
     router.include_router(memory_router, prefix="/memories", tags=["memories"])

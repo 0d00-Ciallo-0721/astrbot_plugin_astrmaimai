@@ -4,6 +4,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 WEBUI_ROOT = ROOT / "astrmai" / "webui"
+PLUGIN_PAGE_ROOT = ROOT / "pages" / "admin"
 TESTS_ROOT = ROOT / "tests"
 
 
@@ -19,12 +20,13 @@ class DirectoryContractsRefactorTests(unittest.TestCase):
         for path in expected:
             self.assertTrue(path.exists(), str(path))
 
-    def test_webui_shell_is_split_into_components_and_pages(self):
-        self.assertTrue((WEBUI_ROOT / "frontend" / "components").exists())
-        self.assertTrue((WEBUI_ROOT / "frontend" / "pages").exists())
-        index_content = (WEBUI_ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
-        self.assertIn('id="page-slot-dashboard"', index_content)
-        self.assertNotIn('id="page-dashboard" x-show=', index_content)
+    def test_plugin_page_is_the_only_supported_management_entry(self):
+        self.assertTrue((PLUGIN_PAGE_ROOT / "index.html").exists())
+        self.assertTrue((PLUGIN_PAGE_ROOT / "app.js").exists())
+        self.assertTrue((PLUGIN_PAGE_ROOT / "style.css").exists())
+        server_content = (WEBUI_ROOT / "backend" / "server.py").read_text(encoding="utf-8")
+        self.assertNotIn("frontend_dir", server_content)
+        self.assertNotIn("StaticFiles(directory=frontend_dir", server_content)
 
     def test_p2_99_acceptance_docs_exist(self):
         self.assertTrue((ROOT / "plan" / "P2_99_TEST_MIGRATION_MATRIX.md").exists())

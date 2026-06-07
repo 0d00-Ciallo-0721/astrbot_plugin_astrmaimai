@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
 import os
-import secrets
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,7 +32,7 @@ def set_active_facade(facade: Any) -> None:
     previous = ACTIVE_FACADE
     if previous is not None and previous is not facade:
         _logger.warning(
-            "ACTIVE_FACADE is being overwritten 鈥?old facade (%r) may leak resources. "
+            "ACTIVE_FACADE is being overwritten 閳?old facade (%r) may leak resources. "
             "Attempting graceful termination of the previous facade.",
             previous,
         )
@@ -69,14 +69,43 @@ class PluginApiAdapter:
         if self.facade is None:
             self.facade = get_active_facade()
 
-    # 鈹€鈹€ internal helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 閳光偓閳光偓 internal helpers 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+
+    @staticmethod
+    def _contains_symlink(path: str) -> bool:
+        """Check whether *path* or any of its parent components is a symbolic link.
+
+        Returns ``True`` if a symlink is detected.  Silently stops at the
+        first non-existent component (a missing file cannot be a symlink).
+        Re-raises non-``FileNotFoundError`` OSErrors to avoid silently
+        skipping paths hidden behind permission errors.
+        """
+        current = os.path.abspath(path)
+        while True:
+            try:
+                st = os.lstat(current)
+            except FileNotFoundError:
+                return False  # 文件/目录不存在，不可能为符号链接
+            if stat.S_ISLNK(st.st_mode):
+                return True
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        return False
 
     def _validate_path(self, path: str) -> str:
         """Resolve and validate that *path* is within allowed directories.
 
         Returns the resolved real path.  Raises ``ValueError`` if the path
-        escapes the plugin data or plugin root directories.
+        escapes the plugin data or plugin root directories, or contains a
+        symbolic link anywhere in its ancestry.
         """
+        try:
+            if self._contains_symlink(path):
+                raise ValueError(f"Symbolic link detected in path: {path!r}")
+        except OSError as exc:
+            raise ValueError(f"Cannot verify path safety (lstat failed): {path!r} ({exc})") from exc
         resolved = os.path.realpath(path)
         data_root = os.path.realpath(os.path.dirname(self.config_path) or ".")
         plugin_root = os.path.realpath(
@@ -146,7 +175,7 @@ class PluginApiAdapter:
         method = getattr(self.facade, method_name, None) if self.facade else None
         return method(*args) if callable(method) else None
 
-    # 鈹€鈹€ narrow facade accessors (preferred over runtime passthrough) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 閳光偓閳光偓 narrow facade accessors (preferred over runtime passthrough) 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
     def get_planner(self) -> Any:
         return self._call_facade("get_planner")
@@ -205,7 +234,7 @@ class PluginApiAdapter:
         task = self.get_proactive_task()
         return getattr(task, "heartflow_topic_digest_service", None) if task else None
 
-    # 鈹€鈹€ memory sub-component accessors 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 閳光偓閳光偓 memory sub-component accessors 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
     def _memory_sub(self, attr: str) -> Any:
         engine = self.get_memory_engine()
@@ -247,10 +276,10 @@ class PluginApiAdapter:
         gate = self._call_facade("get_instant_gate")
         return gate if gate is not None else self._memory_sub("instant_gate")
 
-    # 鈹€鈹€ safe wrappers for private/internal access 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 閳光偓閳光偓 safe wrappers for private/internal access 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
     def candidate_to_dict(self, candidate: Any) -> dict[str, Any]:
-        """瀹夊叏鍖呰 store._candidate_to_dict锛岄伩鍏嶇鏈夋柟娉曠┛閫?"""
+        """鐎瑰鍙忛崠鍛邦棅 store._candidate_to_dict閿涘矂浼╅崗宥囶潌閺堝鏌熷▔鏇犫敍闁?"""
         candidate_dict = self._call_facade("candidate_to_dict", candidate)
         if isinstance(candidate_dict, dict):
             return candidate_dict
@@ -260,7 +289,7 @@ class PluginApiAdapter:
         return dict(candidate) if hasattr(candidate, "__dict__") else {}
 
     def format_timeline_item(self, item: Any) -> Any:
-        """瀹夊叏鍖呰 observer.format_timeline_item"""
+        """鐎瑰鍙忛崠鍛邦棅 observer.format_timeline_item"""
         formatter = getattr(self.facade, "format_timeline_item", None) if self.facade else None
         if callable(formatter):
             return formatter(item)
@@ -272,14 +301,14 @@ class PluginApiAdapter:
         return item
 
     def get_expression_pattern_service(self) -> Any:
-        """瀹夊叏鑾峰彇 expression_pattern_service"""
+        """鐎瑰鍙忛懢宄板絿 expression_pattern_service"""
         service = self._call_facade("get_expression_pattern_service")
         if service is not None:
             return service
         engine = self.get_memory_engine()
         return getattr(engine, "expression_pattern_service", None) if engine else None
 
-    # 鈹€鈹€ public API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # 閳光偓閳光偓 public API 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
     async def get_runtime_diagnostics(self) -> dict[str, Any]:
         if self.facade:
@@ -345,7 +374,6 @@ class PluginApiAdapter:
             "vision.",
             "sys3.",
             "life.",
-            "global_settings.webui_password",
             "memory.embedding_models",
         )
         return any(any(key.startswith(prefix) for prefix in reload_prefixes) for key in changed_keys)
@@ -365,7 +393,7 @@ class PluginApiAdapter:
         if hasattr(self.facade, "apply_hot_config"):
             return bool(self.facade.apply_hot_config(config_dict, parsed_config))
         _logger.error(
-            "_apply_hot_config: facade.apply_hot_config unavailable 鈥?cannot hot-apply config without facade support."
+            "_apply_hot_config: facade.apply_hot_config unavailable 閳?cannot hot-apply config without facade support."
         )
         raise RuntimeError(
             "Facade does not support apply_hot_config. "
@@ -412,49 +440,6 @@ class PluginApiAdapter:
 
     async def write_persona_cache(self, data: dict[str, Any]) -> None:
         self._write_json(self.persona_cache_path, data)
-
-    def get_webui_password(self) -> str:
-        config = self._read_json(self.config_path)
-        stored = config.get("global_settings", {}).get("webui_password", "") or ""
-        if not stored:
-            return ""
-        if stored.startswith("$scrypt$"):
-            return stored
-        # Plaintext detected — migrate to scrypt hash
-        import hashlib
-        import base64
-        salt = os.urandom(16)
-        hashed = hashlib.scrypt(
-            password=stored.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=0, dklen=32
-        )
-        encoded = (
-            "$scrypt$"
-            + base64.b64encode(salt).decode("ascii")
-            + "$"
-            + base64.b64encode(hashed).decode("ascii")
-        )
-        config.setdefault("global_settings", {})["webui_password"] = encoded
-        self._write_json_atomic(self.config_path, config)
-        _logger.warning("Migrated webui_password from plaintext to scrypt hash")
-        return encoded
-
-    def check_webui_password(self, plaintext: str) -> bool:
-        stored = self.get_webui_password()
-        if not stored:
-            return False
-        if not stored.startswith("$scrypt$"):
-            # Legacy plaintext — constant-time compare
-            return secrets.compare_digest(plaintext, stored)
-        import hashlib
-        import base64
-        _, salt_b64, hash_b64 = stored.split("$", 2)
-        salt = base64.b64decode(salt_b64)
-        expected = base64.b64decode(hash_b64)
-        actual = hashlib.scrypt(
-            password=plaintext.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=0, dklen=32
-        )
-        return secrets.compare_digest(actual, expected)
-
 
 __all__ = [
     "PluginApiAdapter",

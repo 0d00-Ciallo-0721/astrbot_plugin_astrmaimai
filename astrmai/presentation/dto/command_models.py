@@ -18,8 +18,8 @@ class WorkCommandRequest:
         return cls(raw_message=raw, task_query=task_query)
 
     @property
-    def is_empty(self) -> bool:
-        return not self.task_query
+    def has_query(self) -> bool:
+        return bool(self.task_query)
 
 
 @dataclass(slots=True)

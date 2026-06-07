@@ -1,4 +1,5 @@
 # astrmai/Heart/sensors.py
+import inspect
 import random
 import re
 import time
@@ -107,15 +108,34 @@ class PreFilters:
         # 判断私聊环境 (如果不存在 group_id 则为私聊)
         is_private = not bool(event.get_group_id())
 
-        def _scan_reply_chain(chain):
+        async def _extract_image_ref(image_component):
+            file_path = getattr(image_component, "file", None) or getattr(image_component, "path", None)
+            if file_path:
+                return str(file_path)
+            file_to_base64 = getattr(image_component, "file_to_base64", None)
+            if callable(file_to_base64):
+                try:
+                    encoded = file_to_base64()
+                    if inspect.isawaitable(encoded):
+                        encoded = await encoded
+                    if encoded:
+                        return f"data:image/jpeg;base64,{encoded}"
+                except Exception:
+                    pass
+            return ""
+
+        async def _scan_reply_chain(chain):
             """递归扫描引用链中的图片"""
             urls = []
-            if not chain: return urls
+            if not chain:
+                return urls
             for c in chain:
-                if isinstance(c, Comp.Image) and getattr(c, 'url', ''):
-                    urls.append(c.url)
+                if isinstance(c, Comp.Image):
+                    image_ref = await _extract_image_ref(c)
+                    if image_ref:
+                        urls.append(image_ref)
                 elif isinstance(c, Comp.Reply) and hasattr(c, 'chain'):
-                    urls.extend(_scan_reply_chain(c.chain))
+                    urls.extend(await _scan_reply_chain(c.chain))
             return urls
 
         if event.message_obj and event.message_obj.message:
@@ -127,7 +147,7 @@ class PreFilters:
                 # 探针：检测引用组件，并递归挖掘被引用消息中的图片
                 if isinstance(seg, Comp.Reply):
                     if hasattr(seg, 'chain'):
-                        scanned_reply_images = _scan_reply_chain(seg.chain)
+                        scanned_reply_images = await _scan_reply_chain(seg.chain)
                         if scanned_reply_images:
                             has_payload = True
                             reply_image_urls.extend(scanned_reply_images)
@@ -148,8 +168,10 @@ class PreFilters:
                     has_payload = True
                     
                 # 顺手提取 URL
-                if isinstance(seg, Comp.Image) and getattr(seg, 'url', ''):
-                    image_urls.append(seg.url)
+                if isinstance(seg, Comp.Image):
+                    image_ref = await _extract_image_ref(seg)
+                    if image_ref:
+                        image_urls.append(image_ref)
                     
         # 封装着色逻辑：主脑视觉直通车
         direct_vision_urls = []
@@ -188,6 +210,7 @@ class PreFilters:
             )
         elif direct_vision_urls:
             event.set_extra("direct_vision_urls", direct_vision_urls)
+            event.set_extra("direct_image_refs", direct_vision_urls)
             logger.debug(
                 "[AstrMai-Sensor] vision direct path selected "
                 f"(urls={len(direct_vision_urls)}, probability={probability:.2f})"
@@ -209,6 +232,7 @@ class PreFilters:
         # 记录提取到的所有图片足迹；reply-image 也应保留给后续主链使用
         extracted_image_urls = list(dict.fromkeys(list(image_urls or []) + list(reply_image_urls or [])))
         event.set_extra("extracted_image_urls", extracted_image_urls)
+        event.set_extra("extracted_image_refs", extracted_image_urls)
         
         # 3. 🚨 核心指令拦截防火墙 🚨
         if clean_text:

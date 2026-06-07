@@ -6,6 +6,8 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -191,6 +193,124 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_eav_fact_newer_write_supersedes_all_active_older_versions(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            oldest_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="最早只有1台服务器",
+                    summary="1台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True},
+                    created_at=1000.0,
+                )
+            )
+            middle_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="后来变成2台服务器",
+                    summary="2台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True},
+                    created_at=2000.0,
+                )
+            )
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE canonical_memories SET status = 'active', superseded_by = '' WHERE id = ?",
+                    (oldest_id,),
+                )
+                await db.commit()
+            newest_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="现在已经是3台服务器",
+                    summary="3台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True},
+                    created_at=3000.0,
+                )
+            )
+            oldest = await store.get_canonical(oldest_id, include_inactive=True)
+            middle = await store.get_canonical(middle_id, include_inactive=True)
+            newest = await store.get_canonical(newest_id, include_inactive=True)
+            self.assertEqual(oldest.status, "superseded")
+            self.assertEqual(oldest.superseded_by, newest_id)
+            self.assertEqual(middle.status, "superseded")
+            self.assertEqual(middle.superseded_by, newest_id)
+            self.assertEqual(newest.status, "active")
+
+        asyncio.run(run())
+
+    def test_eav_fact_older_backfill_cascades_duplicate_active_versions_to_latest_old(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            latest_old_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="现在是3台服务器",
+                    summary="3台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True},
+                    created_at=3000.0,
+                )
+            )
+            duplicate_old_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="之前是2台服务器",
+                    summary="2台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True},
+                    created_at=2000.0,
+                )
+            )
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE canonical_memories SET status = 'active', superseded_by = '' WHERE id = ?",
+                    (duplicate_old_id,),
+                )
+                await db.commit()
+            very_old_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="authority_backfill",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="zlj",
+                    content="最早是1台服务器",
+                    summary="1台服务器",
+                    dedup_key="zlj:asset:server_count",
+                    metadata={"authority_eav": True},
+                    created_at=1000.0,
+                )
+            )
+            latest_old = await store.get_canonical(latest_old_id, include_inactive=True)
+            duplicate_old = await store.get_canonical(duplicate_old_id, include_inactive=True)
+            very_old = await store.get_canonical(very_old_id, include_inactive=True)
+            self.assertEqual(latest_old.status, "active")
+            self.assertEqual(duplicate_old.status, "superseded")
+            self.assertEqual(duplicate_old.superseded_by, latest_old_id)
+            self.assertEqual(very_old.status, "superseded")
+            self.assertEqual(very_old.superseded_by, latest_old_id)
+
+        asyncio.run(run())
+
     def test_injection_trace_is_recorded_and_tool_excludes_injected_ids(self):
         async def run():
             _store, _retrieval, writer, injection, tools, _maintenance = self._services()
@@ -293,6 +413,63 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(len(result.items), 1)
             self.assertEqual(result.items[0].persona_id, "persona-a")
             self.assertIn("gentle", result.items[0].content)
+
+        asyncio.run(run())
+
+    def test_retrieval_persona_lore_uses_same_session_scope_for_canonical_and_hybrid(self):
+        class _HybridResult:
+            content = "I keep a gentle, concise voice."
+            score = 0.8
+
+            def __init__(self):
+                self.metadata = {
+                    "canonical_id": "idx-persona",
+                    "session_id": "__self_lore__",
+                    "persona_id": "persona-a",
+                    "kind": "persona_lore",
+                }
+
+        class _Engine:
+            def __init__(self):
+                self.calls = []
+
+            async def search_memories(self, query, *, top_k, session_id=None, persona_id=None):
+                self.calls.append({
+                    "query": query,
+                    "top_k": top_k,
+                    "session_id": session_id,
+                    "persona_id": persona_id,
+                })
+                return [_HybridResult()]
+
+        async def run():
+            store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
+            writer = self.write_mod.MemoryWriteService(store)
+            await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="persona_lore",
+                    kind="persona_lore",
+                    session_id="__self_lore__",
+                    persona_id="persona-a",
+                    content="I keep a gentle, concise voice.",
+                    dedup_key="lore:persona-a",
+                )
+            )
+            engine = _Engine()
+            retrieval = self.retrieval_mod.MemoryRetrievalService(store, engine=engine)
+            rows = await retrieval.retrieve(
+                self.contracts.MemoryQuery(
+                    query="gentle voice",
+                    session_id="chat-1",
+                    persona_id="persona-a",
+                    layers=["persona_lore"],
+                    include_persona_lore=True,
+                    top_k=3,
+                )
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].persona_id, "persona-a")
+            self.assertEqual(engine.calls[0]["session_id"], "__self_lore__")
 
         asyncio.run(run())
 
@@ -483,10 +660,10 @@ class MemoryV2ServiceTests(unittest.TestCase):
             def _build_memory_metadata(self, **kwargs):
                 return dict(kwargs)
 
-            async def _run_documents_query(self, query, params=()):
+            async def _run_documents_query(self, query, params=(), *, db_path=None):
                 return [(len(self.deleted) + 1,)]
 
-            async def _execute_documents_write(self, query, params=()):
+            async def _execute_documents_write(self, query, params=(), *, db_path=None):
                 self.deleted.append((query, params))
                 return 1
 
@@ -878,6 +1055,118 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_instant_memory_llm_backfill_falls_back_on_gateway_signature_typeerror(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            class _PromptRegistry:
+                def render_template(self, template_id, variables):
+                    return SimpleNamespace(prompt="instant prompt", system_prompt="instant system")
+
+            class _Gateway:
+                def __init__(self):
+                    self.calls = []
+                    self.config = _Config()
+
+                async def call_data_process_task(self, *args, **kwargs):
+                    self.calls.append({"args": args, "kwargs": kwargs})
+                    if "template_envelope" in kwargs:
+                        raise TypeError("unexpected keyword template_envelope")
+                    return {"worth": True, "fact": "用户想保留旧款机械键盘"}
+
+            gateway = _Gateway()
+            gate = gate_mod.InstantMemoryGate(
+                gateway=gateway,
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            gate.prompt_registry = _PromptRegistry()
+            turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-typeerror-fallback",
+                chat_id="chat-typeerror",
+                user_text="帮我记住那把旧款机械键盘",
+                assistant_text="记下来了",
+                source="test",
+                think_level=2,
+            )
+
+            result = await gate.run_llm_backfill(turn)
+
+            self.assertTrue(result.hit)
+            self.assertEqual(len(gateway.calls), 2)
+            rows = await store.list_candidates(session_id="chat-typeerror", kinds=["fact"], limit=10)
+            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
+            self.assertEqual(len(llm_rows), 1)
+
+        asyncio.run(run())
+
+    def test_instant_memory_llm_backfill_returns_empty_when_lane_resolution_fails(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            gate_mod = importlib.import_module("astrmai.memory.services.instant_memory_gate")
+
+            class _Engine:
+                def __init__(self, write_service):
+                    self.write_service = write_service
+
+            class _Config:
+                class memory:
+                    cleanup_interval = 3600
+                    summary_threshold = 30
+
+            class _PromptRegistry:
+                def render_template(self, template_id, variables):
+                    return SimpleNamespace(prompt="instant prompt", system_prompt="instant system")
+
+            class _Gateway:
+                def __init__(self):
+                    self.calls = []
+                    self.config = _Config()
+
+                async def call_data_process_task(self, *args, **kwargs):
+                    self.calls.append({"args": args, "kwargs": kwargs})
+                    return {"worth": True, "fact": "这条不该被写入"}
+
+            gateway = _Gateway()
+            gate = gate_mod.InstantMemoryGate(
+                gateway=gateway,
+                engine=_Engine(writer),
+                config=_Config(),
+            )
+            gate.prompt_registry = _PromptRegistry()
+
+            def _raise_lane_error(_chat_id):
+                raise ValueError("lane boom")
+
+            gate.memory_lane_key = _raise_lane_error
+            turn = self.contracts.CommittedMemoryTurn(
+                turn_id="turn-lane-error",
+                chat_id="chat-lane",
+                user_text="这条不该被写入",
+                assistant_text="好的",
+                source="test",
+                think_level=2,
+            )
+
+            result = await gate.run_llm_backfill(turn)
+
+            self.assertFalse(result.hit)
+            self.assertEqual(gateway.calls, [])
+            rows = await store.list_candidates(session_id="chat-lane", kinds=["fact"], limit=10)
+            self.assertEqual(rows, [])
+
+        asyncio.run(run())
+
     def test_search_prefers_fts_and_basic_terms_still_work(self):
         async def run():
             store, retrieval, writer, _injection, _tools, _maintenance = self._services()
@@ -1016,6 +1305,28 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertGreater(ranked[1].relevance_score, 0.6)
 
         asyncio.run(run())
+
+    def test_fuse_candidates_uses_configured_conflict_penalty(self):
+        scoring_mod = importlib.import_module("astrmai.memory.services.memory_scoring")
+        retrieval = self.retrieval_mod.MemoryRetrievalService(
+            store=self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name),
+            scoring=scoring_mod.MemoryScoringConfig(conflict_penalty=0.35),
+        )
+        query = self.contracts.MemoryQuery(query="Alice", session_id="chat-1")
+        candidate = self.contracts.MemoryCandidate(
+            id="mem-1",
+            kind="memory",
+            source="unit",
+            summary="candidate",
+            content="candidate",
+            importance=0.5,
+            confidence=0.8,
+            relevance_score=0.0,
+            metadata={"corrected_by": "mem-2"},
+        )
+        fused = retrieval._fuse_candidates([candidate], [], query)
+        self.assertEqual(len(fused), 1)
+        self.assertAlmostEqual(fused[0].metadata["_score_breakdown"]["conflict_penalty"], 0.35, places=4)
 
     def test_deep_retrieval_hydrates_missing_metadata_before_rerank(self):
         class _Gateway:
@@ -1244,6 +1555,11 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(report["physically_deleted"], 1)
             self.assertIsNotNone(await store.get_canonical(protected_id, include_inactive=True))
             self.assertIsNone(await store.get_canonical(disposable_id, include_inactive=True))
+            async with aiosqlite.connect(self.db_path) as db:
+                protected_fts = await (await db.execute("SELECT COUNT(*) FROM canonical_fts WHERE memory_id = ?", (protected_id,))).fetchone()
+                disposable_fts = await (await db.execute("SELECT COUNT(*) FROM canonical_fts WHERE memory_id = ?", (disposable_id,))).fetchone()
+            self.assertEqual(int(protected_fts[0] or 0), 1)
+            self.assertEqual(int(disposable_fts[0] or 0), 0)
 
         asyncio.run(run())
 
@@ -1359,14 +1675,14 @@ class MemoryV2ServiceTests(unittest.TestCase):
             def _build_memory_metadata(self, **kwargs):
                 return dict(kwargs)
 
-            async def _run_documents_query(self, query, params=()):
+            async def _run_documents_query(self, query, params=(), *, db_path=None):
                 if "SELECT id, metadata" in query:
                     return list(self.rows)
                 if "SELECT id FROM documents" in query:
                     return [(row[0],) for row in self.rows if row[1] and (not params or params[0] in row[1])]
                 return []
 
-            async def _execute_documents_write(self, query, params=()):
+            async def _execute_documents_write(self, query, params=(), *, db_path=None):
                 self.cleaned.append((query, params))
                 return 1
 
@@ -1422,6 +1738,104 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(report["schema_version"], 2)
             self.assertGreaterEqual(report["canonical_counts"]["active"], 1)
             self.assertIn("migrations", report)
+
+        asyncio.run(run())
+
+    def test_legacy_canonical_migration_ignores_duplicate_primary_keys(self):
+        async def run():
+            legacy_db_path = os.path.join(self.temp_dir.name, "legacy_docs.db")
+            target_db_path = os.path.join(self.temp_dir.name, "memory_v2.db")
+            schema_sql = """
+                CREATE TABLE canonical_memories (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT DEFAULT '',
+                    sender_id TEXT DEFAULT '',
+                    persona_id TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    kind TEXT DEFAULT '',
+                    content TEXT DEFAULT '',
+                    summary TEXT DEFAULT '',
+                    tags TEXT DEFAULT '[]',
+                    importance REAL DEFAULT 0.5,
+                    confidence REAL DEFAULT 0.8,
+                    status TEXT DEFAULT 'active',
+                    decay_score REAL DEFAULT 1.0,
+                    create_time REAL DEFAULT 0,
+                    update_time REAL DEFAULT 0,
+                    last_access_time REAL DEFAULT 0,
+                    access_count INTEGER DEFAULT 0,
+                    superseded_by TEXT DEFAULT '',
+                    deleted_reason TEXT DEFAULT '',
+                    metadata TEXT DEFAULT '{}',
+                    dedup_key TEXT DEFAULT '',
+                    source_ref TEXT DEFAULT '',
+                    visibility TEXT DEFAULT 'auto_and_tool'
+                )
+            """
+            row_sql = """
+                INSERT INTO canonical_memories (
+                    id, session_id, sender_id, persona_id, source, kind, content, summary,
+                    tags, importance, confidence, status, decay_score, create_time, update_time,
+                    last_access_time, access_count, superseded_by, deleted_reason, metadata,
+                    dedup_key, source_ref, visibility
+                ) VALUES (?, ?, '', '', 'legacy', 'memory', ?, ?, '[]', 0.5, 0.8, 'active', 1.0, ?, ?, ?, 0, '', '', '{}', ?, ?, 'auto_and_tool')
+            """
+            async with aiosqlite.connect(legacy_db_path) as db:
+                await db.execute(schema_sql)
+                await db.execute(row_sql, ("mem-1", "chat-1", "legacy duplicate", "legacy duplicate", 1.0, 1.0, 1.0, "legacy:1", "legacy:1"))
+                await db.execute(row_sql, ("mem-2", "chat-1", "legacy new", "legacy new", 2.0, 2.0, 2.0, "legacy:2", "legacy:2"))
+                await db.commit()
+            async with aiosqlite.connect(target_db_path) as db:
+                await db.execute(schema_sql)
+                await db.execute(row_sql, ("mem-1", "chat-1", "target duplicate", "target duplicate", 3.0, 3.0, 3.0, "target:1", "target:1"))
+                await db.commit()
+
+            store = self.store_mod.MemoryV2Store(target_db_path, data_path=self.temp_dir.name, legacy_db_path=legacy_db_path)
+            real_isfile = os.path.isfile
+
+            def _patched_isfile(path):
+                if path == legacy_db_path:
+                    return True
+                if path == target_db_path:
+                    return False
+                return real_isfile(path)
+
+            with patch("astrmai.memory.services.v2_store.os.path.isfile", side_effect=_patched_isfile):
+                await store._migrate_from_legacy_db()
+
+            async with aiosqlite.connect(target_db_path) as db:
+                rows = await (await db.execute("SELECT id, content FROM canonical_memories ORDER BY id")).fetchall()
+            self.assertEqual(rows, [("mem-1", "target duplicate"), ("mem-2", "legacy new")])
+
+        asyncio.run(run())
+
+    def test_memory_engine_run_documents_query_requires_explicit_db_path(self):
+        async def run():
+            memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+            config = SimpleNamespace(
+                provider=SimpleNamespace(embedding_models=[]),
+                memory=SimpleNamespace(recall_top_k=5),
+                persona=SimpleNamespace(persona_id="persona-1"),
+            )
+            gateway = SimpleNamespace(config=config)
+            engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), gateway, embedding_models=[], config=config)
+
+            async with aiosqlite.connect(engine.db_path) as db:
+                await db.execute("CREATE TABLE documents (id INTEGER PRIMARY KEY, text TEXT, metadata TEXT)")
+                await db.execute("INSERT INTO documents(text, metadata) VALUES (?, ?)", ("doc memory", '{"session_id":"chat-1"}'))
+                await db.commit()
+            async with aiosqlite.connect(engine.v2_db_path) as db:
+                await db.execute("CREATE TABLE canonical_memories (content TEXT)")
+                await db.execute("INSERT INTO canonical_memories(content) VALUES (?)", ("canonical memory",))
+                await db.commit()
+
+            with self.assertRaisesRegex(ValueError, "db_path must be explicitly provided"):
+                await engine._run_documents_query("SELECT 1")
+
+            doc_rows = await engine._run_documents_query("SELECT text FROM documents", db_path=engine.db_path)
+            canonical_rows = await engine._run_documents_query("SELECT content FROM canonical_memories", db_path=engine.v2_db_path)
+            self.assertEqual(doc_rows, [("doc memory",)])
+            self.assertEqual(canonical_rows, [("canonical memory",)])
 
         asyncio.run(run())
 

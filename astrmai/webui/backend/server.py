@@ -1,30 +1,33 @@
+import logging
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from .routes import api_router
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="AstrMai WebUI")
+
+
+def _cors_origins() -> list[str]:
+    raw = os.getenv(
+        "ASTRMAI_CORS_ORIGINS",
+        "http://localhost:8765,http://127.0.0.1:8765,http://localhost:8787,http://127.0.0.1:8787",
+    )
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8765"],
+    allow_origins=_cors_origins(),
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # API Routers
 app.include_router(api_router, prefix="/api")
-
-# The frontend code is at astrmai/webui/frontend
-base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-frontend_dir = os.path.join(base_dir, "frontend")
-
-# Mount StaticFiles
-app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn

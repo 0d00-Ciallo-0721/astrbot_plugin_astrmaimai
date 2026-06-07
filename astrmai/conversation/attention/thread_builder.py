@@ -127,7 +127,7 @@ def _build_thread_signature(focus_candidate, root_candidate, reply_mode: ReplyMo
             str(root.sender_id or ""),
             str(root.reply_target_sender_id or ""),
             str(focus_candidate.sender_id or ""),
-            hashlib.md5(str(root.rich_text or root.text or "").encode("utf-8")).hexdigest()[:10],
+            hashlib.sha256(str(root.rich_text or root.text or "").encode("utf-8")).hexdigest()[:10],
         ]
     )
     return basis
@@ -137,6 +137,7 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
     core_events: list = []
     related_events: list = []
     ambient_events: list = []
+    event_order = {candidate.event: candidate.index for candidate in normalized_events}
     attention_config = getattr(gate.config, "attention", None)
     thread_enabled = bool(getattr(attention_config, "focus_thread_enabled", True))
     core_limit = int(getattr(attention_config, "focus_thread_core_max_messages", 4) or 4)
@@ -210,9 +211,9 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
             continue
         _append_unique(ambient_events, candidate.event, ambient_limit)
 
-    core_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
-    related_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
-    ambient_events.sort(key=lambda event: next(item.index for item in normalized_events if item.event is event))
+    core_events.sort(key=lambda event: event_order.get(event, -1))
+    related_events.sort(key=lambda event: event_order.get(event, -1))
+    ambient_events.sort(key=lambda event: event_order.get(event, -1))
 
     return FocusThreadContext(
         focus_event=focus_candidate.event,

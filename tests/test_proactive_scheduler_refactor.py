@@ -140,6 +140,44 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(status["scheduler_poll_interval"], 5.0)
         self.assertEqual(status["global_maintenance_interval"], 60.0)
 
+    def test_configure_accepts_deps_and_binds_planner_heartflow_manager(self):
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=1,
+                    dream_time_ranges=[],
+                    silence_threshold=10,
+                    wakeup_min_energy=20,
+                    wakeup_cost=5,
+                    wakeup_cooldown=60,
+                    dream_visible=False,
+                ),
+                persona=SimpleNamespace(persona_id="global", name="Mai"),
+                evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            ),
+            call_proactive_task=None,
+        )
+
+        async def _call_proactive_task(**kwargs):
+            return "ok"
+
+        gateway.call_proactive_task = _call_proactive_task
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(get_active_states=lambda: [], get_active_profiles=lambda: [], apply_natural_decay=lambda state: None),
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=gateway.config,
+        )
+        planner = SimpleNamespace(heartflow_manager=None)
+
+        task.configure(self.mod.ProactiveDeps(dream_visible=True, planner=planner))
+
+        self.assertTrue(task.dream_scheduler.dream_visible)
+        self.assertIs(planner.heartflow_manager, task.heartflow_manager)
+
     def test_proactive_task_refresh_config_propagates_to_runtime_children(self):
         old_config = SimpleNamespace(
             life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"], silence_threshold=10, wakeup_min_energy=20, wakeup_cost=5, wakeup_cooldown=60, dream_visible=False),

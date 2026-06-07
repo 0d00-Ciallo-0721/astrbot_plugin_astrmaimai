@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import unittest
+from collections import defaultdict
 
 
 class _FakePersistence:
@@ -13,6 +14,18 @@ class _FakePersistence:
 
     async def save_user_profile(self, profile):
         self.saved[profile.user_id] = profile
+
+
+class _FlakyPersistence(_FakePersistence):
+    def __init__(self):
+        super().__init__()
+        self.calls = defaultdict(int)
+
+    async def save_user_profile(self, profile):
+        self.calls[profile.user_id] += 1
+        if self.calls[profile.user_id] == 1:
+            raise RuntimeError("save failed")
+        await super().save_user_profile(profile)
 
 
 class UserProfileServiceMigratedTests(unittest.TestCase):
@@ -104,6 +117,26 @@ class UserProfileServiceMigratedTests(unittest.TestCase):
         self.assertFalse(locked_changed)
         self.assertFalse(unlocked_placeholder)
         self.assertEqual(profile.name, "Alice")
+
+    def test_flush_message_counters_keeps_dirty_when_save_fails_then_clears_on_success(self):
+        persistence = _FlakyPersistence()
+        service = self.mod.UserProfileService(persistence)
+
+        async def _run():
+            profile = await service.get_user_profile("user-1")
+            profile.name = "Alice"
+            profile.is_dirty = True
+            with self.assertRaisesRegex(RuntimeError, "save failed"):
+                await service.flush_message_counters()
+            dirty_after_failure = profile.is_dirty
+            await service.flush_message_counters()
+            return profile, dirty_after_failure
+
+        profile, dirty_after_failure = asyncio.run(_run())
+
+        self.assertTrue(dirty_after_failure)
+        self.assertFalse(profile.is_dirty)
+        self.assertIn("user-1", persistence.saved)
 
 
 if __name__ == "__main__":

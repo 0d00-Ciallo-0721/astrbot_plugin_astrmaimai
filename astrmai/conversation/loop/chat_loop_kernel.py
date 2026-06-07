@@ -50,6 +50,7 @@ class ChatLoopKernel:
     BUSY_BACKPRESSURE_RATIO = 0.5
     BUSY_BACKPRESSURE_DIALOGUE_CAP = 16
     MAINTENANCE_QUOTA_PRESSURE_ESCALATION = 4
+    MAINTENANCE_BUDGET_BLOCKED_IDLE_THRESHOLD = 3
     CONSECUTIVE_SELECTION_SOFT_LIMIT = 3
     CONSECUTIVE_SELECTION_BIAS_MULTIPLIER = 8.0
     PHASE_PRIORITY = {
@@ -81,8 +82,32 @@ class ChatLoopKernel:
         "IDLE": 5,
     }
     DEFAULT_SCHEDULER_PROFILE_NAME = "balanced"
+    _SCHEDULER_BASE = {
+        "fairness_penalty_multiplier": 12.0,
+        "selection_cooldown_soft_limit": 3,
+        "selection_cooldown_bias_multiplier": 8.0,
+        "maintenance_boost_divisor_seconds": 45.0,
+        "starvation_divisor_seconds": 30.0,
+        "forced_promotion_max_slots": 4,
+        "dialogue_batch_slots": 24,
+        "maintenance_batch_slots": 4,
+        "maintenance_heavy_dialogue_slots": 12,
+        "maintenance_heavy_batch_slots": 12,
+        "busy_backpressure_ratio": 0.5,
+        "busy_backpressure_dialogue_cap": 16,
+        "forced_promotion_pass_thresholds": {
+            "WAITING": 2,
+            "BUSY": 2,
+            "ACTIVE": 3,
+            "COOLDOWN": 4,
+            "MAINTENANCE": 4,
+            "IDLE": 5,
+        },
+    }
     SCHEDULER_POLICY_PROFILES = {
+        "balanced": _SCHEDULER_BASE,
         "dialogue_first": {
+            **_SCHEDULER_BASE,
             "forced_promotion_pass_thresholds": {
                 "WAITING": 2,
                 "BUSY": 2,
@@ -92,41 +117,14 @@ class ChatLoopKernel:
                 "IDLE": 6,
             },
             "fairness_penalty_multiplier": 14.0,
-            "selection_cooldown_soft_limit": 3,
             "selection_cooldown_bias_multiplier": 10.0,
             "maintenance_boost_divisor_seconds": 60.0,
             "starvation_divisor_seconds": 28.0,
-            "forced_promotion_max_slots": 4,
-            "dialogue_batch_slots": 24,
-            "maintenance_batch_slots": 4,
-            "maintenance_heavy_dialogue_slots": 12,
             "maintenance_heavy_batch_slots": 10,
             "busy_backpressure_ratio": 0.45,
-            "busy_backpressure_dialogue_cap": 16,
-        },
-        "balanced": {
-            "forced_promotion_pass_thresholds": {
-                "WAITING": 2,
-                "BUSY": 2,
-                "ACTIVE": 3,
-                "COOLDOWN": 4,
-                "MAINTENANCE": 4,
-                "IDLE": 5,
-            },
-            "fairness_penalty_multiplier": 12.0,
-            "selection_cooldown_soft_limit": 3,
-            "selection_cooldown_bias_multiplier": 8.0,
-            "maintenance_boost_divisor_seconds": 45.0,
-            "starvation_divisor_seconds": 30.0,
-            "forced_promotion_max_slots": 4,
-            "dialogue_batch_slots": 24,
-            "maintenance_batch_slots": 4,
-            "maintenance_heavy_dialogue_slots": 12,
-            "maintenance_heavy_batch_slots": 12,
-            "busy_backpressure_ratio": 0.5,
-            "busy_backpressure_dialogue_cap": 16,
         },
         "maintenance_friendly": {
+            **_SCHEDULER_BASE,
             "forced_promotion_pass_thresholds": {
                 "WAITING": 2,
                 "BUSY": 2,
@@ -140,7 +138,6 @@ class ChatLoopKernel:
             "selection_cooldown_bias_multiplier": 6.0,
             "maintenance_boost_divisor_seconds": 30.0,
             "starvation_divisor_seconds": 24.0,
-            "forced_promotion_max_slots": 4,
             "dialogue_batch_slots": 20,
             "maintenance_batch_slots": 6,
             "maintenance_heavy_dialogue_slots": 10,
@@ -1481,6 +1478,8 @@ class ChatLoopKernel:
         maintenance_candidates = self._maintenance_candidates(snapshot)
         maintenance_budget = self._maintenance_budget_state(snapshot.chat_id)
         maintenance_budget_blocked = maintenance_budget["total"] <= 0 or maintenance_budget["remaining"] <= 0
+        pending_heartflow = bool((state.pending_signals or {}).get("pending_heartflow", False))
+        pending_heartflow_reason = str((state.pending_signals or {}).get("pending_heartflow_reason", "") or "")
 
         if snapshot.proactive_signal:
             if snapshot.quiet_signal:
@@ -1488,7 +1487,18 @@ class ChatLoopKernel:
             elif self._cooldown_active(snapshot, "wakeup"):
                 cooldown_blocks.append("wakeup")
             else:
-                return self._bridge_decision(snapshot, "PROACTIVE_WAKEUP", "wakeup_signal")
+                proactive_metadata = {}
+                if snapshot.heartflow_signal:
+                    proactive_metadata["pending_heartflow"] = True
+                    proactive_metadata["pending_heartflow_reason"] = f"heartflow_signal:{snapshot.heartflow_signal}"
+                return self._bridge_decision(snapshot, "PROACTIVE_WAKEUP", "wakeup_signal", metadata=proactive_metadata)
+
+        if pending_heartflow and not snapshot.quiet_signal and not self._cooldown_active(snapshot, "heartflow"):
+            metadata = {
+                "pending_heartflow_consumed": True,
+                "pending_heartflow_reason": pending_heartflow_reason or "pending_heartflow_replay",
+            }
+            return self._bridge_decision(snapshot, "HEARTFLOW_EVALUATE", pending_heartflow_reason or "pending_heartflow", metadata=metadata)
 
         if snapshot.heartflow_signal:
             if snapshot.quiet_signal:
@@ -1556,8 +1566,16 @@ class ChatLoopKernel:
                 metadata["compaction_block_source"] = "cooldown"
         elif maintenance_budget_blocked and self._has_maintenance_candidate(maintenance_candidates):
             reason = "maintenance_budget_blocked"
+            blocked_rounds = 1
+            previous_signals = dict(state.pending_signals or {})
+            if str(state.phase or "").upper() == "MAINTENANCE" and bool(previous_signals.get("maintenance_budget_blocked", False)):
+                blocked_rounds = int(previous_signals.get("maintenance_budget_blocked_rounds", 0) or 0) + 1
+            metadata["maintenance_budget_blocked"] = True
+            metadata["maintenance_budget_blocked_rounds"] = blocked_rounds
             metadata["maintenance_blocked_by_budget"] = True
             metadata["maintenance_blocked_by"] = "maintenance_budget"
+            if blocked_rounds >= self.MAINTENANCE_BUDGET_BLOCKED_IDLE_THRESHOLD:
+                metadata["maintenance_phase_downgraded"] = True
         elif maintenance_candidates["memory"].get("candidate_present", False):
             metadata["memory_block_source"] = str(maintenance_candidates["memory"].get("reason", "") or "not_selected")
         if maintenance_candidates["dream"].get("eligible", False) and reason != "dream_signal":
@@ -1788,6 +1806,12 @@ class ChatLoopKernel:
                     decision.metadata["schedule_reason"] = "cooldown_expiry"
                     return
 
+            if bool(decision.metadata.get("maintenance_phase_downgraded", False)):
+                decision.next_tick_delay = self.IDLE_BACKOFF_SECONDS
+                decision.metadata["scheduler_bucket"] = "idle_backoff"
+                decision.metadata["schedule_reason"] = "maintenance_budget_blocked_idle_downgrade"
+                return
+
             if self._has_maintenance_candidate(maintenance_candidates):
                 decision.next_tick_delay = self.MAINTENANCE_CANDIDATE_RECHECK_SECONDS
                 decision.metadata["scheduler_bucket"] = "maintenance_backoff"
@@ -1865,6 +1889,8 @@ class ChatLoopKernel:
         if action == "NOOP" and str(decision.reason or "") in {"quiet_hours", "cooldown_blocked"}:
             return "COOLDOWN"
         if action == "NOOP" and str(decision.reason or "") == "maintenance_budget_blocked":
+            if bool(decision.metadata.get("maintenance_phase_downgraded", False)):
+                return "IDLE"
             return "MAINTENANCE"
         return "IDLE"
 
@@ -1897,7 +1923,13 @@ class ChatLoopKernel:
         base_signals["not_selected_reason"] = str(decision.metadata.get("not_selected_reason", "") or "")
         base_signals["quota_bucket"] = str(decision.metadata.get("quota_bucket", "") or "")
         base_signals["quota_skip_reason"] = str(decision.metadata.get("quota_skip_reason", "") or "")
+        base_signals["maintenance_budget_blocked"] = bool(decision.metadata.get("maintenance_budget_blocked", False))
+        base_signals["maintenance_budget_blocked_rounds"] = int(decision.metadata.get("maintenance_budget_blocked_rounds", 0) or 0)
+        base_signals["maintenance_phase_downgraded"] = bool(decision.metadata.get("maintenance_phase_downgraded", False))
         base_signals["maintenance_blocked_by_budget"] = bool(decision.metadata.get("maintenance_blocked_by_budget", False))
+        base_signals["pending_heartflow"] = bool(decision.metadata.get("pending_heartflow", False))
+        base_signals["pending_heartflow_reason"] = str(decision.metadata.get("pending_heartflow_reason", "") or "")
+        base_signals["pending_heartflow_consumed"] = bool(decision.metadata.get("pending_heartflow_consumed", False))
         base_signals["batch_plan"] = dict(decision.metadata.get("batch_plan", {}) or {})
         base_signals["batch_fill_rate"] = float(decision.metadata.get("batch_fill_rate", 0.0) or 0.0)
         base_signals["batch_pressure"] = dict(decision.metadata.get("batch_pressure", {}) or {})

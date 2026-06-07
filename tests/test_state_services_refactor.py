@@ -1,7 +1,9 @@
 import asyncio
+import datetime
 import importlib
 import sys
 import tempfile
+import time
 import types
 import unittest
 from types import SimpleNamespace
@@ -31,6 +33,31 @@ class _FakePersistence:
 
     async def save_user_profile(self, user_id, profile):
         return None
+
+
+class _DropPersistence(_FakePersistence):
+    async def load_chat_state(self, chat_id):
+        return {
+            "chat_id": chat_id,
+            "energy": 0.05,
+            "mood": 0.0,
+            "group_config": {},
+            "last_reset_date": datetime.date.today().isoformat(),
+            "total_replies": 0,
+            "last_reply_time": 0.0,
+            "last_passive_decay_time": 0.0,
+            "last_energy_recovery_time": 0.0,
+            "total_messages": 0,
+            "judgment_mode": "single",
+            "last_msg_info": self._last_msg_info(),
+            "last_access_time": 0.0,
+            "next_wakeup_timestamp": 0.0,
+            "is_dirty": False,
+        }
+
+    @staticmethod
+    def _last_msg_info():
+        return {"sender_id": "", "has_image": False, "image_urls": [], "vl_executed": False}
 
 
 class StateRefactorTests(unittest.TestCase):
@@ -109,14 +136,92 @@ class StateRefactorTests(unittest.TestCase):
 
         private_before, private_after, group_before, group_after = asyncio.run(_run())
 
-        self.assertEqual(private_before, 0.8)
-        self.assertEqual(private_after, 0.8)
-        self.assertEqual(group_before, 0.8)
-        self.assertAlmostEqual(group_after, 0.6)
+        self.assertEqual(private_before, 0.5)
+        self.assertEqual(private_after, 0.5)
+        self.assertEqual(group_before, 0.5)
+        self.assertAlmostEqual(group_after, 0.3)
         self.assertEqual(
             [chat_id for chat_id, _, _ in persistence.saved_chat_states],
             ["default:GroupMessage:group-1"],
         )
+
+    def test_should_drop_by_energy_persists_recovery_side_effect(self):
+        persistence = _DropPersistence()
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = self.state_mod.StateEngine(persistence, SimpleNamespace(config=config), config=config)
+
+        original_random = self.state_mod.random.random if hasattr(self.state_mod, "random") else None
+
+        async def _run():
+            import astrmai.state.energy.energy_manager as energy_manager_mod
+            old_random = energy_manager_mod.random.random
+            energy_manager_mod.random.random = lambda: 0.0
+            try:
+                dropped = await engine.should_drop_by_energy("default:GroupMessage:group-drop", 2)
+                state = await engine.get_state("default:GroupMessage:group-drop")
+                return dropped, state
+            finally:
+                energy_manager_mod.random.random = old_random
+
+        dropped, state = asyncio.run(_run())
+
+        self.assertTrue(dropped)
+        self.assertAlmostEqual(state.energy, 0.25)
+        self.assertFalse(state.is_dirty)
+        self.assertEqual(
+            [chat_id for chat_id, _, _ in persistence.saved_chat_states],
+            ["default:GroupMessage:group-drop"],
+        )
+
+    def test_update_mood_snapshot_does_not_mutate_live_state_before_analysis(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=1),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = self.state_mod.StateEngine(_FakePersistence(), SimpleNamespace(config=config), config=config)
+        live_state = SimpleNamespace(
+            mood=0.2,
+            energy=0.4,
+            last_reply_time=time.time() - 7200.0,
+            last_passive_decay_time=time.time() - 7200.0,
+            is_dirty=False,
+        )
+        observed = {}
+
+        async def _get_state(chat_id):
+            observed["chat_id"] = chat_id
+            return live_state
+
+        async def _get_state_inner(chat_id):
+            return live_state
+
+        async def _save_chat_state(chat_id, state):
+            observed["saved_energy"] = state.energy
+            observed["saved_mood"] = state.mood
+
+        async def _analyze(text, current_mood, user_affection=0.0, chat_id=None):
+            observed["energy_during_analysis"] = live_state.energy
+            observed["dirty_during_analysis"] = live_state.is_dirty
+            return "happy", 0.6
+
+        engine.get_state = _get_state
+        engine.chat_state_service._get_state_inner = _get_state_inner
+        engine.chat_state_service.persistence.save_chat_state = _save_chat_state
+        engine.mood_manager.analyze_mood = _analyze
+
+        tag, final_mood = asyncio.run(engine.update_mood("chat-snapshot", "hello"))
+
+        self.assertEqual(tag, "happy")
+        self.assertAlmostEqual(final_mood, 0.6)
+        self.assertAlmostEqual(observed["energy_during_analysis"], 0.4)
+        self.assertFalse(observed["dirty_during_analysis"])
+        self.assertAlmostEqual(observed["saved_energy"], 0.5)
+        self.assertAlmostEqual(live_state.energy, 0.5)
 
     def test_settle_no_send_affection_only_updates_negative_interactions(self):
         config = SimpleNamespace(

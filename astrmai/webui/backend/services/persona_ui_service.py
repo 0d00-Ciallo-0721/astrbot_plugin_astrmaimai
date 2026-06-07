@@ -56,16 +56,23 @@ class PersonaUiService:
         }
 
     async def get_persona(self) -> dict[str, Any]:
-        return {
-            "status": "error",
-            "message": "Raw persona cache is not exposed by AstrMai Web diagnostics; use AstrBot native persona management.",
-        }
+        cache = await self.plugin_api.read_persona_cache()
+        persona_id = self._resolve_persona_id(self.plugin_api)
+        _, payload = self._select_cache_payload(cache, persona_id)
+        return dict(payload)
 
     async def update_persona(self, data: dict) -> dict[str, Any]:
-        return {
-            "status": "error",
-            "message": "Raw persona cache is read-only in AstrMai Web diagnostics; use AstrBot native persona management.",
-        }
+        cache = await self.plugin_api.read_persona_cache()
+        persona_id = self._resolve_persona_id(self.plugin_api)
+        cache_key, payload = self._select_cache_payload(cache, persona_id)
+        updated_payload = dict(payload)
+        updated_payload.update(dict(data or {}))
+
+        updated_cache = dict(cache) if isinstance(cache, dict) else {}
+        target_key = cache_key or persona_id or "global"
+        updated_cache[target_key] = updated_payload
+        await self.plugin_api.write_persona_cache(updated_cache)
+        return updated_payload
 
     def _resolve_persona_id(self, plugin_api: Any) -> str:
         try:

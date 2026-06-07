@@ -120,7 +120,9 @@ class MemoryEngine:
         return metadata
 
     async def _run_documents_query(self, query: str, params: tuple = (), *, db_path: str | None = None) -> list:
-        target = str(db_path or self.db_path)
+        target = str(db_path or "").strip()
+        if not target:
+            raise ValueError("db_path must be explicitly provided for _run_documents_query")
         async with aiosqlite.connect(target) as db:
             cursor = await db.execute(query, params)
             return await cursor.fetchall()
@@ -395,7 +397,7 @@ class MemoryEngine:
                 metadata={"guidance": signal.guidance, "cognitive_feedback": True},
                 dedup_key=(
                     f"feedback:{chat_id}:{signal.source}:"
-                    f"{hashlib.sha1(f'{signal.summary}|{signal.guidance}'.encode()).hexdigest()[:20]}"
+                    f"{hashlib.sha256(f'{signal.summary}|{signal.guidance}'.encode()).hexdigest()[:20]}"
                 ),
                 source_ref=f"cognitive_feedback:{signal.source}",
                 visibility="tool_only",
@@ -616,8 +618,6 @@ class MemoryEngine:
                     statement = select(MemoryEvent).order_by(desc(MemoryEvent.created_at)).limit(limit)
                     return [MemoryEvent.model_validate(item.model_dump()) for item in session.exec(statement).all()]
 
-            import asyncio
-
             events = await asyncio.to_thread(_load_events)
             for event in events:
                 content = str(getattr(event, "narrative", "") or "").strip()
@@ -677,8 +677,6 @@ class MemoryEngine:
                     statement = select(Jargon).order_by(desc(Jargon.updated_at)).limit(limit)
                     return [Jargon.model_validate(item.model_dump()) for item in session.exec(statement).all()]
 
-            import asyncio
-
             rows = await asyncio.to_thread(_load_jargons)
             for item in rows:
                 content = str(getattr(item, "content", "") or "").strip()
@@ -735,8 +733,6 @@ class MemoryEngine:
                     statement = select(ExpressionPattern).order_by(desc(ExpressionPattern.last_active_time)).limit(limit)
                     return [ExpressionPattern.model_validate(item.model_dump()) for item in session.exec(statement).all()]
 
-            import asyncio
-
             rows = await asyncio.to_thread(_load_patterns)
             for item in rows:
                 expression = str(getattr(item, "expression", "") or "").strip()
@@ -777,7 +773,7 @@ class MemoryEngine:
         recent_memories: list[str] = []
         cutoff_time = time.time() - (hours * 3600)
         try:
-            columns = [row[1] for row in await self._run_documents_query("PRAGMA table_info(documents)")]
+            columns = [row[1] for row in await self._run_documents_query("PRAGMA table_info(documents)", db_path=self.db_path)]
             if not columns:
                 logger.warning("[Memory] documents table has no columns yet; skip recent memory lookup.")
                 return []
@@ -791,6 +787,7 @@ class MemoryEngine:
                   AND json_extract(metadata, '$.create_time') >= ?
                 """,
                 (session_id, cutoff_time),
+                db_path=self.db_path,
             )
             for row in rows:
                 if row and row[0]:

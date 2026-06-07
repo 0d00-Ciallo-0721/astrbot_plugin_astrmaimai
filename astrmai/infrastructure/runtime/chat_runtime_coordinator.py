@@ -44,14 +44,20 @@ class ChatRuntimeCoordinator:
             if state.executor_pending >= max_pending:
                 return None
             state.executor_pending += 1
-            return state.executor_lock
+            executor_lock = state.executor_lock
+        await executor_lock.acquire()
+        return executor_lock
 
     async def release_executor(self, chat_id: str) -> None:
+        executor_lock: Optional[asyncio.Lock] = None
         async with self._lock:
             state = self._states.get(chat_id)
             if not state:
                 return
             state.executor_pending = max(0, state.executor_pending - 1)
+            executor_lock = state.executor_lock
+        if executor_lock is not None and executor_lock.locked():
+            executor_lock.release()
 
     async def update_wait_targets(self, chat_id: str, targets: List[str], target_name: str = "") -> None:
         async with self._lock:

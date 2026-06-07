@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 
-import aiohttp
 from astrbot.api import logger
 
 
@@ -30,14 +29,7 @@ async def extract_image_base64(gate, image_component):
 
 
 async def extract_image_base64_from_url(gate, url: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    return base64.b64encode(data).decode("utf-8")
-    except Exception as exc:
-        logger.debug(f"[{gate.__class__.__name__}] 获取图片 URL 失败: {exc}")
+    logger.debug(f"[{gate.__class__.__name__}] remote image URLs are disabled: {url}")
     return ""
 
 

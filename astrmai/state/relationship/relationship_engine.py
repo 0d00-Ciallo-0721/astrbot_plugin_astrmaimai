@@ -329,6 +329,10 @@ class RelationshipEngine:
         # 3. 对每个维度应用深度算法
         old_score = vec.social_score
         is_positive = sum(deltas.values()) > 0
+        streak_multiplier = 1.0
+        if is_positive and vec.positive_streak > 1:
+            streak_bonus = math.log2(vec.positive_streak + 1) * 0.3
+            streak_multiplier += min(streak_bonus, 1.5)
 
         for dim_name, raw_delta in deltas.items():
             current_val = getattr(vec, dim_name, 0.0)
@@ -339,10 +343,8 @@ class RelationshipEngine:
             # 3.2 强度乘数
             saturated_delta *= max(0.1, min(3.0, intensity))
 
-            # 3.3 共振放大 (连续正面互动)
-            if is_positive and vec.positive_streak > 1:
-                streak_bonus = math.log2(vec.positive_streak + 1) * 0.3
-                saturated_delta *= (1.0 + min(streak_bonus, 1.5))
+            # 3.3 共振放大 (连续正面互动)，按事件级别统一计算一次放大因子。
+            saturated_delta *= streak_multiplier
 
             # 3.4 信任惩罚放大 (负面事件时，高信任的背叛更痛)
             if raw_delta < 0 and dim_name == "emotion_bond":

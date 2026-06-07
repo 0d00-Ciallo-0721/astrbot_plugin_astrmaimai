@@ -39,12 +39,6 @@
         "default": true,
         "hint": "开启后，内部错误不会直接暴露给普通用户，同时会把错误信息发送给管理员。"
       },
-      "webui_password": {
-        "description": "WebUI 绠＄悊瀵嗙爜",
-        "type": "string",
-        "default": "",
-        "hint": "鐣欑┖琛ㄧず鏈厤缃紱淇敼鍚庨渶瑕侀噸鏂扮櫥褰曟垨閲嶆柊鑾峰彇 token銆?"
-      },
       "deep_temporal_alpha": {
         "description": "deep retrieval 鏃堕棿浠叉潈淇濆簳绯绘暟",
         "type": "float",
@@ -770,3 +764,4 @@
     }
   }
 }
+

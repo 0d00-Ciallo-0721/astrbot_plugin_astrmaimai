@@ -328,6 +328,10 @@ def _render_proactive_wakeup_opening(payload: dict[str, Any], template_version: 
 
 
 def _render_proactive_diary_summary(payload: dict[str, Any], template_version: str) -> PromptEnvelope:
+    persona_injection = str(payload.get("persona_injection", "") or "").strip()
+    if not persona_injection:
+        persona_summary = str(payload.get("persona_summary", "") or "").strip()
+        persona_injection = f"[你的核心人设]\n{persona_summary}" if persona_summary else ""
     return PromptEnvelope(
         template_id=PromptTemplateId.PROACTIVE_DIARY_SUMMARY.value,
         template_version=template_version or "v1",
@@ -340,7 +344,7 @@ def _render_proactive_diary_summary(payload: dict[str, Any], template_version: s
         ),
         payload=PromptPayload(
             text=(
-                f"[Persona Hint]\n{str(payload.get('persona_summary', '') or '').strip()}\n\n"
+                f"{persona_injection}\n\n"
                 f"[Chat ID]\n{str(payload.get('chat_id', '') or '').strip()}\n\n"
                 f"[Recent Memories]\n{str(payload.get('recent_text', '') or '').strip()}"
             )

@@ -53,8 +53,9 @@ class _SyntheticExternalEvent:
 
 
 class AttentionGate:
-    ATTENTION_WINDOW_TTL_SECONDS = 30.0
+    ATTENTION_WINDOW_TTL_SECONDS = 180.0
     ATTENTION_WINDOW_MAX_EVENTS = 12
+    BACKGROUND_TASK_MAX_CONCURRENCY = 8
 
     def __init__(
         self,
@@ -92,6 +93,8 @@ class AttentionGate:
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
+        self._session_tasks: set[asyncio.Task] = set()
+        self._background_task_semaphore = asyncio.Semaphore(self.BACKGROUND_TASK_MAX_CONCURRENCY)
         self._global_message_cache = collections.OrderedDict()
         self.perception_builder = PerceptionBuilder(self)
         self.window_buffer = AttentionWindowBuffer(self)
@@ -231,7 +234,10 @@ class AttentionGate:
         return "", ""
 
     def _is_image_only(self, event: AstrMessageEvent) -> bool:
-        has_img = bool(event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls"))
+        has_img = bool(
+            event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls"))
+            or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls"))
+        )
         has_text = bool(str(getattr(event, "message_str", "") or "").strip())
         return has_img and not has_text
 
@@ -244,7 +250,17 @@ class AttentionGate:
                 break
         return count
 
+    async def _run_background_task(self, coro):
+        async with self._background_task_semaphore:
+            return await coro
+
     def _fire_background_task(self, coro):
+        task = asyncio.create_task(self._run_background_task(coro))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._handle_task_result)
+        return task
+
+    def _fire_priority_task(self, coro):
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
@@ -258,6 +274,48 @@ class AttentionGate:
             task.result()
         except Exception as exc:
             logger.error(f"[Attention Task Error] {exc}", exc_info=exc)
+
+    def _spawn_session_worker(
+        self,
+        chat_id: str,
+        session: SessionContext,
+        self_id: str,
+        *,
+        is_private: bool = False,
+        is_strong_wakeup: bool = False,
+    ):
+        task = asyncio.create_task(
+            self._debounce_and_judge(
+                chat_id,
+                session,
+                self_id,
+                is_private=is_private,
+                is_strong_wakeup=is_strong_wakeup,
+            )
+        )
+        self._session_tasks.add(task)
+        task.add_done_callback(self._handle_session_worker_result)
+        return task
+
+    def _handle_session_worker_result(self, task: asyncio.Task):
+        self._session_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.error(f"[Attention Worker Error] {exc}", exc_info=exc)
+
+    def _schedule_compaction_task(self, chat_id: str, focus_context) -> asyncio.Task | None:
+        if self.context_compaction is None:
+            return None
+        return self._fire_background_task(
+            self.context_compaction.schedule_compaction_evaluation(
+                chat_id,
+                focus_context=focus_context,
+                message_source="user",
+            )
+        )
 
     async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
         session = await self._get_or_create_session(chat_id)
@@ -299,7 +357,10 @@ class AttentionGate:
                 reply_target_sender_name=self._extract_reply_target(event)[1],
                 is_at_bot=self._is_at_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
                 is_reply_to_bot=self._is_reply_to_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
-                has_direct_vision=bool(event.get_extra("direct_vision_urls", []) or event.get_extra("extracted_image_urls", [])),
+                has_direct_vision=bool(
+                    event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
+                    or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+                ),
                 is_image_only=self._is_image_only(event),
                 timestamp=float(getattr(event, "timestamp", time.time()) or time.time()),
             )
@@ -327,7 +388,10 @@ class AttentionGate:
         if not chat_id:
             return
         content = str(getattr(event, "message_str", "") or "").strip()
-        if not content and not (event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls")):
+        if not content and not (
+            event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls"))
+            or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls"))
+        ):
             return
         try:
             await store.append_segment(
@@ -337,13 +401,13 @@ class AttentionGate:
                 speaker_name=str(event.get_sender_name() or ""),
                 content=content,
                 role="user",
-                message_kind="image" if bool(event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls")) and not content else ("mixed" if bool(event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls")) else "text"),
+                message_kind="image" if bool(event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls"))) and not content else ("mixed" if bool(event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls"))) else "text"),
                 is_bot=False,
                 reply_target_sender_id=self._extract_reply_target(event)[0],
                 reply_target_sender_name=self._extract_reply_target(event)[1],
                 is_at_bot=self._is_at_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
                 is_reply_to_bot=self._is_reply_to_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
-                has_direct_vision=bool(event.get_extra("direct_vision_urls") or []),
+                has_direct_vision=bool(event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls")) or []),
                 is_image_only=self._is_image_only(event),
                 timestamp=float(getattr(event, "timestamp", 0.0) or time.time()),
             )
@@ -368,7 +432,12 @@ class AttentionGate:
         self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
         sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
         msg_str = str(getattr(event, "message_str", "") or "")
-        extracted_images = list(dict.fromkeys(list(event.get_extra("direct_vision_urls", []) or []) + list(event.get_extra("extracted_image_urls", []) or [])))
+        extracted_images = list(
+            dict.fromkeys(
+                list(event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", [])) or [])
+                + list(event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", [])) or [])
+            )
+        )
         is_private = not bool(group_id)
         return {
             "chat_id": chat_id,
@@ -392,7 +461,7 @@ class AttentionGate:
         async with session.lock:
             session.accumulation_pool = [event]
         if self.sys2_process:
-            self._fire_background_task(self.sys2_process(event, [event]))
+            self._fire_priority_task(self.sys2_process(event, [event]))
         return "ENGAGED"
 
     async def _handle_force_engage(self, event: AstrMessageEvent, chat_id: str) -> str | None:
@@ -454,11 +523,10 @@ class AttentionGate:
             return None
         if extracted_images and not msg_str.strip():
             return None
-        should_drop = getattr(chat_state, "should_drop", False)
+        should_drop = bool(getattr(chat_state, "should_drop", False))
         return "THROTTLED" if should_drop else None
 
-    def _handle_repeater_echo(self, event: AstrMessageEvent, session: SessionContext, is_private: bool, extracted_images: list[Any], msg_str: str) -> str | None:
-        _ = event  # 参数保留用于接口一致性，方法体内仅使用 session 状态
+    def _handle_repeater_echo(self, session: SessionContext, is_private: bool, extracted_images: list[Any], msg_str: str) -> str | None:
         if is_private:
             return None
         msg_hash = f"{msg_str}|{bool(extracted_images)}"
@@ -527,7 +595,7 @@ class AttentionGate:
             if not event:
                 continue
             text = str(getattr(event, "message_str", "") or "").strip()
-            if text or event.get_extra("extracted_image_urls") or event.get_extra("direct_vision_urls"):
+            if text or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls")):
                 filtered.append(event)
         return filtered
 
@@ -604,7 +672,7 @@ class AttentionGate:
         if throttle_result:
             return throttle_result
 
-        repeater_result = self._handle_repeater_echo(event, session, is_private, extracted_images, msg_str)
+        repeater_result = self._handle_repeater_echo(session, is_private, extracted_images, msg_str)
         if repeater_result:
             return repeater_result
 
@@ -618,14 +686,12 @@ class AttentionGate:
             session.is_evaluating = True
 
         if should_schedule:
-            self._fire_background_task(
-                self._debounce_and_judge(
-                    chat_id,
-                    session,
-                    self_id,
-                    is_private=is_private,
-                    is_strong_wakeup=is_strong_wakeup,
-                )
+            self._spawn_session_worker(
+                chat_id,
+                session,
+                self_id,
+                is_private=is_private,
+                is_strong_wakeup=is_strong_wakeup,
             )
         return "BUFFERED"
 
@@ -660,105 +726,84 @@ class AttentionGate:
         is_private: bool = False,
         is_strong_wakeup: bool = False,
     ):
-        try:
-            await asyncio.sleep(self._compute_debounce_delay(session, is_private, is_strong_wakeup))
+        current_is_strong_wakeup = is_strong_wakeup
+        while True:
+            await asyncio.sleep(self._compute_debounce_delay(session, is_private, current_is_strong_wakeup))
             async with session.lock:
                 batch_events = list(session.accumulation_pool)
                 session.accumulation_pool.clear()
                 merged_events = self._merge_attention_window(session, batch_events)
 
-            if not batch_events:
-                return
+            if batch_events:
+                events = await self._format_and_filter_messages(merged_events)
+                if events:
+                    normalized = self._build_normalized_events(events, self_id)
+                    focus_event, _, _ = self._select_focus_event(events, self_id, normalized_events=normalized)
+                    if focus_event is None:
+                        focus_event = events[-1]
+                    focus_candidate = next((candidate for candidate in normalized if candidate.event is focus_event), None)
+                    if focus_candidate is None:
+                        focus_candidate = normalized[-1]
+                    root_candidate, root_reason = self._resolve_thread_root(focus_candidate, normalized)
+                    focus_thread = self._build_focus_thread(focus_candidate, root_candidate, normalized)
+                    focus_thread.focus_reason = focus_thread.focus_reason or "selected_focus_event"
+                    focus_thread.root_reason = focus_thread.root_reason or root_reason
 
-            events = await self._format_and_filter_messages(merged_events)
-            if not events:
-                return
-
-            normalized = self._build_normalized_events(events, self_id)
-            focus_event, _, _ = self._select_focus_event(events, self_id, normalized_events=normalized)
-            if focus_event is None:
-                focus_event = events[-1]
-            focus_candidate = next((candidate for candidate in normalized if candidate.event is focus_event), None)
-            if focus_candidate is None:
-                focus_candidate = normalized[-1]
-            root_candidate, root_reason = self._resolve_thread_root(focus_candidate, normalized)
-            focus_thread = self._build_focus_thread(focus_candidate, root_candidate, normalized)
-            focus_thread.focus_reason = focus_thread.focus_reason or "selected_focus_event"
-            focus_thread.root_reason = focus_thread.root_reason or root_reason
-
-            emit_legacy_focus_thread_extras(focus_event, focus_thread, window_events=events)
-            retrieve_keys = ["CORE_ONLY"] if focus_candidate.is_near_context_query else ["ALL"]
-            focus_event.set_extra("retrieve_keys", retrieve_keys)
-            focus_event.set_extra("is_fast_mode", False)
-            turn_context = ensure_turn_context(focus_event)
-            turn_context.attention.window_events = list(events)
-            turn_context.attention.focus_thread = focus_thread
-            turn_context.attention.retrieve_keys = list(retrieve_keys)
-            turn_context.attention.is_fast_mode = False
-            turn_context.attention.focus_reason = focus_thread.focus_reason
-            turn_context.attention.root_reason = focus_thread.root_reason
-            if self.context_compaction is not None:
-                self._fire_background_task(
-                    self.context_compaction.schedule_compaction_evaluation(
-                        chat_id,
-                        focus_context=focus_thread,
-                        message_source="user",
+                    emit_legacy_focus_thread_extras(focus_event, focus_thread, window_events=events)
+                    retrieve_keys = ["CORE_ONLY"] if focus_candidate.is_near_context_query else ["ALL"]
+                    focus_event.set_extra("retrieve_keys", retrieve_keys)
+                    focus_event.set_extra("is_fast_mode", False)
+                    turn_context = ensure_turn_context(focus_event)
+                    turn_context.attention.window_events = list(events)
+                    turn_context.attention.focus_thread = focus_thread
+                    turn_context.attention.retrieve_keys = list(retrieve_keys)
+                    turn_context.attention.is_fast_mode = False
+                    turn_context.attention.focus_reason = focus_thread.focus_reason
+                    turn_context.attention.root_reason = focus_thread.root_reason
+                    self._schedule_compaction_task(chat_id, focus_thread)
+                    should_skip_judge = bool(
+                        focus_candidate.is_direct_wakeup
+                        or focus_candidate.is_at_bot
+                        or focus_candidate.is_reply_to_bot
+                        or focus_candidate.has_direct_vision
+                        or current_is_strong_wakeup
                     )
-                )
-            should_skip_judge = bool(
-                focus_candidate.is_direct_wakeup
-                or focus_candidate.is_at_bot
-                or focus_candidate.is_reply_to_bot
-                or focus_candidate.has_direct_vision
-                or is_strong_wakeup
-            )
-            judge_action = await self._evaluate_judge_gate(
-                chat_id,
-                focus_event,
-                focus_thread,
-                events,
-                is_strong_wakeup=should_skip_judge,
-            )
-            focus_event.set_extra("judge_action", judge_action)
-            turn_context.attention.judge_action = judge_action
-            debug_trace(
-                focus_event,
-                "attention_focus_ready",
-                chat_id=chat_id,
-                focus_reason=focus_thread.focus_reason,
-                root_reason=focus_thread.root_reason,
-                focus_preview=preview_text(str(getattr(focus_event, "message_str", "") or ""), 80),
-                judge_action=judge_action,
-            )
-            if judge_action == "WAIT":
-                async with session.lock:
-                    self._append_attention_window(session, batch_events)
-                return
-            if judge_action == "IGNORE":
-                async with session.lock:
-                    self._append_attention_window(session, [focus_event])
-                return
-            async with session.lock:
-                self._append_attention_window(session, batch_events)
-            if self.sys2_process:
-                await self.sys2_process(focus_event, focus_thread.all_thread_events())
-        finally:
-            reschedule_pending = False
+                    judge_action = await self._evaluate_judge_gate(
+                        chat_id,
+                        focus_event,
+                        focus_thread,
+                        events,
+                        is_strong_wakeup=should_skip_judge,
+                    )
+                    focus_event.set_extra("judge_action", judge_action)
+                    turn_context.attention.judge_action = judge_action
+                    debug_trace(
+                        focus_event,
+                        "attention_focus_ready",
+                        chat_id=chat_id,
+                        focus_reason=focus_thread.focus_reason,
+                        root_reason=focus_thread.root_reason,
+                        focus_preview=preview_text(str(getattr(focus_event, "message_str", "") or ""), 80),
+                        judge_action=judge_action,
+                    )
+                    if judge_action == "WAIT":
+                        async with session.lock:
+                            self._append_attention_window(session, batch_events)
+                    elif judge_action == "IGNORE":
+                        async with session.lock:
+                            self._append_attention_window(session, [focus_event])
+                    else:
+                        async with session.lock:
+                            self._append_attention_window(session, batch_events)
+                        if self.sys2_process:
+                            await self.sys2_process(focus_event, focus_thread.all_thread_events())
+
             async with session.lock:
                 if session.accumulation_pool:
-                    reschedule_pending = True
-                else:
-                    session.is_evaluating = False
-            if reschedule_pending:
-                self._fire_background_task(
-                    self._debounce_and_judge(
-                        chat_id,
-                        session,
-                        self_id,
-                        is_private=is_private,
-                        is_strong_wakeup=False,
-                    )
-                )
+                    current_is_strong_wakeup = False
+                    continue
+                session.is_evaluating = False
+                return
 
 
 __all__ = ["AttentionGate"]

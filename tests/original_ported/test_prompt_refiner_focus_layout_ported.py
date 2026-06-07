@@ -156,12 +156,12 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
 
         final_system_prompt, final_prompt = asyncio.run(_run())
         self.assertEqual(final_system_prompt, "system prompt only")
-        self.assertIn("---???????---", final_prompt)
+        self.assertIn("---内在驱动---", final_prompt)
         self.assertIn("agency posture: keep pushback restrained", final_prompt)
         self.assertIn("mode note: keep it brief and answer the current ask", final_prompt)
         self.assertNotIn("---当前状态与约束---", final_prompt)
         self.assertGreater(
-            final_prompt.index("---???????---"),
+            final_prompt.index("---内在驱动---"),
             final_prompt.index("---眼前正在对我说的---\nAlice: why not?"),
         )
 
@@ -256,8 +256,8 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertLess(final_prompt.index("---对话记录"), final_prompt.index("---旁边在聊的---"))
         self.assertLess(final_prompt.index("---旁边在聊的---"), final_prompt.index("---记忆闪回"))
         self.assertLess(final_prompt.index("---记忆闪回"), final_prompt.index("---背景理解"))
-        self.assertLess(final_prompt.index("---背景理解"), final_prompt.index("---???????---"))
-        self.assertLess(final_prompt.index("---???????---"), final_prompt.index("---本轮指引---"))
+        self.assertLess(final_prompt.index("---背景理解"), final_prompt.index("---内在驱动---"))
+        self.assertLess(final_prompt.index("---内在驱动---"), final_prompt.index("---本轮指引---"))
 
     def test_refiner_skips_soft_background_in_fast_mode(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(

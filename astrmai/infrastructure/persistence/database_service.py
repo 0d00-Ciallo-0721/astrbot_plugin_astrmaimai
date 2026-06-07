@@ -16,8 +16,8 @@ from .persistence_manager import PersistenceManager
 
 T = TypeVar("T")
 
-# Cache PRAGMA table_info(chat_states) result to avoid repeated schema queries
-_CHAT_STATES_COLUMNS: list[str] | None = None
+# TTL for PRAGMA table_info column caches (seconds) — avoids stale schema after runtime DDL
+_COL_CACHE_TTL_SEC = 300
 
 
 class DatabaseService(
@@ -33,6 +33,8 @@ class DatabaseService(
         self.persistence = persistence
         self._db_lock_instance = None
         self.memory_engine = None
+        self._chat_state_cols_cache: list[str] | None = None
+        self._chat_state_cols_ts: float = 0.0
         from .repositories.chat_repository import ChatRepository
         from .repositories.memory_repository import MemoryRepository
         from .repositories.profile_repository import ProfileRepository
@@ -167,12 +169,23 @@ class DatabaseService(
             row = cursor.fetchone()
             if not row:
                 return None
-            global _CHAT_STATES_COLUMNS
-            if _CHAT_STATES_COLUMNS is None:
+            actual_col_names = [col[0] for col in (cursor.description or [])]
+            now = time.time()
+            if (
+                not actual_col_names
+                or len(actual_col_names) != len(row)
+            ):
                 cols_cursor = conn.execute("PRAGMA table_info(chat_states)")
-                _CHAT_STATES_COLUMNS = [col[1] for col in cols_cursor.fetchall()]
-            col_names = _CHAT_STATES_COLUMNS
-            row_dict = dict(zip(col_names, row))
+                actual_col_names = [col[1] for col in cols_cursor.fetchall()]
+            if (
+                self._chat_state_cols_cache is None
+                or (now - self._chat_state_cols_ts) > _COL_CACHE_TTL_SEC
+                or len(self._chat_state_cols_cache) != len(actual_col_names)
+                or self._chat_state_cols_cache != actual_col_names
+            ):
+                self._chat_state_cols_cache = list(actual_col_names)
+                self._chat_state_cols_ts = now
+            row_dict = dict(zip(actual_col_names, row))
             state = ChatState(
                 chat_id=str(row_dict.get("chat_id", chat_id) or chat_id),
                 energy=float(row_dict.get("energy", 0.5) or 0.5),
@@ -183,6 +196,7 @@ class DatabaseService(
             state.total_replies = int(row_dict.get("total_replies") or 0)
             state.last_reply_time = float(row_dict.get("last_reply_time") or 0.0)
             state.last_passive_decay_time = float(row_dict.get("last_passive_decay_time") or 0.0)
+            state.last_energy_recovery_time = float(row_dict.get("last_energy_recovery_time") or 0.0)
             state.total_messages = int(row_dict.get("total_messages") or 0)
             state.judgment_mode = str(row_dict.get("judgment_mode", "single") or "single")
             last_msg_info_raw = json.loads(row_dict.get("last_msg_info") or "{}")

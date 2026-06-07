@@ -1,15 +1,15 @@
 from fastapi import APIRouter, Depends
 
 from ..adapters.plugin_api import PluginApiAdapter
-from ..auth import get_current_user
+from ..access import get_current_user
 from ..db import get_db
-from ..services.chatruntimeservice import ChatRuntimeService
+from ..services.admin_ui_service import AdminUiService
 
 router = APIRouter()
 
 
-def _service() -> ChatRuntimeService:
-    return ChatRuntimeService(PluginApiAdapter(), get_db)
+def _service() -> AdminUiService:
+    return AdminUiService(PluginApiAdapter(), get_db)
 
 
 @router.get("")
@@ -32,6 +32,3 @@ async def disable_memory_feedback(feedback_id: str, user: str = Depends(get_curr
     return await _service().disable_memory_feedback(feedback_id)
 
 
-@router.delete("/{feedback_id}")
-async def delete_memory_feedback(feedback_id: str, user: str = Depends(get_current_user)):
-    return await _service().disable_memory_feedback(feedback_id)

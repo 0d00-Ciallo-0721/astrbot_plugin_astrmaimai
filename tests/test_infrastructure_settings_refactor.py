@@ -127,22 +127,47 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
         self.assertFalse(quiet.quiet_hours)
         self.assertEqual(quiet.quiet_ranges, ())
 
+    def test_proactive_rhythm_logs_timezone_diagnostic_only_once(self):
+        rhythm_mod = importlib.reload(importlib.import_module("astrmai.proactive.rhythm"))
+        calls = []
+        original_info = rhythm_mod.logger.info
+        rhythm_mod._TZ_DIAGNOSTIC_LOGGED = False
+        rhythm_mod.logger.info = lambda message: calls.append(message)
+        config = SimpleNamespace(
+            life=SimpleNamespace(proactive_quiet_hours=["23:30-07:30"]),
+            reply=SimpleNamespace(base_frequency=0.7),
+        )
+        quiet_ts = time.mktime((2026, 5, 11, 23, 45, 0, 0, 0, -1))
+        morning_ts = time.mktime((2026, 5, 12, 8, 30, 0, 0, 0, -1))
+
+        try:
+            quiet = rhythm_mod.evaluate_proactive_rhythm(config, now=quiet_ts)
+            morning = rhythm_mod.evaluate_proactive_rhythm(config, now=morning_ts)
+        finally:
+            rhythm_mod.logger.info = original_info
+
+        self.assertTrue(quiet.quiet_hours)
+        self.assertFalse(morning.quiet_hours)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("local timezone diagnostic", calls[0])
+        self.assertIn("quiet_ranges=['23:30-07:30']", calls[0])
+
     def test_astrmai_config_preserves_runtime_config_fields(self):
         config_mod = importlib.import_module("config")
 
         parsed = config_mod.AstrMaiConfig(
             life={"proactive_quiet_hours": ["00:00-01:00"]},
-            global_settings={"webui_password": "secret"},
+            global_settings={"debug_mode": True},
         )
 
         self.assertEqual(parsed.life.proactive_quiet_hours, ["00:00-01:00"])
-        self.assertEqual(parsed.global_settings.webui_password, "secret")
+        self.assertTrue(parsed.global_settings.debug_mode)
 
     def test_project_schema_exposes_runtime_config_fields(self):
         schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
 
-        self.assertIn("webui_password", schema["global_settings"]["items"])
+        self.assertNotIn("webui_password", schema["global_settings"]["items"])
         self.assertIn("proactive_quiet_hours", schema["life"]["items"])
 
 

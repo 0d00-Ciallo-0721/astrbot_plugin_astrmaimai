@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from dataclasses import dataclass
 import random
 import time
 
@@ -22,6 +23,12 @@ from .group_signin_service import GroupSigninService
 from .heartflow import HeartflowManager, HeartflowTopicDigestService
 from .review_dispatcher import ReviewDispatcher
 from .wakeup_service import WakeupService
+
+
+@dataclass(slots=True)
+class ProactiveDeps:
+    dream_visible: bool = False
+    planner: object | None = None
 
 
 class ProactiveTask:
@@ -60,6 +67,7 @@ class ProactiveTask:
         self._task = None
         self._background_tasks: set[asyncio.Task] = set()
         self._bg_semaphore = asyncio.Semaphore(2)
+        self._profile_semaphore = asyncio.Semaphore(1)
         self._last_profile_run = 0.0
         self._last_diary_date = ""
         self._last_global_maintenance_run = 0.0
@@ -195,6 +203,26 @@ class ProactiveTask:
         self._is_running = False
         if self._task:
             self._task.cancel()
+
+    def configure(
+        self,
+        deps: ProactiveDeps | None = None,
+        *,
+        dream_visible: bool | None = None,
+    ) -> None:
+        """Apply post-construction configuration (encapsulates bootstrap wiring)."""
+        resolved_deps = deps or ProactiveDeps()
+        if dream_visible is not None:
+            resolved_deps = ProactiveDeps(
+                dream_visible=bool(dream_visible),
+                planner=resolved_deps.planner,
+            )
+        self.dream_scheduler.dream_visible = bool(resolved_deps.dream_visible)
+        if resolved_deps.planner is not None:
+            resolved_deps.planner.heartflow_manager = self.heartflow_manager
+        self.auto_check_task = None
+        self.reflect_tracker = None
+        self.review_dispatcher.reflect_tracker = None
 
     def set_db_service(self, db_service):
         self._db_service = db_service
@@ -403,7 +431,7 @@ class ProactiveTask:
         logger.info(f"[Life] nickname generated for {getattr(profile, 'name', '')}: {nickname}")
 
     async def _run_profiling_task(self):
-        async with self._bg_semaphore:
+        async with self._profile_semaphore:
             for state in self.state_engine.get_active_states():
                 chat_id = str(getattr(state, "chat_id", "") or "")
                 if not chat_id or chat_id.startswith("FriendMessage:"):

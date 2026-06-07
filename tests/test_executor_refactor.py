@@ -182,6 +182,27 @@ class RefactoredExecutorTests(unittest.TestCase):
             [("default:GroupMessage:group-1", "bot-1", "tool-finished")],
         )
 
+    def test_tool_mode_wait_signal_sets_execution_signal_without_visible_reply(self):
+        gateway = _FakeGateway(tool_responses={"model-a": "[SYSTEM_WAIT_SIGNAL]"})
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        async def _run():
+            return await executor.execute(event, "prompt", "system", tools=[object()])
+
+        result = asyncio.run(_run())
+
+        self.assertIsNone(result)
+        self.assertEqual(event.get_extra("astrmai_execution_signal"), "wait")
+        self.assertEqual(reply_service.calls, [])
+
     def test_chat_tool_tier_limits_runtime_max_steps(self):
         gateway = _FakeGateway()
         gateway.config.agent.max_steps = 8
@@ -264,6 +285,48 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertNotIn("System note", model_prompt)
         self.assertNotIn("[Vision]", model_prompt)
         self.assertTrue(any(mode == "vision" for mode, _kwargs in gateway.calls))
+
+    def test_direct_vision_context_exception_does_not_delete_original_file(self):
+        gateway = _FakeGateway()
+
+        async def _raise_vision(**kwargs):
+            raise RuntimeError("vision failed")
+
+        gateway.call_vision_task = _raise_vision
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+        vision_bundle = self.executor_mod.VisionBundle(
+            image_urls=[temp_image.name],
+            direct_image_urls=[temp_image.name],
+            is_direct_request=True,
+            is_image_only=True,
+            source="event_extra",
+        )
+
+        async def _run():
+            return await executor._inject_direct_vision_context(
+                _FakeEvent(),
+                "default:GroupMessage:group-1",
+                "prompt",
+                "system",
+                vision_bundle,
+            )
+
+        try:
+            asyncio.run(_run())
+            self.assertTrue(os.path.exists(temp_image.name))
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
 
     def test_text_mode_switches_model_on_prompt_scaffold_output_and_traces_failure(self):
         gateway = _FakeGateway(
@@ -358,6 +421,26 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(exhausted[0]["attempted_models"], ["model-a", "model-b"])
         self.assertEqual(exhausted[0]["last_failure_kind"], "provider_failure_text")
         self.assertTrue(exhausted[0]["fallback_triggered"])
+
+    def test_fatal_fallback_skips_visible_reply_for_stale_drop(self):
+        gateway = _FakeGateway()
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_execution_status", "stale_drop")
+
+        async def _run():
+            await executor._handle_fatal_fallback(event, event.unified_msg_origin, "boom")
+
+        asyncio.run(_run())
+
+        self.assertEqual(reply_service.calls, [])
 
     def test_text_mode_pool_exhausted_trace_includes_gateway_cooldown_skips(self):
         gateway = _CooldownAwareFakeGateway(

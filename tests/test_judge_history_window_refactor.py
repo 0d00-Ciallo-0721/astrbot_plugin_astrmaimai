@@ -71,6 +71,20 @@ class _LegacyHistoryPersistence:
         return list(self._chat_history)[:limit]
 
 
+class _ShortCircuitPersistence:
+    def __init__(self, recent_messages=None):
+        self._recent_messages = list(recent_messages or [])
+        self.calls = []
+
+    async def get_recent_messages(self, chat_id, limit=8):
+        self.calls.append("recent")
+        return list(self._recent_messages)[:limit]
+
+    async def get_chat_history(self, chat_id, limit=8):
+        self.calls.append("history")
+        raise AssertionError("secondary loader should not run after recent_messages succeeds")
+
+
 class _DatabaseServiceStub:
     def __init__(self, records):
         self.records = list(records)
@@ -224,6 +238,24 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
         self.assertIn("WindowUser: window-backed clue", gateway.prompts[-1])
         self.assertNotIn("DbUser: db-backed clue", gateway.prompts[-1])
         self.assertEqual(db_service.calls, [])
+
+    def test_load_recent_history_records_short_circuits_after_first_valid_loader(self):
+        now = time.time()
+        persistence = _ShortCircuitPersistence(
+            recent_messages=[{"sender_name": "RecentUser", "content": "recent clue", "timestamp": now - 30}]
+        )
+        judge = self.mod.Judge(_FakeGateway(), _FakeStateEngine(persistence))
+
+        records = asyncio.run(
+            judge._load_recent_history_records(
+                "default:GroupMessage:group-1",
+                max_age_seconds=900.0,
+                limit=8,
+            )
+        )
+
+        self.assertEqual([record["sender_name"] for record in records], ["RecentUser"])
+        self.assertEqual(persistence.calls, ["recent"])
 
     def test_flatten_history_content_uses_readable_placeholders(self):
         flattened = self.mod.Judge._flatten_history_content(

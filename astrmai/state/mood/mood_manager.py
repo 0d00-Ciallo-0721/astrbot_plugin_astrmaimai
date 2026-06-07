@@ -187,7 +187,14 @@ class MoodManager:
             return "curious", current_mood
         return "neutral", current_mood
 
-    async def analyze_mood(self, text: str, current_mood: float, user_affection: float = 0.0, chat_id: str = "") -> Tuple[str, float]:
+    async def analyze_mood(
+        self,
+        text: str,
+        current_mood: float,
+        user_affection: float = 0.0,
+        chat_id: str = "",
+        **_: Any,
+    ) -> Tuple[str, float]:
         if not text or len(text) < 2:
             return "neutral", current_mood
 

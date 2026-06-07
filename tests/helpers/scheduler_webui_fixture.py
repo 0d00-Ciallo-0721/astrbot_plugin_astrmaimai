@@ -483,7 +483,6 @@ def _planner_history(profile: str) -> SimpleNamespace:
 def _config_payload(profile: str) -> dict[str, Any]:
     return {
         "global_settings": {
-            "webui_password": "astrmai_admin",
             "fixture_profile": profile,
         },
         "persona": {
@@ -810,22 +809,9 @@ def _write_direct_open_harness(profile: str) -> str:
   (function () {{
     const fixtureBase = "{FIXTURE_SERVER_BASE_URL}";
     const activeProfile = "{profile}";
-    let authTokenPromise = null;
     function normalizeEndpoint(endpoint) {{
       const clean = String(endpoint || "").replace(/^\\/+/, "");
       return clean.startsWith("admin/") ? clean.slice("admin/".length) : clean;
-    }}
-    async function authToken() {{
-      if (!authTokenPromise) {{
-        authTokenPromise = fetch(new URL("/api/auth/login", fixtureBase).toString(), {{
-          method: "POST",
-          headers: {{"content-type": "application/json"}},
-          body: JSON.stringify({{ password: "astrmai_admin" }}),
-        }})
-          .then((response) => response.json())
-          .then((payload) => payload.token || "");
-      }}
-      return authTokenPromise;
     }}
     async function request(method, endpoint, payload) {{
       const mapped = normalizeEndpoint(endpoint);
@@ -836,12 +822,10 @@ def _write_direct_open_harness(profile: str) -> str:
           url.searchParams.set(key, String(value));
         }});
       }}
-      const token = await authToken();
       const options = {{
         method,
         headers: {{
           "content-type": "application/json",
-          "Authorization": token ? `Bearer ${{token}}` : "",
         }},
       }};
       if (method !== "GET") {{
@@ -1108,7 +1092,7 @@ async def build_scheduler_fixture_facade(
         gateway=_FixtureGateway(),
         runtime_coordinator=coordinator,
         config=SimpleNamespace(
-            global_settings=SimpleNamespace(webui_password="astrmai_admin"),
+            global_settings=SimpleNamespace(),
             persona=SimpleNamespace(persona_id=FIXTURE_PERSONA_ID),
         ),
         persona_summarizer=SimpleNamespace(pending_tasks={}),

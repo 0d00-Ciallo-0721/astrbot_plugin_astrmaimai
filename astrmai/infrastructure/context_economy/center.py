@@ -452,4 +452,4 @@ class ContextEconomyCenter:
                 str(stable_prefix_text or ""),
             ]
         )
-        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()

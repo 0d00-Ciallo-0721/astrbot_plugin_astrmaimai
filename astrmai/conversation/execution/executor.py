@@ -329,9 +329,18 @@ class ConcurrentExecutor:
             if self._chat_pending_count[chat_id] >= 2:
                 return None, False
             self._chat_pending_count[chat_id] += 1
-            return self._chat_locks[chat_id], False
+            chat_lock = self._chat_locks[chat_id]
+        await chat_lock.acquire()
+        return chat_lock, False
 
-    async def _release_chat_execution_lock(self, chat_id: str, using_runtime_coordinator: bool) -> None:
+    async def _release_chat_execution_lock(
+        self,
+        chat_id: str,
+        using_runtime_coordinator: bool,
+        chat_lock: Optional[asyncio.Lock],
+    ) -> None:
+        if chat_lock is not None and chat_lock.locked():
+            chat_lock.release()
         if using_runtime_coordinator:
             await self.runtime_coordinator.release_executor(chat_id)
             return
@@ -384,7 +393,6 @@ class ConcurrentExecutor:
             )
             return model_prompt, system_prompt
 
-        import aiohttp
         import base64
         import io
         import os
@@ -398,19 +406,16 @@ class ConcurrentExecutor:
         saw_exception = False
         for url_or_path in vision_bundle.direct_image_urls:
             temp_file_path = None
-            is_temp = False
+            created_temp_file_path = None
             try:
                 image_bytes = None
-                if str(url_or_path).startswith("http"):
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url_or_path, timeout=15) as resp:
-                            if resp.status == 200:
-                                image_bytes = await resp.read()
-                elif str(url_or_path).startswith("data:image"):
+                if str(url_or_path).startswith("data:image"):
                     _, encoded = str(url_or_path).split(",", 1)
                     image_bytes = base64.b64decode(encoded)
                 elif os.path.exists(url_or_path):
                     temp_file_path = url_or_path
+                elif str(url_or_path).startswith("http"):
+                    logger.debug(f"[{chat_id}] remote image URL skipped because remote fetching is disabled: {url_or_path}")
 
                 if image_bytes:
                     try:
@@ -420,7 +425,7 @@ class ConcurrentExecutor:
                     fd, temp_file_path = tempfile.mkstemp(suffix=f".{img_format}")
                     with os.fdopen(fd, "wb") as file_obj:
                         file_obj.write(image_bytes)
-                    is_temp = True
+                    created_temp_file_path = temp_file_path
 
                 if temp_file_path and os.path.exists(temp_file_path):
                     result_dict = await self.gateway.call_vision_task(
@@ -456,9 +461,9 @@ class ConcurrentExecutor:
                     failure_kind=failure_kind,
                 )
             finally:
-                if is_temp and temp_file_path and os.path.exists(temp_file_path):
+                if created_temp_file_path and os.path.exists(created_temp_file_path):
                     try:
-                        os.remove(temp_file_path)
+                        os.remove(created_temp_file_path)
                     except Exception:
                         pass
 
@@ -665,6 +670,8 @@ class ConcurrentExecutor:
                 if not reply_text:
                     raise ValueError("empty tool reply")
                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
+                    if hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_execution_signal", "wait")
                     debug_trace(event, "execution.executor.wait_signal", model=provider_id)
                     return None
                 if "[TERMINAL_YIELD]:" in reply_text:
@@ -753,117 +760,124 @@ class ConcurrentExecutor:
             return None
 
         try:
-            async with chat_lock:
-                models = self.gateway.get_agent_models()
-                if not models:
-                    logger.error(f"[{chat_id}] no configured agent model")
+            models = self.gateway.get_agent_models()
+            if not models:
+                logger.error(f"[{chat_id}] no configured agent model")
+                return None
+
+            runtime = self._execution_runtime_values(event, chat_id)
+            try:
+                event._is_final_reply_phase = True
+                if not await self._check_pre_model_freshness(event, chat_id, "executor calculation"):
+                    debug_trace(event, "execution.executor.stale_drop", reason="freshness_check_failed")
                     return None
 
-                runtime = self._execution_runtime_values(event, chat_id)
-                try:
-                    event._is_final_reply_phase = True
-                    if not await self._check_pre_model_freshness(event, chat_id, "executor calculation"):
-                        debug_trace(event, "execution.executor.stale_drop", reason="freshness_check_failed")
-                        return None
-
-                    vision_bundle = self._build_vision_bundle(event, direct_vision_urls)
-                    execution_event = self._build_sanitized_execution_event(event, vision_bundle)
-                    should_use_native, native_skip_reason, breaker_until = self._should_attempt_native_main_reply_vision(
+                vision_bundle = self._build_vision_bundle(event, direct_vision_urls)
+                execution_event = self._build_sanitized_execution_event(event, vision_bundle)
+                should_use_native, native_skip_reason, breaker_until = self._should_attempt_native_main_reply_vision(
+                    event,
+                    chat_id,
+                    vision_bundle,
+                )
+                if should_use_native:
+                    self._mark_vision_main_reply_state(
                         event,
-                        chat_id,
-                        vision_bundle,
+                        strategy="native_direct",
+                        selected=True,
+                        outcome="skipped",
                     )
-                    if should_use_native:
-                        self._mark_vision_main_reply_state(
-                            event,
-                            strategy="native_direct",
-                            selected=True,
-                            outcome="skipped",
-                        )
-                        try:
-                            if tools is None or len(tools) == 0:
-                                result = await self._run_text_mode(
-                                    event,
-                                    chat_id,
-                                    prompt,
-                                    system_prompt,
-                                    runtime,
-                                    image_urls=vision_bundle.direct_image_urls,
-                                    raise_on_exhaustion=True,
-                                )
-                            else:
-                                result = await self._run_tool_mode(
-                                    event,
-                                    chat_id,
-                                    execution_event,
-                                    prompt,
-                                    system_prompt,
-                                    tools,
-                                    runtime,
-                                    image_urls=vision_bundle.direct_image_urls,
-                                    raise_on_exhaustion=True,
-                                )
-                            if result is not None:
-                                self._mark_vision_main_reply_state(
-                                    event,
-                                    strategy="native_direct",
-                                    selected=True,
-                                    outcome="success",
-                                    details=f"images={len(vision_bundle.direct_image_urls)}",
-                                )
-                            return result
-                        except Exception as exc:
-                            fallback_reason = self._classify_execution_failure_kind(str(exc))
-                            breaker_until = self._open_native_main_reply_breaker(chat_id)
-                            logger.warning(
-                                f"[{chat_id}] native main-reply vision failed; falling back to relay chain: {exc}"
+                    try:
+                        if tools is None or len(tools) == 0:
+                            result = await self._run_text_mode(
+                                event,
+                                chat_id,
+                                prompt,
+                                system_prompt,
+                                runtime,
+                                image_urls=vision_bundle.direct_image_urls,
+                                raise_on_exhaustion=True,
                             )
+                        else:
+                            result = await self._run_tool_mode(
+                                event,
+                                chat_id,
+                                execution_event,
+                                prompt,
+                                system_prompt,
+                                tools,
+                                runtime,
+                                image_urls=vision_bundle.direct_image_urls,
+                                raise_on_exhaustion=True,
+                            )
+                        if result is not None:
                             self._mark_vision_main_reply_state(
                                 event,
                                 strategy="native_direct",
                                 selected=True,
-                                outcome="fallback_to_relay",
-                                breaker_until=breaker_until,
-                                fallback_reason=fallback_reason,
-                                details=preview_text(str(exc), 120),
+                                outcome="success",
+                                details=f"images={len(vision_bundle.direct_image_urls)}",
                             )
-                    else:
-                        outcome = "breaker_open" if native_skip_reason == "breaker_open" else "skipped"
+                        return result
+                    except Exception as exc:
+                        fallback_reason = self._classify_execution_failure_kind(str(exc))
+                        breaker_until = self._open_native_main_reply_breaker(chat_id)
+                        logger.warning(
+                            f"[{chat_id}] native main-reply vision failed; falling back to relay chain: {exc}"
+                        )
                         self._mark_vision_main_reply_state(
                             event,
-                            strategy="relay",
-                            selected=False,
-                            outcome=outcome,
+                            strategy="native_direct",
+                            selected=True,
+                            outcome="fallback_to_relay",
                             breaker_until=breaker_until,
-                            fallback_reason=native_skip_reason,
+                            fallback_reason=fallback_reason,
+                            details=preview_text(str(exc), 120),
                         )
-
-                    api_prompt, relay_system_prompt = await self._inject_direct_vision_context(
-                        event, chat_id, prompt, system_prompt, vision_bundle
-                    )
-
-                    if tools is None or len(tools) == 0:
-                        return await self._run_text_mode(event, chat_id, api_prompt, relay_system_prompt, runtime)
-                    return await self._run_tool_mode(
+                else:
+                    outcome = "breaker_open" if native_skip_reason == "breaker_open" else "skipped"
+                    self._mark_vision_main_reply_state(
                         event,
-                        chat_id,
-                        execution_event,
-                        api_prompt,
-                        relay_system_prompt,
-                        tools,
-                        runtime,
+                        strategy="relay",
+                        selected=False,
+                        outcome=outcome,
+                        breaker_until=breaker_until,
+                        fallback_reason=native_skip_reason,
                     )
-                except Exception as exc:
-                    logger.error(f"[{chat_id}] executor core crashed: {exc}")
-                    await self._handle_fatal_fallback(event, chat_id, f"executor core exception:\n{exc}")
-                    return None
-                finally:
-                    if hasattr(event, "_is_final_reply_phase"):
-                        delattr(event, "_is_final_reply_phase")
+
+                api_prompt, relay_system_prompt = await self._inject_direct_vision_context(
+                    event, chat_id, prompt, system_prompt, vision_bundle
+                )
+
+                if tools is None or len(tools) == 0:
+                    return await self._run_text_mode(event, chat_id, api_prompt, relay_system_prompt, runtime)
+                return await self._run_tool_mode(
+                    event,
+                    chat_id,
+                    execution_event,
+                    api_prompt,
+                    relay_system_prompt,
+                    tools,
+                    runtime,
+                )
+            except Exception as exc:
+                logger.error(f"[{chat_id}] executor core crashed: {exc}")
+                await self._handle_fatal_fallback(event, chat_id, f"executor core exception:\n{exc}")
+                return None
+            finally:
+                if hasattr(event, "_is_final_reply_phase"):
+                    delattr(event, "_is_final_reply_phase")
         finally:
-            await self._release_chat_execution_lock(chat_id, using_runtime_coordinator)
+            await self._release_chat_execution_lock(chat_id, using_runtime_coordinator, chat_lock)
     async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str):
         logger.error(f"[{chat_id}] fatal executor fallback triggered")
+        if str(event.get_extra("astrmai_execution_status", "") or "") == "stale_drop":
+            debug_trace(
+                event,
+                "execution.executor.fatal_fallback_skipped",
+                reason="stale_drop",
+                error_preview=preview_text(error_detail, 120),
+            )
+            return
         fallback_msg = getattr(self.config.reply, "fallback_text", "(temporary silence...)")
         await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
 

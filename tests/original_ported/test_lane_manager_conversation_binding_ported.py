@@ -38,6 +38,29 @@ class _FakeConversationManager:
         self.conversations[conversation_id] = _FakeConversation(history=history or [])
 
 
+class _SlowConversationManager(_FakeConversationManager):
+    def __init__(self):
+        super().__init__()
+        self.first_started = asyncio.Event()
+        self.allow_finish = asyncio.Event()
+        self.active_gets = 0
+        self.max_active_gets = 0
+
+    async def get_conversation(self, unified_msg_origin, conversation_id, create_if_not_exists=False):
+        self.active_gets += 1
+        self.max_active_gets = max(self.max_active_gets, self.active_gets)
+        self.first_started.set()
+        try:
+            await self.allow_finish.wait()
+            return await super().get_conversation(
+                unified_msg_origin,
+                conversation_id,
+                create_if_not_exists=create_if_not_exists,
+            )
+        finally:
+            self.active_gets -= 1
+
+
 class LaneManagerBindingTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -75,6 +98,28 @@ class LaneManagerBindingTests(unittest.TestCase):
         self.assertEqual(len(history2), 2)
         self.assertEqual(history2[0]["role"], "user")
         self.assertEqual(history2[1]["content"], "world")
+
+    def test_same_lane_allows_conversation_io_outside_lane_lock(self):
+        conversation_manager = _SlowConversationManager()
+        manager = self.lane_mod.LaneManager(conversation_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+
+        async def _run():
+            lane_umo = manager.resolve_lane_umo("default:GroupMessage:group-1", lane_key)
+            await conversation_manager.new_conversation(lane_umo, title="seed")
+            first = asyncio.create_task(manager.ensure_lane(lane_key, "default:GroupMessage:group-1"))
+            await conversation_manager.first_started.wait()
+            second = asyncio.create_task(manager.ensure_lane(lane_key, "default:GroupMessage:group-1"))
+            await asyncio.sleep(0.05)
+            overlap_seen = conversation_manager.max_active_gets >= 2
+            conversation_manager.allow_finish.set()
+            await first
+            await second
+            return overlap_seen
+
+        overlap_seen = asyncio.run(_run())
+
+        self.assertTrue(overlap_seen)
 
 
 if __name__ == "__main__":

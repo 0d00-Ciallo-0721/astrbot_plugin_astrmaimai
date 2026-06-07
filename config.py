@@ -17,7 +17,6 @@ class GlobalSettingsConfig(BaseModel):
     enable_private_chat: bool = Field(default=False)
     admin_ids: List[str] = Field(default=[])
     enable_error_interception: bool = Field(default=True)
-    webui_password: str = Field(default="", description="AstrMai WebUI 管理密码；留空表示未配置")
 
 
 class PersonaConfig(BaseModel):
@@ -197,3 +196,4 @@ class AstrMaiConfig(BaseModel):
     vision: VisionConfig = Field(default_factory=VisionConfig)
     sys3: Sys3Settings = Field(default_factory=Sys3Settings)
     private_chat: PrivateChatConfig = Field(default_factory=PrivateChatConfig)
+

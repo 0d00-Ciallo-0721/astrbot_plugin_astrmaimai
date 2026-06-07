@@ -36,22 +36,9 @@
   (function () {
     const fixtureBase = "http://127.0.0.1:8765";
     const activeProfile = "admin_full";
-    let authTokenPromise = null;
     function normalizeEndpoint(endpoint) {
       const clean = String(endpoint || "").replace(/^\/+/, "");
       return clean.startsWith("admin/") ? clean.slice("admin/".length) : clean;
-    }
-    async function authToken() {
-      if (!authTokenPromise) {
-        authTokenPromise = fetch(new URL("/api/auth/login", fixtureBase).toString(), {
-          method: "POST",
-          headers: {"content-type": "application/json"},
-          body: JSON.stringify({ password: "astrmai_admin" }),
-        })
-          .then((response) => response.json())
-          .then((payload) => payload.token || "");
-      }
-      return authTokenPromise;
     }
     async function request(method, endpoint, payload) {
       const mapped = normalizeEndpoint(endpoint);
@@ -62,12 +49,10 @@
           url.searchParams.set(key, String(value));
         });
       }
-      const token = await authToken();
       const options = {
         method,
         headers: {
           "content-type": "application/json",
-          "Authorization": token ? `Bearer ${token}` : "",
         },
       };
       if (method !== "GET") {

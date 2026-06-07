@@ -494,6 +494,21 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertEqual(observed["calls"], 0)
 
+    def test_merge_wait_targets_preserves_existing_targets_before_pending_actions(self):
+        service = self._service()
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra("astrmai_wait_targets", ["user-1"])
+        pending_actions = [
+            {"action": "at", "target_id": "user-2", "target_name": "Bob"},
+            {"action": "at", "target_id": "user-1", "target_name": "Alice"},
+        ]
+
+        merged = service._merge_wait_targets(event, pending_actions)
+
+        self.assertEqual(merged, ["user-1", "user-2"])
+        self.assertEqual(event.get_extra("astrmai_wait_targets"), ["user-1", "user-2"])
+        self.assertEqual(event.get_extra("astrmai_wait_target_name"), "Bob")
+
 
 if __name__ == "__main__":
     unittest.main()

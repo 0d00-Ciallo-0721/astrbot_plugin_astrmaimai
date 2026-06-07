@@ -23,7 +23,7 @@ class PresentationCommandsRefactorTests(unittest.TestCase):
         )
         request = dto_mod.WorkCommandRequest.from_message("/work 帮我整理今天的待办")
         self.assertEqual(request.task_query, "帮我整理今天的待办")
-        self.assertFalse(request.is_empty)
+        self.assertTrue(request.has_query)
 
     def test_main_uses_presentation_command_handlers(self):
         path = Path(__file__).resolve().parents[1] / "main.py"

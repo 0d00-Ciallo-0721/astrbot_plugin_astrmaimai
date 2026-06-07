@@ -77,6 +77,7 @@ class ChatState:
     judgment_mode: str = "single"
     last_msg_info: LastMessageMetadata = field(default_factory=LastMessageMetadata)
     last_passive_decay_time: float = 0.0
+    last_energy_recovery_time: float = 0.0
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
     next_wakeup_timestamp: float = 0.0

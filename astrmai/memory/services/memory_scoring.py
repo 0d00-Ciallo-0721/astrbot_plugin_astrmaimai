@@ -14,6 +14,7 @@ class MemoryScoringConfig:
     importance_weight: float = 0.15
     recency_weight: float = 0.10
     confidence_weight: float = 0.05
+    conflict_penalty: float = 0.20
     stale_penalty: float = 0.20
     search_weight: float = 0.45
     search_importance_weight: float = 0.20

@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends
 
 from ..adapters.plugin_api import PluginApiAdapter
-from ..auth import get_current_user
+from ..access import get_current_user
 from ..db import get_db
 from ..schemas import BatchReviewRequest, ReviewActionRequest
 from ..services.review_ui_service import ReviewUiService

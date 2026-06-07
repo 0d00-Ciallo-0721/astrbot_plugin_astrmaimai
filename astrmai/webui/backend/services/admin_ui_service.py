@@ -45,16 +45,18 @@ class AdminUiService:
         from .heartflowservice import HeartflowService
         from .schedulerservice import SchedulerService
         from .cognitionservice import CognitionService
+        from .contexteconomyuiservice import ContextEconomyUiService
         from .learningservice import LearningService
+        from .runtimeuiservice import RuntimeUiService
         from .toolsservice import ToolsService
-        from .chatruntimeservice import ChatRuntimeService
         self._observability = ObservabilityService(plugin_api)
         self._heartflow = HeartflowService(plugin_api)
         self._scheduler = SchedulerService(plugin_api)
         self._cognition = CognitionService(plugin_api)
         self._learning = LearningService(plugin_api)
+        self._runtime = RuntimeUiService(plugin_api)
+        self._context_economy_ui = ContextEconomyUiService(plugin_api)
         self._tools = ToolsService(plugin_api)
-        self._chat_runtime = ChatRuntimeService(plugin_api)
 
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:
@@ -104,11 +106,7 @@ class AdminUiService:
         }
 
     async def runtime_status(self) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "data": await self.plugin_api.get_runtime_diagnostics(),
-            "runtime_bound": self.plugin_api.facade is not None,
-        }
+        return await self._runtime.runtime_status()
 
     @staticmethod
     def _parse_filter_values(value: Any) -> set[str]:
@@ -330,42 +328,23 @@ class AdminUiService:
         return {"status": "ok", "items": formatted, "total": len(formatted), "runtime_bound": True}
 
     async def runtime_capabilities(self) -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "data": await self.plugin_api.get_capability_overview(),
-            "runtime_bound": self.plugin_api.facade is not None,
-        }
+        return await self._runtime.runtime_capabilities()
 
     async def runtime_models(self) -> dict[str, Any]:
-        diagnostics = await self.plugin_api.get_runtime_diagnostics()
-        return {
-            "status": "ok",
-            "data": diagnostics.get("models", {}),
-            "runtime_bound": self.plugin_api.facade is not None,
-        }
+        return await self._runtime.runtime_models()
 
     async def runtime_health(self) -> dict[str, Any]:
-        diagnostics = await self.plugin_api.get_runtime_diagnostics()
-        status = diagnostics.get("status", {}) if isinstance(diagnostics, dict) else {}
-        active_chats = 0
-        coordinator = self.plugin_api.get_runtime_coordinator()
-        if coordinator and hasattr(coordinator, "list_active_chats"):
-            try:
-                active_chats = len(await coordinator.list_active_chats(1800))
-            except Exception:
-                active_chats = 0
+        base_health = await self._runtime.runtime_health(await self._expression_pattern_stats())
+        data = dict(base_health.get("data", {}) or {})
         expression_stats = await self._expression_pattern_stats()
+        data["active_chats"] = int(data.get("active_chat_count", 0) or 0)
+        data["pending_reviews"] = expression_stats["pending"]
+        data["total_memory_events"] = await self._safe_count("MemoryEvent")
+        data["total_canonical_memories"] = await self._safe_count("canonical_memories")
+        data.pop("active_chat_count", None)
         return {
             "status": "ok",
-            "data": {
-                "running": bool(status.get("lifecycle_started", False)),
-                "boot_phase": status.get("boot_phase", ""),
-                "degraded_count": len(status.get("degraded_components", {}) or {}),
-                "active_chats": active_chats,
-                "pending_reviews": expression_stats["pending"],
-                "total_memory_events": await self._safe_count("MemoryEvent"),
-                "total_canonical_memories": await self._safe_count("canonical_memories"),
-            },
+            "data": data,
             "runtime_bound": self.plugin_api.facade is not None,
         }
 
@@ -528,15 +507,7 @@ class AdminUiService:
         return payload
 
     async def context_economy_overview_view(self, limit: int = 20) -> dict[str, Any]:
-        snapshot = self._context_economy_snapshot()
-        return {
-            "status": "ok",
-            "data": {
-                "overview": self._context_economy_overview(snapshot),
-                "templates": self._context_economy_templates(snapshot, limit=limit),
-            },
-            "runtime_bound": self.plugin_api.facade is not None,
-        }
+        return await self._context_economy_ui.context_economy_overview_view(limit=limit)
 
     async def context_economy_templates_view(
         self,
@@ -546,32 +517,13 @@ class AdminUiService:
         sort_by: str = "rotate",
         sort_dir: str | None = None,
     ) -> dict[str, Any]:
-        snapshot = self._context_economy_snapshot()
-        family_value = str(workload_family or "")
-        template_value = str(template_id or "")
-        items = self._context_economy_templates(
-            snapshot,
+        return await self._context_economy_ui.context_economy_templates_view(
             limit=limit,
-            template_id=template_value,
-            workload_family=family_value,
+            template_id=template_id,
+            workload_family=workload_family,
             sort_by=sort_by,
-            sort_dir=str(sort_dir or ""),
+            sort_dir=sort_dir,
         )
-        total_items = self._context_economy_templates(
-            snapshot,
-            limit=200,
-            template_id=template_value,
-            workload_family=family_value,
-            sort_by=sort_by,
-            sort_dir=str(sort_dir or ""),
-        )
-        return {
-            "status": "ok",
-            "items": items,
-            "total": len(total_items),
-            "available_workload_families": self._context_economy_workload_families(snapshot),
-            "runtime_bound": self.plugin_api.facade is not None,
-        }
 
     # ── heartflow (delegated to HeartflowService) ──
 

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Body
 from typing import Dict, Any
 from ..adapters.plugin_api import PluginApiAdapter
-from ..auth import get_current_user
+from ..access import get_current_user
 from ..services.persona_ui_service import PersonaUiService
 
 router = APIRouter()

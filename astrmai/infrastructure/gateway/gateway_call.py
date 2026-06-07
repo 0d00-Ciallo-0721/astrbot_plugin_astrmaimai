@@ -259,7 +259,9 @@ class GatewayCallMixin:
 
                         safe_text, failure_kind = validate_visible_output_text(
                             content,
-                            speaker_names=self._bot_speaker_names(),
+                            speaker_names=self._bot_speaker_names(
+                                getattr(getattr(getattr(self, "config", None), "system1", None), "nicknames", [])
+                            ),
                         )
                         if failure_kind:
                             raise ValueError(failure_kind)

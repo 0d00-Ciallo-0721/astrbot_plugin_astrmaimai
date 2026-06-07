@@ -269,14 +269,16 @@ class MemoryV2Store:
             self._migrated_from_legacy = True
             return
         try:
-            legacy = aiosqlite.connect(self.legacy_db_path)
             target = aiosqlite.connect(self.db_path)
-            async with legacy as leg_db, target as tgt_db:
-                cursor = await leg_db.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='canonical_memories'"
+            async with target as tgt_db:
+                await tgt_db.execute("ATTACH DATABASE ? AS legacy_src", (self.legacy_db_path,))
+                cursor = await tgt_db.execute(
+                    "SELECT name FROM legacy_src.sqlite_master WHERE type='table' AND name='canonical_memories'"
                 )
                 row = await cursor.fetchone()
+                await cursor.close()
                 if not row:
+                    await tgt_db.execute("DETACH DATABASE legacy_src")
                     self._migrated_from_legacy = True
                     return
                 await tgt_db.execute(
@@ -308,12 +310,11 @@ class MemoryV2Store:
                     )
                     """
                 )
-                await tgt_db.execute("ATTACH DATABASE ? AS legacy_src", (self.legacy_db_path,))
                 await tgt_db.execute(
-                    "INSERT INTO main.canonical_memories SELECT * FROM legacy_src.canonical_memories"
+                    "INSERT OR IGNORE INTO main.canonical_memories SELECT * FROM legacy_src.canonical_memories"
                 )
-                await tgt_db.execute("DETACH DATABASE legacy_src")
                 await tgt_db.commit()
+                await tgt_db.execute("DETACH DATABASE legacy_src")
             count = 0
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute("SELECT COUNT(*) FROM canonical_memories")
@@ -585,6 +586,8 @@ class MemoryV2Store:
 
         async def _apply(inner_db) -> list[str]:
             covered_old_ids: list[str] = []
+            superseding_old_id = ""
+            new_record_is_superseded = False
             cursor = await inner_db.execute(
                 """
                 SELECT id, create_time
@@ -599,25 +602,38 @@ class MemoryV2Store:
                 old_id = str(row[0] or "")
                 old_create_time = float(row[1] or 0.0)
                 if old_create_time < float(created_at or 0.0):
+                    replacement_id = superseding_old_id or new_memory_id
                     await inner_db.execute(
                         """
                         UPDATE canonical_memories
                         SET status = ?, superseded_by = ?, update_time = ?
                         WHERE id = ?
                         """,
-                        (SUPERSEDED_STATUS, new_memory_id, self._now(), old_id),
+                        (SUPERSEDED_STATUS, replacement_id, self._now(), old_id),
                     )
                     covered_old_ids.append(old_id)
                 else:
+                    if not new_record_is_superseded:
+                        await inner_db.execute(
+                            """
+                            UPDATE canonical_memories
+                            SET status = ?, superseded_by = ?, update_time = ?
+                            WHERE id = ?
+                            """,
+                            (SUPERSEDED_STATUS, old_id, self._now(), new_memory_id),
+                        )
+                        superseding_old_id = old_id
+                        new_record_is_superseded = True
+                        continue
                     await inner_db.execute(
                         """
                         UPDATE canonical_memories
                         SET status = ?, superseded_by = ?, update_time = ?
                         WHERE id = ?
                         """,
-                        (SUPERSEDED_STATUS, old_id, self._now(), new_memory_id),
+                        (SUPERSEDED_STATUS, superseding_old_id, self._now(), old_id),
                     )
-                    break
+                    covered_old_ids.append(old_id)
             return covered_old_ids
 
         if db is not None:
@@ -1048,12 +1064,14 @@ class MemoryV2Store:
                     f"DELETE FROM canonical_fts WHERE memory_id IN ({placeholders})",
                     tuple(self.last_physical_delete_ids),
                 )
-            cursor = await db.execute(
-                f"DELETE FROM canonical_memories WHERE {' AND '.join(delete_where)}",
-                tuple(delete_params),
-            )
+                cursor = await db.execute(
+                    f"DELETE FROM canonical_memories WHERE id IN ({placeholders})",
+                    tuple(self.last_physical_delete_ids),
+                )
+            else:
+                cursor = None
             await db.commit()
-            return cursor.rowcount
+            return int(getattr(cursor, "rowcount", 0) or 0)
 
     async def purge_jargon_candidates(
         self,

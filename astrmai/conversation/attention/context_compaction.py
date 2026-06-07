@@ -102,6 +102,75 @@ class CompactionDecisionSnapshot:
     last_safe_hook_checked_at: int = 0
 
 
+class CompactionSafetyAnalyzer:
+    def __init__(self, engine: "ContextCompactionEngine"):
+        self._engine = engine
+
+    def detect_safe_window(self, snapshot: dict[str, Any], focus_context: Any = None) -> tuple[bool, str, bool, list[str]]:
+        return self._engine.detect_safe_window(snapshot, focus_context=focus_context)
+
+    def build_decision_snapshot(
+        self,
+        chat_id: str,
+        snapshot: dict[str, Any],
+        focus_context: Any = None,
+        *,
+        evaluation_count: int | None = None,
+        queued_from_node: bool = False,
+    ) -> CompactionDecisionSnapshot:
+        return self._engine.build_decision_snapshot(
+            chat_id,
+            snapshot,
+            focus_context=focus_context,
+            evaluation_count=evaluation_count,
+            queued_from_node=queued_from_node,
+        )
+
+    def evaluate_compaction_eligibility(
+        self,
+        chat_id: str,
+        snapshot: dict[str, Any],
+        focus_context: Any = None,
+        *,
+        evaluation_count: int | None = None,
+        queued_from_node: bool = False,
+        record_state: bool = True,
+    ) -> CompactionResult:
+        return self._engine.evaluate_compaction_eligibility(
+            chat_id,
+            snapshot,
+            focus_context=focus_context,
+            evaluation_count=evaluation_count,
+            queued_from_node=queued_from_node,
+            record_state=record_state,
+        )
+
+
+class CompactionWindowSelector:
+    def __init__(self, engine: "ContextCompactionEngine"):
+        self._engine = engine
+
+    def bootstrap_message_counter(self, chat_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return self._engine._bootstrap_message_counter(chat_id, snapshot)
+
+    def note_message_appended(self, chat_id: str, message_source: str | None = None) -> dict[str, Any]:
+        return self._engine._note_message_appended(chat_id, message_source=message_source)
+
+    def pop_pending_eval_node(self, state: dict[str, Any], node: int) -> None:
+        self._engine._pop_pending_eval_node(state, node)
+
+
+class CompactionExecutor:
+    def __init__(self, engine: "ContextCompactionEngine"):
+        self._engine = engine
+
+    async def maybe_compact(self, chat_id: str, focus_context: Any = None) -> CompactionResult:
+        return await self._engine.maybe_compact(chat_id, focus_context=focus_context)
+
+    async def get_trace_status(self, chat_id: str, focus_context: Any = None) -> dict[str, Any]:
+        return await self._engine.get_trace_status(chat_id, focus_context=focus_context)
+
+
 class ContextCompactionEngine(CompactionProviderMixin):
     def __init__(
         self,
@@ -126,6 +195,9 @@ class ContextCompactionEngine(CompactionProviderMixin):
         self._failure_cooldown_seconds = 10.0
         self._chat_states: dict[str, dict[str, Any]] = {}
         self._pending_tasks: dict[str, Any] = {}
+        self.safety_analyzer = CompactionSafetyAnalyzer(self)
+        self.window_selector = CompactionWindowSelector(self)
+        self.compaction_executor = CompactionExecutor(self)
 
     @staticmethod
     def _normalize_summary_text(text: str) -> str:
@@ -208,10 +280,10 @@ class ContextCompactionEngine(CompactionProviderMixin):
                     chat_id,
                     keep_recent_segments=self.compaction_keep_recent_segments,
                 )
-                self._bootstrap_message_counter(chat_id, bootstrap_snapshot)
+                self.window_selector.bootstrap_message_counter(chat_id, bootstrap_snapshot)
             except Exception:
                 pass
-        self._note_message_appended(chat_id, message_source=message_source)
+        self.window_selector.note_message_appended(chat_id, message_source=message_source)
         existing = self._pending_tasks.get(chat_id)
         if existing and not existing.done():
             return CompactionResult(
@@ -223,7 +295,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
                 pending_eval_nodes=list(state.get("pending_eval_nodes", []) or []),
                 pending_eval_nodes_count=len(list(state.get("pending_eval_nodes", []) or [])),
             )
-        task = self._create_task(self.maybe_compact(chat_id, focus_context=focus_context))
+        task = self._create_task(self.compaction_executor.maybe_compact(chat_id, focus_context=focus_context))
         self._pending_tasks[chat_id] = task
         try:
             return await task

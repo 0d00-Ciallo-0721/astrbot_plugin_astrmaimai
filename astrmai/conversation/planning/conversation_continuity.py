@@ -214,6 +214,7 @@ class ConversationContinuityStore:
         # state.current_goal、state.goal_status、continuity_weight 等。
         # 此行为是有意设计，非 bug（参见 TECHNICAL-DEBT-INVENTORY D22）。
         if lightweight_event or item.reply_need in {"wait", "ignore"}:
+            state.turns = [*self.recent(chat_id, now=now), item][-self.MAX_TURNS_PER_CHAT :]
             return item
 
         previous_focus = state.last_focus_preview or state.current_topic

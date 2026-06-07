@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -128,6 +129,38 @@ class StateEngineMoodMigratedTests(unittest.TestCase):
         self.assertEqual(observed['text'], 'legacy hello')
         self.assertAlmostEqual(observed['current_mood'], -0.1)
         self.assertAlmostEqual(observed['saved_mood'], 0.0)
+
+    def test_update_mood_legacy_signature_avoids_false_typeerror_fallback(self):
+        config = SimpleNamespace(
+            reply=SimpleNamespace(emotion_mapping=[]),
+            energy=SimpleNamespace(recovery_silence_min=60, daily_recovery=0.1, cost_per_reply=0.1, min_reply_threshold=0.2),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+        )
+        gateway = SimpleNamespace(config=config)
+        engine = self.state_mod.StateEngine(SimpleNamespace(), gateway, config=config)
+
+        class _MockState:
+            mood = 0.1
+            energy = 0.5
+            last_reply_time = time.time()
+            last_passive_decay_time = time.time()
+            is_dirty = False
+
+        async def _get_state_inner(chat_id):
+            return _MockState()
+
+        async def _save_chat_state(chat_id, state):
+            del chat_id, state
+
+        async def _legacy_analyze_mood(text, current_mood, user_affection=0.0):
+            raise RuntimeError(f"legacy-path:{text}:{current_mood}:{user_affection}")
+
+        engine.chat_state_service._get_state_inner = _get_state_inner
+        engine.chat_state_service.persistence.save_chat_state = _save_chat_state
+        engine.mood_manager.analyze_mood = _legacy_analyze_mood
+
+        with self.assertRaisesRegex(RuntimeError, r"legacy-path:legacy hello:0\.1:0\.0"):
+            asyncio.run(engine.update_mood('chat-legacy-error', 'legacy hello'))
 
 
 __all__ = ['StateEngineMoodMigratedTests']

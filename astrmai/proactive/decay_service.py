@@ -21,11 +21,15 @@ class DecayService:
         for profile in self.state_engine.get_active_profiles():
             if now - (getattr(profile, "last_access_time", 0) or 0) <= 86400:
                 continue
-            old_score = profile.social_score
+            old_score = float(profile.social_score or 0.0)
             if old_score > 10:
                 delta = -1
             elif old_score < -10:
                 delta = 1
+            elif old_score > 0:
+                delta = -min(old_score, 1.0)
+            elif old_score < 0:
+                delta = min(abs(old_score), 1.0)
             else:
                 delta = 0
             if delta != 0:

@@ -29,6 +29,22 @@ class VisionBundle:
     is_image_only: bool = False
     source: str = ""
 
+    @property
+    def image_refs(self) -> list[str]:
+        return self.image_urls
+
+    @image_refs.setter
+    def image_refs(self, values: list[str]) -> None:
+        self.image_urls = list(values or [])
+
+    @property
+    def direct_image_refs(self) -> list[str]:
+        return self.direct_image_urls
+
+    @direct_image_refs.setter
+    def direct_image_refs(self, values: list[str]) -> None:
+        self.direct_image_urls = list(values or [])
+
 
 @dataclass
 class ReplyFreshnessBudget:

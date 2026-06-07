@@ -885,7 +885,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             except Exception as exc:
                 logger.debug(f"[Proactive] completion callback degraded: {exc}")
 
-    async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
+    async def _prepare_plan_context(
+        self,
+        event: AstrMessageEvent,
+        event_messages: List[AstrMessageEvent],
+    ) -> dict[str, Any]:
         debug_trace(
             event,
             "planning.enter",
@@ -914,13 +918,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             event_messages = event_messages[-3:]
 
         planning_context = await self._build_planning_context(event, event_messages, chat_id)
-        focus_context = planning_context["focus_context"]
-        context_events = planning_context["context_events"]
-        window_lines = planning_context["window_lines"]
         prompt_envelope = planning_context["prompt_envelope"]
-        near_context_priority = planning_context["near_context_priority"]
         turn_context.prompt_envelope = prompt_envelope
-        turn_context.attention.focus_thread = focus_context
+        turn_context.attention.focus_thread = planning_context["focus_context"]
         turn_context.attention.is_lightweight_event = bool(planning_context.get("is_lightweight_event", False))
         if planning_context.get("is_lightweight_event", False):
             retrieve_keys = ["CORE_ONLY"]
@@ -968,6 +968,242 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             is_fast_mode = True
             turn_context.attention.retrieve_keys = list(retrieve_keys)
             turn_context.attention.is_fast_mode = True
+        return {
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "sender_name": sender_name,
+            "turn_context": turn_context,
+            "retrieve_keys": retrieve_keys,
+            "is_all_mode": is_all_mode,
+            "is_fast_mode": is_fast_mode,
+            "judge_action": judge_action,
+            "is_tool_call_mode": is_tool_call_mode,
+            "planning_context": planning_context,
+            "focus_context": planning_context["focus_context"],
+            "prompt_envelope": prompt_envelope,
+            "near_context_priority": planning_context["near_context_priority"],
+            "reflection_summary": reflection_summary,
+            "cooldown_tags": cooldown_tags,
+            "think_decision": think_decision,
+            "memory_feedback_summary": memory_feedback_summary,
+            "cognitive_gate": cognitive_gate,
+        }
+
+    async def _invoke_planning_llm(
+        self,
+        *,
+        event: AstrMessageEvent,
+        chat_id: str,
+        user_id: str,
+        sender_name: str,
+        focus_context,
+        planning_context: dict[str, Any],
+        prompt_envelope,
+        retrieve_keys: list[str],
+        think_level: int,
+        reflection_summary: str,
+        cooldown_tags: list[str],
+        cognitive_decision: CognitiveDecision | None,
+        is_all_mode: bool,
+        is_fast_mode: bool,
+        is_tool_call_mode: bool,
+        near_context_priority: bool,
+    ) -> dict[str, Any]:
+        sys1_thought = event.get_extra("sys1_thought", "")
+        ctx = getattr(self.context_engine, "context", None)
+        side_inputs = await self.input_loader.load_prompt_inputs(
+            event,
+            chat_id,
+            prompt_envelope,
+            planning_context["window_lines"],
+            think_level,
+            user_id=user_id,
+        )
+        stable_expression_habits, situational_style_append = self._adjust_expression_habits_for_behavior(
+            side_inputs.get("stable_expression_habits", ""),
+            cognitive_decision,
+            cooldown_tags,
+        )
+        side_inputs["stable_expression_habits"] = stable_expression_habits
+        if situational_style_append:
+            current_style_cues = str(side_inputs.get("situational_style_cues", "") or "").strip()
+            side_inputs["situational_style_cues"] = "\n".join(
+                part for part in [current_style_cues, situational_style_append] if part
+            ).strip()
+        tools = await self._build_execution_tools(
+            chat_id,
+            event,
+            user_id,
+            sender_name,
+            ctx,
+            is_all_mode=is_all_mode,
+            is_fast_mode=is_fast_mode,
+            is_tool_call_mode=is_tool_call_mode,
+            tool_state=side_inputs.get("tool_state"),
+        )
+        self._remember_tool_trace(chat_id, tools, event)
+        self._append_tool_guidance(prompt_envelope, tools, event)
+        if cognitive_decision and not (is_all_mode or is_fast_mode or is_tool_call_mode):
+            self._set_disable_rag_injection(ctx, cognitive_decision.memory_policy == "none")
+
+        goals_context = side_inputs.get("goals_context", "")
+        agency_context = "\n".join(
+            part
+            for part in [
+                reflection_summary,
+                self._agency_posture_guidance(cognitive_decision) if cognitive_decision else "",
+            ]
+            if str(part or "").strip()
+        )
+        planner_reasoning = side_inputs.get("planner_reasoning", "")
+        system_prompt, style_variant, proactive_recall = await self.context_engine.build_prompt(
+            chat_id=chat_id,
+            event_messages=planning_context["context_events"],
+            prompt_envelope=prompt_envelope,
+            retrieve_keys=retrieve_keys,
+            situational_style_cues=side_inputs.get("situational_style_cues", ""),
+            sys1_thought=sys1_thought,
+            goals_context=goals_context,
+            stable_expression_habits=side_inputs.get("stable_expression_habits", ""),
+            planner_reasoning=planner_reasoning,
+            stable_jargon_explanation=side_inputs.get("stable_jargon_explanation", ""),
+            near_context_priority=near_context_priority,
+            agency_context=agency_context,
+        )
+        if think_level <= 0:
+            proactive_recall = ""
+        event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
+
+        if prompt_envelope is not None:
+            prompt_envelope.cognitive_drive_block = agency_context or planner_reasoning or sys1_thought or goals_context
+            event.set_extra("astrmai_prompt_envelope", prompt_envelope)
+        await self._apply_private_jump_context(
+            ctx,
+            event,
+            user_id,
+            prompt_envelope=prompt_envelope,
+        )
+        self._append_mode_instructions(
+            event,
+            prompt_envelope=prompt_envelope,
+            is_tool_call_mode=is_tool_call_mode,
+            is_all_mode=is_all_mode,
+            is_fast_mode=is_fast_mode,
+        )
+
+        prefix_status = self.context_engine.get_last_prefix_status(chat_id) if hasattr(self.context_engine, "get_last_prefix_status") else {}
+        final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
+            event=event,
+            system_prompt=system_prompt,
+            context=ctx,
+            prompt_envelope=prompt_envelope,
+            style_variant=style_variant,
+            proactive_recall=proactive_recall,
+        )
+        turn_context = ensure_turn_context(event)
+        turn_context.continuity.system_prompt_length = len(final_system_prompt or "")
+        turn_context.continuity.prompt_length = len(final_prompt or "")
+        turn_context.continuity.frozen_prefix_length = int(prefix_status.get("frozen_prefix_length", 0) or 0)
+        turn_context.continuity.semi_stable_length = int(prefix_status.get("semi_stable_length", 0) or 0)
+        turn_context.continuity.dynamic_prompt_blocks = {
+            "cognitive_drive": len(getattr(prompt_envelope, "cognitive_drive_block", "") or ""),
+            "soft_background": int(getattr(prompt_envelope, "soft_background_rendered_chars", 0) or 0),
+            "situational_context": len(getattr(prompt_envelope, "situational_context_block", "") or ""),
+            "planner_runtime_instruction": len(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or ""),
+        }
+        turn_context.continuity.dynamic_prompt_length = (
+            int(turn_context.continuity.dynamic_prompt_blocks.get("cognitive_drive", 0) or 0)
+            + int(turn_context.continuity.dynamic_prompt_blocks.get("soft_background", 0) or 0)
+            + int(turn_context.continuity.dynamic_prompt_blocks.get("situational_context", 0) or 0)
+            + int(turn_context.continuity.dynamic_prompt_blocks.get("planner_runtime_instruction", 0) or 0)
+        )
+        await self._update_turn_trace_runtime(
+            event,
+            chat_id,
+            prompt_envelope=prompt_envelope,
+        )
+
+        direct_vision_urls = list(
+            dict.fromkeys(
+                list(focus_context.vision_bundle.direct_image_urls or [])
+                or list(focus_context.vision_bundle.image_urls or [])
+            )
+        )
+        if direct_vision_urls:
+            final_prompt += "\n(Director note: the user shared photos with you; please respond with the image content in mind.)"
+            logger.info(f"[{chat_id}] Scheduled direct-vision payload with {len(direct_vision_urls)} image(s) into executor.")
+
+        reply_text = await self.executor.execute(
+            event=event,
+            system_prompt=final_system_prompt,
+            prompt=final_prompt,
+            tools=tools,
+            direct_vision_urls=direct_vision_urls,
+        )
+        return {
+            "reply_text": reply_text,
+            "focus_context": focus_context,
+            "tools": tools,
+            "side_inputs": side_inputs,
+            "planning_context": planning_context,
+            "is_fast_mode": is_fast_mode,
+            "is_all_mode": is_all_mode,
+            "is_tool_call_mode": is_tool_call_mode,
+            "final_system_prompt": final_system_prompt,
+        }
+
+    async def _parse_plan_result(
+        self,
+        *,
+        event: AstrMessageEvent,
+        chat_id: str,
+        prompt_envelope,
+        cognitive_decision: CognitiveDecision | None,
+        llm_result: dict[str, Any],
+    ) -> str:
+        return await self._finalize_plan_result(
+            event=event,
+            chat_id=chat_id,
+            reply_text=llm_result["reply_text"],
+            focus_context=llm_result["focus_context"],
+            prompt_envelope=prompt_envelope,
+            tools=llm_result["tools"],
+            cognitive_decision=cognitive_decision,
+            side_inputs=llm_result["side_inputs"],
+            planning_context=llm_result["planning_context"],
+            is_fast_mode=llm_result["is_fast_mode"],
+            is_all_mode=llm_result["is_all_mode"],
+            is_tool_call_mode=llm_result["is_tool_call_mode"],
+            final_system_prompt=llm_result["final_system_prompt"],
+        )
+
+    async def plan_and_execute(self, event: AstrMessageEvent, event_messages: List[AstrMessageEvent]):
+        prepared = await self._prepare_plan_context(event, event_messages)
+        return await self._continue_plan_execution(event, prepared)
+
+    async def _continue_plan_execution(
+        self,
+        event: AstrMessageEvent,
+        prepared: dict[str, Any],
+    ) -> str:
+        chat_id = prepared["chat_id"]
+        user_id = prepared["user_id"]
+        sender_name = prepared["sender_name"]
+        turn_context = prepared["turn_context"]
+        retrieve_keys = prepared["retrieve_keys"]
+        is_all_mode = prepared["is_all_mode"]
+        is_fast_mode = prepared["is_fast_mode"]
+        judge_action = prepared["judge_action"]
+        is_tool_call_mode = prepared["is_tool_call_mode"]
+        planning_context = prepared["planning_context"]
+        focus_context = prepared["focus_context"]
+        prompt_envelope = prepared["prompt_envelope"]
+        near_context_priority = prepared["near_context_priority"]
+        reflection_summary = prepared["reflection_summary"]
+        cooldown_tags = prepared["cooldown_tags"]
+        think_decision = prepared["think_decision"]
+        memory_feedback_summary = prepared["memory_feedback_summary"]
+        cognitive_gate = prepared["cognitive_gate"]
         if think_decision.level <= 0 and "group_non_direct" in think_decision.signals:
             event.set_extra("astrmai_cognitive_action", "wait")
             event.set_extra("astrmai_reply_need", "wait")
@@ -1098,143 +1334,49 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 is_all_mode = False
                 is_fast_mode = False
 
-        sys1_thought = event.get_extra("sys1_thought", "")
-        ctx = getattr(self.context_engine, "context", None)
-        side_inputs = await self.input_loader.load_prompt_inputs(
-            event,
-            chat_id,
-            prompt_envelope,
-            window_lines,
-            think_decision.level,
-            user_id=user_id,
-        )
-        stable_expression_habits, situational_style_append = self._adjust_expression_habits_for_behavior(
-            side_inputs.get("stable_expression_habits", ""),
-            cognitive_decision,
-            cooldown_tags,
-        )
-        side_inputs["stable_expression_habits"] = stable_expression_habits
-        if situational_style_append:
-            current_style_cues = str(side_inputs.get("situational_style_cues", "") or "").strip()
-            side_inputs["situational_style_cues"] = "\n".join(
-                part for part in [current_style_cues, situational_style_append] if part
-            ).strip()
-        tools = await self._build_execution_tools(
-            chat_id,
-            event,
-            user_id,
-            sender_name,
-            ctx,
-            is_all_mode=is_all_mode,
-            is_fast_mode=is_fast_mode,
-            is_tool_call_mode=is_tool_call_mode,
-            tool_state=side_inputs.get("tool_state"),
-        )
-        self._remember_tool_trace(chat_id, tools, event)
-        self._append_tool_guidance(prompt_envelope, tools, event)
-        if cognitive_decision and not (is_all_mode or is_fast_mode or is_tool_call_mode):
-            self._set_disable_rag_injection(ctx, cognitive_decision.memory_policy == "none")
-
-        goals_context = side_inputs.get("goals_context", "")
-        agency_context = "\n".join(
-            part
-            for part in [
-                reflection_summary,
-                self._agency_posture_guidance(cognitive_decision) if cognitive_decision else "",
-            ]
-            if str(part or "").strip()
-        )
-        planner_reasoning = side_inputs.get("planner_reasoning", "")
-        system_prompt, style_variant, proactive_recall = await self.context_engine.build_prompt(
+        llm_result = await self._invoke_planning_llm(
+            event=event,
             chat_id=chat_id,
-            event_messages=context_events,
+            user_id=user_id,
+            sender_name=sender_name,
+            focus_context=focus_context,
+            planning_context=planning_context,
             prompt_envelope=prompt_envelope,
             retrieve_keys=retrieve_keys,
-            situational_style_cues=side_inputs.get("situational_style_cues", ""),
-            sys1_thought=sys1_thought,
-            goals_context=goals_context,
-            stable_expression_habits=side_inputs.get("stable_expression_habits", ""),
-            planner_reasoning=planner_reasoning,
-            stable_jargon_explanation=side_inputs.get("stable_jargon_explanation", ""),
-            near_context_priority=near_context_priority,
-            agency_context=agency_context,
-        )
-        if think_decision.level <= 0:
-            proactive_recall = ""
-        event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
-
-        if prompt_envelope is not None:
-            prompt_envelope.cognitive_drive_block = agency_context or planner_reasoning or sys1_thought or goals_context
-            event.set_extra("astrmai_prompt_envelope", prompt_envelope)
-        await self._apply_private_jump_context(
-            ctx,
-            event,
-            user_id,
-            prompt_envelope=prompt_envelope,
-        )
-
-        self._append_mode_instructions(
-            event,
-            prompt_envelope=prompt_envelope,
-            is_tool_call_mode=is_tool_call_mode,
+            think_level=think_decision.level,
+            reflection_summary=reflection_summary,
+            cooldown_tags=cooldown_tags,
+            cognitive_decision=cognitive_decision,
             is_all_mode=is_all_mode,
             is_fast_mode=is_fast_mode,
+            is_tool_call_mode=is_tool_call_mode,
+            near_context_priority=near_context_priority,
         )
-
-        prefix_status = self.context_engine.get_last_prefix_status(chat_id) if hasattr(self.context_engine, "get_last_prefix_status") else {}
-        final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
+        return await self._parse_plan_result(
             event=event,
-            system_prompt=system_prompt,
-            context=ctx,
+            chat_id=chat_id,
             prompt_envelope=prompt_envelope,
-            style_variant=style_variant,
-            proactive_recall=proactive_recall,
-        )
-        turn_context.continuity.system_prompt_length = len(final_system_prompt or "")
-        turn_context.continuity.prompt_length = len(final_prompt or "")
-        turn_context.continuity.frozen_prefix_length = int(prefix_status.get("frozen_prefix_length", 0) or 0)
-        turn_context.continuity.semi_stable_length = int(prefix_status.get("semi_stable_length", 0) or 0)
-        turn_context.continuity.dynamic_prompt_blocks = {
-            "cognitive_drive": len(getattr(prompt_envelope, "cognitive_drive_block", "") or ""),
-            "soft_background": int(getattr(prompt_envelope, "soft_background_rendered_chars", 0) or 0),
-            "situational_context": len(getattr(prompt_envelope, "situational_context_block", "") or ""),
-            "planner_runtime_instruction": len(getattr(prompt_envelope, "planner_runtime_instruction_block", "") or ""),
-        }
-        turn_context.continuity.dynamic_prompt_length = (
-            int(turn_context.continuity.dynamic_prompt_blocks.get("cognitive_drive", 0) or 0)
-            + int(turn_context.continuity.dynamic_prompt_blocks.get("soft_background", 0) or 0)
-            + int(turn_context.continuity.dynamic_prompt_blocks.get("situational_context", 0) or 0)
-            + int(turn_context.continuity.dynamic_prompt_blocks.get("planner_runtime_instruction", 0) or 0)
+            cognitive_decision=cognitive_decision,
+            llm_result=llm_result,
         )
 
-        await self._update_turn_trace_runtime(
-            event,
-            chat_id,
-            prompt_envelope=prompt_envelope,
-        )
-
-        direct_vision_urls = list(
-            dict.fromkeys(
-                list(focus_context.vision_bundle.direct_image_urls or [])
-                or list(focus_context.vision_bundle.image_urls or [])
-            )
-        )
-        if direct_vision_urls:
-            final_prompt += "\n(导演旁白：用户递给了你几张照片，请结合画面内容进行回应。)"
-            logger.info(f"[{chat_id}] 已编排主脑直通车负载，携带 {len(direct_vision_urls)} 张图片进入执行器。")
-
-        reply_text = await self.executor.execute(
-            event=event,
-            system_prompt=final_system_prompt,
-            prompt=final_prompt,
-            tools=tools,
-            direct_vision_urls=direct_vision_urls,
-        )
-        # stale_drop / executor-failure: executor returned None, skip content-dependent
-        # post-processing.  Keep tools=None so action_taken="none" — semantically
-        # correct because no tool was actually executed (tools were built but the
-        # executor dropped the request).  Recording "tool" would mislead downstream
-        # continuity logic into believing a tool call took place.
+    async def _finalize_plan_result(
+        self,
+        *,
+        event: AstrMessageEvent,
+        chat_id: str,
+        reply_text: str | None,
+        focus_context: Any,
+        prompt_envelope: Any,
+        tools: Any,
+        cognitive_decision: Any,
+        side_inputs: dict,
+        planning_context: dict,
+        is_fast_mode: bool,
+        is_all_mode: bool,
+        is_tool_call_mode: bool,
+        final_system_prompt: str,
+    ):
         if reply_text is None:
             self._record_agency_reflection(chat_id, None, None, cognitive_decision)
             self._record_conversation_continuity(
@@ -1275,12 +1417,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 decision=cognitive_decision,
             )
             if follow_reason:
-                logger.info(f"[{chat_id}] 触发连续发言: {follow_reason}")
+                logger.info(f"[{chat_id}] Triggered follow-up: {follow_reason}")
                 follow_prompt = (
-                    f"(导演旁白: 你刚刚说了 \"{reply_text[:100]}\"。"
-                    f"现在你想补充一句——{follow_reason}。"
-                    "请生成一条极其简短的追加消息，像真人追发第二条那样自然。"
-                    "严禁重复你刚才说过的话！)"
+                    f"(Director note: you just said \"{reply_text[:100]}\"."
+                    f" Now you want to add one more short line because: {follow_reason}."
+                    " Generate one extremely short follow-up message that feels like a natural second message from a real person."
+                    " Never repeat what you already said just now!)"
                 )
                 await asyncio.sleep(random.uniform(1.0, 3.5))
                 await self.executor.execute(

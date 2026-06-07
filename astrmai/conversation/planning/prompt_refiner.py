@@ -66,6 +66,16 @@ class PromptRefiner:
         return cleaned[: max(0, limit - 3)] + "..."
 
     @staticmethod
+    def _sanitize_prompt_fragment(value: object, *, limit: int = 200) -> str:
+        text = str(value or "")
+        text = re.sub(r"<\|[^>\r\n]{0,80}\|>", " ", text)
+        text = text.replace("\n", " ").replace("\r", " ").replace("```", "` ` `")
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip()
+
+    @staticmethod
     def _truncate_soft_background_text(text: str, budget_chars: int) -> str:
         cleaned = str(text or "").strip()
         budget = max(0, int(budget_chars or 0))
@@ -111,11 +121,11 @@ class PromptRefiner:
     ) -> str:
         parts: list[str] = []
         if cognitive_drive_block:
-            parts.append(f"---???????---\n{cognitive_drive_block}")
+            parts.append(f"---内在驱动---\n{cognitive_drive_block}")
         if situational_context_block:
-            parts.append(f"---褰撳墠鐘舵€佷笌绾︽潫---\n{situational_context_block}")
+            parts.append(f"---当前状态与约束---\n{situational_context_block}")
         if planner_runtime_instruction_block:
-            parts.append(f"---鏈疆涓婁笅鏂囪В閲?--\n{planner_runtime_instruction_block}")
+            parts.append(f"---本轮上下文解析---\n{planner_runtime_instruction_block}")
         if not parts:
             return ""
         return cls._truncate_soft_background_text("\n\n".join(parts), cls.RUNTIME_GUIDANCE_MAX_CHARS)
@@ -697,31 +707,40 @@ class PromptRefiner:
         if not picids or not self.db_service:
             return text
 
-        for picid in picids:
-            resolved_text = "[一张尚未看清的图片]"
-            try:
-                with self.db_service.get_session() as session:
-                    from ...infrastructure.persistence import VisualMemory
-
+        with self.db_service.get_session() as session:
+            from ...infrastructure.persistence import VisualMemory
+            for picid in picids:
+                resolved_text = "[一张尚未看清的图片]"
+                try:
                     mem = session.get(VisualMemory, picid)
                     if mem and mem.description:
+                        # 截断并过滤换行，防止 LLM 输出中的恶意内容注入 prompt
+                        safe_desc = self._sanitize_prompt_fragment(mem.description, limit=200)
                         try:
                             tags = json.loads(mem.emotion_tags)
-                            tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+                            if isinstance(tags, list):
+                                safe_tags = []
+                                for tag in tags[:8]:
+                                    sanitized = self._sanitize_prompt_fragment(tag, limit=48)
+                                    if sanitized:
+                                        safe_tags.append(sanitized)
+                                tags_str = ", ".join(safe_tags)
+                            else:
+                                tags_str = self._sanitize_prompt_fragment(tags, limit=96)
                         except Exception:
                             tags_str = ""
                         if mem.type == "emoji":
                             resolved_text = (
-                                f"[发了一个表情包，画面是：{mem.description}，传达了：{tags_str}]"
+                                f"[发了一个表情包，画面是：{safe_desc}，传达了：{tags_str}]"
                                 if tags_str
-                                else f"[发了一个表情包，画面是：{mem.description}]"
+                                else f"[发了一个表情包，画面是：{safe_desc}]"
                             )
                         else:
-                            resolved_text = f"[发了一张图片，画面是：{mem.description}]"
-            except Exception as exc:
-                logger.debug(f"[PromptRefiner] visual memory resolve failed {picid}: {exc}")
+                            resolved_text = f"[发了一张图片，画面是：{safe_desc}]"
+                except Exception as exc:
+                    logger.debug(f"[PromptRefiner] visual memory resolve failed {picid}: {exc}")
 
-            text = text.replace(f"[picid:{picid}]", resolved_text)
+                text = text.replace(f"[picid:{picid}]", resolved_text)
 
         return text
 

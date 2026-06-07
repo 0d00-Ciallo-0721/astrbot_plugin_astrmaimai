@@ -57,6 +57,7 @@ class PersistenceSchemaMixin:
                         total_replies INTEGER,
                         last_reply_time REAL DEFAULT 0,
                         last_passive_decay_time REAL DEFAULT 0,
+                        last_energy_recovery_time REAL DEFAULT 0,
                         total_messages INTEGER DEFAULT 0,
                         judgment_mode TEXT DEFAULT 'single',
                         last_msg_info TEXT DEFAULT '{}',
@@ -94,6 +95,7 @@ class PersistenceSchemaMixin:
                 for col_def in [
                     "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN last_energy_recovery_time REAL DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'",
                     "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'",
@@ -116,8 +118,9 @@ class PersistenceSchemaMixin:
                 ]:
                     try:
                         db.execute(col_def)
-                    except Exception:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            raise
                 for col_def in [
                     "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''",
                     "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'",
@@ -135,8 +138,9 @@ class PersistenceSchemaMixin:
                 ]:
                     try:
                         db.execute(col_def)
-                    except Exception:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            raise
                 db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,
@@ -165,8 +169,9 @@ class PersistenceSchemaMixin:
                 """)
                 try:
                     db.execute("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''")
-                except Exception:
-                    pass
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
                 db.execute("""
                     CREATE INDEX IF NOT EXISTS ix_memoryevent_session_id
                     ON memoryevent (session_id)
@@ -193,6 +198,7 @@ class PersistenceSchemaMixin:
                         total_replies INTEGER,
                         last_reply_time REAL DEFAULT 0,
                         last_passive_decay_time REAL DEFAULT 0,
+                        last_energy_recovery_time REAL DEFAULT 0,
                         total_messages INTEGER DEFAULT 0,
                         judgment_mode TEXT DEFAULT 'single',
                         last_msg_info TEXT DEFAULT '{}',
@@ -231,6 +237,7 @@ class PersistenceSchemaMixin:
                 for col_def in [
                     "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
+                    "ALTER TABLE chat_states ADD COLUMN last_energy_recovery_time REAL DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0",
                     "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'",
                     "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'",
@@ -253,8 +260,9 @@ class PersistenceSchemaMixin:
                 ]:
                     try:
                         await db.execute(col_def)
-                    except Exception:
-                        pass  # ?                # [] CronSnapshot  SQL 
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            raise
                 for col_def in [
                     "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''",
                     "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'",
@@ -272,8 +280,9 @@ class PersistenceSchemaMixin:
                 ]:
                     try:
                         await db.execute(col_def)
-                    except Exception:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column name" not in str(e).lower():
+                            raise
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,
@@ -302,8 +311,9 @@ class PersistenceSchemaMixin:
                 """)
                 try:
                     await db.execute("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''")
-                except Exception:
-                    pass
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
                 await db.execute("""
                     CREATE INDEX IF NOT EXISTS ix_memoryevent_session_id
                     ON memoryevent (session_id)

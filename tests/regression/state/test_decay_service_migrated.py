@@ -95,6 +95,96 @@ class DecayServiceMigratedTests(unittest.TestCase):
         self.assertTrue(persistence.saved_profiles)
         self.assertAlmostEqual(persistence.saved_profiles[-1]["social_score"], 19.0)
 
+    def test_run_once_small_social_scores_move_toward_zero(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(
+                cost_per_reply=0.1,
+                min_reply_threshold=0.1,
+                daily_recovery=0.1,
+                recovery_silence_min=1,
+            ),
+            mood=SimpleNamespace(decay_interval=60, decay_rate=0.1),
+            reply=SimpleNamespace(emotion_mapping=[]),
+            evolution=SimpleNamespace(enable_relationship_engine=True),
+        )
+        persistence = _Persistence()
+        engine = StateEngine(persistence, SimpleNamespace(config=config), config=config)
+        service = DecayService(engine, None, config)
+
+        async def _run():
+            positive = await engine.get_user_profile("user-pos")
+            positive.social_score = 5.0
+            positive.last_access_time = 0.0
+            negative = await engine.get_user_profile("user-neg")
+            negative.social_score = -3.0
+            negative.last_access_time = 0.0
+            await service.run_once()
+            return positive, negative
+
+        positive, negative = asyncio.run(_run())
+
+        self.assertAlmostEqual(positive.social_score, 4.0)
+        self.assertAlmostEqual(negative.social_score, -2.0)
+
+    def test_run_once_small_fractional_scores_do_not_cross_zero(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(
+                cost_per_reply=0.1,
+                min_reply_threshold=0.1,
+                daily_recovery=0.1,
+                recovery_silence_min=1,
+            ),
+            mood=SimpleNamespace(decay_interval=60, decay_rate=0.1),
+            reply=SimpleNamespace(emotion_mapping=[]),
+            evolution=SimpleNamespace(enable_relationship_engine=True),
+        )
+        persistence = _Persistence()
+        engine = StateEngine(persistence, SimpleNamespace(config=config), config=config)
+        service = DecayService(engine, None, config)
+
+        async def _run():
+            positive = await engine.get_user_profile("user-frac-pos")
+            positive.social_score = 0.2
+            positive.last_access_time = 0.0
+            negative = await engine.get_user_profile("user-frac-neg")
+            negative.social_score = -0.2
+            negative.last_access_time = 0.0
+            await service.run_once()
+            return positive, negative
+
+        positive, negative = asyncio.run(_run())
+
+        self.assertAlmostEqual(positive.social_score, 0.0)
+        self.assertAlmostEqual(negative.social_score, 0.0)
+
+    def test_memory_decay_failure_is_not_retried_again_on_same_day(self):
+        class _StateEngine:
+            def get_active_states(self):
+                return []
+
+            def get_active_profiles(self):
+                return []
+
+        class _MemoryEngine:
+            def __init__(self):
+                self.calls = 0
+
+            async def apply_daily_decay(self):
+                self.calls += 1
+                raise RuntimeError("boom")
+
+        config = SimpleNamespace(evolution=SimpleNamespace(enable_relationship_engine=False))
+        memory_engine = _MemoryEngine()
+        service = DecayService(_StateEngine(), memory_engine, config)
+
+        async def _run():
+            await service.run_once()
+            await service.run_once()
+
+        asyncio.run(_run())
+
+        self.assertEqual(memory_engine.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,12 +53,9 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
         sender_name = event.get_sender_name() or '??/??'
         rich_text = str(event.get_extra('astrmai_rich_text', event.message_str) or '')
         text = str(event.message_str or rich_text or '')
-        image_urls = list(
-            dict.fromkeys(
-                list(event.get_extra('direct_vision_urls', []) or [])
-                + list(event.get_extra('extracted_image_urls', []) or [])
-            )
-        )
+        direct_refs = list(event.get_extra('direct_image_refs', event.get_extra('direct_vision_urls', [])) or [])
+        extracted_refs = list(event.get_extra('extracted_image_refs', event.get_extra('extracted_image_urls', [])) or [])
+        image_urls = list(dict.fromkeys(direct_refs + extracted_refs))
         token_set = gate._tokenize_text(rich_text or text)
         reply_target_sender_id, reply_target_sender_name = gate._extract_reply_target(event)
         is_at_bot = gate._is_at_bot_event(event, self_id)
@@ -79,7 +76,7 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
                 reply_target_sender_id=reply_target_sender_id,
                 reply_target_sender_name=reply_target_sender_name,
                 image_urls=image_urls,
-                has_direct_vision=bool(event.get_extra('direct_vision_urls', []) or []),
+                has_direct_vision=bool(direct_refs),
                 is_image_only=bool(image_urls and not token_set),
                 token_set=token_set,
                 index=index,

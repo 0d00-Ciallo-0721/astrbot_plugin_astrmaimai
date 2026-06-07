@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from typing import Dict, Any
 
 from ..adapters.plugin_api import PluginApiAdapter
-from ..auth import get_current_user
+from ..access import get_current_user
 from ..services.settings_ui_service import SettingsUiService
 
 router = APIRouter()

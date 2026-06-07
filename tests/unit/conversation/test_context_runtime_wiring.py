@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import unittest
@@ -446,6 +447,22 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             self.assertEqual(result["total"], 1)
             self.assertEqual(result["items"][0]["stage"], "execution.executor.model_failure")
             self.assertEqual(result["items"][0]["failure_evidence"]["failure_kind"], "provider_failure_text")
+
+        asyncio.run(run())
+
+    def test_trace_stores_write_json_atomically(self):
+        raw_store_mod = importlib.import_module("astrmai.infrastructure.runtime.raw_trace_store")
+        turn_store_mod = importlib.import_module("astrmai.infrastructure.runtime.turn_trace_store")
+
+        async def run():
+            raw_store = raw_store_mod.RawTraceEventStore(self.temp_dir.name, max_per_chat=50)
+            turn_store = turn_store_mod.TurnTraceSampleStore(self.temp_dir.name, max_per_chat=50)
+            await raw_store.append({"created_at": 1.0, "chat_id": "chat-1", "stage": "raw"})
+            await turn_store.append({"created_at": 2.0, "chat_id": "chat-1", "stage": "turn"})
+            raw_payload = json.loads(raw_store.path.read_text(encoding="utf-8"))
+            turn_payload = json.loads(turn_store.path.read_text(encoding="utf-8"))
+            self.assertEqual(raw_payload["by_chat"]["chat-1"][0]["stage"], "raw")
+            self.assertEqual(turn_payload["by_chat"]["chat-1"][0]["stage"], "turn")
 
         asyncio.run(run())
 

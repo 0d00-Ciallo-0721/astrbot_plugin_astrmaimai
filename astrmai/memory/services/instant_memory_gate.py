@@ -236,29 +236,35 @@ class InstantMemoryGate:
         if self.prompt_registry is None:
             return await self._run_llm_backfill_legacy(turn)
 
-        envelope = self.prompt_registry.render_template(
-            PromptTemplateId.MEMORY_INSTANT_BACKFILL,
-            {
-                "user_msg": str(turn.user_text or ""),
-                "ai_msg": str(turn.assistant_text or "")[:200],
-            },
-        )
         try:
-            response = await gateway.call_data_process_task(
-                prompt=envelope.prompt,
-                system_prompt=envelope.system_prompt,
-                is_json=True,
-                lane_key=self.memory_lane_key(turn.chat_id),
-                base_origin="",
-                template_envelope=envelope,
+            envelope = self.prompt_registry.render_template(
+                PromptTemplateId.MEMORY_INSTANT_BACKFILL,
+                {
+                    "user_msg": str(turn.user_text or ""),
+                    "ai_msg": str(turn.assistant_text or "")[:200],
+                },
             )
-        except TypeError:
-            response = await gateway.call_data_process_task(
-                envelope.prompt,
-                system_prompt=envelope.system_prompt,
-                lane_key=self.memory_lane_key(turn.chat_id),
-                base_origin="",
-            )
+            lane_key = self.memory_lane_key(turn.chat_id)
+            try:
+                response = await gateway.call_data_process_task(
+                    prompt=envelope.prompt,
+                    system_prompt=envelope.system_prompt,
+                    is_json=True,
+                    lane_key=lane_key,
+                    base_origin="",
+                    template_envelope=envelope,
+                )
+            except TypeError:
+                response = await gateway.call_data_process_task(
+                    envelope.prompt,
+                    system_prompt=envelope.system_prompt,
+                    lane_key=lane_key,
+                    base_origin="",
+                )
+            except Exception as exc:
+                logger.warning(f"[InstantMemoryGate] instant llm backfill degraded: {exc}")
+                await self._observe(turn, "backfill_failed", level="error", reason="prompt_backfill_failed", summary=str(exc))
+                return InstantGateResult()
         except Exception as exc:
             logger.warning(f"[InstantMemoryGate] instant llm backfill degraded: {exc}")
             await self._observe(turn, "backfill_failed", level="error", reason="prompt_backfill_failed", summary=str(exc))

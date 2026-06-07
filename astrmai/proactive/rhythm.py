@@ -4,9 +4,12 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from astrbot.api import logger
+
 
 DEFAULT_QUIET_HOURS = ("23:30-07:30",)
 _MISSING = object()
+_TZ_DIAGNOSTIC_LOGGED = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +81,30 @@ def _time_bucket(now_minutes: int, quiet: bool) -> str:
     return "evening"
 
 
+def _log_tz_diagnostic_once(local_time: time.struct_time, *, current: float, quiet_ranges: tuple[str, ...]) -> None:
+    global _TZ_DIAGNOSTIC_LOGGED
+    if _TZ_DIAGNOSTIC_LOGGED:
+        return
+    _TZ_DIAGNOSTIC_LOGGED = True
+    tz_name = ""
+    if 0 <= int(getattr(local_time, "tm_isdst", -1) or -1) < len(getattr(time, "tzname", ())):
+        tz_name = str(time.tzname[int(local_time.tm_isdst)] or "")
+    elif getattr(time, "tzname", ()):
+        tz_name = str(time.tzname[0] or "")
+    offset_seconds = 0
+    if hasattr(time, "altzone") and int(getattr(local_time, "tm_isdst", 0) or 0) > 0:
+        offset_seconds = -int(time.altzone)
+    elif hasattr(time, "timezone"):
+        offset_seconds = -int(time.timezone)
+    offset_hours = round(offset_seconds / 3600.0, 2)
+    logger.info(
+        "[ProactiveRhythm] local timezone diagnostic: "
+        f"tz_name={tz_name or 'unknown'}; offset_hours={offset_hours}; "
+        f"local_date={time.strftime('%Y-%m-%d %H:%M:%S', local_time)}; "
+        f"epoch={current:.0f}; quiet_ranges={list(quiet_ranges)}"
+    )
+
+
 def evaluate_proactive_rhythm(config: Any = None, *, now: float | None = None) -> ProactiveRhythm:
     current = time.time() if now is None else float(now)
     # NOTE: uses local time; containerized deployments should configure host TZ
@@ -91,6 +118,7 @@ def evaluate_proactive_rhythm(config: Any = None, *, now: float | None = None) -
         ranges = DEFAULT_QUIET_HOURS
     else:
         ranges = _normalize_ranges(getattr(life, "proactive_quiet_hours", _MISSING))
+    _log_tz_diagnostic_once(local, current=current, quiet_ranges=ranges)
     quiet = any(_in_range(now_minutes, item) for item in ranges)
 
     if reply is None:

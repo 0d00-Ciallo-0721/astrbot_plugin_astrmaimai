@@ -11,9 +11,12 @@ from .orm_models import ChatState, LastMessageMetadata
 
 
 class StateProfilePersistenceMixin:
-    # Cached column names -- avoids PRAGMA table_info on every load
+    # Cached column names — avoids PRAGMA table_info on every load (TTL-matched with DatabaseService)
+    _COL_CACHE_TTL_SEC: float = 300.0
     _chat_state_cols_cache: "list | None" = None
+    _chat_state_cols_ts: float = 0.0
     _user_profile_cols_cache: "list | None" = None
+    _user_profile_cols_ts: float = 0.0
 
     @staticmethod
     def _relationship_vector_from_metadata(profile_metadata: Any) -> Dict[str, Any]:
@@ -23,48 +26,65 @@ class StateProfilePersistenceMixin:
         return dict(relationship_vector) if isinstance(relationship_vector, dict) else {}
 
     async def _get_chat_state_cols(self, db) -> list:
-        if self._chat_state_cols_cache is None:
+        now = time.time()
+        if self._chat_state_cols_cache is None or (now - self._chat_state_cols_ts) > self._COL_CACHE_TTL_SEC:
             cursor = await db.execute("PRAGMA table_info(chat_states)")
             cols_info = await cursor.fetchall()
             self._chat_state_cols_cache = [c[1] for c in cols_info]
+            self._chat_state_cols_ts = now
         return self._chat_state_cols_cache
 
     async def _get_user_profile_cols(self, db) -> list:
-        if self._user_profile_cols_cache is None:
+        now = time.time()
+        if self._user_profile_cols_cache is None or (now - self._user_profile_cols_ts) > self._COL_CACHE_TTL_SEC:
             cursor = await db.execute("PRAGMA table_info(user_profiles)")
             cols_info = await cursor.fetchall()
             self._user_profile_cols_cache = [c[1] for c in cols_info]
+            self._user_profile_cols_ts = now
         return self._user_profile_cols_cache
 
-    async def load_chat_state(self, chat_id: str) -> Optional[Dict[str, Any]]:
+    async def load_chat_state(self, chat_id: str) -> Optional[ChatState]:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
             row = await cursor.fetchone()
             if row:
-                col_names = await self._get_chat_state_cols(db)
-                row_dict = dict(zip(col_names, row))
+                actual_col_names = [col[0] for col in (cursor.description or [])]
+                now = time.time()
+                if not actual_col_names or len(actual_col_names) != len(row):
+                    actual_col_names = await self._get_chat_state_cols(db)
+                if (
+                    self._chat_state_cols_cache is None
+                    or (now - self._chat_state_cols_ts) > self._COL_CACHE_TTL_SEC
+                    or len(self._chat_state_cols_cache) != len(actual_col_names)
+                    or self._chat_state_cols_cache != actual_col_names
+                ):
+                    self._chat_state_cols_cache = list(actual_col_names)
+                    self._chat_state_cols_ts = now
+                row_dict = dict(zip(actual_col_names, row))
                 last_msg_info_raw = json.loads(row_dict.get("last_msg_info") or "{}")
-                return {
-                    "chat_id": row_dict.get("chat_id", chat_id),
-                    "energy": row_dict.get("energy", 0.5),
-                    "mood": row_dict.get("mood", 0.0),
-                    "group_config": json.loads(row_dict.get("group_config") or "{}"),
-                    "last_reset_date": row_dict.get("last_reset_date", ""),
-                    "total_replies": int(row_dict.get("total_replies") or 0),
-                    "last_reply_time": float(row_dict.get("last_reply_time") or 0.0),
-                    "last_passive_decay_time": float(row_dict.get("last_passive_decay_time") or 0.0),
-                    "total_messages": int(row_dict.get("total_messages") or 0),
-                    "judgment_mode": str(row_dict.get("judgment_mode") or "single"),
-                    "last_msg_info": LastMessageMetadata(
-                        sender_id=last_msg_info_raw.get("sender_id", ""),
-                        has_image=bool(last_msg_info_raw.get("has_image", False)),
-                        image_urls=last_msg_info_raw.get("image_urls", []),
-                        vl_executed=bool(last_msg_info_raw.get("vl_executed", False)),
-                    ),
-                    "last_access_time": float(row_dict.get("last_access_time") or 0.0),
-                    "next_wakeup_timestamp": float(row_dict.get("next_wakeup_timestamp") or 0.0),
-                    "is_dirty": bool(row_dict.get("is_dirty") or False),
-                }
+                state = ChatState(
+                    chat_id=str(row_dict.get("chat_id", chat_id) or chat_id),
+                    energy=float(row_dict.get("energy", 0.5) or 0.5),
+                    mood=float(row_dict.get("mood", 0.0) or 0.0),
+                )
+                state.group_config = json.loads(row_dict.get("group_config") or "{}")
+                state.last_reset_date = str(row_dict.get("last_reset_date", "") or "")
+                state.total_replies = int(row_dict.get("total_replies") or 0)
+                state.last_reply_time = float(row_dict.get("last_reply_time") or 0.0)
+                state.last_passive_decay_time = float(row_dict.get("last_passive_decay_time") or 0.0)
+                state.last_energy_recovery_time = float(row_dict.get("last_energy_recovery_time") or 0.0)
+                state.total_messages = int(row_dict.get("total_messages") or 0)
+                state.judgment_mode = str(row_dict.get("judgment_mode", "single") or "single")
+                state.last_msg_info = LastMessageMetadata(
+                    sender_id=last_msg_info_raw.get("sender_id", ""),
+                    has_image=bool(last_msg_info_raw.get("has_image", False)),
+                    image_urls=last_msg_info_raw.get("image_urls", []),
+                    vl_executed=bool(last_msg_info_raw.get("vl_executed", False)),
+                )
+                state.last_access_time = float(row_dict.get("last_access_time") or 0.0)
+                state.next_wakeup_timestamp = float(row_dict.get("next_wakeup_timestamp") or 0.0)
+                state.is_dirty = bool(row_dict.get("is_dirty") or False)
+                return state
         return None
 
     async def save_chat_state(self, chat_id: str, state: ChatState):
@@ -80,27 +100,45 @@ class StateProfilePersistenceMixin:
             ensure_ascii=False,
         )
         async with aiosqlite.connect(self.db_path) as db:
+            now = time.time()
             await db.execute("""
-                INSERT OR REPLACE INTO chat_states 
-                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, total_messages, judgment_mode, last_msg_info, last_access_time, next_wakeup_timestamp, is_dirty, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                chat_id,
-                state.energy,
-                state.mood,
-                config_json,
-                state.last_reset_date,
-                state.total_replies,
-                float(getattr(state, "last_reply_time", 0.0) or 0.0),
-                float(getattr(state, "last_passive_decay_time", 0.0) or 0.0),
-                int(getattr(state, "total_messages", 0) or 0),
-                str(getattr(state, "judgment_mode", "single") or "single"),
-                last_msg_info_json,
-                float(getattr(state, "last_access_time", 0.0) or 0.0),
-                float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0),
-                int(getattr(state, "is_dirty", False) or False),
-                time.time(),
-            ))
+                INSERT INTO chat_states
+                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, last_energy_recovery_time, total_messages, judgment_mode, last_msg_info, last_access_time, next_wakeup_timestamp, is_dirty, updated_at)
+                VALUES (:chat_id, :energy, :mood, :group_config, :last_reset_date, :total_replies, :last_reply_time, :last_passive_decay_time, :last_energy_recovery_time, :total_messages, :judgment_mode, :last_msg_info, :last_access_time, :next_wakeup_timestamp, :is_dirty, :updated_at)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    energy = :energy,
+                    mood = :mood,
+                    group_config = :group_config,
+                    last_reset_date = :last_reset_date,
+                    total_replies = :total_replies,
+                    last_reply_time = :last_reply_time,
+                    last_passive_decay_time = :last_passive_decay_time,
+                    last_energy_recovery_time = :last_energy_recovery_time,
+                    total_messages = :total_messages,
+                    judgment_mode = :judgment_mode,
+                    last_msg_info = :last_msg_info,
+                    last_access_time = :last_access_time,
+                    next_wakeup_timestamp = :next_wakeup_timestamp,
+                    is_dirty = :is_dirty,
+                    updated_at = :updated_at
+            """, {
+                "chat_id": chat_id,
+                "energy": state.energy,
+                "mood": state.mood,
+                "group_config": config_json,
+                "last_reset_date": state.last_reset_date,
+                "total_replies": state.total_replies,
+                "last_reply_time": float(getattr(state, "last_reply_time", 0.0) or 0.0),
+                "last_passive_decay_time": float(getattr(state, "last_passive_decay_time", 0.0) or 0.0),
+                "last_energy_recovery_time": float(getattr(state, "last_energy_recovery_time", 0.0) or 0.0),
+                "total_messages": int(getattr(state, "total_messages", 0) or 0),
+                "judgment_mode": str(getattr(state, "judgment_mode", "single") or "single"),
+                "last_msg_info": last_msg_info_json,
+                "last_access_time": float(getattr(state, "last_access_time", 0.0) or 0.0),
+                "next_wakeup_timestamp": float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0),
+                "is_dirty": int(getattr(state, "is_dirty", False) or False),
+                "updated_at": now,
+            })
             await db.commit()
 
     async def load_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:

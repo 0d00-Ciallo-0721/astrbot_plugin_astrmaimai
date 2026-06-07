@@ -204,7 +204,7 @@ class ContextEngine:
             prompt_envelope.situational_context_block = situational_context_block.strip()
         if self.prefix_caching_enabled:
             semantic_system_text = frozen_prefix
-            semantic_system_hash = hashlib.md5(semantic_system_text.encode("utf-8")).hexdigest()
+            semantic_system_hash = hashlib.sha256(semantic_system_text.encode("utf-8")).hexdigest()
             current_hash = semantic_system_hash
             previous_meta = dict(self._prefix_meta_by_chat.get(chat_id, {}) or {})
             previous_hash = str(previous_meta.get("prefix_hash", "") or "")
@@ -491,7 +491,7 @@ class ContextEngine:
         try_recall = any(keyword in last_msg for keyword in trigger_keywords)
         if not try_recall:
             probability = float(getattr(getattr(self.config, "memory", None), "auto_recall_probability", 0.0) or 0.0)
-            roll = int(hashlib.md5(f"{chat_id}:{last_msg}".encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+            roll = int(hashlib.sha256(f"{chat_id}:{last_msg}".encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
             try_recall = roll < probability
         if not try_recall:
             return ""
@@ -525,10 +525,10 @@ class ContextEngine:
         if not prompt:
             return ""
         picids = re.findall(r"\[picid:([a-fA-F0-9]{32})\]", prompt)
-        for picid in set(picids):
-            replacement = "[一张尚未识别清楚的图片]"
-            try:
-                with self.db.get_session() as session:
+        with self.db.get_session() as session:
+            for picid in set(picids):
+                replacement = "[一张尚未识别清楚的图片]"
+                try:
                     memory = session.get(VisualMemory, picid)
                     if memory and memory.description:
                         try:
@@ -540,9 +540,9 @@ class ContextEngine:
                             replacement = f"[表情包：{memory.description}{tag_text}]"
                         else:
                             replacement = f"[图片：{memory.description}]"
-            except Exception as exc:
-                logger.debug(f"[ContextEngine] visual memory resolve failed for {picid}: {exc}")
-            prompt = prompt.replace(f"[picid:{picid}]", replacement)
+                except Exception as exc:
+                    logger.debug(f"[ContextEngine] visual memory resolve failed for {picid}: {exc}")
+                prompt = prompt.replace(f"[picid:{picid}]", replacement)
         return prompt
 
     def _system_rules_block(self) -> str:
@@ -592,7 +592,7 @@ class ContextEngine:
         ]
         if is_fast_mode:
             return styles[0]
-        style_seed = hashlib.md5(f"{chat_id}:{int(time.time() // 3600)}".encode("utf-8")).hexdigest()
+        style_seed = hashlib.sha256(f"{chat_id}:{int(time.time() // 3600)}".encode("utf-8")).hexdigest()
         return styles[int(style_seed[:2], 16) % len(styles)]
 
     def _block(self, title: str, content: str) -> str:

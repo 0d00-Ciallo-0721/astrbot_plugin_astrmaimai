@@ -723,6 +723,126 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertEqual(history[0].status, "skipped")
         self.assertEqual(history[0].skip_reason, "cooldown")
 
+    def test_heartflow_tick_chat_cleans_stale_history_buckets(self):
+        manager = self.heartflow_mod.HeartflowManager(
+            state_engine=_FakeStateEngine(energy=0.8, mood=0.1),
+            memory_engine=_FakeMemory(),
+        )
+        now = time.time()
+        stale_ts = now - (self.heartflow_mod.HeartflowManager.ACTIVE_CHAT_TTL_SECONDS * 2) - 30
+
+        manager._states["stale-chat"] = self.heartflow_mod.HeartflowChatState(
+            chat_id="stale-chat",
+            last_tick_ts=stale_ts,
+            last_activity_ts=stale_ts,
+            interest=0.2,
+            engagement=0.2,
+            talk_willingness=0.2,
+            silence_pressure=0.2,
+            fatigue=0.8,
+            mood_bias=0.0,
+            current_focus="old context",
+            recent_impulse="observe",
+        )
+        manager._pulses_by_chat["stale-chat"] = [
+            self.heartflow_mod.HeartflowPulse(
+                chat_id="stale-chat",
+                timestamp=stale_ts,
+                pulse_type="observe",
+                reason="stale pulse",
+                guidance="ignore",
+                suggested_social_intent="observe",
+                suggested_action_tier="none",
+                urgency=0.1,
+            )
+        ]
+        manager._action_decisions_by_chat["stale-chat"] = [
+            self.heartflow_mod.HeartflowActionDecision(
+                chat_id="stale-chat",
+                timestamp=stale_ts,
+                action_type="observe",
+                reason="stale action",
+                guidance="ignore",
+            )
+        ]
+        manager._impulse_decisions_by_chat["stale-chat"] = [
+            self.heartflow_mod.HeartflowImpulseDecision(
+                chat_id="stale-chat",
+                timestamp=stale_ts,
+                pulse_type="observe",
+                blocked_reason="stale",
+            )
+        ]
+
+        snapshot = {
+            "latest_activity_ts": now - 20,
+            "recent_activity_count": 3,
+            "recent_activity_count_60s": 2,
+            "recent_direct_count": 1,
+            "recent_bot_reply_count": 0,
+            "latest_activity_preview": "what should we do now?",
+            "wait_targets": [],
+            "executor_pending": 0,
+        }
+
+        payload = asyncio.run(manager.tick_chat("chat-1", snapshot=snapshot, now=now))
+
+        self.assertTrue(payload["performed"])
+        self.assertNotIn("stale-chat", manager._states)
+        self.assertNotIn("stale-chat", manager._pulses_by_chat)
+        self.assertNotIn("stale-chat", manager._action_decisions_by_chat)
+        self.assertNotIn("stale-chat", manager._impulse_decisions_by_chat)
+        self.assertIn("chat-1", manager._states)
+        status = manager.describe_status()
+        self.assertEqual(status["active_chats"], 1)
+        self.assertEqual(status["pending_pulses"], 1)
+
+    def test_heartflow_tick_batch_cleans_history_only_once_per_cycle(self):
+        now = time.time()
+
+        class _Coordinator:
+            async def list_active_chats(self, ttl_seconds):
+                return ["chat-1", "chat-2"]
+
+            async def get_activity_snapshot(self, chat_id):
+                return {
+                    "latest_activity_ts": now - 20,
+                    "recent_activity_count": 2,
+                    "recent_activity_count_60s": 1,
+                    "recent_direct_count": 0,
+                    "recent_bot_reply_count": 0,
+                    "latest_activity_preview": f"{chat_id} hello?",
+                    "wait_targets": [],
+                    "executor_pending": 0,
+                }
+
+        manager = self.heartflow_mod.HeartflowManager(
+            runtime_coordinator=_Coordinator(),
+            state_engine=_FakeStateEngine(energy=0.8, mood=0.1),
+            memory_engine=_FakeMemory(),
+        )
+        cleanup_calls = {"sessions": 0, "history": 0}
+        original_cleanup_sessions = manager._cleanup_sessions
+        original_cleanup_history = manager._cleanup_stale_chat_history
+
+        def _count_cleanup_sessions(*, now):
+            cleanup_calls["sessions"] += 1
+            return original_cleanup_sessions(now=now)
+
+        def _count_cleanup_history(*, now):
+            cleanup_calls["history"] += 1
+            return original_cleanup_history(now=now)
+
+        manager._cleanup_sessions = _count_cleanup_sessions
+        manager._cleanup_stale_chat_history = _count_cleanup_history
+
+        asyncio.run(manager.tick(now=now))
+
+        self.assertEqual(cleanup_calls["sessions"], 1)
+        self.assertEqual(cleanup_calls["history"], 1)
+        self.assertIn("chat-1", manager._states)
+        self.assertIn("chat-2", manager._states)
+
     def test_cognitive_loop_reads_heartflow_hidden_context(self):
         gateway = _FakeGateway()
         loop = self.loop_mod.CognitiveLoop(gateway)

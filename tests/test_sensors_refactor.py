@@ -67,9 +67,12 @@ class RefactoredSensorsTests(unittest.TestCase):
             ),
         )
 
-    def _image_component(self, url):
+    def _image_component(self, *, file_path=None, url=None):
         image = self.Comp.Image()
-        image.url = url
+        if file_path is not None:
+            image.file = file_path
+        if url is not None:
+            image.url = url
         return image
 
     def _plain_component(self, text):
@@ -93,13 +96,13 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         event = _FakeEvent(
             group_id=None,
-            components=[self._image_component("https://example.com/private.jpg")],
+            components=[self._image_component(file_path="private.jpg")],
         )
 
         result = asyncio.run(filters.should_process_message(event))
 
         self.assertTrue(result)
-        self.assertEqual(event.get_extra("extracted_image_urls"), ["https://example.com/private.jpg"])
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["private.jpg"])
         self.assertFalse(event.get_extra("vision_direct_selected"))
         self.assertEqual(event.get_extra("vision_direct_skip_reason"), "probability_gate")
         self.assertFalse(event.get_extra("astrmai_is_direct_vision_request"))
@@ -111,7 +114,7 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         event = _FakeEvent(
             group_id=None,
-            components=[self._image_component("https://example.com/private.jpg")],
+            components=[self._image_component(file_path="private.jpg")],
         )
 
         result = asyncio.run(filters.should_process_message(event))
@@ -127,7 +130,7 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         event = _FakeEvent(
             group_id=None,
-            components=[self._image_component("https://example.com/private.jpg")],
+            components=[self._image_component(file_path="private.jpg")],
         )
 
         result = asyncio.run(filters.should_process_message(event))
@@ -136,7 +139,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertTrue(event.get_extra("vision_direct_selected"))
         self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
         self.assertTrue(event.get_extra("astrmai_is_direct_vision_request"))
-        self.assertEqual(event.get_extra("direct_vision_urls"), ["https://example.com/private.jpg"])
+        self.assertEqual(event.get_extra("direct_vision_urls"), ["private.jpg"])
 
     def test_group_reply_image_probability_gate_keeps_extracted_urls(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
@@ -148,7 +151,7 @@ class RefactoredSensorsTests(unittest.TestCase):
             components=[
                 self._at_component("bot-1"),
                 self._plain_component("看这个"),
-                self._reply_component([self._image_component("https://example.com/reply.jpg")]),
+                self._reply_component([self._image_component(file_path="reply.jpg")]),
             ],
         )
 
@@ -158,7 +161,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertFalse(event.get_extra("vision_direct_selected"))
         self.assertEqual(event.get_extra("vision_direct_skip_reason"), "probability_gate")
         self.assertFalse(event.get_extra("direct_vision_urls"))
-        self.assertEqual(event.get_extra("extracted_image_urls"), ["https://example.com/reply.jpg"])
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["reply.jpg"])
 
     def test_group_reply_image_disable_switch_still_keeps_extracted_urls(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=False, probability=1.0))
@@ -170,7 +173,7 @@ class RefactoredSensorsTests(unittest.TestCase):
             components=[
                 self._at_component("bot-1"),
                 self._plain_component("看这个"),
-                self._reply_component([self._image_component("https://example.com/reply.jpg")]),
+                self._reply_component([self._image_component(file_path="reply.jpg")]),
             ],
         )
 
@@ -179,7 +182,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertFalse(event.get_extra("vision_direct_selected"))
         self.assertEqual(event.get_extra("vision_direct_skip_reason"), "disabled")
-        self.assertEqual(event.get_extra("extracted_image_urls"), ["https://example.com/reply.jpg"])
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["reply.jpg"])
 
     def test_group_pure_reply_image_is_not_dropped_as_empty_message(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
@@ -189,15 +192,30 @@ class RefactoredSensorsTests(unittest.TestCase):
             group_id="group-1",
             components=[
                 self._at_component("bot-1"),
-                self._reply_component([self._image_component("https://example.com/reply.jpg")]),
+                self._reply_component([self._image_component(file_path="reply.jpg")]),
             ],
         )
 
         result = asyncio.run(filters.should_process_message(event))
 
         self.assertTrue(result)
-        self.assertEqual(event.get_extra("extracted_image_urls"), ["https://example.com/reply.jpg"])
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "probability_gate")
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["reply.jpg"])
+
+    def test_remote_url_only_image_is_not_selected_for_direct_vision(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
+        filters._commands_loaded = True
+
+        event = _FakeEvent(
+            group_id=None,
+            components=[self._image_component(url="https://example.com/private.jpg")],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertEqual(event.get_extra("extracted_image_urls"), [])
+        self.assertFalse(event.get_extra("direct_vision_urls"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "not_direct_path")
 
 
 if __name__ == "__main__":

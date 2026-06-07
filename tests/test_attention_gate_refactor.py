@@ -84,6 +84,19 @@ class _SequenceJudge:
         return SimpleNamespace(action=action)
 
 
+class _FakeCompactionScheduler:
+    def __init__(self):
+        self.calls = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def schedule_compaction_evaluation(self, chat_id, focus_context=None, message_source=None):
+        self.calls.append((chat_id, focus_context, message_source))
+        self.started.set()
+        await self.release.wait()
+        return SimpleNamespace(chat_id=chat_id, state="DONE")
+
+
 class RefactoredAttentionGateTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -142,12 +155,12 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             "user-1",
             "Alice",
             "",
-            extras={"extracted_image_urls": ["https://example.com/reply.jpg"]},
+            extras={"extracted_image_urls": ["reply.jpg"]},
         )
 
         context = self.gate._resolve_event_context(event)
 
-        self.assertEqual(context["extracted_images"], ["https://example.com/reply.jpg"])
+        self.assertEqual(context["extracted_images"], ["reply.jpg"])
         self.assertFalse(context["is_private"])
 
 
@@ -484,5 +497,213 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(result, "ENGAGED")
         self.assertEqual(calls, [("default:GroupMessage:group-1", "external plugin reply", "external_result_bridge")])
+
+    def test_debounce_worker_drain_loop_keeps_late_arrivals(self):
+        captured = []
+        first_batch_entered = asyncio.Event()
+        release_first_batch = asyncio.Event()
+
+        async def fake_sys2(event, events):
+            captured.append([item.message_str for item in events])
+            if len(captured) == 1:
+                first_batch_entered.set()
+                await release_first_batch.wait()
+
+        self.gate.sys2_process = fake_sys2
+        self.gate._compute_debounce_delay = lambda *args, **kwargs: 0.0
+
+        async def _run():
+            first = _FakeEvent("user-1", "Alice", "first")
+            second = _FakeEvent("user-1", "Alice", "second")
+            first_status = await self.gate.process_event(first)
+            await asyncio.wait_for(first_batch_entered.wait(), timeout=1.0)
+            second_status = await self.gate.process_event(second)
+            release_first_batch.set()
+            await asyncio.sleep(0.05)
+            session = await self.gate._get_or_create_session("group-1")
+            return first_status, second_status, session
+
+        first_status, second_status, session = asyncio.run(_run())
+
+        self.assertEqual(first_status, "BUFFERED")
+        self.assertEqual(second_status, "BUFFERED")
+        self.assertGreaterEqual(len(captured), 2)
+        self.assertIn(["first"], captured)
+        self.assertIn(["first", "second"], captured)
+        self.assertFalse(session.is_evaluating)
+        self.assertEqual(session.accumulation_pool, [])
+
+    def test_background_task_semaphore_limits_parallelism(self):
+        max_running = 0
+        running = 0
+
+        async def background_job():
+            nonlocal max_running, running
+            running += 1
+            max_running = max(max_running, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+        async def _run():
+            tasks = [self.gate._fire_background_task(background_job()) for _ in range(20)]
+            await asyncio.gather(*tasks)
+
+        asyncio.run(_run())
+
+        self.assertLessEqual(max_running, self.gate.BACKGROUND_TASK_MAX_CONCURRENCY)
+
+    def test_context_compaction_engine_coalesces_execution_but_keeps_message_accounting(self):
+        compaction_mod = importlib.import_module("astrmai.conversation.attention.context_compaction")
+        compaction_mod = importlib.reload(compaction_mod)
+        engine = compaction_mod.ContextCompactionEngine(dialogue_store=None)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        maybe_compact_calls = 0
+
+        async def fake_maybe_compact(chat_id, focus_context=None):
+            nonlocal maybe_compact_calls
+            maybe_compact_calls += 1
+            started.set()
+            await release.wait()
+            return compaction_mod.CompactionResult(chat_id=chat_id, state="DONE")
+
+        engine.maybe_compact = fake_maybe_compact
+
+        async def _run():
+            first_task = asyncio.create_task(
+                engine.schedule_compaction_evaluation(
+                    "default:GroupMessage:group-1",
+                    focus_context={"focus": 1},
+                    message_source="user",
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            second_result = await engine.schedule_compaction_evaluation(
+                "default:GroupMessage:group-1",
+                focus_context={"focus": 2},
+                message_source="user",
+            )
+            state = engine._state_for_chat("default:GroupMessage:group-1")
+            release.set()
+            first_result = await first_task
+            return first_result, second_result, state
+
+        first_result, second_result, state = asyncio.run(_run())
+
+        self.assertEqual(first_result.state, "DONE")
+        self.assertEqual(second_result.skipped_reason, "evaluation_already_scheduled")
+        self.assertEqual(maybe_compact_calls, 1)
+        self.assertEqual(state["message_count_since_last_compaction"], 2)
+
+    def test_fast_wakeup_bypasses_background_semaphore(self):
+        running_background = 0
+        background_saturated = asyncio.Event()
+        release_background = asyncio.Event()
+        sys2_started = asyncio.Event()
+
+        async def background_job():
+            nonlocal running_background
+            running_background += 1
+            if running_background >= self.gate.BACKGROUND_TASK_MAX_CONCURRENCY:
+                background_saturated.set()
+            await release_background.wait()
+            running_background -= 1
+
+        async def fake_sys2(event, events):
+            sys2_started.set()
+
+        self.gate.sys2_process = fake_sys2
+
+        async def _run():
+            tasks = [
+                self.gate._fire_background_task(background_job())
+                for _ in range(self.gate.BACKGROUND_TASK_MAX_CONCURRENCY)
+            ]
+            await asyncio.wait_for(background_saturated.wait(), timeout=1.0)
+            event = _FakeEvent(
+                "user-1",
+                "Alice",
+                "AstrMai",
+                extras={"wakeup": True},
+            )
+            status = await self.gate.process_event(event)
+            await asyncio.wait_for(sys2_started.wait(), timeout=1.0)
+            release_background.set()
+            await asyncio.gather(*tasks)
+            await asyncio.sleep(0)
+            return status
+
+        status = asyncio.run(_run())
+
+        self.assertEqual(status, "ENGAGED")
+
+    def test_attention_window_ttl_keeps_recent_events_for_180_seconds(self):
+        session = self.gate_mod.SessionContext()
+        recent = _FakeEvent("user-1", "Alice", "recent")
+        expired = _FakeEvent("user-2", "Bob", "expired")
+        now = 500.0
+        session.attention_window = [recent, expired]
+        session.attention_window_ts = [now - 179.0, now - 181.0]
+
+        retained = self.gate._prune_attention_window(session, now=now)
+
+        self.assertEqual(retained, [recent])
+        self.assertEqual(session.attention_window, [recent])
+
+    def test_focus_thread_sorts_output_by_original_event_order(self):
+        thread_builder = importlib.import_module("astrmai.conversation.attention.thread_builder")
+        original_score = thread_builder._score_thread_relation
+        first = _FakeEvent("user-1", "Alice", "first")
+        focus = _FakeEvent("user-1", "Alice", "focus")
+        related = _FakeEvent("user-2", "Bob", "related")
+        ambient = _FakeEvent("user-3", "Cara", "ambient")
+        normalized = self.gate._build_normalized_events([first, focus, related, ambient], self_id="bot-1")
+        focus_candidate = normalized[1]
+
+        def fake_score(_gate, candidate, _focus_candidate, _root_candidate):
+            mapping = {"first": 70, "related": 50, "ambient": 10}
+            return mapping.get(candidate.event.message_str, -1)
+
+        thread_builder._score_thread_relation = fake_score
+        try:
+            focus_thread = self.gate._build_focus_thread(focus_candidate, focus_candidate, normalized)
+        finally:
+            thread_builder._score_thread_relation = original_score
+
+        self.assertEqual([event.message_str for event in focus_thread.core_events], ["first", "focus"])
+        self.assertEqual([event.message_str for event in focus_thread.related_events], ["related"])
+        self.assertEqual([event.message_str for event in focus_thread.ambient_events], ["ambient"])
+
+    def test_throttle_gracefully_handles_missing_should_drop(self):
+        result_with_none = self.gate._should_skip_by_throttle(
+            "hello",
+            [],
+            None,
+            "default:GroupMessage:group-1",
+            False,
+            False,
+        )
+        result_with_plain_object = self.gate._should_skip_by_throttle(
+            "hello",
+            [],
+            object(),
+            "default:GroupMessage:group-1",
+            False,
+            False,
+        )
+
+        self.assertIsNone(result_with_none)
+        self.assertIsNone(result_with_plain_object)
+
+    def test_repeater_echo_signature_cleanup_keeps_behavior(self):
+        session = self.gate_mod.SessionContext()
+
+        first = self.gate._handle_repeater_echo(session, False, [], "echo")
+        second = self.gate._handle_repeater_echo(session, False, [], "echo")
+        third = self.gate._handle_repeater_echo(session, False, [], "echo")
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(third, "repeater_echo")
 if __name__ == "__main__":
     unittest.main()

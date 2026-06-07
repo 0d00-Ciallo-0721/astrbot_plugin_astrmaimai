@@ -13,6 +13,12 @@ from astrmai.infrastructure.runtime.lane_manager import LaneManager
 
 
 class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
+    def test_compaction_engine_exposes_split_helper_components(self):
+        engine = ContextCompactionEngine(dialogue_store=None)
+        self.assertTrue(hasattr(engine, "safety_analyzer"))
+        self.assertTrue(hasattr(engine, "window_selector"))
+        self.assertTrue(hasattr(engine, "compaction_executor"))
+
     def test_warm_transcript_and_cold_summary_lifecycle(self):
         async def run():
             store = GroupDialogueStore(hot_zone_ttl_seconds=30.0, warm_zone_ttl_seconds=300.0, warm_zone_max_tokens=1200)

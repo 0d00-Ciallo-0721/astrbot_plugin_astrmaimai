@@ -167,9 +167,9 @@ class GatewayResultMixin:
             cooldown_overridden=bool(cooldown_overridden),
         )
 
-    def _bot_speaker_names(self) -> List[str]:
+    @staticmethod
+    def _bot_speaker_names(nicknames: list) -> List[str]:
         names: List[str] = ["Bot"]
-        nicknames = getattr(getattr(getattr(self, "config", None), "system1", None), "nicknames", [])
         if isinstance(nicknames, list):
             names.extend(str(name).strip() for name in nicknames if str(name).strip())
         return list(dict.fromkeys(names))

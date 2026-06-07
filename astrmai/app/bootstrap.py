@@ -40,6 +40,7 @@ from ..learning.review.expression_governance_runner import ExpressionGovernanceR
 from ..memory import MemoryEngine, PersonaSummarizer, ReActRetriever
 from ..multimodal.visual_cortex import VisualCortex
 from ..proactive import ProactiveTask
+from ..proactive.proactive_task import ProactiveDeps
 from ..proactive.review_dispatcher import ReviewDispatcher
 from ..shared.constants.defaults import build_infrastructure_settings
 from ..state import FrequencyController, GroupReplyWaitManager, PrivateChatManager, StateEngine
@@ -467,30 +468,18 @@ class PluginBootstrap:
                 runtime_coordinator=runtime.runtime_coordinator,
                 attention_gate=runtime.attention_gate,
             )
-            if runtime.system2_planner is not None:
-                runtime.system2_planner.heartflow_manager = proactive_task.heartflow_manager
-            self._nullify_proactive_refs(proactive_task)
-            proactive_task.dream_scheduler.dream_visible = runtime.feature_flags.dream_visible
+            proactive_task.configure(
+                ProactiveDeps(
+                    dream_visible=runtime.feature_flags.dream_visible,
+                    planner=runtime.system2_planner,
+                )
+            )
             proactive_task.set_db_service(runtime.db_service)
             proactive_task.bind_chat_loop_kernel(runtime.chat_loop_kernel)
             return proactive_task
         except Exception as exc:
             self._record_optional_failure(runtime, "proactive.task", exc)
             return None
-
-    @staticmethod
-    def _nullify_proactive_refs(proactive_task: ProactiveTask) -> None:
-        """Clear cross-service references that are set during construction.
-
-        These attributes are owned by ProactiveTask but are currently
-        nullified here because the bootstrap phase wires lifecycle services
-        (auto_check_task, reflect_tracker) separately.  When ProactiveTask
-        grows a ``configure(deps: ProactiveDependencies)`` method these
-        assignments should move there.
-        """
-        proactive_task.auto_check_task = None
-        proactive_task.reflect_tracker = None
-        proactive_task.review_dispatcher.reflect_tracker = None
 
     def _bind_learning_collaboration(self, runtime: PluginRuntimeContext, evolution: EvolutionManager) -> None:
         if runtime.event_bus is None:

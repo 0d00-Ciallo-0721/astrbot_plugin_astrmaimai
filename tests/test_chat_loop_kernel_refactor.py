@@ -688,6 +688,111 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.state.phase, "MAINTENANCE")
         self.assertEqual(bridge_calls, [])
 
+    def test_maintenance_budget_blocked_degrades_to_idle_after_three_rounds(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _Compaction:
+            async def get_trace_status(self, chat_id):
+                return {"pending_eval_nodes_count": 1}
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(context_compaction=_Compaction())
+
+        async def _tick_once():
+            kernel.set_heartbeat_scheduler_context(
+                {
+                    "selected": ["chat-1"],
+                    "score_breakdown": {"chat-1": {"scheduler_score": 42.0, "due_rank": 1, "pressure_components": {}}},
+                    "poll_mode": "FAST",
+                    "maintenance_budget_total": 0,
+                    "maintenance_budget_used": 0,
+                    "maintenance_budget_remaining": 0,
+                    "maintenance_blocked_by_budget": [],
+                }
+            )
+            return await kernel.tick(chat_id="chat-1", trigger="heartbeat")
+
+        async def _run():
+            first = await _tick_once()
+            first_phase = first.state.phase
+            second = await _tick_once()
+            second_phase = second.state.phase
+            third = await _tick_once()
+            third_phase = third.state.phase
+            return (first, first_phase), (second, second_phase), (third, third_phase)
+
+        (first, first_phase), (second, second_phase), (third, third_phase) = asyncio.run(_run())
+
+        self.assertEqual(first_phase, "MAINTENANCE")
+        self.assertEqual(second_phase, "MAINTENANCE")
+        self.assertEqual(third_phase, "IDLE")
+        self.assertTrue(third.decision.metadata["maintenance_phase_downgraded"])
+        self.assertEqual(third.decision.metadata["maintenance_budget_blocked_rounds"], 3)
+        self.assertEqual(third.decision.metadata["schedule_reason"], "maintenance_budget_blocked_idle_downgrade")
+
+    def test_proactive_dispatch_marks_pending_heartflow_when_both_signals_exist(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _WakeupService:
+            async def build_signal(self, chat_id, now=None):
+                return {"eligible": True, "reason": "silence_threshold_reached"}
+
+        class _HeartflowManager:
+            async def preview_chat(self, chat_id, snapshot=None, now=None):
+                return {"eligible": True, "action_type": "prepare_reply", "blocked_reason": ""}
+
+        async def _bridge(chat_id, snapshot, decision):
+            return {"bridge": decision.action.lower()}
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(wakeup_service=_WakeupService(), heartflow_manager=_HeartflowManager())
+        kernel.bind_dispatch_bridge("PROACTIVE_WAKEUP", _bridge)
+
+        result = asyncio.run(kernel.tick(chat_id="chat-1", trigger="heartbeat"))
+
+        self.assertEqual(result.decision.action, "PROACTIVE_WAKEUP")
+        self.assertTrue(result.decision.metadata["pending_heartflow"])
+        self.assertEqual(result.state.pending_signals["pending_heartflow"], True)
+        self.assertEqual(result.state.pending_signals["pending_heartflow_reason"], "heartflow_signal:prepare_reply")
+
+    def test_pending_heartflow_is_replayed_on_next_heartbeat(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _HeartflowManager:
+            async def preview_chat(self, chat_id, snapshot=None, now=None):
+                return {"eligible": False, "action_type": "prepare_reply", "blocked_reason": ""}
+
+        bridge_calls = []
+
+        async def _bridge(chat_id, snapshot, decision):
+            bridge_calls.append((chat_id, decision.action, decision.reason))
+            return {"bridge": "heartflow"}
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(heartflow_manager=_HeartflowManager())
+        kernel.bind_dispatch_bridge("HEARTFLOW_EVALUATE", _bridge)
+
+        async def _run():
+            state = await kernel.get_loop_state("chat-1")
+            state.pending_signals["pending_heartflow"] = True
+            state.pending_signals["pending_heartflow_reason"] = "heartflow_signal:prepare_reply"
+            await kernel._state_store.save(state)
+            return await kernel.tick(chat_id="chat-1", trigger="heartbeat")
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result.decision.action, "HEARTFLOW_EVALUATE")
+        self.assertEqual(result.decision.reason, "heartflow_signal:prepare_reply")
+        self.assertTrue(result.decision.metadata["pending_heartflow_consumed"])
+        self.assertFalse(result.state.pending_signals["pending_heartflow"])
+        self.assertEqual(bridge_calls, [("chat-1", "HEARTFLOW_EVALUATE", "heartflow_signal:prepare_reply")])
+
     def test_direct_heartbeat_maintenance_uses_fallback_budget_state_in_metadata(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):
