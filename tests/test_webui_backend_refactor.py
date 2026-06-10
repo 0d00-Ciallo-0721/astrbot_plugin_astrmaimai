@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import aiosqlite
+from fastapi.testclient import TestClient
 
 
 class _RuntimeBackedFacade:
@@ -1900,6 +1901,124 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
         self.assertEqual(reflector.calls, [("reflect_batch", "chat-1"), ("auto_audit", "chat-1")])
         self.assertEqual(auto_check.calls, ["chat-1"])
+
+    def test_backend_http_smoke_routes_stay_supported(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        access_mod = importlib.import_module("astrmai.webui.backend.access")
+        server_mod = importlib.import_module("astrmai.webui.backend.server")
+
+        previous_facade = adapter_mod.get_active_facade()
+        previous_overrides = dict(server_mod.app.dependency_overrides)
+
+        class _Reflector:
+            def __init__(self):
+                self.calls = []
+
+            async def reflect_batch(self, chat_id):
+                self.calls.append(("reflect_batch", chat_id))
+
+            async def auto_audit(self, chat_id):
+                self.calls.append(("auto_audit", chat_id))
+
+        class _AutoCheckTask:
+            def __init__(self):
+                self.calls = []
+
+            async def run_once(self, chat_id):
+                self.calls.append(chat_id)
+
+        class _Planner:
+            cognitive_decision_history = []
+            tool_trace_history = []
+            turn_trace_history = []
+            raw_trace_store = None
+            expression_selector = None
+
+        reflector = _Reflector()
+        auto_check = _AutoCheckTask()
+
+        class _Facade:
+            def get_reflector(self):
+                return reflector
+
+            def get_auto_check_task(self):
+                return auto_check
+
+            def get_planner(self):
+                return _Planner()
+
+            def get_observability_hub(self):
+                return None
+
+            def get_chat_loop_kernel(self):
+                return None
+
+            def get_proactive_task(self):
+                return None
+
+        try:
+            adapter_mod.set_active_facade(_Facade())
+            server_mod.app.dependency_overrides[access_mod.get_current_user] = lambda: "codex"
+
+            with TestClient(server_mod.app) as client:
+                response = client.get("/api/tools/recent-calls", params={"limit": 5})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.get("/api/tools/chats/chat-1/recent-calls", params={"limit": 5})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.get(
+                    "/api/cognition/chats/chat-1/unified-timeline",
+                    params={"limit": 5, "include": "decision,tool"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.get("/api/cognition/observability/overview")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.get("/api/cognition/scheduler/status")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.post("/api/learning/reflect/run-once", json={"chat_id": "chat-1"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.post(
+                    "/api/learning/reflect/run-once",
+                    params={"chat_id": "chat-query"},
+                    json={"chat_id": "chat-body"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.post("/api/learning/reflect/run-once", params={"chat_id": "chat-query"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "ok")
+
+                response = client.post("/api/learning/reflect/run-once", json={})
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(response.json()["detail"], "chat_id is required")
+        finally:
+            server_mod.app.dependency_overrides = previous_overrides
+            adapter_mod.set_active_facade(previous_facade)
+
+        self.assertEqual(
+            reflector.calls,
+            [
+                ("reflect_batch", "chat-1"),
+                ("auto_audit", "chat-1"),
+                ("reflect_batch", "chat-body"),
+                ("auto_audit", "chat-body"),
+                ("reflect_batch", "chat-query"),
+                ("auto_audit", "chat-query"),
+            ],
+        )
+        self.assertEqual(auto_check.calls, ["chat-1", "chat-body", "chat-query"])
 
 
     def test_heartflow_chats_uses_get_all_states_when_available(self):

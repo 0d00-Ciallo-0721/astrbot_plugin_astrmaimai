@@ -227,6 +227,8 @@ class W10WebuiPlanMigratedTests(unittest.TestCase):
         repo_root = Path(__file__).resolve().parents[3]
         routes_py = (repo_root / "astrmai" / "webui" / "backend" / "routes.py").read_text(encoding="utf-8")
         self.assertNotIn("auth_router", routes_py)
+        self.assertIn("from .routes import api_router, build_api_router", routes_py)
+        self.assertNotIn("router.include_router(", routes_py)
 
 
 if __name__ == "__main__":

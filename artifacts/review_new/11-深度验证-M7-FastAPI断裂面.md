@@ -61,11 +61,20 @@
 #### learning_routes
 - `run_reflect_once(chat_id)` 已补齐真实委托，不再直连缺失方法
 
+### B6. learning_routes 的 HTTP 请求契约已补强
+- `POST /api/learning/reflect/run-once`
+
+本轮已确认并收口为：
+- 同时兼容 JSON body `{"chat_id": "..."}` 与旧的 query `?chat_id=...`
+- body 优先于 query
+- 当两者都缺失时，返回显式 `422 chat_id is required`
+
 ## 当前影响面结论
 
 ### 确认受影响
 - 本报告曾覆盖的 standalone FastAPI backend 路由链显性断裂面
 - 经 backend route 相关测试与最小路由调用复核，当前未再进入此前那组 `TypeError` / `AttributeError` 错误面
+- 已补做真实 FastAPI 请求级 smoke，`/api/tools/recent-calls`、`/api/tools/chats/{chat_id}/recent-calls`、`/api/cognition/chats/{chat_id}/unified-timeline`、`/api/cognition/observability/overview`、`/api/cognition/scheduler/status`、`/api/learning/reflect/run-once` 均可返回 `status=ok`
 
 ### 不应直接判死
 - `main.py` 注册的 AstrBot Plugin Page 主入口
@@ -76,5 +85,6 @@
 - 但这些 blocking 当前已完成修复，不应继续记为“当前真实问题”
 - 同时必须强调：
   - 这份报告验证的是 standalone FastAPI backend
+  - 运行时聚合入口应以 `astrmai.webui.backend.routes` 包入口（`routes/__init__.py`）为准；同级 `backend/routes.py` 当前不是运行时主入口
   - 不应直接把 Plugin Page 主入口一并判为不可用
   - “这组 route/service 断裂已修复”也不自动等于“整个 standalone backend 已完成全量发布级验证”

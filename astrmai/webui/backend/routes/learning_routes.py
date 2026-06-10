@@ -1,10 +1,17 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Annotated
+
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel
 
 from ..adapters.plugin_api import PluginApiAdapter
 from ..access import get_current_user
 from ..services.learningservice import LearningService
 
 router = APIRouter()
+
+
+class ReflectRunOncePayload(BaseModel):
+    chat_id: str | None = None
 
 
 def _service() -> LearningService:
@@ -27,8 +34,15 @@ async def get_learning_cooldowns(user: str = Depends(get_current_user)):
 
 
 @router.post("/reflect/run-once")
-async def run_reflect_once(chat_id: str, user: str = Depends(get_current_user)):
-    result = await _service().run_reflect_once(chat_id)
+async def run_reflect_once(
+    chat_id: str | None = None,
+    payload: Annotated[ReflectRunOncePayload | None, Body()] = None,
+    user: str = Depends(get_current_user),
+):
+    effective_chat_id = (payload.chat_id if payload else None) or chat_id
+    if not effective_chat_id:
+        raise HTTPException(status_code=422, detail="chat_id is required")
+    result = await _service().run_reflect_once(str(effective_chat_id))
     if result.get("status") == "error":
         raise HTTPException(status_code=409, detail=result.get("message", "Reflector unavailable"))
     return result
