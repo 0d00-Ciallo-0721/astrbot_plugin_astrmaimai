@@ -10,8 +10,10 @@ from astrmai.learning.mining.social_relation_miner import SocialRelationMiner
 
 class _FakeExpressionMiner:
     def __init__(self):
+        from config import AstrMaiConfig
+
         self.gateway = None
-        self.config = SimpleNamespace(evolution=SimpleNamespace(jargon_min_count=1))
+        self.config = AstrMaiConfig(evolution={"jargon_min_count": 1})
 
 
 class _FakeExtractor:
@@ -108,6 +110,12 @@ class MiningHelpersMigratedTests(unittest.TestCase):
         result = asyncio.run(_run())
         self.assertEqual(result, ["ok"])
         self.assertEqual([msg.content for msg in extractor.calls[0][1]], ["hello", "world"])
+
+    def test_jargon_miner_reads_jargon_min_count_from_real_config(self):
+        miner = _FakeExpressionMiner()
+        jargon_miner = JargonMiner(miner, min_messages=1)
+
+        self.assertEqual(jargon_miner.candidate_extractor.min_count, 1)
 
     def test_social_relation_miner_normalizes_score_and_ignores_empty_input(self):
         state_engine = _FakeStateEngine()

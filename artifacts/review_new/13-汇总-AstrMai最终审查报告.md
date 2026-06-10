@@ -42,15 +42,16 @@
 - 但**不能直接等同于**当前 `main.py` 注册的 AstrBot Plugin Page 主入口一定不可用
 
 #### 2. 配置链断裂
-以下问题当前仍然成立：
+以下问题仍需关注，但本轮已收敛掉一部分已知缺口：
 
-- `_conf_schema.json` 仍存在 `conversation` 配置段
-- `config.py` 中 `AstrMaiConfig` 当前没有对应的 `conversation` 字段
-- `_conf_schema.json` 中 `deep_temporal_*` 与 `maintenance_*` 字段当前仍挂在 `global_settings`
-- `config.py` 中这些字段定义在 `MemoryConfig`
+- `conversation` 配置段与 `AstrMaiConfig.conversation` 的承接已修复
+- `deep_temporal_*` / `maintenance_*` 已从 `global_settings` 归位到 `memory`
+- `performance.summary_threshold` 已补齐 schema 暴露并接入运行时读取
+- `evolution.jargon_min_count` 已补齐 schema 暴露并与下游读取对齐
+- 当前仍建议继续排查其余 schema 覆盖缺口，避免出现新的“模型里有、schema 未暴露”项
 
 影响判断：
-- 用户通过配置界面或配置文件写入的部分参数，存在静默失效风险
+- 历史上这类问题确实会导致参数静默失效；本轮已关闭其中 4 个已知缺口，但配置层仍值得继续专项复查
 
 #### 3. 并发与运行时防护不足
 以下问题当前仍然成立或基本成立：
@@ -104,7 +105,8 @@
 - 但 standalone FastAPI backend 路由层当前存在明显断裂，不应视为可用
 
 ### 配置系统
-- 配置系统当前存在真实断裂，尤其是 `conversation` 段缺失与 `deep_temporal_*` / `maintenance_*` 错位
+- 配置系统的主干断裂已收敛一部分：`conversation`、`deep_temporal_*` / `maintenance_*`、`performance.summary_threshold`、`evolution.jargon_min_count` 已完成对齐
+- 但 `config.py` 与 `_conf_schema.json` 仍建议继续做覆盖性复查，避免残留其他未暴露字段
 
 ## 建议的真实优先级
 

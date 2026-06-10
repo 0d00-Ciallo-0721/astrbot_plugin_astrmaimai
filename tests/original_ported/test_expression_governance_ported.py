@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
+from config import AstrMaiConfig
 from astrmai.learning.review.expression_auto_check_task import ExpressionAutoCheckTask
 from astrmai.learning.review.expression_governance_runner import ExpressionGovernanceRunner
 from astrmai.learning.review.jargon_auto_check_task import JargonAutoCheckTask
@@ -199,7 +200,14 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
         task = JargonAutoCheckTask(
             db_service=db,
             gateway=FakeGateway({"decision": "approved", "reason": "group-specific and stable", "meaning": "raid boss nickname"}),
-            config=SimpleNamespace(evolution=SimpleNamespace(review_batch_size=10, review_runner_min_interval_sec=0, jargon_min_count=2, review_min_count=2)),
+            config=AstrMaiConfig(
+                evolution={
+                    "review_batch_size": 10,
+                    "review_runner_min_interval_sec": 0,
+                    "jargon_min_count": 2,
+                    "review_min_count": 2,
+                }
+            ),
         )
 
         processed = await task.run_once("group-1")
@@ -209,6 +217,41 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.updated[0][1]["status"], "active")
         self.assertEqual(store.updated[0][1]["metadata"]["review_status"], "approved")
         self.assertEqual(projector.projected, ["mem-jargon-1"])
+
+    async def test_jargon_auto_check_uses_configured_jargon_threshold_over_review_min_count(self):
+        store = FakeStore(
+            [
+                SimpleNamespace(
+                    id="mem-jargon-2",
+                    kind="jargon",
+                    session_id="group-1",
+                    content="bigbird",
+                    summary="raid boss nickname",
+                    confidence=0.7,
+                    status="review_pending",
+                    visibility="maintenance_only",
+                    metadata={"meaning": "raid boss nickname", "count": 2, "review_status": "review_pending", "examples": ["bigbird is here"]},
+                )
+            ]
+        )
+        db = SimpleNamespace(memory_engine=SimpleNamespace(v2_store=store, index_projector=FakeProjector()))
+        task = JargonAutoCheckTask(
+            db_service=db,
+            gateway=FakeGateway({"decision": "approved"}),
+            config=AstrMaiConfig(
+                evolution={
+                    "review_batch_size": 10,
+                    "review_runner_min_interval_sec": 0,
+                    "review_min_count": 1,
+                    "jargon_min_count": 3,
+                }
+            ),
+        )
+
+        processed = await task.run_once("group-1")
+
+        self.assertEqual(processed, 0)
+        self.assertEqual(store.updated, [])
 
     async def test_governance_runner_processes_jargon_backlog_without_active_chat(self):
         calls = []

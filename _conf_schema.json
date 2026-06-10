@@ -90,6 +90,18 @@
       }
     }
   },
+  "performance": {
+    "type": "object",
+    "description": "人设摘要压缩阈值与性能权衡",
+    "items": {
+      "summary_threshold": {
+        "description": "触发人设摘要压缩的最小长度",
+        "type": "int",
+        "default": 300,
+        "hint": "原始人设文本短于这个长度时，直接使用原文；更长时再进入摘要压缩流程。"
+      }
+    }
+  },
   "system1": {
     "type": "object",
     "description": "快速触发与直觉层",
@@ -532,6 +544,12 @@
         "type": "int",
         "default": 2,
         "hint": "只有重复出现到一定次数的表达，才会进入审核流程。"
+      },
+      "jargon_min_count": {
+        "description": "黑话进入审核的最小证据次数",
+        "type": "int",
+        "default": 2,
+        "hint": "只有同一黑话在群内累计出现到这个次数后，才会进入自动审核。"
       }
     }
   },

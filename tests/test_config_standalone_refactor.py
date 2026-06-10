@@ -10,6 +10,8 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         config = AstrMaiConfig()
         self.assertEqual(config.agent.max_steps, 5)
         self.assertTrue(hasattr(config.provider, "embedding_models"))
+        self.assertTrue(hasattr(config, "performance"))
+        self.assertEqual(config.performance.summary_threshold, 300)
         self.assertTrue(hasattr(config.global_settings, "enable_private_chat"))
         self.assertTrue(hasattr(config.sys3, "enable_work_mode"))
         self.assertTrue(hasattr(config.vision, "use_native_main_reply_vision"))
@@ -17,6 +19,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertTrue(hasattr(config, "conversation"))
         self.assertEqual(config.conversation.compaction_trigger_segments, 40)
         self.assertEqual(config.conversation.compaction_keep_recent_segments, 16)
+        self.assertEqual(config.evolution.jargon_min_count, 2)
 
     def test_astrmai_config_accepts_conversation_and_memory_namespace_fields(self):
         config = AstrMaiConfig(
@@ -67,11 +70,26 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.memory.deep_temporal_alpha, 0.9)
         self.assertEqual(config.memory.maintenance_hot_beta, 0.1)
 
-    def test_schema_json_is_parseable_and_contains_native_vision_fields(self):
+    def test_astrmai_config_accepts_performance_and_evolution_fields(self):
+        config = AstrMaiConfig(
+            performance={"summary_threshold": 512},
+            evolution={"jargon_min_count": 5},
+        )
+
+        self.assertEqual(config.performance.summary_threshold, 512)
+        self.assertEqual(config.evolution.jargon_min_count, 5)
+
+    def test_schema_json_is_parseable_and_contains_runtime_config_fields(self):
         schema = json.loads(Path("_conf_schema.json").read_text(encoding="utf-8"))
+        performance_items = schema["performance"]["items"]
         vision_items = schema["vision"]["items"]
+        evolution_items = schema["evolution"]["items"]
+        self.assertIn("summary_threshold", performance_items)
         self.assertIn("use_native_main_reply_vision", vision_items)
         self.assertIn("native_main_reply_failure_cooldown_sec", vision_items)
+        self.assertIn("jargon_min_count", evolution_items)
+        self.assertEqual(performance_items["summary_threshold"]["default"], 300)
+        self.assertEqual(evolution_items["jargon_min_count"]["default"], 2)
         self.assertEqual(schema["conversation"]["items"]["compaction_trigger_segments"]["default"], 40)
         self.assertEqual(schema["conversation"]["items"]["compaction_keep_recent_segments"]["default"], 16)
 

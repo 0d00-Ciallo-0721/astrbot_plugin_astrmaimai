@@ -25,10 +25,14 @@ class _FakePersistence:
 
 
 class _FakeGateway:
-    def __init__(self, responses):
+    def __init__(self, responses, config=None):
         self.responses = list(responses)
         self.calls = []
-        self.config = SimpleNamespace(performance=SimpleNamespace(summary_threshold=10))
+        if config is None:
+            from config import AstrMaiConfig
+
+            config = AstrMaiConfig(performance={"summary_threshold": 10})
+        self.config = config
 
     async def call_persona_task(self, prompt, **kwargs):
         self.calls.append({"prompt": prompt, "kwargs": kwargs})
@@ -152,6 +156,24 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
         self.assertEqual(payload["first_person_rewrite"], "summary fallback")
         self.assertEqual(payload["summary"], "summary fallback")
+
+    def test_persona_summary_reads_threshold_from_real_performance_config(self):
+        from config import AstrMaiConfig
+
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([], config=AstrMaiConfig(performance={"summary_threshold": 100}))
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+
+        payload = asyncio.run(
+            summarizer.get_summary(
+                original_prompt="short prompt",
+                persona_id="persona-threshold",
+            )
+        )
+
+        self.assertEqual(payload["summary"], "short prompt")
+        self.assertEqual(payload["first_person_rewrite"], "short prompt")
+        self.assertEqual(gateway.calls, [])
 
     def test_persona_core_identity_template_and_fallback_use_same_expert_role_shell(self):
         persistence = _FakePersistence()
