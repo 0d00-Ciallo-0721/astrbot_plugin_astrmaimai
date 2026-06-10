@@ -38,51 +38,6 @@
         "type": "bool",
         "default": true,
         "hint": "开启后，内部错误不会直接暴露给普通用户，同时会把错误信息发送给管理员。"
-      },
-      "deep_temporal_alpha": {
-        "description": "deep retrieval 鏃堕棿浠叉潈淇濆簳绯绘暟",
-        "type": "float",
-        "default": 0.7
-      },
-      "deep_temporal_tau_seconds": {
-        "description": "deep retrieval 鏃堕棿琛板噺褰掍竴鍖栫獥鍙ｏ紙绉掞級",
-        "type": "float",
-        "default": 86400.0
-      },
-      "deep_temporal_lambda_default": {
-        "description": "鏅€氳蹇嗙殑 deep retrieval 鏃堕棿琛板噺寮哄害",
-        "type": "float",
-        "default": 1.0
-      },
-      "deep_temporal_lambda_fact": {
-        "description": "fact 绫昏蹇嗙殑 deep retrieval 缂撹“琛板噺寮哄害",
-        "type": "float",
-        "default": 0.1
-      },
-      "deep_temporal_candidate_pool_factor": {
-        "description": "deep retrieval 鍊欓€夋睜鏀惧ぇ鍊嶆暟",
-        "type": "int",
-        "default": 4
-      },
-      "deep_temporal_candidate_pool_min": {
-        "description": "deep retrieval 鍊欓€夋睜鏈€灏忔潯鏁?",
-        "type": "int",
-        "default": 20
-      },
-      "deep_temporal_llm_window": {
-        "description": "deep retrieval 缁忔湰鍦版椂闂翠话瑁佸悗鍏佽 LLM 寰皟鐨勬渶澶ф潯鏁?",
-        "type": "int",
-        "default": 8
-      },
-      "maintenance_hot_beta": {
-        "description": "maintenance 鐑害鍒嗙殑鏃堕棿涓庤闂粺璁℃潈閲?",
-        "type": "float",
-        "default": 0.7
-      },
-      "maintenance_temporal_stale_hot_threshold": {
-        "description": "maintenance 鍩轰簬鐑害鎵规爣 stale 鐨勯槇鍊?",
-        "type": "float",
-        "default": 0.35
       }
     }
   },
@@ -214,7 +169,7 @@
       "compaction_trigger_segments": {
         "description": "触发压缩的片段数阈值",
         "type": "int",
-        "default": 30,
+        "default": 40,
         "hint": "当同一会话累计片段达到这个数量时，会尝试生成冷区摘要。"
       },
       "compaction_trigger_tokens": {
@@ -226,7 +181,7 @@
       "compaction_keep_recent_segments": {
         "description": "压缩后保留的最近片段数",
         "type": "int",
-        "default": 12,
+        "default": 16,
         "hint": "压缩时会保留最近这几条消息，其余内容进入冷区摘要。"
       },
       "compaction_summary_max_tokens": {
@@ -466,6 +421,51 @@
         "type": "int",
         "default": 5,
         "hint": "每次最多取回多少条相关记忆参与回答。"
+      },
+      "deep_temporal_alpha": {
+        "description": "deep retrieval 鏃堕棿浠叉潈淇濆簳绯绘暟",
+        "type": "float",
+        "default": 0.7
+      },
+      "deep_temporal_tau_seconds": {
+        "description": "deep retrieval 鏃堕棿琛板噺褰掍竴鍖栫獥鍙ｏ紙绉掞級",
+        "type": "float",
+        "default": 86400.0
+      },
+      "deep_temporal_lambda_default": {
+        "description": "鏅€氳蹇嗙殑 deep retrieval 鏃堕棿琛板噺寮哄害",
+        "type": "float",
+        "default": 1.0
+      },
+      "deep_temporal_lambda_fact": {
+        "description": "fact 绫昏蹇嗙殑 deep retrieval 缂撹“琛板噺寮哄害",
+        "type": "float",
+        "default": 0.1
+      },
+      "deep_temporal_candidate_pool_factor": {
+        "description": "deep retrieval 鍊欓€夋睜鏀惧ぇ鍊嶆暟",
+        "type": "int",
+        "default": 4
+      },
+      "deep_temporal_candidate_pool_min": {
+        "description": "deep retrieval 鍊欓€夋睜鏈€灏忔潯鏁?",
+        "type": "int",
+        "default": 20
+      },
+      "deep_temporal_llm_window": {
+        "description": "deep retrieval 缁忔湰鍦版椂闂翠话瑁佸悗鍏佽 LLM 寰皟鐨勬渶澶ф潯鏁?",
+        "type": "int",
+        "default": 8
+      },
+      "maintenance_hot_beta": {
+        "description": "maintenance 鐑害鍒嗙殑鏃堕棿涓庤闂粺璁℃潈閲?",
+        "type": "float",
+        "default": 0.7
+      },
+      "maintenance_temporal_stale_hot_threshold": {
+        "description": "maintenance 鍩轰簬鐑害鎵规爣 stale 鐨勯槇鍊?",
+        "type": "float",
+        "default": 0.35
       }
     }
   },

@@ -2,6 +2,19 @@ from pydantic import BaseModel, Field
 from typing import Dict, List
 
 
+LEGACY_MEMORY_NAMESPACE_FIELDS = (
+    "deep_temporal_alpha",
+    "deep_temporal_tau_seconds",
+    "deep_temporal_lambda_default",
+    "deep_temporal_lambda_fact",
+    "deep_temporal_candidate_pool_factor",
+    "deep_temporal_candidate_pool_min",
+    "deep_temporal_llm_window",
+    "maintenance_hot_beta",
+    "maintenance_temporal_stale_hot_threshold",
+)
+
+
 class ProviderConfig(BaseModel):
     fallback_models: List[str] = Field(default=[])
     agent_models: List[str] = Field(default=[])
@@ -128,6 +141,20 @@ class ReplyConfig(BaseModel):
     typing_speed_factor: float = Field(default=0.1, description="模拟打字等待的强度系数，越大看起来越像在慢慢打字")
 
 
+class ConversationConfig(BaseModel):
+    enable_dialogue_store: bool = Field(default=True)
+    enable_context_compaction: bool = Field(default=True)
+    enable_prefix_caching: bool = Field(default=True)
+    hot_zone_ttl_seconds: float = Field(default=30.0)
+    warm_zone_ttl_seconds: float = Field(default=300.0)
+    warm_zone_max_tokens: int = Field(default=1200)
+    compaction_provider_id: str = Field(default="")
+    compaction_trigger_segments: int = Field(default=40)
+    compaction_trigger_tokens: int = Field(default=1800)
+    compaction_keep_recent_segments: int = Field(default=16)
+    compaction_summary_max_tokens: int = Field(default=450)
+
+
 class MemoryConfig(BaseModel):
     time_decay_rate: float = Field(default=0.01)
     cleanup_interval: int = Field(default=3600)
@@ -179,6 +206,33 @@ class PrivateChatConfig(BaseModel):
 
 
 class AstrMaiConfig(BaseModel):
+    @staticmethod
+    def _normalize_legacy_memory_namespace(data: dict) -> dict:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        global_settings = normalized.get("global_settings")
+        memory = normalized.get("memory")
+        if not isinstance(global_settings, dict):
+            global_settings = {}
+        if memory is None:
+            memory = {}
+        elif not isinstance(memory, dict):
+            return normalized
+        memory_values = dict(memory)
+        updated = False
+        for field_name in LEGACY_MEMORY_NAMESPACE_FIELDS:
+            if field_name in memory_values or field_name not in global_settings:
+                continue
+            memory_values[field_name] = global_settings[field_name]
+            updated = True
+        if updated or ("memory" in normalized and isinstance(memory, dict)):
+            normalized["memory"] = memory_values
+        return normalized
+
+    def __init__(self, **data):
+        super().__init__(**self._normalize_legacy_memory_namespace(data))
+
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     global_settings: GlobalSettingsConfig = Field(default_factory=GlobalSettingsConfig)
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
@@ -191,6 +245,7 @@ class AstrMaiConfig(BaseModel):
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     life: LifeConfig = Field(default_factory=LifeConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
+    conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     infra: InfraConfig = Field(default_factory=InfraConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)

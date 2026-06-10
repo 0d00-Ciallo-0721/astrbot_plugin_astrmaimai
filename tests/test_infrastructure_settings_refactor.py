@@ -162,13 +162,30 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
 
         self.assertEqual(parsed.life.proactive_quiet_hours, ["00:00-01:00"])
         self.assertTrue(parsed.global_settings.debug_mode)
+        self.assertEqual(parsed.conversation.compaction_trigger_segments, 40)
+
+    def test_astrmai_config_normalizes_legacy_memory_namespace(self):
+        config_mod = importlib.import_module("config")
+
+        parsed = config_mod.AstrMaiConfig(
+            global_settings={"maintenance_hot_beta": 0.3},
+        )
+
+        self.assertEqual(parsed.memory.maintenance_hot_beta, 0.3)
 
     def test_project_schema_exposes_runtime_config_fields(self):
         schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        memory_items = schema["memory"]["items"]
+        global_items = schema["global_settings"]["items"]
 
-        self.assertNotIn("webui_password", schema["global_settings"]["items"])
+        self.assertNotIn("webui_password", global_items)
         self.assertIn("proactive_quiet_hours", schema["life"]["items"])
+        self.assertIn("conversation", schema)
+        self.assertIn("deep_temporal_alpha", memory_items)
+        self.assertIn("maintenance_temporal_stale_hot_threshold", memory_items)
+        self.assertNotIn("deep_temporal_alpha", global_items)
+        self.assertNotIn("maintenance_temporal_stale_hot_threshold", global_items)
 
 
 class PersistenceBoundaryRefactorTests(unittest.TestCase):
