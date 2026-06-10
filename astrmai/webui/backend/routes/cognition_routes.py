@@ -2,14 +2,13 @@ from fastapi import APIRouter, Depends
 
 from ..adapters.plugin_api import PluginApiAdapter
 from ..access import get_current_user
-from ..db import get_db
 from ..services.cognitionservice import CognitionService
 
 router = APIRouter()
 
 
 def _service() -> CognitionService:
-    return CognitionService(PluginApiAdapter(), get_db)
+    return CognitionService(PluginApiAdapter())
 
 
 @router.get("/recent-decisions")

@@ -2,14 +2,13 @@ from fastapi import APIRouter, Depends
 
 from ..adapters.plugin_api import PluginApiAdapter
 from ..access import get_current_user
-from ..db import get_db
 from ..services.heartflowservice import HeartflowService
 
 router = APIRouter()
 
 
 def _service() -> HeartflowService:
-    return HeartflowService(PluginApiAdapter(), get_db)
+    return HeartflowService(PluginApiAdapter())
 
 
 @router.get("/status")

@@ -27,6 +27,10 @@ class ToolsService:
         policy = self._as_dict(getattr(planner, "tool_policy", None)) if planner else {}
         return {"status": "ok", "data": policy, "runtime_bound": planner is not None}
 
+    async def recent_tool_traces(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        from .admin_ui_service import AdminUiService
+        return await AdminUiService(self.plugin_api).recent_tool_traces(chat_id=chat_id, limit=limit)
+
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:
         if value is None:

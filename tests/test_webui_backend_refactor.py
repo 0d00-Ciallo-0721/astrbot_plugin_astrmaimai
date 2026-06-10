@@ -1794,6 +1794,113 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("/learning/status", paths)
         self.assertIn("/chats/active", paths)
 
+    def test_backend_route_service_factories_only_pass_plugin_api(self):
+        route_cases = [
+            ("astrmai.webui.backend.routes.cognition_routes", "astrmai.webui.backend.services.cognitionservice", "CognitionService"),
+            ("astrmai.webui.backend.routes.runtime_routes", "astrmai.webui.backend.services.observabilityservice", "ObservabilityService"),
+            ("astrmai.webui.backend.routes.heartflow_routes", "astrmai.webui.backend.services.heartflowservice", "HeartflowService"),
+            ("astrmai.webui.backend.routes.learning_routes", "astrmai.webui.backend.services.learningservice", "LearningService"),
+            ("astrmai.webui.backend.routes.tools_routes", "astrmai.webui.backend.services.toolsservice", "ToolsService"),
+        ]
+        for route_module_name, service_module_name, service_class_name in route_cases:
+            route_mod = importlib.import_module(route_module_name)
+            service_mod = importlib.import_module(service_module_name)
+            service = route_mod._service()
+            self.assertIsInstance(service, getattr(service_mod, service_class_name))
+
+    def test_backend_route_safe_endpoints_construct_without_typeerror(self):
+        route_calls = [
+            ("astrmai.webui.backend.routes.runtime_routes", "get_runtime_status", {"user": "codex"}),
+            ("astrmai.webui.backend.routes.heartflow_routes", "get_heartflow_status", {"user": "codex"}),
+            ("astrmai.webui.backend.routes.learning_routes", "get_learning_status", {"user": "codex"}),
+            ("astrmai.webui.backend.routes.tools_routes", "get_tools_status", {"user": "codex"}),
+            ("astrmai.webui.backend.routes.cognition_routes", "list_recent_decisions", {"limit": 5, "user": "codex"}),
+        ]
+        for route_module_name, handler_name, kwargs in route_calls:
+            route_mod = importlib.import_module(route_module_name)
+            result = asyncio.run(getattr(route_mod, handler_name)(**kwargs))
+            self.assertEqual(result["status"], "ok")
+
+    def test_backend_routes_align_supported_cognition_learning_and_tools_signatures(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        previous_facade = adapter_mod.get_active_facade()
+
+        class _Reflector:
+            def __init__(self):
+                self.calls = []
+
+            async def reflect_batch(self, chat_id):
+                self.calls.append(("reflect_batch", chat_id))
+
+            async def auto_audit(self, chat_id):
+                self.calls.append(("auto_audit", chat_id))
+
+        class _AutoCheckTask:
+            def __init__(self):
+                self.calls = []
+
+            async def run_once(self, chat_id):
+                self.calls.append(chat_id)
+
+        class _Planner:
+            cognitive_decision_history = []
+            tool_trace_history = []
+            turn_trace_history = []
+            raw_trace_store = None
+            expression_selector = None
+
+        reflector = _Reflector()
+        auto_check = _AutoCheckTask()
+
+        class _Facade:
+            def get_reflector(self):
+                return reflector
+
+            def get_auto_check_task(self):
+                return auto_check
+
+            def get_planner(self):
+                return _Planner()
+
+            def get_observability_hub(self):
+                return None
+
+            def get_chat_loop_kernel(self):
+                return None
+
+            def get_proactive_task(self):
+                return None
+
+        try:
+            adapter_mod.set_active_facade(_Facade())
+            route_calls = [
+                ("astrmai.webui.backend.routes.learning_routes", "run_reflect_once", {"chat_id": "chat-1", "user": "codex"}),
+                ("astrmai.webui.backend.routes.tools_routes", "list_recent_tool_calls", {"limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.tools_routes", "list_chat_recent_tool_calls", {"chat_id": "chat-1", "limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "list_chat_recent_turns", {"chat_id": "chat-1", "limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "list_chat_unified_timeline", {"chat_id": "chat-1", "limit": 5, "level": "", "include": "", "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_observability_overview", {"user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_observability_timeline", {"chat_id": "", "domains": "", "levels": "", "kinds": "", "limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_observability_chat", {"chat_id": "chat-1", "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_observability_errors", {"chat_id": "", "limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_observability_search", {"q": "", "chat_id": "", "domains": "", "kinds": "", "levels": "", "tags": "", "limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_context_economy", {"limit": 5, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "list_context_economy_templates", {"limit": 5, "template_id": None, "workload_family": None, "sort_by": "rotate", "sort_dir": None, "user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_scheduler_status", {"user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_scheduler_due_selection", {"user": "codex"}),
+                ("astrmai.webui.backend.routes.cognition_routes", "get_scheduler_chat", {"chat_id": "chat-1", "user": "codex"}),
+            ]
+            for route_module_name, handler_name, kwargs in route_calls:
+                route_mod = importlib.import_module(route_module_name)
+                result = asyncio.run(getattr(route_mod, handler_name)(**kwargs))
+                self.assertEqual(result["status"], "ok", f"{route_module_name}.{handler_name} did not return ok")
+        finally:
+            adapter_mod.set_active_facade(previous_facade)
+
+        self.assertEqual(reflector.calls, [("reflect_batch", "chat-1"), ("auto_audit", "chat-1")])
+        self.assertEqual(auto_check.calls, ["chat-1"])
+
 
     def test_heartflow_chats_uses_get_all_states_when_available(self):
         """heartflow_chats() should prefer get_all_states() over _states."""

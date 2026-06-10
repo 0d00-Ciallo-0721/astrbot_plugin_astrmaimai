@@ -2,14 +2,13 @@ from fastapi import APIRouter, Depends
 
 from ..adapters.plugin_api import PluginApiAdapter
 from ..access import get_current_user
-from ..db import get_db
 from ..services.toolsservice import ToolsService
 
 router = APIRouter()
 
 
 def _service() -> ToolsService:
-    return ToolsService(PluginApiAdapter(), get_db)
+    return ToolsService(PluginApiAdapter())
 
 
 @router.get("/status")

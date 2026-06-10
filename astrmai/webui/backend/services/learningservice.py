@@ -35,6 +35,10 @@ class LearningService:
             "runtime_bound": selector is not None,
         }
 
+    async def run_reflect_once(self, chat_id: str) -> dict[str, Any]:
+        from .chatruntimeservice import ChatRuntimeService
+        return await ChatRuntimeService(self.plugin_api).run_reflect_once(chat_id)
+
     async def _expression_pattern_stats(self) -> dict[str, Any]:
         # delegate to repository via AdminUiService for now
         # (avoids circular import with dashboard_repository)
