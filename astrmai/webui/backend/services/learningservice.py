@@ -14,10 +14,10 @@ class LearningService:
             "data": {
                 "reflector": self.plugin_api.get_reflector() is not None,
                 "dream_agent_bound": self.plugin_api.get_proactive_task() is not None,
-                "reflect_tracker": self.plugin_api.facade is not None,
-                "auto_check_task": self.plugin_api.facade is not None,
+                "reflect_tracker": self.plugin_api.get_reflect_tracker() is not None,
+                "auto_check_task": self.plugin_api.get_auto_check_task() is not None,
             },
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 
     async def expression_stats(self) -> dict[str, Any]:

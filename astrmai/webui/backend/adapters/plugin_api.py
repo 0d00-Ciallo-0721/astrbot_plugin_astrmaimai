@@ -17,6 +17,7 @@ _logger = logging.getLogger(__name__)
 from ..paths import default_config_path, default_persona_cache_path, default_schema_path
 
 ACTIVE_FACADE: Any = None
+_FACADE_UNSET = object()
 APPLY_STATUS: dict[str, Any] = {
     "applied_at": 0.0,
     "status": "idle",
@@ -60,14 +61,18 @@ def get_active_facade() -> Any:
 
 @dataclass(slots=True)
 class PluginApiAdapter:
-    facade: Optional[RuntimeFacadeProtocol] = None
+    facade: Any = field(default=_FACADE_UNSET)
     config_path: str = field(default_factory=default_config_path)
     schema_path: str = field(default_factory=default_schema_path)
     persona_cache_path: str = field(default_factory=default_persona_cache_path)
 
-    def __post_init__(self) -> None:
-        if self.facade is None:
-            self.facade = get_active_facade()
+    def _current_facade(self) -> Optional[RuntimeFacadeProtocol]:
+        if self.facade is _FACADE_UNSET:
+            return get_active_facade()
+        return self.facade
+
+    def has_bound_facade(self) -> bool:
+        return self._current_facade() is not None
 
     # 閳光偓閳光偓 internal helpers 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
@@ -172,8 +177,11 @@ class PluginApiAdapter:
         return backup_path
 
     def _call_facade(self, method_name: str, *args: Any) -> Any:
-        method = getattr(self.facade, method_name, None) if self.facade else None
-        return method(*args) if callable(method) else None
+        facade = self._current_facade()
+        method = getattr(facade, method_name, None) if facade else None
+        if not callable(method):
+            return None
+        return method(*args)
 
     # 閳光偓閳光偓 narrow facade accessors (preferred over runtime passthrough) 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
@@ -290,7 +298,8 @@ class PluginApiAdapter:
 
     def format_timeline_item(self, item: Any) -> Any:
         """鐎瑰鍙忛崠鍛邦棅 observer.format_timeline_item"""
-        formatter = getattr(self.facade, "format_timeline_item", None) if self.facade else None
+        facade = self._current_facade()
+        formatter = getattr(facade, "format_timeline_item", None) if facade else None
         if callable(formatter):
             return formatter(item)
         observer = self.get_memory_observer()
@@ -311,33 +320,39 @@ class PluginApiAdapter:
     # 閳光偓閳光偓 public API 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
     async def get_runtime_diagnostics(self) -> dict[str, Any]:
-        if self.facade:
-            return self.facade.get_runtime_diagnostics()
+        facade = self._current_facade()
+        if facade and hasattr(facade, "get_runtime_diagnostics"):
+            return facade.get_runtime_diagnostics() or {}
         return {}
 
     async def get_capability_overview(self) -> dict[str, Any]:
-        if self.facade and hasattr(self.facade, "get_capability_overview"):
-            return await self.facade.get_capability_overview()
+        facade = self._current_facade()
+        if facade and hasattr(facade, "get_capability_overview"):
+            return await facade.get_capability_overview()
         return {}
 
     async def list_pending_reviews(self, group_id: str = "", limit: int = 50):
-        if self.facade:
-            return await self.facade.list_pending_expression_reviews(group_id=group_id, limit=limit)
+        facade = self._current_facade()
+        if facade and hasattr(facade, "list_pending_expression_reviews"):
+            return await facade.list_pending_expression_reviews(group_id=group_id, limit=limit)
         return []
 
     async def list_recent_reviews(self, group_id: str = "", limit: int = 50):
-        if self.facade and hasattr(self.facade, "list_recent_expression_reviews"):
-            return await self.facade.list_recent_expression_reviews(group_id=group_id, limit=limit)
+        facade = self._current_facade()
+        if facade and hasattr(facade, "list_recent_expression_reviews"):
+            return await facade.list_recent_expression_reviews(group_id=group_id, limit=limit)
         return []
 
     async def get_review_detail(self, pattern_id: str):
-        if self.facade:
-            return await self.facade.get_expression_review_detail(pattern_id)
+        facade = self._current_facade()
+        if facade and hasattr(facade, "get_expression_review_detail"):
+            return await facade.get_expression_review_detail(pattern_id)
         return None
 
     async def submit_review(self, **kwargs):
-        if self.facade:
-            return await self.facade.submit_expression_review(**kwargs)
+        facade = self._current_facade()
+        if facade and hasattr(facade, "submit_expression_review"):
+            return await facade.submit_expression_review(**kwargs)
         return {"status": "deferred"}
 
     async def read_config(self) -> dict[str, Any]:
@@ -388,10 +403,11 @@ class PluginApiAdapter:
         dispatcher) rather than adding if-blocks to a central ``_refresh_live_config_refs``.
         The old centralized method has been removed; each service owns its config refresh.
         """
-        if not self.facade:
+        facade = self._current_facade()
+        if not facade:
             return False
-        if hasattr(self.facade, "apply_hot_config"):
-            return bool(self.facade.apply_hot_config(config_dict, parsed_config))
+        if hasattr(facade, "apply_hot_config"):
+            return bool(facade.apply_hot_config(config_dict, parsed_config))
         _logger.error(
             "_apply_hot_config: facade.apply_hot_config unavailable 閳?cannot hot-apply config without facade support."
         )
@@ -412,7 +428,7 @@ class PluginApiAdapter:
                 APPLY_STATUS = {
                     "applied_at": time.time(),
                     "status": "error",
-                    "runtime_bound": self.facade is not None,
+                    "runtime_bound": self._current_facade() is not None,
                     "reload_required": False,
                     "error": str(exc),
                 }

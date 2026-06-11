@@ -11,16 +11,16 @@ class RuntimeUiService:
         return {
             "status": "ok",
             "data": await self.plugin_api.get_runtime_diagnostics(),
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 
     async def runtime_capabilities(self) -> dict[str, Any]:
         capabilities = await self.plugin_api.get_capability_overview()
-        return {"status": "ok", "data": capabilities, "runtime_bound": self.plugin_api.facade is not None}
+        return {"status": "ok", "data": capabilities, "runtime_bound": self.plugin_api.has_bound_facade()}
 
     async def runtime_models(self) -> dict[str, Any]:
         diagnostics = await self.plugin_api.get_runtime_diagnostics()
-        return {"status": "ok", "data": diagnostics.get("models", {}), "runtime_bound": self.plugin_api.facade is not None}
+        return {"status": "ok", "data": diagnostics.get("models", {}), "runtime_bound": self.plugin_api.has_bound_facade()}
 
     async def runtime_health(self, expression_stats: dict[str, int]) -> dict[str, Any]:
         diagnostics = await self.plugin_api.get_runtime_diagnostics()
@@ -41,5 +41,5 @@ class RuntimeUiService:
                 "active_chat_count": int(active_chats),
                 "expression_patterns": dict(expression_stats or {}),
             },
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }

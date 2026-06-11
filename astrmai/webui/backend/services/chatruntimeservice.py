@@ -79,13 +79,13 @@ class ChatRuntimeService:
                 "silence_threshold": getattr(getattr(self._api.get_runtime_config(), "life", None), "silence_threshold", 0),
                 "wakeup_cooldown": getattr(getattr(self._api.get_runtime_config(), "life", None), "wakeup_cooldown", 0),
             },
-            "runtime_bound": self._api.facade is not None,
+            "runtime_bound": self._api.has_bound_facade(),
         }
 
     async def run_reflect_once(self, chat_id: str) -> dict[str, Any]:
         reflector = self._api.get_reflector()
         if not reflector:
-            return {"status": "error", "message": "Reflector is not bound", "runtime_bound": self._api.facade is not None}
+            return {"status": "error", "message": "Reflector is not bound", "runtime_bound": self._api.has_bound_facade()}
         if hasattr(reflector, "reflect_batch"):
             await reflector.reflect_batch(chat_id)
         if hasattr(reflector, "auto_audit"):
@@ -131,7 +131,7 @@ class ChatRuntimeService:
             if state:
                 state.cooldown_tags = []
                 changed = True
-        return {"status": "ok", "changed": changed, "runtime_bound": self._api.facade is not None}
+        return {"status": "ok", "changed": changed, "runtime_bound": self._api.has_bound_facade()}
 
     async def list_memory_feedback(
         self,

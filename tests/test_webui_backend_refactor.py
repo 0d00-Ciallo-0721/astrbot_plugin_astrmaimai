@@ -134,6 +134,32 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(snapshot["pending_reviews"], 1)
         self.assertIn("capabilities", snapshot)
 
+    def test_runtime_ui_service_reports_unbound_when_no_facade_resolved(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        service_mod = importlib.import_module("astrmai.webui.backend.services.runtimeuiservice")
+
+        previous_facade = adapter_mod.get_active_facade()
+        try:
+            adapter_mod.set_active_facade(None)
+            service = service_mod.RuntimeUiService(adapter_mod.PluginApiAdapter())
+            status = asyncio.run(service.runtime_status())
+            self.assertFalse(status["runtime_bound"])
+            self.assertEqual(status["data"], {})
+        finally:
+            adapter_mod.set_active_facade(previous_facade)
+
+    def test_runtime_ui_service_does_not_mask_bound_facade_failures_as_ok_data(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        service_mod = importlib.import_module("astrmai.webui.backend.services.runtimeuiservice")
+
+        class _Facade:
+            def get_runtime_diagnostics(self):
+                raise RuntimeError("boom")
+
+        service = service_mod.RuntimeUiService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            asyncio.run(service.runtime_status())
+
     def test_server_mounts_aggregated_api_router(self):
         from pathlib import Path
 
@@ -1653,6 +1679,25 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(submitted["status"], "degraded")
         self.assertEqual(legacy_count, 0)
 
+    def test_review_ui_service_does_not_mask_bound_runtime_failures_as_empty_pending_list(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.review_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Facade:
+            async def list_pending_expression_reviews(self, group_id="", limit=50):
+                raise RuntimeError("boom")
+
+            def get_expression_pattern_service(self):
+                return object()
+
+        @asynccontextmanager
+        async def _db_factory():
+            yield None
+
+        service = service_mod.ReviewUiService(adapter_mod.PluginApiAdapter(facade=_Facade()), _db_factory)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            asyncio.run(service.list_pending())
+
     def test_admin_expression_stats_reads_canonical_expression_patterns(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -1810,6 +1855,8 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             self.assertIsInstance(service, getattr(service_mod, service_class_name))
 
     def test_backend_route_safe_endpoints_construct_without_typeerror(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        previous_facade = adapter_mod.get_active_facade()
         route_calls = [
             ("astrmai.webui.backend.routes.runtime_routes", "get_runtime_status", {"user": "codex"}),
             ("astrmai.webui.backend.routes.heartflow_routes", "get_heartflow_status", {"user": "codex"}),
@@ -1817,10 +1864,14 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             ("astrmai.webui.backend.routes.tools_routes", "get_tools_status", {"user": "codex"}),
             ("astrmai.webui.backend.routes.cognition_routes", "list_recent_decisions", {"limit": 5, "user": "codex"}),
         ]
-        for route_module_name, handler_name, kwargs in route_calls:
-            route_mod = importlib.import_module(route_module_name)
-            result = asyncio.run(getattr(route_mod, handler_name)(**kwargs))
-            self.assertEqual(result["status"], "ok")
+        try:
+            adapter_mod.set_active_facade(None)
+            for route_module_name, handler_name, kwargs in route_calls:
+                route_mod = importlib.import_module(route_module_name)
+                result = asyncio.run(getattr(route_mod, handler_name)(**kwargs))
+                self.assertEqual(result["status"], "ok")
+        finally:
+            adapter_mod.set_active_facade(previous_facade)
 
     def test_backend_routes_align_supported_cognition_learning_and_tools_signatures(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")

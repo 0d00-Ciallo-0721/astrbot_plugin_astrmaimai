@@ -137,7 +137,7 @@ class ContextEconomyUiService:
                 "overview": self._context_economy_overview(snapshot),
                 "templates": self._context_economy_templates(snapshot, limit=limit),
             },
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 
     async def context_economy_templates_view(
@@ -172,5 +172,5 @@ class ContextEconomyUiService:
             "items": items,
             "total": len(total_items),
             "available_workload_families": self._context_economy_workload_families(snapshot),
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }

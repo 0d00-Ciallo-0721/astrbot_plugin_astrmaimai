@@ -345,7 +345,7 @@ class AdminUiService:
         return {
             "status": "ok",
             "data": data,
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 
     def _context_economy_snapshot(self) -> dict[str, Any]:
@@ -750,7 +750,7 @@ class AdminUiService:
             if normalized_level:
                 items = [item for item in items if str(item.get("level", "") or "").lower() == normalized_level]
             items = items[:safe_limit]
-            return {"status": "ok", "items": items, "total": len(items), "runtime_bound": self.plugin_api.facade is not None}
+            return {"status": "ok", "items": items, "total": len(items), "runtime_bound": self.plugin_api.has_bound_facade()}
         domain_filters = {"memory" if item == "memory" else "cognition" for item in kind_filters} if kind_filters else {"cognition", "memory"}
         result = await self.observability_timeline(
             chat_id=chat_id,
@@ -950,7 +950,7 @@ class AdminUiService:
                 "silence_threshold": getattr(getattr(self.plugin_api.get_runtime_config(), "life", None), "silence_threshold", 0),
                 "wakeup_cooldown": getattr(getattr(self.plugin_api.get_runtime_config(), "life", None), "wakeup_cooldown", 0),
             },
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 
     async def learning_status(self) -> dict[str, Any]:
@@ -961,7 +961,7 @@ class AdminUiService:
                 "reflect_tracker": self.plugin_api.get_reflect_tracker() is not None,
                 "auto_check_task": self.plugin_api.get_auto_check_task() is not None,
             },
-            "runtime_bound": self.plugin_api.facade is not None,
+            "runtime_bound": self.plugin_api.has_bound_facade(),
         }
 
     async def expression_stats(self) -> dict[str, Any]:
@@ -985,7 +985,7 @@ class AdminUiService:
     async def run_reflect_once(self, chat_id: str) -> dict[str, Any]:
         reflector = self.plugin_api.get_reflector()
         if not reflector:
-            return {"status": "error", "message": "Reflector is not bound", "runtime_bound": self.plugin_api.facade is not None}
+            return {"status": "error", "message": "Reflector is not bound", "runtime_bound": self.plugin_api.has_bound_facade()}
         if hasattr(reflector, "reflect_batch"):
             await reflector.reflect_batch(chat_id)
         if hasattr(reflector, "auto_audit"):
@@ -1032,7 +1032,7 @@ class AdminUiService:
             if state:
                 state.cooldown_tags = []
                 changed = True
-        return {"status": "ok", "changed": changed, "runtime_bound": self.plugin_api.facade is not None}
+        return {"status": "ok", "changed": changed, "runtime_bound": self.plugin_api.has_bound_facade()}
 
 
 __all__ = ["AdminUiService"]
