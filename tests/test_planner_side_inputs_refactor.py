@@ -915,6 +915,45 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "sys3")
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])
 
+    def test_load_planning_side_inputs_uses_async_evolution_manager_api(self):
+        mixin = self.side_inputs_mod.PlannerSideInputMixin()
+        calls = []
+
+        class _EvolutionManager:
+            async def get_active_patterns_canonical_async(self, chat_id, limit=5):
+                calls.append(("async", chat_id, limit))
+                return "async slang context"
+
+            def get_active_patterns(self, chat_id, limit=5):
+                raise AssertionError("legacy sync API should not be used")
+
+        class _GoalManager:
+            async def analyze_and_update(self, chat_id, recent_messages):
+                return "goal context"
+
+        class _ExpressionSelector:
+            async def select(self, **kwargs):
+                return "expression habits"
+
+        mixin.evolution_manager = _EvolutionManager()
+        mixin.goal_manager = _GoalManager()
+        mixin.expression_selector = _ExpressionSelector()
+
+        result = asyncio.run(
+            mixin._load_planning_side_inputs(
+                "chat-1",
+                self.side_inputs_mod.PromptEnvelope(),
+                ["hello", "this context is long enough to trigger expression selection"],
+                is_fast_mode=False,
+            )
+        )
+
+        self.assertEqual(result["slang_context"], "async slang context")
+        self.assertEqual(result["goal_text"], "goal context")
+        self.assertEqual(result["expression_habits"], "expression habits")
+        self.assertEqual(result["situational_style_cues"], "async slang context")
+        self.assertEqual(calls, [("async", "chat-1", 5)])
+
 
 if __name__ == "__main__":
     unittest.main()

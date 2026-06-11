@@ -296,20 +296,35 @@ class EvolutionManager:
             logger.error(f"[Evolution-Processor] goal analysis failed: {exc}")
         return "陪伴用户，提供有趣且连贯的对话"
 
+    def _get_expression_pattern_service(self):
+        memory_engine = getattr(self.db, "memory_engine", None)
+        return getattr(memory_engine, "expression_pattern_service", None) if memory_engine else None
+
+    async def get_active_patterns_canonical_async(self, chat_id: str, limit: int = 5) -> str:
+        service = self._get_expression_pattern_service()
+        if service and hasattr(service, "render_active_patterns"):
+            return await service.render_active_patterns(chat_id, limit=limit)
+        return ""
+
+    async def get_active_patterns_async(self, chat_id: str, limit: int = 5) -> str:
+        return await self.get_active_patterns_canonical_async(chat_id, limit=limit)
+
     def get_active_patterns(self, chat_id: str, limit: int = 5) -> str:
         return self.get_active_patterns_canonical(chat_id, limit=limit)
 
     def get_active_patterns_canonical(self, chat_id: str, limit: int = 5) -> str:
-        memory_engine = getattr(self.db, "memory_engine", None)
-        service = getattr(memory_engine, "expression_pattern_service", None) if memory_engine else None
+        service = self._get_expression_pattern_service()
         if service and hasattr(service, "render_active_patterns"):
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 loop = None
             if loop and loop.is_running():
-                raise RuntimeError("get_active_patterns should run in a worker thread when loop is active")
-            return asyncio.run(service.render_active_patterns(chat_id, limit=limit))
+                raise RuntimeError(
+                    "get_active_patterns_canonical() is sync-only; "
+                    "call await get_active_patterns_canonical_async(...) in async contexts"
+                )
+            return asyncio.run(self.get_active_patterns_canonical_async(chat_id, limit=limit))
         return ""
 
     get_active_patterns = get_active_patterns_canonical

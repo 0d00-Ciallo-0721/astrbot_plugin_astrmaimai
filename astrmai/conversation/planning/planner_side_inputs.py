@@ -193,7 +193,7 @@ class PlannerSideInputMixin:
             }
 
         async def _load_slang():
-            return await asyncio.to_thread(self.evolution_manager.get_active_patterns, chat_id)
+            return await self.evolution_manager.get_active_patterns_canonical_async(chat_id)
 
         async def _load_goals():
             window_text = self._planner_side_input_text(prompt_envelope, window_lines)
