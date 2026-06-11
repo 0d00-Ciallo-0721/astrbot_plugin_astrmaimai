@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
@@ -33,33 +34,64 @@ class GroupReplyWaitManager:
         self.message_budget = int(message_budget)
         self._states: Dict[str, GroupReplyWaitState] = {}
         self._timeout_tasks: Dict[str, asyncio.Task] = {}
-        self._states_lock = asyncio.Lock()
+        self._states_lock = threading.RLock()
+
+    def _pop_timeout_task_locked(self, chat_id: str) -> Optional[asyncio.Task]:
+        return self._timeout_tasks.pop(str(chat_id), None)
 
     def _cancel_timeout_task(self, chat_id: str) -> None:
-        task = self._timeout_tasks.pop(str(chat_id), None)
+        with self._states_lock:
+            task = self._pop_timeout_task_locked(chat_id)
         if task and not task.done():
             task.cancel()
 
-    def _arm_timeout_task(self, chat_id: str) -> None:
-        self._cancel_timeout_task(chat_id)
+    @staticmethod
+    def _build_wait_info_snapshot(state: GroupReplyWaitState, now: float) -> dict:
+        return {
+            "chat_id": state.chat_id,
+            "target_user_id": state.target_user_id,
+            "target_name": state.target_name,
+            "reason": state.reason,
+            "thread_signature": state.thread_signature,
+            "reply_mode": state.reply_mode,
+            "remaining_messages": state.remaining_messages,
+            "remaining_seconds": max(0.0, state.expires_at - now),
+        }
+
+    def _arm_timeout_task(self, chat_id: str, expected_state: GroupReplyWaitState) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
 
         async def _expire_later():
+            expired = False
             try:
                 await asyncio.sleep(self.timeout_sec)
-                async with self._states_lock:
-                    state = self._states.pop(chat_id, None)
-                if state:
+                with self._states_lock:
+                    state = self._states.get(chat_id)
+                    if state is expected_state:
+                        self._states.pop(chat_id, None)
+                        task = asyncio.current_task()
+                        if self._timeout_tasks.get(chat_id) is task:
+                            self._timeout_tasks.pop(chat_id, None)
+                        expired = True
+                if expired:
                     logger.info(f"[GroupWait] wait expired by timeout for chat={chat_id}")
             except asyncio.CancelledError:
                 return
             finally:
-                self._timeout_tasks.pop(chat_id, None)
+                with self._states_lock:
+                    task = asyncio.current_task()
+                    if self._timeout_tasks.get(chat_id) is task:
+                        self._timeout_tasks.pop(chat_id, None)
 
-        self._timeout_tasks[chat_id] = loop.create_task(_expire_later())
+        task = loop.create_task(_expire_later())
+        with self._states_lock:
+            if self._states.get(chat_id) is expected_state:
+                self._timeout_tasks[chat_id] = task
+            else:
+                task.cancel()
 
     @staticmethod
     def _looks_like_thread_resume(event: AstrMessageEvent) -> bool:
@@ -95,7 +127,7 @@ class GroupReplyWaitManager:
         if not target_user_id:
             return False
 
-        self._states[chat_id] = GroupReplyWaitState(
+        state = GroupReplyWaitState(
             chat_id=chat_id,
             target_user_id=target_user_id,
             target_name=target_name,
@@ -107,10 +139,15 @@ class GroupReplyWaitManager:
             expires_at=time.time() + self.timeout_sec,
             remaining_messages=self.message_budget,
         )
+        with self._states_lock:
+            old_task = self._pop_timeout_task_locked(chat_id)
+            self._states[chat_id] = state
+        if old_task and not old_task.done():
+            old_task.cancel()
         logger.info(
             f"[GroupWait] armed wait for chat={chat_id}, target={target_user_id}, reason={reason}, budget={self.message_budget}, timeout={self.timeout_sec}s"
         )
-        self._arm_timeout_task(chat_id)
+        self._arm_timeout_task(chat_id, state)
         return True
 
     def handle_incoming_message(self, event: AstrMessageEvent) -> str:
@@ -118,58 +155,94 @@ class GroupReplyWaitManager:
             return "NONE"
 
         chat_id = str(event.unified_msg_origin)
-        state = self._states.get(chat_id)
-        if not state:
-            return "NONE"
-
+        timeout_task = None
+        action = "NONE"
+        resume_payload = None
+        log_target = ""
         now = time.time()
-        if now >= state.expires_at:
-            self._states.pop(chat_id, None)
-            self._cancel_timeout_task(chat_id)
-            logger.info(f"[GroupWait] wait expired by timeout for chat={chat_id}")
-            return "EXPIRED"
-
         sender_id = str(event.get_sender_id() or "")
-        if sender_id and sender_id == state.target_user_id:
-            if state.thread_signature and not self._looks_like_thread_resume(event):
+        with self._states_lock:
+            state = self._states.get(chat_id)
+            if not state:
+                return "NONE"
+
+            if now >= state.expires_at:
+                self._states.pop(chat_id, None)
+                timeout_task = self._pop_timeout_task_locked(chat_id)
+                action = "EXPIRED_TIMEOUT"
+            elif sender_id and sender_id == state.target_user_id:
+                if state.thread_signature and not self._looks_like_thread_resume(event):
+                    state.remaining_messages -= 1
+                    if state.remaining_messages <= 0:
+                        self._states.pop(chat_id, None)
+                        timeout_task = self._pop_timeout_task_locked(chat_id)
+                        action = "EXPIRED_BUDGET"
+                    else:
+                        action = "OBSERVED_TARGET"
+                        log_target = state.target_name or state.target_user_id
+                else:
+                    self._states.pop(chat_id, None)
+                    timeout_task = self._pop_timeout_task_locked(chat_id)
+                    target_label = state.target_name or state.target_user_id
+                    resume_payload = {
+                        "target_label": target_label,
+                        "target_user_id": state.target_user_id,
+                        "target_name": state.target_name,
+                        "thread_signature": state.thread_signature,
+                        "reply_mode": state.reply_mode,
+                    }
+                    action = "RESUME"
+            else:
                 state.remaining_messages -= 1
                 if state.remaining_messages <= 0:
                     self._states.pop(chat_id, None)
-                    self._cancel_timeout_task(chat_id)
-                    logger.info(f"[GroupWait] wait expired after message budget for chat={chat_id}")
-                    return "EXPIRED"
-                logger.info(
-                    f"[GroupWait] observed target activity but kept waiting for same thread in chat={chat_id}, "
-                    f"target={state.target_name or state.target_user_id}"
-                )
-                return "OBSERVED"
-            self._states.pop(chat_id, None)
-            self._cancel_timeout_task(chat_id)
-            target_label = state.target_name or state.target_user_id
-            event.set_extra("astrmai_force_engage", True)
-            event.set_extra("astrmai_group_wait_resume", True)
-            event.set_extra("astrmai_group_wait_target_id", state.target_user_id)
-            event.set_extra("astrmai_group_wait_target_name", state.target_name)
-            if state.thread_signature:
-                event.set_extra("astrmai_thread_signature", state.thread_signature)
-            if state.reply_mode:
-                event.set_extra("astrmai_reply_mode", state.reply_mode)
-            event.set_extra("astrmai_wait_resume_thought", f"{target_label}接上了你刚才的话题，立刻自然地继续回应。")
-            logger.info(f"[GroupWait] target matched and resumed main flow for chat={chat_id}, target={target_label}")
-            return "RESUME"
+                    timeout_task = self._pop_timeout_task_locked(chat_id)
+                    action = "EXPIRED_BUDGET"
+                else:
+                    action = "OBSERVED"
 
-        state.remaining_messages -= 1
-        if state.remaining_messages <= 0:
-            self._states.pop(chat_id, None)
-            self._cancel_timeout_task(chat_id)
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
+
+        if action == "EXPIRED_TIMEOUT":
+            logger.info(f"[GroupWait] wait expired by timeout for chat={chat_id}")
+            return "EXPIRED"
+        if action == "EXPIRED_BUDGET":
             logger.info(f"[GroupWait] wait expired after message budget for chat={chat_id}")
             return "EXPIRED"
+        if action == "OBSERVED_TARGET":
+            logger.info(
+                f"[GroupWait] observed target activity but kept waiting for same thread in chat={chat_id}, "
+                f"target={log_target}"
+            )
+            return "OBSERVED"
+        if action == "RESUME" and resume_payload is not None:
+            event.set_extra("astrmai_force_engage", True)
+            event.set_extra("astrmai_group_wait_resume", True)
+            event.set_extra("astrmai_group_wait_target_id", resume_payload["target_user_id"])
+            event.set_extra("astrmai_group_wait_target_name", resume_payload["target_name"])
+            if resume_payload["thread_signature"]:
+                event.set_extra("astrmai_thread_signature", resume_payload["thread_signature"])
+            if resume_payload["reply_mode"]:
+                event.set_extra("astrmai_reply_mode", resume_payload["reply_mode"])
+            event.set_extra(
+                "astrmai_wait_resume_thought",
+                f"{resume_payload['target_label']}接上了你刚才的话题，立刻自然地继续回应。",
+            )
+            logger.info(
+                f"[GroupWait] target matched and resumed main flow for chat={chat_id}, "
+                f"target={resume_payload['target_label']}"
+            )
+            return "RESUME"
 
-        return "OBSERVED"
+        return action
 
     def cancel_wait(self, chat_id: str, reason: str = "") -> bool:
-        state = self._states.pop(str(chat_id), None)
-        self._cancel_timeout_task(chat_id)
+        with self._states_lock:
+            state = self._states.pop(str(chat_id), None)
+            timeout_task = self._pop_timeout_task_locked(chat_id)
+        if timeout_task and not timeout_task.done():
+            timeout_task.cancel()
         if not state:
             return False
         logger.info(
@@ -178,16 +251,8 @@ class GroupReplyWaitManager:
         return True
 
     def get_wait_info(self, chat_id: str) -> Optional[dict]:
-        state = self._states.get(str(chat_id))
-        if not state:
-            return None
-        return {
-            "chat_id": state.chat_id,
-            "target_user_id": state.target_user_id,
-            "target_name": state.target_name,
-            "reason": state.reason,
-            "thread_signature": state.thread_signature,
-            "reply_mode": state.reply_mode,
-            "remaining_messages": state.remaining_messages,
-            "remaining_seconds": max(0.0, state.expires_at - time.time()),
-        }
+        with self._states_lock:
+            state = self._states.get(str(chat_id))
+            if not state:
+                return None
+            return self._build_wait_info_snapshot(state, time.time())
