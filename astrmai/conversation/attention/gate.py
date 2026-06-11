@@ -141,6 +141,8 @@ class AttentionGate:
             return True
         if event.get_extra("astrmai_bonus_score", 0.0) >= 1.0:
             return True
+        if self.sensors is None:
+            return False
         try:
             return bool(self.sensors.is_wakeup_signal(event, self_id))
         except Exception:
@@ -613,7 +615,6 @@ class AttentionGate:
             message_cache.popitem(last=False)
 
         perception = self.perception_builder.build(event)
-        turn_context.perception = perception
         context = perception.as_event_context()
         chat_id = context["chat_id"]
         self_id = context["self_id"]

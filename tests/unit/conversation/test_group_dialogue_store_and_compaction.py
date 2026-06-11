@@ -446,6 +446,83 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_compaction_provider_kwargs_tolerate_missing_policy_and_keep_trace_recordable(self):
+        async def run():
+            store = GroupDialogueStore()
+            economy = ContextEconomyCenter()
+            economy.resolve_policy = lambda request: None
+            engine = ContextCompactionEngine(
+                store,
+                gateway=SimpleNamespace(
+                    context=SimpleNamespace(),
+                    context_economy=economy,
+                ),
+            )
+
+            kwargs, trace = engine._compaction_provider_kwargs(
+                "chat-1",
+                "dify-agent",
+                "stable-shell",
+                "dynamic-payload",
+                "compaction_summary_v2",
+                "v2",
+                "section_summary",
+                "stable-shell",
+                "dynamic-payload",
+            )
+
+            self.assertEqual(kwargs, {})
+            self.assertNotIn("session_id", kwargs)
+            self.assertNotIn("cache_control", kwargs)
+            self.assertEqual(trace["workload_family"], "compaction_summary")
+            self.assertEqual(trace["template_id"], "compaction_summary_v2")
+            self.assertEqual(trace["template_version"], "v2")
+            self.assertEqual(trace["schema_id"], "section_summary")
+            self.assertFalse(trace["provider_session_enabled"])
+            self.assertFalse(trace["provider_cache_hint_enabled"])
+
+            economy.record_trace(WorkloadTrace(**trace))
+            snapshot = economy.snapshot_metrics()
+            template_stats = snapshot["_templates"]["compaction_summary_v2@v2"]
+            self.assertEqual(template_stats["call_count"], 1)
+            self.assertEqual(template_stats["provider_session_usage_rate"], 0.0)
+
+        asyncio.run(run())
+
+    def test_compaction_summary_paths_keep_recording_trace_when_policy_resolution_is_missing(self):
+        async def run():
+            store = GroupDialogueStore()
+            economy = ContextEconomyCenter()
+            economy.resolve_policy = lambda request: None
+
+            async def fake_llm_generate(**kwargs):
+                return SimpleNamespace(completion_text="summary text")
+
+            engine = ContextCompactionEngine(
+                store,
+                gateway=SimpleNamespace(
+                    context=SimpleNamespace(llm_generate=fake_llm_generate),
+                    context_economy=economy,
+                ),
+            )
+            engine.provider_id = "dify-agent"
+
+            segment = SimpleNamespace(speaker_name="Alice", speaker_id="u1", content="hello", is_bot=False)
+            summary_v1 = await engine._build_summary_with_provider("chat-1", [segment])
+            summary_v2 = await engine._build_summary_with_provider_v2("chat-1", [segment])
+
+            self.assertEqual(summary_v1, "summary text")
+            self.assertEqual(summary_v2, "summary text")
+
+            snapshot = economy.snapshot_metrics()
+            self.assertEqual(snapshot["compaction_summary"]["call_count"], 2)
+            self.assertEqual(snapshot["_templates"]["compaction_summary_v1@v1"]["call_count"], 1)
+            self.assertEqual(snapshot["_templates"]["compaction_summary_v2@v2"]["call_count"], 1)
+            self.assertEqual(snapshot["_templates"]["compaction_summary_v1@v1"]["provider_session_usage_rate"], 0.0)
+            self.assertEqual(snapshot["_templates"]["compaction_summary_v2@v2"]["provider_session_usage_rate"], 0.0)
+
+        asyncio.run(run())
+
     def test_compaction_persists_structured_cold_summary(self):
         async def run():
             store = GroupDialogueStore()

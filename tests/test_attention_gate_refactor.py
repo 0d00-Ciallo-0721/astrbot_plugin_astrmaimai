@@ -164,6 +164,23 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertFalse(context["is_private"])
 
 
+    def test_is_direct_wakeup_event_handles_missing_sensors_without_losing_fast_paths(self):
+        gate = self.gate_mod.AttentionGate(
+            state_engine=self.gate.state_engine,
+            judge=self.gate.judge,
+            sensors=None,
+            system2_callback=None,
+        )
+
+        ordinary = _FakeEvent("user-1", "Alice", "hello")
+        direct = _FakeEvent("user-2", "Bob", "ping", extras={"astrmai_group_direct_wakeup": True})
+        bonus = _FakeEvent("user-3", "Carol", "ping", extras={"astrmai_bonus_score": 1.0})
+
+        self.assertFalse(gate._is_direct_wakeup_event(ordinary, "bot-1"))
+        self.assertTrue(gate._is_direct_wakeup_event(direct, "bot-1"))
+        self.assertTrue(gate._is_direct_wakeup_event(bonus, "bot-1"))
+
+
 
     def test_process_event_fast_mode_engages_on_direct_wakeup(self):
         captured = []

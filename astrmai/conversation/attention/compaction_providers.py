@@ -5,6 +5,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.context_economy import PromptTemplateId, WorkloadFamily
+from ...infrastructure.context_economy.models import WorkloadTrace
 from ...infrastructure.gateway.provider_capabilities import infer_provider_capabilities
 from ...infrastructure.runtime.lane_manager import LaneKey
 
@@ -77,6 +78,23 @@ class CompactionProviderMixin:
         policy = economy.resolve_policy(request)
         kwargs: dict[str, Any] = {}
         caps = infer_provider_capabilities(provider_id)
+        if policy is None:
+            trace = WorkloadTrace(
+                workload_family=WorkloadFamily.COMPACTION_SUMMARY.value,
+                lane_scope_id=chat_id,
+                template_id=template_id,
+                template_version=template_version,
+                schema_id=schema_id,
+                primary_model=provider_id,
+                actual_model=provider_id,
+                fallback_used=True,
+                provider_family=caps.provider_family,
+                cache_affinity_reason="policy_missing",
+                stable_prefix_length=len(stable_prefix_text or ""),
+                dynamic_payload_length=len(dynamic_payload_text or ""),
+                template_schema_id=schema_id,
+            )
+            return kwargs, trace.as_dict()
         lane_umo = ""
         if lane_manager and policy.lane_key:
             lane_umo = lane_manager.resolve_lane_umo("", policy.lane_key)
@@ -176,34 +194,7 @@ class CompactionProviderMixin:
             clipped = self._clip_summary(str(content or "").strip())
             if clipped:
                 if getattr(self.gateway, "context_economy", None):
-                    self.gateway.context_economy.record_trace(
-                        self.gateway.context_economy.build_trace(
-                            policy=self.gateway.context_economy.resolve_policy(
-                                self.gateway.context_economy.build_request(
-                                    family=WorkloadFamily.COMPACTION_SUMMARY,
-                                    pool_name="memory",
-                                    prompt=prompt,
-                                    system_prompt=system_prompt,
-                                    models=[provider_id],
-                                    lane_key=self._compaction_lane_key(chat_id),
-                                    base_origin="",
-                                    scope_id=chat_id,
-                                    scope_kind="chat",
-                                    template_id=template_id,
-                                    template_version=template_version,
-                                    schema_id=schema_id,
-                                    stable_prefix_text=stable_prefix_text,
-                                    dynamic_payload_text=dynamic_payload_text,
-                                )
-                            ),
-                            lane_umo=str(trace_payload.get("lane_umo", "") or ""),
-                            actual_model=provider_id,
-                            provider_family=str(trace_payload.get("provider_family", "") or ""),
-                            provider_session_id=str(trace_payload.get("provider_session_id", "") or ""),
-                            provider_session_enabled=bool(trace_payload.get("provider_session_enabled", False)),
-                            provider_cache_hint_enabled=bool(trace_payload.get("provider_cache_hint_enabled", False)),
-                        )
-                    )
+                    self.gateway.context_economy.record_trace(WorkloadTrace(**trace_payload))
                 return clipped
         return ""
 
@@ -281,34 +272,7 @@ class CompactionProviderMixin:
             rendered = str(content or "").strip()
             if rendered:
                 if getattr(self.gateway, "context_economy", None):
-                    self.gateway.context_economy.record_trace(
-                        self.gateway.context_economy.build_trace(
-                            policy=self.gateway.context_economy.resolve_policy(
-                                self.gateway.context_economy.build_request(
-                                    family=WorkloadFamily.COMPACTION_SUMMARY,
-                                    pool_name="memory",
-                                    prompt=prompt,
-                                    system_prompt=system_prompt,
-                                    models=[provider_id],
-                                    lane_key=self._compaction_lane_key(chat_id),
-                                    base_origin="",
-                                    scope_id=chat_id,
-                                    scope_kind="chat",
-                                    template_id=template_id,
-                                    template_version=template_version,
-                                    schema_id=schema_id,
-                                    stable_prefix_text=stable_prefix_text,
-                                    dynamic_payload_text=dynamic_payload_text,
-                                )
-                            ),
-                            lane_umo=str(trace_payload.get("lane_umo", "") or ""),
-                            actual_model=provider_id,
-                            provider_family=str(trace_payload.get("provider_family", "") or ""),
-                            provider_session_id=str(trace_payload.get("provider_session_id", "") or ""),
-                            provider_session_enabled=bool(trace_payload.get("provider_session_enabled", False)),
-                            provider_cache_hint_enabled=bool(trace_payload.get("provider_cache_hint_enabled", False)),
-                        )
-                    )
+                    self.gateway.context_economy.record_trace(WorkloadTrace(**trace_payload))
                 return rendered
         return ""
 

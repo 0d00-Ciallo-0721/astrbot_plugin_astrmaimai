@@ -1,4 +1,3 @@
-# astrmai/Heart/sensors.py
 import inspect
 import random
 import re
@@ -69,7 +68,6 @@ class PreFilters:
         # =================================================================
         # 🚀 [新增] 媒体链接白名单防护层 (AstrBot Parser 兼容补丁)
         # =================================================================
-        import re # 如果文件顶部已经 import re，这里的可以删除
         raw_msg = event.message_str or ""
         url_pattern = r"(?i)\b(?:https?://|www\.)[^\s()<>]+(?:\([\w\d]+\)|([^[:punct:]\s]|/))"
         urls = re.findall(url_pattern, raw_msg)
