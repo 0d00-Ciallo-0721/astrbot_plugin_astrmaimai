@@ -71,6 +71,78 @@ class MemoryV2ServiceTests(unittest.TestCase):
         maintenance = self.maintenance_mod.MemoryMaintenanceService(store)
         return store, retrieval, writer, injection, tools, maintenance
 
+    def test_write_service_allows_legal_braced_text(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            content = "{\u91cd\u8981\u504f\u597d} Alice \u559c\u6b22\u628a\u5468\u62a5\u6574\u7406\u6210\u4e09\u6bb5\u3002"
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content=content,
+                    dedup_key="memory:legal-braced-text",
+                )
+            )
+            self.assertTrue(memory_id)
+            candidate = await store.get_canonical(memory_id, include_inactive=True)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate.content, content)
+
+        asyncio.run(run())
+
+    def test_write_service_skips_fenced_json_payload(self):
+        async def run():
+            _store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content="```json\n{\"summary\":\"test\"}\n```",
+                    dedup_key="memory:fenced-json-payload",
+                )
+            )
+            self.assertEqual(memory_id, "")
+
+        asyncio.run(run())
+
+    def test_write_service_skips_error_json_payload(self):
+        async def run():
+            _store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content='{"error":"All chat models fail","detail":"ApiTimesOutError"}',
+                    dedup_key="memory:error-json-payload",
+                )
+            )
+            self.assertEqual(memory_id, "")
+
+        asyncio.run(run())
+
+    def test_write_service_allows_json_payload_without_error_keys_even_if_value_contains_noisy_tokens(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            content = '{"summary":"all chat models fail \u8fd9\u53e5\u8bdd\u53ea\u662f\u88ab\u8bb0\u5f55","topic":"exception handling"}'
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content=content,
+                    dedup_key="memory:json-with-noisy-values",
+                )
+            )
+            self.assertTrue(memory_id)
+            candidate = await store.get_canonical(memory_id, include_inactive=True)
+            self.assertIsNotNone(candidate)
+            self.assertEqual(candidate.content, content)
+
+        asyncio.run(run())
+
     def test_query_filters_layers_excludes_and_stale_by_default(self):
         async def run():
             store, retrieval, writer, _injection, _tools, _maintenance = self._services()

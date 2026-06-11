@@ -1,29 +1,58 @@
 from __future__ import annotations
 
 import hashlib
+import json
+
+from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryWriteRequest
 from .v2_store import MemoryV2Store
 
 
 class MemoryWriteService:
+    _NOISY_TOKENS = ("traceback", "exception", "all chat models fail", "apitimesouterror")
+    _ERROR_JSON_KEYS = frozenset({"error", "errors", "exception", "traceback", "stack", "stacktrace", "detail", "details"})
+
     def __init__(self, store: MemoryV2Store, index_projector=None):
         self.store = store
         self.index_projector = index_projector
 
-    @staticmethod
-    def should_skip_content(content: str) -> bool:
+    @classmethod
+    def _classify_skip_reason(cls, content: str) -> str | None:
         text = str(content or "").strip()
         if not text:
-            return True
-        if text.startswith("{") or text.startswith("```json"):
-            return True
+            return "empty_content"
+        if text.startswith("```json"):
+            return "fenced_json_payload"
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = None
+            else:
+                if isinstance(payload, dict):
+                    lowered_keys = {str(key).strip().lower() for key in payload.keys()}
+                    if lowered_keys & cls._ERROR_JSON_KEYS:
+                        return "error_json_payload"
+                    return None
+                return None
         lowered = text.lower()
-        noisy_tokens = ("traceback", "exception", "all chat models fail", "apitimesouterror")
-        return any(token in lowered for token in noisy_tokens)
+        if any(token in lowered for token in cls._NOISY_TOKENS):
+            return "noisy_error_token"
+        return None
+
+    @staticmethod
+    def should_skip_content(content: str) -> bool:
+        return MemoryWriteService._classify_skip_reason(content) is not None
 
     async def write(self, request: MemoryWriteRequest) -> str:
-        if self.should_skip_content(request.content):
+        skip_reason = self._classify_skip_reason(request.content)
+        if skip_reason:
+            preview = str(request.content or "").strip().replace("\r", " ").replace("\n", " ")[:120]
+            logger.info(
+                f"[MemoryWriteService] skip write | reason={skip_reason} | kind={str(request.kind or '')} "
+                f"| session_id={str(request.session_id or '')} | content_preview={preview}"
+            )
             return ""
         dedup_key = str(request.dedup_key or "").strip()
         if not dedup_key:
