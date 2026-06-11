@@ -4,11 +4,23 @@ import inspect
 import time
 
 from astrbot.api import logger
+from config import LifeConfig
 
 from ..infrastructure.context_economy import PromptTemplateId
 from ..memory.contracts.memory_query import MemoryQuery
 from .dispatcher import ProactiveMessageIntent
 from .rhythm import evaluate_proactive_rhythm
+
+
+def _life_config_field_names() -> tuple[str, ...]:
+    model_fields = getattr(LifeConfig, "model_fields", None)
+    if model_fields is not None:
+        return tuple(model_fields.keys())
+    return tuple(getattr(LifeConfig, "__fields__", {}).keys())
+
+
+_DEFAULT_LIFE_CONFIG = LifeConfig()
+_LIFE_CONFIG_FIELD_NAMES = _life_config_field_names()
 
 
 class WakeupService:
@@ -21,6 +33,32 @@ class WakeupService:
         self.dispatcher = dispatcher
         self.memory_engine = memory_engine
         self.prompt_registry = prompt_registry
+
+    def _resolve_life_config(self):
+        config = getattr(self, "config", None)
+        if config is None:
+            return _DEFAULT_LIFE_CONFIG
+        life = getattr(config, "life", None)
+        if isinstance(life, LifeConfig):
+            return life
+        if life is None:
+            return _DEFAULT_LIFE_CONFIG
+        if self._life_config_is_complete(life):
+            return life
+        merged_values = {}
+        for field_name in _LIFE_CONFIG_FIELD_NAMES:
+            default_value = getattr(_DEFAULT_LIFE_CONFIG, field_name)
+            if isinstance(life, dict):
+                merged_values[field_name] = life.get(field_name, default_value)
+            else:
+                merged_values[field_name] = getattr(life, field_name, default_value)
+        return LifeConfig(**merged_values)
+
+    @staticmethod
+    def _life_config_is_complete(life) -> bool:
+        if isinstance(life, dict):
+            return all(field_name in life for field_name in _LIFE_CONFIG_FIELD_NAMES)
+        return all(hasattr(life, field_name) for field_name in _LIFE_CONFIG_FIELD_NAMES)
 
     async def build_signal(self, chat_id: str, now: float | None = None) -> dict:
         now = time.time() if now is None else float(now)
@@ -47,10 +85,11 @@ class WakeupService:
         if not getattr(state, "chat_id", None):
             return {"eligible": False, "reason": "missing_chat_id", "chat_id": str(chat_id or ""), "state": state}
 
-        silence_threshold = self.config.life.silence_threshold
-        energy_threshold = self.config.life.wakeup_min_energy
-        wakeup_cost = self.config.life.wakeup_cost
-        wakeup_cooldown = self.config.life.wakeup_cooldown
+        life_config = self._resolve_life_config()
+        silence_threshold = life_config.silence_threshold
+        energy_threshold = life_config.wakeup_min_energy
+        wakeup_cost = life_config.wakeup_cost
+        wakeup_cooldown = life_config.wakeup_cooldown
         next_wakeup_timestamp = float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0)
         minutes_silent = 999.0
         if getattr(state, "last_reply_time", 0) > 0:
@@ -122,8 +161,9 @@ class WakeupService:
                 "reason": str(signal.get("reason", "") or "ineligible"),
             }
         state = signal.get("state")
-        wakeup_cost = float(signal.get("wakeup_cost", getattr(self.config.life, "wakeup_cost", 0.0)) or 0.0)
-        wakeup_cooldown = float(signal.get("wakeup_cooldown", getattr(self.config.life, "wakeup_cooldown", 0.0)) or 0.0)
+        life_config = self._resolve_life_config()
+        wakeup_cost = float(signal.get("wakeup_cost", life_config.wakeup_cost) or 0.0)
+        wakeup_cooldown = float(signal.get("wakeup_cooldown", life_config.wakeup_cooldown) or 0.0)
         intent = await self.build_wakeup_intent(state, wakeup_cost, wakeup_cooldown)
         if not intent:
             return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "intent_unavailable"}
@@ -193,7 +233,7 @@ class WakeupService:
 
     async def generate_opening_line(self, chat_id: str) -> str:
         rhythm = evaluate_proactive_rhythm(self.config)
-        persona_id = getattr(self.config.persona, "persona_id", "") or "global"
+        persona_id = getattr(getattr(self.config, "persona", None), "persona_id", "") or "global"
         cache = self.persistence.load_persona_cache()
         persona_data = cache.get(persona_id, {})
         summary = persona_data.get("summary", "")
