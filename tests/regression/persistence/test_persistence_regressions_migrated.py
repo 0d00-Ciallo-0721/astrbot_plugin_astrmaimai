@@ -122,6 +122,64 @@ class PersistenceRegressionsMigratedTests(unittest.TestCase):
         self.assertEqual(profiles["user-1"]["message_count_for_profiling"], 9)
         self.assertEqual(profiles["user-1"]["profile_metadata"]["manual_locked_fields"], ["nickname"])
 
+    def test_schema_patch_helpers_swallow_duplicate_columns_and_wrap_other_errors(self):
+        mixin = self.persistence_mod.PersistenceSchemaMixin()
+
+        class _DuplicateSyncDB:
+            def execute(self, statement):
+                raise sqlite3.OperationalError("duplicate column name: session_id")
+
+        mixin._apply_schema_patch_sync(
+            _DuplicateSyncDB(),
+            "ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''",
+            scope="sync schema patch",
+        )
+
+        class _FailingSyncDB:
+            def execute(self, statement):
+                raise sqlite3.OperationalError("no such table: memoryevent")
+
+        with self.assertRaises(sqlite3.OperationalError) as sync_ctx:
+            mixin._apply_schema_patch_sync(
+                _FailingSyncDB(),
+                "ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''",
+                scope="sync schema patch",
+            )
+
+        sync_message = str(sync_ctx.exception)
+        self.assertIn("sync schema patch failed", sync_message)
+        self.assertIn("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''", sync_message)
+        self.assertIn("no such table: memoryevent", sync_message)
+
+        class _DuplicateAsyncDB:
+            async def execute(self, statement):
+                raise sqlite3.OperationalError("duplicate column name: session_id")
+
+        async def _run_async_checks():
+            await mixin._apply_schema_patch_async(
+                _DuplicateAsyncDB(),
+                "ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''",
+                scope="async schema patch",
+            )
+
+            class _FailingAsyncDB:
+                async def execute(self, statement):
+                    raise sqlite3.OperationalError("no such table: memoryevent")
+
+            with self.assertRaises(sqlite3.OperationalError) as async_ctx:
+                await mixin._apply_schema_patch_async(
+                    _FailingAsyncDB(),
+                    "ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''",
+                    scope="async schema patch",
+                )
+
+            async_message = str(async_ctx.exception)
+            self.assertIn("async schema patch failed", async_message)
+            self.assertIn("ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''", async_message)
+            self.assertIn("no such table: memoryevent", async_message)
+
+        asyncio.run(_run_async_checks())
+
     def test_memory_engine_recall_accepts_and_forwards_top_k(self):
         engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
         engine_mod = importlib.reload(engine_mod)
