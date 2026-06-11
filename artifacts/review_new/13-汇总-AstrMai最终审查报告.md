@@ -34,8 +34,6 @@
 
 - `astrmai/learning/evolution_manager.py`
   - `get_active_patterns_canonical()` 在 loop 活跃时会直接抛 `RuntimeError`
-- `astrmai/state/energy/frequency_controller.py`
-  - 声明了 `_records_lock`，但当前未实际用于 `_records` 的保护
 - `astrmai/state/group_wait/group_reply_wait_manager.py`
   - 正常 `_states` 读写路径未完整加锁
 - `astrmai/proactive/wakeup_service.py`
@@ -94,7 +92,7 @@
 - 修 `config.py` 与 `_conf_schema.json` 的映射断裂
 
 ### 第二优先级
-- 修 `frequency_controller.py` / `group_reply_wait_manager.py` 的并发保护
+- 修 `group_reply_wait_manager.py` 的并发保护
 - 修 `evolution_manager.py` 的运行时 worker/loop 调用路径
 
 ### 第三优先级

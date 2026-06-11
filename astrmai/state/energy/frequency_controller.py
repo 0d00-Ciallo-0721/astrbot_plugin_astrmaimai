@@ -14,9 +14,9 @@
 5. 冷场激励: 超过 silence_threshold 分钟无互动，Bot 主动开口概率略升
 6. 情绪加成: mood > 0.5 (兴奋) 略升频；mood < -0.5 (低落) 降频
 """
-import asyncio
 import time
 import random
+import threading
 from typing import Dict, List
 from dataclasses import dataclass, field
 from astrbot.api import logger
@@ -50,7 +50,7 @@ class FrequencyController:
     def __init__(self, config=None):
         self.config = config
         self._records: Dict[str, ChatReplyRecord] = {}
-        self._records_lock = asyncio.Lock()
+        self._records_lock = threading.RLock()
 
         # 从配置加载参数（如果配置提供）
         if config and hasattr(config, 'reply'):
@@ -80,73 +80,76 @@ class FrequencyController:
             True  = 进入正常决策流程
             False = 跳过本次回复（沉默）
         """
-        # @mention 豁免：被提及时强制进入决策
-        if is_mentioned:
-            self._record_message(chat_id)
-            return True
+        with self._records_lock:
+            # @mention 豁免：被提及时强制进入决策
+            if is_mentioned:
+                self._record_message(chat_id)
+                return True
 
-        # 获取/初始化记录
-        record = self._get_record(chat_id)
-        self._record_message_raw(record)
+            # 获取/初始化记录
+            record = self._get_record(chat_id)
+            self._record_message_raw(record)
 
-        # 计算综合概率
-        prob = self.BASE_FREQ
+            # 计算综合概率
+            prob = self.BASE_FREQ
 
-        # 1. 精力惩罚
-        if energy < self.LOW_ENERGY_THRESHOLD:
-            energy_factor = max(0.2, energy / self.LOW_ENERGY_THRESHOLD)
-            prob *= energy_factor
+            # 1. 精力惩罚
+            if energy < self.LOW_ENERGY_THRESHOLD:
+                energy_factor = max(0.2, energy / self.LOW_ENERGY_THRESHOLD)
+                prob *= energy_factor
 
-        # 2. 密集发言惩罚（频繁回复后自动沉默）
-        recent_replies = self._count_recent_replies(record, self.DENSE_WINDOW_SEC)
-        if recent_replies >= self.DENSE_REPLY_THRESHOLD:
-            prob *= self.DENSE_PENALTY
-            logger.debug(
-                f"[FrequencyController] 📉 {chat_id} 密集发言惩罚 "
-                f"(5min内已回复{recent_replies}次), prob={prob:.2f}"
-            )
+            # 2. 密集发言惩罚（频繁回复后自动沉默）
+            recent_replies = self._count_recent_replies(record, self.DENSE_WINDOW_SEC)
+            if recent_replies >= self.DENSE_REPLY_THRESHOLD:
+                prob *= self.DENSE_PENALTY
+                logger.debug(
+                    f"[FrequencyController] 📉 {chat_id} 密集发言惩罚 "
+                    f"(5min内已回复{recent_replies}次), prob={prob:.2f}"
+                )
+            
+            # 3. 冷场激励（长时间无互动时主动开口）
+            silence_min = self._silence_minutes(record)
+            if silence_min >= self.SILENCE_THRESHOLD_MIN:
+                prob = min(1.0, prob + self.SILENCE_BOOST)
+                logger.debug(
+                    f"[FrequencyController] 💬 {chat_id} 冷场激励 "
+                    f"(沉默{silence_min:.1f}min), prob={prob:.2f}"
+                )
 
-        # 3. 冷场激励（长时间无互动时主动开口）
-        silence_min = self._silence_minutes(record)
-        if silence_min >= self.SILENCE_THRESHOLD_MIN:
-            prob = min(1.0, prob + self.SILENCE_BOOST)
-            logger.debug(
-                f"[FrequencyController] 💬 {chat_id} 冷场激励 "
-                f"(沉默{silence_min:.1f}min), prob={prob:.2f}"
-            )
+            # 4. 情绪调节
+            if mood > self.HIGH_MOOD_THRESHOLD:
+                prob = min(1.0, prob + 0.1)  # 兴奋时更活跃
+            elif mood < self.LOW_MOOD_THRESHOLD:
+                prob = max(0.1, prob - 0.15)  # 低落时更沉默
 
-        # 4. 情绪调节
-        if mood > self.HIGH_MOOD_THRESHOLD:
-            prob = min(1.0, prob + 0.1)  # 兴奋时更活跃
-        elif mood < self.LOW_MOOD_THRESHOLD:
-            prob = max(0.1, prob - 0.15)  # 低落时更沉默
+            # 5. 概率采样
+            result = random.random() < prob
+            if not result:
+                logger.info(
+                    f"[FrequencyController] 🔇 {chat_id} 沉默本次回复 "
+                    f"(prob={prob:.2f}, energy={energy:.2f}, mood={mood:.2f})"
+                )
+            else:
+                # 记录本次有效回复
+                self._record_reply(record)
 
-        # 5. 概率采样
-        result = random.random() < prob
-        if not result:
-            logger.info(
-                f"[FrequencyController] 🔇 {chat_id} 沉默本次回复 "
-                f"(prob={prob:.2f}, energy={energy:.2f}, mood={mood:.2f})"
-            )
-        else:
-            # 记录本次有效回复
-            self._record_reply(record)
-
-        return result
+            return result
 
     def on_message_received(self, chat_id: str):
         """外部调用：收到新消息时更新最后消息时间"""
-        record = self._get_record(chat_id)
-        record.last_message_time = time.time()
+        with self._records_lock:
+            record = self._get_record(chat_id)
+            record.last_message_time = time.time()
 
     # ==========================================
     # 内部工具
     # ==========================================
 
     def _get_record(self, chat_id: str) -> ChatReplyRecord:
-        if chat_id not in self._records:
-            self._records[chat_id] = ChatReplyRecord()
-        return self._records[chat_id]
+        with self._records_lock:
+            if chat_id not in self._records:
+                self._records[chat_id] = ChatReplyRecord()
+            return self._records[chat_id]
 
     def _record_message(self, chat_id: str):
         record = self._get_record(chat_id)
@@ -174,12 +177,13 @@ class FrequencyController:
 
     def cleanup_inactive(self, max_age_hours: float = 24.0):
         """清理长时间不活跃的会话记录"""
-        cutoff = time.time() - max_age_hours * 3600
-        stale = [
-            cid for cid, rec in self._records.items()
-            if rec.last_message_time < cutoff
-        ]
-        for cid in stale:
-            del self._records[cid]
+        with self._records_lock:
+            cutoff = time.time() - max_age_hours * 3600
+            stale = [
+                cid for cid, rec in self._records.items()
+                if rec.last_message_time < cutoff
+            ]
+            for cid in stale:
+                del self._records[cid]
         if stale:
             logger.debug(f"[FrequencyController] 🧹 清理 {len(stale)} 个过期会话记录")

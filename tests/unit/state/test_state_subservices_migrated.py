@@ -1,10 +1,11 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from types import SimpleNamespace
 
 from astrmai.state.energy.energy_manager import EnergyManager
 from astrmai.state.mood.mood_decay import apply_natural_decay
-from astrmai.state.energy.frequency_controller import FrequencyController
+from astrmai.state.energy.frequency_controller import ChatReplyRecord, FrequencyController
 from astrmai.state.relationship.relationship_engine import (
     RelationshipEngine,
     RelationshipEvent,
@@ -22,6 +23,56 @@ class StateSubservicesMigratedTests(unittest.TestCase):
         record.reply_timestamps = [100.0, 120.0, 140.0]
         with patch('astrmai.state.energy.frequency_controller.time.time', return_value=150.0),                  patch('astrmai.state.energy.frequency_controller.random.random', return_value=0.95):
             self.assertFalse(controller.should_reply('chat-1', energy=0.2, mood=-0.6))
+
+    def test_frequency_controller_concurrent_access_keeps_single_record(self):
+        controller = FrequencyController()
+
+        def worker(_):
+            controller.on_message_received('chat-shared')
+            result = controller.should_reply('chat-shared', energy=0.8, mood=0.0)
+            return id(controller._get_record('chat-shared')), result
+
+        with patch('astrmai.state.energy.frequency_controller.random.random', return_value=0.0):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(worker, range(40)))
+
+        record_ids = {record_id for record_id, _ in results}
+        self.assertEqual(len(record_ids), 1)
+        self.assertTrue(all(result for _, result in results))
+        record = controller._get_record('chat-shared')
+        self.assertEqual(len(record.reply_timestamps), 40)
+        self.assertGreater(record.last_message_time, 0.0)
+
+    def test_frequency_controller_concurrent_cleanup_and_updates_keep_records_valid(self):
+        controller = FrequencyController()
+        for idx in range(6):
+            record = controller._get_record(f'stale-{idx}')
+            record.last_message_time = 1.0
+            record.reply_timestamps = [1.0, 2.0]
+
+        def update_worker(index: int):
+            chat_id = f'active-{index % 3}'
+            controller.on_message_received(chat_id)
+            controller.should_reply(chat_id, energy=0.8, mood=0.0)
+
+        def cleanup_worker(_):
+            controller.cleanup_inactive(max_age_hours=0.0)
+
+        with patch('astrmai.state.energy.frequency_controller.random.random', return_value=0.0):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(update_worker, index) for index in range(30)]
+                futures.extend(executor.submit(cleanup_worker, index) for index in range(10))
+                for future in futures:
+                    future.result()
+
+        controller.on_message_received('post-cleanup')
+        post_cleanup_record = controller._get_record('post-cleanup')
+        self.assertIsInstance(post_cleanup_record, ChatReplyRecord)
+        for chat_id, record in controller._records.items():
+            self.assertIsInstance(chat_id, str)
+            self.assertIsInstance(record, ChatReplyRecord)
+            self.assertIsInstance(record.reply_timestamps, list)
+            self.assertIsInstance(record.last_message_time, float)
 
     def test_relationship_engine_process_event_updates_social_score(self):
         engine = RelationshipEngine()
