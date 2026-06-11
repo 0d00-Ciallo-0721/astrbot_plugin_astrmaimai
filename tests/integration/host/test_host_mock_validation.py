@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import io
 import os
 import subprocess
@@ -470,6 +471,115 @@ class HostMockValidationTests(unittest.TestCase):
             self.assertIn(("attention", "at"), calls)
             self.assertIn(("attention", "reply"), calls)
             self.assertIn(("attention", "private"), calls)
+
+    def test_main_entry_routes_into_real_plugin_facade_message_chain_smoke(self):
+        with tempfile.TemporaryDirectory(prefix="astrmai-main-entry-") as temp_dir:
+            _install_extended_astrbot_stubs(temp_dir)
+            _purge_modules(
+                (
+                    "main",
+                    "astrmai.app.plugin_facade",
+                    "astrmai.presentation.events.message_entry",
+                    "astrmai.conversation.ingress.command_guard",
+                    "astrmai.conversation.ingress.dedupe",
+                    "astrmai.conversation.ingress.permission_guard",
+                    "astrmai.conversation.ingress.poke_handler",
+                    "astrmai.infrastructure.runtime.trace_runtime",
+                    "astrmai.shared.helpers.plugin_helpers",
+                )
+            )
+
+            import astrbot.api.message_components as Comp
+
+            if hasattr(sys, "_astrmai_global_debounce_cache"):
+                sys._astrmai_global_debounce_cache = {}
+
+            main_mod = importlib.import_module("main")
+            main_mod = importlib.reload(main_mod)
+
+            attention_calls: list[tuple[str, str]] = []
+            activity_updates: list[str] = []
+
+            async def _record_user_message(event):
+                attention_calls.append(("record", event.unified_msg_origin))
+
+            async def _process_event(event):
+                attention_calls.append(("attention", event.unified_msg_origin))
+                return "ENGAGED"
+
+            async def _increment_user_message_count(user_id: str):
+                activity_updates.append(user_id)
+
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                config=SimpleNamespace(
+                    global_settings=SimpleNamespace(
+                        debug_mode=False,
+                        whitelist_ids=["default:GroupMessage:group-1"],
+                        admin_ids=[],
+                        enable_private_chat=True,
+                        command_prefixes=["/"],
+                    ),
+                    system1=SimpleNamespace(extra_command_list=[]),
+                    provider=SimpleNamespace(task_models=[], agent_models=[], embedding_models=[], fallback_models=[]),
+                ),
+                review_service=SimpleNamespace(),
+                group_reply_wait_manager=None,
+                reflect_tracker=None,
+                evolution=SimpleNamespace(record_user_message=_record_user_message),
+                attention_gate=SimpleNamespace(process_event=_process_event),
+                host_bridge=SimpleNamespace(suppress_default_llm=lambda event: "(ghost)"),
+                sensors=None,
+                context=SimpleNamespace(command_manager=SimpleNamespace(commands={})),
+                state_engine=SimpleNamespace(increment_user_message_count=_increment_user_message_count),
+                chat_loop_kernel=None,
+            )
+
+            def _bind_system2_callback(callback):
+                runtime.system2_callback = callback
+
+            def _bind_host_plugin(plugin):
+                runtime.host_plugin = plugin
+
+            main_mod.AstrMaiConfig = lambda **kwargs: SimpleNamespace()
+            main_mod.build_runtime_context = lambda context, config, raw_config: runtime
+            main_mod.export_legacy_attrs = lambda runtime_ref: {}
+            main_mod.register_astrmai_admin_pages = lambda context, facade: None
+            runtime.bind_system2_callback = _bind_system2_callback
+            runtime.bind_host_plugin = _bind_host_plugin
+
+            plugin = main_mod.AstrMaiPlugin(SimpleNamespace(), config={})
+            event = _StubEvent(
+                umo="default:GroupMessage:group-1",
+                sender_id="user-1",
+                sender_name="Alice",
+                group_id="group-1",
+                text="@bot 你好",
+                message=[Comp.At("bot-1")],
+            )
+
+            async def _run():
+                results = await _collect_asyncgen(plugin.on_global_message(event))
+                await asyncio.sleep(0)
+                return results
+
+            results = asyncio.run(_run())
+            trace_log = event.get_extra("astrmai_trace_log", [])
+            trace_stages = [item.get("stage") for item in trace_log]
+
+            self.assertIsInstance(plugin.facade, main_mod.PluginFacade)
+            self.assertEqual(results, [{"type": "plain", "text": "(ghost)"}])
+            self.assertEqual(
+                attention_calls,
+                [
+                    ("record", "default:GroupMessage:group-1"),
+                    ("attention", "default:GroupMessage:group-1"),
+                ],
+            )
+            self.assertEqual(activity_updates, ["user-1"])
+            self.assertIn("ingress.enter", trace_stages)
+            self.assertIn("ingress.after_attention", trace_stages)
 
     def test_mock_system2_pipeline_preserves_state_lane_executor_reply_followup_chain(self):
         with tempfile.TemporaryDirectory(prefix="astrmai-sys2-") as temp_dir:
