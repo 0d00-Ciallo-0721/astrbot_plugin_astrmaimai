@@ -920,7 +920,7 @@ class PromptRefiner:
                     + proactive_guidance[:500]
                 )
         if focus_message_text:
-            sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(focus_message_text)}")
+            sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(PromptEnvelope.sanitize_user_input(focus_message_text))}")
         if direct_context_text:
             sections.append(f"---前因---\n{await self._resolve_visual_memory(direct_context_text)}")
         if related_context_text:

@@ -87,8 +87,20 @@ class RelationshipVector:
             # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
             first_seen=data.get("first_seen", time.time()),
             last_interaction=data.get("last_interaction", time.time()),
-            last_decay_time=data.get("last_decay_time", time.time()),
+            last_decay_time=cls._normalize_timestamp(data.get("last_decay_time")),
         )
+
+    @staticmethod
+    def _normalize_timestamp(raw):
+        """Clamp invalid timestamps (0, negative, far future) to now."""
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return time.time()
+        now = time.time()
+        if val <= 0 or val > now + 86400 * 365:
+            return now
+        return val
 
     def get_context_description(self) -> str:
         """供 Prompt 注入的关系描述 (无 LLM 消耗)"""

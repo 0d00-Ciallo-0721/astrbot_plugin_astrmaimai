@@ -895,9 +895,7 @@ class AttentionGate:
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
                         if self.sys2_process:
-                            task = asyncio.create_task(self.sys2_process(focus_event, focus_thread.all_thread_events()))
-                            self._background_tasks.add(task)
-                            task.add_done_callback(self._handle_background_task_result)
+                            task = self._fire_background_task(self.sys2_process(focus_event, focus_thread.all_thread_events()))
 
             async with session.lock:
                 if session.accumulation_pool:

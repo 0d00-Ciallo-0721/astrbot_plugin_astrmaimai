@@ -8,6 +8,7 @@ from astrbot.api import logger
 
 from .persona_cache import PersonaCacheMixin
 from .persistence_schema import PersistenceSchemaMixin, _dedupe_sqlmodel_metadata_indexes
+from .sqlite_helpers import sqlite_connect_args
 from .state_profile_persistence import StateProfilePersistenceMixin
 
 
@@ -31,7 +32,7 @@ class PersistenceManager(PersistenceSchemaMixin, PersonaCacheMixin, StateProfile
         self.persona_cache_path = self.cache_dir / "persona_cache.json"
         
         # ?Engine ( Vector Store ?
-        self.engine = create_engine(self.db_url)
+        self.engine = create_engine(self.db_url, connect_args=sqlite_connect_args())
         _dedupe_sqlmodel_metadata_indexes()
         SQLModel.metadata.create_all(self.engine)
         

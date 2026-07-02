@@ -7,6 +7,7 @@ import aiosqlite
 from astrbot.api import logger
 from sqlmodel import SQLModel
 from ...shared.helpers.plugin_helpers import safe_create_task
+from .sqlite_helpers import connect_aiosqlite, connect_sqlite
 
 
 # ── Schema migration versions (PRAGMA user_version) ──────────────────
@@ -197,7 +198,7 @@ class PersistenceSchemaMixin:
 
     def _init_db_sync(self):
         try:
-            with sqlite3.connect(self.db_path) as db:
+            with connect_sqlite(self.db_path) as db:
                 db.execute("""
                     CREATE TABLE IF NOT EXISTS chat_states (
                         chat_id TEXT PRIMARY KEY,
@@ -317,7 +318,7 @@ class PersistenceSchemaMixin:
     async def _init_db(self):
         """Initialize async database tables required by the plugin."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS chat_states (
                         chat_id TEXT PRIMARY KEY,

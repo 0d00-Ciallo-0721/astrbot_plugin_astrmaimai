@@ -21,7 +21,10 @@ class LaneStorageMixin:
             self._lane_creation_locks[lane_key_str] = lock
             # ponytail: cap _lane_creation_locks at 200
             if len(self._lane_creation_locks) > 200:
-                self._lane_creation_locks.pop(next(iter(self._lane_creation_locks)))
+                for old_key, old_lock in list(self._lane_creation_locks.items()):
+                    if old_key != lane_key_str and not old_lock.locked():
+                        self._lane_creation_locks.pop(old_key, None)
+                        break
         return self._lane_creation_locks[lane_key_str]
 
     async def ensure_lane(

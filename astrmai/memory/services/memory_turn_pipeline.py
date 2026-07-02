@@ -389,7 +389,9 @@ class MemoryTurnPipeline:
                     if last_update < stale_cutoff:
                         self._session_history_buffer.pop(chat_id, None)
                         self._memory_locks.pop(chat_id, None)
-                        self._worker_tasks.pop(chat_id, None)
+                        stale_task = self._worker_tasks.pop(chat_id, None)
+                        if stale_task is not None and not stale_task.done():
+                            stale_task.cancel()
                         self._worker_queues.pop(chat_id, None)
                         self._instant_llm_last_check.pop(chat_id, None)
             except asyncio.CancelledError:

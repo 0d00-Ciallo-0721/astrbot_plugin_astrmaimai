@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sqlite3
 import time
 from typing import Any, Callable, List, Optional, TypeVar
 
@@ -12,6 +11,7 @@ from .database_memory import MemoryPersistenceMixin
 from .database_profile_relation import ProfileRelationPersistenceMixin
 from .database_review import ReviewPersistenceMixin
 from .orm_models import ChatState, LastMessageMetadata, MessageLog
+from .sqlite_helpers import connect_sqlite
 from astrbot.api import logger
 
 from .persistence_manager import PersistenceManager
@@ -187,7 +187,7 @@ class DatabaseService(
         self._run_with_session(_sync)
 
     def get_chat_state(self, chat_id: str) -> Optional[ChatState]:
-        with sqlite3.connect(self.persistence.db_path) as conn:
+        with connect_sqlite(self.persistence.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
             row = cursor.fetchone()

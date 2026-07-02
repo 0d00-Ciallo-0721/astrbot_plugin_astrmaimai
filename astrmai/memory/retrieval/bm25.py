@@ -1,7 +1,7 @@
 import json
-import aiosqlite
 from typing import List, Optional, Any
 from astrbot.api import logger
+from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from ..utils import TextProcessor, SearchResult
 
 class BM25Retriever:
@@ -16,7 +16,7 @@ class BM25Retriever:
         self.doc_table = "documents" # 依赖 Faiss 底层共享的 documents 表
 
     async def initialize(self):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS {self.table}
                 USING fts5(content, doc_id UNINDEXED, tokenize='unicode61')
@@ -26,7 +26,7 @@ class BM25Retriever:
     async def add_document(self, doc_id: int, content: str):
         tokens = self.processor.tokenize(content)
         processed = " ".join(tokens)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute(
                 f"INSERT INTO {self.table}(doc_id, content) VALUES (?, ?)",
                 (doc_id, processed)
@@ -44,7 +44,7 @@ class BM25Retriever:
             
         fts_query = " OR ".join(escaped_tokens)
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT doc_id, bm25({self.table}) as score

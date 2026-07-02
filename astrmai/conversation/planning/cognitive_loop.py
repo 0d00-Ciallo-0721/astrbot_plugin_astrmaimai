@@ -373,19 +373,25 @@ class CognitiveLoop:
             memory_feedback = memory_feedback or turn_context.continuity.memory_feedback_summary
             heartflow_context = heartflow_context or turn_context.continuity.heartflow_context
             conversation_continuity = conversation_continuity or turn_context.continuity.conversation_summary
+        safe_current_text = PromptEnvelope.sanitize_inline_text(current_text)
+        safe_focus_message = PromptEnvelope.sanitize_inline_text(focus_message)
+        safe_direct_context = PromptEnvelope.sanitize_inline_text(direct_context)
+        safe_related_context = PromptEnvelope.sanitize_inline_text(related_context)
+        safe_background = PromptEnvelope.sanitize_inline_text(background)
+        safe_recent_transcript = PromptEnvelope.sanitize_inline_text(recent_transcript)
         return (
             "Current message:\n"
-            f"{self._truncate(current_text, 600)}\n\n"
+            f"{self._truncate(safe_current_text, 600)}\n\n"
             "Focused clue:\n"
-            f"{self._truncate(focus_message, 500)}\n\n"
+            f"{self._truncate(safe_focus_message, 500)}\n\n"
             "Direct context:\n"
-            f"{self._truncate(direct_context, 600)}\n\n"
+            f"{self._truncate(safe_direct_context, 600)}\n\n"
             "Related context:\n"
-            f"{self._truncate(related_context, 600)}\n\n"
+            f"{self._truncate(safe_related_context, 600)}\n\n"
             "Background (reference only):\n"
-            f"{self._truncate(background, 600)}\n\n"
+            f"{self._truncate(safe_background, 600)}\n\n"
             "Recent transcript:\n"
-            f"{self._truncate(recent_transcript, 800)}\n\n"
+            f"{self._truncate(safe_recent_transcript, 800)}\n\n"
             "Last bot reply:\n"
             f"{self._truncate(last_reply, 240)}\n\n"
             "Short-term self-continuity notes:\n"
@@ -401,9 +407,9 @@ class CognitiveLoop:
             "Think budget:\n"
             f"level={think_level}; reason={think_reason}; signals={self._truncate(','.join(str(item) for item in (think_signals or [])), 240)}\n\n"
             f"Focus reason: {focus_reason or 'latest_message'}\n"
-            f"Chat id: {event.unified_msg_origin}\n"
-            f"Sender id: {event.get_sender_id()}\n"
-            f"Sender name: {event.get_sender_name() or ''}\n"
+            f"Chat id: {PromptEnvelope.sanitize_inline_text(str(event.unified_msg_origin or ''))}\n"
+            f"Sender id: {PromptEnvelope.sanitize_inline_text(str(event.get_sender_id() or ''))}\n"
+            f"Sender name: {PromptEnvelope.sanitize_inline_text(str(event.get_sender_name() or ''))}\n"
             "If a readonly observation would materially help, request one allowed tool."
         )
 

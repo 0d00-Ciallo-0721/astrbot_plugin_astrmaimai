@@ -229,6 +229,10 @@ class AstrMaiConfig(BaseModel):
         memory = normalized.get("memory")
         if not isinstance(global_settings, dict):
             global_settings = {}
+        # also migrate from top-level legacy fields (old plugin stored flat)
+        for field_name in LEGACY_MEMORY_NAMESPACE_FIELDS:
+            if field_name in normalized and field_name not in global_settings:
+                global_settings[field_name] = normalized[field_name]
         if memory is None:
             memory = {}
         elif not isinstance(memory, dict):

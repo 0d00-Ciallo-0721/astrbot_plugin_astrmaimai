@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -10,11 +10,10 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
-import aiosqlite
-
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
+from ...infrastructure.persistence.sqlite_helpers import connect_aiosqlite
 from .memory_scoring import DEFAULT_MEMORY_SCORING
 
 
@@ -88,7 +87,7 @@ class MemoryV2Store:
 
     async def _resolve_session_id_for_memory_id(self, memory_id: str) -> str:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute("SELECT session_id FROM canonical_memories WHERE id = ? LIMIT 1", (memory_id,))
             row = await cursor.fetchone()
         return self._normalize_lock_scope(str(row[0] or "") if row else "")
@@ -99,7 +98,7 @@ class MemoryV2Store:
             return ["__global__"]
         await self.initialize()
         placeholders = ",".join("?" for _ in ids)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"SELECT DISTINCT session_id FROM canonical_memories WHERE id IN ({placeholders})",
                 tuple(ids),
@@ -145,7 +144,7 @@ class MemoryV2Store:
             return
         backup_dir = await self._backup_legacy_once()
         await self._migrate_from_legacy_db()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS canonical_memories (
@@ -274,7 +273,7 @@ class MemoryV2Store:
             self._migrated_from_legacy = True
             return
         try:
-            target = aiosqlite.connect(self.db_path)
+            target = connect_aiosqlite(self.db_path)
             async with target as tgt_db:
                 await tgt_db.execute("ATTACH DATABASE ? AS legacy_src", (self.legacy_db_path,))
                 cursor = await tgt_db.execute(
@@ -321,13 +320,13 @@ class MemoryV2Store:
                 await tgt_db.commit()
                 await tgt_db.execute("DETACH DATABASE legacy_src")
             count = 0
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute("SELECT COUNT(*) FROM canonical_memories")
                 row = await cursor.fetchone()
                 count = int(row[0]) if row else 0
             logger.info(
                 f"[MemoryV2] migrated {count} canonical_memories rows from "
-                f"{self.legacy_db_path} → {self.db_path}"
+                f"{self.legacy_db_path} 鈫?{self.db_path}"
             )
             self._migrated_from_legacy = True
         except Exception as exc:
@@ -393,7 +392,7 @@ class MemoryV2Store:
         if dedup_key and not authority_eav:
             scopes.append(f"dedup:{dedup_key}")
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 if dedup_key and not authority_eav:
                     cursor = await db.execute(
                         """
@@ -509,7 +508,7 @@ class MemoryV2Store:
         statuses = [ACTIVE_STATUS]
         if allow_stale:
             statuses.append(STALE_STATUS)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
@@ -532,7 +531,7 @@ class MemoryV2Store:
         params: tuple[Any, ...] = (memory_id,)
         if not include_inactive:
             where += " AND status IN ('active', 'stale')"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
@@ -556,7 +555,7 @@ class MemoryV2Store:
         params: tuple[Any, ...] = (clean_key,)
         if not include_inactive:
             where += " AND status IN ('active', 'stale', 'review_pending')"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
@@ -645,7 +644,7 @@ class MemoryV2Store:
             return await _apply(db)
 
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as owned_db:
+            async with connect_aiosqlite(self.db_path) as owned_db:
                 result = await _apply(owned_db)
                 await owned_db.commit()
                 return result
@@ -738,7 +737,7 @@ class MemoryV2Store:
             where.append("kind IN (" + ",".join("?" for _ in layer_set) + ")")
             params.extend(layer_set)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             if fts_query:
                 cursor = await db.execute(
                     f"""
@@ -861,7 +860,7 @@ class MemoryV2Store:
             where.append("visibility IN (" + ",".join("?" for _ in allowed_visibility) + ")")
             params.extend(sorted(allowed_visibility))
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
@@ -908,7 +907,7 @@ class MemoryV2Store:
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         page_limit = max(1, min(int(limit or 100), 500))
         page_offset = max(0, int(offset or 0))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"SELECT COUNT(*) FROM canonical_memories {where_sql}",
                 tuple(params),
@@ -968,7 +967,7 @@ class MemoryV2Store:
             return {}
         await self.initialize()
         placeholders = ",".join("?" for _ in ids)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, importance, status, visibility, create_time,
@@ -1012,7 +1011,7 @@ class MemoryV2Store:
         scopes = await self._resolve_session_ids_for_memory_ids(ids)
         async with await self._acquire_session_scopes(scopes) as _locks:
             now = self._now()
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 for memory_id in ids:
                     await db.execute(
                         """
@@ -1039,7 +1038,7 @@ class MemoryV2Store:
         self.last_physical_delete_ids = []
         now = self._now()
         decay_factor = max(0.0, min(1.0, (1 - float(decay_rate or 0.0)) ** max(int(days or 1), 1)))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute(
                 """
                 UPDATE canonical_memories
@@ -1106,7 +1105,7 @@ class MemoryV2Store:
         protected_skipped = 0
         if not statuses:
             return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, metadata, confidence
@@ -1162,7 +1161,7 @@ class MemoryV2Store:
         clean_kind = str(kind or "").strip()
         if not statuses or not clean_kind:
             return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, metadata, confidence
@@ -1201,7 +1200,7 @@ class MemoryV2Store:
         await self.initialize()
         scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     """
                     UPDATE canonical_memories
@@ -1219,7 +1218,7 @@ class MemoryV2Store:
         now = self._now()
         scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     """
                     UPDATE canonical_memories
@@ -1241,7 +1240,7 @@ class MemoryV2Store:
         await self.initialize()
         scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     """
                     UPDATE canonical_memories
@@ -1276,7 +1275,7 @@ class MemoryV2Store:
             params.append(persona_id)
         scopes = [session_id or "__global__"]
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     f"SELECT id FROM canonical_memories WHERE {' AND '.join(where)}",
                     tuple(params),
@@ -1300,7 +1299,7 @@ class MemoryV2Store:
     async def soft_delete_low_importance(self, *, threshold: float, reason: str = "low_importance") -> list[str]:
         await self.initialize()
         async with await self._acquire_session_scopes(["__global__"]) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     """
                     SELECT id FROM canonical_memories
@@ -1332,7 +1331,7 @@ class MemoryV2Store:
         await self.initialize()
         scopes = await self._resolve_session_ids_for_memory_ids(ids + ([superseded_by] if superseded_by else []))
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 count = 0
                 for memory_id in ids:
                     cursor = await db.execute(
@@ -1344,12 +1343,14 @@ class MemoryV2Store:
                         (superseded_by, self._now(), memory_id),
                     )
                     count += cursor.rowcount
+                for memory_id in ids:
+                    await self._sync_fts(db, memory_id, delete_only=True)
                 await db.commit()
                 return count
 
     async def find_ids_by_source_ref(self, source_ref: str) -> list[str]:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 """
                 SELECT id FROM canonical_memories
@@ -1364,7 +1365,7 @@ class MemoryV2Store:
         now = self._now()
         scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     """
                     UPDATE canonical_memories
@@ -1431,7 +1432,7 @@ class MemoryV2Store:
         assignments = ", ".join(f"{column} = ?" for column in columns)
         scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
         async with await self._acquire_session_scopes(scopes) as _locks:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(
                     f"UPDATE canonical_memories SET {assignments} WHERE id = ?",
                     (*[payload[column] for column in columns], memory_id),
@@ -1447,7 +1448,7 @@ class MemoryV2Store:
         if session_id:
             where.append("session_id = ?")
             params.append(session_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 f"""
                 SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
@@ -1464,7 +1465,7 @@ class MemoryV2Store:
 
     async def migration_applied(self, version: str) -> bool:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT 1 FROM memory_v2_migrations WHERE version = ? AND status = 'applied'",
                 (version,),
@@ -1473,7 +1474,7 @@ class MemoryV2Store:
 
     async def record_migration(self, version: str, *, status: str, detail: str = "") -> None:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO memory_v2_migrations(version, backup_dir, status, detail, applied_at)
@@ -1485,7 +1486,7 @@ class MemoryV2Store:
 
     async def migration_report(self) -> dict[str, Any]:
         await self.initialize()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT version, backup_dir, status, detail, applied_at FROM memory_v2_migrations ORDER BY applied_at DESC"
             )
@@ -1539,7 +1540,7 @@ class MemoryV2Store:
         await self.initialize()
         imported = 0
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute("PRAGMA table_info(documents)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
                 text_col = "page_content" if "page_content" in columns else ("content" if "content" in columns else "text")

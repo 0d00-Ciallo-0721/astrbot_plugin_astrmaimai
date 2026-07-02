@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from sqlmodel import desc, select
 
 from .orm_models import Jargon
+from .sqlite_helpers import connect_sqlite
 
 
 class JargonPersistenceMixin:
@@ -66,7 +67,7 @@ class JargonPersistenceMixin:
         visibility = self._canonical_jargon_visibility(status)
         dedup_key = f"jargon:{group_id}:{content.lower()}"
         source_ref = f"legacy_jargon:{group_id}:{content.lower()}"
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_sqlite(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")  # ponytail: prevent SQLITE_BUSY with concurrent readers
             self._ensure_canonical_jargon_schema_sync(conn)
@@ -165,7 +166,7 @@ class JargonPersistenceMixin:
     def _canonical_jargon_rows(self, group_id: str, *, limit: int = 20, include_stale: bool = False) -> List[dict]:
         statuses = ("active", "stale") if include_stale else ("active",)
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with connect_sqlite(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 if group_id:
                     cursor = conn.execute(

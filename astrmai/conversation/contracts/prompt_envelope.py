@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from .focus_context import FreshnessState, ReplyMode
 
@@ -8,32 +9,42 @@ from .focus_context import FreshnessState, ReplyMode
 @dataclass
 class PromptEnvelope:
     # ── Prompt injection defense helpers ────────────────────────────
+    _ESCAPE_TAGS: ClassVar[dict[str, str]] = {
+        "<user_input>": "[escaped:user_input]",
+        "</user_input>": "[escaped:/user_input]",
+        "<retrieved_memory>": "[escaped:retrieved_memory]",
+        "</retrieved_memory>": "[escaped:/retrieved_memory]",
+    }
+
+    @classmethod
+    def _escape_injection_tags(cls, text: str) -> str:
+        """Replace literal closing/opening tags that could break the wrapper."""
+        for tag, escaped in cls._ESCAPE_TAGS.items():
+            text = text.replace(tag, escaped)
+        return text
+
+    @classmethod
+    def sanitize_inline_text(cls, text: str) -> str:
+        """Escape prompt boundary tags without adding a block wrapper."""
+        return cls._escape_injection_tags(str(text or ""))
+
     @staticmethod
     def sanitize_user_input(text: str) -> str:
         """Wrap user-supplied text in boundary tags to prevent prompt injection.
-
-        LLM system prompts should instruct the model to treat only content
-        inside ``<user_input>`` tags as the real user message.
-
-        TODO: migrate callers to security.InputSanitizer.sanitize()
-        """
+        Tags inside the user text are escaped to prevent early closure."""
         if not text or not str(text).strip():
             return str(text or "")
-        return f"<user_input>\n{text}\n</user_input>"
+        safe = PromptEnvelope.sanitize_inline_text(str(text))
+        return f"<user_input>\n{safe}\n</user_input>"
 
     @staticmethod
     def sanitize_memory_content(text: str) -> str:
         """Wrap retrieved-memory content to prevent persistent prompt injection.
-
-        Malicious content stored in memory could contain pseudo-instructions.
-        This tagging allows the system prompt to instruct the model to treat
-        ``<retrieved_memory>`` content as reference only.
-
-        TODO: migrate callers to security.InputSanitizer.sanitize_memory()
-        """
+        Tags inside the memory content are escaped to prevent early closure."""
         if not text or not str(text).strip():
             return str(text or "")
-        return f"<retrieved_memory>\n{text}\n</retrieved_memory>"
+        safe = PromptEnvelope.sanitize_inline_text(str(text))
+        return f"<retrieved_memory>\n{safe}\n</retrieved_memory>"
 
     raw_user_text: str = ""
     recent_transcript: str = ""

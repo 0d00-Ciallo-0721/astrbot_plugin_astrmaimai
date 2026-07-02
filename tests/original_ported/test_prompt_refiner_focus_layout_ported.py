@@ -80,7 +80,7 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         final_system_prompt, final_prompt = asyncio.run(_run())
         self.assertEqual(final_system_prompt, "system prompt only")
         self.assertLess(final_prompt.index("---前因---\nFocus block"), final_prompt.index("---旁边在聊的---\nBob: stay on topic"))
-        self.assertIn("---眼前正在对我说的---\nAlice: why not?", final_prompt)
+        self.assertIn("---眼前正在对我说的---\n<user_input>\nAlice: why not?\n</user_input>", final_prompt)
         self.assertIn("---补充---\nRelated\nAstrMai: no, that is not allowed", final_prompt)
         self.assertIn("Carol: I am reading too", final_prompt)
 
@@ -162,7 +162,7 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertNotIn("---当前状态与约束---", final_prompt)
         self.assertGreater(
             final_prompt.index("---内在驱动---"),
-            final_prompt.index("---眼前正在对我说的---\nAlice: why not?"),
+            final_prompt.index("---眼前正在对我说的---\n<user_input>\nAlice: why not?\n</user_input>"),
         )
 
 
@@ -413,7 +413,7 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
 
         _system_prompt, final_prompt = asyncio.run(_run())
         envelope = event.get_extra("astrmai_prompt_envelope")
-        self.assertIn("---眼前正在对我说的---\nAlice: why not?", final_prompt)
+        self.assertIn("---眼前正在对我说的---\n<user_input>\nAlice: why not?\n</user_input>", final_prompt)
         self.assertIn("---前因---\nFocus block that must stay", final_prompt)
         self.assertIn("---对话记录", final_prompt)
         self.assertIn("Turn 11: recent mainline detail", final_prompt)

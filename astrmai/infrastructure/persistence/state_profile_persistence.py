@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from time import monotonic
 from typing import Any, Dict, Optional
 
-import aiosqlite
-
 from .orm_models import ChatState, LastMessageMetadata
+from .sqlite_helpers import connect_aiosqlite, connect_sqlite
 
 
 class StateProfilePersistenceMixin:
@@ -61,7 +59,7 @@ class StateProfilePersistenceMixin:
         return self._user_profile_cols_cache
 
     async def load_chat_state(self, chat_id: str) -> Optional[ChatState]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
             row = await cursor.fetchone()
             if row:
@@ -116,7 +114,7 @@ class StateProfilePersistenceMixin:
             },
             ensure_ascii=False,
         )
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             now = time.time()
             await db.execute("""
                 INSERT INTO chat_states
@@ -159,7 +157,7 @@ class StateProfilePersistenceMixin:
             await db.commit()
 
     async def load_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             cursor = await db.execute("SELECT * FROM user_profiles WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
             if row:
@@ -195,7 +193,7 @@ class StateProfilePersistenceMixin:
     def load_all_user_profiles(self) -> Dict[str, Dict[str, Any]]:
         """Load all user profiles into a structured dictionary."""
         profiles: Dict[str, Dict[str, Any]] = {}
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_sqlite(self.db_path) as conn:
             row_cursor = conn.execute("SELECT * FROM user_profiles")
             rows = row_cursor.fetchall()
             cols_cursor = conn.execute("PRAGMA table_info(user_profiles)")
@@ -245,7 +243,7 @@ class StateProfilePersistenceMixin:
         preference_points_json = json.dumps(getattr(profile, "preference_points", []), ensure_ascii=False)
         relationship_points_json = json.dumps(getattr(profile, "relationship_points", []), ensure_ascii=False)
         speech_style_points_json = json.dumps(getattr(profile, "speech_style_points", []), ensure_ascii=False)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO user_profiles 
                 (user_id, name, social_score, last_seen, persona_analysis, message_count_for_profiling,
@@ -266,7 +264,7 @@ class StateProfilePersistenceMixin:
 
     async def add_last_message_meta(self, chat_id: str, sender_id: str, has_image: bool, image_urls: list):
         """Persist last message metadata for multimodal context."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with connect_aiosqlite(self.db_path) as db:
             await db.execute("""
                 INSERT INTO lastmessagemetadatadb 
                 (chat_id, sender_id, has_image, image_urls, vl_executed, timestamp)

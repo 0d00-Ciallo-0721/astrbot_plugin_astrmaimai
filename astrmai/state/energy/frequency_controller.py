@@ -158,7 +158,7 @@ class FrequencyController:
         """外部调用：收到新消息时更新最后消息时间"""
         with self._records_lock:
             record = self._get_record(chat_id)
-            record.last_message_time = monotonic()
+            record.last_message_time = time.time()
 
     # ==========================================
     # 内部工具

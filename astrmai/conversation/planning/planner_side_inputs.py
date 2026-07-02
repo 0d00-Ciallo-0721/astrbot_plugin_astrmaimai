@@ -714,7 +714,9 @@ class PlannerSideInputMixin:
                 "等拿到结果后，再用我自己的语气告诉 ta。"
             )
         if is_all_mode:
-            user_message = self._truncate_runtime_instruction_text(getattr(event, "message_str", ""), 80)
+            user_message = PromptEnvelope.sanitize_inline_text(
+                self._truncate_runtime_instruction_text(getattr(event, "message_str", ""), 80)
+            )
             lines.append(f'对方刚才说的是：“{user_message}”。我这轮就先接住这一条来回。')
         if is_fast_mode:
             lines.append("有人在喊我，我得马上用简短直接的话接住这次呼唤，不绕远路。")

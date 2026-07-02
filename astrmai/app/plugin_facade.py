@@ -95,6 +95,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             self.runtime.rebuild_infrastructure_settings()
 
         # ponytail: refresh all components that hold cached config references
+        _failed = []
         components = [
             ("gateway", getattr(self.runtime, "gateway", None)),
             ("lane_manager", getattr(self.runtime, "lane_manager", None)),
@@ -114,12 +115,13 @@ class PluginFacade(RuntimeFacadeProtocol):
                     comp.refresh_config(parsed_config)
                 except Exception as exc:
                     logger.warning(f"[AstrMai] refresh_config failed for {name}: {exc}")
-
-        # ponytail: log overall hot-apply status for version skew visibility
-        logger.info(f"[AstrMai] hot-apply complete, config reloaded for {len(components)} components")
+                    _failed.append(name)
 
         if hasattr(self.runtime, "sync_host_compat_attrs"):
             self.runtime.sync_host_compat_attrs()
+        if _failed:
+            logger.warning(f"[AstrMai] hot-apply partial failure, failed components: {_failed}")
+            return False
         return True
 
     # ── narrow-domain methods for ingress / message_entry ──
