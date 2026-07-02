@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from time import monotonic
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -136,7 +137,7 @@ class GroupReplyWaitManager:
             thread_signature=str(event.get_extra("astrmai_thread_signature", "") or ""),
             reply_mode=str(event.get_extra("astrmai_reply_mode", "") or ""),
             root_event_identity=str(event.get_extra("astrmai_focus_thread_root_reason", "") or ""),
-            expires_at=time.time() + self.timeout_sec,
+            expires_at=monotonic() + self.timeout_sec,
             remaining_messages=self.message_budget,
         )
         with self._states_lock:
@@ -148,6 +149,14 @@ class GroupReplyWaitManager:
             f"[GroupWait] armed wait for chat={chat_id}, target={target_user_id}, reason={reason}, budget={self.message_budget}, timeout={self.timeout_sec}s"
         )
         self._arm_timeout_task(chat_id, state)
+        event.set_extra("astrmai_group_wait", {
+            "chat_id": chat_id,
+            "target_user_id": target_user_id,
+            "target_name": target_name,
+            "reason": reason,
+            "expires_at": state.expires_at,
+            "thread_signature": state.thread_signature,
+        })
         return True
 
     def handle_incoming_message(self, event: AstrMessageEvent) -> str:
@@ -159,7 +168,7 @@ class GroupReplyWaitManager:
         action = "NONE"
         resume_payload = None
         log_target = ""
-        now = time.time()
+        now = monotonic()
         sender_id = str(event.get_sender_id() or "")
         with self._states_lock:
             state = self._states.get(chat_id)

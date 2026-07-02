@@ -66,6 +66,19 @@ class GroupDialogueStore:
         return thread
 
     @staticmethod
+    def _resolve_chat_key(chat_id) -> str:
+        """Resolve chat_id to a dict key, rejecting None/empty values.
+        
+        ponytail: prevents legacy empty-string fallback coercion
+        when chat_id is None, which would cause all None-chat_id calls to share
+        the same DialogueThread.
+        """
+        key = (str(chat_id) if chat_id is not None else "").strip()
+        if not key:
+            raise ValueError("chat_id must be a non-empty string, got %r" % chat_id)
+        return key
+
+    @staticmethod
     def _estimate_tokens(content: str) -> int:
         text = str(content or "").strip()
         if not text:
@@ -109,21 +122,21 @@ class GroupDialogueStore:
             is_image_only=bool(is_image_only),
         )
         async with self._lock:
-            thread = self._get_thread(str(chat_id or ""))
+            thread = self._get_thread(self._resolve_chat_key(chat_id))
             async with thread.lock:
                 thread.segments.append(segment)
         return segment
 
     async def set_cold_summary(self, chat_id: str, summary: str) -> None:
         async with self._lock:
-            thread = self._get_thread(str(chat_id or ""))
+            thread = self._get_thread(self._resolve_chat_key(chat_id))
             async with thread.lock:
                 thread.cold_summary = str(summary or "").strip()
                 thread.cold_summary_structure = None
 
     async def get_cold_summary(self, chat_id: str) -> str:
         async with self._lock:
-            thread = self._threads.get(str(chat_id or ""))
+            thread = self._threads.get(self._resolve_chat_key(chat_id))
             if not thread:
                 return ""
             async with thread.lock:
@@ -131,13 +144,13 @@ class GroupDialogueStore:
 
     async def set_cold_summary_structure(self, chat_id: str, structure: ColdSummaryStructure | None) -> None:
         async with self._lock:
-            thread = self._get_thread(str(chat_id or ""))
+            thread = self._get_thread(self._resolve_chat_key(chat_id))
             async with thread.lock:
                 thread.cold_summary_structure = structure
 
     async def get_cold_summary_structure(self, chat_id: str) -> ColdSummaryStructure | None:
         async with self._lock:
-            thread = self._threads.get(str(chat_id or ""))
+            thread = self._threads.get(self._resolve_chat_key(chat_id))
             if not thread:
                 return None
             async with thread.lock:
@@ -152,7 +165,7 @@ class GroupDialogueStore:
 
     async def peek_old_segments(self, chat_id: str, *, keep_recent_segments: int = 12) -> list[DialogueSegment]:
         async with self._lock:
-            thread = self._threads.get(str(chat_id or ""))
+            thread = self._threads.get(self._resolve_chat_key(chat_id))
             if not thread:
                 return []
             async with thread.lock:
@@ -164,7 +177,7 @@ class GroupDialogueStore:
 
     async def commit_drain_old_segments(self, chat_id: str, *, keep_recent_segments: int = 12) -> list[DialogueSegment]:
         async with self._lock:
-            thread = self._threads.get(str(chat_id or ""))
+            thread = self._threads.get(self._resolve_chat_key(chat_id))
             if not thread:
                 return []
             async with thread.lock:
@@ -573,7 +586,7 @@ class GroupDialogueStore:
         max_age_seconds: float | None = None,
         max_tokens: int | None = None,
     ) -> WarmContextBundle:
-        chat_key = str(chat_id or "")
+        chat_key = self._resolve_chat_key(chat_id)
         max_age_seconds = self.warm_zone_ttl_seconds if max_age_seconds is None else float(max_age_seconds)
         max_tokens = self.warm_zone_max_tokens if max_tokens is None else int(max_tokens)
         now = time.time()
@@ -618,7 +631,7 @@ class GroupDialogueStore:
 
     async def snapshot_compaction_candidates(self, chat_id: str, *, keep_recent_segments: int = 16) -> dict[str, Any]:
         async with self._lock:
-            thread = self._threads.get(str(chat_id or ""))
+            thread = self._threads.get(self._resolve_chat_key(chat_id))
             if not thread:
                 return {
                     "active_segments": 0,
@@ -651,7 +664,7 @@ class GroupDialogueStore:
 
     async def snapshot_counts(self, chat_id: str) -> dict[str, Any]:
         async with self._lock:
-            thread = self._threads.get(str(chat_id or ""))
+            thread = self._threads.get(self._resolve_chat_key(chat_id))
             if not thread:
                 return {"segments": 0, "tokens": 0, "has_summary": False, "message_load": 0.0}
             async with thread.lock:

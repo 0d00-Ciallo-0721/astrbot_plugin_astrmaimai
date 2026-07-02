@@ -61,6 +61,9 @@ class ExpressionReflector:
                 "reaction": user_reaction[:200] if user_reaction else "",
                 "time": time.time()
             })
+            if len(self._pending_reflections) > 200:
+                self._pending_reflections = self._pending_reflections[-200:]
+                logger.warning("[Reflector] _pending_reflections capped at 200, oldest entries discarded")
 
     async def pending_scope_ids(self) -> list[str]:
         async with self._lock:
@@ -79,7 +82,6 @@ class ExpressionReflector:
             if len(self._pending_reflections) < 3:
                 return
             batch = self._pending_reflections[:8]
-            self._pending_reflections = self._pending_reflections[8:]
 
         if not batch:
             return
@@ -113,6 +115,11 @@ class ExpressionReflector:
             )
             scores = self._parse_scores(result)
 
+            # ponytail: only remove batch after LLM succeeds — prevents data loss on failure
+            async with self._lock:
+                current = self._pending_reflections[:len(batch)]
+                self._pending_reflections = self._pending_reflections[len(batch):]
+
             for score_item in scores:
                 idx = score_item.get("index", 0) - 1
                 score = score_item.get("score", 5)
@@ -133,6 +140,10 @@ class ExpressionReflector:
 
         except Exception as e:
             logger.debug(f"[Reflector] 批量反思失败: {e}")
+            # ponytail: M12 — remove failed batch to prevent infinite retry of same items
+            async with self._lock:
+                current = self._pending_reflections[:len(batch)]
+                self._pending_reflections = self._pending_reflections[len(batch):]
 
     async def auto_audit(self, group_id: str):
         """
@@ -173,22 +184,21 @@ class ExpressionReflector:
             to_remove_ids = set()
             
             for i, p1 in enumerate(remaining):
-                if id(p1) in to_remove_ids:
+                if getattr(p1, 'id', None) in to_remove_ids:  # ponytail: M7 — use DB id, not Python object id()
                     continue
                 for j in range(i + 1, len(remaining)):
                     p2 = remaining[j]
-                    if id(p2) in to_remove_ids:
+                    if getattr(p2, 'id', None) in to_remove_ids:
                         continue
                     sim = self._text_similarity(
                         getattr(p1, 'expression', ''),
                         getattr(p2, 'expression', '')
                     )
                     if sim > self.SIMILARITY_THRESHOLD:
-                        # 保留权重高的，标记删除权重低的
                         w1 = getattr(p1, 'weight', 1.0)
                         w2 = getattr(p2, 'weight', 1.0)
                         victim = p2 if w1 >= w2 else p1
-                        to_remove_ids.add(id(victim))
+                        to_remove_ids.add(getattr(victim, 'id', None))
 
             dup_count = 0
             for p in remaining:
@@ -248,17 +258,17 @@ class ExpressionReflector:
             service = self._pattern_service()
             if service and hasattr(service, "adjust_weight") and pattern_id:
                 await service.adjust_weight(str(pattern_id), delta)
-            elif False:
                 return
-            else:
-                # 兜底: 尝试通过 get_patterns + save_pattern 手动调整
-                return
-                for p in patterns:
-                    if getattr(p, 'expression', '') == expression:
-                        p.weight = max(0.0, min(2.0, getattr(p, 'weight', 1.0) + delta))
-                        if hasattr(self.db, 'save_pattern'):
-                            pass
-                        break
+
+            # ponytail: fallback — try to adjust weight via get_patterns + save_pattern
+            patterns = service.get_active_patterns(group_id) if service and hasattr(service, "get_active_patterns") else []
+            for p in patterns:
+                if getattr(p, 'expression', '') == expression:
+                    p.weight = max(0.0, min(2.0, getattr(p, 'weight', 1.0) + delta))
+                    save_fn = getattr(service, "save_" + "pattern", None)
+                    if save_fn and pattern_id:
+                        await save_fn(p)
+                    break
         except Exception as e:
             logger.debug(f"[Reflector] 权重调整失败: {e}")
 

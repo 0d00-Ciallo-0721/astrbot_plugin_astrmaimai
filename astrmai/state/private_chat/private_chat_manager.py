@@ -1,5 +1,6 @@
 import asyncio
 import time
+from time import monotonic
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -25,7 +26,37 @@ class PrivateChatManager:
         self._sessions: Dict[str, PrivateSession] = {}
         self._chat_to_user: Dict[str, str] = {}
         self._cleanup_lock = asyncio.Lock()
+        self._host_plugin = None  # set by lifecycle manager
         self._init_timeout(config)
+
+    def refresh_config(self, config):
+        self.config = config
+
+    def set_host_plugin(self, host_plugin) -> None:
+        """Inject host plugin reference for KV storage access."""
+        self._host_plugin = host_plugin
+
+    async def _persist_pending_sessions(self) -> None:
+        """Persist active session IDs to KV storage for restart recovery."""
+        if not self._host_plugin:
+            return
+        try:
+            active_ids = list(self._sessions.keys())
+            await self._host_plugin.put_kv_data("pending_private_sessions", active_ids)
+        except Exception:
+            logger.warning("[AstrMai-private-chat] persist pending sessions failed", exc_info=True)
+
+    async def _cleanup_stale_pending_sessions(self) -> None:
+        """Clean up stale pending session IDs from previous run."""
+        if not self._host_plugin:
+            return
+        try:
+            pending = await self._host_plugin.get_kv_data("pending_private_sessions", default=[])
+            if pending:
+                logger.info(f"[PrivateChat] cleaned up {len(pending)} stale pending sessions from previous run")
+                await self._host_plugin.put_kv_data("pending_private_sessions", [])
+        except Exception:
+            logger.warning("[AstrMai-private-chat] cleanup stale sessions failed", exc_info=True)
 
     @staticmethod
     def _session_key(user_id: str, chat_id: str = "") -> str:
@@ -55,7 +86,7 @@ class PrivateChatManager:
     async def signal_new_message(self, user_id: str, message_str: str = "", chat_id: str = ""):
         session = self._get_or_create_session(user_id, chat_id)
         self._bind_chat_session(chat_id, user_id)
-        session.last_message_time = time.time()
+        session.last_message_time = monotonic()
         session.turn_count += 1
 
         if message_str:
@@ -110,7 +141,7 @@ class PrivateChatManager:
             "turn_count": session.turn_count,
             "is_bot_waiting": session.is_bot_waiting,
             "last_message_time": session.last_message_time,
-            "silence_sec": time.time() - session.last_message_time,
+            "silence_sec": monotonic() - session.last_message_time,
         }
 
     def get_session_info_by_chat_id(self, chat_id: str) -> Optional[dict]:
@@ -137,7 +168,7 @@ class PrivateChatManager:
 
     async def cleanup_stale_sessions(self, max_silence_min: float = 30.0):
         async with self._cleanup_lock:
-            now = time.time()
+            now = monotonic()
             stale = []
             for uid, session in self._sessions.items():
                 silence_min = (now - session.last_message_time) / 60.0
@@ -145,6 +176,14 @@ class PrivateChatManager:
                     stale.append(uid)
             for uid in stale:
                 self.close_session(uid)
+            # ponytail: belt-and-suspenders — close_session handles _chat_to_user by user_id,
+            # but also sweep any orphaned chat_id mappings
+            orphaned_chat_ids = [
+                cid for cid, mapped_uid in list(self._chat_to_user.items())
+                if mapped_uid in stale
+            ]
+            for cid in orphaned_chat_ids:
+                self._chat_to_user.pop(cid, None)
             if stale:
                 logger.debug(f"[PrivateChat] cleaned {len(stale)} stale sessions")
 

@@ -15,9 +15,10 @@
 3. 一次性 LLM 调用 → 生成各话题段落的摘要
 4. 写入记忆引擎 (附带话题标签)
 """
-import time
-import re
+import json
 import math
+import re
+import time
 from typing import Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -363,7 +364,6 @@ class TopicSummarizer:
     @staticmethod
     def _parse_summaries(raw, expected_count: int) -> List[str]:
         """安全解析摘要数组"""
-        import json
         items = []
         if isinstance(raw, list):
             items = raw
@@ -373,6 +373,7 @@ class TopicSummarizer:
                 try:
                     items = json.loads(match.group(0))
                 except Exception:
+                    logger.debug("[TopicSummarizer] _parse_summaries JSON parse failed", exc_info=True)
                     pass
 
         # 确保数量对齐

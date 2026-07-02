@@ -1698,6 +1698,31 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "boom"):
             asyncio.run(service.list_pending())
 
+    def test_review_ui_service_gracefully_handles_missing_canonical_memories_table(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.review_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "empty.db"
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                service = service_mod.ReviewUiService(adapter_mod.PluginApiAdapter(facade=None), _db_factory)
+                return await service.list_pending(), await service.list_reviews(page_size=10)
+
+        pending, reviews = asyncio.run(_run())
+        self.assertEqual(pending, [])
+        self.assertEqual(reviews["items"], [])
+        self.assertEqual(reviews["total"], 0)
+
     def test_admin_expression_stats_reads_canonical_expression_patterns(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
@@ -1785,6 +1810,99 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
                 service = service_mod.AdminUiService(adapter_mod.PluginApiAdapter(facade=None), _db_factory)
                 return await service.expression_stats()
+
+        stats = asyncio.run(_run())
+        self.assertEqual(stats["data"]["total"], 3)
+        self.assertEqual(stats["data"]["pending"], 1)
+        self.assertEqual(stats["data"]["approved"], 1)
+        self.assertEqual(stats["data"]["rejected"], 1)
+
+    def test_learning_expression_stats_reuses_canonical_expression_counts(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.learningservice")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "learning.db"
+                async with aiosqlite.connect(db_path) as db:
+                    await db.executescript(
+                        """
+                        CREATE TABLE canonical_memories (
+                            id TEXT PRIMARY KEY,
+                            session_id TEXT,
+                            persona_id TEXT,
+                            source TEXT,
+                            kind TEXT,
+                            content TEXT,
+                            summary TEXT,
+                            tags TEXT,
+                            importance REAL,
+                            confidence REAL,
+                            status TEXT,
+                            decay_score REAL,
+                            create_time REAL,
+                            update_time REAL,
+                            last_access_time REAL,
+                            access_count INTEGER,
+                            superseded_by TEXT,
+                            deleted_reason TEXT,
+                            metadata TEXT,
+                            dedup_key TEXT,
+                            source_ref TEXT,
+                            visibility TEXT
+                        );
+                        """
+                    )
+                    rows = [
+                        ("expr-1", "review_pending", {"review_status": "pending"}),
+                        ("expr-2", "active", {"review_status": "approved"}),
+                        ("expr-3", "rejected", {"review_status": "rejected"}),
+                    ]
+                    for memory_id, status, metadata in rows:
+                        await db.execute(
+                            """
+                            INSERT INTO canonical_memories (
+                                id, session_id, source, kind, content, summary, tags, importance, confidence, status,
+                                decay_score, create_time, update_time, last_access_time, access_count, superseded_by,
+                                deleted_reason, metadata, dedup_key, source_ref, visibility
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                memory_id,
+                                "group-1",
+                                "learning_expression_pattern",
+                                "expression_pattern",
+                                "expr",
+                                "expr",
+                                "[]",
+                                0.6,
+                                0.7,
+                                status,
+                                1.0,
+                                1.0,
+                                2.0,
+                                1.0,
+                                0,
+                                "",
+                                "",
+                                json.dumps(metadata),
+                                memory_id,
+                                "test",
+                                "maintenance_only",
+                            ),
+                        )
+                    await db.commit()
+
+                original_db_path = os.environ.get("ASTRMAI_DB_PATH")
+                try:
+                    os.environ["ASTRMAI_DB_PATH"] = str(db_path)
+                    service = service_mod.LearningService(adapter_mod.PluginApiAdapter(facade=None))
+                    return await service.expression_stats()
+                finally:
+                    if original_db_path is None:
+                        os.environ.pop("ASTRMAI_DB_PATH", None)
+                    else:
+                        os.environ["ASTRMAI_DB_PATH"] = original_db_path
 
         stats = asyncio.run(_run())
         self.assertEqual(stats["data"]["total"], 3)

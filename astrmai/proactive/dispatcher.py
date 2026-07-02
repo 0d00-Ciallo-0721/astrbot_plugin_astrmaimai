@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from time import monotonic
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -215,7 +216,7 @@ class ProactiveDispatcher:
                     except (TypeError, ValueError):
                         cooldown_seconds = 0.0
                     if cooldown_seconds > 0:
-                        cooldown_until = time.time() + cooldown_seconds
+                        cooldown_until = monotonic() + cooldown_seconds
                         self._cooldowns[str(item.get("chat_id", "") or "")] = cooldown_until
                 decision = payload
                 break
@@ -298,19 +299,26 @@ class ProactiveDispatcher:
                 "astrmai_force_engage": True,
             },
         }
-        original_runtime_coordinator = getattr(self.attention_gate, "runtime_coordinator", None)
-        runtime_coordinator_detached = False
-        if hasattr(self.attention_gate, "runtime_coordinator"):
+        async def _inject_event():
+            # ponytail: per-chat flag instead of global setattr to avoid blocking concurrent messages
+            chat_id = intent.chat_id
+            self.attention_gate._proactive_dispatching[chat_id] = True
             try:
-                setattr(self.attention_gate, "runtime_coordinator", None)
-                runtime_coordinator_detached = True
-            except Exception:
-                runtime_coordinator_detached = False
-        try:
-            result = await self.attention_gate.inject_external_event(intent.chat_id, event_data)
-        finally:
-            if runtime_coordinator_detached:
-                setattr(self.attention_gate, "runtime_coordinator", original_runtime_coordinator)
+                return await self.attention_gate.inject_external_event(intent.chat_id, event_data)
+            finally:
+                self.attention_gate._proactive_dispatching.pop(chat_id, None)
+                if hasattr(self.attention_gate, "drain_deferred_messages"):
+                    await self.attention_gate.drain_deferred_messages(chat_id)
+
+        if not hasattr(self.attention_gate, "_proactive_dispatching"):
+            self.attention_gate._proactive_dispatching = {}
+        lock_getter = getattr(self.attention_gate, "get_proactive_lock", None)
+        if callable(lock_getter):
+            injection_lock = lock_getter(intent.chat_id)
+            async with injection_lock:
+                result = await _inject_event()
+        else:
+            result = await _inject_event()
         decision.synthetic_event_queued = bool(result)
         if not decision.reply_sent:
             decision.status = "queued" if decision.synthetic_event_queued else "skipped"

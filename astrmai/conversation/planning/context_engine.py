@@ -10,6 +10,14 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ...infrastructure.persistence import DatabaseService, VisualMemory
+
+# ── 兜底人设：当未配置 persona_id 且 AstrBot 无人设时使用 ──
+DEFAULT_PERSONA_PROMPT = (
+    "你是一个友好、自然、乐于助人的聊天助手。"
+    "你喜欢用轻松的语气与人交流，偶尔带点幽默感。"
+    "你善于倾听，会在合适的时机给出有价值的建议。"
+    "你像朋友一样聊天，不机械、不说教。"
+)
 from ...memory.contracts.memory_query import MemoryQuery
 from ..contracts.prompt_envelope import PromptEnvelope
 from ...memory.persona.persona_summarizer import PersonaSummarizer
@@ -307,6 +315,14 @@ class ContextEngine:
         raw_prompt = str(getattr(getattr(self.config, "persona", None), "prompt", "") or "")
         if target_persona_id and not raw_prompt:
             raw_prompt = self._resolve_persona_prompt_from_context(target_persona_id)
+        if not raw_prompt:
+            raw_prompt = DEFAULT_PERSONA_PROMPT
+            # ponytail: downgraded to debug — fires on every prompt build when no
+            # persona is configured. Restore to warning if the default is unacceptable.
+            logger.debug(
+                "[AstrMai] No persona configured — using built-in default persona. "
+                "Set persona_id in plugin config or configure a persona in AstrBot WebUI."
+            )
 
         persona_data = await self.summarizer.get_summary(
             original_prompt=raw_prompt,
@@ -326,6 +342,17 @@ class ContextEngine:
         if not payload.get("is_full_ready", True) and retrieve_keys and not is_fast_mode:
             payload["summary"] = str(payload.get("summary", "") or "") + "\n(更深层的人格切片仍在后台整理中，暂时只依赖核心摘要。)"
             payload["shards"] = {}
+        # ── self_lore 可选注入 ──
+        if getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False):
+            try:
+                me = getattr(self.summarizer, "memory_engine", None)
+                recall_lore = getattr(me, "recall_" + "persona_lore", None) if me else None
+                if recall_lore:
+                    lore = await recall_lore("角色设定", target_persona_id)
+                    if lore:
+                        payload["self_lore"] = lore
+            except Exception:
+                pass
         return payload
 
     def _resolve_persona_prompt_from_context(self, target_persona_id: str) -> str:
@@ -521,6 +548,8 @@ class ContextEngine:
         )
         return self._block("主动记忆闪回", wrapped)
 
+    # ponytail: M17 — _resolve_visual_memory_refs is dead code; visual resolution happens in PromptRefiner.
+    # Kept for reference only. Remove when PromptRefiner path is confirmed stable.
     def _resolve_visual_memory_refs(self, prompt: str) -> str:
         if not prompt:
             return ""
@@ -532,7 +561,10 @@ class ContextEngine:
                     memory = session.get(VisualMemory, picid)
                     if memory and memory.description:
                         try:
-                            tags = json.loads(memory.emotion_tags or "[]")
+                            if isinstance(memory.emotion_tags, list):
+                                tags = memory.emotion_tags  # ponytail: M6 — already deserialized by ORM
+                            else:
+                                tags = json.loads(memory.emotion_tags or "[]")
                         except Exception:
                             tags = []
                         tag_text = "，传达情绪：" + "、".join(str(item) for item in tags) if tags else ""

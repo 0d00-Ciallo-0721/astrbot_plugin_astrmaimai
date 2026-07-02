@@ -218,6 +218,7 @@ class PlannerSideInputMixin:
             _load_slang(),
             _load_expressions(),
             _load_jargons(),
+            return_exceptions=True,
         )
         goal_text = await _load_goals()
         return {
@@ -389,6 +390,20 @@ class PlannerSideInputMixin:
     ):
         if is_tool_call_mode:
             sys3_light_tools = (await self.sys3_router.get_light_tools_for_planner()).tools
+            # ponytail: M5 — seed seen_names with built-in tool names to prevent SubAgent collision
+            seen_names: set[str] = {
+                self._canonical_tool_name(WaitTool()),
+                self._canonical_tool_name(OmniPerceptionTool(memory_engine=None, memory_tool_service=None, db_service=None, chat_id="", current_sender_id="", current_sender_name="")),
+                self._canonical_tool_name(SelfLoreQueryTool(memory_engine=None, memory_tool_service=None, persona_id="")),
+            }
+            deduped_sys3_tools: list = []
+            for tool in sys3_light_tools:
+                name = getattr(tool, "name", "")
+                if name in seen_names:
+                    logger.warning(f"[Planner] duplicate tool name '{name}' in sys3 tools, skipped")
+                    continue
+                seen_names.add(name)
+                deduped_sys3_tools.append(tool)
             target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
             memory_tool_service = getattr(self.memory_engine, "tool_service", None)
             self._set_disable_rag_injection(ctx, True)
@@ -408,7 +423,7 @@ class PlannerSideInputMixin:
                     memory_tool_service=memory_tool_service,
                     persona_id=target_persona_id,
                 ),
-            ] + sys3_light_tools
+            ] + deduped_sys3_tools
             turn_tools = ensure_turn_context(event).tools
             tool_names = [
                 self._canonical_tool_name(tool)

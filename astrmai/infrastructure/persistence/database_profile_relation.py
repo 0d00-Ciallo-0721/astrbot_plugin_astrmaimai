@@ -3,6 +3,7 @@ import re
 import time
 from typing import List, Optional
 
+from astrbot.api import logger
 from sqlmodel import desc, select
 
 from .orm_models import MessageLog, SocialRelation, UserProfile
@@ -15,10 +16,18 @@ class ProfileRelationPersistenceMixin:
         profiles = self.persistence.load_all_user_profiles()
         for profile_data in profiles.values():
             if profile_data.get("name") == name:
-                return UserProfile(**profile_data)
+                try:
+                    return UserProfile(**profile_data)
+                except Exception:
+                    logger.warning("[AstrMai-profile] construction failed", exc_info=True)
+                    return None
         for profile_data in profiles.values():
             if profile_data.get("nickname") == name:
-                return UserProfile(**profile_data)
+                try:
+                    return UserProfile(**profile_data)
+                except Exception:
+                    logger.warning("[AstrMai-profile] construction failed", exc_info=True)
+                    return None
         return None
 
     def update_social_relation(

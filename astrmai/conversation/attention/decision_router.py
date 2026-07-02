@@ -19,6 +19,7 @@ class AttentionDecisionRouter:
 
     def __init__(self, gate: Any):
         self.gate = gate
+        self._consecutive_timeouts = 0
 
     @staticmethod
     def build_judge_window_message(events: list[Any]) -> str:
@@ -62,6 +63,8 @@ class AttentionDecisionRouter:
                 except Exception as exc:
                     logger.debug(f"[AttentionGate] primary mood update degraded: {exc}")
         message = self.build_judge_window_message(events) or str(getattr(focus_event, "message_str", "") or "")
+        # ponytail: judgment timeout configurable; default 3.0s (was 2.0s) for cold-start LLM resilience
+        judge_timeout = float(getattr(getattr(self.gate, "config", None), "judge_timeout", 3.0) or 3.0)
         try:
             result = await asyncio.wait_for(
                 self.gate.judge.evaluate(
@@ -75,26 +78,31 @@ class AttentionDecisionRouter:
                     window_events=events,
                     focus_event=focus_event,
                 ),
-                timeout=2.0,
+                timeout=judge_timeout,
             )
         except TypeError:
             try:
                 result = await asyncio.wait_for(
                     self.gate.judge.evaluate(chat_id, message, False, "", len(events), False),
-                    timeout=2.0,
+                    timeout=judge_timeout,
                 )
             except Exception as exc:
                 logger.debug(f"[AttentionGate] Judge degraded: {exc}")
                 return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_degraded")
         except asyncio.TimeoutError:
-            logger.debug(f"[AttentionGate] Judge timeout for {chat_id}; pass through")
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts % 10 == 1:
+                logger.warning(
+                    f"[AttentionGate] Judge timeout x{self._consecutive_timeouts} for {chat_id}; passing through"
+                )
             return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_timeout")
         except Exception as exc:
             logger.debug(f"[AttentionGate] Judge degraded: {exc}")
             return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_degraded")
 
         raw_action = str(getattr(result, "action", "PASS") or "PASS").upper()
-        if raw_action in {"WAIT", "IGNORE"}:
+        self._consecutive_timeouts = 0  # 重置计数器
+        if raw_action in {"WAIT", "IGNORE", "TOOL_CALL"}:
             return AttentionDecision(action=raw_action, raw_action=raw_action, reason="judge_gate")
         return AttentionDecision(action="PASS", raw_action=raw_action, reason="judge_pass")
 

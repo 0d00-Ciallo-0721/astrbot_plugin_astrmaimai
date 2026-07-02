@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from time import monotonic
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -29,7 +30,7 @@ class AgencyRuntimeStore:
         self._by_chat: dict[str, list[AgencyReflection]] = {}
 
     def recent(self, chat_id: str, *, now: float | None = None) -> list[AgencyReflection]:
-        now = time.time() if now is None else now
+        now = monotonic() if now is None else now
         kept = [
             item
             for item in self._by_chat.get(chat_id, [])
@@ -40,7 +41,7 @@ class AgencyRuntimeStore:
         return kept
 
     def cooldown_tags(self, chat_id: str, *, within_seconds: float = 10 * 60) -> set[str]:
-        now = time.time()
+        now = monotonic()
         tags: set[str] = set()
         for item in self.recent(chat_id, now=now):
             if now - item.timestamp <= within_seconds:

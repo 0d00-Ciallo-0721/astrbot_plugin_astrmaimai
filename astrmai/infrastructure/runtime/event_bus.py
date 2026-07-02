@@ -2,6 +2,8 @@
 import asyncio
 from typing import Callable, List, Dict, Any
 
+from ...shared.helpers.plugin_helpers import safe_create_task
+
 class EventBus:
     """
     事件总线 (Infrastructure Layer)
@@ -36,8 +38,10 @@ class EventBus:
         
         # 🟢 [深层修复 Bug 4] 引入 MPSC 有界缓冲队列与消费者状态，防止风暴击穿事件循环
         self._event_queue = asyncio.Queue(maxsize=1000)
+        self._dropped_count = 0
         self._workers_started = False
         self._background_tasks = set()
+        self._worker_tasks: set = set()  # ponytail: worker-only tracking (R8)
 
     # ==========================
     # 基础 Event 触发机制 (遗留兼容)
@@ -56,18 +60,25 @@ class EventBus:
         [彻底修复 Bug 4] 剔除高并发下导致竞态条件的 asyncio.Event .clear()，
         防止事件丢失，直接依赖稳定的 pub/sub 路由广播。
         """
-        # 保留 .set() 以防部分兼容旧代码依赖原生 asyncio.Event (如未及升级的挂起锁)
         self.affection_changed.set()
-        
-        # 直接使用强大的混合引用路由发布事件，不执行带有让出性质的 sleep 和容易吞噬事件的 clear()
         await self.publish(self.TOPIC_AFFECTION_CHANGED)
+        self.affection_changed.clear()
 
     def trigger_knowledge_update(self):
         self.knowledge_updated.set()
         try:
-            asyncio.get_running_loop().create_task(self.publish(self.TOPIC_KNOWLEDGE_UPDATED))
+            safe_create_task(
+                self._clear_knowledge_after_publish(),
+                name="eventbus:knowledge_update",
+                track_set=self._background_tasks,
+            )
         except RuntimeError:
             pass
+
+    async def _clear_knowledge_after_publish(self):
+        await self.publish(self.TOPIC_KNOWLEDGE_UPDATED)
+        await asyncio.sleep(0.1)
+        self.knowledge_updated.clear()
 
     async def publish_learning_message_recorded(self, payload: dict):
         await self.publish(self.TOPIC_LEARNING_MESSAGE_RECORDED, payload)
@@ -147,10 +158,10 @@ class EventBus:
                     try:
                         # 🟢 [核心修复 Bug 3] Fire-and-Forget 模式：绝对不要在此处 await 阻塞 Worker！
                         if asyncio.iscoroutinefunction(callback):
-                            task = asyncio.create_task(callback(data))
-                            # 挂载异常钩子，防止背景任务静默崩溃
-                            task.add_done_callback(
-                                lambda t, cb=callback: logger.error(f"[EventBus] Topic '{topic}' 异步回调异常 {cb}: {t.exception()}") if t.exception() else None
+                            safe_create_task(
+                                callback(data),
+                                name=f"eventbus:{topic}",
+                                track_set=self._background_tasks,
                             )
                         else:
                             callback(data)
@@ -162,6 +173,22 @@ class EventBus:
                 break
             except Exception as e:
                 logger.error(f"[EventBus] Worker loop runtime error: {e}")
+
+    async def _worker_health_check(self):
+        """每 30s 检查 worker 数量，不足时自动补足至 3 个。"""
+        # ponytail: _workers_started is never toggled False during normal operation,
+        # but serves as a safety sentinel for clean shutdown via stop().
+        while self._workers_started:
+            await asyncio.sleep(30)
+            # ponytail: only count _worker_tasks, not dispatch tasks (R8)
+            active = sum(1 for t in list(self._worker_tasks) if not t.done())
+            needed = 3 - active
+            for _ in range(max(0, needed)):
+                t = safe_create_task(self._worker_loop())
+                self._background_tasks.add(t)
+                self._worker_tasks.add(t)
+            if needed > 0:
+                logger.warning(f"[EventBus] restarted {needed} worker(s), now {active + needed} total")
     # [修改]
     async def publish(self, topic: str, data: dict = None): 
         """
@@ -178,12 +205,33 @@ class EventBus:
         if not self._workers_started:
             self._workers_started = True
             for _ in range(3):  # 拉起 3 个稳定常驻 Worker
-                task = asyncio.create_task(self._worker_loop())
+                task = safe_create_task(self._worker_loop())
                 self._background_tasks.add(task)
+                self._worker_tasks.add(task)
+            t = safe_create_task(self._worker_health_check())  # 健康检查
+            self._background_tasks.add(t)
         
         try:
             # 使用 nowait 防止高频事件反向阻塞关键请求链路，溢出时告警
             self._event_queue.put_nowait((topic, data))
         except asyncio.QueueFull:
+            self._dropped_count += 1
             from astrbot.api import logger
-            logger.warning(f"[EventBus] 🚨 事件积压超限 (1000)，为保护事件循环正丢弃主题: {topic}")
+            logger.warning(
+                f"[EventBus] queue full (size={self._event_queue.qsize()}), "
+                f"dropped topic={topic}, total_dropped={self._dropped_count}"
+            )
+
+    # ponytail: graceful shutdown — cancels all workers and health check
+    async def stop(self):
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self._worker_tasks.clear()
+        self._workers_started = False
+    
+    def get_dropped_count(self) -> int:
+        """Return the number of events dropped due to queue full (R9)."""
+        return self._dropped_count

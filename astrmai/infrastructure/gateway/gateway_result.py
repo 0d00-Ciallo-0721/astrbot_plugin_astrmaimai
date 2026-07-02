@@ -119,6 +119,7 @@ class GatewayResultMixin:
         model_id: str,
         usage: Dict[str, int],
         debug_meta: Optional[Dict[str, Any]] = None,
+        latency_ms: float = 0.0,
     ) -> None:
         debug_meta = debug_meta or {}
         input_tokens = usage.get("input_tokens", 0)
@@ -126,10 +127,11 @@ class GatewayResultMixin:
         cache_rate = (input_cached / input_tokens) if input_tokens else 0.0
         cache_observation = self._build_cache_observation(usage, debug_meta)
         logger.info(
-            "[GatewayUsage] pool=%s model=%s provider=%s lane_key=%s conversation_id=%s prefix_hash=%s input_tokens=%s input_cached=%s output_tokens=%s cache_rate=%.4f cache_ready=%s cache_hit=%s cache_ready_reasons=%s",
+            "[GatewayUsage] pool=%s model=%s provider=%s latency_ms=%.0f lane_key=%s conversation_id=%s prefix_hash=%s input_tokens=%s input_cached=%s output_tokens=%s cache_rate=%.4f cache_ready=%s cache_hit=%s cache_ready_reasons=%s",
             pool_name,
             model_id,
             debug_meta.get("provider", model_id),
+            latency_ms,
             debug_meta.get("lane_key", ""),
             debug_meta.get("conversation_id", ""),
             debug_meta.get("prefix_hash", ""),
@@ -202,7 +204,7 @@ class GatewayResultMixin:
             json.loads(normalized)
             return normalized
         except Exception:
-            pass
+            logger.debug("[AstrMai-result] json extraction failed", exc_info=True)
         match = re.search(r"```(?:json)?\s*(.*?)```", normalized, re.DOTALL | re.IGNORECASE)
         if match:
             extracted = match.group(1).strip()
@@ -210,7 +212,7 @@ class GatewayResultMixin:
                 json.loads(extracted)
                 return extracted
             except Exception:
-                pass
+                logger.debug("[AstrMai-result] json extraction failed", exc_info=True)
         return normalized
 
     def _parse_json_completion(self, content: str) -> Any:

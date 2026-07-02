@@ -8,6 +8,7 @@ from ..presentation.events.message_entry import handle_global_message
 from ..presentation.events.result_sniffer import sniff_external_plugin_results
 from ..presentation.events.startup_hooks import on_program_start as run_startup_hook
 from ..infrastructure.runtime.lane_manager import LaneKey
+from ..infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
 from ..shared.helpers.plugin_helpers import format_model_pool
 from .lifecycle import PluginLifecycleManager
 from .runtime_context import PluginRuntimeContext
@@ -19,6 +20,9 @@ class PluginFacade(RuntimeFacadeProtocol):
         self.runtime = runtime
         self.lifecycle_manager = PluginLifecycleManager(runtime)
         self.runtime.bind_system2_callback(self._system2_entry)
+        # ponytail: WebUI adapter registration failure is logged but silently
+        # swallowed — admin pages work without it. Surface to user if audit page
+        # reports 404 after boot.
         try:
             from ..webui.backend.adapters.plugin_api import set_active_facade
 
@@ -70,25 +74,50 @@ class PluginFacade(RuntimeFacadeProtocol):
 
     async def terminate(self) -> None:
         await self.lifecycle_manager.terminate()
+        if getattr(self.runtime, "persistence", None):
+            self.runtime.persistence.dispose()
+        if getattr(self.runtime, "runtime_coordinator", None):
+            await self.runtime.runtime_coordinator.prune_inactive()
 
     async def update_user_stats(self, user_id: str) -> None:
-        await self.runtime.state_engine.increment_user_message_count(user_id)
+        try:
+            await self.runtime.state_engine.increment_user_message_count(user_id)
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Failed to update user stats for {user_id}: {exc}")
 
     # ── config hot-apply ────────────────────────────────────────────
 
     def apply_hot_config(self, config_dict: dict, parsed_config) -> bool:
-        """热应用配置到运行时。返回 True 表示已应用。
-
-        这是 PluginApiAdapter._apply_hot_config 的首选路径——
-        实现后消除 fallback 路径的 WARNING。
-        """
+        """热应用配置到运行时。遍历所有组件刷新。"""
         self.runtime.raw_config = dict(config_dict)
         self.runtime.config = parsed_config
         if hasattr(self.runtime, "rebuild_infrastructure_settings"):
             self.runtime.rebuild_infrastructure_settings()
-        proactive_task = getattr(self.runtime, "proactive_task", None)
-        if proactive_task is not None and hasattr(proactive_task, "refresh_config"):
-            proactive_task.refresh_config(parsed_config)
+
+        # ponytail: refresh all components that hold cached config references
+        components = [
+            ("gateway", getattr(self.runtime, "gateway", None)),
+            ("lane_manager", getattr(self.runtime, "lane_manager", None)),
+            ("state_engine", getattr(self.runtime, "state_engine", None)),
+            ("sensors", getattr(self.runtime, "sensors", None)),
+            ("frequency_controller", getattr(self.runtime, "frequency_controller", None)),
+            ("private_chat_manager", getattr(self.runtime, "private_chat_manager", None)),
+            ("attention_gate", getattr(self.runtime, "attention_gate", None)),
+            ("evolution", getattr(self.runtime, "evolution", None)),
+            ("memory_engine", getattr(self.runtime, "memory_engine", None)),
+            ("judge", getattr(self.runtime, "judge", None)),
+            ("proactive_task", getattr(self.runtime, "proactive_task", None)),
+        ]
+        for name, comp in components:
+            if comp is not None and hasattr(comp, "refresh_config"):
+                try:
+                    comp.refresh_config(parsed_config)
+                except Exception as exc:
+                    logger.warning(f"[AstrMai] refresh_config failed for {name}: {exc}")
+
+        # ponytail: log overall hot-apply status for version skew visibility
+        logger.info(f"[AstrMai] hot-apply complete, config reloaded for {len(components)} components")
+
         if hasattr(self.runtime, "sync_host_compat_attrs"):
             self.runtime.sync_host_compat_attrs()
         return True
@@ -165,6 +194,8 @@ class PluginFacade(RuntimeFacadeProtocol):
             )
 
     def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
+        """ponytail: returns suppress result but does NOT call event.stop_event().
+        Caller must call event.stop_event() when this returns non-None."""
         if status == "ENGAGED" or is_direct_call:
             return self.runtime.host_bridge.suppress_default_llm(event)
         return None
@@ -216,6 +247,7 @@ class PluginFacade(RuntimeFacadeProtocol):
         )
 
     def get_planner(self):
+        # ponytail: defensive getattr on @property — masks init failures if property raises.
         return getattr(self.runtime, "system2_planner", None)
 
     def get_gateway(self):
@@ -312,6 +344,8 @@ class PluginFacade(RuntimeFacadeProtocol):
         return getattr(engine, "expression_pattern_service", None) if engine else None
 
     def is_framework_command(self, msg: str) -> bool:
+        # ponytail: uses private AstrBot API _collect_descriptors. This API may
+        # change without notice. Fallback to command_manager is already wired.
         if not msg:
             return False
 
@@ -347,14 +381,22 @@ class PluginFacade(RuntimeFacadeProtocol):
                 if getattr(desc, "aliases", None):
                     for alias in desc.aliases:
                         registered_cmds.add(str(alias).split()[0].lower())
+        except ImportError:
+            logger.debug("[AstrMai-Filter] _collect_descriptors not importable, using command_manager fallback")
+            try:
+                cmd_mgr = getattr(self.runtime.context, "command_manager", None)
+                if cmd_mgr and hasattr(cmd_mgr, "commands"):
+                    registered_cmds.update([str(key).lower() for key in cmd_mgr.commands.keys()])
+            except Exception as exc2:
+                logger.debug(f"[AstrMai-Filter] Fallback command scan also failed: {exc2}")
         except Exception as exc:
             logger.debug(f"[AstrMai-Filter] 内存态穿透失败，尝试降级: {exc}")
             try:
                 cmd_mgr = getattr(self.runtime.context, "command_manager", None)
                 if cmd_mgr and hasattr(cmd_mgr, "commands"):
                     registered_cmds.update([str(key).lower() for key in cmd_mgr.commands.keys()])
-            except Exception as exc:
-                logger.debug(f"[AstrMai-Filter] Fallback command scan also failed: {exc}")
+            except Exception as exc2:
+                logger.debug(f"[AstrMai-Filter] Fallback command scan also failed: {exc2}")
 
         try:
             extra_cmds = getattr(self.runtime.config.system1, "extra_command_list", [])
@@ -407,8 +449,8 @@ class PluginFacade(RuntimeFacadeProtocol):
                 ),
                 tools=full_tools,
                 models=models,
-                max_steps=30,
-                timeout=120,
+                max_steps=getattr(self.runtime.config.sys3, "max_steps", 30) if hasattr(self.runtime.config, "sys3") else 30,
+                timeout=getattr(self.runtime.config.sys3, "tool_timeout", 120) if hasattr(self.runtime.config, "sys3") else 120,
                 persona_id=getattr(self.runtime.config.persona, "persona_id", "") or "astrmai",
             )
             await self.runtime.reply_engine.handle_reply(event, result.text, chat_id)
@@ -477,5 +519,13 @@ class PluginFacade(RuntimeFacadeProtocol):
                             payload = self.runtime.group_reply_wait_manager.get_wait_info(chat_id)
                             if payload:
                                 await self.runtime.chat_loop_kernel.arm_group_wait(chat_id, payload)
+            except LLMCascadeFailureException:
+                logger.exception(f"[AstrMai] Gateway cascade failure for {chat_id}, returning fallback")
+                fallback = str(getattr(getattr(self.runtime.config, "reply", None), "fallback_text", "") or "（陷入了短暂的沉默...）")
+                await self.runtime.reply_engine.handle_reply(main_event, fallback, chat_id)
+            except Exception as e:
+                logger.error(f"[AstrMai] System2 unexpected error for {chat_id}: {e}", exc_info=True)
+                fallback = str(getattr(getattr(self.runtime.config, "reply", None), "fallback_text", "") or "（陷入了短暂的沉默...）")
+                await self.runtime.reply_engine.handle_reply(main_event, fallback, chat_id)
             finally:
                 logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")

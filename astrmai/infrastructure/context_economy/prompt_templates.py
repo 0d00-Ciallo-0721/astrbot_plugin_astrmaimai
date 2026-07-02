@@ -640,7 +640,7 @@ class PromptTemplateRegistry:
         version: str | None = None,
         variant: str | None = None,
     ) -> PromptEnvelope:
-        key = template_id.value if isinstance(template_id, PromptTemplateId) else str(template_id or "").strip()
+        key = str(template_id.value if isinstance(template_id, Enum) else template_id or "").strip()
         if variant:
             key = key or str(variant)
         spec = self._specs.get(key)

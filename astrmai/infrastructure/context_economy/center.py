@@ -106,6 +106,17 @@ class ContextEconomyCenter:
                 return WorkloadFamily.CHAT_TOOLS if tool_mode else WorkloadFamily.CHAT_DIALOG
             if (lane_key.subsystem, lane_key.task_family) == ("sys1", "vision"):
                 return WorkloadFamily.VISION
+            # ponytail: M15 — added missing subsystem mappings
+            if (lane_key.subsystem, lane_key.task_family) == ("sys1", "judge"):
+                return WorkloadFamily.JUDGE
+            if (lane_key.subsystem, lane_key.task_family) == ("sys1", "mood"):
+                return WorkloadFamily.MOOD
+            if (lane_key.subsystem, lane_key.task_family) == ("sys3", "direct"):
+                return WorkloadFamily.CHAT_TOOLS
+            if (lane_key.subsystem, lane_key.task_family) in {("bg", "reflect"), ("bg", "memory")}:
+                return WorkloadFamily.MEMORY_GLOBAL_SUMMARY
+            if (lane_key.subsystem, lane_key.task_family) in {("sys2", "followup"), ("sys2", "goal"), ("sys2", "expression"), ("sys2", "retrieval")}:
+                return WorkloadFamily.CHAT_DIALOG
             if (lane_key.subsystem, lane_key.task_family) == ("sys2", "persona"):
                 return WorkloadFamily.PERSONA_SUMMARY
             if (lane_key.subsystem, lane_key.task_family) in {("bg", "proactive"), ("bg", "wakeup"), ("bg", "diary"), ("bg", "group_signin")}:

@@ -133,11 +133,14 @@ class ReActRetriever:
             f"query: {query}"
         )
         try:
-            result = await self.gateway.call_data_process_task(
-                prompt,
-                is_json=True,
-                lane_key=self._retrieval_lane(chat_id),
-                base_origin=chat_id,
+            result = await asyncio.wait_for(
+                self.gateway.call_data_process_task(
+                    prompt,
+                    is_json=True,
+                    lane_key=self._retrieval_lane(chat_id),
+                    base_origin=chat_id,
+                ),
+                timeout=15.0,  # ponytail: M13 — prevent indefinite hang on LLM stall
             )
             data = self._safe_parse_json(result)
             if data.get("need_search") and data.get("question"):
@@ -301,7 +304,7 @@ class ReActRetriever:
         if isinstance(raw, dict):
             return raw
         if isinstance(raw, str):
-            chunk = self._extract_braced_json(raw)
+            chunk = ReActRetriever._extract_braced_json(raw)
             if chunk:
                 try:
                     return json.loads(chunk)

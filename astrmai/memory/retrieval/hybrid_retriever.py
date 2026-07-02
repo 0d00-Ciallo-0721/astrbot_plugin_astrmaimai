@@ -28,7 +28,7 @@ class HybridRetriever:
             doc_id = await self.vector.add_document(content, metadata)
         else:
             logger.warning("[Hybrid] ⚠️ 向量检索器异常离线，无法生成统一 doc_id。")
-            return None
+            raise RuntimeError("Vector store offline, cannot add memory")
             
         if self.bm25 and doc_id is not None:
             # 2. 将关联 ID 存入 BM25 辅库实现双路绑定
@@ -76,6 +76,7 @@ class HybridRetriever:
         return final_results
 
     def _apply_weighting(self, results: List[SearchResult]) -> List[SearchResult]:
+        # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
         now = time.time()
         time_decay_rate = getattr(self.config.memory, 'time_decay_rate', 0.01) if self.config else 0.01
         

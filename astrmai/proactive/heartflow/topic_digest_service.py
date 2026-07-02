@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from time import monotonic
 from typing import Any
 
 from astrbot.api import logger
@@ -28,9 +29,9 @@ class HeartflowTopicDigestService:
             return
         if self._semaphore:
             async with self._semaphore:
-                await self._run_once_inner(manager, now=time.time() if now is None else now)
+                await self._run_once_inner(manager, now=monotonic() if now is None else now)
             return
-        await self._run_once_inner(manager, now=time.time() if now is None else now)
+        await self._run_once_inner(manager, now=monotonic() if now is None else now)
 
     async def _run_once_inner(self, manager: Any, *, now: float) -> None:
         try:

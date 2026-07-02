@@ -200,7 +200,7 @@ class ThinkLevelPolicy:
     @staticmethod
     def _is_short_ack(compact_text: str) -> bool:
         lowered = compact_text.lower()
-        return len(compact_text) <= 4 or lowered in ThinkLevelPolicy.SHORT_ACKS
+        return lowered in ThinkLevelPolicy.SHORT_ACKS
 
     @staticmethod
     def _current_text(event: Any, prompt_envelope: PromptEnvelope | None) -> str:

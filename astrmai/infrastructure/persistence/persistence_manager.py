@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Any
 from sqlmodel import SQLModel, create_engine, Session
 from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
 
@@ -15,7 +14,12 @@ from .state_profile_persistence import StateProfilePersistenceMixin
 class PersistenceManager(PersistenceSchemaMixin, PersonaCacheMixin, StateProfilePersistenceMixin):
     """Persistence manager for refactored local storage."""
     def __init__(self):
-        base_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai"
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+            base_path = Path(get_astrbot_data_path()) / "plugin_data" / "astrmai"
+        except ImportError:
+            base_path = Path("data") / "plugin_data" / "astrmai"
+            logger.warning("[AstrMai] get_astrbot_data_path not available, using relative path: " + str(base_path))
         base_path.mkdir(parents=True, exist_ok=True)
         
         self.db_path = base_path / "astrmai.db"
@@ -45,4 +49,8 @@ class PersistenceManager(PersistenceSchemaMixin, PersonaCacheMixin, StateProfile
 
     def bind_database_service(self, database_service: Any) -> None:
         self.database_service = database_service
+
+    # ponytail: release SQLAlchemy connection pool
+    def dispose(self):
+        self.engine.dispose()
 

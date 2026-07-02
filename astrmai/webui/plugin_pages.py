@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
+from astrbot.api import logger
+
 try:  # pragma: no cover - Quart is supplied by AstrBot at runtime.
     from quart import request as quart_request
 except Exception:  # pragma: no cover
@@ -101,7 +103,8 @@ class AstrMaiAdminPageApi:
             try:
                 data = await _maybe_await(json_method())
                 return data if isinstance(data, dict) else {}
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"[AstrMai] _body parse failed: {exc}")
                 return {}
         return {}
 
@@ -562,6 +565,13 @@ class AstrMaiAdminPageApi:
 
 
 def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
+    """Register ~85 admin API endpoints under /astrmai/admin.
+
+    Security model: all endpoints rely on AstrBot Plugin Page isolation
+    (iframe sandbox + SAMEORIGIN + CSP headers).  No standalone auth
+    middleware is implemented — access is gated by the AstrBot WebUI
+    admin panel login.
+    """
     if not hasattr(context, "register_web_api"):
         return
 

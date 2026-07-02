@@ -72,6 +72,11 @@ class MemoryV2Store:
             if lock is None:
                 lock = asyncio.Lock()
                 self._session_locks[scope] = lock
+                if len(self._session_locks) > 200:
+                    oldest = next(iter(self._session_locks))
+                    # ponytail: skip locks held by active coroutines to avoid evicting in-use sessions (R17)
+                    if not self._session_locks[oldest].locked():
+                        self._session_locks.pop(oldest, None)
             return lock
 
     async def _acquire_session_scopes(self, scopes: list[str]) -> AsyncExitStack:
@@ -802,6 +807,16 @@ class MemoryV2Store:
         )
         selected = candidates[: max(int(top_k or 5), 1)]
         if selected:
+            restore_ids = [
+                item.id
+                for item in selected
+                if allow_stale and item.status == STALE_STATUS and int(getattr(item, "access_count", 0) or 0) > 0
+            ]
+            for memory_id in restore_ids:
+                await self.restore(memory_id, reason="stale_access")
+            for item in selected:
+                if item.id in restore_ids:
+                    item.status = ACTIVE_STATUS
             await self.mark_accessed([item.id for item in selected])
         return selected
 
@@ -1002,8 +1017,7 @@ class MemoryV2Store:
                     await db.execute(
                         """
                         UPDATE canonical_memories
-                        SET last_access_time = ?, access_count = COALESCE(access_count, 0) + 1,
-                            status = CASE WHEN status = 'stale' THEN 'active' ELSE status END
+                        SET last_access_time = ?, access_count = COALESCE(access_count, 0) + 1
                         WHERE id = ?
                         """,
                         (now, memory_id),
@@ -1083,7 +1097,11 @@ class MemoryV2Store:
         review_statuses: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         await self.initialize()
-        cutoff = self._now() - max(float(older_than_seconds or 0.0), 0.0)
+        now = self._now()
+        cutoff = now - max(float(older_than_seconds or 0.0), 0.0)
+        if cutoff > now:  # ponytail: NTP backward jump guard
+            logger.warning(f"[AstrMai-v2store] NTP backward jump: cutoff={cutoff} > now={now}, clamping")
+            cutoff = 0.0
         deleted_ids: list[str] = []
         protected_skipped = 0
         if not statuses:
@@ -1118,6 +1136,8 @@ class MemoryV2Store:
                 deleted_ids.append(str(memory_id))
             for memory_id in deleted_ids:
                 await db.execute("DELETE FROM canonical_memories WHERE id = ?", (memory_id,))
+            # ponytail: sync FTS to prevent phantom search results
+            await db.execute("DELETE FROM canonical_fts WHERE memory_id NOT IN (SELECT id FROM canonical_memories)")
             await db.commit()
         return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
 
@@ -1132,7 +1152,11 @@ class MemoryV2Store:
         review_statuses: tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         await self.initialize()
-        cutoff = self._now() - max(float(older_than_seconds or 0.0), 0.0)
+        now = self._now()
+        cutoff = now - max(float(older_than_seconds or 0.0), 0.0)
+        if cutoff > now:  # ponytail: NTP backward jump guard
+            logger.warning(f"[AstrMai-v2store] NTP backward jump: cutoff={cutoff} > now={now}, clamping")
+            cutoff = 0.0
         deleted_ids: list[str] = []
         protected_skipped = 0
         clean_kind = str(kind or "").strip()
@@ -1168,6 +1192,8 @@ class MemoryV2Store:
                 deleted_ids.append(str(memory_id))
             for memory_id in deleted_ids:
                 await db.execute("DELETE FROM canonical_memories WHERE id = ?", (memory_id,))
+            # ponytail: sync FTS to prevent phantom search results
+            await db.execute("DELETE FROM canonical_fts WHERE memory_id NOT IN (SELECT id FROM canonical_memories)")
             await db.commit()
         return {"deleted_ids": deleted_ids, "protected_skipped": protected_skipped}
 

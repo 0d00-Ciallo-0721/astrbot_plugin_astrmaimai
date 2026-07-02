@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from types import SimpleNamespace
 
 from astrbot.api import logger
 from config import LifeConfig
@@ -52,7 +53,10 @@ class WakeupService:
                 merged_values[field_name] = life.get(field_name, default_value)
             else:
                 merged_values[field_name] = getattr(life, field_name, default_value)
-        return LifeConfig(**merged_values)
+        try:
+            return LifeConfig(**merged_values)
+        except Exception:
+            return SimpleNamespace(**merged_values)
 
     @staticmethod
     def _life_config_is_complete(life) -> bool:

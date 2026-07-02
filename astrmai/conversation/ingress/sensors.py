@@ -18,6 +18,9 @@ class PreFilters:
         self.foreign_commands = set()
         self._commands_loaded = False 
 
+    def refresh_config(self, config):
+        self.config = config
+
     async def load_foreign_commands(self):
         """公开接口：异步动态加载系统内所有注册指令（D59：替代 hasattr 私有方法访问）"""
         return await self._load_foreign_commands()
@@ -48,6 +51,9 @@ class PreFilters:
                     self.foreign_commands.add(extra.lower())
 
             self._commands_loaded = True
+            # ponytail: cap foreign_commands at 10K to prevent unbounded growth
+            if len(self.foreign_commands) > 10000:
+                self.foreign_commands = set(list(self.foreign_commands)[-8000:])
             logger.debug(f"[AstrMai-Sensor] 🛡️ 成功加载外部系统指令隔离名单 ({len(self.foreign_commands)} 条)")
         except Exception as e:
             logger.warning(f"[AstrMai-Sensor] ⚠️ 加载外部指令列表失败: {e}")
@@ -105,6 +111,20 @@ class PreFilters:
         bot_id = str(event.get_self_id())
         # 判断私聊环境 (如果不存在 group_id 则为私聊)
         is_private = not bool(event.get_group_id())
+        at_cls = getattr(Comp, "At", None)
+        reply_cls = getattr(Comp, "Reply", None)
+        plain_cls = getattr(Comp, "Plain", None)
+        image_cls = getattr(Comp, "Image", None)
+        media_classes = tuple(
+            cls
+            for cls in (
+                image_cls,
+                getattr(Comp, "Video", None),
+                getattr(Comp, "Record", None),
+                getattr(Comp, "File", None),
+            )
+            if cls is not None
+        )
 
         async def _extract_image_ref(image_component):
             file_path = getattr(image_component, "file", None) or getattr(image_component, "path", None)
@@ -128,22 +148,22 @@ class PreFilters:
             if not chain:
                 return urls
             for c in chain:
-                if isinstance(c, Comp.Image):
+                if image_cls is not None and isinstance(c, image_cls):
                     image_ref = await _extract_image_ref(c)
                     if image_ref:
                         urls.append(image_ref)
-                elif isinstance(c, Comp.Reply) and hasattr(c, 'chain'):
+                elif reply_cls is not None and isinstance(c, reply_cls) and hasattr(c, 'chain'):
                     urls.extend(await _scan_reply_chain(c.chain))
             return urls
 
         if event.message_obj and event.message_obj.message:
             for seg in event.message_obj.message:
                 # 探针：检测消息体内是否 @ 了 Bot
-                if isinstance(seg, Comp.At) and str(seg.qq) == bot_id:
+                if at_cls is not None and isinstance(seg, at_cls) and str(seg.qq) == bot_id:
                     has_at_bot = True
                     
                 # 探针：检测引用组件，并递归挖掘被引用消息中的图片
-                if isinstance(seg, Comp.Reply):
+                if reply_cls is not None and isinstance(seg, reply_cls):
                     if hasattr(seg, 'chain'):
                         scanned_reply_images = await _scan_reply_chain(seg.chain)
                         if scanned_reply_images:
@@ -152,21 +172,21 @@ class PreFilters:
                     continue # 忽略引用组件对纯文本的干扰
                     
                 # 忽略艾特对纯文本的干扰
-                if isinstance(seg, Comp.At):
+                if at_cls is not None and isinstance(seg, at_cls):
                     continue 
                 
                 # 提取纯文本
-                if isinstance(seg, Comp.Plain):
+                if plain_cls is not None and isinstance(seg, plain_cls):
                     text = seg.text.replace('\u200b', '').strip()
                     if text: 
                         clean_text_parts.append(text)
                         
                 # 【核心逻辑】：必须检测 Comp.Image 及其他媒体载荷
-                if isinstance(seg, (Comp.Image, Comp.Video, Comp.Record, Comp.File)):
+                if media_classes and isinstance(seg, media_classes):
                     has_payload = True
                     
                 # 顺手提取 URL
-                if isinstance(seg, Comp.Image):
+                if image_cls is not None and isinstance(seg, image_cls):
                     image_ref = await _extract_image_ref(seg)
                     if image_ref:
                         image_urls.append(image_ref)
@@ -271,7 +291,9 @@ class PreFilters:
             
         try:
             for component in event.message_obj.message:
-                if isinstance(component, Comp.At):
+                component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
+                at_cls = getattr(Comp, "At", None)
+                if ((at_cls is not None and isinstance(component, at_cls)) or component_type == "at"):
                     if str(component.qq) == str(bot_self_id):
                         return True
         except Exception:

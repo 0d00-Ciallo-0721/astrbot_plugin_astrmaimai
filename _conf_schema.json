@@ -38,6 +38,19 @@
         "type": "bool",
         "default": true,
         "hint": "开启后，内部错误不会直接暴露给普通用户，同时会把错误信息发送给管理员。"
+      },
+      "external_result_sources": {
+        "description": "外部插件结果白名单",
+        "type": "list",
+        "default": ["astrbot_builtin"],
+        "hint": "仅嗅探这些来源的插件输出并记入上下文。'*' 表示所有来源。留空则不嗅探任何外部结果。"
+      },
+      "error_interception_mode": {
+        "description": "错误拦截模式",
+        "type": "string",
+        "default": "block_only",
+        "options": ["block_and_stop", "block_only", "log_only"],
+        "hint": "block_and_stop: 阻止+停止事件 / block_only: 仅阻止消息 / log_only: 仅记录日志"
       }
     }
   },
@@ -87,6 +100,12 @@
         "default": "",
         "description": "要绑定的人设 ID",
         "hint": "留空时，会按当前会话使用独立人设；填写后，所有会话都会共用这一个人设。"
+      },
+      "include_self_lore_in_prompt": {
+        "description": "自动注入 self_lore",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后 Bot 的自我知识（从人设提取的事实）会自动注入系统提示词。关闭时仅通过 self_lore_query 工具手动查询。"
       }
     }
   },
@@ -153,6 +172,12 @@
         "type": "bool",
         "default": true,
         "hint": "开启后，较稳定的系统提示前缀会尝试缓存复用，降低重复构建成本。"
+      },
+      "enable_token_estimator": {
+        "description": "启用 Token 估算压缩",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，上下文压缩将基于 Token 估算值（而非纯消息条数）判断是否触发，避免长消息导致上下文溢出。字符/4 粗略估算，零依赖。"
       },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
@@ -268,6 +293,12 @@
         "type": "float",
         "default": 0.1,
         "hint": "值越大，发送前的等待感越明显，看起来更像在慢慢打字；值越小，回复会更利落。"
+      },
+      "enable_content_safety_filter": {
+        "description": "启用基础内容安全过滤",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后检测 NSFW/自残/PII 内容并替换为 fallback_text。关闭时不做内容安全检测。"
       }
     }
   },
@@ -378,7 +409,7 @@
         "description": "高风险敏感词列表",
         "type": "list",
         "default": ["傻逼", "弱智", "滚", "死", "妈", "废物", "神经", "有病"],
-        "hint": "遇到这些词时，系统会更谨慎地判断是否需要介入或降级处理。"
+        "hint": "情感路由权重词：当 Bot 情绪为愤怒/悲伤且消息含这些词时，发言者获得更高的情感权重。这不是内容安全过滤，不会拦截或屏蔽消息。"
       }
     }
   },
@@ -478,6 +509,19 @@
         "description": "maintenance 鍩轰簬鐑害鎵规爣 stale 鐨勯槇鍊?",
         "type": "float",
         "default": 0.35
+      },
+      "min_memory_confidence": {
+        "description": "记忆写入最低置信度",
+        "type": "float",
+        "default": 0.3,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "低于此置信度的记忆不会被持久化。设为 0 则不启用此门控。"
+      },
+      "auto_recall_probability": {
+        "type": "float",
+        "default": 0.0,
+        "hint": "自动记忆召回概率（0.0=禁用, 1.0=每次触发）"
       }
     }
   },
@@ -550,6 +594,16 @@
         "type": "int",
         "default": 2,
         "hint": "只有同一黑话在群内累计出现到这个次数后，才会进入自动审核。"
+      },
+      "review_runner_interval_sec": {
+        "type": "int",
+        "default": 60,
+        "hint": "表情审查运行间隔（秒），范围 30-600"
+      },
+      "review_runner_min_interval_sec": {
+        "type": "int",
+        "default": 45,
+        "hint": "表情审查最小间隔（秒），防止同一聊天连续触发"
       }
     }
   },
@@ -557,6 +611,12 @@
     "type": "object",
     "description": "主动性与梦境整理",
     "items": {
+      "enable_proactive": {
+        "description": "启用主动发言",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后 Bot 不会主动打破沉默。开启时 Bot 可能根据上下文主动发起话题。"
+      },
       "dream_interval_min": {
         "description": "梦境整理触发间隔（分钟）",
         "type": "int",
@@ -736,6 +796,12 @@
         "type": "bool",
         "default": false,
         "hint": "开启后，Bot 可以进入更偏任务执行、工具调用的工作流。"
+      },
+      "computer_agent_sandbox_enabled": {
+        "description": "启用 ComputerAgent 代码执行",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后 ComputerAgent 才能加载 Python/Shell 工具。注意：此功能在宿主机直执，请仅在受信任环境开启。关闭时 ComputerAgent 会优雅降级并提示用户。"
       }
     }
   },

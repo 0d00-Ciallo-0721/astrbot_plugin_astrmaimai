@@ -51,9 +51,14 @@ class InfrastructureSettings:
     gateway: GatewaySettings = field(default_factory=GatewaySettings)
     lane: LaneRuntimeSettings = field(default_factory=LaneRuntimeSettings)
     features: RuntimeFeatureFlags = field(default_factory=RuntimeFeatureFlags)
+    token_estimator_enabled: bool = False
 
 
 def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
+    def _num(raw: Any, default: int | float) -> int | float:
+        """Return raw if not None, else default.  Avoids 0-or-default trap."""
+        return default if raw is None else raw
+
     provider = getattr(config, "provider", None)
     infra = getattr(config, "infra", None)
     global_settings = getattr(config, "global_settings", None)
@@ -65,12 +70,12 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
 
     return InfrastructureSettings(
         gateway=GatewaySettings(
-            max_concurrent_llm_calls=int(getattr(infra, "max_concurrent_llm_calls", 3) or 3),
-            llm_retries=int(getattr(infra, "llm_retries", 2)),
-            backoff_factor=float(getattr(infra, "backoff_factor", 1.5) or 1.5),
-            api_timeout=float(getattr(infra, "api_timeout", 15.0) or 15.0),
-            rate_limit_model_cooldown_sec=int(getattr(infra, "rate_limit_model_cooldown_sec", 120) or 120),
-            quota_model_cooldown_sec=int(getattr(infra, "quota_model_cooldown_sec", 1800) or 1800),
+            max_concurrent_llm_calls=int(_num(getattr(infra, "max_concurrent_llm_calls", None), 3)),
+            llm_retries=int(_num(getattr(infra, "llm_retries", None), 2)),
+            backoff_factor=float(_num(getattr(infra, "backoff_factor", None), 1.5)),
+            api_timeout=float(_num(getattr(infra, "api_timeout", None), 15.0)),
+            rate_limit_model_cooldown_sec=int(_num(getattr(infra, "rate_limit_model_cooldown_sec", None), 120)),
+            quota_model_cooldown_sec=int(_num(getattr(infra, "quota_model_cooldown_sec", None), 1800)),
             debug_mode=bool(getattr(global_settings, "debug_mode", False)),
             task_models=_tupleize(getattr(provider, "task_models", ())),
             agent_models=_tupleize(getattr(provider, "agent_models", ())),
@@ -92,6 +97,7 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
             context_compaction_enabled=bool(getattr(getattr(config, "conversation", None), "enable_context_compaction", True)),
             prefix_caching_enabled=bool(getattr(getattr(config, "conversation", None), "enable_prefix_caching", True)),
         ),
+        token_estimator_enabled=bool(getattr(getattr(config, "conversation", None), "enable_token_estimator", False)),
     )
 
 

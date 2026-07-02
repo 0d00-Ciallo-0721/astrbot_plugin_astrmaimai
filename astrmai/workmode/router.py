@@ -15,21 +15,36 @@ class Sys3Router:
         self.plugin_config = plugin_config
         self.context = context
         self.db_service = db_service
+        sandbox_enabled = bool(
+            getattr(getattr(plugin_config, "sys3", None), "computer_agent_sandbox_enabled", False)
+        )
         self._static_agents = [
             CronAgent(db_service=db_service),
-            ComputerAgent(),
+            ComputerAgent(sandbox_enabled=sandbox_enabled),
         ]
         self._handoff_registry = HandoffRegistry(context)
-        logger.info("[Sys3Router] 馃殾 Refactoring-side Sys3 router initialized.")
+        self._raw_agent_map: dict[str, object] = {}
+        logger.info("[Sys3Router] 🚀 Refactoring-side Sys3 router initialized (sandbox=%s).", sandbox_enabled)
 
     async def get_all_agents(self) -> list:
         static_names = {getattr(agent, "name", "") for agent in self._static_agents}
         dynamic_agents = await self._handoff_registry.discover(static_names)
-        return [*self._static_agents, *dynamic_agents]
+        agents = [*self._static_agents, *dynamic_agents]
+        self._raw_agent_map = {getattr(a, "name", ""): a for a in agents if getattr(a, "name", "")}
+        return agents
 
     async def get_light_tools_for_planner(self) -> ToolSet:
         full_set = ToolSet(await self.get_all_agents())
-        return full_set.get_light_tool_set()
+        light_set = full_set.get_light_tool_set()
+        # ponytail: inject handler refs from raw agents so _execute_local won't raise ValueError.
+        # get_light_tool_set() creates bare FunctionTool(handler=None) — without this injection,
+        # tool_loop_agent → _execute_local MRO check fails because FunctionTool.call is not overridden.
+        for light_tool in light_set.tools:
+            name = getattr(light_tool, "name", "")
+            raw_agent = self._raw_agent_map.get(name)
+            if raw_agent is not None and hasattr(raw_agent, "call"):
+                light_tool.handler = raw_agent.call
+        return light_set
 
     async def get_full_tools_for_direct_entry(self) -> ToolSet:
         return ToolSet(await self.get_all_agents())

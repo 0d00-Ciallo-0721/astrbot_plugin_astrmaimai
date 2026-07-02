@@ -83,6 +83,7 @@ class RelationshipVector:
             total_interactions=data.get("total_interactions", 0),
             positive_streak=data.get("positive_streak", 0),
             negative_streak=data.get("negative_streak", 0),
+            # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
             first_seen=data.get("first_seen", time.time()),
             last_interaction=data.get("last_interaction", time.time()),
             last_decay_time=data.get("last_decay_time", time.time()),

@@ -23,6 +23,7 @@ class GatewayLaneMixin:
         try:
             return json.dumps(value, ensure_ascii=False, sort_keys=True)
         except Exception:
+            logger.debug("[AstrMai-lane] json serialization failed", exc_info=True)
             return str(value)
 
     def _record_event_request_trace(
@@ -409,6 +410,8 @@ class GatewayLaneMixin:
         )
         return result.text
 
+    # ponytail: ~200 lines duplicated from _elastic_call_result. Refactor when
+    # tool_chat diverges significantly or test coverage of both paths is sufficient.
     async def tool_chat_in_lane_result(
         self,
         lane_key: LaneKey,

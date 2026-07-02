@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from time import monotonic
 from dataclasses import dataclass
 from typing import Any
 
@@ -172,6 +173,9 @@ class CompactionExecutor:
 
 
 class ContextCompactionEngine(CompactionProviderMixin):
+    """ponytail: no unified compaction error recovery mechanism.
+    Partial coverage: merge failures set cooldown (P2.12).
+    Full recovery (revert to pre-compaction state) requires redesign."""
     def __init__(
         self,
         dialogue_store,
@@ -194,10 +198,22 @@ class ContextCompactionEngine(CompactionProviderMixin):
         self._success_cooldown_seconds = 20.0
         self._failure_cooldown_seconds = 10.0
         self._chat_states: dict[str, dict[str, Any]] = {}
+        # ponytail: guard against unbounded _chat_states growth
+        self._last_chat_state_prune: float = 0.0
         self._pending_tasks: dict[str, Any] = {}
         self.safety_analyzer = CompactionSafetyAnalyzer(self)
         self.window_selector = CompactionWindowSelector(self)
         self.compaction_executor = CompactionExecutor(self)
+
+    def refresh_config(self, config) -> None:
+        conversation = getattr(config, "conversation", None)
+        if conversation is None:
+            return
+        self.compaction_trigger_segments = int(getattr(conversation, "compaction_trigger_segments", 40) or 40)
+        self.compaction_trigger_tokens = int(getattr(conversation, "compaction_trigger_tokens", 1800) or 1800)
+        self.compaction_keep_recent_segments = int(getattr(conversation, "compaction_keep_recent_segments", 16) or 16)
+        self.compaction_summary_max_tokens = int(getattr(conversation, "compaction_summary_max_tokens", 450) or 450)
+        self.provider_id = str(getattr(conversation, "compaction_provider_id", "") or "")
 
     @staticmethod
     def _normalize_summary_text(text: str) -> str:
@@ -273,6 +289,12 @@ class ContextCompactionEngine(CompactionProviderMixin):
         focus_context: Any = None,
         message_source: str | None = None,
     ) -> CompactionResult:
+        # ponytail: prune stale chat states every 300s
+        now = time.time()
+        if now - self._last_chat_state_prune > 300:
+            self._prune_stale_chat_states()
+            self._last_chat_state_prune = now
+
         state = self._state_for_chat(chat_id)
         if self.dialogue_store is not None and int(state.get("message_count_since_last_compaction", 0) or 0) <= 0:
             try:
@@ -282,6 +304,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
                 )
                 self.window_selector.bootstrap_message_counter(chat_id, bootstrap_snapshot)
             except Exception:
+                logger.debug(f"[Compaction] schedule_compaction_evaluation bootstrap failed for {chat_id}", exc_info=True)
                 pass
         self.window_selector.note_message_appended(chat_id, message_source=message_source)
         existing = self._pending_tasks.get(chat_id)
@@ -321,6 +344,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
                 "forced_pending_since_count": 0,
                 "forced_pending_new_messages": 0,
                 "cooldown_until": 0.0,
+                "last_active_at": time.time(),
                 "last_snapshot": None,
                 "last_compacted_tail_event_id": "",
                 "last_compacted_old_segment_count": 0,
@@ -354,6 +378,13 @@ class ContextCompactionEngine(CompactionProviderMixin):
     def get_cooldown_until(self, chat_id: str) -> float:
         state = self._state_for_chat(chat_id)
         return float(self._cooldown_by_chat.get(chat_id, 0.0) or state.get("cooldown_until", 0.0) or 0.0)
+
+    # ponytail: remove _chat_states entries idle > 24h to prevent unbounded growth
+    def _prune_stale_chat_states(self, max_age: float = 86400.0):
+        now = time.time()
+        stale = [cid for cid, s in self._chat_states.items() if now - float(s.get("last_active_at", 0.0) or 0.0) > max_age]
+        for cid in stale:
+            self._chat_states.pop(cid, None)
 
     @staticmethod
     def _eval_nodes() -> tuple[int, ...]:
@@ -401,6 +432,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
         previous_count = int(state.get("message_count_since_last_compaction", 0) or 0)
         current_count = previous_count + 1
         state["message_count_since_last_compaction"] = current_count
+        state["last_active_at"] = time.time()
         state["last_hook_source"] = str(message_source or "")
         state["last_safe_hook_checked_at"] = current_count
         self._queue_crossed_eval_nodes(state, previous_count, current_count)
@@ -502,6 +534,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
             try:
                 sender_id = str(event.get_sender_id() or "")
             except Exception:
+                logger.debug("[Compaction] _event_id_from_focus_event get_sender_id failed", exc_info=True)
                 sender_id = ""
         timestamp = float(getattr(event, "timestamp", 0.0) or 0.0)
         message_text = str(getattr(event, "message_str", "") or "")
@@ -712,6 +745,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
             signals.append("cold_summary_increment_worthwhile")
         return min(score, 10.0), signals or ["benefit_low"]
 
+    # ponytail: deprecated, replaced by detect_safe_window — remove when confirmed no external callers
     def _safety_analysis(self, snapshot: dict[str, Any], focus_context: Any = None) -> tuple[bool, str, bool]:
         recent_segments = list(snapshot.get("recent_segments", []) or [])
         focus_tail_overlap = self._has_focus_tail_overlap(snapshot, focus_context=focus_context)
@@ -1014,16 +1048,16 @@ class ContextCompactionEngine(CompactionProviderMixin):
                 last_safe_window_seen_at_count=int(state.get("last_safe_window_seen_at_count", 0) or 0),
                 post_compaction_recovery_rounds=int(state.get("post_compaction_recovery_rounds", 0) or 0),
             )
-        safe, safety_reason, focus_tail_overlap, safe_window_signals = self.detect_safe_window(snapshot, focus_context=focus_context)
+        safe, safe_window_reason, focus_tail_overlap, safe_window_signals = self.detect_safe_window(snapshot, focus_context=focus_context)
         count_score = self._count_score(evaluation_count)
         closure_score, closure_signals = self._closure_analysis_v2(list(snapshot.get("recent_segments", []) or []))
         tail_activity_score, tail_activity_signals = self._tail_activity_analysis_v2(list(snapshot.get("recent_segments", []) or []))
         topic_density_score, topic_density_signals = self._topic_density_analysis_v2(list(snapshot.get("recent_segments", []) or []))
         stability_score, stability_signals = self._stability_analysis_v2(
             safe,
-            safety_reason,
+            safe_window_reason,
             focus_tail_overlap,
-            safety_reason,
+            safe_window_reason,
             safe_window_signals,
             list(snapshot.get("recent_segments", []) or []),
         )
@@ -1045,7 +1079,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
             final_score=final_score,
             next_eval_at_count=next_eval,
             state="OBSERVING",
-            reason=safety_reason if not safe else "",
+            reason=safe_window_reason if not safe else "",
             is_forced=evaluation_count >= 120 or current_message_count >= 120,
             is_safe_to_compact=safe,
             focus_tail_overlap=focus_tail_overlap,
@@ -1075,7 +1109,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
         evaluation_count = int(decision.evaluation_count or message_count or 0)
         current_state = str(state.get("current_state", "NOT_READY") or "NOT_READY")
         cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
-        if time.time() < cooldown_until:
+        if monotonic() < cooldown_until:
             decision.state = "COOLDOWN"
             decision.reason = "cooldown"
             return decision
@@ -1212,14 +1246,22 @@ class ContextCompactionEngine(CompactionProviderMixin):
             )
             result.state = str(state.get("last_state", result.state) or result.state)
         except Exception:
+            logger.debug(f"[Compaction] get_trace_status snapshot failed for {chat_id}", exc_info=True)
             pass
         return self._result_to_dict(result)
 
     async def maybe_compact(self, chat_id: str, focus_context: Any = None) -> CompactionResult:
         if not self.dialogue_store:
             return CompactionResult(chat_id=chat_id, skipped_reason="store_unavailable", state="NOT_READY")
+        # ponytail: prune stale cooldown entries (>1h old) to prevent unbounded growth
+        prune_cutoff = monotonic() - 3600.0
+        stale_chats = [c for c, t in self._cooldown_by_chat.items() if t < prune_cutoff]
+        for c in stale_chats:
+            del self._cooldown_by_chat[c]
         state = self._state_for_chat(chat_id)
-        now = time.time()
+        now = monotonic()
+        # ponytail: token-based compaction trigger removed — no token_estimator wired.
+        # Message-count based trigger is the sole compaction gate.
         state["cooldown_until"] = float(self._cooldown_by_chat.get(chat_id, 0.0) or state.get("cooldown_until", 0.0) or 0.0)
         if int(state.get("message_count_since_last_compaction", 0) or 0) <= 0:
             try:
@@ -1229,6 +1271,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
                 )
                 self._bootstrap_message_counter(chat_id, bootstrap_snapshot)
             except Exception:
+                logger.debug(f"[Compaction] maybe_compact bootstrap failed for {chat_id}", exc_info=True)
                 bootstrap_snapshot = None
         if now < float(state.get("cooldown_until", 0.0) or 0.0):
             result = CompactionResult(

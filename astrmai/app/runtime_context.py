@@ -78,6 +78,7 @@ class RuntimeStatus:
     visual_started: bool = False
     cron_guard_started: bool = False
     degraded_components: dict[str, str] = field(default_factory=dict)
+    # ponytail: threading.Lock is safe here (sync-only during bootstrap, not held across await)
     _degraded_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def set_phase(self, phase: str) -> None:
@@ -137,6 +138,8 @@ class PluginRuntimeContext:
         self.host_plugin_ref = weakref.ref(host_plugin)
 
     def sync_host_compat_attrs(self) -> None:
+        # ponytail: setattr in loop may partially fail — some attrs set, some not.
+        # Add rollback or exception guard if partial injection causes desync.
         ref = self.host_plugin_ref
         if ref is None:
             return

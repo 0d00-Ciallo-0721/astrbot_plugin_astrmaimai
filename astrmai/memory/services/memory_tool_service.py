@@ -221,6 +221,7 @@ class MemoryToolService:
             _nodes(),
             _reflection(),
             _jargon(),
+            return_exceptions=True,
         )
         sections: list[str] = []
         if memory:

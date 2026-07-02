@@ -296,6 +296,7 @@ class InstantMemoryGate:
             if isinstance(response, str):
                 response = json.loads(response)
         except Exception:
+            logger.debug("[AstrMai-gate] backfill response parse failed", exc_info=True)
             return InstantGateResult()
         if not isinstance(response, dict) or not bool(response.get("worth")):
             await self._observe(turn, "backfill_skipped", reason="worth_false", summary="llm backfill judged not worth memorizing")
@@ -353,6 +354,7 @@ class InstantMemoryGate:
                 payload=payload or {},
             )
         except Exception:
+            logger.debug("[AstrMai-gate] observer record failed", exc_info=True)
             return
 
 

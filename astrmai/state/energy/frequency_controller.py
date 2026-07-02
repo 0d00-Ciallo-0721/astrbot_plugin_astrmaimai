@@ -1,6 +1,12 @@
 # astrmai/Heart/frequency_controller.py
 """
 发言频率控制器 (Frequency Controller) — Phase 6.3 / Gap 1
+
+DEPRECATED: This module is injected into AttentionGate but never called
+in the current pipeline. Frequency control is now handled by EnergyManager
++ AttentionGate throttle logic.  Retained for reference; remove when cleanup
+is scheduled.
+
 参考: MaiBot/heart_flow/heartFC_chat.py frequency_control
 
 核心功能: 模拟人类"有时健谈、有时沉默"的自然节奏，
@@ -15,6 +21,7 @@
 6. 情绪加成: mood > 0.5 (兴奋) 略升频；mood < -0.5 (低落) 降频
 """
 import time
+from time import monotonic
 import random
 import threading
 from typing import Dict, List
@@ -58,6 +65,9 @@ class FrequencyController:
         else:
             self.BASE_FREQ = self.DEFAULT_BASE_FREQ
 
+    def refresh_config(self, config):
+        self.config = config
+
     def should_reply(
         self,
         chat_id: str,
@@ -72,14 +82,23 @@ class FrequencyController:
         Args:
             chat_id:       会话 ID
             is_mentioned:  是否被 @bot 提及
-            energy:        当前精力 (0.0 ~ 1.0)
-            mood:          当前情绪 (-1.0 ~ 1.0)
+            energy:        当前精力 (0.0 ~ 1.0)，默认 1.0
+            mood:          当前情绪 (-1.0 ~ 1.0)，默认 0.0
             message_text:  消息文本（暂未使用，预留关键词分析）
 
         Returns:
             True  = 进入正常决策流程
             False = 跳过本次回复（沉默）
+
+        Concurrency Note:
+            Callers MUST pass the latest ``energy`` and ``mood`` values
+            obtained under ``ChatStateService``'s per-chat lock.  Passing
+            stale values may cause incorrect frequency decisions.
         """
+        if energy is None:
+            energy = 1.0
+        if mood is None:
+            mood = 0.0
         with self._records_lock:
             # @mention 豁免：被提及时强制进入决策
             if is_mentioned:
@@ -139,7 +158,7 @@ class FrequencyController:
         """外部调用：收到新消息时更新最后消息时间"""
         with self._records_lock:
             record = self._get_record(chat_id)
-            record.last_message_time = time.time()
+            record.last_message_time = monotonic()
 
     # ==========================================
     # 内部工具
@@ -173,6 +192,8 @@ class FrequencyController:
 
     def _silence_minutes(self, record: ChatReplyRecord) -> float:
         """计算距离上次消息的沉默时间（分钟）"""
+        if record.last_message_time <= 0:  # ponytail: guard against default epoch=0
+            return 0.0
         return (time.time() - record.last_message_time) / 60.0
 
     def cleanup_inactive(self, max_age_hours: float = 24.0):

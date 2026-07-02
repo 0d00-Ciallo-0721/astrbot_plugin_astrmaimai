@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing import Any
 
 from ..adapters.plugin_api import PluginApiAdapter
+from ..db import get_db
+from .dashboard_repository import DashboardRepository
 
 
 class LearningService:
@@ -40,9 +42,13 @@ class LearningService:
         return await ChatRuntimeService(self.plugin_api).run_reflect_once(chat_id)
 
     async def _expression_pattern_stats(self) -> dict[str, Any]:
-        # delegate to repository via AdminUiService for now
-        # (avoids circular import with dashboard_repository)
-        return {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
+        total, pending, approved, rejected = await DashboardRepository(get_db).expression_pattern_counts()
+        return {
+            "total": total,
+            "pending": pending,
+            "approved": approved,
+            "rejected": rejected,
+        }
 
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:

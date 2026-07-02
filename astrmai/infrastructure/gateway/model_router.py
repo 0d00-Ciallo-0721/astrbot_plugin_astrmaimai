@@ -2,19 +2,19 @@
 """
 智能模型路由器（Model Router）。
 
-职责：将模型轮询调度、健康度评分、故障冷却隔离从 gateway 主流程中拆出。
+职责：将模型轮询调度、健康度评分从 gateway 主流程中拆出。
+冷却管理统一由 GatewayPolicy 负责，本模块仅维护健康评分。
 
 核心策略：
 1. 每个模型维护一个 [-10, +10] 的健康分。
-2. 触发 429 / timeout 等致命错误时进入冷却期。
+2. 冷却由外部 cooldown_checker 回调提供（单一入口 GatewayPolicy）。
 3. 健康分相同时退化为 Round-Robin，避免长期偏压。
-4. 所有模型都在冷却时，优先返回最早解除冷却的模型。
 """
 
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 from astrbot.api import logger
 
@@ -24,10 +24,10 @@ class ModelState:
     """单个模型的运行时状态。"""
 
     health_score: int = 5
-    cooldown_until: float = 0.0
     total_calls: int = 0
     total_failures: int = 0
     consecutive_failures: int = 0
+    cooldown_until: float = 0.0
 
 
 @dataclass
@@ -36,6 +36,7 @@ class PoolState:
 
     cursor: int = 0
     models: Dict[str, ModelState] = field(default_factory=dict)
+    last_used: float = field(default_factory=time.time)
 
 
 # ------------------------------------------------------------------
@@ -47,8 +48,6 @@ HEALTH_INIT = 5
 SUCCESS_REWARD = 1
 FAILURE_PENALTY = -2
 FATAL_PENALTY = -4
-BASE_COOLDOWN_SEC = 30.0
-MAX_COOLDOWN_SEC = 120.0
 
 
 class ModelRouter:
@@ -57,7 +56,8 @@ class ModelRouter:
 
     使用方式：
         router = ModelRouter()
-        ranked = router.get_ranked_models("task", ["model-a", "model-b", "model-c"])
+        ranked = router.get_ranked_models("task", ["model-a", "model-b", "model-c"],
+                                           cooldown_checker=policy._is_model_cooldown)
         router.report_success("task", "model-a")
         router.report_failure("task", "model-b", is_fatal=True)
     """
@@ -76,6 +76,7 @@ class ModelRouter:
         models: List[str],
         sticky_key: str = "",
         sticky_preferred: str = "",
+        cooldown_checker: Callable[[str, str], bool] | None = None,
     ) -> List[str]:
         """
         获取按健康度排序的模型列表。
@@ -83,9 +84,9 @@ class ModelRouter:
         算法：
         1. 清洗并去重输入模型列表。
         2. 为每个模型初始化或获取 ModelState。
-        3. 分离“可用模型”和“冷却中模型”。
+        3. 分离"可用模型"和"冷却中模型"（通过 cooldown_checker 回调）。
         4. 可用模型按健康分降序排序，同分时按轮询游标打散。
-        5. 冷却中模型按最早解冻时间追加到队尾。
+        5. 冷却中模型追加到队尾。
         6. 推进游标，避免同分时长期偏压。
         """
         clean_models = [m.strip() for m in models if m and m.strip()]
@@ -97,21 +98,23 @@ class ModelRouter:
 
         # 确保模型池和模型状态存在
         pool = self._ensure_pool(pool_name)
+        pool.last_used = time.time()
         for mid in unique_models:
             if mid not in pool.models:
                 pool.models[mid] = ModelState()
 
-        now = time.time()
-
-        # 分离可用模型与冷却中模型
+        # 分离可用模型与冷却中模型（通过外部 cooldown_checker）
         available = []
         cooling = []
+        now = time.time()
         for mid in unique_models:
             state = pool.models[mid]
-            if state.cooldown_until > now:
+            if float(getattr(state, "cooldown_until", 0.0) or 0.0) > now:
                 cooling.append((mid, state))
+            elif cooldown_checker and cooldown_checker(pool_name, mid):
+                cooling.append((mid, pool.models[mid]))
             else:
-                available.append((mid, state))
+                available.append((mid, pool.models[mid]))
 
         # 可用模型：健康分降序，同分时参考轮询游标
         cursor = pool.cursor % len(unique_models) if unique_models else 0
@@ -141,9 +144,6 @@ class ModelRouter:
             if pinned is not None:
                 available = [pinned] + tail
 
-        # 冷却中的模型：按最早解冻时间升序
-        cooling.sort(key=lambda x: x[1].cooldown_until)
-
         # 合并结果：可用模型优先，冷却中模型兜底
         ranked = [mid for mid, _ in available] + [mid for mid, _ in cooling]
 
@@ -171,8 +171,9 @@ class ModelRouter:
         """
         上报一次调用失败。
 
-        is_fatal=True: 429 / timeout / ratelimit 等致命错误，触发冷却隔离。
-        is_fatal=False: 普通错误，仅扣分，不进入隔离。
+        is_fatal=True: 429 / timeout / ratelimit 等致命错误，扣 4 分。
+        is_fatal=False: 普通错误，扣 2 分。
+        冷却管理交由 GatewayPolicy 统一处理。
         """
         pool = self._ensure_pool(pool_name)
         state = pool.models.get(model_id)
@@ -187,16 +188,10 @@ class ModelRouter:
         state.health_score = max(HEALTH_MIN, state.health_score + penalty)
 
         if is_fatal:
-            # 自适应冷却：连续失败越多，冷却时间越长
-            cooldown = min(
-                BASE_COOLDOWN_SEC * state.consecutive_failures,
-                MAX_COOLDOWN_SEC,
-            )
-            state.cooldown_until = time.time() + cooldown
+            state.cooldown_until = max(float(getattr(state, "cooldown_until", 0.0) or 0.0), time.time() + 30.0)
             logger.warning(
                 f"[ModelRouter] model {model_id} hit a fatal error; "
-                f"enter cooldown for {cooldown:.0f}s "
-                f"(health={state.health_score}, consecutive_failures={state.consecutive_failures})"
+                f"health={state.health_score}, consecutive_failures={state.consecutive_failures}"
             )
         else:
             logger.debug(
@@ -206,7 +201,6 @@ class ModelRouter:
 
     def get_stats(self) -> Dict[str, dict]:
         """返回所有模型池的运行快照，用于调试和监控。"""
-        now = time.time()
         stats = {}
         for pool_name, pool in self._pools.items():
             pool_stats = {}
@@ -215,8 +209,6 @@ class ModelRouter:
                     "health": state.health_score,
                     "calls": state.total_calls,
                     "failures": state.total_failures,
-                    "cooling": state.cooldown_until > now,
-                    "cooldown_remaining": max(0, state.cooldown_until - now),
                 }
             stats[pool_name] = {
                 "cursor": pool.cursor,
@@ -230,6 +222,12 @@ class ModelRouter:
     def _ensure_pool(self, pool_name: str) -> PoolState:
         """确保模型池状态存在。"""
         if pool_name not in self._pools:
+            # ponytail: prune stale pools (>24h idle, keep max 50 active pools)
+            if len(self._pools) >= 50:
+                cutoff = time.time() - 86400
+                stale = [k for k, v in self._pools.items() if v.last_used < cutoff]
+                for k in stale:
+                    del self._pools[k]
             self._pools[pool_name] = PoolState()
         return self._pools[pool_name]
 
@@ -246,11 +244,9 @@ class ModelRouter:
         sticky_slot = f"{pool_name}:{sticky_key}"
         current = self._sticky_primary.get(sticky_slot, "")
         if current in unique_models:
-            # 命中后移到末尾（LRU 语义）
             self._sticky_primary.move_to_end(sticky_slot)
             return current
         preferred = sticky_preferred if sticky_preferred in unique_models else unique_models[0]
-        # 容量检查：超过上限时淘汰最早插入的条目
         while len(self._sticky_primary) >= self._sticky_primary_maxsize:
             self._sticky_primary.popitem(last=False)
         self._sticky_primary[sticky_slot] = preferred

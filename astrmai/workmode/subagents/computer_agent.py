@@ -6,7 +6,7 @@ from .base_agent import AstrMaiBaseSubAgent
 try:
     from astrbot.core.computer.tools.python import LocalPythonTool
     from astrbot.core.computer.tools.shell import ExecuteShellTool
-    _COMPUTER_TOOLS_AVAILABLE = True
+    _COMPUTER_TOOLS_AVAILABLE = True  # ponytail: 框架工具可用，但 sandbox_enabled 决定是否实际加载
     logger.info("[Sys3/ComputerAgent] 计算机工具加载成功")
 except ImportError:
     _COMPUTER_TOOLS_AVAILABLE = False
@@ -23,6 +23,7 @@ class ComputerAgent(AstrMaiBaseSubAgent):
         "当用户需要执行 Python 代码、运行系统命令、计算复杂数值或处理文件时使用。"
         "注意：此功能需要管理员权限。"
     )
+    sandbox_enabled: bool = False  # 由 Sys3Router 从 config.sys3.computer_agent_sandbox_enabled 注入
 
     def get_max_steps(self) -> int:
         return 15
@@ -43,6 +44,8 @@ class ComputerAgent(AstrMaiBaseSubAgent):
         )
 
     async def get_tool_set(self, ctx, event) -> ToolSet:
+        if not self.sandbox_enabled:
+            return ToolSet([])
         if not _COMPUTER_TOOLS_AVAILABLE:
             return ToolSet([])
         return ToolSet([
@@ -51,6 +54,8 @@ class ComputerAgent(AstrMaiBaseSubAgent):
         ])
 
     async def _get_decline_reason(self) -> str:
+        if not self.sandbox_enabled:
+            return "代码执行功能未启用，请管理员在 AstrBot WebUI → 插件配置 → AstrMai → 工作模式（Sys3）中开启「启用 ComputerAgent 代码执行」"
         return "代码执行工具未能加载，请确认 AstrBot 计算环境配置正确，或考虑改用沙盒模式"
 
 

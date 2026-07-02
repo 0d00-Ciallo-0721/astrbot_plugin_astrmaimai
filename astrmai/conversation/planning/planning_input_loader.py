@@ -104,6 +104,7 @@ class PlanningInputLoader:
             agency_task,
             continuity_task,
             heartflow_task,
+            return_exceptions=True,
         )
         timings = [self._record_timing(event, item) for item in (agency_item, continuity_item, heartflow_item)]
         agency = agency_item.value or {}
@@ -191,7 +192,7 @@ class PlanningInputLoader:
                     ),
                 ]
             )
-        loaded_items = await asyncio.gather(*tasks)
+        loaded_items = await asyncio.gather(*tasks, return_exceptions=True)
         for item in loaded_items:
             self._record_timing(event, item)
             result[item.name] = item.value
@@ -379,7 +380,7 @@ class PlanningInputLoader:
                 return await state_engine.get_user_profile(str(user_id))
             return None
 
-        state, profile = await asyncio.gather(_get_state(), _get_profile())
+        state, profile = await asyncio.gather(_get_state(), _get_profile(), return_exceptions=True)
         relationship_vec = None
         if user_id and hasattr(state_engine, "relationship_engine"):
             relationship_engine = getattr(state_engine, "relationship_engine", None)

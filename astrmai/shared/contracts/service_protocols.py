@@ -1,0 +1,39 @@
+"""Service protocols for type-safe dependency injection.
+
+These Protocol classes provide IDE autocompletion and type checking
+for the most frequently used services in PluginRuntimeContext.
+They are NOT runtime-checked — they serve as documentation and
+static analysis hints.
+"""
+
+from typing import Any, Protocol
+
+
+class GatewayProtocol(Protocol):
+    """Minimal protocol for GlobalModelGateway."""
+
+    async def chat_in_lane_result(self, *, lane_key, prompt, system_prompt="", **kwargs) -> Any: ...
+    async def call_judge_task(self, *, prompt, system_prompt="", **kwargs) -> Any: ...
+    async def call_vision_task(self, *, image_data, prompt="", **kwargs) -> Any: ...
+    async def call_data_process_task(self, *, prompt, system_prompt="", **kwargs) -> Any: ...
+
+
+class MemoryEngineProtocol(Protocol):
+    """Minimal protocol for MemoryEngine."""
+
+    async def search_memories(self, query, top_k=5, **kwargs) -> list: ...
+    async def initialize(self) -> None: ...
+    async def start_background_tasks(self) -> None: ...
+    def get_expression_pattern_service(self) -> Any: ...
+
+
+class StateEngineProtocol(Protocol):
+    """Minimal protocol for StateEngine."""
+
+    async def get_state(self, chat_id: str) -> Any: ...
+    async def update_mood(self, chat_id: str, text: str) -> None: ...
+    async def consume_energy(self, chat_id: str, amount: float = None) -> None: ...
+    async def get_user_profile(self, user_id: str) -> Any: ...
+
+
+__all__ = ["GatewayProtocol", "MemoryEngineProtocol", "StateEngineProtocol"]

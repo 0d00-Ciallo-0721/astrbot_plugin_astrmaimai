@@ -5,6 +5,7 @@ import copy
 import datetime
 import inspect
 import time
+from time import monotonic
 from typing import Any, Dict, List
 
 from astrbot.api import logger
@@ -28,15 +29,29 @@ class ChatStateService:
         self.config = config
         self.chat_states: Dict[str, ChatState] = {}
         self._chat_locks: Dict[str, asyncio.Lock] = {}
+        # ponytail: threading.Lock guards dict mutations, held for trivial ops only — safe in asyncio
         self._pool_lock_mutex = threading.Lock()
+        self._last_lock_prune: float = 0.0
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        with self._pool_lock_mutex:
-            lock = self._chat_locks.get(chat_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._chat_locks[chat_id] = lock
-        return lock
+        # ponytail: FIFO eviction when >500 locks. Python 3.7+ dict is insertion-ordered.
+        # Edge case: very old but still-active chats could be evicted if they're at the front of the dict.
+        # Mitigation: move-to-end on access keeps active chats near the back.
+        now = monotonic()
+        MAX_CHAT_LOCKS = 500
+        if len(self._chat_locks) > MAX_CHAT_LOCKS and now - self._last_lock_prune > 300:
+            excess = len(self._chat_locks) - 300
+            keys_to_remove = list(self._chat_locks.keys())[:excess]
+            for key in keys_to_remove:
+                self._chat_locks.pop(key, None)
+            self._last_lock_prune = now
+        # Move current chat_id to end (LRU approximation in Python 3.7+ ordered dict)
+        if chat_id in self._chat_locks:
+            self._chat_locks[chat_id] = self._chat_locks.pop(chat_id)
+
+        if chat_id not in self._chat_locks:
+            self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
 
     def _touch_state(self, state: ChatState, now: float) -> ChatState:
         state.last_access_time = now
@@ -80,8 +95,11 @@ class ChatStateService:
     async def _persist_if_dirty(self, state: ChatState) -> None:
         if not state.is_dirty:
             return
-        await self.persistence.save_chat_state(state.chat_id, state)
-        state.is_dirty = False
+        try:
+            await self.persistence.save_chat_state(state.chat_id, state)
+            state.is_dirty = False
+        except Exception:
+            logger.exception(f"[ChatState] DB save failed for {state.chat_id} in _persist_if_dirty")
 
     async def _get_state_inner(self, chat_id: str) -> ChatState:
         now = time.time()
@@ -92,7 +110,12 @@ class ChatStateService:
             await self._persist_if_dirty(state)
             return state
 
-        state = await self.persistence.load_chat_state(chat_id)
+        try:
+            state = await self.persistence.load_chat_state(chat_id)
+        except Exception:
+            from astrbot.api import logger as _log
+            _log.exception(f"[ChatState] DB load failed for {chat_id}, using default")
+            state = self._create_default_state(chat_id)
         if state is None:
             state = self._create_default_state(chat_id)
         else:
@@ -135,7 +158,10 @@ class ChatStateService:
             else:
                 state.mood = self._clamp_mood(state.mood + delta)
             self._mark_dirty(state)
-            await self.persistence.save_chat_state(chat_id, state)
+            try:
+                await self.persistence.save_chat_state(chat_id, state)
+            except Exception:
+                logger.exception(f"[ChatState] DB save failed for {chat_id} in atomic_update_mood")
             return state.mood
 
     async def mark_energy_consumed(self, chat_id: str, amount: float) -> ChatState:
@@ -147,17 +173,23 @@ class ChatStateService:
             state.last_reply_time = time.time()
             self._mark_dirty(state)
             logger.debug(f"[{chat_id}] energy settlement: {old_energy:.2f} -> {state.energy:.2f}")
-            await self.persistence.save_chat_state(chat_id, state)
-            state.is_dirty = False
+            try:
+                await self.persistence.save_chat_state(chat_id, state)
+                state.is_dirty = False
+            except Exception:
+                logger.exception(f"[ChatState] DB save failed for {chat_id} in mark_energy_consumed")
             return state
 
     async def should_drop_by_energy(self, chat_id: str, msg_count: int, energy_manager: EnergyManager) -> bool:
         async with self._get_chat_lock(chat_id):
             state = await self._get_state_inner(chat_id)
             should_drop = energy_manager.should_drop_by_energy(state, msg_count)
-            if should_drop and getattr(state, "is_dirty", False):
-                await self.persistence.save_chat_state(chat_id, state)
-                state.is_dirty = False
+            if getattr(state, "is_dirty", False):
+                try:
+                    await self.persistence.save_chat_state(chat_id, state)
+                    state.is_dirty = False
+                except Exception:
+                    logger.exception(f"[ChatState] DB save failed for {chat_id} in should_drop_by_energy")
             return should_drop
 
 
@@ -174,6 +206,14 @@ class StateEngine:
         self.relationship_engine = RelationshipEngine(config=self.config)
         self.affection_router = AffectionRouter(self.relationship_engine, event_bus=event_bus)
         self.energy_manager = EnergyManager(self.config)
+
+    def refresh_config(self, config):
+        """ponytail: hot-reload config into state engine and sub-components"""
+        self.config = config
+        for attr in ("mood_manager", "energy_manager", "relationship_engine"):
+            comp = getattr(self, attr, None)
+            if comp is not None:
+                comp.config = config
 
     async def _load_profile_with_relationship(self, user_id: str) -> UserProfile:
         profile = await self.user_profile_service.get_user_profile(user_id)
@@ -274,11 +314,11 @@ class StateEngine:
             apply_natural_decay(current_state, self.config)
             current_mood = current_state.mood
 
-            if abs(current_mood - snapshot_mood) < 0.001:
+            if abs(current_mood - snapshot_mood) < 0.0001:
                 current_state.mood = ChatStateService._clamp_mood(new_value)
             else:
-                delta = new_value - snapshot_mood
-                current_state.mood = ChatStateService._clamp_mood(current_mood + delta)
+                logger.debug(f"[AstrMai-state] CAS shifted for mood update, applying delta to current baseline")
+                current_state.mood = ChatStateService._clamp_mood(current_mood + (new_value - snapshot_mood))
 
             current_state.is_dirty = True
             await self.chat_state_service.persistence.save_chat_state(chat_id, current_state)

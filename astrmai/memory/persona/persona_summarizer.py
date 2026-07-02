@@ -27,6 +27,15 @@ class PersonaSummarizer:
         self._lock = asyncio.Lock()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
 
+    def _handle_background_task_result(self, task: asyncio.Task) -> None:
+        self.pending_tasks = {k: v for k, v in self.pending_tasks.items() if v is not task}
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"[PersonaSummarizer] 后台切片任务异常: {exc}", exc_info=exc)
+        except asyncio.CancelledError:
+            pass
+
     def _compute_hash(self, text: str) -> str:
         """计算人设内容的 Hash 值，用于缓存 Key"""
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -193,6 +202,7 @@ Rules:
                 # 从残缺缓存中提取原始长文本，重新拉起后台任务
                 raw_text = cached_data.get("raw", original_prompt)
                 task = asyncio.create_task(self._generate_all_shards_background(raw_text, cache_key))
+                task.add_done_callback(self._handle_background_task_result)
                 self.pending_tasks[cache_key] = task
 
             if not str(cached_data.get("first_person_rewrite", "") or "").strip():
@@ -241,6 +251,7 @@ Rules:
                 "shards": {},
                 "is_full_ready": False,
                 "raw": original_prompt,
+                "raw_hash": self._compute_hash(original_prompt),
                 "timestamp": time.time()
             }
             self.cache[cache_key] = new_cache_data
@@ -268,6 +279,7 @@ Rules:
             # 🟢 阶段三：抛出后台任务生成 8 大维度
             # ==========================================
             task = asyncio.create_task(self._generate_all_shards_background(original_prompt, cache_key))
+            task.add_done_callback(self._handle_background_task_result)
             self.pending_tasks[cache_key] = task
             
             return new_cache_data
@@ -454,6 +466,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] logic_style slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -491,6 +504,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] speech_style slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -523,6 +537,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] world_view slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -555,6 +570,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] timeline slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -587,6 +603,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] relations slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -617,6 +634,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] skills slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -648,6 +666,7 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] values slice failed for {cache_key}", exc_info=True)
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
@@ -680,4 +699,5 @@ Rules:
                 fallback_prompt=prompt,
             )
         except Exception:
+            logger.exception(f"[AstrMai-persona] secrets slice failed for {cache_key}", exc_info=True)
             return "无"

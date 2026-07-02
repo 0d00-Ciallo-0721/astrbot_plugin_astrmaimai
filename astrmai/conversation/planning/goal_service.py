@@ -10,6 +10,7 @@
 - 支持"结束对话"特殊目标作为中止信号
 """
 import time
+from time import monotonic
 import asyncio
 import json
 import re
@@ -184,7 +185,7 @@ class GoalManager:
             )
             if matched:
                 g.stale_count = 0
-                g.last_referenced = time.time()
+                g.last_referenced = monotonic()
             else:
                 g.stale_count += 1
 

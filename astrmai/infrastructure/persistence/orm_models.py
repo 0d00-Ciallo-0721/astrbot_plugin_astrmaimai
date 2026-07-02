@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from sqlmodel import Field, SQLModel
+from sqlmodel import Field, SQLModel, UniqueConstraint
 
 
 class LastMessageMetadataDB(SQLModel, table=True):
@@ -20,7 +20,7 @@ class LastMessageMetadataDB(SQLModel, table=True):
 
 
 class ExpressionPattern(SQLModel, table=True):
-    __table_args__ = {"extend_existing": True}
+    # ponytail: R6 — UniqueConstraint prevents duplicate rows from concurrent INSERTs
 
     id: Optional[int] = Field(default=None, primary_key=True)
     situation: str = Field(index=True)
@@ -42,6 +42,11 @@ class ExpressionPattern(SQLModel, table=True):
     last_active_time: float = Field(default_factory=time.time)
     create_time: float = Field(default_factory=time.time)
     group_id: str = Field(index=True)
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "situation", "expression", name="uq_expression_pattern"),
+        {"extend_existing": True},
+    )
 
 
 class MessageLog(SQLModel, table=True):

@@ -14,6 +14,7 @@ import json
 import random
 import re
 import time
+from time import monotonic
 from typing import Any, Dict, List, Optional
 
 from astrbot.api import logger
@@ -70,7 +71,7 @@ class DreamAgent:
 
         dream_log: list[str] = []
         iteration = 0
-        start_time = time.time()
+        start_time = monotonic()
 
         events_desc = "\n".join(
             [f"- [{e.get('event_id', '?')}] {e.get('narrative', '')[:80]}..." for e in seed_events]
@@ -86,7 +87,7 @@ class DreamAgent:
         messages = [{"role": "user", "content": system_prompt}]
 
         while iteration < self.MAX_ITERATIONS:
-            if time.time() - start_time > self.TIMEOUT_SEC:
+            if monotonic() - start_time > self.TIMEOUT_SEC:
                 logger.warning(f"[DreamAgent] dream maintenance timeout after {self.TIMEOUT_SEC}s")
                 break
 

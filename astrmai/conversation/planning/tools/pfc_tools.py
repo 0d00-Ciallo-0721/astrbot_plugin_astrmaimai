@@ -214,6 +214,7 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
             _fetch_nodes(),
             _fetch_reflection(),
             _fetch_jargon(),
+            return_exceptions=True,
         )
 
         sections = []

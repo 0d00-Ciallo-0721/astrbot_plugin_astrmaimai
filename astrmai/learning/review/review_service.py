@@ -116,7 +116,7 @@ class ExpressionReviewService:
                 {
                     "checked": True,
                     "rejected": False,
-                    "review_status": "approved",
+                    "review_status": "approved" if replacement_expression else "pending",
                     "replacement_expression": replacement_expression or None,
                     "apply_replacement": bool(replacement_expression),
                     "review_suggestion": "",
@@ -127,6 +127,7 @@ class ExpressionReviewService:
 
         service = self._pattern_service()
         if service and hasattr(service, "update_review"):
+            # ponytail: kwargs forwarding is intentional — caller builds the dict, callee accepts same keys.
             updated = await service.update_review(pattern_id, **kwargs)
         else:
             legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id

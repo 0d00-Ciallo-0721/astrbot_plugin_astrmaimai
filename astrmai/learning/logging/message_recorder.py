@@ -1,4 +1,5 @@
 import time
+from time import monotonic
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict
@@ -18,6 +19,10 @@ class MessageRecorder:
         self._windows: Dict[str, RecorderWindow] = {}
 
     def _get_window(self, scope_id: str) -> RecorderWindow:
+        # ponytail: prune unbounded _windows, keep most recent 200 entries
+        if scope_id not in self._windows and len(self._windows) >= 200:
+            oldest = min(self._windows, key=lambda k: self._windows[k].last_trigger_time or 0.0)
+            del self._windows[oldest]
         if scope_id not in self._windows:
             self._windows[scope_id] = RecorderWindow()
         return self._windows[scope_id]
@@ -25,7 +30,7 @@ class MessageRecorder:
     def record(self, scope_id: str, timestamp: float | None = None) -> bool:
         if not scope_id:
             return False
-        now = float(timestamp or time.time())
+        now = float(timestamp or monotonic())
         window = self._get_window(scope_id)
         window.timestamps.append(now)
         cutoff = now - self.window_seconds

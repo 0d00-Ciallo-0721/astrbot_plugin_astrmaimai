@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Dict, List
 
 from astrbot.api import logger
@@ -52,6 +53,9 @@ class EvolutionManager:
         self._lock_mutex = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
 
+    def refresh_config(self, config):
+        self.config = config
+
     async def _get_mining_lock(self, group_id: str) -> asyncio.Lock:
         async with self._lock_mutex:
             if group_id not in self._mining_locks:
@@ -70,7 +74,7 @@ class EvolutionManager:
             if exc:
                 logger.error(f"[Evolution Task Error] {exc}", exc_info=exc)
         except asyncio.CancelledError:
-            pass
+            logger.debug(f"[Evolution Task] task cancelled: {task.get_name()}")
 
     async def _append_message_log(self, *, group_id: str, sender_id: str, sender_name: str, content: str):
         if hasattr(self.db, "add_message_log_async"):
@@ -287,7 +291,7 @@ class EvolutionManager:
             if isinstance(result, dict):
                 return str(result.get("goal", "陪伴用户，提供有趣且连贯的对话"))
             if isinstance(result, str):
-                match = __import__("re").search(r"\{.*?\}", result, __import__("re").DOTALL)
+                match = re.search(r"\{.*?\}", result, re.DOTALL)
                 if match:
                     data = json.loads(match.group(0))
                     if isinstance(data, dict):

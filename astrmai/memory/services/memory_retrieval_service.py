@@ -11,6 +11,7 @@ from .memory_scoring import DEFAULT_MEMORY_SCORING, MemoryScoringConfig, rerank_
 from .expression_pattern_retrieval_policy import ExpressionPatternRetrievalPolicy
 from .jargon_retrieval_policy import JargonRetrievalPolicy
 from .v2_store import MemoryV2Store
+from ...infrastructure.runtime.lane_manager import LaneKey
 
 
 class MemoryRetrievalService:
@@ -155,7 +156,7 @@ class MemoryRetrievalService:
                 seen.add(item.id)
                 candidates.append(item)
             if len(candidates) >= limit:
-                continue
+                break  # ponytail: M11 — stop early instead of wasting more queries
         return candidates[:limit]
 
     async def _retrieve_once(self, query: MemoryQuery) -> list[MemoryCandidate]:
@@ -350,7 +351,7 @@ class MemoryRetrievalService:
             if float(item.created_at or 0.0) <= 0.0:
                 item.created_at = float(payload.get("created_at") or 0.0)
                 if item.created_at > 0:
-                    item.recency_score = 1.0 / (1.0 + max(0.0, (time.time() - item.created_at) / 86400))
+                    item.recency_score = 1.0 / (1.0 + max(0.0, (time.time() - item.created_at) / 86400))  # ponytail: NTP guard
             item.updated_at = float(payload.get("updated_at") or item.updated_at or 0.0)
             item.last_access_time = float(payload.get("last_access_time") or item.last_access_time or 0.0)
             item.importance = float(payload.get("importance") or item.importance or 0.5)
@@ -380,7 +381,11 @@ class MemoryRetrievalService:
             f"Request: {base_query}"
         )
         try:
-            response = await gateway.call_data_process_task(prompt=prompt, is_json=True)
+            response = await gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=LaneKey(subsystem="bg", task_family="query_rewrite", scope_id="global", scope_kind="global"),
+            )
             if isinstance(response, str):
                 response = json.loads(response)
             queries = response.get("queries", []) if isinstance(response, dict) else []

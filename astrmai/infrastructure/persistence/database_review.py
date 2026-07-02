@@ -3,6 +3,8 @@ import json
 import time
 from typing import List, Optional
 
+from astrbot.api import logger
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import desc, select
 
 from .orm_models import ExpressionPattern
@@ -72,27 +74,55 @@ class ReviewPersistenceMixin:
         if service and hasattr(service, "write_pattern"):
             try:
                 asyncio.get_running_loop()
+                # ponytail: fire-and-forget canonical write from async context
+                task = asyncio.create_task(self._save_pattern_to_canonical_async(pattern))
+                task.add_done_callback(
+                    lambda t, p=pattern: (
+                        logger.exception(f"[DatabaseReview] canonical save failed for pattern {getattr(p, 'id', '?')}")
+                        if t.exception() else None
+                    )
+                )
             except RuntimeError:
                 asyncio.run(self._save_pattern_to_canonical_async(pattern))
-                return pattern
-        with self.get_session() as session:
-            statement = select(ExpressionPattern).where(
-                ExpressionPattern.group_id == pattern.group_id,
-                ExpressionPattern.situation == pattern.situation,
-                ExpressionPattern.expression == pattern.expression,
-            )
-            existing = session.exec(statement).first()
-            if existing:
-                target = self._merge_existing_pattern(existing, pattern)
-                session.add(target)
-            else:
-                if not getattr(pattern, "content_list", ""):
-                    pattern.content_list = "[]"
-                target = pattern
-                session.add(target)
-            session.commit()
-            session.refresh(target)
-            return ExpressionPattern.model_validate(target.model_dump())
+        # deprecated: ORM write for read-compat only, v2_store is primary
+        try:
+            with self.get_session() as session:
+                statement = select(ExpressionPattern).where(
+                    ExpressionPattern.group_id == pattern.group_id,
+                    ExpressionPattern.situation == pattern.situation,
+                    ExpressionPattern.expression == pattern.expression,
+                )
+                existing = session.exec(statement).first()
+                if existing:
+                    target = self._merge_existing_pattern(existing, pattern)
+                    session.add(target)
+                else:
+                    if not getattr(pattern, "content_list", ""):
+                        pattern.content_list = "[]"
+                    target = pattern
+                    session.add(target)
+                try:
+                    session.commit()
+                    session.refresh(target)
+                except IntegrityError:
+                    # ponytail: R6 — UNIQUE constraint violation, fallback to merge
+                    session.rollback()
+                    with self.get_session() as retry_session:
+                        statement_retry = select(ExpressionPattern).where(
+                            ExpressionPattern.group_id == pattern.group_id,
+                            ExpressionPattern.situation == pattern.situation,
+                            ExpressionPattern.expression == pattern.expression,
+                        )
+                        existing = retry_session.exec(statement_retry).first()
+                        if existing:
+                            target = self._merge_existing_pattern(existing, pattern)
+                            retry_session.add(target)
+                            retry_session.commit()
+                            retry_session.refresh(target)
+                return ExpressionPattern.model_validate(target.model_dump())
+        except Exception as exc:
+            logger.warning(f"[AstrMai-db] save_pattern ORM write failed: {exc}")
+            return pattern
 
     def get_patterns(self, group_id: str, limit: int = 5, only_checked: bool = False, include_rejected: bool = False, shared_scope: Optional[str] = None, think_level: Optional[int] = None, review_status: Optional[str] = None) -> List[ExpressionPattern]:
         with self.get_session() as session:

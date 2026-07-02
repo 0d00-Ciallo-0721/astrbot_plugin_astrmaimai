@@ -160,7 +160,8 @@ class AffectionRouter:
         if t_sender_id:
             t_score = t_weight
             if mood_tag in ["angry", "sad"] and any(word in t_text for word in sensitive_words):
-                logger.warning(f"[AffectionRouter] trigger silent-assassin defense by user {t_sender_id}")
+                # affection boost for hostile messages (NOT a safety filter — does not block messages)
+                logger.warning(f"[AffectionRouter] trigger hostile-message affection boost by user {t_sender_id}")
                 t_score = 80.0
 
         total_scores: Dict[str, float] = {}

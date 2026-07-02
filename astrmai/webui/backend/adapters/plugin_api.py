@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 from ..paths import default_config_path, default_persona_cache_path, default_schema_path
+from ....shared.helpers.plugin_helpers import safe_create_task
 
 ACTIVE_FACADE: Any = None
 _FACADE_UNSET = object()
@@ -25,6 +26,7 @@ APPLY_STATUS: dict[str, Any] = {
     "reload_required": False,
     "error": "",
 }
+# ponytail: global lock for apply_config serialization — acceptable
 _apply_lock = threading.Lock()
 
 
@@ -47,7 +49,7 @@ def set_active_facade(facade: Any) -> None:
                 except RuntimeError:
                     loop = None
                 if loop is not None and loop.is_running():
-                    loop.create_task(term())
+                    safe_create_task(term())
                 else:
                     _asyncio.run(term())
         except Exception as exc:
@@ -134,6 +136,16 @@ class PluginApiAdapter:
         with open(safe_path, "r", encoding="utf-8") as file:
             return json.load(file)
 
+    def _read_schema_json(self, path: str) -> dict[str, Any]:
+        safe_path = os.path.realpath(path)
+        default_path = os.path.realpath(default_schema_path())
+        if safe_path == default_path:
+            if not os.path.exists(safe_path):
+                return {}
+            with open(safe_path, "r", encoding="utf-8") as file:
+                return json.load(file)
+        return self._read_json(path)
+
     def _write_json(self, path: str, data: dict[str, Any]) -> None:
         safe_path = self._validate_path(path)
         os.makedirs(os.path.dirname(safe_path) or ".", exist_ok=True)
@@ -181,6 +193,7 @@ class PluginApiAdapter:
         method = getattr(facade, method_name, None) if facade else None
         if not callable(method):
             return None
+        # ponytail: positional-only — keyword args silently dropped. Add **kwargs support if needed.
         return method(*args)
 
     # 閳光偓閳光偓 narrow facade accessors (preferred over runtime passthrough) 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
@@ -362,7 +375,7 @@ class PluginApiAdapter:
         self._write_json_atomic(self.config_path, data)
 
     async def read_schema(self) -> dict[str, Any]:
-        return self._read_json(self.schema_path)
+        return self._read_schema_json(self.schema_path)
 
     async def get_config_meta(self) -> dict[str, Any]:
         config_exists = os.path.exists(self.config_path)

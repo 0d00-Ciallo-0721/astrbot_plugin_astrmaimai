@@ -9,7 +9,7 @@ from astrbot.api.event import MessageChain
 
 
 async def send_meme(event, emotion_tag: str, probability: int, memes_dir: Path, context=None):
-    if not emotion_tag or emotion_tag in {"neutral", "none"}:
+    if not emotion_tag or emotion_tag.lower() in {"neutral", "none"}:
         return
     if random.randint(1, 100) > probability:
         return

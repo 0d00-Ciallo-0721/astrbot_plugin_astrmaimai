@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 import random
 import time
+from time import monotonic
 
 from astrbot.api import logger
 
@@ -192,12 +193,34 @@ class ProactiveTask:
         if self._is_running:
             return
         self._is_running = True
-        self._last_global_maintenance_run = time.time()
+        self._last_global_maintenance_run = monotonic()
         self._scheduler_poll_mode = "FAST"
         self._scheduler_poll_interval_seconds = self.FAST_POLL_INTERVAL_SECONDS
         if self.dream_agent is None and self._db_service:
             self._bind_dream_dependencies()
         self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._on_loop_done)
+
+    def _on_loop_done(self, task):
+        """Loop 意外终止时自动重启（正常 stop 不触发）。"""
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            if self._is_running:
+                logger.error("[ProactiveTask] loop unexpectedly cancelled, restarting in 5s")
+                loop = asyncio.get_running_loop()
+                loop.call_later(5, lambda: self._restart_if_still_running())
+            return
+        if exc and self._is_running:
+            logger.exception("[ProactiveTask] loop crashed, restarting in 5s")
+            loop = asyncio.get_running_loop()
+            loop.call_later(5, lambda: self._restart_if_still_running())
+
+    def _restart_if_still_running(self):
+        """ponytail: re-check _is_running after 5s delay to avoid reanimating stopped scheduler"""
+        if self._is_running:
+            self._is_running = False  # reset so start() will actually restart
+            asyncio.ensure_future(self.start())
 
     async def stop(self):
         self._is_running = False
@@ -359,6 +382,8 @@ class ProactiveTask:
             )
         else:
             prompt = self.profile_generator.build_prompt(profile, summary)
+            if prompt is None:  # ponytail: skip when no new messages
+                return
             result = await self._call_background_lane("profile", str(getattr(profile, "user_id", profile.name)), prompt)
         parsed = self.profile_generator.parse_result(result)
         analysis = parsed["analysis"]
@@ -718,7 +743,7 @@ class ProactiveTask:
             if hasattr(self.chat_loop_kernel, "get_heartbeat_scheduler_context"):
                 try:
                     final_context = dict(self.chat_loop_kernel.get_heartbeat_scheduler_context() or {})
-                except Exception:
+                except Exception:  # ponytail: heartbeat context is non-critical debug info
                     final_context = {}
             if hasattr(self.chat_loop_kernel, "clear_heartbeat_scheduler_context"):
                 self.chat_loop_kernel.clear_heartbeat_scheduler_context()
@@ -736,13 +761,14 @@ class ProactiveTask:
                 await asyncio.sleep(self._scheduler_poll_interval_seconds)
                 await self._run_chat_heartbeat_pass()
                 now = time.time()
-                if (now - self._last_global_maintenance_run) < self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS:
-                    continue
+                # ponytail: M1 — only skip maintenance block, not profiling/reflection/diary
+                run_maintenance = (now - self._last_global_maintenance_run) >= self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS
 
-                self._last_global_maintenance_run = now
-                await self.decay_service.run_once()
-                await self.group_signin_service.run_once()
-                self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
+                if run_maintenance:
+                    self._last_global_maintenance_run = now
+                    await self.decay_service.run_once()
+                    await self.group_signin_service.run_once()
+                    self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
 
                 if now - self._last_profile_run > 3600:
                     await self._run_profiling_task()
@@ -750,7 +776,7 @@ class ProactiveTask:
 
                 await self._run_reflection_tasks()
 
-                if self.diary_service.should_run(self._last_diary_date, now):
+                if run_maintenance and self.diary_service.should_run(self._last_diary_date, now):
                     self._last_diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
                     self._fire_background_task(self._run_daily_diary_task_with_jitter())
             except asyncio.CancelledError:
@@ -779,7 +805,7 @@ class ProactiveTask:
             try:
                 kernel_status = dict(self.chat_loop_kernel.describe_status_sync() or {})
                 bridge_status = dict(kernel_status.get("dispatch_bridges", {}) or {})
-            except Exception:
+            except Exception:  # ponytail: kernel status is best-effort observability
                 kernel_status = {}
                 bridge_status = {}
         return {

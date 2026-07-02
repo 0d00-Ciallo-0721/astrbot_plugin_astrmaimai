@@ -22,10 +22,13 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
 
     if check_message_dedup(event).should_stop:
         debug_trace(event, "ingress.stop", reason="duplicate_message")
+        event.stop_event()
         return
 
     if scope.sender_id == scope.self_id:
         debug_trace(event, "ingress.stop", reason="self_message")
+        if hasattr(event, "stop_event"):
+            event.stop_event()
         return
 
     try:
@@ -35,11 +38,13 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         poke_decision = IngressDecision.allow()
     if poke_decision.should_stop:
         debug_trace(event, "ingress.stop", reason="poke_event")
+        event.stop_event()
         return
 
     try:
         if check_framework_command(facade, msg).should_stop:
             debug_trace(event, "ingress.stop", reason="framework_command")
+            event.stop_event()
             return
     except Exception:
         logger.exception("[AstrMai] check_framework_command failed")
@@ -49,12 +54,16 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
             debug_trace(event, "ingress.stop", reason="permission_guard")
             return
     except Exception:
-        logger.exception("[AstrMai] check_message_scope_access failed")
+        logger.exception("[AstrMai] check_message_scope_access failed — denying by default")
+        event.stop_event()
+        return
 
     try:
         group_wait_result = await facade.handle_group_reply_wait(event, scope)
     except Exception:
         logger.exception("[AstrMai] handle_group_reply_wait failed")
+        yield event.plain_result("\u26a0\ufe0f \u5904\u7406\u6d88\u606f\u65f6\u9047\u5230\u95ee\u9898\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5\u3002")
+        event.stop_event()
         return
 
     if facade.is_debug_mode():
@@ -73,6 +82,7 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         review_feedback = None
     if review_feedback:
         yield event.plain_result(review_feedback)
+        event.stop_event()
         return
 
     try:
@@ -86,6 +96,13 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         logger.exception("[AstrMai] record_and_dispatch_attention failed")
         status = "error"
         is_direct_call = False
+
+    if status == "error":
+        # ponytail: surface the failure to the user instead of silently dropping the message (R10)
+        fallback = getattr(getattr(facade, "config", None), "reply", None)
+        fallback_text = getattr(fallback, "fallback_text", None) if fallback else None
+        yield event.plain_result(fallback_text or "处理出错，请稍后重试")
+        return
     debug_trace(event, "ingress.after_attention", status=status, direct_call=is_direct_call)
 
     try:

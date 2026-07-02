@@ -679,7 +679,7 @@ class CognitiveLoop:
                 return "Current state service is offline."
             state = await self.state_engine.get_state(chat_id)
             last_reply_time = float(getattr(state, "last_reply_time", 0.0) or 0.0)
-            idle_seconds = max(0, int(time.time() - last_reply_time)) if last_reply_time > 0 else -1
+            idle_seconds = max(0, int(time.time() - last_reply_time)) if last_reply_time > 0 else -1  # ponytail: NTP guard
             return (
                 f"energy={float(getattr(state, 'energy', 0.0) or 0.0):.2f}; "
                 f"mood={float(getattr(state, 'mood', 0.0) or 0.0):.2f}; "

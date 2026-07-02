@@ -317,6 +317,23 @@ class ContextEconomyPolicyTests(unittest.TestCase):
         self.assertEqual(envelope.template_version, "v3")
         self.assertEqual(envelope.schema_id, "text")
 
+    def test_prompt_template_registry_accepts_enum_instances_from_previous_module_load(self):
+        templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
+        stale_template_id = templates_mod.PromptTemplateId.COMPACTION_SUMMARY_V1
+        templates_mod = importlib.reload(templates_mod)
+        registry = templates_mod.PromptTemplateRegistry()
+
+        envelope = registry.render_template(
+            stale_template_id,
+            {
+                "lines_text": "line-a\nline-b",
+            },
+        )
+
+        self.assertEqual(envelope.template_id, templates_mod.PromptTemplateId.COMPACTION_SUMMARY_V1.value)
+        self.assertEqual(envelope.template_version, "v1")
+        self.assertIn("line-a", envelope.prompt)
+
     def test_dream_template_and_fallback_share_stable_system_shell_wording(self):
         templates_mod = importlib.import_module("astrmai.infrastructure.context_economy.prompt_templates")
         templates_mod = importlib.reload(templates_mod)

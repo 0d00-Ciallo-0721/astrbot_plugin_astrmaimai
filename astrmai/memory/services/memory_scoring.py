@@ -61,6 +61,7 @@ def compute_temporal_boost(
     alpha = min(max(float(scoring.deep_temporal_alpha or 0.0), 0.0), 1.0)
     if float(candidate.created_at or 0.0) <= 0.0:
         return alpha + (1.0 - alpha) * 1.0
+    # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
     now_ts = float(now or time.time())
     age_seconds = max(0.0, now_ts - float(candidate.created_at or 0.0))
     decay_lambda = (
@@ -109,7 +110,7 @@ def compute_hot_score(
         age_since_last_access_seconds = _normalized_tau_seconds(scoring.deep_temporal_tau_seconds)
     tau = _normalized_tau_seconds(scoring.deep_temporal_tau_seconds)
     freshness = 1.0 / (1.0 + age_since_last_access_seconds / tau)
-    return beta * freshness + (1.0 - beta) * math.log(float(candidate.access_count or 0) + 1.0)
+    return beta * freshness + (1.0 - beta) * math.log(max(0.0, float(candidate.access_count or 0)) + 1.0)
 
 
 __all__ = [

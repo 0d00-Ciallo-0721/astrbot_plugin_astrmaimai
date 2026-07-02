@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from time import monotonic
 from copy import deepcopy
 from typing import Any, Awaitable, Callable
 
@@ -9,6 +10,7 @@ from astrbot.api import logger
 
 from ...infrastructure.runtime.observability import RuntimeObservabilityHub
 from ...proactive.rhythm import evaluate_proactive_rhythm
+from ...shared.helpers.plugin_helpers import safe_create_task
 from .models import ChatLoopDecision, ChatLoopSnapshot, ChatLoopState, ChatLoopTickResult
 from .state_store import ChatLoopStateStore
 
@@ -267,7 +269,7 @@ class ChatLoopKernel:
             "target_ids": list(state.wait_target_ids or []),
             "target_name": state.wait_target_name,
             "thread_signature": state.wait_thread_signature,
-            "remaining_seconds": max(0.0, float(state.wait_expires_at or 0.0) - time.time()) if state.wait_expires_at > 0 else 0.0,
+            "remaining_seconds": max(0.0, float(state.wait_expires_at or 0.0) - monotonic()) if state.wait_expires_at > 0 else 0.0,
             "remaining_messages": int(state.wait_message_budget or 0),
         }
 
@@ -387,7 +389,7 @@ class ChatLoopKernel:
 
     async def arm_group_wait(self, chat_id: str, payload: dict[str, Any]) -> ChatLoopState:
         state = await self._state_store.get_or_create(str(chat_id or ""))
-        now = time.time()
+        now = monotonic()
         remaining_seconds = float(payload.get("remaining_seconds", 0.0) or 0.0)
         expires_at = now + remaining_seconds if remaining_seconds > 0 else 0.0
         self._apply_wait_arm(
@@ -1250,7 +1252,7 @@ class ChatLoopKernel:
                 message_budget=int(group_payload.get("remaining_messages", 0) or 0),
                 reason=str(group_payload.get("reason", "group_wait_sync") or "group_wait_sync"),
             )
-            return
+            return  # ponytail: group wait blocks private wait in same chat
 
         private_payload = self._collect_private_wait_state(chat_id, event)
         if private_payload and bool(private_payload.get("is_bot_waiting", False)):
@@ -1279,6 +1281,7 @@ class ChatLoopKernel:
             return {}
 
     def _collect_private_wait_state(self, chat_id: str, event: Any) -> dict[str, Any]:
+        """ponytail: sync getter in async context — acceptable for local dict access in PrivateChatManager."""
         manager = self.private_chat_manager
         if manager is None:
             return {}
@@ -1862,7 +1865,7 @@ class ChatLoopKernel:
                 state.forced_promotion_count = int(state.forced_promotion_count or 0) + 1
                 state.last_forced_promotion_at = now
         else:
-            state.consecutive_selected_count = 0
+            pass  # ponytail: don't reset fairness counter on non-heartbeat message ingress
         state.next_tick_at = now + float(decision.next_tick_delay or 0.0) if decision.next_tick_delay > 0 else 0.0
         state.retry_backoff_until = 0.0
         self._write_base_pending_signals(state, decision)
@@ -1878,7 +1881,8 @@ class ChatLoopKernel:
     @staticmethod
     def _derive_phase(decision: ChatLoopDecision) -> str:
         action = str(decision.action or "")
-        if action in {"INGRESS_MESSAGE", "INGRESS_EXTERNAL", "RESUME_WAIT", "INTERRUPT_WAIT"}:
+        if action in {"INGRESS_MESSAGE", "INGRESS_EXTERNAL", "RESUME_WAIT", "INTERRUPT_WAIT",
+                       "PROACTIVE_WAKEUP", "HEARTFLOW_EVALUATE"}:
             return "ACTIVE"
         if action == "WAIT":
             return "WAITING"
@@ -2067,7 +2071,7 @@ class ChatLoopKernel:
             "selected": selected,
             "skipped_by_batch": skipped,
         }
-        asyncio.create_task(
+        safe_create_task(
             hub.record(
                 domain="scheduler",
                 kind="heartbeat",
@@ -2128,7 +2132,7 @@ class ChatLoopKernel:
         if metadata.get("poll_mode"):
             summary_bits.append(f"poll={metadata.get('poll_mode')}")
         title = action.replace("_", " ").title() if action else "Scheduler tick"
-        asyncio.create_task(
+        safe_create_task(
             hub.record(
                 domain="scheduler",
                 kind=kind,
@@ -2221,7 +2225,7 @@ class ChatLoopKernel:
     def _expire_wait_if_needed(self, state: ChatLoopState) -> None:
         if not self._has_active_wait(state):
             return
-        now = time.time()
+        now = monotonic()
         if state.wait_expires_at > 0 and now >= float(state.wait_expires_at or 0.0):
             self._clear_wait_state(state, status="expired", reason="wait_timeout")
             return

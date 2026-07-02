@@ -143,7 +143,7 @@ class CompactionProviderMixin:
         envelope = self._render_compaction_envelope(
             PromptTemplateId.COMPACTION_SUMMARY_V1,
             lines_text="\n".join(lines),
-        ) if hasattr(self, "_render_compaction_envelope") else None
+        )
         if envelope is not None:
             system_prompt = envelope.system_prompt
             prompt = envelope.prompt
@@ -221,7 +221,7 @@ class CompactionProviderMixin:
         envelope = self._render_compaction_envelope(
             PromptTemplateId.COMPACTION_SUMMARY_V2,
             lines_text="\n".join(lines),
-        ) if hasattr(self, "_render_compaction_envelope") else None
+        )
         if envelope is not None:
             system_prompt = envelope.system_prompt
             prompt = envelope.prompt

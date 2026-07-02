@@ -20,10 +20,13 @@ class PersonaCacheMixin:
             return {}
 
     def save_persona_cache(self, cache_data: Dict[str, Any]):
-        """Persist persona cache to disk."""
+        """Persist persona cache to disk (atomic write via tempfile)."""
+        import os
         try:
-            with open(self.persona_cache_path, "w", encoding="utf-8") as f:
+            tmp_path = str(self.persona_cache_path) + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, str(self.persona_cache_path))
         except Exception as e:
             logger.error(f"[Persistence] : {e}")
 

@@ -14,6 +14,8 @@ class PromptEnvelope:
 
         LLM system prompts should instruct the model to treat only content
         inside ``<user_input>`` tags as the real user message.
+
+        TODO: migrate callers to security.InputSanitizer.sanitize()
         """
         if not text or not str(text).strip():
             return str(text or "")
@@ -26,6 +28,8 @@ class PromptEnvelope:
         Malicious content stored in memory could contain pseudo-instructions.
         This tagging allows the system prompt to instruct the model to treat
         ``<retrieved_memory>`` content as reference only.
+
+        TODO: migrate callers to security.InputSanitizer.sanitize_memory()
         """
         if not text or not str(text).strip():
             return str(text or "")

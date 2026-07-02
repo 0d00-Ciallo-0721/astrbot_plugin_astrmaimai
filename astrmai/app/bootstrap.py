@@ -189,12 +189,14 @@ class PluginBootstrap:
     ) -> None:
         memory_engine.db_service = db_service
         db_service.memory_engine = memory_engine
+        # ponytail: trace_cache_dir default path guess. Verify actual cache dir on disk
+        # if turn_trace_store / raw_trace_store produce file-not-found at runtime.
         trace_cache_dir = Path(getattr(persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache"))
         db_service.turn_trace_store = TurnTraceSampleStore(trace_cache_dir)
         db_service.raw_trace_store = RawTraceEventStore(trace_cache_dir)
         db_service.context_economy_benchmark_store = ContextEconomyBenchmarkSampleStore(trace_cache_dir)
         gateway.benchmark_sample_store = db_service.context_economy_benchmark_store
-        if hasattr(memory_engine, "tool_service"):
+        if getattr(memory_engine, "tool_service", None) is not None:
             memory_engine.tool_service.db_service = db_service
 
     def _build_state_dialogue_services(
@@ -260,6 +262,7 @@ class PluginBootstrap:
                 visual_cortex = VisualCortex(gateway, db_service)
             except Exception as exc:
                 self._record_optional_failure(runtime, "multimodal.visual_cortex", exc)
+                logger.warning(f"[AstrMai] VisualCortex init failed, vision disabled: {exc}", exc_info=True)
         return judge, sensors, visual_cortex
 
     def _build_work_mode(self, runtime: PluginRuntimeContext) -> WorkModeServices:
@@ -350,6 +353,8 @@ class PluginBootstrap:
         )
 
     def _build_chat_loop_kernel(self, runtime: PluginRuntimeContext) -> ChatLoopKernel:
+        if runtime.attention_gate is None:
+            logger.warning("[Bootstrap] attention_gate is None; ChatLoopKernel will have no message handler")
         kernel = ChatLoopKernel(
             runtime_coordinator=runtime.runtime_coordinator,
             message_handler=runtime.attention_gate.process_event if runtime.attention_gate is not None else None,
@@ -479,6 +484,8 @@ class PluginBootstrap:
             return proactive_task
         except Exception as exc:
             self._record_optional_failure(runtime, "proactive.task", exc)
+            logger.warning(f"[Bootstrap] ProactiveTask creation failed: {type(exc).__name__}: {exc}")
+            logger.warning("[Bootstrap] 主动发言、梦境整理等功能将不可用")
             return None
 
     def _bind_learning_collaboration(self, runtime: PluginRuntimeContext, evolution: EvolutionManager) -> None:

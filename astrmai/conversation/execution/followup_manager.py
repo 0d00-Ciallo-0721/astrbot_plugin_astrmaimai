@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from time import monotonic
 
 from astrbot.api import logger
 
@@ -12,6 +13,8 @@ class FollowupManager:
         self._private_wait_tasks: dict[str, asyncio.Task] = {}
 
     def _resolve_followup_cooldown_seconds(self) -> float:
+        # ponytail: `or 0.0` makes config zero indistinguishable from "not set".
+        # Add sentinel (e.g. -1.0) if zero needs to be a valid explicit config.
         attention = getattr(getattr(self.runtime, "config", None), "attention", None)
         configured = float(getattr(attention, "thread_same_speaker_followup_sec", 0.0) or 0.0)
         if configured > 0:
@@ -29,7 +32,7 @@ class FollowupManager:
         await kernel.set_cooldown(
             chat_id,
             "followup",
-            time.time() + cooldown_seconds,
+            monotonic() + cooldown_seconds,
             reason="followup_dispatch",
         )
 

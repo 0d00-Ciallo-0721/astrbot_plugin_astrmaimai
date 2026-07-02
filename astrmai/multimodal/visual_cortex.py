@@ -7,6 +7,7 @@ from astrbot.api import logger
 
 from ..infrastructure.persistence.orm_models import VisualMemory
 from ..infrastructure.runtime.lane_manager import LaneKey
+from ..shared.helpers.plugin_helpers import safe_create_task
 
 from .image_pipeline import ImagePipeline
 
@@ -17,12 +18,12 @@ class VisualCortex:
     def __init__(self, gateway, db_service):
         self.gateway = gateway
         self.db_service = db_service
-        self.queue = asyncio.Queue()
+        self.queue = asyncio.Queue(maxsize=100)  # ponytail: R11 — cap queue to prevent OOM
         self._worker_task = None
 
     def start(self):
         if self._worker_task is None:
-            self._worker_task = asyncio.create_task(self._worker())
+            self._worker_task = safe_create_task(self._worker())
             logger.info("[AstrMai-VisualCortex] async multimodal worker started.")
 
     def stop(self):
@@ -49,6 +50,9 @@ class VisualCortex:
                 break
             except Exception as exc:
                 logger.error(f"[AstrMai-VisualCortex] queue worker degraded: {exc}", exc_info=True)
+
+    # ponytail: sync DB session in async worker — acceptable for SQLite (fast, no network).
+    # If this becomes a bottleneck, wrap in asyncio.to_thread().
 
     def _build_lane_key(self, scope_id: str) -> LaneKey:
         return LaneKey(subsystem="sys1", task_family="vision", scope_id=scope_id or "global")
@@ -79,7 +83,8 @@ class VisualCortex:
     async def process_image_async(self, picid: str, base64_data: str, scope_id: str = "global"):
         prepared = None
         try:
-            if self._get_cached_memory(picid):
+            cached = await asyncio.to_thread(self._get_cached_memory, picid)
+            if cached:
                 logger.info(f"[AstrMai-VisualCortex] cache hit for {picid}, skip duplicate analysis.")
                 return
 

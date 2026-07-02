@@ -45,7 +45,14 @@ class ChatRuntimeCoordinator:
                 return None
             state.executor_pending += 1
             executor_lock = state.executor_lock
-        await executor_lock.acquire()
+        try:
+            await executor_lock.acquire()
+        except asyncio.CancelledError:
+            # ponytail: decrement on cancel to prevent permanent blockage
+            async with self._lock:
+                if chat_id in self._states:
+                    self._states[chat_id].executor_pending = max(0, self._states[chat_id].executor_pending - 1)
+            raise
         return executor_lock
 
     async def release_executor(self, chat_id: str) -> None:
@@ -153,6 +160,17 @@ class ChatRuntimeCoordinator:
             state.wait_target_name = ""
             state.activity_times = []
             return True
+
+    async def prune_inactive(self, max_idle_sec: float = 1800) -> int:
+        now = time.time()
+        async with self._lock:
+            stale_ids = [
+                chat_id for chat_id, state in self._states.items()
+                if now - state.latest_activity_ts > max_idle_sec
+            ]
+            for chat_id in stale_ids:
+                del self._states[chat_id]
+        return len(stale_ids)
 
     async def evaluate_reply_freshness(
         self,

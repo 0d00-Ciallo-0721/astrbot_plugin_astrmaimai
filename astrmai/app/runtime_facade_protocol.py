@@ -12,6 +12,9 @@ from __future__ import annotations
 from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 
+# ponytail: @runtime_checkable adds isinstance() overhead. PluginFacade explicitly
+# inherits, so structural matching isn't needed. Remove when no caller uses
+# isinstance(obj, RuntimeFacadeProtocol).
 @runtime_checkable
 class RuntimeFacadeProtocol(Protocol):
     """Public contract of the runtime facade consumed by PluginApiAdapter,

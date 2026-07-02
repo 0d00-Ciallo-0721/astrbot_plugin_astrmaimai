@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, List, Optional
 
 from astrbot.api import logger
@@ -8,6 +9,21 @@ from .runtime_contracts import VisibleReplyArtifact
 
 
 class LaneStorageMixin:
+    def __init_lane_storage__(self):
+        # ponytail: per-lane creation lock to prevent duplicate conversations
+        self._lane_creation_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lane_creation_lock(self, lane_key_str: str) -> asyncio.Lock:
+        # ponytail: sync method with no await points — atomic within asyncio event loop (R25)
+        lock = self._lane_creation_locks.get(lane_key_str)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lane_creation_locks[lane_key_str] = lock
+            # ponytail: cap _lane_creation_locks at 200
+            if len(self._lane_creation_locks) > 200:
+                self._lane_creation_locks.pop(next(iter(self._lane_creation_locks)))
+        return self._lane_creation_locks[lane_key_str]
+
     async def ensure_lane(
         self,
         lane_key: LaneKey,
@@ -49,12 +65,22 @@ class LaneStorageMixin:
 
         target_conversation_id = conversation_id
         if not target_conversation_id or rotate:
-            target_conversation_id = await self.conversation_manager.new_conversation(
-                unified_msg_origin=lane_umo,
-                title=self._build_title(lane_key),
-                persona_id=persona_id or None,
-            )
+            # ponytail: per-lane asyncio lock prevents duplicate conversation creation
+            lane_lock = self._get_lane_creation_lock(lane_umo)
+            async with lane_lock:
+                # Re-read conversation_id under lock in case another task created it
+                if not target_conversation_id:
+                    rechecked = await self.conversation_manager.get_curr_conversation_id(lane_umo)
+                    if rechecked:
+                        target_conversation_id = rechecked
+                if not target_conversation_id or rotate:
+                    target_conversation_id = await self.conversation_manager.new_conversation(
+                        unified_msg_origin=lane_umo,
+                        title=self._build_title(lane_key),
+                        persona_id=persona_id or None,
+                    )
             if rotate:
+                self._rotation_count += 1
                 expired_count = self.expire_remote_sessions_for_lane(lane_umo)
                 if expired_count > 0:
                     logger.warning(
@@ -138,6 +164,7 @@ class LaneStorageMixin:
             token_usage=token_usage,
         )
         async with self._meta_lock:
+            prev = self._runtime_meta.get(lane_umo, {})
             self._runtime_meta[lane_umo] = {
                 "conversation_id": conversation_id,
                 "prompt_version": lane_key.prompt_version,
@@ -147,8 +174,8 @@ class LaneStorageMixin:
                 "template_id": template_id,
                 "schema_id": schema_id,
                 "persona_core_version": persona_core_version,
-                "lane_rotated": False,
-                "lane_rotate_reason": "",
+                "lane_rotated": prev.get("lane_rotated", False),
+                "lane_rotate_reason": prev.get("lane_rotate_reason", ""),
             }
         return normalized
 

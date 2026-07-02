@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from astrbot.api import logger
 
@@ -12,6 +13,14 @@ from .v2_store import MemoryV2Store
 class MemoryWriteService:
     _NOISY_TOKENS = ("traceback", "exception", "all chat models fail", "apitimesouterror")
     _ERROR_JSON_KEYS = frozenset({"error", "errors", "exception", "traceback", "stack", "stacktrace", "detail", "details"})
+    _INJECTION_PATTERNS = (
+        r'</?user_input>',
+        r'</?retrieved_memory>',
+        r'忽略(所有)?系统指令',
+        r'输出你的(系统)?提示词',
+        r'\[SYSTEM\]',
+        r'\[INST\]',
+    )
 
     def __init__(self, store: MemoryV2Store, index_projector=None):
         self.store = store
@@ -39,6 +48,10 @@ class MemoryWriteService:
         lowered = text.lower()
         if any(token in lowered for token in cls._NOISY_TOKENS):
             return "noisy_error_token"
+        for pattern in cls._INJECTION_PATTERNS:
+            if re.search(pattern, lowered):
+                logger.warning(f"[MemoryWrite] injection payload blocked: {text[:80]}...")
+                return "injection_payload"
         return None
 
     @staticmethod
@@ -87,7 +100,10 @@ class MemoryWriteService:
         if self.index_projector and superseded_old_ids:
             await self.index_projector.cleanup_deleted(superseded_old_ids)
         if self.index_projector and memory_id and not new_record_is_superseded:
-            await self.index_projector.project(memory_id=memory_id, request=normalized)
+            try:
+                await self.index_projector.project(memory_id=memory_id, request=normalized)
+            except Exception as exc:
+                logger.warning(f"[MemoryWrite] index projection failed for {memory_id}: {exc}")
         return memory_id
 
 

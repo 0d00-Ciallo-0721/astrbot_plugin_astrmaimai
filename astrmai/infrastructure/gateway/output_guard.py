@@ -2,6 +2,31 @@ import json
 import re
 from typing import Iterable, List
 
+# ── 内容安全检测模式 ──────────────────────────────────────
+_NSFW_PATTERNS = [
+    r'(?i)\b(fuck|shit|damn|asshole|bitch|dick|piss)\b',
+    r'(操你|草你|靠你妈|日你|傻逼|他妈|你妈逼|cnm|nmsl|卧槽尼玛)',
+]
+_SELF_HARM_PATTERNS = [
+    r'(自杀|自残|割腕|跳楼|不想活|想死|活不下去|离开这个世界)',
+]
+_PII_PATTERNS = [
+    r'\b1[3-9]\d{9}\b',            # 中国大陆手机号
+    r'\b\d{17}[\dXx]\b',            # 身份证号
+]
+
+
+def looks_like_harmful_content(text: str) -> bool:
+    """检测文本是否包含 NSFW/自残/PII 有害内容。"""
+    if not text:
+        return False
+    lowered = text.lower()
+    for pattern_list in (_NSFW_PATTERNS, _SELF_HARM_PATTERNS, _PII_PATTERNS):
+        for pattern in pattern_list:
+            if re.search(pattern, lowered):
+                return True
+    return False
+
 
 PROVIDER_FAILURE_MARKERS = (
     "request_id",

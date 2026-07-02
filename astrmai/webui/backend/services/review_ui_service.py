@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 import json
+import sqlite3
 
 from ..adapters.plugin_api import PluginApiAdapter
 
@@ -75,18 +76,21 @@ class ReviewUiService:
 
     async def _list_canonical_reviews(self, *, status=None, group_id=None, keyword=None, page: int = 1, page_size: int = 20):
         offset = max(page - 1, 0) * page_size
-        async with self.db_factory() as db:
-            async with db.execute(
-                """
-                SELECT id, session_id, source, content, status, create_time, last_access_time, metadata
-                FROM canonical_memories
-                WHERE kind = 'expression_pattern'
-                ORDER BY update_time DESC, create_time DESC
-                LIMIT ?
-                """,
-                (max(page * page_size * 4, page_size * 8),),
-            ) as cursor:
-                rows = [dict(row) for row in await cursor.fetchall()]
+        try:
+            async with self.db_factory() as db:
+                async with db.execute(
+                    """
+                    SELECT id, session_id, source, content, status, create_time, last_access_time, metadata
+                    FROM canonical_memories
+                    WHERE kind = 'expression_pattern'
+                    ORDER BY update_time DESC, create_time DESC
+                    LIMIT ?
+                    """,
+                    (max(page * page_size * 4, page_size * 8),),
+                ) as cursor:
+                    rows = [dict(row) for row in await cursor.fetchall()]
+        except sqlite3.OperationalError:
+            return {"items": [], "total": 0, "page": page, "page_size": page_size}
         items = [self._canonical_to_review_item(row) for row in rows]
         filtered = []
         normalized_status = str(status or "").strip().lower()
@@ -156,15 +160,19 @@ class ReviewUiService:
             page_size=page_size,
         )
 
+    _ACTION_MAP = {"approve": "approved", "reject": "rejected", "revise": "revision_needed", "replace": "replace"}
+
     async def submit_review(self, review_id: str, action: str, replacement=None, weight=None, reason=None):
-        mapped = "approved" if action == "approve" else "rejected"
+        mapped = self._ACTION_MAP.get(action)
+        if mapped is None:
+            return {"status": "error", "message": f"Unknown action: {action!r}"}
         result = await self.plugin_api.submit_review(
             pattern_id=str(review_id),
             decision=mapped,
             reviewer_id="webui",
             replacement_expression=replacement or "",
             reason=reason or "",
-            weight_delta=0.0,
+            weight_delta=float(weight - 1.0) if weight is not None else 0.0,
         )
         if result and result.get("id"):
             return {"status": "ok", "data": result}

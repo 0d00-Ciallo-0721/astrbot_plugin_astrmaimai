@@ -52,6 +52,8 @@ class CognitiveFeedbackSignal:
 class MemoryEngine:
     """Refactored memory engine with lazy vector bootstrap and stable facade methods."""
 
+    DISABLE_TTL_SEC = 7 * 86400  # ponytail: 7-day TTL for disabled feedback keys
+
     def __init__(self, context, gateway, embedding_models: list = None, config=None):
         self.context = context
         self.gateway = gateway
@@ -83,9 +85,12 @@ class MemoryEngine:
         self._next_retry_time = 0.0
         self._learning_event_history = []
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
-        self._disabled_cognitive_feedback_keys: set[tuple[str, str, str, str]] = set()
+        self._disabled_cognitive_feedback_keys: dict[str, float] = {}
         self.v2_store = MemoryV2Store(self.v2_db_path, data_path=self.data_path, legacy_db_path=self.db_path)
         # Sub-components that depend on self are initialized in initialize()
+
+    def refresh_config(self, config):
+        self.config = config
 
     def _remember_learning_event(self, event_name: str, payload: dict | None) -> None:
         event_payload = dict(payload or {})
@@ -339,6 +344,9 @@ class MemoryEngine:
         items.append(signal)
         if len(items) > 32:
             del items[:-32]
+        if len(self._cognitive_feedback_cache) > 100:
+            oldest = next(iter(self._cognitive_feedback_cache))
+            del self._cognitive_feedback_cache[oldest]
 
     @staticmethod
     def _cognitive_feedback_key(signal: CognitiveFeedbackSignal) -> tuple[str, str, str, str]:
@@ -349,8 +357,18 @@ class MemoryEngine:
             str(signal.guidance or ""),
         )
 
+    @staticmethod
+    def _cognitive_feedback_key_str(signal: CognitiveFeedbackSignal) -> str:
+        return f"{signal.chat_id}|{signal.source}|{signal.summary}|{signal.guidance}"
+
     def disable_cognitive_feedback(self, signal: CognitiveFeedbackSignal) -> None:
-        self._disabled_cognitive_feedback_keys.add(self._cognitive_feedback_key(signal))
+        now = time.time()
+        key = self._cognitive_feedback_key_str(signal)
+        self._disabled_cognitive_feedback_keys[key] = now
+        # ponytail: lazy TTL cleanup on each disable
+        stale = [k for k, ts in list(self._disabled_cognitive_feedback_keys.items()) if now - ts > 7 * 86400]
+        for k in stale:
+            del self._disabled_cognitive_feedback_keys[k]
 
     async def record_cognitive_feedback(
         self,
@@ -450,6 +468,7 @@ class MemoryEngine:
                     metadata = json.loads(metadata_raw or "{}") if isinstance(metadata_raw, str) else {}
                     importance = float(metadata.get("importance") or 0.5)
                 except Exception:
+                    logger.debug("[MemoryEngine] cognitive feedback metadata parse failed", exc_info=True)
                     pass
                 parsed = self._parse_cognitive_feedback_content(
                     str(text or ""),
@@ -468,7 +487,7 @@ class MemoryEngine:
         unique: list[CognitiveFeedbackSignal] = []
         seen: set[tuple[str, str, str]] = set()
         for item in sorted(signals, key=lambda signal: signal.timestamp, reverse=True):
-            if self._cognitive_feedback_key(item) in self._disabled_cognitive_feedback_keys:
+            if self._cognitive_feedback_key_str(item) in self._disabled_cognitive_feedback_keys:
                 continue
             key = (item.source, item.summary, item.guidance)
             if key in seen:
@@ -518,7 +537,7 @@ class MemoryEngine:
             return "(no relevant persona lore found)"
         return "\n".join(f"[fact] {item.summary or item.content}" for item in candidates)
 
-    async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None, layers: list[str] | None = None) -> str:
+    async def recall(self, query: str, session_id: str = None, persona_id: str = None, top_k: int = None, layers: list[str] | None = None, exclude_kinds: list[str] | None = None) -> str:
         recall_top_k = top_k if top_k is not None else getattr(getattr(self.config, "memory", None), "recall_top_k", 5)
         memory_query = MemoryQuery(
             query=str(query or ""),
@@ -526,7 +545,7 @@ class MemoryEngine:
             persona_id=str(persona_id or ""),
             layers=list(layers or []),
             top_k=int(recall_top_k or 5),
-            exclude_kinds=["feedback"],
+            exclude_kinds=list(exclude_kinds) if exclude_kinds is not None else ["feedback"],
         )
         candidates = await self.retrieval_service.retrieve(memory_query)
         # Safety net: exclude_kinds in MemoryQuery handles the v2_store path,
@@ -629,6 +648,7 @@ class MemoryEngine:
                     if isinstance(parsed_tags, list):
                         tags = [str(item) for item in parsed_tags]
                 except Exception:
+                    logger.debug("[MemoryEngine] legacy memory event tags parse failed", exc_info=True)
                     tags = []
                 metadata = {
                     "legacy_event_id": getattr(event, "event_id", ""),

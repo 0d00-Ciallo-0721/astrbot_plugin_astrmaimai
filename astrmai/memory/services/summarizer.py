@@ -6,6 +6,7 @@ from typing import Dict
 
 from .instant_memory_gate import InstantMemoryGate
 from .session_memory_summarizer import SessionMemorySummarizer, uuid4_short
+from ...shared.helpers.plugin_helpers import safe_create_task
 
 
 class ChatHistorySummarizer(SessionMemorySummarizer):
@@ -33,7 +34,7 @@ class ChatHistorySummarizer(SessionMemorySummarizer):
         if self._running:
             return
         self._running = True
-        self._periodic_task = asyncio.create_task(self._periodic_check_loop())
+        self._periodic_task = safe_create_task(self._periodic_check_loop())
 
     async def stop(self):
         self._running = False
@@ -109,6 +110,7 @@ class ChatHistorySummarizer(SessionMemorySummarizer):
             except asyncio.CancelledError:
                 break
             except Exception:
+                logger.debug("[ChatHistorySummarizer] _periodic_check_loop degraded", exc_info=True)
                 break
 
     async def _try_instant_memorize(self, chat_id: str, user_msg: str, ai_msg: str):

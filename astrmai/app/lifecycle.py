@@ -7,12 +7,12 @@ from typing import Any
 from astrbot.api import logger
 
 from ..multimodal import init_meme_storage
-from ..shared.helpers.plugin_helpers import cleanup_stale_focus_pools, collect_background_tasks
+from ..shared.helpers.plugin_helpers import cleanup_stale_focus_pools, collect_background_tasks, safe_create_task
 from .runtime_context import PluginRuntimeContext
 
 
 class PluginLifecycleManager:
-    SHUTDOWN_TASK_TIMEOUT: float = 3.0
+    SHUTDOWN_TASK_TIMEOUT: float = 8.0
 
     def __init__(self, runtime: PluginRuntimeContext):
         self.runtime = runtime
@@ -20,7 +20,10 @@ class PluginLifecycleManager:
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
-        task = asyncio.create_task(coro)
+        # ponytail: prune done tasks to prevent unbounded set growth
+        done_tasks = {t for t in self._background_tasks if t.done()}
+        self._background_tasks -= done_tasks
+        task = safe_create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
         return task
@@ -32,7 +35,7 @@ class PluginLifecycleManager:
             if exc:
                 logger.error(f"[AstrMai-Background] 后台任务异常: {exc}", exc_info=exc)
         except asyncio.CancelledError:
-            pass
+            logger.debug(f"[AstrMai-Background] task cancelled: {task.get_name()}")
 
     async def initialize_memory(self) -> None:
         self.runtime.set_boot_phase("lifecycle.memory")
@@ -48,16 +51,28 @@ class PluginLifecycleManager:
         logger.info("[AstrMai] AstrBot Loaded. Starting system initialization from refactoring workspace...")
         logger.info("[AstrMai] Initializing Memory Engine...")
         await self.initialize_memory()
+        logger.info("[AstrMai] boot phase: memory initialized")
+
         init_meme_storage()
         await self.load_command_metadata()
+        logger.info("[AstrMai] boot phase: commands loaded")
+
+        await self._wire_private_chat_plugin()
         await self.start_expression_governance_services()
         await self.start_proactive_services()
+        logger.info("[AstrMai] boot phase: proactive services started")
+
         await self.start_visual_services()
-        self.runtime.status.is_running = True
+        logger.info("[AstrMai] boot phase: visual services started")
+
         self.start_background_services()
+        self.runtime.status.is_running = True
         await self.start_workmode_guard()
+        logger.info("[AstrMai] boot phase: workmode guard started")
+
         self.runtime.status.lifecycle_started = True
         self.runtime.set_boot_phase("runtime.running")
+        logger.info("[AstrMai] boot complete — runtime running")
 
     async def load_command_metadata(self) -> None:
         self.runtime.set_boot_phase("lifecycle.commands")
@@ -69,6 +84,18 @@ class PluginLifecycleManager:
         except Exception as exc:
             self.runtime.mark_degraded("conversation.foreign_commands", str(exc))
             logger.warning(f"[AstrMai] Foreign command metadata degraded: {exc}")
+
+    async def _wire_private_chat_plugin(self) -> None:
+        """Inject host plugin into PrivateChatManager for KV storage access."""
+        pcm = self.runtime.private_chat_manager
+        host = self.runtime.host_plugin_ref
+        # ponytail: host() deref is called twice — first check, then set. Store ref
+        # to avoid a spurious GC race between the two calls.
+        if pcm and host:
+            host_plugin = host()
+            if host_plugin:
+                pcm.set_host_plugin(host_plugin)
+                await pcm._cleanup_stale_pending_sessions()
 
     async def start_proactive_services(self) -> None:
         self.runtime.set_boot_phase("lifecycle.proactive")
@@ -97,13 +124,16 @@ class PluginLifecycleManager:
         if not self.runtime.visual_cortex:
             return
         try:
-            self.runtime.visual_cortex.start()
+            self.runtime.visual_cortex.start()  # sync method, confirmed
             self.runtime.status.visual_started = True
         except Exception as exc:
             self.runtime.mark_degraded("multimodal.visual_runtime", str(exc))
             logger.warning(f"[AstrMai] Visual service degraded: {exc}")
 
     def start_background_services(self) -> None:
+        # ponytail: fires tasks without confirming they started successfully.
+        # Tasks are tracked via track_task() for shutdown; add health probe if
+        # silent stall is observed in the field.
         self.runtime.set_boot_phase("lifecycle.background")
         self.track_task(self._memory_gc_task())
         self.track_task(self._db_sync_task())
@@ -114,23 +144,31 @@ class PluginLifecycleManager:
             return
         try:
             await self.runtime.cron_guard.reload_all_lost_jobs()
+        except Exception as exc:
+            self.runtime.mark_degraded("workmode.cron_guard_reload", str(exc))
+            logger.warning(f"[AstrMai] Workmode guard reload degraded: {exc}")
+            return
+        try:
             self.track_task(self.runtime.cron_guard.run_heartbeat())
             self.runtime.status.cron_guard_started = True
             logger.info("[AstrMai] Sys3 CronHeartbeatGuard started.")
         except Exception as exc:
             self.runtime.mark_degraded("workmode.cron_guard", str(exc))
-            logger.warning(f"[AstrMai] Workmode guard degraded: {exc}")
+            logger.warning(f"[AstrMai] Workmode guard heartbeat degraded: {exc}")
 
     async def _db_sync_task(self) -> None:
         while self.runtime.status.is_running:
             try:
-                await asyncio.sleep(15)
+                await asyncio.sleep(5)  # ponytail: 5s flush interval (was 15s) to reduce data loss on crash
                 if hasattr(self.runtime.state_engine, "flush_message_counters"):
                     await self.runtime.state_engine.flush_message_counters()
             except asyncio.CancelledError:
                 logger.info("[AstrMai-DB-Sync] 收到终止信号，执行最后一次提交后退出。")
-                if hasattr(self.runtime.state_engine, "flush_message_counters"):
-                    await self.runtime.state_engine.flush_message_counters()
+                try:
+                    if hasattr(self.runtime.state_engine, "flush_message_counters"):
+                        await self.runtime.state_engine.flush_message_counters()
+                except Exception:
+                    logger.warning("[AstrMai] shutdown flush failed", exc_info=True)  # ponytail: R19
                 raise
             except Exception as exc:
                 logger.error(f"[AstrMai-DB-Sync] 数据库批量同步任务异常: {exc}")
@@ -159,6 +197,10 @@ class PluginLifecycleManager:
         try:
             await self._terminate_impl()
         finally:
+            # ponytail: clear ChatRuntimeCoordinator states to free memory
+            coordinator = getattr(self.runtime, "runtime_coordinator", None)
+            if coordinator and hasattr(coordinator, "_states"):
+                coordinator._states.clear()
             self._reset_runtime_status_flags()
             self.runtime.set_boot_phase("shutdown.complete")
 
@@ -169,6 +211,13 @@ class PluginLifecycleManager:
                 await memory_pipeline.stop()
         except Exception as exc:
             logger.warning(f"[AstrMai] Memory pipeline shutdown degraded: {exc}")
+
+        try:
+            pcm = self.runtime.private_chat_manager
+            if pcm:
+                await pcm._persist_pending_sessions()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] PrivateChat persist shutdown degraded: {exc}")
 
         try:
             await self.stop_proactive_services()
@@ -199,6 +248,8 @@ class PluginLifecycleManager:
 
         if tasks_to_wait:
             logger.info(f"[AstrMai] 正在等待 {len(tasks_to_wait)} 个后台协程安全结束...")
+            # ponytail: dict.fromkeys dedup relies on asyncio.Task being hashable
+            # (CPython detail). Use explicit id() dedup if this breaks on another runtime.
             unique_tasks = [task for task in dict.fromkeys(tasks_to_wait) if task is not None]
             for task in unique_tasks:
                 if not task.done():
@@ -212,6 +263,20 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.warning(f"[AstrMai] Background task cleanup degraded: {exc}")
 
+        # 停止 EventBus workers
+        event_bus = getattr(self.runtime, "event_bus", None)
+        if event_bus is not None:
+            await event_bus.stop()
+
+        # 释放 DB 连接池
+        persistence = getattr(self.runtime, "persistence", None)
+        if persistence is not None:
+            persistence.dispose()
+
+    # ponytail: 10+ flags set sequentially with no atomicity guarantee.
+    # Acceptable because terminate() is called once at shutdown and flags are
+    # only read by the next bootstrap cycle. Add a bulk-reset if parallel boot
+    # is needed.
     def _reset_runtime_status_flags(self) -> None:
         """Reset all runtime status flags for a clean shutdown slate.
 

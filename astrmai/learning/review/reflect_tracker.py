@@ -53,8 +53,10 @@ class ReflectTracker:
     async def get_unsent_requests(self) -> List[Dict]:
         async with self._lock:
             requests = [item.copy() for item in self._pending.values() if not item.get("sent")]
-            for item in self._pending.values():
-                item["sent"] = True
+            for req in requests:
+                pid = req.get("pattern_id", "")
+                if pid and pid in self._pending:
+                    self._pending[pid]["sent"] = True
             return requests
 
     async def try_consume_feedback(self, event: AstrMessageEvent) -> Optional[str]:
@@ -80,6 +82,10 @@ class ReflectTracker:
             pattern_id = candidates[0]["pattern_id"]
         if pattern_id is None:
             return None
+
+        # ponytail: atomically pop inside lock to prevent TOCTOU double-processing
+        async with self._lock:
+            self._pending.pop(str(pattern_id), None)
 
         decision = await self._parse_feedback(event.unified_msg_origin, text)
         if not decision:
@@ -129,8 +135,6 @@ class ReflectTracker:
         else:
             legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
             updated = await self.db.update_pattern_review_async(legacy_id, **kwargs)
-        async with self._lock:
-            self._pending.pop(str(pattern_id), None)
         if not updated:
             return None
         return f"已处理表达审核 #{pattern_id}：{action}"
@@ -188,4 +192,5 @@ def _extract_canonical_pattern_id(text: str) -> Optional[str]:
     return None
 
 
+# ponytail: replaces int-return with str-return for canonical IDs. Callers use str() so compatible.
 ReflectTracker._extract_pattern_id = staticmethod(_extract_canonical_pattern_id)

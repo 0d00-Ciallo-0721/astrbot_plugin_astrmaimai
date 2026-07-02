@@ -6,6 +6,99 @@ import sqlite3
 import aiosqlite
 from astrbot.api import logger
 from sqlmodel import SQLModel
+from ...shared.helpers.plugin_helpers import safe_create_task
+
+
+# ── Schema migration versions (PRAGMA user_version) ──────────────────
+# Each tuple: (version_number, ddl_statement)
+# New migrations MUST be appended with incrementing version numbers.
+_MIGRATIONS: list[tuple[int, str]] = [
+    ( 1, "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0"),
+    ( 2, "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0"),
+    ( 3, "ALTER TABLE chat_states ADD COLUMN last_energy_recovery_time REAL DEFAULT 0"),
+    ( 4, "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0"),
+    ( 5, "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'"),
+    ( 6, "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'"),
+    ( 7, "ALTER TABLE chat_states ADD COLUMN last_access_time REAL DEFAULT 0"),
+    ( 8, "ALTER TABLE chat_states ADD COLUMN next_wakeup_timestamp REAL DEFAULT 0"),
+    ( 9, "ALTER TABLE chat_states ADD COLUMN is_dirty INTEGER DEFAULT 0"),
+    (10, "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'"),
+    (11, "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''"),
+    (12, "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''"),
+    (13, "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0"),
+    (14, "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0"),
+    (15, "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'"),
+    (16, "ALTER TABLE user_profiles ADD COLUMN identity_points TEXT DEFAULT '[]'"),
+    (17, "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'"),
+    (18, "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'"),
+    (19, "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'"),
+    (20, "ALTER TABLE user_profiles ADD COLUMN message_count_for_profiling INTEGER DEFAULT 0"),
+    (21, "ALTER TABLE user_profiles ADD COLUMN last_persona_gen_time REAL DEFAULT 0"),
+    (22, "ALTER TABLE user_profiles ADD COLUMN profile_metadata TEXT DEFAULT '{}'"),
+    (23, "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''"),
+    (24, "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'"),
+    (25, "ALTER TABLE expressionpattern ADD COLUMN count INTEGER DEFAULT 1"),
+    (26, "ALTER TABLE expressionpattern ADD COLUMN checked INTEGER DEFAULT 0"),
+    (27, "ALTER TABLE expressionpattern ADD COLUMN rejected INTEGER DEFAULT 0"),
+    (28, "ALTER TABLE expressionpattern ADD COLUMN modified_by TEXT DEFAULT ''"),
+    (29, "ALTER TABLE expressionpattern ADD COLUMN source TEXT DEFAULT 'learning'"),
+    (30, "ALTER TABLE expressionpattern ADD COLUMN shared_scope TEXT DEFAULT ''"),
+    (31, "ALTER TABLE expressionpattern ADD COLUMN think_level INTEGER DEFAULT 0"),
+    (32, "ALTER TABLE expressionpattern ADD COLUMN review_status TEXT DEFAULT 'pending'"),
+    (33, "ALTER TABLE expressionpattern ADD COLUMN review_reason TEXT DEFAULT ''"),
+    (34, "ALTER TABLE expressionpattern ADD COLUMN review_suggestion TEXT DEFAULT ''"),
+    (35, "ALTER TABLE expressionpattern ADD COLUMN last_review_time REAL DEFAULT 0"),
+    (36, "ALTER TABLE memoryevent ADD COLUMN session_id TEXT DEFAULT ''"),
+]
+
+
+def _run_migrations(db: sqlite3.Connection) -> None:
+    """Execute unapplied schema migrations based on PRAGMA user_version."""
+    current = db.execute("PRAGMA user_version").fetchone()[0]
+    if current != 0 and current not in range(1, len(_MIGRATIONS) + 1):
+        logger.warning(
+            f"[AstrMai-DB] PRAGMA user_version={current}, expected 0..{len(_MIGRATIONS)}. "
+            f"Proceeding with catch-up migration."
+        )
+    for version, ddl in _MIGRATIONS:
+        if version <= current:
+            continue
+        try:
+            db.execute(ddl)
+            db.execute(f"PRAGMA user_version = {version}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                db.execute(f"PRAGMA user_version = {version}")
+                logger.info(f"[AstrMai-DB] migration v{version} already applied (column exists)")
+            else:
+                logger.error(f"[AstrMai-DB] migration v{version} failed: {exc}")
+                raise
+
+
+async def _run_migrations_async(db: aiosqlite.Connection) -> None:
+    """Async variant of schema migrations based on PRAGMA user_version."""
+    cursor = await db.execute("PRAGMA user_version")
+    row = await cursor.fetchone()
+    await cursor.close()
+    current = int(row[0] if row else 0)
+    if current != 0 and current not in range(1, len(_MIGRATIONS) + 1):
+        logger.warning(
+            f"[AstrMai-DB] PRAGMA user_version={current}, expected 0..{len(_MIGRATIONS)}. "
+            f"Proceeding with catch-up migration."
+        )
+    for version, ddl in _MIGRATIONS:
+        if version <= current:
+            continue
+        try:
+            await db.execute(ddl)
+            await db.execute(f"PRAGMA user_version = {version}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                await db.execute(f"PRAGMA user_version = {version}")
+                logger.info(f"[AstrMai-DB] migration v{version} already applied (column exists)")
+            else:
+                logger.error(f"[AstrMai-DB] migration v{version} failed: {exc}")
+                raise
 
 
 def _is_duplicate_column_error(exc: sqlite3.OperationalError) -> bool:
@@ -40,6 +133,15 @@ def _dedupe_sqlmodel_metadata_indexes() -> None:
 
 
 class PersistenceSchemaMixin:
+    # ponytail: lazy init ready event, avoids MRO issues with mixins
+    _init_ready_event: asyncio.Event | None = None
+
+    @property
+    def _init_ready(self) -> asyncio.Event:
+        if self._init_ready_event is None:
+            self._init_ready_event = asyncio.Event()
+            self._init_ready_event.set()  # default to ready (sync init or not yet scheduled)
+        return self._init_ready_event
     @staticmethod
     def _schema_patch_error_message(scope: str, statement: str, exc: Exception) -> str:
         return f"{scope} failed for {statement!r}: {exc}"
@@ -73,8 +175,12 @@ class PersistenceSchemaMixin:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             self._init_db_sync()
+            self._init_ready.set()
             return
-        self._init_task = loop.create_task(self._init_db())
+        # ponytail: clear event before fire-and-forget, set after init completes
+        self._init_ready.clear()
+        self._init_task = safe_create_task(self._init_db())
+        self._init_task.add_done_callback(lambda _: self._init_ready.set())
 
     def _init_db_sync(self):
         try:
@@ -124,53 +230,34 @@ class PersistenceSchemaMixin:
                         updated_at REAL
                     )
                 """)
-                self._apply_schema_patch_batch_sync(
-                    db,
-                    [
-                        "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN last_energy_recovery_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'",
-                        "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'",
-                        "ALTER TABLE chat_states ADD COLUMN last_access_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN next_wakeup_timestamp REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN is_dirty INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
-                        "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
-                        "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN identity_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN message_count_for_profiling INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN last_persona_gen_time REAL DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN profile_metadata TEXT DEFAULT '{}'",
-                    ],
-                    scope="sync chat/user profile schema patch",
-                )
-                self._apply_schema_patch_batch_sync(
-                    db,
-                    [
-                        "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'",
-                        "ALTER TABLE expressionpattern ADD COLUMN count INTEGER DEFAULT 1",
-                        "ALTER TABLE expressionpattern ADD COLUMN checked INTEGER DEFAULT 0",
-                        "ALTER TABLE expressionpattern ADD COLUMN rejected INTEGER DEFAULT 0",
-                        "ALTER TABLE expressionpattern ADD COLUMN modified_by TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN source TEXT DEFAULT 'learning'",
-                        "ALTER TABLE expressionpattern ADD COLUMN shared_scope TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN think_level INTEGER DEFAULT 0",
-                        "ALTER TABLE expressionpattern ADD COLUMN review_status TEXT DEFAULT 'pending'",
-                        "ALTER TABLE expressionpattern ADD COLUMN review_reason TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN review_suggestion TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN last_review_time REAL DEFAULT 0",
-                    ],
-                    scope="sync expressionpattern schema patch",
-                )
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS expressionpattern (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        situation TEXT,
+                        expression TEXT,
+                        weight REAL DEFAULT 1.0,
+                        last_active_time REAL DEFAULT 0,
+                        create_time REAL DEFAULT 0,
+                        group_id TEXT DEFAULT ''
+                    )
+                """)
+                db.execute("""
+                    CREATE TABLE IF NOT EXISTS memoryevent (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT,
+                        date TEXT,
+                        narrative TEXT DEFAULT '',
+                        emotion TEXT DEFAULT '',
+                        importance INTEGER DEFAULT 5,
+                        emotional_intensity INTEGER DEFAULT 5,
+                        reflection TEXT DEFAULT '',
+                        memory_kind TEXT DEFAULT 'event',
+                        source_layer TEXT DEFAULT 'fact',
+                        tags TEXT DEFAULT '[]',
+                        created_at REAL DEFAULT 0
+                    )
+                """)
+                _run_migrations(db)
                 db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,
@@ -263,53 +350,34 @@ class PersistenceSchemaMixin:
                         updated_at REAL
                     )
                 """)
-                await self._apply_schema_patch_batch_async(
-                    db,
-                    [
-                        "ALTER TABLE chat_states ADD COLUMN last_reply_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN last_passive_decay_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN last_energy_recovery_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN total_messages INTEGER DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN judgment_mode TEXT DEFAULT 'single'",
-                        "ALTER TABLE chat_states ADD COLUMN last_msg_info TEXT DEFAULT '{}'",
-                        "ALTER TABLE chat_states ADD COLUMN last_access_time REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN next_wakeup_timestamp REAL DEFAULT 0",
-                        "ALTER TABLE chat_states ADD COLUMN is_dirty INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN tags TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN nickname TEXT DEFAULT ''",
-                        "ALTER TABLE user_profiles ADD COLUMN nickname_reason TEXT DEFAULT ''",
-                        "ALTER TABLE user_profiles ADD COLUMN know_times INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN is_known INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN memory_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN identity_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN preference_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN relationship_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN speech_style_points TEXT DEFAULT '[]'",
-                        "ALTER TABLE user_profiles ADD COLUMN message_count_for_profiling INTEGER DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN last_persona_gen_time REAL DEFAULT 0",
-                        "ALTER TABLE user_profiles ADD COLUMN profile_metadata TEXT DEFAULT '{}'",
-                    ],
-                    scope="async chat/user profile schema patch",
-                )
-                await self._apply_schema_patch_batch_async(
-                    db,
-                    [
-                        "ALTER TABLE expressionpattern ADD COLUMN style TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN content_list TEXT DEFAULT '[]'",
-                        "ALTER TABLE expressionpattern ADD COLUMN count INTEGER DEFAULT 1",
-                        "ALTER TABLE expressionpattern ADD COLUMN checked INTEGER DEFAULT 0",
-                        "ALTER TABLE expressionpattern ADD COLUMN rejected INTEGER DEFAULT 0",
-                        "ALTER TABLE expressionpattern ADD COLUMN modified_by TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN source TEXT DEFAULT 'learning'",
-                        "ALTER TABLE expressionpattern ADD COLUMN shared_scope TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN think_level INTEGER DEFAULT 0",
-                        "ALTER TABLE expressionpattern ADD COLUMN review_status TEXT DEFAULT 'pending'",
-                        "ALTER TABLE expressionpattern ADD COLUMN review_reason TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN review_suggestion TEXT DEFAULT ''",
-                        "ALTER TABLE expressionpattern ADD COLUMN last_review_time REAL DEFAULT 0",
-                    ],
-                    scope="async expressionpattern schema patch",
-                )
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS expressionpattern (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        situation TEXT,
+                        expression TEXT,
+                        weight REAL DEFAULT 1.0,
+                        last_active_time REAL DEFAULT 0,
+                        create_time REAL DEFAULT 0,
+                        group_id TEXT DEFAULT ''
+                    )
+                """)
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS memoryevent (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT,
+                        date TEXT,
+                        narrative TEXT DEFAULT '',
+                        emotion TEXT DEFAULT '',
+                        importance INTEGER DEFAULT 5,
+                        emotional_intensity INTEGER DEFAULT 5,
+                        reflection TEXT DEFAULT '',
+                        memory_kind TEXT DEFAULT 'event',
+                        source_layer TEXT DEFAULT 'fact',
+                        tags TEXT DEFAULT '[]',
+                        created_at REAL DEFAULT 0
+                    )
+                """)
+                await _run_migrations_async(db)
                 await db.execute("""
                     CREATE TABLE IF NOT EXISTS cronsnapshot (
                         job_id      TEXT PRIMARY KEY,
@@ -346,5 +414,6 @@ class PersistenceSchemaMixin:
                     ON memoryevent (session_id)
                 """)
                 await db.commit()
+            return
         except Exception as e:
             logger.error(f"[AstrMai-Infra] init db failed: {e}")

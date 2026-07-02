@@ -52,7 +52,7 @@ class ReplyFreshnessMixin:
         if event_ts <= 0:
             return FreshnessState.FRESH, ""
 
-        reply_age = time.time() - event_ts
+        reply_age = max(0.0, time.time() - event_ts)  # ponytail: NTP guard
         max_age = self._reply_max_age_seconds()
         if reply_age > max_age:
             if await self._allow_direct_reply_timeout(event, chat_id, event_ts):

@@ -68,6 +68,7 @@ class JargonPersistenceMixin:
         source_ref = f"legacy_jargon:{group_id}:{content.lower()}"
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")  # ponytail: prevent SQLITE_BUSY with concurrent readers
             self._ensure_canonical_jargon_schema_sync(conn)
             cursor = conn.execute(
                 """

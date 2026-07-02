@@ -1,6 +1,7 @@
 import json
 import re
 import time
+from time import monotonic
 from typing import Optional
 
 from astrbot.api import logger
@@ -74,12 +75,16 @@ class JargonAutoCheckTask:
         store = self._store()
         if not store or not hasattr(store, "list_candidates"):
             return 0
-        now = time.time()
+        now = monotonic()
         scope = self._scope_id(group_id)
         min_interval = float(getattr(self.config.evolution, "review_runner_min_interval_sec", 45) or 45)
         if now - float(self._last_run_at.get(scope, 0.0) or 0.0) < min_interval:
             return 0
         self._last_run_at[scope] = now
+        # ponytail: prune unbounded _last_run_at, keep most recent 250 entries
+        if len(self._last_run_at) > 500:
+            sorted_keys = sorted(self._last_run_at, key=self._last_run_at.get, reverse=True)[:250]
+            self._last_run_at = {k: self._last_run_at[k] for k in sorted_keys}
 
         limit = max(int(getattr(self.config.evolution, "review_batch_size", 10) or 10), 1)
         jargon_min_count = int(

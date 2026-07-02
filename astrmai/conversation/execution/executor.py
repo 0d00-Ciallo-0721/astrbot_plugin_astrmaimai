@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+from time import monotonic
 from typing import Any, Optional
 
 from astrbot.api import logger
@@ -103,6 +104,7 @@ class ConcurrentExecutor:
                 sanitized_event.message_obj = sanitized_message_obj
             return sanitized_event
         except Exception:
+            logger.debug("[Executor] _build_sanitized_execution_event failed", exc_info=True)
             return event
 
     @staticmethod
@@ -180,7 +182,7 @@ class ConcurrentExecutor:
         return bool(getattr(vision_cfg, "use_native_main_reply_vision", False))
 
     def _native_main_reply_breaker_until(self, chat_id: str) -> float:
-        now = time.time()
+        now = monotonic()
         breaker_until = float(self._native_vision_breakers.get(chat_id, 0.0) or 0.0)
         if breaker_until and breaker_until <= now:
             self._native_vision_breakers.pop(chat_id, None)
@@ -191,7 +193,7 @@ class ConcurrentExecutor:
         vision_cfg = getattr(self.config, "vision", None)
         cooldown = int(getattr(vision_cfg, "native_main_reply_failure_cooldown_sec", 180) or 180)
         cooldown = max(1, cooldown)
-        breaker_until = time.time() + float(cooldown)
+        breaker_until = monotonic() + float(cooldown)
         self._native_vision_breakers[chat_id] = breaker_until
         return breaker_until
 
@@ -206,7 +208,7 @@ class ConcurrentExecutor:
         if not vision_bundle.direct_image_urls:
             return False, str(event.get_extra("vision_direct_skip_reason", "") or "not_direct_path"), 0.0
         breaker_until = self._native_main_reply_breaker_until(chat_id)
-        if breaker_until > time.time():
+        if breaker_until > monotonic():
             return False, "breaker_open", breaker_until
         return True, "", 0.0
 
@@ -248,6 +250,7 @@ class ConcurrentExecutor:
             try:
                 return str(classifier(error_message).value)
             except Exception:
+                logger.debug("[Executor] _classify_execution_failure_kind inner failed", exc_info=True)
                 pass
         lowered = str(error_message).lower()
         if "empty_response" in lowered:
@@ -284,6 +287,7 @@ class ConcurrentExecutor:
             try:
                 return bool(is_fatal(error_message))
             except Exception:
+                logger.debug("[AstrMai-exec] _is_executor_failure_fatal inner failed", exc_info=True)
                 return False
         return False
 
@@ -412,6 +416,8 @@ class ConcurrentExecutor:
                 if str(url_or_path).startswith("data:image"):
                     _, encoded = str(url_or_path).split(",", 1)
                     image_bytes = base64.b64decode(encoded)
+                # ponytail: sync file I/O in async context — acceptable for local temp files.
+                # If this becomes a bottleneck, wrap in asyncio.to_thread().
                 elif os.path.exists(url_or_path):
                     temp_file_path = url_or_path
                 elif str(url_or_path).startswith("http"):
@@ -422,6 +428,8 @@ class ConcurrentExecutor:
                         img_format = Image.open(io.BytesIO(image_bytes)).format.lower()
                     except Exception:
                         img_format = "jpeg"
+                    # ponytail: sync tempfile.mkstemp/os.fdopen in async context.
+                    # OK for small writes; migrate to aiofiles if I/O stalls observed.
                     fd, temp_file_path = tempfile.mkstemp(suffix=f".{img_format}")
                     with os.fdopen(fd, "wb") as file_obj:
                         file_obj.write(image_bytes)
@@ -465,6 +473,7 @@ class ConcurrentExecutor:
                     try:
                         os.remove(created_temp_file_path)
                     except Exception:
+                        logger.debug("[Executor] temp file cleanup failed", exc_info=True)
                         pass
 
         if vision_descriptions:

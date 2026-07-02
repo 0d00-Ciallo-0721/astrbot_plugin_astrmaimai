@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from time import monotonic
 from typing import Any, Dict, Optional
 
 import aiosqlite
@@ -19,6 +20,22 @@ class StateProfilePersistenceMixin:
     _user_profile_cols_ts: float = 0.0
 
     @staticmethod
+    def _safe_json_loads(value: Any, default: Any = None):
+        """Safe JSON deserialization with fallback for dirty/corrupted data."""
+        raw = str(value or "").strip()
+        if not raw:
+            return default if default is not None else {}
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger = __import__("astrbot.api", fromlist=["logger"]).logger
+            logger.warning(
+                f"[AstrMai-Persistence] safe_json_loads failed, falling back to default: {exc} | "
+                f"raw_preview={raw[:120]!r}"
+            )
+            return default if default is not None else {}
+
+    @staticmethod
     def _relationship_vector_from_metadata(profile_metadata: Any) -> Dict[str, Any]:
         if not isinstance(profile_metadata, dict):
             return {}
@@ -26,7 +43,7 @@ class StateProfilePersistenceMixin:
         return dict(relationship_vector) if isinstance(relationship_vector, dict) else {}
 
     async def _get_chat_state_cols(self, db) -> list:
-        now = time.time()
+        now = monotonic()
         if self._chat_state_cols_cache is None or (now - self._chat_state_cols_ts) > self._COL_CACHE_TTL_SEC:
             cursor = await db.execute("PRAGMA table_info(chat_states)")
             cols_info = await cursor.fetchall()
@@ -35,7 +52,7 @@ class StateProfilePersistenceMixin:
         return self._chat_state_cols_cache
 
     async def _get_user_profile_cols(self, db) -> list:
-        now = time.time()
+        now = monotonic()
         if self._user_profile_cols_cache is None or (now - self._user_profile_cols_ts) > self._COL_CACHE_TTL_SEC:
             cursor = await db.execute("PRAGMA table_info(user_profiles)")
             cols_info = await cursor.fetchall()
@@ -61,13 +78,13 @@ class StateProfilePersistenceMixin:
                     self._chat_state_cols_cache = list(actual_col_names)
                     self._chat_state_cols_ts = now
                 row_dict = dict(zip(actual_col_names, row))
-                last_msg_info_raw = json.loads(row_dict.get("last_msg_info") or "{}")
+                last_msg_info_raw = self._safe_json_loads(row_dict.get("last_msg_info"), {"sender_id": "", "has_image": False, "image_urls": [], "vl_executed": False})
                 state = ChatState(
                     chat_id=str(row_dict.get("chat_id", chat_id) or chat_id),
                     energy=float(row_dict.get("energy", 0.5) or 0.5),
                     mood=float(row_dict.get("mood", 0.0) or 0.0),
                 )
-                state.group_config = json.loads(row_dict.get("group_config") or "{}")
+                state.group_config = self._safe_json_loads(row_dict.get("group_config"))
                 state.last_reset_date = str(row_dict.get("last_reset_date", "") or "")
                 state.total_replies = int(row_dict.get("total_replies") or 0)
                 state.last_reply_time = float(row_dict.get("last_reply_time") or 0.0)
@@ -148,7 +165,7 @@ class StateProfilePersistenceMixin:
             if row:
                 col_names = await self._get_user_profile_cols(db)
                 row_dict = dict(zip(col_names, row))
-                profile_metadata = json.loads(row_dict.get("profile_metadata") or "{}")
+                profile_metadata = self._safe_json_loads(row_dict.get("profile_metadata"))
                 return {
                     "user_id": row_dict.get("user_id", ""),
                     "name": row_dict.get("name", "Unknown"),
@@ -157,21 +174,21 @@ class StateProfilePersistenceMixin:
                     "persona_analysis": row_dict.get("persona_analysis", ""),
                     "message_count_for_profiling": int(row_dict.get("message_count_for_profiling") or 0),
                     "last_persona_gen_time": float(row_dict.get("last_persona_gen_time") or 0.0),
-                    "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
+                    "group_footprints": self._safe_json_loads(row_dict.get("group_footprints")),
                     "profile_metadata": profile_metadata,
                     "relationship_vector": self._relationship_vector_from_metadata(profile_metadata),
                     "identity": row_dict.get("identity", ""),
-                    "tags": json.loads(row_dict.get("tags") or "[]"),
+                    "tags": self._safe_json_loads(row_dict.get("tags"), []),
                     # Phase 8.1: 
                     "nickname": row_dict.get("nickname", ""),
                     "nickname_reason": row_dict.get("nickname_reason", ""),
                     "know_times": int(row_dict.get("know_times") or 0),
                     "is_known": bool(row_dict.get("is_known") or False),
-                    "identity_points": json.loads(row_dict.get("identity_points") or "[]"),
-                    "preference_points": json.loads(row_dict.get("preference_points") or "[]"),
-                    "relationship_points": json.loads(row_dict.get("relationship_points") or "[]"),
-                    "speech_style_points": json.loads(row_dict.get("speech_style_points") or "[]"),
-                    "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
+                    "identity_points": self._safe_json_loads(row_dict.get("identity_points"), []),
+                    "preference_points": self._safe_json_loads(row_dict.get("preference_points"), []),
+                    "relationship_points": self._safe_json_loads(row_dict.get("relationship_points"), []),
+                    "speech_style_points": self._safe_json_loads(row_dict.get("speech_style_points"), []),
+                    "memory_points": self._safe_json_loads(row_dict.get("memory_points"), []),
                 }
         return None
 
@@ -189,7 +206,7 @@ class StateProfilePersistenceMixin:
             user_id = row_dict.get("user_id", "")
             if not user_id:
                 continue
-            profile_metadata = json.loads(row_dict.get("profile_metadata") or "{}")
+            profile_metadata = self._safe_json_loads(row_dict.get("profile_metadata"))
             profiles[user_id] = {
                 "user_id": user_id,
                 "name": row_dict.get("name", "Unknown"),
@@ -198,20 +215,20 @@ class StateProfilePersistenceMixin:
                 "persona_analysis": row_dict.get("persona_analysis", ""),
                 "message_count_for_profiling": int(row_dict.get("message_count_for_profiling") or 0),
                 "last_persona_gen_time": float(row_dict.get("last_persona_gen_time") or 0.0),
-                "group_footprints": json.loads(row_dict.get("group_footprints") or "{}"),
+                "group_footprints": self._safe_json_loads(row_dict.get("group_footprints")),
                 "profile_metadata": profile_metadata,
                 "relationship_vector": self._relationship_vector_from_metadata(profile_metadata),
                 "identity": row_dict.get("identity", ""),
-                "tags": json.loads(row_dict.get("tags") or "[]"),
+                "tags": self._safe_json_loads(row_dict.get("tags"), []),
                 "nickname": row_dict.get("nickname", ""),
                 "nickname_reason": row_dict.get("nickname_reason", ""),
                 "know_times": int(row_dict.get("know_times") or 0),
                 "is_known": bool(row_dict.get("is_known") or False),
-                "memory_points": json.loads(row_dict.get("memory_points") or "[]"),
-                "identity_points": json.loads(row_dict.get("identity_points") or "[]"),
-                "preference_points": json.loads(row_dict.get("preference_points") or "[]"),
-                "relationship_points": json.loads(row_dict.get("relationship_points") or "[]"),
-                "speech_style_points": json.loads(row_dict.get("speech_style_points") or "[]"),
+                "memory_points": self._safe_json_loads(row_dict.get("memory_points"), []),
+                "identity_points": self._safe_json_loads(row_dict.get("identity_points"), []),
+                "preference_points": self._safe_json_loads(row_dict.get("preference_points"), []),
+                "relationship_points": self._safe_json_loads(row_dict.get("relationship_points"), []),
+                "speech_style_points": self._safe_json_loads(row_dict.get("speech_style_points"), []),
             }
         return profiles
 

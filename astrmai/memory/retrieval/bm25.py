@@ -105,10 +105,13 @@ class BM25Retriever:
                 
             # 分数归一化处理
             if results:
-                scores = [r.score for r in results]
-                max_score, min_score = max(scores), min(scores)
-                score_range = max_score - min_score if max_score != min_score else 1.0
-                for r in results:
-                    r.score = (r.score - min_score) / score_range
+                if len(results) == 1:
+                    results[0].score = 1.0
+                else:
+                    scores = [r.score for r in results]
+                    max_score, min_score = max(scores), min(scores)
+                    score_range = max_score - min_score if max_score != min_score else max(abs(max_score), 1.0)
+                    for r in results:
+                        r.score = (r.score - min_score) / score_range
                     
             return results

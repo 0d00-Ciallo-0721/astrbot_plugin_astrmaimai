@@ -40,7 +40,11 @@ class SessionMemorySummarizer:
             from sqlmodel import select
             from ...infrastructure.persistence import MessageLog
 
-            cutoff_time = time.time() - (days * 86400)
+            now = time.time()
+            cutoff_time = now - (days * 86400)
+            if cutoff_time > now:  # ponytail: NTP backward jump guard
+                logger.warning(f"[AstrMai-summarizer] NTP backward jump: cutoff={cutoff_time} > now={now}, clamping")
+                cutoff_time = 0.0
 
             def fetch_logs_sync():
                 with db.get_session() as session:

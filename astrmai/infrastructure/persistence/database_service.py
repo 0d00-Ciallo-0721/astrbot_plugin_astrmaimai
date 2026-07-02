@@ -12,6 +12,8 @@ from .database_memory import MemoryPersistenceMixin
 from .database_profile_relation import ProfileRelationPersistenceMixin
 from .database_review import ReviewPersistenceMixin
 from .orm_models import ChatState, LastMessageMetadata, MessageLog
+from astrbot.api import logger
+
 from .persistence_manager import PersistenceManager
 
 T = TypeVar("T")
@@ -46,6 +48,23 @@ class DatabaseService(
         self.review_repository = ReviewRepository(self)
         if hasattr(self.persistence, "bind_database_service"):
             self.persistence.bind_database_service(self)
+
+    @staticmethod
+    def _safe_json_loads(value: Any, default: Any = None):
+        """Safe JSON deserialization with fallback for dirty/corrupted data."""
+        raw = str(value or "").strip()
+        if not raw:
+            return default if default is not None else {}
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            from astrbot.api import logger
+
+            logger.warning(
+                f"[AstrMai-DB] safe_json_loads failed, falling back to default: {exc} | "
+                f"raw_preview={raw[:120]!r}"
+            )
+            return default if default is not None else {}
 
     @property
     def _db_lock(self):
@@ -126,7 +145,11 @@ class DatabaseService(
     ) -> List[MessageLog]:
         cutoff_timestamp = None
         if max_age_seconds is not None and max_age_seconds > 0:
-            cutoff_timestamp = time.time() - float(max_age_seconds)
+            now = time.time()
+            cutoff_timestamp = now - float(max_age_seconds)
+            if cutoff_timestamp > now:  # ponytail: NTP backward jump guard
+                logger.warning(f"[AstrMai-db] NTP backward jump: cutoff={cutoff_timestamp} > now={now}, clamping")
+                cutoff_timestamp = 0.0
 
         def _sync(session: Session) -> List[MessageLog]:
             filters = [MessageLog.group_id == group_id]
@@ -165,6 +188,7 @@ class DatabaseService(
 
     def get_chat_state(self, chat_id: str) -> Optional[ChatState]:
         with sqlite3.connect(self.persistence.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             cursor = conn.execute("SELECT * FROM chat_states WHERE chat_id = ?", (chat_id,))
             row = cursor.fetchone()
             if not row:
@@ -191,7 +215,7 @@ class DatabaseService(
                 energy=float(row_dict.get("energy", 0.5) or 0.5),
                 mood=float(row_dict.get("mood", 0.0) or 0.0),
             )
-            state.group_config = json.loads(row_dict.get("group_config") or "{}")
+            state.group_config = self._safe_json_loads(row_dict.get("group_config"))
             state.last_reset_date = str(row_dict.get("last_reset_date", "") or "")
             state.total_replies = int(row_dict.get("total_replies") or 0)
             state.last_reply_time = float(row_dict.get("last_reply_time") or 0.0)
@@ -199,7 +223,7 @@ class DatabaseService(
             state.last_energy_recovery_time = float(row_dict.get("last_energy_recovery_time") or 0.0)
             state.total_messages = int(row_dict.get("total_messages") or 0)
             state.judgment_mode = str(row_dict.get("judgment_mode", "single") or "single")
-            last_msg_info_raw = json.loads(row_dict.get("last_msg_info") or "{}")
+            last_msg_info_raw = self._safe_json_loads(row_dict.get("last_msg_info"), {"sender_id": "", "has_image": False, "image_urls": [], "vl_executed": False})
             state.last_msg_info = LastMessageMetadata(
                 sender_id=last_msg_info_raw.get("sender_id", ""),
                 has_image=bool(last_msg_info_raw.get("has_image", False)),

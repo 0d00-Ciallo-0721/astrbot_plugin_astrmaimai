@@ -77,6 +77,10 @@ class DreamScheduler:
         if not self.dream_agent or not self.dream_generator:
             return {"performed": False, "reason": "dependencies_unavailable", "session_id": str(session_id or ""), "throttle_scope": "global"}
         async with self._bg_semaphore:
+            # ponytail: R2 — throttle check inside semaphore to prevent concurrent bypass
+            now_ts = time.time()
+            if now_ts - self._last_dream_time < self._dream_interval:
+                return {"performed": False, "reason": "dream_global_cooldown", "session_id": str(session_id or ""), "throttle_scope": "global"}
             if session_id:
                 eligibility = self.describe_session_eligibility(session_id, time.time())
                 if not eligibility.get("eligible", False):
@@ -160,6 +164,12 @@ class DreamScheduler:
         return await self._run_for_session(None)
 
     async def run_once_for_session(self, session_id: str) -> dict:
+        """Trigger dream for a specific session.
+
+        Note: throttle is **global** — ``_last_dream_time`` is shared across
+        all sessions.  ``session_id`` is only passed to the dream agent and
+        does NOT affect the throttle decision.
+        """
         return await self._run_for_session(session_id)
 
     def _within_dream_time_range(self) -> bool:

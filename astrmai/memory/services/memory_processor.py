@@ -191,8 +191,8 @@ JSON 格式要求：
         if match:
             text = match.group(1)
         else:
-            # 正则兜底提取大括号内容
-            match = re.search(r'\{.*\}', text, re.DOTALL)
+            # 正则兜底提取大括号内容（balanced braces, not greedy .*）
+            match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
             if match:
                 text = match.group(0)
         try:

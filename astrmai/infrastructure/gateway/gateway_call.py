@@ -170,6 +170,7 @@ class GatewayCallMixin:
                             request_kwargs=request_kwargs,
                             request_kwargs_factory=request_kwargs_factory,
                         )
+                        t0 = time.perf_counter()
                         response = await asyncio.wait_for(
                             self.context.llm_generate(
                                 chat_provider_id=model_id,
@@ -180,20 +181,33 @@ class GatewayCallMixin:
                             timeout=timeout_limit,
                         )
                     except asyncio.TimeoutError as exc:
-                        raise TimeoutError(f"api timeout ({timeout_limit}s)") from exc
-                    except Exception as exc:
+                        # ponytail: timeout is not fatal — should retry, not raise into outer except (R8)
                         last_error = str(exc)
                         last_result = self._build_failure_result(
-                            error_kind=self._classify_failure_kind(last_error),
+                            error_kind=self._classify_failure_kind(last_error, error=exc),
                             error_message=last_error,
                             model_id=model_id,
                             raw_completion="",
                         )
-                        is_fatal = self._is_fatal_failure(last_error)
+                        is_fatal = False  # ponytail: asyncio timeout → retry, not fatal
+                        self.router.report_failure(report_pool, model_id, is_fatal=False)
+                        logger.warning(f"[Gateway] model {model_id} timeout ({attempt+1}/{max_retries+1}): {last_error}")
+                        if attempt < max_retries:
+                            await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
+                        continue
+                    except Exception as exc:
+                        last_error = str(exc)
+                        last_result = self._build_failure_result(
+                            error_kind=self._classify_failure_kind(last_error, error=exc),
+                            error_message=last_error,
+                            model_id=model_id,
+                            raw_completion="",
+                        )
+                        is_fatal = self._is_fatal_failure(last_error, error=exc)
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
                         self._open_model_cooldown(report_pool, model_id, last_error)
                         if is_fatal:
-                            logger.error(f"[Gateway] fatal model failure {model_id}: {last_error[:120]}")
+                            logger.exception(f"[Gateway] fatal model failure {model_id}")
                             break
                         logger.warning(
                             f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {last_error}"
@@ -202,8 +216,10 @@ class GatewayCallMixin:
                             await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
                         continue
 
+                    raw_completion_text = ""  # ponytail: init before try to avoid NameError in nested except
                     try:
                         content = getattr(response, "completion_text", "") or ""
+                        latency_ms = (time.perf_counter() - t0) * 1000
                         raw_completion_text = content
                         if not content.strip():
                             raise ValueError("empty_response")
@@ -224,7 +240,7 @@ class GatewayCallMixin:
                         if is_json:
                             parsed_json = self._parse_json_completion(content)
                             self.router.report_success(report_pool, model_id)
-                            self._log_usage(report_pool, model_id, usage, log_meta)
+                            self._log_usage(report_pool, model_id, usage, log_meta, latency_ms=latency_ms)
                             economy_payload = {}
                             if workload_policy and record_economy:
                                 workload_trace = self.context_economy.build_trace(
@@ -301,16 +317,16 @@ class GatewayCallMixin:
                     except Exception as exc:
                         last_error = str(exc)
                         last_result = self._build_failure_result(
-                            error_kind=self._classify_failure_kind(last_error),
+                            error_kind=self._classify_failure_kind(last_error, error=exc),
                             error_message=last_error,
                             model_id=model_id,
                             raw_completion=raw_completion_text,
                         )
-                        is_fatal = self._is_fatal_failure(last_error)
+                        is_fatal = self._is_fatal_failure(last_error, error=exc)
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
                         self._open_model_cooldown(report_pool, model_id, f"{last_error} {raw_completion_text}")
                         if is_fatal:
-                            logger.error(f"[Gateway] fatal model failure {model_id}: {last_error[:120]}")
+                            logger.exception(f"[Gateway] fatal model failure {model_id}")
                             break
                         logger.warning(
                             f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {last_error}"

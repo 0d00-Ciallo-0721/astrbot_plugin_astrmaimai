@@ -76,6 +76,7 @@ class MemoryPromotionEngine:
             yield (subject_id, entity, attribute, value), evidence
 
     async def run_audit(self, session_id: str, maintenance_result: dict, *, now: float | None = None) -> dict[str, Any]:
+        # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
         now_ts = float(now or time.time())
         report = {
             "session_id": str(session_id or ""),

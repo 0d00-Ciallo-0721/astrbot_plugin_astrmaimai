@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from astrbot.api import logger
+from ...shared.helpers.plugin_helpers import safe_create_task
 
 
 class ExpressionGovernanceRunner:
@@ -31,7 +32,7 @@ class ExpressionGovernanceRunner:
         if self._is_running:
             return
         self._is_running = True
-        self._task = asyncio.create_task(self._loop())
+        self._task = safe_create_task(self._loop())
 
     async def stop(self):
         self._is_running = False

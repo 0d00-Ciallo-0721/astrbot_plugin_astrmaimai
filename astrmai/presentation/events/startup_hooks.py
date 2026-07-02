@@ -14,3 +14,4 @@ async def on_program_start(runtime: PluginRuntimeContext, lifecycle_manager: Plu
         await lifecycle_manager.on_program_start()
     except Exception:
         logger.exception("[AstrMai] lifecycle_manager.on_program_start failed")
+        raise  # ponytail: R13 — propagate startup failure

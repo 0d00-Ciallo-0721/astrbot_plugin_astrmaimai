@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from time import monotonic
 from dataclasses import replace
 from typing import Any
 
@@ -251,6 +252,7 @@ class HeartflowManager:
         return self._materialize_session(chat_id, snapshot, now=now, persist=False)
 
     def _cleanup_sessions(self, *, now: float) -> None:
+        # ponytail: or 0.0 treats epoch-0 as "never active" — consistent with cleanup intent.
         expired = [
             chat_id
             for chat_id, session in self._sessions.items()
@@ -354,7 +356,7 @@ class HeartflowManager:
         }
 
     async def preview_chat(self, chat_id: str, snapshot: dict | None = None, now: float | None = None) -> dict[str, Any]:
-        now = time.time() if now is None else now
+        now = monotonic() if now is None else now
         if snapshot is None and self.runtime_coordinator and hasattr(self.runtime_coordinator, "get_activity_snapshot"):
             try:
                 snapshot = await self.runtime_coordinator.get_activity_snapshot(chat_id)

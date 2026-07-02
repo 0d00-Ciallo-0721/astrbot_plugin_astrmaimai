@@ -1,4 +1,6 @@
+import asyncio
 import time
+from time import monotonic
 from typing import Any, Callable, Dict, List, Optional
 
 from ..context_economy import WorkloadPolicy
@@ -11,7 +13,7 @@ class GatewayPolicyMixin:
         return str(pool_name or ""), str(model_id or "")
 
     def _cleanup_model_cooldowns(self) -> None:
-        now = time.time()
+        now = monotonic()
         cooldowns = getattr(self, "_model_cooldowns", {})
         for key, meta in list(cooldowns.items()):
             if float(meta.get("until", 0.0) or 0.0) <= now:
@@ -46,12 +48,17 @@ class GatewayPolicyMixin:
         if duration <= 0:
             return {}
         meta = {
-            "until": time.time() + duration,
+            "until": monotonic() + duration,
             "reason": reason,
             "duration_sec": duration,
         }
         getattr(self, "_model_cooldowns", {})[self._cooldown_key(pool_name, model_id)] = meta
         return dict(meta)
+
+    def _is_model_cooldown(self, pool_name: str, model_id: str) -> bool:
+        """查询模型是否处于冷却期（由 GatewayPolicy._model_cooldowns 统一管理）。"""
+        meta = self._model_cooldown_meta(pool_name, model_id)
+        return bool(meta)
 
     def _filter_cooldown_attempt_queue(
         self,
@@ -95,6 +102,7 @@ class GatewayPolicyMixin:
             models,
             sticky_key=sticky_key,
             sticky_preferred=sticky_preferred,
+            cooldown_checker=self._is_model_cooldown,
         )
         attempt_queue = primary_models.copy()
         if use_fallback:
@@ -120,7 +128,9 @@ class GatewayPolicyMixin:
             llm_kwargs["image_urls"] = list(image_urls)
         return llm_kwargs
 
-    def _classify_failure_kind(self, error_message: str) -> FailureKind:
+    def _classify_failure_kind(self, error_message: str, error: Exception | None = None) -> FailureKind:
+        if error is not None and isinstance(error, asyncio.TimeoutError):
+            return FailureKind.TIMEOUT
         lowered = str(error_message).lower()
         if "empty_response" in lowered:
             return FailureKind.EMPTY_RESPONSE
@@ -140,7 +150,9 @@ class GatewayPolicyMixin:
             return FailureKind.BAD_PAYLOAD
         return FailureKind.UNKNOWN
 
-    def _is_fatal_failure(self, error_message: str) -> bool:
+    def _is_fatal_failure(self, error_message: str, error: Exception | None = None) -> bool:
+        if error is not None and isinstance(error, asyncio.TimeoutError):
+            return False  # 客户端超时不致命，应重试
         lowered = str(error_message).lower()
         fatal_keywords = (
             "429",
@@ -156,6 +168,8 @@ class GatewayPolicyMixin:
             "invalid_request_error",
             "apitimeouterror",
             "request timed out",
-            "timeout",
+            "timed out",
+            "408",
+            "504",
         )
         return any(keyword in lowered for keyword in fatal_keywords) or "content=none" in lowered

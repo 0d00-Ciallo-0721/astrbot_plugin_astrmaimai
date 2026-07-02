@@ -72,8 +72,15 @@ class CronAgent(AstrMaiBaseSubAgent):
         if not self.db_service:
             return
 
-        ctx = context.context.context
-        event = context.context.event
+        astr_agent_ctx = context.context
+        if astr_agent_ctx is None:
+            logger.error("[AstrMai-cron] ContextWrapper.context is None; AstrBot API may have changed")
+            return
+        ctx = astr_agent_ctx.context
+        event = astr_agent_ctx.event
+        if ctx is None or event is None:
+            logger.error(f"[AstrMai-cron] astr_agent_ctx.context={ctx}, .event={event}")
+            return
         cron_mgr = getattr(ctx, "cron_manager", None)
         if not cron_mgr:
             return
@@ -84,6 +91,7 @@ class CronAgent(AstrMaiBaseSubAgent):
         try:
             from ...infrastructure.persistence.orm_models import CronSnapshot
         except Exception:
+            logger.exception("[AstrMai-cron] CronSnapshot import failed", exc_info=True)
             CronSnapshot = None
 
         if CronSnapshot is None:

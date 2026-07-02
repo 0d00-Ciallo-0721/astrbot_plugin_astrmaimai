@@ -31,7 +31,28 @@ class UserProfileService:
         self.persistence = persistence
         self.user_profiles: Dict[str, UserProfile] = {}
         self._user_locks: Dict[str, asyncio.Lock] = {}
+        # ponytail: threading.Lock guards dict mutations, held for trivial ops only — safe in asyncio
         self._pool_lock_mutex = threading.Lock()
+        self._profiles_dict_lock = asyncio.Lock()
+
+    def invalidate_cache(self, user_id: str = None):
+        """ponytail: invalidate cached profile(s) after external modification"""
+        if user_id:
+            self.user_profiles.pop(user_id, None)
+        else:
+            self.user_profiles.clear()
+
+    async def _flush_profile(self, user_id: str, profile):
+        """ponytail: immediately persist a dirty profile"""
+        if not profile.is_dirty:
+            return
+        try:
+            await self.persistence.save_user_profile(user_id, profile.as_dict())
+            profile.is_dirty = False
+        except Exception as exc:
+            from astrbot.api import logger
+
+            logger.warning(f"[AstrMai-profile] flush failed for {user_id}: {exc}")
 
     def _get_user_lock(self, user_id: str) -> asyncio.Lock:
         with self._pool_lock_mutex:
@@ -105,6 +126,7 @@ class UserProfileService:
         return str(meta.get("nickname_origin", "") or "").strip() != "manual"
 
     def _touch_profile(self, profile: UserProfile, *, now: float | None = None) -> None:
+        # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
         ts = now if now is not None else time.time()
         profile.last_access_time = ts
         profile.last_seen = ts
@@ -112,6 +134,7 @@ class UserProfileService:
 
     async def get_user_profile(self, user_id: str) -> UserProfile:
         async with self._get_user_lock(user_id):
+            # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
             now = time.time()
             if user_id in self.user_profiles:
                 profile = self.user_profiles[user_id]
@@ -120,7 +143,16 @@ class UserProfileService:
 
             data = await self.persistence.load_user_profile(user_id)
             if data:
-                profile = UserProfile(**data)
+                try:
+                    profile = UserProfile(**data)
+                except Exception as exc:
+                    from astrbot.api import logger
+
+                    logger.warning(
+                        f"[AstrMai] UserProfile construction failed for {user_id}, "
+                        f"falling back to default: {exc}"
+                    )
+                    profile = UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
             else:
                 profile = UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
 
@@ -128,8 +160,19 @@ class UserProfileService:
                 profile.name = _DEFAULT_PROFILE_NAME
             profile.last_access_time = now
             profile.is_dirty = False
+            self._migrate_relationship_vector(profile)
             self.user_profiles[user_id] = profile
             return profile
+
+    @staticmethod
+    def _migrate_relationship_vector(profile: UserProfile) -> None:
+        """单向迁移：将 profile_metadata 中的旧 relationship_vector 移至字段。"""
+        meta = profile.profile_metadata if isinstance(profile.profile_metadata, dict) else {}
+        if "relationship_vector" in meta:
+            if not profile.relationship_vector:
+                profile.relationship_vector = meta.pop("relationship_vector")
+            else:
+                meta.pop("relationship_vector", None)
 
     async def update_social_score(self, user_id: str, score: float, relationship_vector: dict = None) -> UserProfile:
         async with self._get_user_lock(user_id):
@@ -137,13 +180,23 @@ class UserProfileService:
             profile = self.user_profiles.get(user_id)
             if profile is None:
                 data = await self.persistence.load_user_profile(user_id)
-                profile = UserProfile(**data) if data else UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
+                if data:
+                    try:
+                        profile = UserProfile(**data)
+                    except Exception as exc:
+                        from astrbot.api import logger
+
+                        logger.warning(
+                            f"[AstrMai] UserProfile construction failed for {user_id} "
+                            f"in update_social_score, falling back to default: {exc}"
+                        )
+                        profile = UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
+                else:
+                    profile = UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
                 self.user_profiles[user_id] = profile
             profile.social_score = score
             if relationship_vector:
                 profile.relationship_vector = relationship_vector
-                meta = self._profile_metadata(profile)
-                meta["relationship_vector"] = relationship_vector
             self._touch_profile(profile, now=now)
             await self._save_profile(profile)
             return profile
@@ -189,6 +242,14 @@ class UserProfileService:
         footprint.setdefault("private_touch_count", 0)
         return footprint
 
+    async def _get_profile_inner(self, user_id: str) -> UserProfile:
+        """Re-read profile without acquiring lock — caller must hold _get_user_lock."""
+        if user_id in self.user_profiles:
+            return self.user_profiles[user_id]
+        profile = await self._load_profile(user_id)
+        self.user_profiles[user_id] = profile
+        return profile
+
     async def observe_user_activity(
         self,
         user_id: str,
@@ -200,6 +261,8 @@ class UserProfileService:
     ) -> None:
         profile = await self.get_user_profile(user_id)
         async with self._get_user_lock(user_id):
+            # ponytail: re-read profile under lock to prevent TOCTOU (R20)
+            profile = await self._get_profile_inner(user_id)
             cleaned_name = self._clean_text(sender_name)
             if cleaned_name and not self.is_manual_locked(profile, "name") and not self._is_placeholder_name(cleaned_name):
                 current = self._clean_text(profile.name)
@@ -218,6 +281,7 @@ class UserProfileService:
                     recent.append({"text": snippet[:120], "at": time.time()})
                 footprint["recent_messages"] = recent[-_RECENT_MESSAGES_LIMIT:]
             self._touch_profile(profile)
+            await self._flush_profile(user_id, profile)
 
     async def record_profile_learning_touch(
         self,
@@ -499,11 +563,12 @@ class UserProfileService:
         return self.get_profile_prompt_bundle(profile)
 
     async def flush_message_counters(self) -> None:
-        dirty_user_ids = [
-            user_id
-            for user_id, profile in self.user_profiles.items()
-            if getattr(profile, "is_dirty", False)
-        ]
+        async with self._profiles_dict_lock:
+            dirty_user_ids = [
+                user_id
+                for user_id, profile in self.user_profiles.items()
+                if getattr(profile, "is_dirty", False)
+            ]
         for user_id in dirty_user_ids:
             async with self._get_user_lock(user_id):
                 profile = self.user_profiles.get(user_id)

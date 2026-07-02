@@ -35,6 +35,14 @@ async def bridge_external_plugin_result(runtime, event) -> None:
     if event.get_extra("astrmai_loop_source", "") == "external_result_bridge":
         return
 
+    # ── 外部结果白名单检查 ──
+    loop_source = event.get_extra("astrmai_loop_source", "") or "astrbot_builtin"
+    runtime_config = getattr(runtime, "config", None)
+    allowed = getattr(getattr(runtime_config, "global_settings", None), "external_result_sources", ["astrbot_builtin"]) or ["astrbot_builtin"]
+    if "*" not in allowed and loop_source not in allowed:
+        logger.debug(f"[ExtBridge] skipped non-whitelisted source: {loop_source}")
+        return
+
     reply_text = extract_external_reply_text(event.get_result())
     if not reply_text:
         return

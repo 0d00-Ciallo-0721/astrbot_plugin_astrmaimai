@@ -40,6 +40,12 @@ class GlobalModelGateway(
             f"[Gateway] global concurrency limiter ready, max={self.settings.max_concurrent_llm_calls}"
         )
 
+    def refresh_config(self, config):
+        """ponytail: hot-reload config into gateway"""
+        self.config = config
+        from ...shared.constants.defaults import build_infrastructure_settings
+        self.settings = build_infrastructure_settings(config).gateway
+
     def get_models_for_task(self, pool_name: str, models: List[str]) -> List[str]:
         return self.router.get_ranked_models(pool_name, models)
 

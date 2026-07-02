@@ -1,5 +1,6 @@
 import asyncio
 import time
+from time import monotonic
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -38,7 +39,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         ("sys1", "judge"): LanePolicy(store_mode="structured", max_raw_turns=6),
         ("sys1", "mood"): LanePolicy(store_mode="structured", max_raw_turns=6),
         ("sys1", "vision"): LanePolicy(store_mode="structured", max_raw_turns=2),
-        ("sys2", "dialog"): LanePolicy(store_mode="full", max_raw_turns=12),
+        ("sys2", "dialog"): LanePolicy(store_mode="full", max_raw_turns=12, summarize_threshold_tokens=1800),
         ("sys2", "followup"): LanePolicy(store_mode="structured", max_raw_turns=4),
         ("sys2", "goal"): LanePolicy(store_mode="structured", max_raw_turns=4),
         ("sys2", "expression"): LanePolicy(store_mode="structured", max_raw_turns=4),
@@ -59,16 +60,22 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         config: Any = None,
         settings: LaneRuntimeSettings | None = None,
     ):
+        self.__init_lane_storage__()
         self.conversation_manager = conversation_manager
         self.config = config
         self.settings = settings or build_infrastructure_settings(config).lane
         self._runtime_meta: Dict[str, Dict[str, Any]] = {}
         self._remote_sessions: Dict[str, Tuple[str, float]] = {}
-        self._remote_sessions_ttl: float = 3600.0
+        self._remote_sessions_ttl: float = 300.0  # 5 min, aligns with provider session TTL
         self._remote_sessions_last_cleanup: float = 0.0
         self._lane_locks: Dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
         self._meta_lock = asyncio.Lock()
+        self._rotation_count = 0
+        self._active_lane_count = 0
+
+    def refresh_config(self, config):
+        self.config = config
 
     def get_policy(self, lane_key: LaneKey) -> LanePolicy:
         return self.DEFAULT_POLICIES.get(
@@ -84,6 +91,11 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         async with self._lock:
             if lane_umo not in self._lane_locks:
                 self._lane_locks[lane_umo] = asyncio.Lock()
+                if len(self._lane_locks) > 100:
+                    oldest = next(iter(self._lane_locks))
+                    # ponytail: M14 — skip locks held by active coroutines
+                    if not self._lane_locks[oldest].locked():
+                        self._lane_locks.pop(oldest, None)
             return self._lane_locks[lane_umo]
 
     async def _should_rotate(
@@ -148,7 +160,7 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
 
     def get_remote_session_id(self, lane_umo: str, provider_family: str) -> str:
         key = f"{provider_family}:{lane_umo}"
-        now = time.time()
+        now = monotonic()
         # 惰性清理：每 300s 最多执行一次全量扫描
         if now - self._remote_sessions_last_cleanup > 300.0:
             self._cleanup_remote_sessions(now)

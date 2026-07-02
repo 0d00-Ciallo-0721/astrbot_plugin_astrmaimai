@@ -69,13 +69,14 @@ class RRFFusion:
         for doc_id in all_doc_ids:
             score = 0.0
             
+            # ponytail: RRFFusion metadata "first wins" — BM25 overwrites vector.
             # BM25 贡献
             if doc_id in bm25_map:
                 rank, res = bm25_map[doc_id]
                 score += 1.0 / (self.k + rank + 1)
                 doc_info[doc_id] = res
             
-            # Vector 贡献
+            # Vector 贡献 (metadata only set if BM25 didn't win)
             if doc_id in vector_map:
                 rank, res = vector_map[doc_id]
                 score += 1.0 / (self.k + rank + 1)

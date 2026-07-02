@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 from ..adapters.plugin_api import PluginApiAdapter
+from ....shared.helpers.plugin_helpers import safe_create_task
 
 
 class ChatRuntimeService:
@@ -46,7 +47,7 @@ class ChatRuntimeService:
         scheduler = getattr(task, "dream_scheduler", None) if task else None
         if not scheduler or not getattr(scheduler, "dream_agent", None) or not getattr(scheduler, "dream_generator", None):
             return {"status": "error", "message": "Dream dependencies are not bound", "runtime_bound": scheduler is not None}
-        asyncio.create_task(scheduler.run_once())
+        safe_create_task(scheduler.run_once())
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def diary_status(self) -> dict[str, Any]:
@@ -66,7 +67,7 @@ class ChatRuntimeService:
         state_engine = self._api.get_state_engine()
         if not service or not state_engine:
             return {"status": "error", "message": "Diary dependencies are not bound", "runtime_bound": task is not None}
-        asyncio.create_task(service.run_once(state_engine.get_active_states()))
+        safe_create_task(service.run_once(state_engine.get_active_states()))
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def wakeup_status(self) -> dict[str, Any]:

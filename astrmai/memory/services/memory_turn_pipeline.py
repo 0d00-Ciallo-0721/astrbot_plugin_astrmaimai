@@ -380,6 +380,18 @@ class MemoryTurnPipeline:
                     if str(payload.get("reason", "")) == "idle_timeout":
                         await self._observe_chat(chat_id, "memory_pipeline", "idle_timeout", level="warning", reason="idle_timeout")
                     await self.run_maintenance_for_session(chat_id)
+                # ponytail: prune inactive dict entries
+                now = time.time()
+                stale_cutoff = now - 1800
+                for chat_id in list(self._session_history_buffer.keys()):
+                    buf = self._session_history_buffer.get(chat_id)
+                    last_update = buf.get("last_update", 0) if isinstance(buf, dict) else 0
+                    if last_update < stale_cutoff:
+                        self._session_history_buffer.pop(chat_id, None)
+                        self._memory_locks.pop(chat_id, None)
+                        self._worker_tasks.pop(chat_id, None)
+                        self._worker_queues.pop(chat_id, None)
+                        self._instant_llm_last_check.pop(chat_id, None)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -429,6 +441,7 @@ class MemoryTurnPipeline:
                 payload=payload or {},
             )
         except Exception:
+            logger.debug("[AstrMai-mem-pipeline] observe_turn failed", exc_info=True)
             return
 
     async def _observe_chat(
@@ -456,6 +469,7 @@ class MemoryTurnPipeline:
                 payload=payload or {},
             )
         except Exception:
+            logger.debug("[AstrMai-mem-pipeline] observe_chat failed", exc_info=True)
             return
 
     async def _observe_global(

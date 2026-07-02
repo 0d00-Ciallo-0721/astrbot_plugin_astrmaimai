@@ -33,8 +33,12 @@ class ImagePipeline:
             image_format = "jpeg"
 
         fd, temp_file_path = tempfile.mkstemp(suffix=f".{image_format}")
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(image_bytes)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(image_bytes)
+        except Exception:
+            os.close(fd)
+            raise  # ponytail: M18 — cleanup fd on write failure
         return PreparedImage(
             file_path=temp_file_path,
             image_bytes=image_bytes,

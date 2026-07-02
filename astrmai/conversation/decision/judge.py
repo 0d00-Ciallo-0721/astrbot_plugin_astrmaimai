@@ -22,13 +22,18 @@ class Judge:
         self.gateway = gateway
         self.state_engine = state_engine
         self.config = config if config else gateway.config
-        # [新增] Sys1 专属群组级思考锁，防止同一群重入
+        # ponytail: plain set() for Sys1 group mutex — asyncio is single-threaded
+        # within event loop, so no true concurrency hazard. Add asyncio.Lock if
+        # groups share event loops.
         self.active_sys1_groups = set()
         self.DEFAULT_HISTORY_LIMIT = 8
         self.NORMAL_HISTORY_MAX_AGE_SECONDS = 900.0
         self.WAKEUP_HISTORY_MAX_AGE_SECONDS = 1800.0
         self.PRIMARY_MOOD_MICROADJUST_THRESHOLD = 0.15
         self.PRIMARY_MOOD_MICROADJUST_SCALE = 0.25
+
+    def refresh_config(self, config):
+        self.config = config
 
 # ==========================================
     # [新增 P1-T1] 动态行为修饰器
@@ -49,14 +54,8 @@ class Judge:
         if any(kw in message for kw in task_keywords):
             actions.append("TOOL_CALL: 明确的指令求助，需要调用外部工具")
         
-        # FETCH_KNOWLEDGE: 20% 概率随机激活 或 消息含问号时必定激活
-        if "?" in message or "？" in message or any(kw in message for kw in ["为什么", "怎么", "啥", "什么", "解释", "查", "搜索", "资料"]):
-            actions.append("FETCH_KNOWLEDGE: 你突然想去翻翻记忆/知识库确认一下（灵光一闪）")
-        
-        # RETHINK_GOAL: 窗口内事件 >= 5 条时以 30% 概率激活
-        if window_events_count >= 5:
-            actions.append("RETHINK_GOAL: 聊了一阵子了，你想重新审视一下自己的对话目标")
-            
+        # ponytail: M4 — FETCH_KNOWLEDGE and RETHINK_GOAL were offered to LLM but silently downgraded;
+        # removed from prompt to avoid misleading the LLM. Planner handles all action routing.
         return "\n".join(f"- {a}" for a in actions)
 
     # ==========================================
@@ -202,7 +201,11 @@ class Judge:
                 timestamp = self._extract_history_timestamp(record)
                 if timestamp <= 0:
                     continue
-                if now - timestamp > max_age_seconds:
+                delta = now - timestamp
+                if delta < 0:  # ponytail: NTP guard
+                    logger.warning(f"[AstrMai-judge] clock skew: msg ts {timestamp} > now {now}")
+                    delta = 0
+                if delta > max_age_seconds:
                     continue
                 filtered.append(record)
             if not filtered:
@@ -320,6 +323,7 @@ class Judge:
             # 【最高优先级】: 极速穿透判定 (4维检查)
             # =====================================================================
             if is_force_wakeup or is_keyword_wakeup:
+                # ponytail: time.time() for cold-chat check; NTP risk accepted (last_reply_time stored as time.time())
                 time_since_last_reply = time.time() - state.last_reply_time
                 is_cold_chat = time_since_last_reply > 180
                 is_low_entropy = (window_events_count == 1)
@@ -495,17 +499,10 @@ class Judge:
                 plan.meta["retrieve_keys"] = keys
                 
                 # 🟢 [修改 P1-T1] 校验扩展的合法动作并执行降级处理
-                valid_actions = ["REPLY", "WAIT", "IGNORE", "TOOL_CALL", "FETCH_KNOWLEDGE", "RETHINK_GOAL"]
+                valid_actions = ["REPLY", "WAIT", "IGNORE", "TOOL_CALL"]
                 if plan.action not in valid_actions:
                     plan.action = "IGNORE"
-                
-                # 动作降级 (保护下游 Planner 路由不被破坏)
-                if plan.action == "FETCH_KNOWLEDGE":
-                    plan.action = "REPLY"
-                    plan.meta["retrieve_keys"] = plan.meta.get("retrieve_keys", []) or ["ALL"]
-                elif plan.action == "RETHINK_GOAL":
-                    plan.action = "REPLY"
-                    plan.meta["force_rethink_goal"] = True
+                # ponytail: M4 — FETCH_KNOWLEDGE/RETHINK_GOAL downgrade removed; actions no longer offered to LLM
 
                 mood_tag = result.get("mood_tag", "neutral")
                 try:
@@ -545,7 +542,7 @@ class Judge:
                 return plan
             
             except Exception as e:
-                logger.warning(f"[{chat_id}] Judge LLM 失败，默认放行: {e}")
+                logger.exception(f"[{chat_id}] Judge LLM failed, defaulting to REPLY: {e}")
                 plan.action = "REPLY" 
                 plan.meta["retrieve_keys"] = []
                 return plan

@@ -95,16 +95,19 @@ class MoodManager:
                     parsed_successfully = True
             except json.JSONDecodeError as exc:
                 logger.debug(f"[MoodManager] standard JSON parse failed, trying AST fallback: {exc}")
-                try:
-                    eval_data = ast.literal_eval(json_str)
-                    if isinstance(eval_data, list) and eval_data and isinstance(eval_data[0], dict):
-                        data = eval_data[0]
-                    elif isinstance(eval_data, dict):
-                        data = eval_data
-                    if data:
-                        parsed_successfully = True
-                except Exception:
+                if len(json_str) > 10000:  # ponytail: size guard against LLM hallucination
                     pass
+                else:
+                    try:
+                        eval_data = ast.literal_eval(json_str)
+                        if isinstance(eval_data, list) and eval_data and isinstance(eval_data[0], dict):
+                            data = eval_data[0]
+                        elif isinstance(eval_data, dict):
+                            data = eval_data
+                        if data:
+                            parsed_successfully = True
+                    except Exception:
+                        logger.debug("[AstrMai-mood] AST literal_eval failed", exc_info=True)
 
         if not parsed_successfully or ("mood_tag" not in data and "mood_value" not in data):
             logger.debug(f"[MoodManager] structured parse failed, trying regex extraction: {clean_str[:80]}...")

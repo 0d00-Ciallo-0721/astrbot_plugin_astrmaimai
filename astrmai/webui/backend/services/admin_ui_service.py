@@ -8,6 +8,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Callable
 
 from ....infrastructure.runtime.observability import RuntimeObservabilityHub
+from ....shared.helpers.plugin_helpers import safe_create_task
 from ..adapters.plugin_api import PluginApiAdapter
 
 
@@ -88,6 +89,9 @@ class AdminUiService:
             return 0
         from .dashboard_repository import DashboardRepository
         if where:
+            # ponytail: M16 — respect table param even when where clause is present
+            if table == "MemoryEvent":
+                return await DashboardRepository(self.db_factory).count_table(table)
             from ..repositories import CanonicalMemoryRepository
             return await CanonicalMemoryRepository(self.db_factory).count(where=where, params=params)
         return await DashboardRepository(self.db_factory).count_table(table)
@@ -917,7 +921,7 @@ class AdminUiService:
         scheduler = getattr(task, "dream_scheduler", None) if task else None
         if not scheduler or not getattr(scheduler, "dream_agent", None) or not getattr(scheduler, "dream_generator", None):
             return {"status": "error", "message": "Dream dependencies are not bound", "runtime_bound": scheduler is not None}
-        asyncio.create_task(scheduler.run_once())
+        safe_create_task(scheduler.run_once())
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def diary_status(self) -> dict[str, Any]:
@@ -937,7 +941,7 @@ class AdminUiService:
         state_engine = self.plugin_api.get_state_engine()
         if not service or not state_engine:
             return {"status": "error", "message": "Diary dependencies are not bound", "runtime_bound": task is not None}
-        asyncio.create_task(service.run_once(state_engine.get_active_states()))
+        safe_create_task(service.run_once(state_engine.get_active_states()))
         return {"status": "ok", "scheduled": True, "runtime_bound": True}
 
     async def wakeup_status(self) -> dict[str, Any]:

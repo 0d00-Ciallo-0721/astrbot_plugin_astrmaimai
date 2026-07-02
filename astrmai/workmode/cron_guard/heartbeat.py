@@ -39,6 +39,10 @@ class CronHeartbeatGuard:
             if not snap.job_id or not str(snap.job_id).strip():
                 continue
             if snap.job_id not in active_job_ids:
+                logger.info(
+                    f"[CronGuard] reviving job '{snap.name}' "
+                    f"from session '{getattr(snap, 'target_origin', '')}' (id={snap.job_id})"
+                )
                 if await self._revive_job(cron_mgr, snap):
                     revived += 1
         return revived

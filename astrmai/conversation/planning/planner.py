@@ -13,6 +13,7 @@ from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_conte
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
 from .agency_feedback_bridge import AgencyReflectionBridge
 from .agency_runtime import AgencyRuntimeStore
+from ...shared.helpers.plugin_helpers import safe_create_task
 from .behavior_tuning import BehaviorTuningPolicy
 from .cognitive_loop import CognitiveDecision, CognitiveLoop
 from .conversation_continuity import ConversationContinuityStore
@@ -83,6 +84,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.think_level_policy = ThinkLevelPolicy()
         self.input_loader = PlanningInputLoader(self)
         self.reflector = None
+        # ponytail: per-instance history but not per-chat — fidelity degrades under load.
+        # Replace with dict[chat_id, list[dict]] when multi-chat contention is observed.
         self.cognitive_decision_history: list[dict] = []
         self.tool_trace_history: list[dict] = []
         self.turn_trace_history: list[dict] = []
@@ -519,7 +522,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if not getattr(self, "agency_reflection_bridge", None):
             return
         try:
-            asyncio.create_task(self.agency_reflection_bridge.maybe_flush(self.agency_runtime, chat_id))
+            safe_create_task(self.agency_reflection_bridge.maybe_flush(self.agency_runtime, chat_id))
         except RuntimeError:
             pass
 
@@ -843,7 +846,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             )
             if self.context_compaction is not None:
                 try:
-                    asyncio.create_task(
+                    safe_create_task(
                         self.context_compaction.schedule_compaction_evaluation(
                             chat_id,
                             focus_context=focus_context,

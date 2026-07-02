@@ -5,6 +5,7 @@ from typing import Any
 
 
 def apply_natural_decay(state: Any, config: Any) -> None:
+    # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
     now = time.time()
     is_dirty = False
     minutes_silent = 999.0

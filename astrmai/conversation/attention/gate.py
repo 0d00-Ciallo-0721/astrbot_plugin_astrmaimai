@@ -82,6 +82,9 @@ class AttentionGate:
         self.private_chat_manager = private_chat_manager
         self.runtime_coordinator = runtime_coordinator
         self.chat_loop_kernel = chat_loop_kernel
+        self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
+        self._proactive_dispatching: dict[str, bool] = {}
+        self._deferred_messages: dict[str, list] = {}  # ponytail: R12 — queue blocked messages
         self.dialogue_store = getattr(state_engine, "dialogue_store", None)
         self.context_compaction = getattr(state_engine, "context_compaction", None)
         if self.context_compaction is None:
@@ -92,13 +95,44 @@ class AttentionGate:
 
         self.focus_pools: Dict[str, SessionContext] = {}
         self._pool_lock = asyncio.Lock()
+        # ponytail: guard against unbounded focus_pools growth
+        self._last_focus_pool_prune: float = 0.0
         self._background_tasks: set[asyncio.Task] = set()
         self._session_tasks: set[asyncio.Task] = set()
         self._background_task_semaphore = asyncio.Semaphore(self.BACKGROUND_TASK_MAX_CONCURRENCY)
+        # ponytail: dedup cache is FIFO-evicted at 256 entries, no time-based TTL.
+        # Entry persists until pushed out by 256 newer messages — acceptable for message dedup.
         self._global_message_cache = collections.OrderedDict()
         self.perception_builder = PerceptionBuilder(self)
         self.window_buffer = AttentionWindowBuffer(self)
         self.decision_router = AttentionDecisionRouter(self)
+
+    def refresh_config(self, config):
+        self.config = config
+
+    def get_proactive_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return a per-chat lock for proactive injection serialization."""
+        if chat_id not in self._proactive_injection_lock:
+            self._proactive_injection_lock[chat_id] = asyncio.Lock()
+        return self._proactive_injection_lock[chat_id]
+
+    async def drain_deferred_messages(self, chat_id: str, limit: int = 5):
+        """Replay messages queued during proactive dispatching."""
+        queue = self._deferred_messages.pop(chat_id, None)
+        if not queue:
+            return
+        drained = 0
+        for event in queue[:limit]:
+            try:
+                await self.process_event(event)
+                drained += 1
+            except Exception:
+                logger.warning(
+                    f"[AttentionGate] drain deferred message failed for {chat_id}",
+                    exc_info=True,
+                )
+        if drained:
+            logger.info(f"[AttentionGate] drained {drained} deferred messages for {chat_id}")
 
     async def _extract_image_base64(self, image_component):
         return await extract_image_base64(self, image_component)
@@ -122,6 +156,12 @@ class AttentionGate:
         return build_focus_thread(self, focus_candidate, root_candidate, normalized_events)
 
     async def _get_or_create_session(self, chat_id: str) -> SessionContext:
+        # ponytail: prune stale focus pools every 300s
+        now = time.time()
+        if now - self._last_focus_pool_prune > 300:
+            self._prune_stale_focus_pools()
+            self._last_focus_pool_prune = now
+
         async with self._pool_lock:
             session = self.focus_pools.get(chat_id)
             if session is None:
@@ -133,6 +173,14 @@ class AttentionGate:
                 self.focus_pools[chat_id] = session
             session.last_active_time = time.time()
             return session
+
+    # ponytail: remove focus_pools entries idle > 24h to prevent unbounded growth
+    def _prune_stale_focus_pools(self, max_age: float = 86400.0):
+        now = time.time()
+        stale = [cid for cid, s in self.focus_pools.items() if now - float(s.last_active_time) > max_age]
+        for cid in stale:
+            self.focus_pools.pop(cid, None)
+            self._proactive_injection_lock.pop(cid, None)
 
     def _is_direct_wakeup_event(self, event: AstrMessageEvent, self_id: str) -> bool:
         if not event:
@@ -146,12 +194,13 @@ class AttentionGate:
         try:
             return bool(self.sensors.is_wakeup_signal(event, self_id))
         except Exception:
+            logger.warning("[AttentionGate] is_direct_wakeup_event failed", exc_info=True)
             return False
 
     def _is_at_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
         message = getattr(getattr(event, "message_obj", None), "message", None) or []
         for component in message:
-            component_type = getattr(component, "type", component.__class__.__name__).lower()
+            component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
             if component_type != "at":
                 continue
             target = str(getattr(component, "qq", "") or getattr(component, "target", "") or "")
@@ -163,7 +212,7 @@ class AttentionGate:
         message = getattr(getattr(event, "message_obj", None), "message", None) or []
         bot_names = [str(name).strip() for name in getattr(getattr(self.config, "system1", None), "nicknames", []) or [] if str(name).strip()]
         for component in message:
-            component_type = getattr(component, "type", component.__class__.__name__).lower()
+            component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
             if component_type != "reply":
                 continue
             reply_sender_id = str(getattr(component, "sender_id", "") or "")
@@ -508,11 +557,18 @@ class AttentionGate:
                 if await self.sensors.is_command(msg_str):
                     return False
             except Exception:
-                pass
+                try:
+                    logger.exception(f"[AttentionGate] sensor is_command check failed on msg={msg_str[:100]!r}")
+                except AttributeError:
+                    logger.error(f"[AttentionGate] sensor is_command check failed on msg={msg_str[:100]!r}")
         if hasattr(self.sensors, "should_process_message"):
             try:
                 return bool(await self.sensors.should_process_message(event))
             except Exception:
+                try:
+                    logger.exception("[AttentionGate] sensor should_process_message check failed, defaulting to pass")
+                except AttributeError:
+                    logger.error("[AttentionGate] sensor should_process_message check failed, defaulting to pass")
                 return True
         return True
 
@@ -606,6 +662,17 @@ class AttentionGate:
         event.set_extra("astrmai_trace_id", trace_id)
         turn_context = ensure_turn_context(event)
 
+        _chat_id = getattr(event, "unified_msg_origin", "") or ""
+        if self._proactive_dispatching.get(_chat_id, False) and not event.get_extra("astrmai_is_proactive_event", False):
+            # ponytail: R12 — queue deferred message instead of silently dropping
+            queue = self._deferred_messages.setdefault(_chat_id, [])
+            if len(queue) < 5:
+                queue.append(event)
+            logger.warning(
+                f"[AttentionGate] proactive dispatching in progress; queued message for {_chat_id} (queue={len(queue)})"
+            )
+            return "PROACTIVE_BLOCKED"
+
         message_cache = self._ensure_global_msg_cache()
         message_id = self._build_message_id(event)
         if message_id in message_cache:
@@ -667,6 +734,7 @@ class AttentionGate:
                 maybe_state = self.state_engine.get_state(chat_id)
                 chat_state = await maybe_state if asyncio.iscoroutine(maybe_state) else maybe_state
             except Exception:
+                logger.warning("[AttentionGate] get_state failed", exc_info=True)
                 chat_state = None
 
         throttle_result = self._should_skip_by_throttle(msg_str, extracted_images, chat_state, chat_id, is_private, is_strong_wakeup)
@@ -797,7 +865,9 @@ class AttentionGate:
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
                         if self.sys2_process:
-                            await self.sys2_process(focus_event, focus_thread.all_thread_events())
+                            task = asyncio.create_task(self.sys2_process(focus_event, focus_thread.all_thread_events()))
+                            self._background_tasks.add(task)
+                            task.add_done_callback(lambda t: self._background_tasks.discard(t))
 
             async with session.lock:
                 if session.accumulation_pool:

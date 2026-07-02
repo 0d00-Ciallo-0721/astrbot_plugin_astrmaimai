@@ -1,4 +1,5 @@
 import numpy as np
+import asyncio
 from typing import List, Optional, Any
 from astrbot.api.star import Context
 from astrbot.api import logger
@@ -40,12 +41,12 @@ class EmbeddingClient:
                 if hasattr(provider, method_name):
                     method = getattr(provider, method_name)
                     try:
-                        # 尝试批处理格式
+                        # 尝试批处理格式（15 秒超时防止 embedding provider 卡死）
                         try:
-                            result = await method([text]) 
-                        except:
+                            result = await asyncio.wait_for(method([text]), timeout=15.0)
+                        except (TypeError, ValueError, asyncio.TimeoutError):
                             # 回退单文本格式
-                            result = await method(text)   
+                            result = await asyncio.wait_for(method(text), timeout=15.0)
 
                         # 结果标准化
                         if result:

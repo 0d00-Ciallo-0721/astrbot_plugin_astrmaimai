@@ -1,3 +1,4 @@
+# ponytail: AstrBot v4.26.2+ requires Python 3.12
 tenacity
 aiosqlite
 aiohttp

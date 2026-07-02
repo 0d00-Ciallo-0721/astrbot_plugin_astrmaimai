@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from time import monotonic
 from collections import Counter
 from typing import Any
 
@@ -36,7 +37,7 @@ class HeartflowFeedbackBridge:
         *,
         now: float | None = None,
     ) -> bool:
-        now = time.time() if now is None else now
+        now = monotonic() if now is None else now
         pending = self._pending_pulses(pulses_by_chat, chat_id)
         if len(pending) >= self.MIN_NEW_PULSES:
             return True
@@ -51,6 +52,7 @@ class HeartflowFeedbackBridge:
     def build_feedback(pulses: list[HeartflowPulse]) -> tuple[str, str, list[str]]:
         if not pulses:
             return "", "", []
+        # ponytail: computed for future use — currently informational only.
         avg_interest = sum(float(getattr(item, "urgency", 0.0) or 0.0) for item in pulses) / len(pulses)
         impulses = Counter(str(item.suggested_social_intent or item.pulse_type or "observe") for item in pulses)
         tiers = Counter(str(item.suggested_action_tier or "none") for item in pulses)

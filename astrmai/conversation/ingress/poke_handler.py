@@ -16,6 +16,11 @@ async def handle_poke_if_needed(runtime: PluginRuntimeContext, event) -> Ingress
     poke_component = getattr(Comp, "Poke", None)
     if poke_component and any(isinstance(component, poke_component) for component in message_chain):
         if runtime.sensors and runtime.attention_gate:
-            await runtime.sensors.process_poke_event(event, runtime.context, runtime.attention_gate)
+            try:
+                await runtime.sensors.process_poke_event(event, runtime.context, runtime.attention_gate)
+            except Exception as exc:
+                from astrbot.api import logger
+
+                logger.warning(f"[AstrMai] process_poke_event failed for {getattr(event, 'unified_msg_origin', 'unknown')}: {exc}")
         return IngressDecision.stop("poke_event")
     return IngressDecision.allow()

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from importlib import import_module
 from typing import Any, List, Tuple
 
-Comp = import_module("astrbot.api.message_components")
+from astrbot.api import logger as _astrbot_logger
+
+_comp_cache = None
+
+
+def _get_comp():
+    global _comp_cache
+    if _comp_cache is None:
+        _comp_cache = import_module("astrbot.api.message_components")
+    return _comp_cache
 
 
 def get_preferred_model(models: List[str], default: str = "Unconfigured") -> str:
@@ -15,6 +25,52 @@ def format_model_pool(models: List[str], default: str = "Unconfigured") -> str:
     if not models:
         return default
     return f"{models[0]} (+{len(models) - 1})"
+
+
+def safe_create_task(coro, name: str = "", track_set: set = None):
+    """ponytail: fire-and-forget with error logging, add structured task management when needed.
+    
+    Wraps asyncio.create_task() with automatic exception logging via add_done_callback.
+    Use this for any background task where silent exception swallowing is unacceptable.
+    """
+    owns_loop = False
+    if isinstance(coro, asyncio.Task):
+        task = coro
+        loop = None
+    else:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            owns_loop = True
+            task = loop.create_task(coro, name=name or None)
+        else:
+            task = asyncio.create_task(coro, name=name or None)
+    if track_set is not None:
+        track_set.add(task)
+
+    def _log_task_result(t: asyncio.Task) -> None:
+        if track_set is not None:
+            track_set.discard(t)
+        if t.cancelled():
+            return
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            task_name = (name or t.get_name()) if hasattr(t, 'get_name') else name or "unknown"
+            _astrbot_logger.error(f"[AstrMai] background task '{task_name}' crashed: {exc}", exc_info=exc)
+
+    task.add_done_callback(_log_task_result)
+    if owns_loop:
+        try:
+            loop.run_until_complete(task)
+        except Exception:
+            pass
+        finally:
+            loop.close()
+    return task
 
 
 def extract_result_text(result: Any) -> str:
@@ -57,8 +113,7 @@ def get_event_self_id(event: Any) -> str:
 
 
 def _message_component_class(name: str):
-    current = import_module("astrbot.api.message_components")
-    return getattr(current, name, None) or getattr(Comp, name, None)
+    return getattr(_get_comp(), name, None)
 
 
 def is_direct_call_event(event: Any) -> bool:
@@ -71,7 +126,12 @@ def is_direct_call_event(event: Any) -> bool:
 
     at_component = _message_component_class("At")
     for component in event.message_obj.message:
-        is_at = isinstance(component, at_component) if at_component else component.__class__.__name__ == "At"
+        component_name = component.__class__.__name__.lstrip("_")
+        is_at = (
+            (isinstance(component, at_component) if at_component else False)
+            or component_name == "At"
+            or str(getattr(component, "type", "")).lower() == "at"
+        )
         if is_at and str(getattr(component, "qq", "")) == bot_id:
             return True
     return False

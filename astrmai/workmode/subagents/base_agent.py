@@ -7,6 +7,8 @@ AstrMai SubAgent 抽象基类
 """
 from pydantic import Field
 from pydantic.dataclasses import dataclass
+# ponytail: these are internal AstrBot APIs — may break on major version upgrades.
+# Monitor AstrBot changelog for FunctionTool/CallableTool/ContextWrapper migration.
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
@@ -54,8 +56,14 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
         query = kwargs.get("query", "（无任务描述）")
 
         astr_agent_ctx = context.context
+        if astr_agent_ctx is None:
+            logger.error(f"[Sys3/{self.name}] ContextWrapper.context is None; AstrBot API may have changed")
+            return "[SUBAGENT_ERROR] 系统上下文不可用，请联系管理员检查 AstrBot 版本兼容性。"
         ctx = astr_agent_ctx.context
         event = astr_agent_ctx.event
+        if ctx is None or event is None:
+            logger.error(f"[Sys3/{self.name}] astr_agent_ctx.context={ctx}, .event={event}; AstrBot API may have changed")
+            return "[SUBAGENT_ERROR] 系统上下文不完整，无法执行任务。"
 
         try:
             provider_id = await ctx.get_current_chat_provider_id(event.unified_msg_origin)
@@ -83,6 +91,26 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
         logger.info(f"[Sys3/{self.name}] 接受任务，ReAct 启动: {query[:60]}...")
 
         try:
+            # 优先走 Gateway（享受模型路由/重试/冷却）
+            gateway = getattr(ctx, "gateway", None)
+            if gateway is not None:
+                from ...infrastructure.runtime.lane_manager import LaneKey
+                models = gateway.get_agent_models() if hasattr(gateway, "get_agent_models") else []
+                result = await gateway.tool_chat_in_lane_result(
+                    lane_key=LaneKey(subsystem="sys3", task_family=self.name, scope_id=str(event.unified_msg_origin)),
+                    base_origin=str(event.unified_msg_origin),
+                    event=event,
+                    prompt=query,
+                    system_prompt=system_prompt,
+                    tools=ToolSet(active_tools),
+                    models=models,
+                    max_steps=self.get_max_steps(),
+                    timeout=self.get_timeout(),
+                )
+                result_text = result.text if hasattr(result, "text") else str(result)
+                logger.info(f"[Sys3/{self.name}] 任务完成 (via Gateway)，结果长度: {len(result_text)} 字")
+                return result_text
+            # 回退：裸 AstrBot provider
             llm_resp = await ctx.tool_loop_agent(
                 event=event,
                 chat_provider_id=provider_id,
@@ -93,7 +121,7 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
                 tool_call_timeout=self.get_timeout(),
             )
             result = getattr(llm_resp, "completion_text", None) or "任务已执行完毕，但无文字输出。"
-            logger.info(f"[Sys3/{self.name}] 任务完成，结果长度: {len(result)} 字")
+            logger.info(f"[Sys3/{self.name}] 任务完成 (raw provider)，结果长度: {len(result)} 字")
             return result
         except Exception as exc:
             logger.error(f"[Sys3/{self.name}] 内部 ReAct 循环异常: {exc}", exc_info=True)

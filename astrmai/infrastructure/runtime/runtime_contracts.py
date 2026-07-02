@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+# ponytail: re-exported from defaults for convenience. Contract module depends on config — architectural debt.
 from ...shared.constants.defaults import (
     GatewaySettings,
     InfrastructureSettings,

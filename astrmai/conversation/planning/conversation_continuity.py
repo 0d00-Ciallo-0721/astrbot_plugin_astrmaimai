@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from time import monotonic
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 import re
@@ -121,7 +122,7 @@ class ConversationContinuityStore:
         return True
 
     def recent(self, chat_id: str, *, now: float | None = None) -> list[ConversationTurnRecord]:
-        now = time.time() if now is None else now
+        now = time.time() if now is None else now  # ponytail: M3 — use time.time() to match record()
         state = self._state(chat_id)
         self._expire_state_if_stale(state, now)
         kept = [
@@ -134,7 +135,7 @@ class ConversationContinuityStore:
         return state.turns
 
     def snapshot(self, chat_id: str, *, now: float | None = None) -> dict[str, Any]:
-        now = time.time() if now is None else now
+        now = monotonic() if now is None else now
         state = self._state(chat_id)
         self.recent(chat_id, now=now)
         return {
