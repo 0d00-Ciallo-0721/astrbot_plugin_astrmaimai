@@ -57,19 +57,16 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
 
         astr_agent_ctx = context.context
         if astr_agent_ctx is None:
-            logger.error(f"[Sys3/{self.name}] ContextWrapper.context is None; AstrBot API may have changed")
-            return "[SUBAGENT_ERROR] 系统上下文不可用，请联系管理员检查 AstrBot 版本兼容性。"
+            raise RuntimeError(f"[Sys3/{self.name}] ContextWrapper.context is None; AstrBot API may have changed")
         ctx = astr_agent_ctx.context
         event = astr_agent_ctx.event
         if ctx is None or event is None:
-            logger.error(f"[Sys3/{self.name}] astr_agent_ctx.context={ctx}, .event={event}; AstrBot API may have changed")
-            return "[SUBAGENT_ERROR] 系统上下文不完整，无法执行任务。"
+            raise RuntimeError(f"[Sys3/{self.name}] astr_agent_ctx.context={ctx}, .event={event}; AstrBot API may have changed")
 
         try:
             provider_id = await ctx.get_current_chat_provider_id(event.unified_msg_origin)
         except Exception as exc:
-            logger.error(f"[Sys3/{self.name}] 无法获取 Provider ID: {exc}")
-            return f"[SUBAGENT_ERROR] 无法连接到语言模型服务：{exc}。请告知用户检查 Provider 配置。"
+            raise RuntimeError(f"[Sys3/{self.name}] 无法获取 Provider ID: {exc}") from exc
 
         try:
             tools = await self.get_tool_set(ctx, event)
@@ -124,11 +121,7 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
             logger.info(f"[Sys3/{self.name}] 任务完成 (raw provider)，结果长度: {len(result)} 字")
             return result
         except Exception as exc:
-            logger.error(f"[Sys3/{self.name}] 内部 ReAct 循环异常: {exc}", exc_info=True)
-            return (
-                f"[SUBAGENT_ERROR] 任务执行过程中发生错误：{str(exc)[:150]}\n"
-                "请告知用户稍后重试，并在日志中查看详细错误信息。"
-            )
+            raise RuntimeError(f"[Sys3/{self.name}] 内部 ReAct 循环异常: {exc}") from exc
 
 
 __all__ = ["AstrMaiBaseSubAgent"]

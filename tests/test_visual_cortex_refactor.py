@@ -94,8 +94,8 @@ class VisualCortexRefactorTests(unittest.TestCase):
 
         cortex = self.visual_mod.VisualCortex(_Gateway(), _DB())
         asyncio.run(cortex.process_image_async("pic-1", self._build_png_base64(), scope_id="chat-1"))
-        self.assertIn("pic-1", stored)
-        self.assertEqual(stored["pic-1"].description, "test")
+        self.assertIn("chat-1:pic-1", stored)
+        self.assertEqual(stored["chat-1:pic-1"].description, "test")
 
 
 if __name__ == "__main__":

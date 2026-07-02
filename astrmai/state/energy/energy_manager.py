@@ -41,9 +41,9 @@ class EnergyManager:
         if current_energy <= min_threshold:
             drop_prob = 1.0
         else:
-            drop_prob = max(0.0, (0.5 - current_energy) / max(0.001, (0.5 - min_threshold)))
+            drop_prob = min(1.0, max(0.0, (0.5 - current_energy) / max(0.001, (0.5 - min_threshold))))
         if random.random() < drop_prob:
-            recover_amount = float(msg_count) * self.get_reply_cost()
+            recover_amount = max(self.get_reply_cost(), float(msg_count) * self.get_reply_cost())
             state.energy = min(1.0, current_energy + recover_amount)
             state.is_dirty = True
             return True

@@ -59,6 +59,18 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
         """Return raw if not None, else default.  Avoids 0-or-default trap."""
         return default if raw is None else raw
 
+    def _min_int(raw: Any, default: int, minimum: int) -> int:
+        try:
+            return max(minimum, int(_num(raw, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _min_float(raw: Any, default: float, minimum: float) -> float:
+        try:
+            return max(minimum, float(_num(raw, default)))
+        except (TypeError, ValueError):
+            return default
+
     provider = getattr(config, "provider", None)
     infra = getattr(config, "infra", None)
     global_settings = getattr(config, "global_settings", None)
@@ -70,10 +82,10 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
 
     return InfrastructureSettings(
         gateway=GatewaySettings(
-            max_concurrent_llm_calls=int(_num(getattr(infra, "max_concurrent_llm_calls", None), 3)),
+            max_concurrent_llm_calls=_min_int(getattr(infra, "max_concurrent_llm_calls", None), 3, 1),
             llm_retries=int(_num(getattr(infra, "llm_retries", None), 2)),
             backoff_factor=float(_num(getattr(infra, "backoff_factor", None), 1.5)),
-            api_timeout=float(_num(getattr(infra, "api_timeout", None), 15.0)),
+            api_timeout=_min_float(getattr(infra, "api_timeout", None), 15.0, 1.0),
             rate_limit_model_cooldown_sec=int(_num(getattr(infra, "rate_limit_model_cooldown_sec", None), 120)),
             quota_model_cooldown_sec=int(_num(getattr(infra, "quota_model_cooldown_sec", None), 1800)),
             debug_mode=bool(getattr(global_settings, "debug_mode", False)),

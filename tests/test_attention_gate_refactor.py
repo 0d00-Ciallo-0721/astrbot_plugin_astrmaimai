@@ -550,6 +550,45 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertFalse(session.is_evaluating)
         self.assertEqual(session.accumulation_pool, [])
 
+    def test_worker_failure_recovery_only_resets_failed_session(self):
+        async def _run():
+            failed_session = self.gate_mod.SessionContext()
+            failed_session.is_evaluating = True
+            failed_session.accumulation_pool = [_FakeEvent("user-1", "Alice", "retry me")]
+            healthy_session = self.gate_mod.SessionContext()
+            healthy_session.is_evaluating = True
+            self.gate.focus_pools["failed-chat"] = failed_session
+            self.gate.focus_pools["healthy-chat"] = healthy_session
+
+            async def broken_worker():
+                raise RuntimeError("boom")
+
+            task = asyncio.create_task(broken_worker())
+            task._worker_context = SimpleNamespace(
+                chat_id="failed-chat",
+                session=failed_session,
+                self_id="bot-1",
+            )
+            self.gate._session_tasks.add(task)
+            task.add_done_callback(self.gate._handle_session_worker_result)
+            await asyncio.sleep(0.05)
+
+            pending = list(getattr(self.gate, "_background_tasks", set()) or [])
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            spawned = list(getattr(self.gate, "_session_tasks", set()) or [])
+            for spawned_task in spawned:
+                spawned_task.cancel()
+            if spawned:
+                await asyncio.gather(*spawned, return_exceptions=True)
+            return failed_session, healthy_session, spawned
+
+        failed_session, healthy_session, spawned = asyncio.run(_run())
+
+        self.assertFalse(failed_session.is_evaluating)
+        self.assertTrue(healthy_session.is_evaluating)
+        self.assertTrue(spawned)
+
     def test_background_task_semaphore_limits_parallelism(self):
         max_running = 0
         running = 0

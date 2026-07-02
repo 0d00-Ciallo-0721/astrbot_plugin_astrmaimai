@@ -35,7 +35,7 @@ class GlobalModelGateway(
         self.lane_manager: Optional[LaneManager] = None
         self._model_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
         self._last_agent_model_selection: dict[str, Any] = {}
-        self._global_semaphore = asyncio.Semaphore(self.settings.max_concurrent_llm_calls)
+        self._global_semaphore = asyncio.Semaphore(max(1, int(self.settings.max_concurrent_llm_calls)))
         logger.info(
             f"[Gateway] global concurrency limiter ready, max={self.settings.max_concurrent_llm_calls}"
         )

@@ -57,6 +57,17 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
         self.assertTrue(settings.features.dream_visible)
         self.assertTrue(settings.features.meme_enabled)
 
+    def test_build_infrastructure_settings_clamps_zero_gateway_limits(self):
+        defaults_mod = importlib.import_module(
+            "astrmai.shared.constants.defaults"
+        )
+        settings = defaults_mod.build_infrastructure_settings(
+            SimpleNamespace(infra=SimpleNamespace(max_concurrent_llm_calls=0, api_timeout=0.0))
+        )
+
+        self.assertEqual(settings.gateway.max_concurrent_llm_calls, 1)
+        self.assertEqual(settings.gateway.api_timeout, 1.0)
+
     def test_gateway_and_lane_manager_can_use_local_settings_views(self):
         defaults_mod = importlib.import_module(
             "astrmai.shared.constants.defaults"

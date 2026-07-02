@@ -188,8 +188,8 @@ class MemoryConfig(BaseModel):
 class InfraConfig(BaseModel):
     llm_retries: int = Field(default=2, ge=0)
     backoff_factor: float = Field(default=1.5, ge=0.0)
-    api_timeout: float = Field(default=15.0, ge=0.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
-    max_concurrent_llm_calls: int = Field(default=3, ge=0, description="全局 LLM 并发请求上限，防止后台任务雪崩导致 429")
+    api_timeout: float = Field(default=15.0, ge=1.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
+    max_concurrent_llm_calls: int = Field(default=3, ge=1, description="全局 LLM 并发请求上限，防止后台任务雪崩导致 429")
     rate_limit_model_cooldown_sec: int = Field(default=120, ge=0, description="模型触发 429/rate limit 后的运行期冷却时间（秒）")
     quota_model_cooldown_sec: int = Field(default=1800, ge=0, description="模型触发 403/配额/权限失败后的运行期冷却时间（秒）")
 

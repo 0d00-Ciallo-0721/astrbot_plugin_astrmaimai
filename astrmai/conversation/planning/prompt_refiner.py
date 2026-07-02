@@ -941,10 +941,9 @@ class PromptRefiner:
             sections.append(f"---旁边在聊的---\n{await self._resolve_visual_memory(background_window_text)}")
 
         memory_parts = []
-        if effective_proactive_recall:
-            memory_parts.append(await self._resolve_visual_memory(effective_proactive_recall))
-        if injection:
-            memory_parts.append(await self._resolve_visual_memory(injection))
+        sanitized_memory = prompt_envelope.memory_block  # use sanitized wrapper
+        if sanitized_memory:
+            memory_parts.append(await self._resolve_visual_memory(sanitized_memory))
         if memory_parts:
             sections.append(
                 "---记忆闪回（仅供内心参考，不要出现在回复正文中）---\n"

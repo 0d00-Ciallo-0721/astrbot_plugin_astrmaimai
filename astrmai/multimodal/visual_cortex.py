@@ -30,8 +30,13 @@ class VisualCortex:
         if self._worker_task:
             self._worker_task.cancel()
 
-    def submit_task(self, picid: str, base64_data: str):
-        self.queue.put_nowait((picid, base64_data))
+    def submit_task(self, picid: str, base64_data: str) -> bool:
+        try:
+            self.queue.put_nowait((picid, base64_data))
+            return True
+        except asyncio.QueueFull:
+            logger.warning(f"[AstrMai-VisualCortex] queue full, dropped task for {picid}")
+            return False
 
     def describe_status(self) -> dict:
         return {
@@ -57,16 +62,16 @@ class VisualCortex:
     def _build_lane_key(self, scope_id: str) -> LaneKey:
         return LaneKey(subsystem="sys1", task_family="vision", scope_id=scope_id or "global")
 
-    def _get_cached_memory(self, picid: str):
+    def _get_cached_memory(self, scoped_picid: str):
         with self.db_service.get_session() as session:
-            return session.get(VisualMemory, picid)
+            return session.get(VisualMemory, scoped_picid)
 
-    def _upsert_visual_memory(self, picid: str, img_type: str, description: str, tags_json_str: str) -> None:
+    def _upsert_visual_memory(self, scoped_picid: str, img_type: str, description: str, tags_json_str: str) -> None:
         with self.db_service.get_session() as session:
-            memory = session.get(VisualMemory, picid)
+            memory = session.get(VisualMemory, scoped_picid)
             if not memory:
                 memory = VisualMemory(
-                    picid=picid,
+                    picid=scoped_picid,
                     type=img_type,
                     description=description,
                     emotion_tags=tags_json_str,
@@ -82,8 +87,9 @@ class VisualCortex:
 
     async def process_image_async(self, picid: str, base64_data: str, scope_id: str = "global"):
         prepared = None
+        scoped_picid = f"{scope_id}:{picid}"
         try:
-            cached = await asyncio.to_thread(self._get_cached_memory, picid)
+            cached = await asyncio.to_thread(self._get_cached_memory, scoped_picid)
             if cached:
                 logger.info(f"[AstrMai-VisualCortex] cache hit for {picid}, skip duplicate analysis.")
                 return
@@ -113,7 +119,7 @@ class VisualCortex:
 
             await asyncio.to_thread(
                 self._upsert_visual_memory,
-                picid,
+                scoped_picid,
                 img_type,
                 description,
                 tags_json_str,

@@ -24,6 +24,7 @@ def apply_natural_decay(state: Any, config: Any) -> None:
         minutes_silent > recovery_min
         and state.energy < 0.8
         and recovery_window > 0.0
+        and recovery_anchor > 0.0
         and (now - recovery_anchor) >= recovery_window
     ):
         state.energy = min(0.8, state.energy + 0.1)

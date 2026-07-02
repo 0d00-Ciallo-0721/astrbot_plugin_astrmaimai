@@ -785,8 +785,8 @@ class HostMockValidationTests(unittest.TestCase):
             static_agents = router.get_static_agent_names()
             route_paths = {getattr(route, "path", "") for route in app.router.routes}
 
-            self.assertIn("pic-1", stored)
-            self.assertEqual(stored["pic-1"].description, "mock vision")
+            self.assertIn("chat-1:pic-1", stored)
+            self.assertEqual(stored["chat-1:pic-1"].description, "mock vision")
             self.assertTrue(running)
             self.assertIn("dream_scheduler", proactive_status)
             self.assertIn("transfer_to_cron", static_agents)

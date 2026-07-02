@@ -97,7 +97,8 @@ class StateSubservicesMigratedTests(unittest.TestCase):
         state = SimpleNamespace(
             energy=0.4,
             mood=0.2,
-            last_reply_time=0.0,
+            last_reply_time=1200.0,  # 20 min ago, ensures valid recovery_anchor
+            last_energy_recovery_time=0.0,
             last_passive_decay_time=0.0,
             is_dirty=False,
         )

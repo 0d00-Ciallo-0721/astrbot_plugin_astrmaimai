@@ -4,6 +4,7 @@ import asyncio
 import collections
 import re
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Set
 
 from astrbot.api import logger
@@ -344,6 +345,7 @@ class AttentionGate:
                 is_strong_wakeup=is_strong_wakeup,
             )
         )
+        task._worker_context = SimpleNamespace(chat_id=chat_id, session=session, self_id=self_id)
         self._session_tasks.add(task)
         task.add_done_callback(self._handle_session_worker_result)
         return task
@@ -356,6 +358,23 @@ class AttentionGate:
             task.result()
         except Exception as exc:
             logger.error(f"[Attention Worker Error] {exc}", exc_info=exc)
+            worker_context = getattr(task, "_worker_context", None)
+            if worker_context is not None:
+                recovery = asyncio.create_task(self._recover_failed_session_worker(worker_context))
+                self._background_tasks.add(recovery)
+                recovery.add_done_callback(self._handle_background_task_result)
+
+    async def _recover_failed_session_worker(self, worker_context):
+        chat_id = str(getattr(worker_context, "chat_id", "") or "")
+        session = getattr(worker_context, "session", None)
+        self_id = str(getattr(worker_context, "self_id", "") or "")
+        if not chat_id or session is None:
+            return
+        async with session.lock:
+            has_pending = bool(session.accumulation_pool)
+            session.is_evaluating = False
+        if has_pending:
+            self._spawn_session_worker(chat_id, session, self_id)
 
     def _schedule_compaction_task(self, chat_id: str, focus_context) -> asyncio.Task | None:
         if self.context_compaction is None:

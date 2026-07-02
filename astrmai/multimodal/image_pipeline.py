@@ -62,7 +62,7 @@ class ImagePipeline:
     @staticmethod
     def transform_gif(gif_base64: str, similarity_threshold: float = 1000.0, max_frames: int = 15) -> Optional[str]:
         try:
-            gif_data = base64.b64decode(gif_base64.encode("ascii", errors="ignore").decode("ascii"))
+            gif_data = base64.b64decode(gif_base64)
             gif = Image.open(io.BytesIO(gif_data))
 
             all_frames = []

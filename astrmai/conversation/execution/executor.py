@@ -685,12 +685,15 @@ class ConcurrentExecutor:
                     return None
                 if "[TERMINAL_YIELD]:" in reply_text:
                     idx = reply_text.find("[TERMINAL_YIELD]:")
-                    terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:") :].strip()
+                    terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:"):].strip()
+                    safe_content, failure_kind = validate_visible_output_text(terminal_content)
+                    if failure_kind:
+                        raise ValueError(failure_kind)
                     return await self._finalize_reply(
                         event,
                         chat_id,
                         runtime["bot_id"],
-                        terminal_content,
+                        safe_content,
                         trace_mode="tool_terminal_yield",
                         model=provider_id,
                     )

@@ -71,6 +71,7 @@ class RelationshipVector:
             "negative_streak": self.negative_streak,
             "first_seen": self.first_seen,
             "last_interaction": self.last_interaction,
+            "last_decay_time": self.last_decay_time,
         }
 
     @classmethod
