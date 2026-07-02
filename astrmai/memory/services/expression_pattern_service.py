@@ -148,7 +148,7 @@ class ExpressionPatternService:
             review_reason=str(metadata.get("review_reason") or ""),
             review_suggestion=str(metadata.get("review_suggestion") or ""),
             last_review_time=float(metadata.get("last_review_time") or 0.0),
-            weight=float(metadata.get("weight") or 1.0),
+            weight=ExpressionPatternService._safe_float(metadata.get("weight"), 1.0),
             last_active_time=float(metadata.get("last_active_time") or candidate.last_access_time or candidate.updated_at or candidate.created_at or 0.0),
             create_time=float(candidate.created_at or 0.0),
             status=str(candidate.status or "review_pending"),
@@ -281,7 +281,7 @@ class ExpressionPatternService:
         if rejected is not None and rejected:
             metadata["review_status"] = "rejected"
         metadata["last_review_time"] = time.time()
-        metadata["weight"] = max(0.0, min(3.0, float(metadata.get("weight") or current.weight or 1.0) + float(weight_delta or 0.0)))
+        metadata["weight"] = max(0.0, min(3.0, self._safe_float(metadata.get("weight"), self._safe_float(current.weight, 1.0)) + float(weight_delta or 0.0)))
         next_review_status = str(metadata.get("review_status") or current.review_status or "pending").strip().lower()
         status = self._canonical_status(next_review_status)
         visibility = self._visibility_for_status(status)
@@ -303,12 +303,22 @@ class ExpressionPatternService:
         if not current:
             return None
         metadata = dict(current.metadata or {})
-        metadata["weight"] = max(0.0, min(3.0, float(metadata.get("weight") or current.weight or 1.0) + float(delta or 0.0)))
+        metadata["weight"] = max(0.0, min(3.0, self._safe_float(metadata.get("weight"), self._safe_float(current.weight, 1.0)) + float(delta or 0.0)))
         metadata["last_active_time"] = time.time()
         changed = await self.store.update_memory(str(pattern_id), metadata=metadata)
         if not changed:
             return None
         return await self.get_pattern(pattern_id)
+
+    @staticmethod
+    def _safe_float(value, default: float) -> float:
+        """Parse float without falsy-or-default trap (0.0 is valid)."""
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
     async def write_pattern(self, group_id: str, payload: dict[str, Any], *, source: str = "learning_expression_pattern") -> str:
         expression = str(payload.get("expression") or "").strip()
@@ -325,7 +335,14 @@ class ExpressionPatternService:
         review_status = self._merge_review_status(existing_metadata.get("review_status", ""), incoming_review_status)
         merged_samples = self._sample_list([*self._sample_list(existing_metadata.get("content_samples", [])), *incoming_samples])
         merged_count = int(existing_metadata.get("count") or 0) + max(int(payload.get("count") or 1), 1)
-        merged_weight = float(existing_metadata.get("weight") or 0.0) + max(float(payload.get("weight") or 1.0), 0.1)
+        merged_weight = max(
+            0.0,
+            min(
+                3.0,
+                self._safe_float(existing_metadata.get("weight"), 0.0)
+                + max(self._safe_float(payload.get("weight"), 1.0), 0.1),
+            ),
+        )
         summary = str(payload.get("summary") or expression).strip()
         confidence = float(payload.get("confidence") or payload.get("activation_score") or existing_metadata.get("confidence") or 0.6)
         importance = max(0.2, min(1.0, float(payload.get("activation_score") or confidence or 0.6)))

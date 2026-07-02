@@ -130,6 +130,10 @@ class PreFilters:
             file_path = getattr(image_component, "file", None) or getattr(image_component, "path", None)
             if file_path:
                 return str(file_path)
+            # non-HTTP URLs (WeChat wxfile://, QQ local references, etc.) may be extractable
+            image_url = getattr(image_component, "url", None) or getattr(image_component, "image_url", None) or getattr(image_component, "src", None)
+            if image_url and not str(image_url).startswith(("http://", "https://")):
+                return str(image_url)
             file_to_base64 = getattr(image_component, "file_to_base64", None)
             if callable(file_to_base64):
                 try:

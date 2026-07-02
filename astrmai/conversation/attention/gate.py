@@ -376,6 +376,14 @@ class AttentionGate:
         if has_pending:
             self._spawn_session_worker(chat_id, session, self_id)
 
+    def _handle_background_task_result(self, task: asyncio.Task):
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"[AttentionGate] background task failed: {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+
     def _schedule_compaction_task(self, chat_id: str, focus_context) -> asyncio.Task | None:
         if self.context_compaction is None:
             return None
@@ -743,9 +751,12 @@ class AttentionGate:
         if is_private and self.private_chat_manager and not is_strong_wakeup:
             try:
                 await self.private_chat_manager.signal_new_message(sender_id, msg_str, chat_id=chat_id)
+                return "PRIVATE_WAIT"
             except Exception as exc:
-                logger.debug(f"[AttentionGate] private chat wait signal degraded: {exc}")
-            return "PRIVATE_WAIT"
+                logger.warning(
+                    f"[AttentionGate] private chat wait signal failed for {chat_id}, "
+                    f"falling back to normal attention: {exc}"
+                )
 
         chat_state = None
         if hasattr(self.state_engine, "get_state"):
@@ -886,7 +897,7 @@ class AttentionGate:
                         if self.sys2_process:
                             task = asyncio.create_task(self.sys2_process(focus_event, focus_thread.all_thread_events()))
                             self._background_tasks.add(task)
-                            task.add_done_callback(lambda t: self._background_tasks.discard(t))
+                            task.add_done_callback(self._handle_background_task_result)
 
             async with session.lock:
                 if session.accumulation_pool:

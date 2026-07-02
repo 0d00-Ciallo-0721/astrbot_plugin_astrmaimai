@@ -44,7 +44,12 @@ class GlobalModelGateway(
         """ponytail: hot-reload config into gateway"""
         self.config = config
         from ...shared.constants.defaults import build_infrastructure_settings
+        old_limit = max(1, int(getattr(self.settings, "max_concurrent_llm_calls", 1) or 1))
         self.settings = build_infrastructure_settings(config).gateway
+        new_limit = max(1, int(self.settings.max_concurrent_llm_calls))
+        if new_limit != old_limit:
+            self._global_semaphore = asyncio.Semaphore(new_limit)
+            logger.info(f"[Gateway] concurrency limiter rebuilt, max={new_limit}")
 
     def get_models_for_task(self, pool_name: str, models: List[str]) -> List[str]:
         return self.router.get_ranked_models(pool_name, models)

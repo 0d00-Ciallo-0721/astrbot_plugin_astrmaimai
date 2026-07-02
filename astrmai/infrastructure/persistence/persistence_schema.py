@@ -180,7 +180,20 @@ class PersistenceSchemaMixin:
         # ponytail: clear event before fire-and-forget, set after init completes
         self._init_ready.clear()
         self._init_task = safe_create_task(self._init_db())
-        self._init_task.add_done_callback(lambda _: self._init_ready.set())
+        self._init_task.add_done_callback(self._on_init_db_done)
+
+    def _on_init_db_done(self, task):
+        if task.cancelled():
+            self._init_error = asyncio.CancelledError()
+            logger.warning("[AstrMai-DB] async init task cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._init_error = exc
+            logger.error(f"[AstrMai-DB] async init failed: {exc}", exc_info=(type(exc), exc, exc.__traceback__))
+            return
+        self._init_error = None
+        self._init_ready.set()
 
     def _init_db_sync(self):
         try:
@@ -417,3 +430,4 @@ class PersistenceSchemaMixin:
             return
         except Exception as e:
             logger.error(f"[AstrMai-Infra] init db failed: {e}")
+            raise

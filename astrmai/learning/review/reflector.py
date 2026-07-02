@@ -202,7 +202,7 @@ class ExpressionReflector:
 
             dup_count = 0
             for p in remaining:
-                if id(p) in to_remove_ids:
+                if getattr(p, "id", None) in to_remove_ids:
                     changed = await self._reject_pattern(getattr(p, "id", ""), weight_delta=-0.2)
                     if changed:
                         dup_count += 1

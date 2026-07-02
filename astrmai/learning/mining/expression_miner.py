@@ -32,6 +32,9 @@ class ExpressionMiner:
         for message in messages or []:
             if message is None:
                 continue
+            sender = str(getattr(message, "sender_name", "") or "")
+            if sender == "SELF":
+                continue
             content = str(getattr(message, "content", "") or "").strip()
             if not content or content.startswith("[") or len(content) > 100:
                 continue

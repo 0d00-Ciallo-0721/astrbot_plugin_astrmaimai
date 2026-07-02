@@ -220,12 +220,18 @@ class ProactiveTask:
         """ponytail: re-check _is_running after 5s delay to avoid reanimating stopped scheduler"""
         if self._is_running:
             self._is_running = False  # reset so start() will actually restart
-            asyncio.ensure_future(self.start())
+            from ..shared.helpers.plugin_helpers import safe_create_task
+            safe_create_task(self.start())
 
     async def stop(self):
         self._is_running = False
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
 
     def configure(
         self,
