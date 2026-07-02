@@ -162,6 +162,7 @@ class MemoryEngine:
     async def initialize(self):
         await self.v2_store.initialize()
         self.index_projector = MemoryIndexProjector(self)
+        self.v2_store.index_projector = self.index_projector
         self.write_service = MemoryWriteService(self.v2_store, self.index_projector)
         self.retrieval_service = MemoryRetrievalService(self.v2_store, engine=self)
         self.expression_pattern_service = ExpressionPatternService(self.v2_store, self.write_service)

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import types
@@ -90,13 +91,56 @@ class CronGuardRefactorTests(unittest.TestCase):
             async def list_jobs(self):
                 return []
 
-            async def add_job(self, job):
-                revived.append(("add", job.id))
+            async def add_active_job(self, name, cron_expression, payload, run_once, run_at):
+                revived.append(("add", name))
 
         guard = self.guard_mod.CronHeartbeatGuard(_DB(), SimpleNamespace(cron_manager=_CronMgr()))
         result = asyncio.run(guard.reload_all_lost_jobs())
         self.assertEqual(result, 1)
-        self.assertIn(("add", "job-1"), revived)
+        self.assertIn(("add", "n"), revived)
+
+    def test_guard_replaces_snapshot_when_framework_returns_new_job_id(self):
+        saved = []
+        deactivated = []
+
+        class _DB:
+            async def save_cron_snapshot(self, snapshot):
+                saved.append(snapshot)
+
+            async def deactivate_cron_snapshot(self, job_id):
+                deactivated.append(job_id)
+
+        class _CronMgr:
+            async def add_active_job(self, name, cron_expression, payload, run_once, run_at):
+                self.added = {
+                    "name": name,
+                    "cron_expression": cron_expression,
+                    "payload": payload,
+                    "run_once": run_once,
+                    "run_at": run_at,
+                }
+                return SimpleNamespace(id="new-job")
+
+        cron_mgr = _CronMgr()
+        guard = self.guard_mod.CronHeartbeatGuard(_DB(), SimpleNamespace(cron_manager=cron_mgr))
+        snap = SimpleNamespace(
+            job_id="old-job",
+            name="n",
+            cron_expression=None,
+            run_at=None,
+            run_once=True,
+            target_origin="umo",
+            payload=json.dumps({"session": "umo", "run_at": "2026-07-03T08:30:00+08:00"}, ensure_ascii=False),
+        )
+
+        result = asyncio.run(guard._revive_job(cron_mgr, snap))
+
+        self.assertTrue(result)
+        self.assertEqual(cron_mgr.added["payload"]["session"], "umo")
+        self.assertEqual(cron_mgr.added["run_at"].isoformat(), "2026-07-03T08:30:00+08:00")
+        self.assertEqual(deactivated, ["old-job"])
+        self.assertEqual(saved[0].job_id, "new-job")
+        self.assertEqual(json.loads(saved[0].payload)["session"], "umo")
 
 
 if __name__ == "__main__":

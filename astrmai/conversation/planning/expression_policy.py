@@ -357,6 +357,24 @@ class ExpressionSelector:
         compact_context = re.sub(r"\s+", "", str(context_text or ""))
         return expression in compact_context
 
+    @staticmethod
+    def _situation_keyword_match(situation: str, context: str) -> bool:
+        """Lightweight match: check if situation CJK bigrams overlap with context.
+        Returns True if there's at least partial overlap, or if situation is empty/universal."""
+        if not situation or not str(situation).strip():
+            return True
+        sit = str(situation).strip()
+        ctx = str(context or "").strip()
+        if not ctx:
+            return True
+        sit_chars = re.sub(r"[^\u4e00-\u9fff]", "", sit)
+        ctx_chars = re.sub(r"[^\u4e00-\u9fff]", "", ctx)
+        if not sit_chars:
+            return True
+        sit_bigrams = {sit_chars[i:i+2] for i in range(len(sit_chars)-1)}
+        ctx_bigrams = {ctx_chars[i:i+2] for i in range(len(ctx_chars)-1)}
+        return bool(sit_bigrams & ctx_bigrams)
+
     def _apply_pattern_cooldown(
         self,
         scope_key: str,
@@ -448,8 +466,12 @@ class ExpressionSelector:
         )
         if not patterns:
             return '', []
+        # Lightweight situation match: keep patterns whose situation has CJK bigram overlap with context
+        matched = [p for p in patterns if self._situation_keyword_match(getattr(p, 'situation', ''), context_text)]
+        if not matched:
+            matched = list(patterns)  # fallback: no match → use all patterns
         scope_key = self._scope_key(chat_id, shared_scope)
-        selected = self._apply_pattern_cooldown(scope_key, patterns, context_text, self.FAST_SELECT_LIMIT)
+        selected = self._apply_pattern_cooldown(scope_key, matched, context_text, self.FAST_SELECT_LIMIT)
         return self._finalize_habits(scope_key, selected)
 
     async def _deep_select(

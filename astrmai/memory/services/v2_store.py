@@ -56,6 +56,7 @@ class MemoryV2Store:
         self._initialized = False
         self._migrated_from_legacy = False
         self.last_physical_delete_ids: list[str] = []
+        self.index_projector = None
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_locks_guard = asyncio.Lock()
 
@@ -813,6 +814,11 @@ class MemoryV2Store:
             ]
             for memory_id in restore_ids:
                 await self.restore(memory_id, reason="stale_access")
+                if getattr(self, "index_projector", None):
+                    try:
+                        await self.index_projector.project(memory_id)
+                    except Exception:
+                        pass
             for item in selected:
                 if item.id in restore_ids:
                     item.status = ACTIVE_STATUS
@@ -1369,10 +1375,12 @@ class MemoryV2Store:
                 cursor = await db.execute(
                     """
                     UPDATE canonical_memories
-                    SET content = ?, summary = ?, update_time = ?, status = 'active'
+                    SET content = ?, summary = ?, update_time = ?, status = 'active',
+                        decay_score = MAX(COALESCE(decay_score, 1.0), 0.5),
+                        last_access_time = ?
                     WHERE id = ? AND status IN ('active', 'stale')
                     """,
-                    (content, summary or str(content or "")[:240], now, memory_id),
+                    (content, summary or str(content or "")[:240], now, now, memory_id),
                 )
                 await self._sync_fts(db, memory_id)
                 await db.commit()

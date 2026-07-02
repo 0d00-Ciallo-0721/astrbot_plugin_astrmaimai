@@ -274,11 +274,20 @@ class ExpressionPatternService:
             metadata["review_reason"] = str(review_reason or "")
         if review_suggestion is not None:
             metadata["review_suggestion"] = str(review_suggestion or "")
-        if review_status is not None:
-            metadata["review_status"] = str(review_status or "").strip().lower()
-        if checked is not None and checked:
+        explicit_review_status = (
+            str(review_status or "").strip().lower()
+            if review_status is not None
+            else None
+        )
+        checked_true = checked is not None and checked
+        rejected_true = rejected is not None and rejected
+        if explicit_review_status is not None:
+            metadata["review_status"] = explicit_review_status
+        elif checked_true and rejected_true:
+            metadata["review_status"] = str(metadata.get("review_status") or "pending").strip().lower()
+        elif checked_true:
             metadata["review_status"] = "approved"
-        if rejected is not None and rejected:
+        elif rejected_true:
             metadata["review_status"] = "rejected"
         metadata["last_review_time"] = time.time()
         metadata["weight"] = max(0.0, min(3.0, self._safe_float(metadata.get("weight"), self._safe_float(current.weight, 1.0)) + float(weight_delta or 0.0)))

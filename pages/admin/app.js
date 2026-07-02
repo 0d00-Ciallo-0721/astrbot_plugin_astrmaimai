@@ -45,6 +45,7 @@ const state = {
   schedulerChatLoop: null,
   schedulerChatId: "",
   schedulerPollTimer: null,
+  lastApiErrorToastAt: 0,
   selectedReviews: new Set(),
   activeUserId: "",
   cache: {
@@ -189,6 +190,19 @@ function unwrapResponse(result) {
     throw new Error(apiErrorMessage(result));
   }
   return result;
+}
+
+/** Safe API fetch wrapper — preserves last successful data on error */
+function safeFetch(fetchFn, fallback) {
+  return fetchFn().catch((err) => {
+    console.warn("[AstrMai-Admin] API fetch degraded:", err.message || err);
+    const now = Date.now();
+    if (now - Number(state.lastApiErrorToastAt || 0) > 3000) {
+      state.lastApiErrorToastAt = now;
+      toast(`数据加载失败：${err.message || err}`);
+    }
+    return fallback;
+  });
 }
 
 async function readyBridge(bridge) {
@@ -390,8 +404,13 @@ function openFormModal(title, fields, initial, onSubmit, submitText = "保存") 
     const data = {};
     fields.forEach((field) => {
       const node = form.elements[field.name];
-      if (field.cast === "float") data[field.name] = Number.parseFloat(node.value || "0");
-      else if (field.cast === "int") data[field.name] = Number.parseInt(node.value || "0", 10);
+      if (field.cast === "float") {
+        const v = Number.parseFloat(node.value || "0");
+        data[field.name] = Number.isNaN(v) ? 0 : v;
+      } else if (field.cast === "int") {
+        const v = Number.parseInt(node.value || "0", 10);
+        data[field.name] = Number.isNaN(v) ? 0 : v;
+      }
       else data[field.name] = node.value;
     });
     await onSubmit(data);
@@ -453,11 +472,11 @@ function dashboardShell(body) {
 
 async function renderDashboardOverview() {
   const [snapshot, health, capabilities, models, observabilityOverview] = await Promise.all([
-    api.get("/dashboard").catch(() => ({})),
-    api.get("/runtime/health").catch(() => ({})),
-    api.get("/runtime/capabilities").catch(() => ({})),
-    api.get("/runtime/models").catch(() => ({})),
-    api.get("/cognition/observability/overview").catch(() => ({})),
+    safeFetch(() => api.get("/dashboard"), {}),
+    safeFetch(() => api.get("/runtime/health"), {}),
+    safeFetch(() => api.get("/runtime/capabilities"), {}),
+    safeFetch(() => api.get("/runtime/models"), {}),
+    safeFetch(() => api.get("/cognition/observability/overview"), {}),
   ]);
   state.observabilityOverview = observabilityOverview;
   const healthData = health.data || {};
@@ -498,12 +517,12 @@ async function renderDashboardOverview() {
 
 async function renderDashboardHeartflow() {
   const [status, chats, impulses, timeline, digests, intents] = await Promise.all([
-    api.get("/heartflow/status").catch(() => ({})),
-    api.get("/heartflow/chats").catch(() => ({ items: [] })),
-    api.get("/heartflow/impulses?limit=50").catch(() => ({ items: [] })),
-    api.get("/heartflow/timeline?limit=80").catch(() => ({ items: [] })),
-    api.get("/heartflow/topic-digests?limit=50").catch(() => ({ items: [] })),
-    api.get("/proactive/intents?limit=50").catch(() => ({ items: [] })),
+    safeFetch(() => api.get("/heartflow/status"), {}),
+    safeFetch(() => api.get("/heartflow/chats"), { items: [] }),
+    safeFetch(() => api.get("/heartflow/impulses?limit=50"), { items: [] }),
+    safeFetch(() => api.get("/heartflow/timeline?limit=80"), { items: [] }),
+    safeFetch(() => api.get("/heartflow/topic-digests?limit=50"), { items: [] }),
+    safeFetch(() => api.get("/proactive/intents?limit=50"), { items: [] }),
   ]);
   const impulseRows = asItems(impulses).map((item) => `
     <tr>
@@ -615,7 +634,7 @@ async function loadSchedulerChatLoop(chatId = null) {
     return;
   }
   state.schedulerChatId = targetChat;
-  state.schedulerChatLoop = await api.get(`/cognition/scheduler/chats/${segment(targetChat)}`).catch(() => null);
+  state.schedulerChatLoop = await safeFetch(() => api.get(`/cognition/scheduler/chats/${segment(targetChat)}`), null);
 }
 
 function shouldPollScheduler() {
@@ -637,7 +656,11 @@ function startSchedulerPolling() {
       stopSchedulerPolling();
       return;
     }
-    renderDashboardCognition().catch(() => {});
+    if (state._pollingInFlight) return;  // guard: skip if previous poll still running
+    state._pollingInFlight = true;
+    renderDashboardCognition()
+      .catch(() => {})
+      .finally(() => { state._pollingInFlight = false; });
   }, SCHEDULER_POLL_INTERVAL_MS);
 }
 
@@ -699,12 +722,12 @@ function renderSchedulerDiagnosticsSection() {
 
 async function renderDashboardCognition() {
   const [decisions, turns, schedulerStatus, schedulerDueSelection, observabilityOverview, unifiedTimeline] = await Promise.all([
-    api.get("/cognition/recent-decisions?limit=50").catch(() => ({ items: [] })),
-    api.get("/cognition/recent-turns?limit=50").catch(() => ({ items: [] })),
-    api.get("/cognition/scheduler/status").catch(() => null),
-    api.get("/cognition/scheduler/due-selection").catch(() => null),
-    api.get("/cognition/observability/overview").catch(() => ({})),
-    api.get(observabilityTimelinePath()).catch(() => ({ items: [] })),
+    safeFetch(() => api.get("/cognition/recent-decisions?limit=50"), { items: [] }),
+    safeFetch(() => api.get("/cognition/recent-turns?limit=50"), { items: [] }),
+    safeFetch(() => api.get("/cognition/scheduler/status"), null),
+    safeFetch(() => api.get("/cognition/scheduler/due-selection"), null),
+    safeFetch(() => api.get("/cognition/observability/overview"), {}),
+    safeFetch(() => api.get(observabilityTimelinePath()), { items: [] }),
   ]);
   state.observabilityOverview = observabilityOverview;
   state.schedulerStatus = schedulerStatus;
@@ -789,7 +812,7 @@ async function renderDashboardCognition() {
 
 async function loadUnifiedTimeline(chatId) {
   const buildUnifiedTimelinePath = (chatId) => `/cognition/chats/${segment(chatId)}/unified-timeline?limit=80&include=decision,tool,trace,memory`;
-  return api.get(buildUnifiedTimelinePath(chatId)).catch(() => ({ items: [] }));
+  return safeFetch(() => api.get(buildUnifiedTimelinePath(chatId)), { items: [] });
 }
 
 function renderThinkLevelSummary(cognitive) {
@@ -903,9 +926,9 @@ function openTurnTrace(index, source = state.cache.turns) {
 
 async function renderDashboardTools() {
   const [status, policy, calls] = await Promise.all([
-    api.get("/tools/status").catch(() => ({})),
-    api.get("/tools/policy").catch(() => ({})),
-    api.get("/tools/recent-calls?limit=50").catch(() => ({ items: [] })),
+    safeFetch(() => api.get("/tools/status"), {}),
+    safeFetch(() => api.get("/tools/policy"), {}),
+    safeFetch(() => api.get("/tools/recent-calls?limit=50"), { items: [] }),
   ]);
   const rows = asItems(calls).map((item) => `
     <tr>
@@ -927,9 +950,9 @@ async function renderDashboardTools() {
 async function openChatTrace(chatId) {
   if (!chatId) return toast("缺少 chat_id");
   const [decisions, tools, turns] = await Promise.all([
-    api.get(`/cognition/chats/${segment(chatId)}/recent-decisions?limit=20`).catch(() => ({ items: [] })),
-    api.get(`/tools/chats/${segment(chatId)}/recent-calls?limit=20`).catch(() => ({ items: [] })),
-    api.get(`/cognition/chats/${segment(chatId)}/turns?limit=20`).catch(() => ({ items: [] })),
+    safeFetch(() => api.get(`/cognition/chats/${segment(chatId)}/recent-decisions?limit=20`), { items: [] }),
+    safeFetch(() => api.get(`/tools/chats/${segment(chatId)}/recent-calls?limit=20`), { items: [] }),
+    safeFetch(() => api.get(`/cognition/chats/${segment(chatId)}/turns?limit=20`), { items: [] }),
   ]);
   openModal(`chat 轨迹：${escapeHtml(chatId)}`, `
     <h4>主动决策池</h4><pre>${json(decisions.items || [])}</pre>
@@ -941,16 +964,16 @@ async function openChatTrace(chatId) {
 async function loadLearning() {
   showLoading("正在读取主动学习与任务...");
   const [proactive, intents, dream, diary, wakeup, learning, feedback, sources, chats, cooldowns] = await Promise.all([
-    api.get("/proactive/status").catch(() => ({})),
-    api.get("/proactive/intents?limit=50").catch(() => ({ items: [] })),
-    api.get("/proactive/dream/status").catch(() => ({})),
-    api.get("/proactive/diary/status").catch(() => ({})),
-    api.get("/proactive/wakeup/status").catch(() => ({})),
-    api.get("/learning/status").catch(() => ({})),
-    api.get("/memory-feedback?limit=50").catch(() => ({ items: [] })),
-    api.get("/memory-feedback/sources").catch(() => ({ items: [] })),
-    api.get("/chats/active?max_age_seconds=1800").catch(() => ({ items: [] })),
-    api.get("/learning/cooldowns").catch(() => ({})),
+    safeFetch(() => api.get("/proactive/status"), {}),
+    safeFetch(() => api.get("/proactive/intents?limit=50"), { items: [] }),
+    safeFetch(() => api.get("/proactive/dream/status"), {}),
+    safeFetch(() => api.get("/proactive/diary/status"), {}),
+    safeFetch(() => api.get("/proactive/wakeup/status"), {}),
+    safeFetch(() => api.get("/learning/status"), {}),
+    safeFetch(() => api.get("/memory-feedback?limit=50"), { items: [] }),
+    safeFetch(() => api.get("/memory-feedback/sources"), { items: [] }),
+    safeFetch(() => api.get("/chats/active?max_age_seconds=1800"), { items: [] }),
+    safeFetch(() => api.get("/learning/cooldowns"), {}),
   ]);
   const cards = [
     ["造梦空间", "Dream Agent", dream.data || dream, "执行造梦序列", "run-dream"],
@@ -1041,8 +1064,8 @@ function bindLearningActions() {
 async function loadReviews() {
   showLoading("正在读取表达审核...");
   const [pending, all] = await Promise.all([
-    api.get("/reviews/pending").catch(() => ({ items: [] })),
-    api.get("/reviews?page_size=50").catch(() => ({ items: [] })),
+    safeFetch(() => api.get("/reviews/pending"), { items: [] }),
+    safeFetch(() => api.get("/reviews?page_size=50"), { items: [] }),
   ]);
   const pendingItems = asItems(pending);
   const allItems = asItems(all);
@@ -1091,10 +1114,10 @@ function bindReviewActions() {
 async function loadMemories() {
   showLoading("正在读取记忆网络...");
   const [events, reflections, nodes, jargon] = await Promise.all([
-    api.get("/memories/events").catch(() => ({ items: [] })),
-    api.get(`/memories/reflections?month=${segment(state.cache.memories.month)}`).catch(() => ({ items: [] })),
-    api.get("/memories/nodes").catch(() => ({ items: [] })),
-    api.get("/memories/jargon").catch(() => ({ items: [] })),
+    safeFetch(() => api.get("/memories/events"), { items: [] }),
+    safeFetch(() => api.get(`/memories/reflections?month=${segment(state.cache.memories.month)}`), { items: [] }),
+    safeFetch(() => api.get("/memories/nodes"), { items: [] }),
+    safeFetch(() => api.get("/memories/jargon"), { items: [] }),
   ]);
   state.cache.memories.events = asItems(events);
   state.cache.memories.reflections = asItems(reflections);
@@ -1141,7 +1164,7 @@ async function loadMemories() {
 
 async function loadUsers() {
   showLoading("正在读取用户画像...");
-  const users = await api.get("/users").catch(() => ({ items: [] }));
+  const users = await safeFetch(() => api.get("/users"), { items: [] });
   state.cache.users = asItems(users);
   if (!state.activeUserId && state.cache.users[0]) state.activeUserId = state.cache.users[0].user_id || state.cache.users[0].id || "";
   renderUsers();

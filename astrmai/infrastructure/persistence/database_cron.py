@@ -12,6 +12,13 @@ class CronPersistenceMixin:
             with self.get_session() as session:
                 existing = session.get(CronSnapshot, snapshot.job_id)
                 if existing:
+                    existing.name = snapshot.name
+                    existing.cron_expression = snapshot.cron_expression
+                    existing.run_at = snapshot.run_at
+                    existing.run_once = snapshot.run_once
+                    existing.target_origin = snapshot.target_origin
+                    existing.payload = snapshot.payload
+                    existing.note = snapshot.note
                     existing.is_active = snapshot.is_active
                     existing.updated_at = time.time()
                     session.add(existing)

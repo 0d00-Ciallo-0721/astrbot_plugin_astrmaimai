@@ -1,3 +1,5 @@
+import json
+from datetime import datetime
 from typing import Any
 
 from pydantic.dataclasses import dataclass
@@ -85,7 +87,6 @@ class CronAgent(AstrMaiBaseSubAgent):
         if not cron_mgr:
             return
 
-        import json
         import time
 
         try:
@@ -104,6 +105,13 @@ class CronAgent(AstrMaiBaseSubAgent):
 
         for job in active_jobs:
             payload = getattr(job, "payload", {}) or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
             session = str(payload.get("session", ""))
             if session != current_umo:
                 continue
@@ -114,6 +122,14 @@ class CronAgent(AstrMaiBaseSubAgent):
 
             active_job_ids.add(job_id)
             run_at_dt = getattr(job, "run_at", None)
+            # fallback: parse run_at from payload for framework versions storing it there
+            if not run_at_dt:
+                raw_run_at = (payload or {}).get("run_at")
+                if raw_run_at:
+                    try:
+                        run_at_dt = datetime.fromisoformat(str(raw_run_at))
+                    except (ValueError, TypeError):
+                        pass
             run_at_ts = run_at_dt.timestamp() if run_at_dt else None
             snapshot = CronSnapshot(
                 job_id=job_id,
