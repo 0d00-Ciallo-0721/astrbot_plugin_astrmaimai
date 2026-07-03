@@ -15,15 +15,18 @@ class HandoffRegistry:
     async def discover(self, static_names: set[str]) -> list[Any]:
         # ponytail: re-scan every call to pick up newly registered SubAgents (R18)
         orchestrator = self._find_orchestrator()
-        existing_names: set[str] = {getattr(a, "name", "") for a in self._dynamic_agents}
+        previous_names: set[str] = {getattr(a, "name", "") for a in self._dynamic_agents}
         if not orchestrator or not hasattr(orchestrator, "handoffs"):
             if not self._loaded:
                 logger.warning("[Sys3Router] 未找到 subagent_orchestrator，保持纯静态模式。")
                 self._loaded = True
-            return list(self._dynamic_agents)
+            self._dynamic_agents = []
+            return []
 
+        next_agents: list[Any] = []
+        existing_names: set[str] = set()
         for handoff in getattr(orchestrator, "handoffs", []) or []:
-            agent_name = getattr(handoff, "name", "")
+            agent_name = str(getattr(handoff, "name", "") or "").strip()
             if not agent_name or agent_name in static_names:
                 continue
             if agent_name in existing_names:
@@ -31,12 +34,15 @@ class HandoffRegistry:
             if not getattr(handoff, "active", True):
                 logger.info(f"[Sys3Router] skip inactive dynamic agent: {agent_name}")
                 continue
-            self._dynamic_agents.append(handoff)
+            next_agents.append(handoff)
             existing_names.add(agent_name)
+            if agent_name in previous_names:
+                continue
             provider = getattr(handoff, "provider_id", "璺熼殢鍏ㄥ眬")
             logger.info(
                 f"[Sys3Router] 馃攲 婊¤鎸傝浇 WebUI 鍔ㄦ€?SubAgent: [{agent_name}] | 鐙珛 Provider: [{provider}]"
             )
+        self._dynamic_agents = next_agents
         return list(self._dynamic_agents)
 
     def list_loaded_names(self) -> list[str]:

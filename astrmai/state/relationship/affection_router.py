@@ -180,6 +180,13 @@ class AffectionRouter:
             return None
 
         winner_id, max_score = max(total_scores.items(), key=lambda item: item[1])
+        if (
+            t_sender_id
+            and t_score > t_weight
+            and total_scores.get(t_sender_id, 0.0) >= max_score
+        ):
+            winner_id = t_sender_id
+            max_score = total_scores[t_sender_id]
         max_possible_score = w_weight + h_weight + (t_score if t_score > t_weight else t_weight)
         logger.debug(
             f"[AffectionRouter] leaderboard={total_scores} winner={winner_id}({max_score:.1f}) threshold={threshold}"

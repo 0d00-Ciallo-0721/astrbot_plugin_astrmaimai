@@ -200,6 +200,14 @@ class MemoryUiService:
         limit: int = 100,
         offset: int = 0,
     ) -> dict:
+        try:
+            limit = max(1, min(int(limit or 100), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            offset = 0
         engine = self._memory_engine()
         store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "list_canonical"):
@@ -533,7 +541,11 @@ class MemoryUiService:
     async def create_event(self, data: dict) -> dict[str, object]:
         now = time.time()
         event_id = data.get("event_id") or f"plugin_page_{int(now * 1000)}"
-        importance = data.get("importance", 0.5)
+        raw_importance = data.get("importance", 0.5)
+        try:
+            importance = float(0.5 if raw_importance is None else raw_importance)
+        except (TypeError, ValueError):
+            importance = 0.5
         content = str(data.get("narrative") or data.get("reflection") or "").strip()
         tags = data.get("tags", [])
         if isinstance(tags, str):
@@ -545,7 +557,7 @@ class MemoryUiService:
             content=content,
             summary=content[:240],
             tags=list(tags or []),
-            importance=float(importance or 0.5),
+            importance=importance,
             confidence=0.75,
             metadata={
                 "legacy_event_id": event_id,

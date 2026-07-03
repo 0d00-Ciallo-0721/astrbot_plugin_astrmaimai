@@ -62,6 +62,17 @@ class CronAgent(AstrMaiBaseSubAgent):
     async def _get_decline_reason(self) -> str:
         return "框架定时任务工具 (cron_tools) 未能成功加载，请检查 AstrBot 版本是否 >= v4.14.0"
 
+    @staticmethod
+    def _parse_run_at(value: Any) -> datetime | None:
+        if not value:
+            return None
+        if hasattr(value, "timestamp"):
+            return value
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> ToolExecResult:
         result = await super().call(context, **kwargs)
         try:
@@ -121,15 +132,11 @@ class CronAgent(AstrMaiBaseSubAgent):
                 continue
 
             active_job_ids.add(job_id)
-            run_at_dt = getattr(job, "run_at", None)
+            run_at_dt = self._parse_run_at(getattr(job, "run_at", None))
             # fallback: parse run_at from payload for framework versions storing it there
             if not run_at_dt:
                 raw_run_at = (payload or {}).get("run_at")
-                if raw_run_at:
-                    try:
-                        run_at_dt = datetime.fromisoformat(str(raw_run_at))
-                    except (ValueError, TypeError):
-                        pass
+                run_at_dt = self._parse_run_at(raw_run_at)
             run_at_ts = run_at_dt.timestamp() if run_at_dt else None
             snapshot = CronSnapshot(
                 job_id=job_id,

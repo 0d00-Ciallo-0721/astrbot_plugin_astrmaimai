@@ -49,6 +49,10 @@ class ReviewUiService:
         if not isinstance(metadata, dict):
             metadata = {}
         review_status = str(metadata.get("review_status") or row.get("status") or "pending").strip().lower()
+        try:
+            weight = float(1.0 if metadata.get("weight") is None else metadata.get("weight"))
+        except (TypeError, ValueError):
+            weight = 1.0
         return {
             "id": str(row.get("id") or ""),
             "group_id": str(row.get("session_id") or ""),
@@ -63,7 +67,7 @@ class ReviewUiService:
             "review_suggestion": str(metadata.get("review_suggestion") or ""),
             "shared_scope": str(metadata.get("shared_scope") or ""),
             "think_level": int(metadata.get("think_level") or 0),
-            "weight": float(metadata.get("weight") or 1.0),
+            "weight": weight,
             "modified_by": str(metadata.get("modified_by") or ""),
             "source": str(row.get("source") or ""),
             "content_list": json.dumps(metadata.get("content_samples") or [], ensure_ascii=False),
@@ -136,6 +140,14 @@ class ReviewUiService:
         return pending
 
     async def list_reviews(self, status=None, group_id=None, keyword=None, page: int = 1, page_size: int = 20):
+        try:
+            page = max(1, int(page or 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = max(1, min(int(page_size or 20), 200))
+        except (TypeError, ValueError):
+            page_size = 20
         offset = (page - 1) * page_size
         facade_items = await self.plugin_api.list_recent_reviews(group_id=group_id or "", limit=max(page * page_size, page_size))
         if self._runtime_bound():
@@ -172,7 +184,7 @@ class ReviewUiService:
             reviewer_id="webui",
             replacement_expression=replacement or "",
             reason=reason or "",
-            weight_delta=float(weight - 1.0) if weight is not None else 0.0,
+            weight_delta=float(weight) - 1.0 if weight is not None else 0.0,
         )
         if result and result.get("id"):
             return {"status": "ok", "data": result}

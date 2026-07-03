@@ -110,6 +110,55 @@ class GatewayCallMixin:
         except Exception as exc:
             logger.debug(f"[Gateway] benchmark sample skipped: {exc}")
 
+    async def _record_success_artifacts(
+        self,
+        *,
+        report_pool: str,
+        model_id: str,
+        usage: Dict[str, int],
+        log_meta: Dict[str, Any],
+        latency_ms: float,
+        workload_policy: Optional[WorkloadPolicy],
+        record_economy: bool,
+        fallback_used: bool,
+        provider_session_id: str,
+    ) -> Dict[str, Any]:
+        try:
+            self._log_usage(report_pool, model_id, usage, log_meta, latency_ms=latency_ms)
+        except Exception as exc:
+            logger.warning(f"[Gateway] usage logging degraded after successful call: {exc}")
+
+        economy_payload: Dict[str, Any] = {}
+        if workload_policy and record_economy:
+            try:
+                workload_trace = self.context_economy.build_trace(
+                    policy=workload_policy,
+                    actual_model=model_id,
+                    fallback_used=fallback_used,
+                    provider_family=log_meta["provider"],
+                    provider_session_id=provider_session_id,
+                    provider_session_enabled=bool(provider_session_id),
+                    provider_cache_hint_enabled=bool(log_meta.get("request_cache_control")),
+                )
+                self.context_economy.record_trace(workload_trace)
+                economy_payload = workload_trace.as_dict()
+            except Exception as exc:
+                logger.warning(f"[Gateway] economy trace degraded after successful call: {exc}")
+
+        try:
+            await self._record_benchmark_sample(
+                usage=usage,
+                model_id=model_id,
+                provider_family=log_meta["provider"],
+                workload_policy=workload_policy,
+                economy_payload=economy_payload,
+                fallback_used=fallback_used,
+                provider_session_id=provider_session_id,
+            )
+        except Exception as exc:
+            logger.warning(f"[Gateway] benchmark recording degraded after successful call: {exc}")
+        return economy_payload
+
     async def _elastic_call_result(
         self,
         pool_name: str,
@@ -240,26 +289,14 @@ class GatewayCallMixin:
                         if is_json:
                             parsed_json = self._parse_json_completion(content)
                             self.router.report_success(report_pool, model_id)
-                            self._log_usage(report_pool, model_id, usage, log_meta, latency_ms=latency_ms)
-                            economy_payload = {}
-                            if workload_policy and record_economy:
-                                workload_trace = self.context_economy.build_trace(
-                                    policy=workload_policy,
-                                    actual_model=model_id,
-                                    fallback_used=bool(model_id not in primary_models),
-                                    provider_family=log_meta["provider"],
-                                    provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
-                                    provider_session_enabled=bool(llm_kwargs.get("session_id")),
-                                    provider_cache_hint_enabled=bool(llm_kwargs.get("cache_control")),
-                                )
-                                self.context_economy.record_trace(workload_trace)
-                                economy_payload = workload_trace.as_dict()
-                            await self._record_benchmark_sample(
-                                usage=usage,
+                            economy_payload = await self._record_success_artifacts(
+                                report_pool=report_pool,
                                 model_id=model_id,
-                                provider_family=log_meta["provider"],
+                                usage=usage,
+                                log_meta=log_meta,
+                                latency_ms=latency_ms,
                                 workload_policy=workload_policy,
-                                economy_payload=economy_payload,
+                                record_economy=record_economy,
                                 fallback_used=bool(model_id not in primary_models),
                                 provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
                             )
@@ -283,26 +320,14 @@ class GatewayCallMixin:
                             raise ValueError(failure_kind)
 
                         self.router.report_success(report_pool, model_id)
-                        self._log_usage(report_pool, model_id, usage, log_meta)
-                        economy_payload = {}
-                        if workload_policy and record_economy:
-                            workload_trace = self.context_economy.build_trace(
-                                policy=workload_policy,
-                                actual_model=model_id,
-                                fallback_used=bool(model_id not in primary_models),
-                                provider_family=log_meta["provider"],
-                                provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
-                                provider_session_enabled=bool(llm_kwargs.get("session_id")),
-                                provider_cache_hint_enabled=bool(llm_kwargs.get("cache_control")),
-                            )
-                            self.context_economy.record_trace(workload_trace)
-                            economy_payload = workload_trace.as_dict()
-                        await self._record_benchmark_sample(
-                            usage=usage,
+                        economy_payload = await self._record_success_artifacts(
+                            report_pool=report_pool,
                             model_id=model_id,
-                            provider_family=log_meta["provider"],
+                            usage=usage,
+                            log_meta=log_meta,
+                            latency_ms=latency_ms,
                             workload_policy=workload_policy,
-                            economy_payload=economy_payload,
+                            record_economy=record_economy,
                             fallback_used=bool(model_id not in primary_models),
                             provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
                         )

@@ -167,13 +167,8 @@ class PluginFacade(RuntimeFacadeProtocol):
 
     def apply_hot_config(self, config_dict: dict, parsed_config) -> bool:
         """热应用配置到运行时。遍历所有组件刷新。"""
-        self.runtime.raw_config = dict(config_dict)
-        self.runtime.config = parsed_config
-        if hasattr(self.runtime, "rebuild_infrastructure_settings"):
-            self.runtime.rebuild_infrastructure_settings()
-
-        # ponytail: refresh all components that hold cached config references
-        _failed = []
+        old_raw_config = dict(getattr(self.runtime, "raw_config", {}) or {})
+        old_config = getattr(self.runtime, "config", None)
         components = [
             ("gateway", getattr(self.runtime, "gateway", None)),
             ("lane_manager", getattr(self.runtime, "lane_manager", None)),
@@ -187,18 +182,43 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("judge", getattr(self.runtime, "judge", None)),
             ("proactive_task", getattr(self.runtime, "proactive_task", None)),
         ]
-        for name, comp in components:
-            if comp is not None and hasattr(comp, "refresh_config"):
-                try:
-                    comp.refresh_config(parsed_config)
-                except Exception as exc:
-                    logger.warning(f"[AstrMai] refresh_config failed for {name}: {exc}")
-                    _failed.append(name)
 
-        if hasattr(self.runtime, "sync_host_compat_attrs"):
-            self.runtime.sync_host_compat_attrs()
-        if _failed:
-            logger.warning(f"[AstrMai] hot-apply partial failure, failed components: {_failed}")
+        def _apply_runtime(raw_config, config) -> None:
+            self.runtime.raw_config = dict(raw_config)
+            self.runtime.config = config
+            if hasattr(self.runtime, "rebuild_infrastructure_settings"):
+                self.runtime.rebuild_infrastructure_settings()
+
+        def _refresh_components(config) -> None:
+            for name, comp in components:
+                if comp is not None and hasattr(comp, "refresh_config"):
+                    comp.refresh_config(config)
+
+        try:
+            _apply_runtime(config_dict, parsed_config)
+            _refresh_components(parsed_config)
+            if hasattr(self.runtime, "sync_host_compat_attrs"):
+                self.runtime.sync_host_compat_attrs()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] hot-apply failed, rolling back: {exc}")
+            rollback_errors = []
+            try:
+                _apply_runtime(old_raw_config, old_config)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"runtime:{rollback_exc}")
+            for name, comp in components:
+                if comp is not None and hasattr(comp, "refresh_config"):
+                    try:
+                        comp.refresh_config(old_config)
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{name}:{rollback_exc}")
+            try:
+                if hasattr(self.runtime, "sync_host_compat_attrs"):
+                    self.runtime.sync_host_compat_attrs()
+            except Exception as rollback_exc:
+                rollback_errors.append(f"sync:{rollback_exc}")
+            if rollback_errors:
+                logger.error(f"[AstrMai] hot-apply rollback degraded: {rollback_errors}")
             return False
         return True
 

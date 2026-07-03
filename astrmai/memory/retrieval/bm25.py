@@ -50,7 +50,7 @@ class BM25Retriever:
                 SELECT doc_id, bm25({self.table}) as score
                 FROM {self.table}
                 WHERE {self.table} MATCH ?
-                ORDER BY score DESC
+                ORDER BY score ASC
                 LIMIT ?
                 """,
                 (fts_query, k * 2) 
@@ -110,8 +110,12 @@ class BM25Retriever:
                 else:
                     scores = [r.score for r in results]
                     max_score, min_score = max(scores), min(scores)
-                    score_range = max_score - min_score if max_score != min_score else max(abs(max_score), 1.0)
-                    for r in results:
-                        r.score = (r.score - min_score) / score_range
+                    if max_score == min_score:
+                        for r in results:
+                            r.score = 1.0
+                    else:
+                        score_range = max_score - min_score
+                        for r in results:
+                            r.score = (max_score - r.score) / score_range
                     
             return results

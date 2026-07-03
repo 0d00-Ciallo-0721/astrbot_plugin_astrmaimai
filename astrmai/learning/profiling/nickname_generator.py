@@ -53,7 +53,7 @@ class NicknameGenerator:
                 return nickname, reason
         except Exception:
             pass
-        return self.choose(text), ""
+        return "", ""
 
 
 __all__ = ["NicknameGenerator"]

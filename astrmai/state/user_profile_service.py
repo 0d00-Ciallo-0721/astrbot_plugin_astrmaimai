@@ -431,6 +431,7 @@ class UserProfileService:
             "preference_points": [],
             "relationship_points": [],
             "speech_style_points": [],
+            "other_points": [],
         }
         for raw_point in list(memory_points or []):
             parsed = self._parse_memory_point(raw_point)
@@ -443,8 +444,10 @@ class UserProfileService:
                 buckets["preference_points"].append(normalized)
             elif parsed["category"] in {"关系", "互动"}:
                 buckets["relationship_points"].append(normalized)
-            else:
+            elif parsed["category"] in {"表达", "说话", "口癖", "语气", "speech", "style", "琛ㄨ揪"}:
                 buckets["speech_style_points"].append(normalized)
+            else:
+                buckets["other_points"].append(normalized)
         for key, values in buckets.items():
             unique: List[str] = []
             seen: set[str] = set()

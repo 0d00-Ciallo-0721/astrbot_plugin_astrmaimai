@@ -336,6 +336,40 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
         self.assertEqual(state_engine.mood_updates, [("default:GroupMessage:group-1", -0.1)])
         self.assertAlmostEqual(focus_event.get_extra("astrmai_judge_mood_delta"), -0.1)
 
+    def test_judge_releases_active_group_lock_after_gateway_failure(self):
+        class _FailingGateway(_FakeGateway):
+            async def chat_in_lane_result(self, **kwargs):
+                self.prompts.append(kwargs["prompt"])
+                raise RuntimeError("gateway down")
+
+        gateway = _FailingGateway()
+        judge = self.mod.Judge(gateway, _FakeStateEngine(_LegacyHistoryPersistence()), config=gateway.config)
+        self.mod.logger.exception = lambda *args, **kwargs: None
+
+        first = asyncio.run(
+            judge.evaluate(
+                chat_id="default:GroupMessage:group-1",
+                message="first turn",
+                is_force_wakeup=False,
+                persona_summary="persona summary",
+                window_events_count=1,
+            )
+        )
+        second = asyncio.run(
+            judge.evaluate(
+                chat_id="default:GroupMessage:group-1",
+                message="second turn",
+                is_force_wakeup=False,
+                persona_summary="persona summary",
+                window_events_count=1,
+            )
+        )
+
+        self.assertEqual(first.action, "REPLY")
+        self.assertEqual(second.action, "REPLY")
+        self.assertNotIn("default:GroupMessage:group-1", judge.active_sys1_groups)
+        self.assertEqual(len(gateway.prompts), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

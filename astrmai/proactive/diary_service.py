@@ -84,8 +84,8 @@ class DiaryService:
         current = time.localtime(now_ts)
         current_hour = current.tm_hour
         current_date = time.strftime("%Y-%m-%d", current)
-        # ponytail: check both before 4 AM AND not near the boundary (jitter could push past 4:00)
-        return 3 <= current_hour < 4 and current_hour < 4 and last_diary_date != current_date
+        # ponytail: daily diary runs in the early-morning low-traffic window.
+        return 3 <= current_hour < 5 and last_diary_date != current_date
 
 
 __all__ = ["DiaryService"]

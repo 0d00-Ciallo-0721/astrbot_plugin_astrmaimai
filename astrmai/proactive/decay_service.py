@@ -15,10 +15,23 @@ class DecayService:
     async def run_once(self):
         now = time.time()
 
-        for state in self.state_engine.get_active_states():
-            self.state_engine.apply_natural_decay(state)  # synchronous, no I/O
+        try:
+            active_states = list(self.state_engine.get_active_states())
+        except Exception as exc:
+            logger.debug(f"[Life] state decay listing degraded: {exc}")
+            active_states = []
+        for state in active_states:
+            try:
+                self.state_engine.apply_natural_decay(state)  # synchronous, no I/O
+            except Exception as exc:
+                logger.debug(f"[Life] state decay degraded: {exc}")
 
-        for profile in self.state_engine.get_active_profiles():
+        try:
+            active_profiles = list(self.state_engine.get_active_profiles())
+        except Exception as exc:
+            logger.debug(f"[Life] profile decay listing degraded: {exc}")
+            active_profiles = []
+        for profile in active_profiles:
             if now - (getattr(profile, "last_access_time", 0) or 0) <= 86400:
                 continue
             old_score = float(profile.social_score or 0.0)
@@ -34,7 +47,10 @@ class DecayService:
                 delta = 0
             if delta != 0:
                 profile.last_access_time = now
-                await self.state_engine.update_social_score_from_fact(profile.user_id, delta)
+                try:
+                    await self.state_engine.update_social_score_from_fact(profile.user_id, delta)
+                except Exception as exc:
+                    logger.debug(f"[Life] profile social decay degraded: {exc}")
 
         enable_rel_engine = getattr(self.config.evolution, "enable_relationship_engine", True) if hasattr(self.config, "evolution") else True
         if enable_rel_engine and hasattr(self.state_engine, "relationship_engine"):

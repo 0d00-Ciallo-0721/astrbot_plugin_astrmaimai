@@ -106,6 +106,7 @@ class ExpressionReflector:
 
 返回 JSON 数组: [{{"index": 1, "score": 8, "feedback": "简评"}}]"""
 
+        batch_consumed = False
         try:
             result = await self.gateway.call_data_process_task(
                 prompt,
@@ -117,8 +118,8 @@ class ExpressionReflector:
 
             # ponytail: only remove batch after LLM succeeds — prevents data loss on failure
             async with self._lock:
-                current = self._pending_reflections[:len(batch)]
                 self._pending_reflections = self._pending_reflections[len(batch):]
+                batch_consumed = True
 
             for score_item in scores:
                 idx = score_item.get("index", 0) - 1
@@ -141,9 +142,8 @@ class ExpressionReflector:
         except Exception as e:
             logger.debug(f"[Reflector] 批量反思失败: {e}")
             # ponytail: M12 — remove failed batch to prevent infinite retry of same items
-            async with self._lock:
-                current = self._pending_reflections[:len(batch)]
-                self._pending_reflections = self._pending_reflections[len(batch):]
+            if batch_consumed:
+                logger.debug("[Reflector] batch already consumed before weight update failure")
 
     async def auto_audit(self, group_id: str):
         """
@@ -153,7 +153,6 @@ class ExpressionReflector:
         now = time.time()
         if now - self._last_audit_time < self.AUDIT_INTERVAL:
             return
-        self._last_audit_time = now
 
         try:
             service = self._pattern_service()
@@ -168,6 +167,7 @@ class ExpressionReflector:
                 )
             else:
                 return
+            self._last_audit_time = now
             if len(patterns) < 10:
                 return
 

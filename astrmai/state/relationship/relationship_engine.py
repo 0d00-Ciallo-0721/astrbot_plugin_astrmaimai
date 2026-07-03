@@ -22,6 +22,7 @@
   - 惩罚倍率 (负面事件的伤害随信任度提高而放大)
 """
 import math
+import re
 import time
 from typing import Dict, Optional
 from dataclasses import dataclass, field
@@ -490,6 +491,21 @@ class RelationshipEngine:
     # 高级分析 (纯算法)
     # ==========================================
 
+    @staticmethod
+    def _contains_insult(text: str) -> bool:
+        lower = str(text or "").lower()
+        if not lower:
+            return False
+        ascii_words = ("sb", "cnm", "nmsl")
+        if any(re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", lower) for word in ascii_words):
+            return True
+        chinese_words = ("傻逼", "去死", "白痴", "废物", "脑残", "鍌婚€?", "鍘绘", "鐧界棿", "搴熺墿", "鑴戞畫")
+        if any(word in lower for word in chinese_words):
+            return True
+        roll_words = ("滚开", "滚蛋", "滚出去", "滚远点", "快滚", "给我滚", "婊氬紑")
+        stripped = lower.strip()
+        return stripped == "滚" or any(word in stripped for word in roll_words)
+
     def classify_interaction_type(self, text: str) -> str:
         """
         纯算法交互类型分类 — 基于关键词匹配，零 LLM 消耗。
@@ -501,8 +517,7 @@ class RelationshipEngine:
         lower = text.lower()
 
         # 侮辱检测
-        insult_words = {"sb", "傻逼", "滚", "去死", "白痴", "废物", "脑残", "cnm", "nmsl"}
-        if any(w in lower for w in insult_words):
+        if self._contains_insult(lower):
             return RelationshipEvent.INSULT
 
         # 粗鲁检测

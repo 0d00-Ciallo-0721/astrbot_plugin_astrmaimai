@@ -204,9 +204,10 @@ class GoalManager:
 
         goals = []
         for item in items:
-            if isinstance(item, dict) and item.get("goal"):
+            goal_value = item.get("goal") if isinstance(item, dict) else None
+            if isinstance(goal_value, str) and goal_value.strip():
                 goals.append(ConversationGoal(
-                    goal=str(item["goal"])[:30],  # 强制限长
+                    goal=goal_value.strip()[:30],  # 强制限长
                     reasoning=str(item.get("reasoning", ""))
                 ))
         return goals

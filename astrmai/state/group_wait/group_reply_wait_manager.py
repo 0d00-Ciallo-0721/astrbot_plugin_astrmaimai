@@ -264,4 +264,4 @@ class GroupReplyWaitManager:
             state = self._states.get(str(chat_id))
             if not state:
                 return None
-            return self._build_wait_info_snapshot(state, time.time())
+            return self._build_wait_info_snapshot(state, monotonic())

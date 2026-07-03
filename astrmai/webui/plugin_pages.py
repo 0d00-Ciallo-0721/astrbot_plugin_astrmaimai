@@ -122,6 +122,13 @@ class AstrMaiAdminPageApi:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _strings(value: Any) -> list[str]:
+        if value is None:
+            return []
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        return [str(item).strip() for item in values if item is not None and str(item).strip()]
+
     def _admin(self) -> AdminUiService:
         return AdminUiService(self.plugin_api, get_db)
 
@@ -371,7 +378,7 @@ class AstrMaiAdminPageApi:
     async def submit_review(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
         return await self._reviews().submit_review(
-            self._int(self._path(request).get("id")),
+            str(self._path(request).get("id", "") or ""),
             str(body.get("action", "")),
             body.get("replacement"),
             body.get("weight"),
@@ -380,17 +387,20 @@ class AstrMaiAdminPageApi:
 
     async def batch_review(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
-        ids = [self._int(item) for item in body.get("ids", []) if str(item).strip()]
+        ids = self._strings(body.get("ids"))
         return await self._reviews().batch_review(ids, str(body.get("action", "")))
 
     async def create_review(self, request: Any) -> dict[str, Any]:
         return await self._reviews().create_review(await self._body(request))
 
     async def update_review(self, request: Any) -> dict[str, Any]:
-        return await self._reviews().update_review_record(self._int(self._path(request).get("id")), await self._body(request))
+        return await self._reviews().update_review_record(
+            str(self._path(request).get("id", "") or ""),
+            await self._body(request),
+        )
 
     async def delete_review(self, request: Any) -> dict[str, Any]:
-        return await self._reviews().delete_review_record(self._int(self._path(request).get("id")))
+        return await self._reviews().delete_review_record(str(self._path(request).get("id", "") or ""))
 
     async def list_memory_events(self, request: Any) -> Any:
         return await self._memory().list_events()
@@ -430,11 +440,11 @@ class AstrMaiAdminPageApi:
 
     async def memory_migration_dry_run(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
-        return await self._memory().migration_dry_run(sources=list(body.get("import_sources") or []))
+        return await self._memory().migration_dry_run(sources=self._strings(body.get("import_sources")))
 
     async def memory_migration_execute(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
-        return await self._memory().migration_execute(sources=list(body.get("import_sources") or []))
+        return await self._memory().migration_execute(sources=self._strings(body.get("import_sources")))
 
     async def memory_migration_verify(self, request: Any) -> dict[str, Any]:
         return await self._memory().migration_verify()

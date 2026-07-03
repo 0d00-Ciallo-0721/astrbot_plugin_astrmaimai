@@ -74,8 +74,16 @@ class ReviewPersistenceMixin:
         if service and hasattr(service, "write_pattern"):
             try:
                 asyncio.get_running_loop()
-                # ponytail: fire-and-forget canonical write from async context
-                task = asyncio.create_task(self._save_pattern_to_canonical_async(pattern))
+                lifecycle = getattr(self, "lifecycle", None)
+                manager = getattr(lifecycle, "manager", None)
+                if manager is None:
+                    runtime_lifecycle = getattr(getattr(self, "runtime", None), "lifecycle", None)
+                    manager = getattr(runtime_lifecycle, "manager", None)
+                if manager is not None and hasattr(manager, "track_task"):
+                    task = manager.track_task(self._save_pattern_to_canonical_async(pattern))
+                else:
+                    # ponytail: fire-and-forget canonical write from async context
+                    task = asyncio.create_task(self._save_pattern_to_canonical_async(pattern))
                 task.add_done_callback(
                     lambda t, p=pattern: (
                         logger.exception(f"[DatabaseReview] canonical save failed for pattern {getattr(p, 'id', '?')}")

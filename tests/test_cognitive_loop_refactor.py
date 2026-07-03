@@ -196,6 +196,24 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
         bare_question_event = _FakeEvent("？ ")
         self.assertFalse(loop.should_run(bare_question_event))
 
+    def test_gate_decision_state_is_written_to_event_and_turn_context(self):
+        loop = self.mod.CognitiveLoop(_FakeGateway([]))
+        event = _FakeEvent("")
+
+        gate = loop.gate_decision(event)
+        loop.mark_gate_decision(event, gate, ran=False)
+
+        self.assertFalse(gate.should_run)
+        self.assertEqual(gate.skip_reason, "empty_message")
+        self.assertFalse(event.get_extra("astrmai_cognitive_loop_ran"))
+        self.assertEqual(event.get_extra("astrmai_cognitive_loop_skipped_reason"), "empty_message")
+        self.assertEqual(event.get_extra("astrmai_cognitive_loop_skip_signals"), ["empty_message"])
+        turn_context = event.get_extra("astrmai_turn_context")
+        self.assertIsNotNone(turn_context)
+        self.assertFalse(turn_context.cognitive.cognitive_loop_ran)
+        self.assertEqual(turn_context.cognitive.cognitive_loop_skipped_reason, "empty_message")
+        self.assertEqual(turn_context.cognitive.cognitive_loop_skip_signals, ["empty_message"])
+
     def test_cognitive_loop_skips_readonly_tool_step_below_think_level_three(self):
         gateway = _FakeGateway(
             [

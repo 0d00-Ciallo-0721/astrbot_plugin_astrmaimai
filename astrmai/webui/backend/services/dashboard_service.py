@@ -15,14 +15,42 @@ class DashboardService:
         self.plugin_api = plugin_api
         self._repo = DashboardRepository(db_factory)
 
+    @staticmethod
+    def _db_size_kb(db_path: str) -> float:
+        try:
+            return round((os.path.getsize(db_path) if os.path.exists(db_path) else 0) / 1024, 2)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _process_memory_mb() -> float:
+        try:
+            return round(psutil.Process().memory_info().rss / 1024 / 1024, 2)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _cpu_percent() -> float:
+        try:
+            return psutil.cpu_percent(interval=0.1)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _memory_percent() -> float:
+        try:
+            return psutil.virtual_memory().percent
+        except Exception:
+            return 0
+
     async def get_snapshot(self) -> dict:
         db_path = default_db_path()
         counts = await self._repo.snapshot_counts()
         return {
-            "db_size_kb": round((os.path.getsize(db_path) if os.path.exists(db_path) else 0) / 1024, 2),
-            "webui_mem_mb": round(psutil.Process().memory_info().rss / 1024 / 1024, 2),
-            "sys_cpu_percent": psutil.cpu_percent(interval=0.1),
-            "sys_mem_percent": psutil.virtual_memory().percent,
+            "db_size_kb": self._db_size_kb(db_path),
+            "webui_mem_mb": self._process_memory_mb(),
+            "sys_cpu_percent": self._cpu_percent(),
+            "sys_mem_percent": self._memory_percent(),
             "diagnostics": await self.plugin_api.get_runtime_diagnostics(),
             "capabilities": await self.plugin_api.get_capability_overview(),
             **counts,

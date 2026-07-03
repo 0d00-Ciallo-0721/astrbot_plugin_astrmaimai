@@ -374,7 +374,7 @@ class ExpressionPatternService:
         }
         if payload.get("legacy_pattern_id"):
             metadata["legacy_pattern_id"] = payload.get("legacy_pattern_id")
-        await self.write_service.write(
+        memory_id = await self.write_service.write(
             MemoryWriteRequest(
                 source=source,
                 kind="expression_pattern",
@@ -390,7 +390,10 @@ class ExpressionPatternService:
                 status=status,
             )
         )
-        return str((await self.store.get_by_dedup_key(dedup_key, include_inactive=True)).id)
+        if memory_id:
+            return str(memory_id)
+        stored = await self.store.get_by_dedup_key(dedup_key, include_inactive=True)
+        return str(stored.id) if stored else ""
 
     async def render_active_patterns(self, group_id: str, *, limit: int = 5) -> str:
         patterns = await self.list_patterns(

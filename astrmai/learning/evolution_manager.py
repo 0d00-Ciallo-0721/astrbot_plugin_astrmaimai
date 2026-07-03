@@ -85,7 +85,8 @@ class EvolutionManager:
                 content=content,
             )
             return
-        self.db.add_message_log(
+        await asyncio.to_thread(
+            self.db.add_message_log,
             group_id=group_id,
             sender_id=sender_id,
             sender_name=sender_name,
@@ -254,8 +255,17 @@ class EvolutionManager:
         group_lock = await self._get_mining_lock(group_id)
         async with group_lock:
             current_unprocessed = await self._load_unprocessed_logs(group_id, limit=999)
-            current_unprocessed_ids = {log.id for log in current_unprocessed}
-            if not logs or logs[0].id not in current_unprocessed_ids:
+            requested_ids = {
+                self._field(log, "id")
+                for log in logs
+                if self._field(log, "id") is not None
+            }
+            logs = [
+                log
+                for log in current_unprocessed
+                if self._field(log, "id") in requested_ids
+            ]
+            if not logs:
                 return
 
             patterns = await self.expression_miner.mine(group_id, logs)
@@ -266,7 +276,7 @@ class EvolutionManager:
                 jargons = await self.jargon_miner.mine(group_id, logs)
                 jargon_count = await self._save_jargons(group_id, jargons)
 
-            await self._mark_logs_processed([log.id for log in logs])
+            await self._mark_logs_processed([self._field(log, "id") for log in logs])
             payload = MiningCompletedEvent(
                 group_id=str(group_id),
                 pattern_count=len(patterns),

@@ -90,7 +90,7 @@ class MemoryInjectionService:
             )
             await db_service.save_retrieval_trace_async(record.to_orm_model())
         except Exception:
-            pass
+            logger.warning("[MemoryInjection] failed to persist retrieval trace", exc_info=True)
 
     @classmethod
     def has_memory_intent(cls, text: str) -> bool:

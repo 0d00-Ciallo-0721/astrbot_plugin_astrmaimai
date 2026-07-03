@@ -72,6 +72,7 @@ class MemoryPromotionEngine:
             evidence = {
                 "turn_id": str(evidence.get("turn_id") or item.get("turn_id") or ""),
                 "text": str(evidence.get("text") or value)[:200],
+                "memory_id": str(evidence.get("memory_id") or item.get("memory_id") or ""),
             }
             yield (subject_id, entity, attribute, value), evidence
 
@@ -99,6 +100,7 @@ class MemoryPromotionEngine:
             report["scanned_canonical"] += 1
         for key, evidence in self._iter_detected_facts(maintenance_result):
             grouped[key].append(evidence)
+            canonical_source_ids[key].append(str(evidence.get("memory_id") or ""))
             report["scanned_detected_facts"] += 1
 
         for (subject_id, entity, attribute, value), evidences in grouped.items():

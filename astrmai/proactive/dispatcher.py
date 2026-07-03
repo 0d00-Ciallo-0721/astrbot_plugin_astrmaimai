@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from time import monotonic
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -110,11 +109,20 @@ class ProactiveDispatcher:
     async def _safety_check(self, intent: ProactiveMessageIntent, *, now: float) -> tuple[bool, str, dict[str, Any]]:
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
         snapshot = await self._activity_snapshot(intent.chat_id)
-        latest_ts = float(snapshot.get("latest_activity_ts", 0.0) or 0.0)
+        try:
+            latest_ts = float(snapshot.get("latest_activity_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            latest_ts = 0.0
         active_age = max(0.0, now - latest_ts) if latest_ts > 0 else 0.0
         active = intent.source == "wakeup" or (latest_ts > 0 and active_age <= 1800.0)
-        wait_targets = [str(item) for item in snapshot.get("wait_targets", []) or [] if str(item).strip()]
-        executor_pending = int(snapshot.get("executor_pending", 0) or 0)
+        raw_wait_targets = snapshot.get("wait_targets", []) or []
+        if not isinstance(raw_wait_targets, (list, tuple, set)):
+            raw_wait_targets = [raw_wait_targets]
+        wait_targets = [str(item).strip() for item in raw_wait_targets if str(item).strip()]
+        try:
+            executor_pending = int(snapshot.get("executor_pending", 0) or 0)
+        except (TypeError, ValueError):
+            executor_pending = 1
         energy = await self._state_energy(intent.chat_id)
         min_energy = float(getattr(getattr(self.config, "life", None), "wakeup_min_energy", 0.0) or 0.0)
         talk_willingness = intent.metadata.get("talk_willingness", None)
@@ -123,6 +131,9 @@ class ProactiveDispatcher:
         except (TypeError, ValueError):
             talk_value = None
         cooldown_until = float(self._cooldowns.get(intent.chat_id, 0.0) or 0.0)
+        if cooldown_until and now >= cooldown_until:
+            self._cooldowns.pop(intent.chat_id, None)
+            cooldown_until = 0.0
         checks = {
             "has_attention_gate": bool(self.attention_gate and hasattr(self.attention_gate, "inject_external_event")),
             "chat_active": active,
@@ -216,7 +227,7 @@ class ProactiveDispatcher:
                     except (TypeError, ValueError):
                         cooldown_seconds = 0.0
                     if cooldown_seconds > 0:
-                        cooldown_until = monotonic() + cooldown_seconds
+                        cooldown_until = time.time() + cooldown_seconds
                         self._cooldowns[str(item.get("chat_id", "") or "")] = cooldown_until
                 decision = payload
                 break

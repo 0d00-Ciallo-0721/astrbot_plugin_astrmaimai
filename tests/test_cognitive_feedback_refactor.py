@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -323,6 +324,23 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertIn("温柔陪伴型", captured_prompt["prompt"])
         self.assertIn("今天没有显著事件。", captured_prompt["prompt"])
         self.assertEqual(memory.memory_calls[0]["content"], "[内部日记] quiet diary summary")
+
+    def test_diary_service_should_run_covers_full_early_morning_window(self):
+        service = self.diary_mod.DiaryService(
+            persistence=None,
+            memory_engine=None,
+            config=None,
+            call_background_lane=None,
+            semaphore=None,
+        )
+        at_3 = time.mktime((2026, 7, 3, 3, 30, 0, 0, 0, -1))
+        at_4 = time.mktime((2026, 7, 3, 4, 30, 0, 0, 0, -1))
+        at_5 = time.mktime((2026, 7, 3, 5, 0, 0, 0, 0, -1))
+
+        self.assertTrue(service.should_run("", at_3))
+        self.assertTrue(service.should_run("", at_4))
+        self.assertFalse(service.should_run("", at_5))
+        self.assertFalse(service.should_run("2026-07-03", at_4))
 
 
 if __name__ == "__main__":

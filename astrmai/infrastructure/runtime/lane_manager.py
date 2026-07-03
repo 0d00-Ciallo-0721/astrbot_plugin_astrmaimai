@@ -92,10 +92,13 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
             if lane_umo not in self._lane_locks:
                 self._lane_locks[lane_umo] = asyncio.Lock()
                 if len(self._lane_locks) > 100:
-                    oldest = next(iter(self._lane_locks))
+                    for candidate_umo, candidate_lock in list(self._lane_locks.items()):
+                        if len(self._lane_locks) <= 100:
+                            break
+                        if candidate_umo == lane_umo or candidate_lock.locked():
+                            continue
+                        self._lane_locks.pop(candidate_umo, None)
                     # ponytail: M14 — skip locks held by active coroutines
-                    if not self._lane_locks[oldest].locked():
-                        self._lane_locks.pop(oldest, None)
             return self._lane_locks[lane_umo]
 
     async def _should_rotate(

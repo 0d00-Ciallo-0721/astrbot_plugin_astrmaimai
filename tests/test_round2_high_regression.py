@@ -35,7 +35,8 @@ class Round2RegressionTests(unittest.TestCase):
 
     def test_r10_bm25_score_range_fixed(self):
         src = _read("astrmai/memory/retrieval/bm25.py")
-        self.assertIn("max(abs(max_score), 1.0)", src)
+        self.assertIn("ORDER BY score ASC", src)
+        self.assertIn("(max_score - r.score) / score_range", src)
 
     def test_r11_visual_cortex_queue_maxsize(self):
         src = _read("astrmai/multimodal/visual_cortex.py")

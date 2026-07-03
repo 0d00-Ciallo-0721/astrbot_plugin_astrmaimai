@@ -14,6 +14,17 @@ if TYPE_CHECKING:
     from ...app.runtime_facade_protocol import RuntimeFacadeProtocol
 
 
+def _runtime_fallback_text(facade: RuntimeFacadeProtocol) -> str:
+    try:
+        getter = getattr(facade, "get_runtime_config", None)
+        config = getter() if callable(getter) else None
+        reply = getattr(config, "reply", None) if config is not None else None
+        return str(getattr(reply, "fallback_text", "") or "")
+    except Exception:
+        logger.debug("[AstrMai] failed to resolve runtime fallback text", exc_info=True)
+        return ""
+
+
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     scope = MessageScope.from_event(event)
     msg = event.message_str.strip() if event.message_str else ""
@@ -102,8 +113,7 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
 
     if status == "error":
         # ponytail: surface the failure to the user instead of silently dropping the message (R10)
-        fallback = getattr(getattr(facade, "config", None), "reply", None)
-        fallback_text = getattr(fallback, "fallback_text", None) if fallback else None
+        fallback_text = _runtime_fallback_text(facade)
         yield event.plain_result(fallback_text or "处理出错，请稍后重试")
         return
     debug_trace(event, "ingress.after_attention", status=status, direct_call=is_direct_call)

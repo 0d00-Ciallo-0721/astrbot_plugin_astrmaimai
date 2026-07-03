@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from astrmai.conversation.attention.context_compaction import ContextCompactionEngine
+from astrmai.conversation.attention.context_compaction import CompactionExecutor, CompactionResult, ContextCompactionEngine
 from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
 from astrmai.conversation.contracts.focus_context import FocusThreadContext
 from astrmai.infrastructure.context_economy import ContextEconomyCenter
@@ -712,6 +712,37 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
             self.assertEqual(engine._state_for_chat("chat-1")["last_state"], "COOLDOWN")
 
         asyncio.run(run())
+
+    def test_compaction_executor_delegates_without_losing_focus_context(self):
+        class _Engine:
+            def __init__(self):
+                self.calls = []
+
+            async def maybe_compact(self, chat_id, focus_context=None):
+                self.calls.append(("compact", chat_id, focus_context))
+                return CompactionResult(chat_id=chat_id, triggered=True, state="COOLDOWN")
+
+            async def get_trace_status(self, chat_id, focus_context=None):
+                self.calls.append(("trace", chat_id, focus_context))
+                return {"chat_id": chat_id, "focus_context": focus_context}
+
+        engine = _Engine()
+        executor = CompactionExecutor(engine)
+        focus_context = SimpleNamespace(focus_id="focus-1")
+
+        result = asyncio.run(executor.maybe_compact("chat-1", focus_context=focus_context))
+        trace = asyncio.run(executor.get_trace_status("chat-1", focus_context=focus_context))
+
+        self.assertTrue(result.triggered)
+        self.assertEqual(result.state, "COOLDOWN")
+        self.assertIs(trace["focus_context"], focus_context)
+        self.assertEqual(
+            engine.calls,
+            [
+                ("compact", "chat-1", focus_context),
+                ("trace", "chat-1", focus_context),
+            ],
+        )
 
 
 if __name__ == "__main__":

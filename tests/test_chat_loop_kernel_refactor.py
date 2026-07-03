@@ -134,6 +134,40 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.decision.metadata["scheduler_bucket"], "fast_recheck")
         self.assertEqual(calls, [])
 
+    def test_background_dispatch_failure_records_retry_state(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _Compaction:
+            async def get_trace_status(self, chat_id):
+                return {
+                    "message_count_since_last_compaction": 100,
+                    "next_eval_at_count": 80,
+                    "pending_eval_nodes_count": 0,
+                }
+
+        async def _failing_bridge(chat_id, snapshot, decision):
+            raise RuntimeError("bridge failed")
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(context_compaction=_Compaction())
+        kernel.bind_dispatch_bridge("COMPACTION_EVALUATE", _failing_bridge)
+
+        async def _run():
+            with self.assertRaises(RuntimeError):
+                await kernel.tick(chat_id="default:GroupMessage:group-1", trigger="heartbeat")
+            return await kernel.get_loop_state("default:GroupMessage:group-1")
+
+        state = asyncio.run(_run())
+
+        self.assertEqual(state.last_decision, "COMPACTION_EVALUATE")
+        self.assertGreater(state.retry_backoff_until, 0.0)
+        self.assertEqual(state.next_tick_at, state.retry_backoff_until)
+        self.assertTrue(state.pending_signals["dispatch_failed"])
+        self.assertEqual(state.pending_signals["dispatch_error_type"], "RuntimeError")
+        self.assertEqual(state.pending_signals["dispatch_error_reason"], "bridge failed")
+
     def test_message_resume_wait_produces_resume_action(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):

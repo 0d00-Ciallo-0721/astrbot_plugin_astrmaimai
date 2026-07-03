@@ -260,6 +260,41 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertEqual([item[0] for item in seen], ["prepare", "continue"])
         self.assertEqual(seen[1][2], {"prepared": True})
 
+    def test_plan_and_execute_honors_cognitive_gate_without_calling_decide(self):
+        class _GateOnlyLoop:
+            def __init__(self):
+                self.gate_calls = 0
+                self.mark_calls = []
+
+            def gate_decision(self, event, prompt_envelope=None):
+                self.gate_calls += 1
+                return SimpleNamespace(
+                    should_run=False,
+                    skip_reason="test_gate_skip",
+                    signals=["test_gate_skip"],
+                    readonly_tools_allowed=False,
+                )
+
+            def mark_gate_decision(self, event, gate, *, ran=False):
+                self.mark_calls.append((gate.skip_reason, ran))
+                event.set_extra("astrmai_cognitive_loop_skipped_reason", gate.skip_reason)
+
+            async def decide(self, **kwargs):
+                raise AssertionError("cognitive decide should not run when gate rejects")
+
+        planner = self._make_planner(None)
+        planner.cognitive_loop = _GateOnlyLoop()
+        event = _FakeEvent(text="please answer normally with enough detail")
+        _install_focus_extras(event)
+
+        result = asyncio.run(planner.plan_and_execute(event, [event]))
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(planner.cognitive_loop.gate_calls, 1)
+        self.assertEqual(planner.cognitive_loop.mark_calls, [("test_gate_skip", False)])
+        self.assertEqual(event.get_extra("astrmai_cognitive_loop_skipped_reason"), "test_gate_skip")
+        self.assertEqual(len(planner.executor.calls), 1)
+
     def test_planner_settles_no_send_relationship_for_negative_ignore_turn(self):
         observed = {}
 

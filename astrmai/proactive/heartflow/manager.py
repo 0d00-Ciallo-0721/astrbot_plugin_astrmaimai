@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from time import monotonic
 from dataclasses import replace
 from typing import Any
 
@@ -96,9 +95,22 @@ class HeartflowManager:
         return self._clamp(direct_count_score + direct_recency)
 
     @staticmethod
-    def _snapshot_tags(snapshot: dict) -> list[str]:
-        tags = snapshot.get("cooldown_tags", []) or []
-        return [str(tag or "").strip() for tag in tags if str(tag or "").strip()]
+    def _string_list_snapshot(snapshot: dict, key: str) -> list[str]:
+        values = snapshot.get(key, []) or []
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        return [str(item or "").strip() for item in values if str(item or "").strip()]
+
+    @staticmethod
+    def _executor_pending(snapshot: dict) -> int:
+        try:
+            return max(0, int(snapshot.get("executor_pending", 0) or 0))
+        except (TypeError, ValueError):
+            return 1
+
+    @classmethod
+    def _snapshot_tags(cls, snapshot: dict) -> list[str]:
+        return cls._string_list_snapshot(snapshot, "cooldown_tags")
 
     def _conflict_penalty(self, snapshot: dict, state: HeartflowChatState | None = None) -> float:
         tags = set(self._snapshot_tags(snapshot))
@@ -356,7 +368,7 @@ class HeartflowManager:
         }
 
     async def preview_chat(self, chat_id: str, snapshot: dict | None = None, now: float | None = None) -> dict[str, Any]:
-        now = monotonic() if now is None else now
+        now = time.time() if now is None else now
         if snapshot is None and self.runtime_coordinator and hasattr(self.runtime_coordinator, "get_activity_snapshot"):
             try:
                 snapshot = await self.runtime_coordinator.get_activity_snapshot(chat_id)
@@ -379,7 +391,11 @@ class HeartflowManager:
             self._cleanup_sessions(now=now)
             self._cleanup_stale_chat_history(now=now)
         if snapshot is None and self.runtime_coordinator and hasattr(self.runtime_coordinator, "get_activity_snapshot"):
-            snapshot = await self.runtime_coordinator.get_activity_snapshot(chat_id)
+            try:
+                snapshot = await self.runtime_coordinator.get_activity_snapshot(chat_id)
+            except Exception as exc:
+                logger.debug(f"[Heartflow] tick snapshot degraded for {chat_id}: {exc}")
+                snapshot = {}
         session, state, pulse, action, decision = await self._compute_chat_cycle(chat_id, snapshot=snapshot, now=now, persist_session=True)
         if not all((session, state, pulse, action, decision)):
             return {"chat_id": chat_id, "eligible": False, "action_type": "", "blocked_reason": "snapshot_unavailable"}
@@ -435,10 +451,10 @@ class HeartflowManager:
         now: float,
         session: HeartflowSessionState | None = None,
     ) -> HeartflowChatState:
-        latest_ts = float(snapshot.get("latest_activity_ts", 0.0) or 0.0)
+        latest_ts = self._float_snapshot(snapshot, "latest_activity_ts")
         age_seconds = max(0.0, now - latest_ts) if latest_ts > 0 else self.ACTIVE_CHAT_TTL_SECONDS
-        recent_count = int(snapshot.get("recent_activity_count", 0) or 0)
-        recent_count_60s = int(snapshot.get("recent_activity_count_60s", 0) or 0)
+        recent_count = self._int_snapshot(snapshot, "recent_activity_count")
+        recent_count_60s = self._int_snapshot(snapshot, "recent_activity_count_60s")
         preview = str(snapshot.get("latest_activity_preview", "") or "").strip()
         energy, mood = await self._load_state_values(chat_id)
 
@@ -594,8 +610,8 @@ class HeartflowManager:
         *,
         now: float,
     ) -> HeartflowActionDecision:
-        wait_targets = [str(item) for item in snapshot.get("wait_targets", []) or [] if str(item).strip()]
-        executor_pending = self._int_snapshot(snapshot, "executor_pending")
+        wait_targets = self._string_list_snapshot(snapshot, "wait_targets")
+        executor_pending = self._executor_pending(snapshot)
         age_seconds = max(0.0, now - float(session.last_activity_ts or 0.0)) if session.last_activity_ts > 0 else self.ACTIVE_CHAT_TTL_SECONDS
         visible_score, score_components = self._compute_visible_candidate_score(state, session)
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
@@ -723,8 +739,8 @@ class HeartflowManager:
     ) -> HeartflowImpulseDecision:
         latest_ts = float(snapshot.get("latest_activity_ts", state.last_activity_ts) or 0.0)
         age_seconds = max(0.0, now - latest_ts) if latest_ts > 0 else self.ACTIVE_CHAT_TTL_SECONDS + 1.0
-        wait_targets = [str(item) for item in snapshot.get("wait_targets", []) or [] if str(item).strip()]
-        executor_pending = int(snapshot.get("executor_pending", 0) or 0)
+        wait_targets = self._string_list_snapshot(snapshot, "wait_targets")
+        executor_pending = self._executor_pending(snapshot)
         visible_score, score_components = self._compute_visible_candidate_score(state, session)
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
         visible_threshold = rhythm.threshold(self.VISIBLE_CANDIDATE_SCORE_THRESHOLD)

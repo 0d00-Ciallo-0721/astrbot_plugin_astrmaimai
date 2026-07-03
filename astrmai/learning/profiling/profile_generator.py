@@ -68,17 +68,24 @@ class ProfileGenerator:
         tags: list[str] = []
         analysis = ""
         memory_points: list[str] = []
-        text = str(result or "").strip()
-        if not text:
+        data = result if isinstance(result, dict) else None
+        text = "" if data is not None else str(result or "").strip()
+        if data is None and not text:
             return {"tags": tags, "analysis": analysis, "memory_points": memory_points}
 
         try:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
+            if data is None:
+                match = re.search(r"\{.*\}", text, re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+            if isinstance(data, dict):
                 raw_tags = data.get("tags", [])
                 if isinstance(raw_tags, list):
-                    tags = [str(item).strip() for item in raw_tags if str(item).strip()]
+                    tags = [
+                        str(item).strip()
+                        for item in raw_tags
+                        if item is not None and str(item).strip()
+                    ]
                 analysis = str(data.get("summary", data.get("analysis", "")) or "").strip()
                 raw_points = data.get("memory_points", [])
                 if isinstance(raw_points, list):
@@ -91,7 +98,7 @@ class ProfileGenerator:
                         category = str(item.get("category", "其他") or "其他").strip()
                         weight = item.get("weight", 0.5)
                         memory_points.append(f"{category}:{content}:{weight}")
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
         if not analysis:

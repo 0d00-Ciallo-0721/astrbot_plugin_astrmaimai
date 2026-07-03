@@ -219,7 +219,7 @@ class WakeupService:
         chat_id = str(getattr(state, "chat_id", "") or "")
         if not chat_id:
             return None
-        guidance = await self.generate_opening_line(chat_id)
+        guidance = str(await self.generate_opening_line(chat_id) or "").strip()
         if not guidance:
             return None
         return ProactiveMessageIntent(

@@ -49,6 +49,8 @@ class MemoryContextBuilder:
                 prefix += " (possibly stale)"
             line = f"{prefix} {text}"
             if len(line) > budget:
+                if budget <= 3:
+                    break
                 line = line[: max(0, budget - 3)] + "..."
             lines.append(line)
             budget -= len(line)

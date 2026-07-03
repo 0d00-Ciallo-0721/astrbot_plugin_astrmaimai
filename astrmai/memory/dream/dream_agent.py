@@ -356,8 +356,9 @@ class DreamAgent:
                         "emotion": event.emotion,
                         "importance": event.importance,
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"[DreamAgent] failed to read legacy memory event {event_id}: {exc}")
+            raise
         return None
 
     def _delete_event(self, event_id: str):
