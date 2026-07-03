@@ -761,6 +761,59 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_projection_failure_is_pending_and_repairable(self):
+        class _FlakyRetriever:
+            def __init__(self):
+                self.fail = True
+                self.added = []
+
+            async def add_memory(self, content, metadata):
+                if self.fail:
+                    raise RuntimeError("vector unavailable")
+                self.added.append((content, metadata))
+                return len(self.added)
+
+        class _FakeEngine:
+            def __init__(self, store):
+                self.v2_store = store
+                self.retriever = _FlakyRetriever()
+                self.deleted = []
+
+            def _build_memory_metadata(self, **kwargs):
+                return dict(kwargs)
+
+            async def _run_documents_query(self, query, params=(), *, db_path=None):
+                return []
+
+            async def _execute_documents_write(self, query, params=(), *, db_path=None):
+                self.deleted.append((query, params))
+                return 0
+
+        async def run():
+            store, _retrieval, _writer, _injection, _tools, _maintenance = self._services()
+            engine = _FakeEngine(store)
+            projector = self.projector_mod.MemoryIndexProjector(engine)
+            writer = self.write_mod.MemoryWriteService(store, projector)
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content="Alice recoverable projection memory.",
+                )
+            )
+
+            report = await projector.check_consistency()
+            self.assertIn(memory_id, report["missing_projection_ids"])
+
+            engine.retriever.fail = False
+            repaired = await projector.repair_consistency(report)
+
+            self.assertEqual(repaired["rebuilt_missing"], 1)
+            self.assertEqual(engine.retriever.added[0][1]["canonical_id"], memory_id)
+
+        asyncio.run(run())
+
     def test_hybrid_projection_fallback_must_pass_canonical_status_check(self):
         class _Result:
             content = "Alice deleted projected memory."
@@ -1399,6 +1452,51 @@ class MemoryV2ServiceTests(unittest.TestCase):
         fused = retrieval._fuse_candidates([candidate], [], query)
         self.assertEqual(len(fused), 1)
         self.assertAlmostEqual(fused[0].metadata["_score_breakdown"]["conflict_penalty"], 0.35, places=4)
+
+    def test_hybrid_search_batch_hydrates_canonical_candidates_in_result_order(self):
+        class _HybridResult:
+            def __init__(self, content, score, metadata):
+                self.content = content
+                self.score = score
+                self.metadata = metadata
+
+        class _Engine:
+            async def search_memories(self, *args, **kwargs):
+                return [
+                    _HybridResult("first", 0.7, {"canonical_id": "mem-1"}),
+                    _HybridResult("index only", 0.6, {"id": "idx_1"}),
+                    _HybridResult("second", 0.8, {"canonical_id": "mem-2"}),
+                ]
+
+        class _Store:
+            def __init__(self, candidate_cls):
+                self.batch_calls = []
+                self.get_by_id_calls = []
+                self.rows = {
+                    "mem-1": candidate_cls(id="mem-1", kind="memory", source="unit", summary="first", content="first", relevance_score=0.1),
+                    "mem-2": candidate_cls(id="mem-2", kind="memory", source="unit", summary="second", content="second", relevance_score=0.2),
+                }
+
+            async def batch_get_by_ids(self, ids, *, allow_stale=False):
+                self.batch_calls.append((list(ids), allow_stale))
+                return {key: self.rows[key] for key in ids if key in self.rows}
+
+            async def get_by_id(self, memory_id, *, allow_stale=False):
+                self.get_by_id_calls.append((memory_id, allow_stale))
+                return self.rows.get(memory_id)
+
+        async def run():
+            store = _Store(self.contracts.MemoryCandidate)
+            retrieval = self.retrieval_mod.MemoryRetrievalService(store, engine=_Engine())
+            query = self.contracts.MemoryQuery(query="needle", session_id="chat-1", top_k=3)
+            candidates = await retrieval._hybrid_search(query, "auto")
+            self.assertEqual([item.id for item in candidates], ["mem-1", "idx_1", "mem-2"])
+            self.assertEqual(store.batch_calls, [(["mem-1", "mem-2"], False)])
+            self.assertEqual(store.get_by_id_calls, [])
+            self.assertGreaterEqual(candidates[0].relevance_score, 0.7)
+            self.assertGreaterEqual(candidates[2].relevance_score, 0.8)
+
+        asyncio.run(run())
 
     def test_deep_retrieval_hydrates_missing_metadata_before_rerank(self):
         class _Gateway:

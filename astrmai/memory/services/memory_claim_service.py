@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from astrbot.api import logger
+
 from ...infrastructure.context_economy.prompt_templates import PromptTemplateId
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.memory_query import MemoryClaim
@@ -115,6 +117,7 @@ class MemoryClaimExtractor:
             if isinstance(response, str):
                 response = json.loads(response)
         except Exception:
+            logger.debug("[MemoryClaimExtractor] LLM claim extraction failed", exc_info=True)
             return []
         result: list[MemoryClaim] = []
         for item in list((response or {}).get("claims", []) or []):

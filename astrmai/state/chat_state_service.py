@@ -144,6 +144,12 @@ class ChatStateService:
     def get_active_states(self) -> List[ChatState]:
         return list(self.chat_states.values())
 
+    async def clear_chat_state(self, chat_id: str) -> bool:
+        async with self._get_chat_lock(chat_id):
+            removed = self.chat_states.pop(chat_id, None) is not None
+            self._chat_locks.pop(chat_id, None)
+            return removed
+
     async def atomic_update_mood(
         self,
         chat_id: str,
@@ -341,6 +347,9 @@ class StateEngine:
 
     def get_active_states(self) -> List[ChatState]:
         return self.chat_state_service.get_active_states()
+
+    async def clear_chat_state(self, chat_id: str) -> bool:
+        return await self.chat_state_service.clear_chat_state(chat_id)
 
     def get_active_profiles(self) -> List[UserProfile]:
         return self.user_profile_service.get_active_profiles()

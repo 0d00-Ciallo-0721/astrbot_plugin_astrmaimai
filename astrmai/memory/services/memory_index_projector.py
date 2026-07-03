@@ -12,19 +12,21 @@ class MemoryIndexProjector:
 
     def __init__(self, engine):
         self.engine = engine
+        self._pending_projection_ids: set[str] = set()
 
     def _documents_db_path(self) -> str | None:
         return getattr(self.engine, "db_path", None)
 
-    async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> None:
+    async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
         if not memory_id or not getattr(self.engine, "retriever", None):
-            return
+            return False
         try:
             if request is None:
                 candidate = await self.engine.v2_store.get_by_id(memory_id, allow_stale=False)
                 if not candidate:
                     await self.delete_projection(memory_id)
-                    return
+                    self._pending_projection_ids.discard(memory_id)
+                    return True
                 request = MemoryWriteRequest(
                     source=candidate.source,
                     kind=candidate.kind,
@@ -53,8 +55,12 @@ class MemoryIndexProjector:
             )
             metadata.update(dict(request.metadata or {}))
             await self.engine.retriever.add_memory(request.content, metadata)
+            self._pending_projection_ids.discard(memory_id)
+            return True
         except Exception as exc:
+            self._pending_projection_ids.add(memory_id)
             logger.warning(f"[MemoryIndexProjector] projection degraded: {exc}")
+            return False
 
     async def delete_projection(self, memory_id: str) -> int:
         return await self.cleanup_deleted([memory_id])
@@ -121,6 +127,10 @@ class MemoryIndexProjector:
                 by_canonical.setdefault(canonical_id, []).append(doc_id)
             projected_ids = set(by_canonical)
             report["missing_projection_ids"] = sorted(projectable_ids - projected_ids)
+            if self._pending_projection_ids:
+                report["missing_projection_ids"] = sorted(
+                    set(report["missing_projection_ids"]) | (self._pending_projection_ids & projectable_ids)
+                )
             for canonical_id, doc_ids in by_canonical.items():
                 if len(doc_ids) > 1:
                     report["duplicate_projection_ids"].append(canonical_id)
@@ -143,15 +153,15 @@ class MemoryIndexProjector:
             "deduplicated": 0,
         }
         for memory_id in report.get("missing_projection_ids", []) or []:
-            await self.project(str(memory_id))
-            repaired["rebuilt_missing"] += 1
+            if await self.project(str(memory_id)):
+                repaired["rebuilt_missing"] += 1
         removable = set(report.get("orphan_projection_ids", []) or []) | set(report.get("inactive_projection_ids", []) or [])
         if removable:
             repaired["deleted_orphan"] = await self.cleanup_deleted(sorted(removable & set(report.get("orphan_projection_ids", []) or [])))
             repaired["deleted_inactive"] = await self.cleanup_deleted(sorted(removable & set(report.get("inactive_projection_ids", []) or [])))
         for memory_id in report.get("duplicate_projection_ids", []) or []:
-            await self.project(str(memory_id))
-            repaired["deduplicated"] += 1
+            if await self.project(str(memory_id)):
+                repaired["deduplicated"] += 1
         return repaired
 
     async def _clear_projected_documents(self, *, session_id: str = "") -> int:

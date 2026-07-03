@@ -65,6 +65,10 @@ class GroupDialogueStore:
             self._threads[chat_id] = thread
         return thread
 
+    async def clear_chat(self, chat_id: str) -> bool:
+        async with self._lock:
+            return self._threads.pop(self._resolve_chat_key(chat_id), None) is not None
+
     @staticmethod
     def _resolve_chat_key(chat_id) -> str:
         """Resolve chat_id to a dict key, rejecting None/empty values.

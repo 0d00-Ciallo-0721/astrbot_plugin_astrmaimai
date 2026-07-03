@@ -2319,6 +2319,42 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         result = adapter._apply_hot_config({}, object())
         self.assertFalse(result)
 
+    def test_dashboard_repository_count_table_enforces_whitelist(self):
+        repo_mod = importlib.import_module("astrmai.webui.backend.services.dashboard_repository")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = os.path.join(tmpdir, "dashboard.db")
+
+            async def run():
+                db = await aiosqlite.connect(db_path)
+                try:
+                    await db.execute("CREATE TABLE UserProfile (id TEXT)")
+                    await db.execute("CREATE TABLE MemoryEvent (id TEXT)")
+                    await db.execute("CREATE TABLE canonical_memories (id TEXT)")
+                    await db.commit()
+                finally:
+                    await db.close()
+
+                @asynccontextmanager
+                async def db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                repo = repo_mod.DashboardRepository(db_factory)
+                counts = [
+                    await repo.count_table("UserProfile"),
+                    await repo.count_table("MemoryEvent"),
+                    await repo.count_table("canonical_memories"),
+                ]
+                with self.assertRaises(ValueError):
+                    await repo.count_table("UserProfile; DROP TABLE MemoryEvent")
+                return counts
+
+            self.assertEqual(asyncio.run(run()), [0, 0, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

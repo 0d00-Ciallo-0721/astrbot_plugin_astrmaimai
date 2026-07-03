@@ -372,8 +372,10 @@ class PreFilters:
             bot_id = str(event.bot.self_id)
             
         if not bot_id and hasattr(event, "get_self_id"):
-            try: bot_id = str(event.get_self_id())
-            except Exception: pass
+            try:
+                bot_id = str(event.get_self_id())
+            except Exception:
+                logger.debug("[AstrMai-Sensor] Failed to read bot self_id from event", exc_info=True)
                 
         if not bot_id: bot_id = "unknown"
 
@@ -439,7 +441,8 @@ class PreFilters:
                 valid_name = current_name
                 
             profile = None
-            if hasattr(attention_gate, 'state_engine'):
+            is_anonymous_uid = str(uid or "").startswith("80000000")
+            if not is_anonymous_uid and hasattr(attention_gate, 'state_engine'):
                 profile = await attention_gate.state_engine.get_user_profile(uid)
                 
             # 如果 event 没带有效名字，向数据库画像借用
@@ -447,7 +450,7 @@ class PreFilters:
                 valid_name = profile.name
                 
             # 如果数据库也没有，强行调用 API 溯源
-            if not valid_name:
+            if not valid_name and not is_anonymous_uid:
                 client = getattr(event, 'bot', None)
                 if client and hasattr(client, 'api') and group_id:
                     try:

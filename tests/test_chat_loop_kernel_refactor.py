@@ -1150,6 +1150,104 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertIn(("cancel_group_wait_if_interrupted", "BUFFERED"), facade_calls)
         self.assertIn(("suppress_default_llm_if_engaged", "BUFFERED", False), facade_calls)
 
+    def test_message_entry_anonymous_sender_skips_user_activity_tracking(self):
+        facade_calls = []
+
+        async def _handle_group_reply_wait(event, scope):
+            return "NONE"
+
+        async def _try_consume_reflect_feedback(event):
+            return None
+
+        async def _record_and_dispatch_attention(event, scope):
+            facade_calls.append(("record_and_dispatch_attention", scope.sender_id, scope.is_anonymous_sender))
+            return "BUFFERED"
+
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        def _check_message_scope_access(scope):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=_check_message_scope_access,
+            handle_group_reply_wait=_handle_group_reply_wait,
+            is_debug_mode=lambda: False,
+            track_incoming_user_activity=lambda sender_id: facade_calls.append(("track", sender_id)),
+            try_consume_reflect_feedback=_try_consume_reflect_feedback,
+            record_and_dispatch_attention=_record_and_dispatch_attention,
+            cancel_group_wait_if_interrupted=lambda event, result, status: None,
+            suppress_default_llm_if_engaged=lambda event, status, is_direct_call: None,
+        )
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="800000001234",
+            sender_name="Anonymous",
+            group_id="group-1",
+            text="anonymous message",
+        )
+
+        async def _run():
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
+
+        self.assertEqual(asyncio.run(_run()), [])
+        self.assertNotIn(("track", "800000001234"), facade_calls)
+        self.assertIn(("record_and_dispatch_attention", "800000001234", True), facade_calls)
+
+    def test_group_decrease_notice_clears_only_runtime_state_for_bot_self(self):
+        facade_mod = importlib.import_module("astrmai.app.plugin_facade")
+        calls = []
+
+        class _AsyncClear:
+            def __init__(self, method_name):
+                setattr(self, method_name, self._clear)
+
+            async def _clear(self, chat_id):
+                calls.append(chat_id)
+                return True
+
+        class _Heartflow:
+            def clear_chat(self, chat_id):
+                calls.append(chat_id)
+                return True
+
+        class _GroupWait:
+            def cancel_wait(self, chat_id, reason=""):
+                calls.append((chat_id, reason))
+                return True
+
+        facade = object.__new__(facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(
+            attention_gate=_AsyncClear("clear_chat_state"),
+            state_engine=_AsyncClear("clear_chat_state"),
+            runtime_coordinator=_AsyncClear("clear_runtime_state"),
+            dialogue_store=_AsyncClear("clear_chat"),
+            chat_loop_kernel=_AsyncClear("clear_chat_state"),
+            proactive_task=SimpleNamespace(heartflow_manager=_Heartflow()),
+            group_reply_wait_manager=_GroupWait(),
+        )
+        event = SimpleNamespace(
+            unified_msg_origin="default:GroupMessage:123456",
+            raw_event={
+                "post_type": "notice",
+                "notice_type": "group_decrease",
+                "group_id": "123456",
+                "user_id": "bot-1",
+                "self_id": "bot-1",
+            },
+            get_self_id=lambda: "bot-1",
+        )
+
+        handled = asyncio.run(facade.handle_group_membership_notice(event))
+
+        self.assertTrue(handled)
+        self.assertEqual(calls.count("default:GroupMessage:123456"), 6)
+        self.assertIn(("default:GroupMessage:123456", "bot_left_group"), calls)
+
     def test_message_entry_self_message_stops_before_kernel(self):
         calls = []
 

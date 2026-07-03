@@ -526,6 +526,28 @@ class MemoryV2Store:
             return None
         return self._row_to_candidate(row)
 
+    async def batch_get_by_ids(self, memory_ids: list[str], *, allow_stale: bool = False) -> dict[str, MemoryCandidate]:
+        await self.initialize()
+        ids = list(dict.fromkeys(str(item or "").strip() for item in memory_ids if str(item or "").strip()))
+        if not ids:
+            return {}
+        statuses = [ACTIVE_STATUS]
+        if allow_stale:
+            statuses.append(STALE_STATUS)
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
+                       tags, importance, confidence, status, create_time,
+                       update_time, last_access_time, metadata, visibility, access_count, decay_score, superseded_by
+                FROM canonical_memories
+                WHERE id IN ({','.join('?' for _ in ids)}) AND status IN ({','.join('?' for _ in statuses)})
+                """,
+                (*ids, *statuses),
+            )
+            rows = await cursor.fetchall()
+        return {str(row[0]): self._row_to_candidate(row) for row in rows}
+
     async def get_canonical(self, memory_id: str, *, include_inactive: bool = False) -> MemoryCandidate | None:
         await self.initialize()
         where = "id = ?"

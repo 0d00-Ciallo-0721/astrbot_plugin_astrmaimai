@@ -83,6 +83,7 @@ class MemoryEngine:
         self._is_ready = False
         self._init_failures = 0
         self._next_retry_time = 0.0
+        self._index_consistency_repaired = False
         self._learning_event_history = []
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
         self._disabled_cognitive_feedback_keys: dict[str, float] = {}
@@ -244,6 +245,24 @@ class MemoryEngine:
                 except Exception as exc:
                     await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])
                     logger.warning(f"[MemoryV2] index rebuild degraded: {exc}")
+            if not self._index_consistency_repaired:
+                try:
+                    report = await self.index_projector.check_consistency()
+                    needs_repair = any(
+                        report.get(key)
+                        for key in (
+                            "missing_projection_ids",
+                            "orphan_projection_ids",
+                            "inactive_projection_ids",
+                            "duplicate_projection_ids",
+                        )
+                    )
+                    if needs_repair:
+                        repaired = await self.index_projector.repair_consistency(report)
+                        logger.info(f"[MemoryV2] index consistency repaired: {repaired}")
+                    self._index_consistency_repaired = True
+                except Exception as exc:
+                    logger.warning(f"[MemoryV2] index consistency repair degraded: {exc}")
             logger.info("[AstrMai] hybrid memory engine ready (BM25 + FaissVecDB).")
             return True
 

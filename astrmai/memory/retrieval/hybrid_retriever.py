@@ -1,6 +1,7 @@
 import asyncio
 import time
 import math
+import json
 from typing import List, Dict, Any, Optional
 from astrbot.api import logger
 
@@ -83,10 +84,9 @@ class HybridRetriever:
         for r in results:
             meta = r.metadata
             if isinstance(meta, str):
-                import json
                 try:
                     meta = json.loads(meta)
-                except:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     meta = {}
                     
             create_time = meta.get("create_time", now)

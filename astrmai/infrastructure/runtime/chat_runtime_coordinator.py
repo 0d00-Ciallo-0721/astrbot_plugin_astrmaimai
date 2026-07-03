@@ -152,14 +152,7 @@ class ChatRuntimeCoordinator:
 
     async def clear_runtime_state(self, chat_id: str) -> bool:
         async with self._lock:
-            state = self._states.get(chat_id)
-            if not state:
-                return False
-            state.executor_pending = 0
-            state.wait_targets = []
-            state.wait_target_name = ""
-            state.activity_times = []
-            return True
+            return self._states.pop(chat_id, None) is not None
 
     async def prune_inactive(self, max_idle_sec: float = 1800) -> int:
         now = time.time()

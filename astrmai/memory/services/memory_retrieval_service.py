@@ -245,15 +245,34 @@ class MemoryRetrievalService:
         excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
         layer_set = {str(item) for item in query.layers or [] if str(item).strip()}
         candidates: list[MemoryCandidate] = []
+        pending_ids: list[str] = []
+        hybrid_candidates: list[tuple[MemoryCandidate, str | None]] = []
         for result in results:
             candidate = self._result_to_candidate(result, query)
             canonical_id = str(candidate.metadata.get("canonical_id") or candidate.id or "")
             if canonical_id and not canonical_id.startswith("idx_"):
-                canonical = await self.store.get_by_id(canonical_id, allow_stale=query.allow_stale)
+                pending_ids.append(canonical_id)
+                hybrid_candidates.append((candidate, canonical_id))
+            else:
+                hybrid_candidates.append((candidate, None))
+        canonical_map = {}
+        if pending_ids and hasattr(self.store, "batch_get_by_ids"):
+            try:
+                canonical_map = await self.store.batch_get_by_ids(pending_ids, allow_stale=query.allow_stale)
+            except Exception as exc:
+                logger.debug(f"[MemoryRetrievalService] batch canonical hydrate failed: {exc}")
+                canonical_map = {}
+        for candidate, canonical_id in hybrid_candidates:
+            if canonical_id:
+                canonical = canonical_map.get(canonical_id)
                 if not canonical:
                     continue
-                canonical.relevance_score = max(candidate.relevance_score, canonical.relevance_score)
+                canonical.relevance_score = max(float(candidate.relevance_score or 0.0), float(canonical.relevance_score or 0.0))
                 candidate = canonical
+            candidates.append(candidate)
+        # Filter out excluded/deleted
+        final_candidates = []
+        for candidate in candidates:
             if candidate.id in excluded:
                 continue
             if candidate.status in {"deleted", "merged", "deprecated", "review_pending", "rejected", "superseded"}:
@@ -266,8 +285,8 @@ class MemoryRetrievalService:
                 continue
             if layer_set and candidate.kind not in layer_set:
                 continue
-            candidates.append(candidate)
-        return candidates
+            final_candidates.append(candidate)
+        return final_candidates
 
     def _fuse_candidates(
         self,

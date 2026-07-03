@@ -15,7 +15,10 @@ class ReviewDispatcher:
         requests = await self.reflect_tracker.get_unsent_requests()
         for item in requests:
             try:
-                await self.context.send_message(item["group_id"], MessageChain().message(item["question"]))
+                umo = self._normalize_umo(item.get("umo") or item.get("group_id", ""))
+                await self.context.send_message(umo, MessageChain().message(item["question"]))
+                if hasattr(self.reflect_tracker, "mark_request_sent"):
+                    await self.reflect_tracker.mark_request_sent(str(item.get("pattern_id", "") or ""))
             except Exception as exc:
                 logger.warning(f"[Life] review dispatch degraded: {exc}")
 
@@ -28,6 +31,15 @@ class ReviewDispatcher:
             logger.debug(f"[Life] review dispatcher status degraded: {exc}")
             return {"ready": False, "pending": 0}
         return {"ready": True, "pending": len(requests)}
+
+    @staticmethod
+    def _normalize_umo(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if ":" in text:
+            return text
+        return f"default:GroupMessage:{text}"
 
 
 __all__ = ["ReviewDispatcher"]

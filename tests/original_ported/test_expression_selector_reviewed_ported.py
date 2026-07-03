@@ -96,5 +96,27 @@ class ExpressionSelectorReviewedPortedTests(unittest.TestCase):
         self.assertNotIn("咻——！", third)
 
 
+    def test_fast_select_blocks_conflicting_contextual_situation(self):
+        db = _FakeDB()
+        db.patterns = [
+            _FakePattern("被夸奖时", "thanks for saying that"),
+            _FakePattern("", "generic fallback"),
+        ]
+        selector = ExpressionSelector(db, _FakeGateway())
+
+        async def _run():
+            return await selector.select(
+                chat_id="group-1",
+                context_text="你滚，别烦我",
+                think_level=0,
+                shared_scope="group-1",
+            )
+
+        result = asyncio.run(_run())
+
+        self.assertNotIn("thanks for saying that", result)
+        self.assertIn("generic fallback", result)
+
+
 if __name__ == "__main__":
     unittest.main()

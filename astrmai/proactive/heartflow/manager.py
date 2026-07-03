@@ -917,6 +917,10 @@ class HeartflowManager:
         items = [*self._impulse_decisions_by_chat.get(decision.chat_id, []), decision]
         self._impulse_decisions_by_chat[decision.chat_id] = items[-self.IMPULSE_DECISION_HISTORY_LIMIT :]
 
+    @staticmethod
+    def _decay_no_reply_count(session: HeartflowSessionState) -> None:
+        session.consecutive_no_reply_count = max(0, int(session.consecutive_no_reply_count or 0) - 1)
+
     def _remember_action_decision(self, decision: HeartflowActionDecision) -> None:
         items = [*self._action_decisions_by_chat.get(decision.chat_id, []), decision]
         self._action_decisions_by_chat[decision.chat_id] = items[-self.ACTION_DECISION_HISTORY_LIMIT :]
@@ -926,9 +930,14 @@ class HeartflowManager:
         session.last_impulse = decision.action_type
         if decision.action_type == "observe":
             session.consecutive_observe_count += 1
+            self._decay_no_reply_count(session)
             session.consecutive_prepare_count = 0
         elif decision.action_type == "no_reply":
-            session.consecutive_no_reply_count += 1
+            previous_no_reply = int(session.consecutive_no_reply_count or 0)
+            if previous_no_reply >= 3:
+                session.consecutive_no_reply_count = max(0, previous_no_reply - 1)
+            else:
+                session.consecutive_no_reply_count = previous_no_reply + 1
             session.consecutive_prepare_count = 0
         elif decision.action_type == "prepare_reply":
             session.consecutive_prepare_count += 1
@@ -939,6 +948,7 @@ class HeartflowManager:
             session.consecutive_no_reply_count = 0
             session.consecutive_prepare_count = 0
         elif decision.action_type in {"wait", "cool_down", "complete_topic"}:
+            self._decay_no_reply_count(session)
             session.consecutive_prepare_count = 0
 
     def _recent_tags(self, chat_id: str) -> list[str]:
@@ -955,6 +965,14 @@ class HeartflowManager:
 
     def get_session(self, chat_id: str) -> HeartflowSessionState | None:
         return self._sessions.get(chat_id)
+
+    def clear_chat(self, chat_id: str) -> bool:
+        removed = self._states.pop(chat_id, None) is not None
+        removed = self._sessions.pop(chat_id, None) is not None or removed
+        removed = self._pulses_by_chat.pop(chat_id, None) is not None or removed
+        removed = self._impulse_decisions_by_chat.pop(chat_id, None) is not None or removed
+        removed = self._action_decisions_by_chat.pop(chat_id, None) is not None or removed
+        return removed
 
     def list_sessions(self, limit: int = 50) -> list[HeartflowSessionState]:
         limit = max(1, min(int(limit or 50), 300))

@@ -135,6 +135,21 @@ class AttentionGate:
         if drained:
             logger.info(f"[AttentionGate] drained {drained} deferred messages for {chat_id}")
 
+    async def clear_chat_state(self, chat_id: str) -> bool:
+        removed = False
+        async with self._pool_lock:
+            removed = self.focus_pools.pop(chat_id, None) is not None or removed
+            removed = self._proactive_dispatching.pop(chat_id, None) is not None or removed
+            removed = self._deferred_messages.pop(chat_id, None) is not None or removed
+            removed = self._proactive_injection_lock.pop(chat_id, None) is not None or removed
+        compaction = getattr(self, "context_compaction", None)
+        if compaction is not None and hasattr(compaction, "clear_chat_state"):
+            try:
+                removed = bool(compaction.clear_chat_state(chat_id)) or removed
+            except Exception as exc:
+                logger.debug(f"[AttentionGate] context compaction clear degraded for {chat_id}: {exc}")
+        return removed
+
     async def _extract_image_base64(self, image_component):
         return await extract_image_base64(self, image_component)
 
@@ -398,17 +413,19 @@ class AttentionGate:
     async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
         session = await self._get_or_create_session(chat_id)
         now = time.time()
+        is_anonymous_sender = str(sender_id or "").startswith("80000000")
+        activity_sender_id = "" if is_anonymous_sender else sender_id
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_timestamp", now)
             ensure_turn_context(event).perception.timestamp = now
-        if sender_id and sender_id != str(getattr(self.state_engine, "bot_id", "") or ""):
+        if activity_sender_id and activity_sender_id != str(getattr(self.state_engine, "bot_id", "") or ""):
             session.last_active_user_time = now
         if self.runtime_coordinator and hasattr(self.runtime_coordinator, "mark_activity"):
             try:
                 await self.runtime_coordinator.mark_activity(
                     chat_id,
                     now,
-                    sender_id,
+                    activity_sender_id,
                     event.get_sender_name() if hasattr(event, "get_sender_name") else "",
                     str(getattr(event, "message_str", "") or ""),
                     event.get_extra("astrmai_thread_signature", None) if hasattr(event, "get_extra") else None,
@@ -421,11 +438,14 @@ class AttentionGate:
         store = getattr(self, "dialogue_store", None)
         if not store:
             return
+        sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
+        if sender_id.startswith("80000000"):
+            return
         try:
             await store.append_segment(
                 chat_id,
                 event_id=self._build_message_id(event),
-                speaker_id=str(getattr(event, "get_sender_id", lambda: "")() or ""),
+                speaker_id=sender_id,
                 speaker_name=str(getattr(event, "get_sender_name", lambda: "")() or ""),
                 content=str(getattr(event, "message_str", "") or ""),
                 role="user",
@@ -465,6 +485,9 @@ class AttentionGate:
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
         if not chat_id:
             return
+        sender_id = str(event.get_sender_id() or "")
+        if sender_id.startswith("80000000"):
+            return
         content = str(getattr(event, "message_str", "") or "").strip()
         if not content and not (
             event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls"))
@@ -475,7 +498,7 @@ class AttentionGate:
             await store.append_segment(
                 chat_id,
                 event_id=self._build_message_id(event),
-                speaker_id=str(event.get_sender_id() or ""),
+                speaker_id=sender_id,
                 speaker_name=str(event.get_sender_name() or ""),
                 content=content,
                 role="user",

@@ -7,6 +7,7 @@ from astrmai.learning.review.expression_auto_check_task import ExpressionAutoChe
 from astrmai.learning.review.expression_governance_runner import ExpressionGovernanceRunner
 from astrmai.learning.review.jargon_auto_check_task import JargonAutoCheckTask
 from astrmai.learning.review.reflect_tracker import ReflectTracker
+from astrmai.proactive.review_dispatcher import ReviewDispatcher
 
 
 class FakeGateway:
@@ -140,6 +141,49 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#2", message)
         self.assertEqual(db.updated[0][1]["review_status"], "approved")
 
+    async def test_tracker_matches_full_umo_for_bare_group_pending_request(self):
+        pattern = SimpleNamespace(id=22, group_id="123456", situation="greeting", expression="here I am")
+        db = FakeDB([pattern])
+        tracker = ReflectTracker(db, FakeGateway({"decision": "approved"}), config=SimpleNamespace(global_settings=SimpleNamespace(admin_ids=["admin-1"])))
+        tracker.queue_review_request(pattern, reason="needs human confirmation")
+
+        message = await tracker.try_consume_feedback(FakeEvent("expression review #22 approve", group_id="default:GroupMessage:123456"))
+
+        self.assertIn("#22", message)
+        self.assertEqual(db.updated[0][1]["review_status"], "approved")
+
+    async def test_review_dispatcher_normalizes_bare_group_id_and_marks_sent_after_success(self):
+        class _Context:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, umo, chain):
+                self.sent.append((umo, chain))
+
+        pattern = SimpleNamespace(id=2, group_id="123456", situation="greeting", expression="here I am")
+        tracker = ReflectTracker(FakeDB([pattern]), FakeGateway({"decision": "approved"}))
+        tracker.queue_review_request(pattern, reason="needs human confirmation")
+        context = _Context()
+
+        await ReviewDispatcher(context, tracker).dispatch_pending()
+
+        self.assertEqual(context.sent[0][0], "default:GroupMessage:123456")
+        self.assertEqual(await tracker.get_unsent_requests(), [])
+
+    async def test_review_dispatcher_keeps_pending_request_when_send_fails(self):
+        class _Context:
+            async def send_message(self, umo, chain):
+                raise RuntimeError("send failed")
+
+        pattern = SimpleNamespace(id=3, group_id="123456", situation="greeting", expression="here I am")
+        tracker = ReflectTracker(FakeDB([pattern]), FakeGateway({"decision": "approved"}))
+        tracker.queue_review_request(pattern, reason="needs human confirmation")
+
+        await ReviewDispatcher(_Context(), tracker).dispatch_pending()
+
+        requests = await tracker.get_unsent_requests()
+        self.assertEqual([item["pattern_id"] for item in requests], ["3"])
+
     async def test_governance_runner_uses_canonical_backlog_not_active_states(self):
         calls = []
 
@@ -203,7 +247,7 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
             config=AstrMaiConfig(
                 evolution={
                     "review_batch_size": 10,
-                    "review_runner_min_interval_sec": 0,
+                    "review_runner_min_interval_sec": 15,
                     "jargon_min_count": 2,
                     "review_min_count": 2,
                 }
@@ -241,7 +285,7 @@ class ExpressionGovernancePortedTests(unittest.IsolatedAsyncioTestCase):
             config=AstrMaiConfig(
                 evolution={
                     "review_batch_size": 10,
-                    "review_runner_min_interval_sec": 0,
+                    "review_runner_min_interval_sec": 15,
                     "review_min_count": 1,
                     "jargon_min_count": 3,
                 }

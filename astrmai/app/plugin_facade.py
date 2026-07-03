@@ -66,6 +66,84 @@ class PluginFacade(RuntimeFacadeProtocol):
         async for result in handle_global_message(self, event):
             yield result
 
+    def _find_notice_payload(self, obj, depth: int = 0) -> dict:
+        if depth > 4:
+            return {}
+        if isinstance(obj, dict):
+            if obj.get("notice_type") == "group_decrease":
+                return obj
+            for value in obj.values():
+                found = self._find_notice_payload(value, depth + 1)
+                if found:
+                    return found
+        elif hasattr(obj, "__dict__"):
+            for value in vars(obj).values():
+                found = self._find_notice_payload(value, depth + 1)
+                if found:
+                    return found
+        return {}
+
+    def _group_decrease_notice_for_self(self, event) -> tuple[str, str] | None:
+        payload = self._find_notice_payload(event)
+        if not payload:
+            return None
+        group_id = str(payload.get("group_id") or "")
+        user_id = str(payload.get("user_id") or "")
+        self_id = str(payload.get("self_id") or "")
+        if not self_id and hasattr(event, "get_self_id"):
+            try:
+                self_id = str(event.get_self_id() or "")
+            except Exception:
+                self_id = ""
+        if not group_id or not user_id or not self_id or user_id != self_id:
+            return None
+        chat_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if not chat_id:
+            chat_id = f"default:GroupMessage:{group_id}"
+        return chat_id, group_id
+
+    async def handle_group_membership_notice(self, event) -> bool:
+        resolved = self._group_decrease_notice_for_self(event)
+        if not resolved:
+            return False
+        chat_id, group_id = resolved
+        await self.clear_group_runtime_state(chat_id, group_id=group_id)
+        logger.info(f"[AstrMai] bot left group {group_id}; cleared runtime state for {chat_id}")
+        return True
+
+    async def clear_group_runtime_state(self, chat_id: str, *, group_id: str = "") -> dict[str, bool]:
+        result: dict[str, bool] = {}
+        runtime = self.runtime
+        components = [
+            ("attention_gate", getattr(runtime, "attention_gate", None), "clear_chat_state", True),
+            ("state_engine", getattr(runtime, "state_engine", None), "clear_chat_state", True),
+            ("runtime_coordinator", getattr(runtime, "runtime_coordinator", None), "clear_runtime_state", True),
+            ("dialogue_store", getattr(runtime, "dialogue_store", None), "clear_chat", True),
+            ("chat_loop_kernel", getattr(runtime, "chat_loop_kernel", None), "clear_chat_state", True),
+        ]
+        proactive_task = getattr(runtime, "proactive_task", None)
+        heartflow_manager = getattr(proactive_task, "heartflow_manager", None) if proactive_task else None
+        components.append(("heartflow_manager", heartflow_manager, "clear_chat", False))
+        for name, component, method_name, is_async in components:
+            method = getattr(component, method_name, None) if component is not None else None
+            if not callable(method):
+                result[name] = False
+                continue
+            try:
+                cleared = await method(chat_id) if is_async else method(chat_id)
+                result[name] = bool(cleared)
+            except Exception as exc:
+                result[name] = False
+                logger.debug(f"[AstrMai] runtime clear degraded for {name}/{chat_id}: {exc}", exc_info=True)
+        group_wait = getattr(runtime, "group_reply_wait_manager", None)
+        if group_wait is not None and hasattr(group_wait, "cancel_wait"):
+            try:
+                result["group_reply_wait"] = bool(group_wait.cancel_wait(chat_id, reason="bot_left_group"))
+            except Exception as exc:
+                result["group_reply_wait"] = False
+                logger.debug(f"[AstrMai] group wait clear degraded for {chat_id}: {exc}", exc_info=True)
+        return result
+
     async def sniff_external_plugin_results(self, event) -> None:
         await sniff_external_plugin_results(self.runtime, event)
 
@@ -173,7 +251,8 @@ class PluginFacade(RuntimeFacadeProtocol):
         return None
 
     async def record_and_dispatch_attention(self, event, scope) -> str:
-        await self.runtime.evolution.record_user_message(event)
+        if not getattr(scope, "is_anonymous_sender", False):
+            await self.runtime.evolution.record_user_message(event)
         if getattr(self.runtime, "chat_loop_kernel", None) is not None:
             tick_result = await self.runtime.chat_loop_kernel.tick(
                 chat_id=scope.chat_id,

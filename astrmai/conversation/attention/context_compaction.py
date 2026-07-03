@@ -379,6 +379,11 @@ class ContextCompactionEngine(CompactionProviderMixin):
         state = self._state_for_chat(chat_id)
         return float(self._cooldown_by_chat.get(chat_id, 0.0) or state.get("cooldown_until", 0.0) or 0.0)
 
+    def clear_chat_state(self, chat_id: str) -> bool:
+        removed = self._chat_states.pop(chat_id, None) is not None
+        removed = self._cooldown_by_chat.pop(chat_id, None) is not None or removed
+        return removed
+
     # ponytail: remove _chat_states entries idle > 24h to prevent unbounded growth
     def _prune_stale_chat_states(self, max_age: float = 86400.0):
         now = time.time()

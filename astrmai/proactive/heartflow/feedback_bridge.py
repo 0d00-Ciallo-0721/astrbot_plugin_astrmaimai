@@ -104,7 +104,7 @@ class HeartflowFeedbackBridge:
         except Exception as exc:
             logger.debug(f"[HeartflowFeedbackBridge] feedback write degraded: {exc}")
             return False
-        self._last_flush_ts[chat_id] = time.time()
+        self._last_flush_ts[chat_id] = monotonic()
         self._last_pulse_ts[chat_id] = max(float(item.timestamp or 0.0) for item in pending)
         return True
 

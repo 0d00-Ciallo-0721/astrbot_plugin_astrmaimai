@@ -30,9 +30,12 @@ class ReflectTracker:
         if not getattr(pattern, "id", None):
             return
         pattern_id = str(pattern.id)
+        group_id = str(getattr(pattern, "group_id", "") or "")
+        umo = self._normalize_umo(getattr(pattern, "umo", "") or getattr(pattern, "unified_msg_origin", "") or group_id)
         self._pending[pattern_id] = {
             "pattern_id": pattern_id,
-            "group_id": pattern.group_id,
+            "group_id": group_id,
+            "umo": umo,
             "question": self._build_question(pattern, reason=reason, replacement=replacement),
             "created_at": time.time(),
             "sent": False,
@@ -52,12 +55,22 @@ class ReflectTracker:
 
     async def get_unsent_requests(self) -> List[Dict]:
         async with self._lock:
-            requests = [item.copy() for item in self._pending.values() if not item.get("sent")]
-            for req in requests:
-                pid = req.get("pattern_id", "")
-                if pid and pid in self._pending:
-                    self._pending[pid]["sent"] = True
-            return requests
+            return [item.copy() for item in self._pending.values() if not item.get("sent")]
+
+    async def mark_request_sent(self, pattern_id: str) -> None:
+        async with self._lock:
+            pid = str(pattern_id or "")
+            if pid and pid in self._pending:
+                self._pending[pid]["sent"] = True
+
+    @staticmethod
+    def _normalize_umo(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if ":" in text:
+            return text
+        return f"default:GroupMessage:{text}"
 
     async def try_consume_feedback(self, event: AstrMessageEvent) -> Optional[str]:
         admin_ids = set(getattr(self.config.global_settings, "admin_ids", []) or [])
@@ -70,9 +83,13 @@ class ReflectTracker:
             return None
 
         async with self._lock:
+            event_umo = str(event.unified_msg_origin or "")
+            normalized_event_umo = self._normalize_umo(event_umo)
             candidates = [
                 item for item in self._pending.values()
-                if item.get("group_id") == event.unified_msg_origin
+                if item.get("group_id") == event_umo
+                or item.get("umo") == event_umo
+                or item.get("umo") == normalized_event_umo
             ]
         if not candidates:
             return None

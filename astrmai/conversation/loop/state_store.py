@@ -26,6 +26,10 @@ class ChatLoopStateStore:
         async with self._lock:
             return self._states.get(chat_id)
 
+    async def clear(self, chat_id: str) -> bool:
+        async with self._lock:
+            return self._states.pop(chat_id, None) is not None
+
     async def count(self) -> int:
         async with self._lock:
             return len(self._states)

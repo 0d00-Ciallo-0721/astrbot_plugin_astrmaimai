@@ -101,7 +101,9 @@ class MemoryWriteService:
             await self.index_projector.cleanup_deleted(superseded_old_ids)
         if self.index_projector and memory_id and not new_record_is_superseded:
             try:
-                await self.index_projector.project(memory_id=memory_id, request=normalized)
+                projected = await self.index_projector.project(memory_id=memory_id, request=normalized)
+                if projected is False:
+                    logger.warning(f"[MemoryWrite] index projection pending repair for {memory_id}")
             except Exception as exc:
                 logger.warning(f"[MemoryWrite] index projection failed for {memory_id}: {exc}")
         return memory_id

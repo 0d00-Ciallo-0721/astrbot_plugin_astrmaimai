@@ -104,8 +104,8 @@ class EvolutionConfig(BaseModel):
     enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
     enable_relationship_engine: bool = Field(default=True, description="启动好感度四维关系图谱推演")
     jargon_min_count: int = Field(default=2, ge=1, description="黑话进入自动审核前所需的最少证据次数")
-    review_runner_interval_sec: int = 60
-    review_runner_min_interval_sec: int = 45
+    review_runner_interval_sec: int = Field(default=60, ge=30, le=600)
+    review_runner_min_interval_sec: int = Field(default=45, ge=15)
 
 
 class LifeConfig(BaseModel):
@@ -182,7 +182,7 @@ class MemoryConfig(BaseModel):
     deep_temporal_llm_window: int = Field(default=8, ge=1)
     maintenance_hot_beta: float = Field(default=0.7, ge=0.0, le=1.0)
     maintenance_temporal_stale_hot_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
-    auto_recall_probability: float = 0.0
+    auto_recall_probability: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class InfraConfig(BaseModel):

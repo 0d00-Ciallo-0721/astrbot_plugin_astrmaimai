@@ -191,6 +191,14 @@ class AstrMaiPlugin(Star):
     # ponytail: priority=10 is lower than many plugins. Lower-priority plugins
     # that return content before on_global_message fires will silently suppress
     # AstrMai. Consider priority=1 if suppression is observed in the field.
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
+    async def on_group_membership_notice(self, event: AstrMessageEvent):
+        try:
+            if await self.facade.handle_group_membership_notice(event):
+                event.stop_event()
+        except Exception:
+            logger.exception("[AstrMai] group membership notice hook failed")
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_global_message(self, event: AstrMessageEvent):
         if event.get_extra("heartflow_is_command"):

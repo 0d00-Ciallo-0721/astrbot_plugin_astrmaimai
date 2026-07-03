@@ -70,10 +70,13 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         sender_name = event.get_sender_name()
         logger.info(f"[AstrMai-Sensor] 收到消息 | 发送者: {sender_name} | 内容: {msg_str[:20]}...")
 
-    try:
-        facade.track_incoming_user_activity(event.get_sender_id())
-    except Exception:
-        logger.warning("[AstrMai] track_incoming_user_activity failed")
+    if not scope.is_anonymous_sender:
+        try:
+            facade.track_incoming_user_activity(event.get_sender_id())
+        except Exception:
+            logger.warning("[AstrMai] track_incoming_user_activity failed")
+    else:
+        debug_trace(event, "ingress.anonymous_sender", chat_id=scope.chat_id)
 
     try:
         review_feedback = await facade.try_consume_reflect_feedback(event)

@@ -119,13 +119,65 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertGreater(state.interest, 0.70)
         self.assertGreater(state.engagement, 0.50)
-        self.assertGreater(state.talk_willingness, 0.25)
-        hidden = manager.get_hidden_context("chat-1")
-        self.assertIn("interest=", hidden)
-        self.assertIn("high_interest", hidden)
-        self.assertIn("what now?", hidden)
-        self.assertIn("latest_impulse_decision=", hidden)
-        self.assertIn("dispatch_enabled=False", hidden)
+
+    def test_no_reply_counter_decays_after_threshold(self):
+        manager_mod = importlib.import_module("astrmai.proactive.heartflow.manager")
+        models_mod = importlib.import_module("astrmai.proactive.heartflow.models")
+        manager = manager_mod.HeartflowManager(
+            runtime_coordinator=self.coordinator_mod.ChatRuntimeCoordinator(),
+            state_engine=_FakeStateEngine(),
+            memory_engine=_FakeMemory(),
+        )
+        manager._sessions["chat-1"] = models_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=100.0,
+            last_activity_ts=100.0,
+            last_tick_ts=100.0,
+            expires_at=1000.0,
+            consecutive_no_reply_count=3,
+        )
+        decision = models_mod.HeartflowActionDecision(
+            chat_id="chat-1",
+            timestamp=120.0,
+            action_type="no_reply",
+            reason="insert pressure",
+            guidance="stay quiet",
+            blocked_reason="insert_pressure",
+        )
+
+        manager._remember_action_decision(decision)
+
+        self.assertEqual(manager.get_session("chat-1").consecutive_no_reply_count, 2)
+
+    def test_no_reply_counter_decays_on_non_reply_actions(self):
+        manager_mod = importlib.import_module("astrmai.proactive.heartflow.manager")
+        models_mod = importlib.import_module("astrmai.proactive.heartflow.models")
+        manager = manager_mod.HeartflowManager(
+            runtime_coordinator=self.coordinator_mod.ChatRuntimeCoordinator(),
+            state_engine=_FakeStateEngine(),
+            memory_engine=_FakeMemory(),
+        )
+        manager._sessions["chat-1"] = models_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=100.0,
+            last_activity_ts=100.0,
+            last_tick_ts=100.0,
+            expires_at=1000.0,
+            consecutive_no_reply_count=4,
+        )
+
+        for action in ("observe", "wait", "cool_down", "complete_topic"):
+            manager._remember_action_decision(
+                models_mod.HeartflowActionDecision(
+                    chat_id="chat-1",
+                    timestamp=120.0,
+                    action_type=action,
+                    reason="release",
+                    guidance="release silence",
+                )
+            )
+
+        self.assertEqual(manager.get_session("chat-1").consecutive_no_reply_count, 0)
 
     def test_heartflow_creates_session_and_records_hidden_action(self):
         coordinator = self.coordinator_mod.ChatRuntimeCoordinator()

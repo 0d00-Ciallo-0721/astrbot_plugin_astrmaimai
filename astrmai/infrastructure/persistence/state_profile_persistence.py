@@ -269,5 +269,5 @@ class StateProfilePersistenceMixin:
                 INSERT INTO lastmessagemetadatadb 
                 (chat_id, sender_id, has_image, image_urls, vl_executed, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (chat_id, sender_id, has_image, json.dumps(image_urls), False, time.time()))
+            """, (chat_id, sender_id, has_image, json.dumps(image_urls, ensure_ascii=False), False, time.time()))
             await db.commit()

@@ -45,6 +45,10 @@ class MessageScope:
     def is_private_chat(self) -> bool:
         return not self.is_group_chat
 
+    @property
+    def is_anonymous_sender(self) -> bool:
+        return self.sender_id.startswith("80000000")
+
     @classmethod
     def from_event(cls, event: Any) -> "MessageScope":
         umo, platform_type, entity_id = resolve_event_scope(event)

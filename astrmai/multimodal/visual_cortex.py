@@ -94,7 +94,7 @@ class VisualCortex:
                 logger.info(f"[AstrMai-VisualCortex] cache hit for {picid}, skip duplicate analysis.")
                 return
 
-            prepared = ImagePipeline.prepare_image(base64_data)
+            prepared = await asyncio.to_thread(ImagePipeline.prepare_image, base64_data)
             if not prepared:
                 logger.warning(f"[AstrMai-VisualCortex] failed to prepare image payload: {picid}")
                 return

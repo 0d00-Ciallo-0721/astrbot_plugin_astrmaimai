@@ -267,7 +267,7 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
             return "动作取消：不能 @ 自己。"
         added = _append_once(
             current_event,
-            matcher=lambda item: item.get("action") == "at" and str(item.get("target_id")) == target_id,
+            matcher=lambda item: item.get("action") == "at" and str(item.get("target_id") or "") == target_id,
             action={
                 "action": "at",
                 "target_id": target_id,

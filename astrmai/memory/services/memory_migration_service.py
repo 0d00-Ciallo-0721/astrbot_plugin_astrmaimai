@@ -89,7 +89,7 @@ class MemoryMigrationService:
             if self.index_projector:
                 report["rebuilt_projection"] = await self.index_projector.rebuild_all()
             report["verification"] = await self.verify()
-            await self.store.record_migration("2_final_execute", status="applied", detail=json.dumps(report["imported"]))
+            await self.store.record_migration("2_final_execute", status="applied", detail=json.dumps(report["imported"], ensure_ascii=False))
         except Exception as exc:
             report["errors"].append(str(exc))
             await self.store.record_migration("2_final_execute", status="failed", detail=str(exc)[:500])

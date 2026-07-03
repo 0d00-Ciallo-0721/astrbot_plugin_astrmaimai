@@ -300,19 +300,24 @@ class ChatLoopKernel:
         }
 
     def _scheduler_policy(self) -> dict[str, Any]:
+        cached = getattr(self, "_cached_scheduler_policy", None)
+        if cached is not None:
+            return cached
         default_policy = self._default_scheduler_policy_values()
         active_profile = str(self._scheduler_policy_profile_name or self.DEFAULT_SCHEDULER_PROFILE_NAME)
         profile_values = dict(self.SCHEDULER_POLICY_PROFILES.get(active_profile, {}) or {})
         merged = deepcopy(default_policy)
         for key, value in profile_values.items():
             merged[key] = deepcopy(value)
+        self._cached_scheduler_policy = merged
         return merged
+
+    def _invalidate_scheduler_policy_cache(self):
+        self._cached_scheduler_policy = None
 
     def _scheduler_policy_value(self, key: str, default: Any = None) -> Any:
         policy = self._scheduler_policy()
-        if key in policy:
-            return deepcopy(policy[key])
-        return deepcopy(default)
+        return policy.get(key, default)
 
     @classmethod
     def scheduler_policy_profiles_sync(cls) -> dict[str, dict[str, Any]]:
@@ -323,12 +328,13 @@ class ChatLoopKernel:
         if profile_name not in self.SCHEDULER_POLICY_PROFILES:
             raise ValueError(f"Unknown scheduler profile: {profile_name}")
         self._scheduler_policy_profile_name = profile_name
+        self._invalidate_scheduler_policy_cache()
 
     def scheduler_policy_sync(self) -> dict[str, Any]:
         return {
             "active_profile": str(self._scheduler_policy_profile_name or self.DEFAULT_SCHEDULER_PROFILE_NAME),
             "available_profiles": list(self.SCHEDULER_POLICY_PROFILES.keys()),
-            "current": self._scheduler_policy(),
+            "current": deepcopy(self._scheduler_policy()),
             "profiles": self.scheduler_policy_profiles_sync(),
         }
 
@@ -386,6 +392,11 @@ class ChatLoopKernel:
 
     async def peek_loop_state(self, chat_id: str) -> ChatLoopState | None:
         return await self._state_store.get(str(chat_id or ""))
+
+    async def clear_chat_state(self, chat_id: str) -> bool:
+        chat_key = str(chat_id or "")
+        self._heartbeat_pass_context.pop(chat_key, None)
+        return await self._state_store.clear(chat_key)
 
     async def arm_group_wait(self, chat_id: str, payload: dict[str, Any]) -> ChatLoopState:
         state = await self._state_store.get_or_create(str(chat_id or ""))

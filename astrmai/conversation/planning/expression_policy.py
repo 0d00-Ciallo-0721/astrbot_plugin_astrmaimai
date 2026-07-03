@@ -359,21 +359,70 @@ class ExpressionSelector:
 
     @staticmethod
     def _situation_keyword_match(situation: str, context: str) -> bool:
-        """Lightweight match: check if situation CJK bigrams overlap with context.
-        Returns True if there's at least partial overlap, or if situation is empty/universal."""
         if not situation or not str(situation).strip():
             return True
         sit = str(situation).strip()
         ctx = str(context or "").strip()
         if not ctx:
             return True
-        sit_chars = re.sub(r"[^\u4e00-\u9fff]", "", sit)
-        ctx_chars = re.sub(r"[^\u4e00-\u9fff]", "", ctx)
-        if not sit_chars:
+        sit_features = ExpressionSelector._extract_situation_features(sit)
+        ctx_features = ExpressionSelector._extract_situation_features(ctx)
+        if not sit_features["tags"] and not sit_features["tokens"]:
             return True
-        sit_bigrams = {sit_chars[i:i+2] for i in range(len(sit_chars)-1)}
-        ctx_bigrams = {ctx_chars[i:i+2] for i in range(len(ctx_chars)-1)}
-        return bool(sit_bigrams & ctx_bigrams)
+        if not ctx_features["tags"] and not ctx_features["tokens"]:
+            return True
+        if ExpressionSelector._has_conflicting_situation_tags(sit_features["tags"], ctx_features["tags"]):
+            return False
+        if sit_features["tags"] and ctx_features["tags"]:
+            return bool(sit_features["tags"] & ctx_features["tags"])
+        if sit_features["tokens"] and ctx_features["tokens"]:
+            return bool(sit_features["tokens"] & ctx_features["tokens"])
+        return not sit_features["tags"]
+
+    @staticmethod
+    def _extract_situation_features(text: str) -> dict[str, set[str]]:
+        value = str(text or "").strip().lower()
+        tag_keywords = {
+            "praise": ("夸", "赞", "喜欢", "厉害", "不错", "好棒", "优秀", "可爱", "牛", "谢谢", "感谢", "praise", "praised", "good", "nice", "thanks"),
+            "attack": ("滚", "骂", "讨厌", "烦", "闭嘴", "傻", "垃圾", "恶心", "爬", "gun", "hate", "shut"),
+            "reject": ("拒绝", "不要", "别", "不想", "算了", "免了", "走开"),
+            "help": ("帮", "求", "怎么", "如何", "为什么", "能不能", "请问", "help", "how", "why"),
+            "joke": ("哈哈", "笑死", "玩笑", "开玩笑", "梗", "乐", "lol", "hhh"),
+            "comfort": ("难过", "伤心", "焦虑", "害怕", "累", "安慰", "抱抱", "哭"),
+            "greeting": ("你好", "早", "晚安", "嗨", "hello", "hi"),
+        }
+        tags: set[str] = set()
+        tokens: set[str] = set()
+        for tag, keywords in tag_keywords.items():
+            for keyword in keywords:
+                if keyword in value:
+                    tags.add(tag)
+                    tokens.add(keyword)
+        for word in re.findall(r"[a-z0-9_]{2,}", value):
+            tokens.add(word)
+        cjk = re.sub(r"[^\u4e00-\u9fff]", "", value)
+        if len(cjk) == 1:
+            tokens.add(cjk)
+        elif len(cjk) > 1:
+            tokens.update(cjk[i:i+2] for i in range(len(cjk) - 1))
+        return {"tags": tags, "tokens": tokens}
+
+    @staticmethod
+    def _has_conflicting_situation_tags(situation_tags: set[str], context_tags: set[str]) -> bool:
+        conflicts = {
+            ("praise", "attack"),
+            ("praise", "reject"),
+            ("comfort", "attack"),
+            ("greeting", "attack"),
+        }
+        return any(a in situation_tags and b in context_tags for a, b in conflicts) or any(
+            b in situation_tags and a in context_tags for a, b in conflicts
+        )
+
+    @staticmethod
+    def _has_situation_signal(text: str) -> bool:
+        features = ExpressionSelector._extract_situation_features(text)
+        return bool(features["tags"])
 
     def _apply_pattern_cooldown(
         self,
@@ -468,6 +517,10 @@ class ExpressionSelector:
             return '', []
         # Lightweight situation match: keep patterns whose situation has CJK bigram overlap with context
         matched = [p for p in patterns if self._situation_keyword_match(getattr(p, 'situation', ''), context_text)]
+        if not matched and self._has_situation_signal(context_text):
+            matched = [p for p in patterns if not self._has_situation_signal(getattr(p, 'situation', ''))]
+        if not matched and self._has_situation_signal(context_text):
+            return '', []
         if not matched:
             matched = list(patterns)  # fallback: no match → use all patterns
         scope_key = self._scope_key(chat_id, shared_scope)

@@ -101,6 +101,41 @@ class RelationshipProfileRoundtripMigratedTests(unittest.TestCase):
         self.assertGreater(vector.emotion_bond, 6.0)
         self.assertGreater(vector.respect, 3.0)
 
+    def test_affection_is_unified_across_groups_for_same_user(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(emotion_mapping=[]),
+        )
+        engine = StateEngine(_ProfilePersistence(), SimpleNamespace(config=config), config=config)
+
+        async def _run():
+            before = await engine.get_user_profile("user-cross-group")
+            before_score = before.social_score
+            await engine.calculate_and_update_affection(
+                user_id="user-cross-group",
+                group_id="group-a",
+                mood_tag="happy",
+                message_text="谢谢你帮我",
+            )
+            after_first = await engine.get_user_profile("user-cross-group")
+            after_first_score = after_first.social_score
+            await engine.calculate_and_update_affection(
+                user_id="user-cross-group",
+                group_id="group-b",
+                mood_tag="happy",
+                message_text="谢谢你帮我",
+            )
+            after_second = await engine.get_user_profile("user-cross-group")
+            return before_score, after_first_score, after_second.social_score
+
+        before, after_first, after_second = asyncio.run(_run())
+
+        self.assertNotEqual(after_first, before)
+        self.assertGreater(after_second, after_first)
+        self.assertIn("user-cross-group", engine.relationship_engine._vectors)
+        self.assertNotIn(("user-cross-group", "group-a"), engine.relationship_engine._vectors)
+
     def test_relationship_vector_roundtrip_preserves_last_decay_time(self):
         temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 

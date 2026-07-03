@@ -3,6 +3,7 @@ import importlib
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from tests.helpers import install_astrbot_stubs
 
@@ -73,6 +74,27 @@ class MemoryConflictResolutionTests(unittest.TestCase):
             self.assertNotEqual(decision.action, "authority_override")
         else:
             self.assertEqual(decision.action, "plain_memory_write")
+
+    def test_llm_claim_extraction_failure_returns_empty_claims(self):
+        class _Templates:
+            def render_template(self, *_args, **_kwargs):
+                return SimpleNamespace(prompt="extract", system_prompt="system")
+
+        class _Gateway:
+            context_economy = SimpleNamespace(templates=_Templates())
+
+            async def call_data_process_task(self, **_kwargs):
+                raise RuntimeError("provider failed")
+
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor(_Gateway())
+            return await extractor.extract(
+                user_text="plain chat with no rule claim",
+                subject_id="zlj",
+                turn_id="turn-4",
+            )
+
+        self.assertEqual(asyncio.run(run()), [])
 
 
 if __name__ == "__main__":

@@ -94,6 +94,21 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("当前不是群聊", result)
         self.assertEqual(api.calls, [])
 
+    def test_construct_at_event_ignores_dirty_none_target_when_deduping(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.set_extra("astrmai_pending_actions", [{"action": "at", "target_id": None}])
+
+        class _DbService:
+            async def resolve_entity_spatio_temporal(self, **kwargs):
+                return "user-2", "111"
+
+        tool = self.mod.ConstructAtEventTool(db_service=_DbService())
+        asyncio.run(tool.call(_wrap_event(event), target_name="Bob"))
+
+        actions = event.get_extra("astrmai_pending_actions")
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[-1]["target_id"], "user-2")
+
     def test_group_sign_tool_calls_current_group_only(self):
         event = _FakeEvent(group_id="67890")
         api = _FakeApi()

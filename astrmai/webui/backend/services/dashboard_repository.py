@@ -8,10 +8,14 @@ from typing import Any, Callable
 class DashboardRepository:
     """Encapsulates raw SQL queries for dashboard data."""
 
+    _COUNT_TABLE_WHITELIST = frozenset({"UserProfile", "MemoryEvent", "canonical_memories"})
+
     def __init__(self, db_factory: Callable):
         self.db_factory = db_factory
 
     async def count_table(self, table: str) -> int:
+        if table not in self._COUNT_TABLE_WHITELIST:
+            raise ValueError(f"Table {table!r} is not in the allowed whitelist")
         try:
             async with self.db_factory() as db:
                 async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
