@@ -1431,6 +1431,19 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_search_scoring_weights_sum_to_one(self):
+        scoring_mod = importlib.import_module("astrmai.memory.services.memory_scoring")
+        scoring = scoring_mod.DEFAULT_MEMORY_SCORING
+
+        total = (
+            scoring.search_weight
+            + scoring.search_importance_weight
+            + scoring.search_confidence_weight
+            + scoring.search_recency_weight
+        )
+
+        self.assertAlmostEqual(total, 1.0)
+
     def test_fuse_candidates_uses_configured_conflict_penalty(self):
         scoring_mod = importlib.import_module("astrmai.memory.services.memory_scoring")
         retrieval = self.retrieval_mod.MemoryRetrievalService(
