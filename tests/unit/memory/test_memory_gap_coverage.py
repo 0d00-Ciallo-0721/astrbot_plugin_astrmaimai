@@ -263,6 +263,107 @@ class MemoryGapCoverageTests(unittest.TestCase):
         self.assertEqual(report["jargon"]["pending_human_without_review_suggestion"], 1)
         self.assertEqual(report["expression_pattern"]["missing_situation"], 1)
 
+    def test_memory_engine_add_memory_builds_legacy_write_request(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+
+        class _WriteService:
+            def __init__(self):
+                self.requests = []
+
+            async def write(self, request):
+                self.requests.append(request)
+                return "mem-written"
+
+        gateway = SimpleNamespace(config=SimpleNamespace(provider=SimpleNamespace(embedding_models=[]), memory=SimpleNamespace(recall_top_k=5)))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), gateway, embedding_models=[], config=gateway.config)
+        engine.write_service = _WriteService()
+
+        result = asyncio.run(
+            engine.add_memory(
+                "remember this",
+                session_id="chat-1",
+                persona_id="persona-1",
+                importance=0.9,
+                sender_id="user-1",
+                created_at=123.0,
+            )
+        )
+
+        request = engine.write_service.requests[0]
+        self.assertEqual(result, "mem-written")
+        self.assertEqual(request.source, "legacy_add_memory")
+        self.assertEqual(request.kind, "memory")
+        self.assertEqual(request.session_id, "chat-1")
+        self.assertEqual(request.persona_id, "persona-1")
+        self.assertEqual(request.sender_id, "user-1")
+        self.assertEqual(request.content, "remember this")
+        self.assertEqual(request.importance, 0.9)
+        self.assertEqual(request.source_ref, "memory_engine.add_memory")
+
+    def test_memory_engine_search_memories_returns_empty_when_faiss_initialization_fails(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        gateway = SimpleNamespace(config=SimpleNamespace(provider=SimpleNamespace(embedding_models=[]), memory=SimpleNamespace(recall_top_k=5)))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), gateway, embedding_models=[], config=gateway.config)
+        engine._ensure_faiss_initialized = lambda: asyncio.sleep(0, result=False)
+
+        result = asyncio.run(engine.search_memories("query", top_k=3, session_id="chat-1"))
+
+        self.assertEqual(result, [])
+
+    def test_memory_engine_recall_query_and_search_render_retrieval_results(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+
+        class _RetrievalService:
+            def __init__(self, contracts):
+                self.contracts = contracts
+                self.queries = []
+
+            async def retrieve(self, query):
+                self.queries.append(query)
+                return [
+                    _candidate(self.contracts, "mem-1", content="visible memory", summary="visible summary"),
+                    _candidate(self.contracts, "mem-feedback", content="[cognitive_feedback:test]\nsummary: hidden"),
+                ]
+
+            def render_recall(self, query, candidates):
+                return f"{query.session_id}|" + ",".join(item.id for item in candidates)
+
+        gateway = SimpleNamespace(config=SimpleNamespace(provider=SimpleNamespace(embedding_models=[]), memory=SimpleNamespace(recall_top_k=7)))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), gateway, embedding_models=[], config=gateway.config)
+        engine.retrieval_service = _RetrievalService(self.contracts)
+
+        recalled = asyncio.run(engine.recall("hello", session_id="chat-1", persona_id="persona-1", layers=["memory"], top_k=2))
+        queried = asyncio.run(engine.query("hello", session_id="chat-2", top_k=4))
+        searched = asyncio.run(engine.search("hello", session_id="chat-3", top_k=5))
+
+        self.assertEqual(recalled, "chat-1|mem-1")
+        self.assertEqual(queried, "chat-2|mem-1")
+        self.assertEqual(searched, "chat-3|mem-1")
+        first_query = engine.retrieval_service.queries[0]
+        self.assertEqual(first_query.query, "hello")
+        self.assertEqual(first_query.persona_id, "persona-1")
+        self.assertEqual(first_query.layers, ["memory"])
+        self.assertEqual(first_query.top_k, 2)
+        self.assertEqual(first_query.exclude_kinds, ["feedback"])
+
+    def test_memory_engine_recall_returns_no_result_message_when_empty(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+
+        class _RetrievalService:
+            async def retrieve(self, query):
+                return []
+
+            def render_recall(self, query, candidates):
+                raise AssertionError("empty recall should not render")
+
+        gateway = SimpleNamespace(config=SimpleNamespace(provider=SimpleNamespace(embedding_models=[]), memory=SimpleNamespace(recall_top_k=5)))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), gateway, embedding_models=[], config=gateway.config)
+        engine.retrieval_service = _RetrievalService()
+
+        result = asyncio.run(engine.recall("missing", session_id="chat-1"))
+
+        self.assertEqual(result, "No relevant memory found for 'missing'.")
+
 
 if __name__ == "__main__":
     unittest.main()

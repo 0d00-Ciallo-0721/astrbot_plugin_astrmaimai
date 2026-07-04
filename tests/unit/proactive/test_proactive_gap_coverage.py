@@ -28,11 +28,13 @@ class ProactiveGapCoverageTests(unittest.TestCase):
             "astrmai.proactive.dispatcher",
             "astrmai.proactive.wakeup_service",
             "astrmai.proactive.heartflow.manager",
+            "astrmai.proactive.proactive_task",
         ):
             sys.modules.pop(module_name, None)
         self.dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
         self.wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
         self.heartflow_mod = importlib.import_module("astrmai.proactive.heartflow.manager")
+        self.task_mod = importlib.import_module("astrmai.proactive.proactive_task")
 
     def tearDown(self):
         try:
@@ -264,6 +266,63 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         self.assertEqual(payload["blocked_reason"], "user_waiting")
         self.assertIsNotNone(manager.get_state("chat-3"))
         self.assertIsNotNone(manager.get_session("chat-3"))
+
+    def test_proactive_task_maintenance_cycle_isolates_subservice_failures(self):
+        async def _run():
+            calls = []
+
+            class _Decay:
+                async def run_once(self):
+                    calls.append("decay")
+                    raise RuntimeError("decay failed")
+
+            class _GroupSignin:
+                async def run_once(self):
+                    calls.append("signin")
+
+            class _Digest:
+                async def run_once(self, manager):
+                    calls.append(("digest", manager.name))
+
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task.decay_service = _Decay()
+            task.group_signin_service = _GroupSignin()
+            task.heartflow_topic_digest_service = _Digest()
+            task.heartflow_manager = SimpleNamespace(name="heartflow")
+            task._background_tasks = set()
+            task._handle_task_result = lambda background_task: task._background_tasks.discard(background_task)
+            task._fire_background_task = self.task_mod.ProactiveTask._fire_background_task.__get__(task, self.task_mod.ProactiveTask)
+
+            await task._run_maintenance_cycle()
+            await asyncio.gather(*list(task._background_tasks))
+
+            self.assertEqual(calls, ["decay", "signin", ("digest", "heartflow")])
+            self.assertEqual(task._background_tasks, set())
+
+        asyncio.run(_run())
+
+    def test_proactive_task_stop_cancels_loop_and_background_tasks(self):
+        async def _run():
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task._is_running = True
+
+            async def _sleep_forever():
+                await asyncio.sleep(60)
+
+            loop_task = asyncio.create_task(_sleep_forever())
+            background_task = asyncio.create_task(_sleep_forever())
+            task._task = loop_task
+            task._background_tasks = {background_task}
+
+            await task.stop()
+
+            self.assertFalse(task._is_running)
+            self.assertIsNone(task._task)
+            self.assertTrue(loop_task.cancelled())
+            self.assertTrue(background_task.cancelled())
+            self.assertEqual(task._background_tasks, set())
+
+        asyncio.run(_run())
 
     def test_preview_chat_uses_epoch_clock_for_stale_snapshot(self):
         class _Coordinator:

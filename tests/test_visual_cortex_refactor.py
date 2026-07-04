@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import importlib
 import io
 import sys
@@ -96,6 +97,42 @@ class VisualCortexRefactorTests(unittest.TestCase):
         asyncio.run(cortex.process_image_async("pic-1", self._build_png_base64(), scope_id="chat-1"))
         self.assertIn("chat-1:pic-1", stored)
         self.assertEqual(stored["chat-1:pic-1"].description, "test")
+
+    def test_worker_marks_queue_item_done_when_processing_raises(self):
+        async def _run():
+            cortex = self.visual_mod.VisualCortex(gateway=None, db_service=None)
+
+            async def _raise(_picid, _base64_data):
+                raise RuntimeError("vision unavailable")
+
+            cortex.process_image_async = _raise
+            worker = asyncio.create_task(cortex._worker())
+            await cortex.queue.put(("pic-error", "payload"))
+            await asyncio.wait_for(cortex.queue.join(), timeout=1.0)
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+
+        asyncio.run(_run())
+
+    def test_worker_marks_queue_item_done_when_cancelled_during_processing(self):
+        async def _run():
+            cortex = self.visual_mod.VisualCortex(gateway=None, db_service=None)
+            started = asyncio.Event()
+
+            async def _block(_picid, _base64_data):
+                started.set()
+                await asyncio.sleep(60)
+
+            cortex.process_image_async = _block
+            worker = asyncio.create_task(cortex._worker())
+            await cortex.queue.put(("pic-cancel", "payload"))
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            worker.cancel()
+            await worker
+            await asyncio.wait_for(cortex.queue.join(), timeout=1.0)
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

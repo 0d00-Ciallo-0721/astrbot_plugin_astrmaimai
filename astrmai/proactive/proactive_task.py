@@ -232,6 +232,13 @@ class ProactiveTask:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._background_tasks:
+            tasks = list(self._background_tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.difference_update(tasks)
 
     def configure(
         self,
@@ -761,6 +768,20 @@ class ProactiveTask:
             self._last_maintenance_budget_remaining = int(selection_report.get("maintenance_budget_remaining", 0) or 0)
         return results
 
+    async def _run_maintenance_cycle(self) -> None:
+        try:
+            await self.decay_service.run_once()
+        except Exception as exc:
+            logger.error(f"[ProactiveTask] decay maintenance degraded: {exc}")
+        try:
+            await self.group_signin_service.run_once()
+        except Exception as exc:
+            logger.error(f"[ProactiveTask] group signin maintenance degraded: {exc}")
+        try:
+            self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
+        except Exception as exc:
+            logger.error(f"[ProactiveTask] heartflow topic digest scheduling degraded: {exc}")
+
     async def _loop(self):
         while self._is_running:
             try:
@@ -772,9 +793,7 @@ class ProactiveTask:
 
                 if run_maintenance:
                     self._last_global_maintenance_run = now
-                    await self.decay_service.run_once()
-                    await self.group_signin_service.run_once()
-                    self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
+                    await self._run_maintenance_cycle()
 
                 if now - self._last_profile_run > 3600:
                     await self._run_profiling_task()

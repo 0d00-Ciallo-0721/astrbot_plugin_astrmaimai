@@ -20,6 +20,7 @@ class _FakeEvent:
         self._group_id = group_id
         self._self_id = self_id
         self._extra = {}
+        self.stopped = False
 
     def get_sender_id(self):
         return self._sender_id
@@ -39,6 +40,9 @@ class _FakeEvent:
     def set_extra(self, key, value):
         self._extra[key] = value
 
+    def stop_event(self):
+        self.stopped = True
+
     def plain_result(self, text):
         return {"type": "plain", "text": text}
 
@@ -49,6 +53,7 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         install_astrbot_stubs(self.temp_dir.name)
         for name in (
             "astrmai.conversation.loop.chat_loop_kernel",
+            "astrmai.conversation.ingress.dedupe",
             "astrmai.presentation.events.message_entry",
         ):
             sys.modules.pop(name, None)
@@ -1231,6 +1236,114 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(asyncio.run(_run()), [])
         self.assertNotIn(("track", "800000001234"), facade_calls)
         self.assertIn(("record_and_dispatch_attention", "800000001234", True), facade_calls)
+
+    def test_message_entry_permission_deny_stops_before_wait_and_attention(self):
+        calls = []
+
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            calls.append("poke")
+            return IngressDecision.allow()
+
+        def _check_message_scope_access(scope):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            calls.append(("permission", scope.chat_id))
+            return IngressDecision.stop("not_allowed")
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=_check_message_scope_access,
+            handle_group_reply_wait=lambda event, scope: (_ for _ in ()).throw(AssertionError("wait should not run")),
+            is_debug_mode=lambda: False,
+            track_incoming_user_activity=lambda sender_id: calls.append(("track", sender_id)),
+            try_consume_reflect_feedback=lambda event: asyncio.sleep(0, result=None),
+            record_and_dispatch_attention=lambda event, scope: asyncio.sleep(0, result="BUFFERED"),
+            cancel_group_wait_if_interrupted=lambda event, result, status: None,
+            suppress_default_llm_if_engaged=lambda event, status, is_direct_call: None,
+        )
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            group_id="group-1",
+            text="blocked message",
+        )
+
+        async def _run():
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
+
+        self.assertEqual(asyncio.run(_run()), [])
+        self.assertEqual(calls, ["poke", ("permission", "default:GroupMessage:group-1")])
+
+    def test_message_entry_attention_error_yields_runtime_fallback_text(self):
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        def _check_message_scope_access(scope):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=_check_message_scope_access,
+            handle_group_reply_wait=lambda event, scope: asyncio.sleep(0, result="NONE"),
+            is_debug_mode=lambda: False,
+            track_incoming_user_activity=lambda sender_id: None,
+            try_consume_reflect_feedback=lambda event: asyncio.sleep(0, result=None),
+            record_and_dispatch_attention=lambda event, scope: asyncio.sleep(0, result="error"),
+            cancel_group_wait_if_interrupted=lambda event, result, status: (_ for _ in ()).throw(AssertionError("cancel should not run")),
+            suppress_default_llm_if_engaged=lambda event, status, is_direct_call: None,
+            get_runtime_config=lambda: SimpleNamespace(reply=SimpleNamespace(fallback_text="稍后再试")),
+        )
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            group_id="group-1",
+            text="normal message",
+        )
+
+        async def _run():
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
+
+        self.assertEqual(asyncio.run(_run()), [{"type": "plain", "text": "稍后再试"}])
+
+    def test_message_entry_yields_ghost_message_when_default_llm_is_suppressed(self):
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        def _check_message_scope_access(scope):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+            return IngressDecision.allow()
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=_check_message_scope_access,
+            handle_group_reply_wait=lambda event, scope: asyncio.sleep(0, result="NONE"),
+            is_debug_mode=lambda: False,
+            track_incoming_user_activity=lambda sender_id: None,
+            try_consume_reflect_feedback=lambda event: asyncio.sleep(0, result=None),
+            record_and_dispatch_attention=lambda event, scope: asyncio.sleep(0, result="ENGAGED"),
+            cancel_group_wait_if_interrupted=lambda event, result, status: None,
+            suppress_default_llm_if_engaged=lambda event, status, is_direct_call: "[[ghost]]",
+        )
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            group_id="group-1",
+            text="normal message",
+        )
+
+        async def _run():
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
+
+        self.assertEqual(asyncio.run(_run()), [{"type": "plain", "text": "[[ghost]]"}])
 
     def test_group_decrease_notice_clears_only_runtime_state_for_bot_self(self):
         facade_mod = importlib.import_module("astrmai.app.plugin_facade")

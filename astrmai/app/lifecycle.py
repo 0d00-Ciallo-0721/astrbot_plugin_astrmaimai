@@ -266,12 +266,18 @@ class PluginLifecycleManager:
         # 停止 EventBus workers
         event_bus = getattr(self.runtime, "event_bus", None)
         if event_bus is not None:
-            await event_bus.stop()
+            try:
+                await event_bus.stop()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] EventBus shutdown degraded: {exc}")
 
         # 释放 DB 连接池
         persistence = getattr(self.runtime, "persistence", None)
         if persistence is not None:
-            persistence.dispose()
+            try:
+                persistence.dispose()
+            except Exception as exc:
+                logger.warning(f"[AstrMai] Persistence dispose degraded: {exc}")
 
     # ponytail: 10+ flags set sequentially with no atomicity guarantee.
     # Acceptable because terminate() is called once at shutdown and flags are

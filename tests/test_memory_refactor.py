@@ -472,6 +472,106 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertTrue(result["eligible"])
         self.assertEqual(result["reason"], "eligible")
 
+    def test_compat_summarizer_describe_session_eligibility_falls_back_without_pipeline(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=3, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(),
+            config=gateway.config,
+        )
+
+        result = asyncio.run(summarizer.describe_session_eligibility("chat-fallback"))
+
+        self.assertFalse(result["eligible"])
+        self.assertFalse(result["candidate_present"])
+        self.assertEqual(result["reason"], "memory_pipeline_unavailable")
+        self.assertEqual(result["threshold_messages"], 6)
+
+    def test_compat_summarizer_run_once_for_session_forwards_to_pipeline(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        calls = []
+
+        class _Pipeline:
+            async def run_maintenance_for_session(self, chat_id):
+                calls.append(chat_id)
+                return {"performed": True, "chat_id": chat_id}
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(memory_pipeline=_Pipeline()),
+            config=gateway.config,
+        )
+
+        result = asyncio.run(summarizer.run_once_for_session("chat-run"))
+
+        self.assertEqual(calls, ["chat-run"])
+        self.assertEqual(result, {"performed": True, "chat_id": "chat-run"})
+
+    def test_compat_summarizer_ingest_committed_turn_forwards_to_pipeline(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        class _GateResult:
+            hit = True
+
+        class _Pipeline:
+            def __init__(self):
+                self.turns = []
+                self._session_history_buffer = {"chat-ingest": {"buffer": ["u", "a", "u2", "a2"]}}
+
+            def build_turn(self, **kwargs):
+                turn = SimpleNamespace(**kwargs)
+                self.turns.append(turn)
+                return turn
+
+            async def record_turn(self, turn):
+                self.recorded = turn
+                return {"performed": True, "pending_messages": 1}
+
+            async def process_instant_gate(self, turn):
+                self.gated = turn
+                return _GateResult()
+
+        pipeline = _Pipeline()
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(memory_pipeline=pipeline),
+            config=gateway.config,
+        )
+
+        result = asyncio.run(
+            summarizer.ingest_committed_turn(
+                "chat-ingest",
+                "hello",
+                "hi",
+                source="reply_post_send",
+                is_proactive=True,
+            )
+        )
+
+        self.assertEqual(pipeline.turns[0].chat_id, "chat-ingest")
+        self.assertEqual(pipeline.turns[0].user_text, "hello")
+        self.assertEqual(pipeline.turns[0].assistant_text, "hi")
+        self.assertEqual(pipeline.turns[0].source, "reply_post_send")
+        self.assertTrue(pipeline.turns[0].is_proactive)
+        self.assertIs(pipeline.recorded, pipeline.gated)
+        self.assertEqual(result["source"], "reply_post_send")
+        self.assertTrue(result["instant_gate_hit"])
+        self.assertEqual(result["pending_messages"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

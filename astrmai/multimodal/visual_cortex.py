@@ -49,12 +49,16 @@ class VisualCortex:
         while True:
             try:
                 picid, base64_data = await self.queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
                 await self.process_image_async(picid, base64_data)
-                self.queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.error(f"[AstrMai-VisualCortex] queue worker degraded: {exc}", exc_info=True)
+            finally:
+                self.queue.task_done()
 
     # ponytail: sync DB session in async worker — acceptable for SQLite (fast, no network).
     # If this becomes a bottleneck, wrap in asyncio.to_thread().

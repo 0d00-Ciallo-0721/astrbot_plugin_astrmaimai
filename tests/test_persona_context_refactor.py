@@ -175,6 +175,106 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertEqual(payload["first_person_rewrite"], "short prompt")
         self.assertEqual(gateway.calls, [])
 
+    def test_persona_summary_empty_prompt_uses_ready_fallback_without_gateway(self):
+        from config import AstrMaiConfig
+
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([], config=AstrMaiConfig(performance={"summary_threshold": 10}))
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+
+        payload = asyncio.run(summarizer.get_summary(original_prompt="", persona_id="persona-empty"))
+
+        self.assertEqual(payload["summary"], "")
+        self.assertEqual(payload["first_person_rewrite"], "")
+        self.assertTrue(payload["is_full_ready"])
+        self.assertEqual(payload["raw"], "")
+        self.assertEqual(gateway.calls, [])
+
+    def test_persona_summary_concurrent_requests_share_single_generation(self):
+        from config import AstrMaiConfig
+
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([], config=AstrMaiConfig(performance={"summary_threshold": 5}))
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        calls = {"core": 0, "style": 0, "rewrite": 0, "background": 0}
+
+        async def _core(_original_prompt, _cache_key):
+            calls["core"] += 1
+            await asyncio.sleep(0)
+            return "core summary"
+
+        async def _style(_original_prompt, _cache_key):
+            calls["style"] += 1
+            await asyncio.sleep(0)
+            return "style summary"
+
+        async def _rewrite(**_kwargs):
+            calls["rewrite"] += 1
+            return "I answer in my own voice."
+
+        async def _background(*_args, **_kwargs):
+            calls["background"] += 1
+
+        summarizer._summarize_core_identity_with_retry = _core
+        summarizer._summarize_style_with_retry = _style
+        summarizer._build_first_person_rewrite = _rewrite
+        summarizer._generate_all_shards_background = _background
+
+        async def _run():
+            return await asyncio.gather(
+                summarizer.get_summary("long persona prompt", persona_id="persona-concurrent"),
+                summarizer.get_summary("long persona prompt", persona_id="persona-concurrent"),
+            )
+
+        first, second = asyncio.run(_run())
+
+        self.assertEqual(first["summary"], "core summary")
+        self.assertEqual(second["summary"], "core summary")
+        self.assertEqual(calls["core"], 1)
+        self.assertEqual(calls["style"], 1)
+        self.assertEqual(calls["rewrite"], 1)
+        self.assertEqual(calls["background"], 1)
+
+    def test_persona_background_shard_failure_keeps_cache_recoverable_and_clears_pending(self):
+        persistence = _FakePersistence(
+            {
+                "persona-shards": {
+                    "summary": "core",
+                    "style": "style",
+                    "shards": {},
+                    "is_full_ready": False,
+                    "raw": "raw persona",
+                }
+            }
+        )
+        gateway = _FakeGateway([])
+        memory_engine = SimpleNamespace(
+            clear_persona_lore=lambda _persona_id: asyncio.sleep(0),
+            add_persona_lore=lambda _prompt, _persona_id: asyncio.sleep(0),
+        )
+        summarizer = self.persona_mod.PersonaSummarizer(
+            persistence,
+            gateway,
+            config=gateway.config,
+            memory_engine=memory_engine,
+        )
+
+        async def _logic(_original_prompt, _cache_key):
+            return "logic"
+
+        async def _speech(_original_prompt, _cache_key):
+            raise RuntimeError("speech shard failed")
+
+        summarizer._summarize_logic_style = _logic
+        summarizer._summarize_speech_style = _speech
+        summarizer.pending_tasks["persona-shards"] = object()
+
+        asyncio.run(summarizer._generate_all_shards_background("raw persona", "persona-shards"))
+
+        self.assertFalse(summarizer.cache["persona-shards"]["is_full_ready"])
+        self.assertEqual(summarizer.cache["persona-shards"]["shards"], {})
+        self.assertNotIn("persona-shards", summarizer.pending_tasks)
+
     def test_persona_core_identity_template_and_fallback_use_same_expert_role_shell(self):
         persistence = _FakePersistence()
         gateway = _FakeGateway(["core summary"])
