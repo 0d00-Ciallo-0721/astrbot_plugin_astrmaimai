@@ -90,11 +90,18 @@ class RRFFusion:
         results = []
         for doc_id in sorted_ids:
             info = doc_info[doc_id]
+            metadata = dict(info.metadata or {})
+            matched_by = []
+            if doc_id in bm25_map:
+                matched_by.append("legacy_bm25")
+            if doc_id in vector_map:
+                matched_by.append("faiss")
+            metadata["matched_by"] = matched_by
             results.append(SearchResult(
                 doc_id=doc_id,
                 score=fused_scores[doc_id],
                 content=info.content,
-                metadata=info.metadata,
+                metadata=metadata,
                 source="hybrid"
             ))
             

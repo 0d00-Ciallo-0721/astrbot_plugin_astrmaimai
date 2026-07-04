@@ -288,6 +288,201 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertEqual(gateway.context_economy.requests[0]["family"], context_mod.WorkloadFamily.PERSONA_SUMMARY)
         self.assertEqual(gateway.context_economy.requests[0]["persona_id"], "persona-1")
 
+    def test_normalize_vision_failure_reason_handles_empty_and_valid_payloads(self):
+        task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
+
+        class _Gateway(task_mod.GatewayTaskMixin):
+            @staticmethod
+            def _classify_failure_kind(value):
+                kind = "provider_failure_text" if "provider failed" in str(value).lower() else "unknown"
+                return SimpleNamespace(value=kind)
+
+        gateway = _Gateway()
+
+        self.assertEqual(gateway._normalize_vision_failure_reason({}), (False, "empty_result"))
+        self.assertEqual(gateway._normalize_vision_failure_reason(None), (False, "empty_result"))
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason({"description": None}),
+            (False, "empty_description"),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason({"description": " none "}),
+            (False, "empty_description"),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "a cat", "emotion_tags": [" calm ", "curious"]}
+            ),
+            (True, ""),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "provider failed before inference"}
+            ),
+            (False, "provider_failure_text"),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "a cat", "emotion_tags": None}
+            ),
+            (True, ""),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "a cat", "emotion_tags": [" ", ""]}
+            ),
+            (False, "invalid_emotion_tags"),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "a cat", "emotion_tags": ["provider failed"]}
+            ),
+            (False, "provider_failure_text"),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "a cat", "emotion_tags": "provider failed"}
+            ),
+            (False, "provider_failure_text"),
+        )
+        self.assertEqual(
+            gateway._normalize_vision_failure_reason(
+                {"description": "a cat", "emotion_tags": {"calm": True}}
+            ),
+            (False, "invalid_emotion_tags"),
+        )
+
+    def test_call_vision_task_uses_elastic_path_without_lane_manager(self):
+        task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
+        context_mod = importlib.import_module("astrmai.infrastructure.context_economy")
+        lane_mod = importlib.import_module("astrmai.infrastructure.runtime.lane_manager")
+
+        class _ContextEconomy:
+            def __init__(self):
+                self.requests = []
+
+            def build_request(self, **kwargs):
+                self.requests.append(kwargs)
+                return kwargs
+
+            @staticmethod
+            def resolve_policy(request):
+                return {"family": request["family"]}
+
+        class _Gateway(task_mod.GatewayTaskMixin):
+            def __init__(self):
+                self.lane_manager = None
+                self.context_economy = _ContextEconomy()
+                self.elastic_calls = []
+
+            @staticmethod
+            def _vision_models():
+                return ["vision-a"]
+
+            @staticmethod
+            def _filter_cooldown_attempt_queue(_pool_name, _primary, attempt_queue):
+                return list(attempt_queue), [], False
+
+            async def _elastic_call_result(self, **kwargs):
+                self.elastic_calls.append(kwargs)
+                return SimpleNamespace(
+                    parsed_json={"description": "a cat", "emotion_tags": ["calm"]},
+                    model_id="vision-a",
+                )
+
+            @staticmethod
+            def _classify_failure_kind(_value):
+                return SimpleNamespace(value="unknown")
+
+            @staticmethod
+            def _open_model_cooldown(*_args):
+                raise AssertionError("valid vision result must not open cooldown")
+
+        gateway = _Gateway()
+        lane_key = lane_mod.LaneKey(
+            subsystem="bg",
+            task_family="vision",
+            scope_id="chat-1",
+            scope_kind="chat",
+        )
+
+        result = asyncio.run(
+            gateway.call_vision_task(
+                image_data="image-data",
+                prompt="Analyze",
+                lane_key=lane_key,
+            )
+        )
+
+        self.assertEqual(result["description"], "a cat")
+        self.assertEqual(len(gateway.elastic_calls), 1)
+        self.assertEqual(gateway.elastic_calls[0]["models"], ["vision-a"])
+        self.assertEqual(gateway.elastic_calls[0]["image_urls"], ["image-data"])
+        self.assertEqual(
+            gateway.context_economy.requests[0]["family"],
+            context_mod.WorkloadFamily.VISION,
+        )
+
+    def test_get_agent_models_combines_router_rankings_and_records_filter_state(self):
+        task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
+
+        class _Router:
+            def __init__(self):
+                self.calls = []
+
+            def get_ranked_models(self, pool_name, models):
+                self.calls.append((pool_name, list(models)))
+                if pool_name == "agent":
+                    return ["agent-b", "agent-a"]
+                return ["fallback-a", "agent-a"]
+
+        class _Gateway(task_mod.GatewayTaskMixin):
+            def __init__(self):
+                self.router = _Router()
+                self.filter_calls = []
+
+            @staticmethod
+            def _agent_models():
+                return ["agent-a", "agent-b"]
+
+            @staticmethod
+            def _fallback_models():
+                return ["fallback-a", "agent-a"]
+
+            def _filter_cooldown_attempt_queue(self, pool_name, primary, attempt_queue):
+                self.filter_calls.append((pool_name, primary, attempt_queue))
+                return ["agent-b", "fallback-a"], [{"model_id": "agent-a"}], True
+
+        gateway = _Gateway()
+
+        result = gateway.get_agent_models()
+
+        self.assertEqual(result, ["agent-b", "fallback-a"])
+        self.assertEqual(
+            gateway.router.calls,
+            [
+                ("agent", ["agent-a", "agent-b"]),
+                ("fallback", ["fallback-a", "agent-a"]),
+            ],
+        )
+        self.assertEqual(
+            gateway.filter_calls,
+            [
+                (
+                    "agent",
+                    ["agent-b", "agent-a"],
+                    ["agent-b", "agent-a", "fallback-a"],
+                )
+            ],
+        )
+        self.assertEqual(
+            gateway._last_agent_model_selection,
+            {
+                "skipped_cooldown_models": [{"model_id": "agent-a"}],
+                "cooldown_overridden": True,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

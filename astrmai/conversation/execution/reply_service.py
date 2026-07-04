@@ -61,6 +61,16 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             max_length=self.no_segment_limit,
         )
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+        self.segmentation_threshold = self.config.reply.segment_min_len
+        self.no_segment_limit = self.config.reply.no_segment_max_len
+        self.meme_probability = self.config.reply.meme_probability
+        self.segmenter = TextSegmenter(
+            min_length=self.segmentation_threshold,
+            max_length=self.no_segment_limit,
+        )
+
     async def handle_reply(
         self,
         event: AstrMessageEvent,

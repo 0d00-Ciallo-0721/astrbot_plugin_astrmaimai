@@ -131,6 +131,161 @@ class DreamAgentGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_tool_get_detail_reads_legacy_event_from_database_session(self):
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        class _Result:
+            @staticmethod
+            def first():
+                return SimpleNamespace(
+                    event_id="event-1",
+                    narrative="memory narrative",
+                    emotion="happy",
+                    importance=0.8,
+                )
+
+        class _Session:
+            @staticmethod
+            def exec(_statement):
+                return _Result()
+
+        class _DB:
+            @staticmethod
+            def get_session():
+                return _SessionContext(_Session())
+
+        agent = DreamAgent(SimpleNamespace(config=SimpleNamespace()), _DB())
+
+        result = asyncio.run(agent._tool_get_detail({"event_id": "event-1"}))
+
+        self.assertIn("memory narrative", result)
+        self.assertIn("happy", result)
+        self.assertIn("0.8", result)
+
+    def test_tool_search_memory_uses_retrieval_service_and_renders_result(self):
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        class _Retrieval:
+            def __init__(self):
+                self.query = None
+                self.candidates = [SimpleNamespace(summary="first match")]
+
+            async def retrieve(self, query):
+                self.query = query
+                return self.candidates
+
+            def render_recall(self, query, candidates):
+                self.rendered = (query, candidates)
+                return "rendered memory result"
+
+        retrieval = _Retrieval()
+        engine = SimpleNamespace(retrieval_service=retrieval)
+        agent = DreamAgent(
+            SimpleNamespace(config=SimpleNamespace()),
+            SimpleNamespace(),
+            memory_engine=engine,
+        )
+
+        result = asyncio.run(
+            agent._tool_search_memory({"query": "deployment", "limit": 3}, "chat-1")
+        )
+
+        self.assertEqual(result, "rendered memory result")
+        self.assertEqual(retrieval.query.query, "deployment")
+        self.assertEqual(retrieval.query.session_id, "chat-1")
+        self.assertEqual(retrieval.query.top_k, 3)
+        self.assertEqual(retrieval.rendered[1], retrieval.candidates)
+
+    def test_tool_merge_writes_memory_and_marks_canonical_sources_merged(self):
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        class _Store:
+            async def find_ids_by_source_ref(self, source_ref):
+                return {
+                    "MemoryEvent:legacy-1": ["mem_1"],
+                    "MemoryEvent:legacy-2": ["mem_2"],
+                }.get(source_ref, [])
+
+        class _Maintenance:
+            def __init__(self):
+                self.calls = []
+
+            async def mark_merged(self, memory_ids, superseded_by):
+                self.calls.append((memory_ids, superseded_by))
+
+        class _Engine:
+            def __init__(self):
+                self.v2_store = _Store()
+                self.maintenance_service = _Maintenance()
+                self.write_calls = []
+
+            async def add_memory(self, **kwargs):
+                self.write_calls.append(kwargs)
+                return "mem_new"
+
+        engine = _Engine()
+        agent = DreamAgent(
+            SimpleNamespace(config=SimpleNamespace()),
+            SimpleNamespace(),
+            memory_engine=engine,
+        )
+
+        result = asyncio.run(
+            agent._tool_merge(
+                {
+                    "event_ids": ["legacy-1", "legacy-2"],
+                    "new_narrative": "merged narrative",
+                },
+                "chat-1",
+            )
+        )
+
+        self.assertIn("merged narrative", result)
+        self.assertEqual(
+            engine.write_calls,
+            [{"content": "merged narrative", "session_id": "chat-1", "importance": 0.7}],
+        )
+        self.assertEqual(
+            engine.maintenance_service.calls,
+            [(["mem_1", "mem_2"], "mem_new")],
+        )
+
+    def test_resolve_canonical_ids_handles_mixed_canonical_and_legacy_ids(self):
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        class _Store:
+            async def find_ids_by_source_ref(self, source_ref):
+                return ["mem_legacy"] if source_ref == "MemoryEvent:legacy-1" else []
+
+        agent = DreamAgent(
+            SimpleNamespace(config=SimpleNamespace()),
+            SimpleNamespace(),
+            memory_engine=SimpleNamespace(v2_store=_Store()),
+        )
+
+        canonical, unresolved = asyncio.run(
+            agent._resolve_canonical_ids(
+                ["mem_direct", "legacy-1", "legacy-missing", "mem_direct", ""]
+            )
+        )
+
+        self.assertEqual(canonical, ["mem_direct", "mem_legacy"])
+        self.assertEqual(unresolved, ["legacy-missing"])
+
+    def test_run_dream_cycle_returns_none_when_seed_events_are_empty(self):
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        class _Gateway:
+            config = SimpleNamespace()
+
+            async def call_data_process_task(self, **_kwargs):
+                raise AssertionError("gateway should not run without seed events")
+
+        agent = DreamAgent(_Gateway(), SimpleNamespace())
+        agent._get_seed_events = lambda _session_id: asyncio.sleep(0, result=[])
+
+        self.assertIsNone(asyncio.run(agent.run_dream_cycle("chat-empty")))
+
 
 if __name__ == "__main__":
     unittest.main()

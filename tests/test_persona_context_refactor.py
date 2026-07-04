@@ -318,6 +318,274 @@ class PersonaContextRefactorTests(unittest.TestCase):
             "你是一个资深的角色扮演设定提取专家。",
         )
 
+    def test_persona_remaining_shards_use_expected_templates(self):
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        calls = []
+
+        async def _call_template(template_id, **kwargs):
+            calls.append((template_id, kwargs))
+            return f"shard:{template_id.value}"
+
+        summarizer._call_persona_template = _call_template
+        shard_methods = [
+            (
+                summarizer._summarize_world_view,
+                self.persona_mod.PromptTemplateId.PERSONA_WORLD_VIEW,
+            ),
+            (
+                summarizer._summarize_timeline,
+                self.persona_mod.PromptTemplateId.PERSONA_TIMELINE,
+            ),
+            (
+                summarizer._summarize_relations,
+                self.persona_mod.PromptTemplateId.PERSONA_RELATIONS,
+            ),
+            (
+                summarizer._summarize_skills,
+                self.persona_mod.PromptTemplateId.PERSONA_SKILLS,
+            ),
+            (
+                summarizer._summarize_values,
+                self.persona_mod.PromptTemplateId.PERSONA_VALUES,
+            ),
+            (
+                summarizer._summarize_secrets,
+                self.persona_mod.PromptTemplateId.PERSONA_SECRETS,
+            ),
+        ]
+
+        async def _run():
+            return [
+                await method("raw persona facts", "persona-shards")
+                for method, _template_id in shard_methods
+            ]
+
+        results = asyncio.run(_run())
+
+        self.assertEqual(
+            results,
+            [f"shard:{template_id.value}" for _method, template_id in shard_methods],
+        )
+        self.assertEqual(
+            [template_id for template_id, _kwargs in calls],
+            [template_id for _method, template_id in shard_methods],
+        )
+        for _template_id, kwargs in calls:
+            self.assertEqual(kwargs["original_prompt"], "raw persona facts")
+            self.assertEqual(kwargs["cache_key"], "persona-shards")
+            self.assertFalse(kwargs["is_json"])
+            self.assertIn("raw persona facts", kwargs["fallback_prompt"])
+
+    def test_persona_cache_recovery_creates_background_task_when_not_ready(self):
+        persistence = _FakePersistence(
+            {
+                "persona-recovery": {
+                    "summary": "cached summary",
+                    "first_person_rewrite": "I remember who I am.",
+                    "style": "brief",
+                    "shards": {},
+                    "is_full_ready": False,
+                    "raw": "cached raw persona",
+                }
+            }
+        )
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+
+        async def _run():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            calls = []
+
+            async def _background(raw_text, cache_key):
+                calls.append((raw_text, cache_key))
+                started.set()
+                await release.wait()
+
+            summarizer._generate_all_shards_background = _background
+            payload = await summarizer.get_summary(
+                original_prompt="new prompt",
+                persona_id="persona-recovery",
+            )
+            await started.wait()
+            task = summarizer.pending_tasks["persona-recovery"]
+            self.assertFalse(task.done())
+            release.set()
+            await task
+            await asyncio.sleep(0)
+            return payload, calls
+
+        payload, calls = asyncio.run(_run())
+
+        self.assertEqual(payload["summary"], "cached summary")
+        self.assertEqual(calls, [("cached raw persona", "persona-recovery")])
+        self.assertNotIn("persona-recovery", summarizer.pending_tasks)
+
+    def test_first_person_rewrite_without_template_uses_persona_lane(self):
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        summarizer.prompt_registry = None
+        calls = []
+
+        async def _call_lane(prompt, cache_key, **kwargs):
+            calls.append((prompt, cache_key, kwargs))
+            return "I answer briefly in my own voice."
+
+        summarizer._call_persona_lane = _call_lane
+
+        result = asyncio.run(
+            summarizer._build_first_person_rewrite(
+                original_prompt="raw persona",
+                summary="brief summary",
+                style="calm",
+                cache_key="persona-1",
+            )
+        )
+
+        self.assertEqual(result, "I answer briefly in my own voice.")
+        self.assertEqual(calls[0][1], "persona-1")
+        self.assertIn("brief summary", calls[0][0])
+        self.assertEqual(
+            calls[0][2]["system_prompt"],
+            "Rewrite persona summaries into concise first-person self-awareness text.",
+        )
+        self.assertFalse(calls[0][2]["is_json"])
+
+    def test_first_person_rewrite_with_template_passes_envelope_to_persona_lane(self):
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        rendered = []
+        lane_calls = []
+        envelope = SimpleNamespace(prompt="template prompt", system_prompt="template system")
+
+        def _render(template_id, variables):
+            rendered.append((template_id, variables))
+            return envelope
+
+        async def _call_lane(prompt, cache_key, **kwargs):
+            lane_calls.append((prompt, cache_key, kwargs))
+            return "I use the rendered template."
+
+        summarizer.prompt_registry = SimpleNamespace(render_template=_render)
+        summarizer._call_persona_lane = _call_lane
+
+        result = asyncio.run(
+            summarizer._build_first_person_rewrite(
+                original_prompt="raw persona",
+                summary="brief summary",
+                style="calm",
+                cache_key="persona-1",
+            )
+        )
+
+        self.assertEqual(result, "I use the rendered template.")
+        self.assertEqual(
+            rendered,
+            [
+                (
+                    self.persona_mod.PromptTemplateId.PERSONA_FIRST_PERSON_REWRITE,
+                    {
+                        "original_prompt": "raw persona",
+                        "summary": "brief summary",
+                        "style": "calm",
+                    },
+                )
+            ],
+        )
+        self.assertEqual(lane_calls[0][0:2], ("template prompt", "persona-1"))
+        self.assertEqual(lane_calls[0][2]["system_prompt"], "template system")
+        self.assertIs(lane_calls[0][2]["template_envelope"], envelope)
+
+    def test_persona_cache_hit_without_id_persists_generated_rewrite(self):
+        persistence = _FakePersistence(
+            {
+                "session_chat-1": {
+                    "summary": "cached summary",
+                    "first_person_rewrite": "",
+                    "style": "brief",
+                    "shards": {},
+                    "is_full_ready": True,
+                    "raw": "cached raw persona",
+                }
+            }
+        )
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        summarizer._build_first_person_rewrite = lambda **_kwargs: asyncio.sleep(
+            0,
+            result="I use the repaired rewrite.",
+        )
+
+        payload = asyncio.run(
+            summarizer.get_summary(
+                original_prompt="fallback raw",
+                persona_id="",
+                session_id="chat-1",
+            )
+        )
+
+        self.assertEqual(payload["first_person_rewrite"], "I use the repaired rewrite.")
+        self.assertEqual(
+            persistence.cache["session_chat-1"]["first_person_rewrite"],
+            "I use the repaired rewrite.",
+        )
+        self.assertEqual(len(persistence.saved_snapshots), 1)
+
+    def test_first_person_rewrite_rejects_empty_and_too_short_results(self):
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        summarizer.prompt_registry = None
+
+        self.assertEqual(
+            asyncio.run(
+                summarizer._build_first_person_rewrite(
+                    original_prompt="",
+                    summary="",
+                    style="",
+                    cache_key="persona-empty",
+                )
+            ),
+            "",
+        )
+        summarizer._call_persona_lane = lambda *_args, **_kwargs: asyncio.sleep(0, result="no")
+        self.assertEqual(
+            asyncio.run(
+                summarizer._build_first_person_rewrite(
+                    original_prompt="raw",
+                    summary="summary",
+                    style="calm",
+                    cache_key="persona-short",
+                )
+            ),
+            "",
+        )
+
+    def test_persist_cache_falls_back_to_sync_persistence(self):
+        class _SyncPersistence:
+            def __init__(self):
+                self.saved = None
+
+            @staticmethod
+            def load_persona_cache():
+                return {}
+
+            def save_persona_cache(self, cache_data):
+                self.saved = dict(cache_data)
+
+        persistence = _SyncPersistence()
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        summarizer.cache["persona-1"] = {"summary": "cached"}
+
+        asyncio.run(summarizer._persist_cache())
+
+        self.assertEqual(persistence.saved, {"persona-1": {"summary": "cached"}})
+
     def test_context_engine_prefers_first_person_rewrite_and_honors_disable_rag_injection(self):
         memory_engine = _FakeMemoryEngine()
 

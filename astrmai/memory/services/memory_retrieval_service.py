@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from difflib import SequenceMatcher
 import json
+import math
+import re
 import time
 
 from astrbot.api import logger
@@ -39,21 +43,40 @@ class MemoryRetrievalService:
             query.metadata = metadata
         return trace
 
+    @classmethod
+    def _mark_degraded(cls, query: MemoryQuery, component: str) -> None:
+        trace = cls._trace_bucket(query)
+        degraded = trace.setdefault("degraded_components", [])
+        if component not in degraded:
+            degraded.append(component)
+
     @staticmethod
-    def _candidate_trace_payload(candidates, *, limit=8):
+    def _matched_sources(value) -> list[str]:
+        values = [value] if isinstance(value, str) else list(value or [])
+        return sorted({str(item) for item in values if str(item).strip()})
+
+    @staticmethod
+    def _candidate_trace_payload(candidates, *, limit=8, include_content=False):
         payload = []
         for item in list(candidates or [])[:max(int(limit or 0), 0)]:
-            payload.append({
+            metadata = dict(getattr(item, "metadata", {}) or {})
+            entry = {
                 "id": str(getattr(item, "id", "") or ""),
                 "kind": str(getattr(item, "kind", "") or ""),
+                "source": str(getattr(item, "source", "") or ""),
+                "matched_by": MemoryRetrievalService._matched_sources(metadata.get("matched_by")),
                 "status": str(getattr(item, "status", "") or ""),
                 "visibility": str(getattr(item, "visibility", "") or ""),
                 "relevance_score": round(float(getattr(item, "relevance_score", 0.0) or 0.0), 4),
                 "importance": round(float(getattr(item, "importance", 0.0) or 0.0), 4),
                 "confidence": round(float(getattr(item, "confidence", 0.0) or 0.0), 4),
-                "score_breakdown": (getattr(item, "metadata", {}) or {}).get("_score_breakdown"),
-                "summary_preview": str(getattr(item, "summary", "") or getattr(item, "content", "") or "")[:120],
-            })
+                "score_breakdown": metadata.get("_score_breakdown"),
+            }
+            if include_content:
+                entry["summary_preview"] = str(
+                    getattr(item, "summary", "") or getattr(item, "content", "") or ""
+                )[:120]
+            payload.append(entry)
         return payload
 
     @staticmethod
@@ -64,6 +87,12 @@ class MemoryRetrievalService:
                 metadata = json.loads(metadata)
             except Exception:
                 metadata = {}
+        metadata = dict(metadata)
+        matched_by = MemoryRetrievalService._matched_sources(metadata.get("matched_by"))
+        source = str(getattr(result, "source", "") or "")
+        if not matched_by:
+            matched_by = ["faiss" if source == "vector" else "legacy_bm25" if source == "bm25" else "legacy_hybrid"]
+        metadata["matched_by"] = matched_by
         content = str(getattr(result, "content", "") or "")
         memory_id = str(metadata.get("canonical_id") or metadata.get("id") or f"idx_{abs(hash(content))}")
         return MemoryCandidate(
@@ -91,10 +120,211 @@ class MemoryRetrievalService:
             metadata=metadata,
         )
 
+    @staticmethod
+    def _explicit_candidate_limit(query: MemoryQuery) -> int | None:
+        metadata = query.metadata or {}
+        value = metadata.get("candidate_limit", metadata.get("retrieval_candidate_k"))
+        if value is None:
+            return None
+        try:
+            return max(int(value), max(int(query.top_k or 5), 1))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _candidate_limit(cls, query: MemoryQuery) -> int:
+        return cls._explicit_candidate_limit(query) or max(int(query.top_k or 5), 1)
+
+    @staticmethod
+    def _clone_candidate(candidate: MemoryCandidate) -> MemoryCandidate:
+        return replace(
+            candidate,
+            tags=list(candidate.tags or []),
+            metadata=dict(candidate.metadata or {}),
+        )
+
+    @staticmethod
+    def _get_candidate_sort_score(candidate: MemoryCandidate) -> float:
+        metadata = candidate.metadata or {}
+        return float(metadata.get("_final_relevance_score", candidate.relevance_score) or 0.0)
+
+    @classmethod
+    def _stable_sort_key(cls, candidate: MemoryCandidate) -> tuple:
+        metadata = candidate.metadata or {}
+        return (
+            -cls._get_candidate_sort_score(candidate),
+            -float(metadata.get("_base_relevance_score", candidate.relevance_score) or 0.0),
+            -len(cls._matched_sources(metadata.get("matched_by"))),
+            -float(candidate.updated_at or candidate.created_at or 0.0),
+            str(candidate.id or ""),
+        )
+
+    @staticmethod
+    def _normalized_content(candidate: MemoryCandidate) -> str:
+        text = str(candidate.summary or candidate.content or "").lower()
+        for source, target in (
+            ("特别喜欢", "喜欢"),
+            ("很喜欢", "喜欢"),
+            ("爱吃", "喜欢吃"),
+            ("偏爱", "喜欢"),
+            ("用户", ""),
+        ):
+            text = text.replace(source, target)
+        return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+
+    def _deduplicate_candidates(self, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
+        merged: list[MemoryCandidate] = []
+        identities: dict[str, int] = {}
+        for original in candidates:
+            candidate = self._clone_candidate(original)
+            canonical_id = str(candidate.metadata.get("canonical_id") or "")
+            keys = [f"id:{candidate.id}"]
+            if canonical_id:
+                keys.append(f"canonical:{canonical_id}")
+            existing_index = next((identities[key] for key in keys if key in identities), None)
+            if existing_index is None:
+                normalized = self._normalized_content(candidate)
+                if len(normalized) >= 4:
+                    existing_index = next(
+                        (
+                            index
+                            for index, item in enumerate(merged)
+                            if SequenceMatcher(
+                                None,
+                                normalized,
+                                self._normalized_content(item),
+                            ).ratio() >= 0.88
+                        ),
+                        None,
+                    )
+            if existing_index is None:
+                existing_index = len(merged)
+                merged.append(candidate)
+            else:
+                existing = merged[existing_index]
+                existing.relevance_score = max(existing.relevance_score, candidate.relevance_score)
+                existing.metadata["matched_by"] = sorted(
+                    set(self._matched_sources(existing.metadata.get("matched_by")))
+                    | set(self._matched_sources(candidate.metadata.get("matched_by")))
+                )
+            for key in keys:
+                identities[key] = existing_index
+        return merged
+
+    def _intent_rerank(self, query: MemoryQuery, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
+        if not candidates:
+            return []
+        raw_scores = [
+            score if math.isfinite(score) else 0.0
+            for score in (float(item.relevance_score or 0.0) for item in candidates)
+        ]
+        low, high = min(raw_scores), max(raw_scores)
+        if all(0.0 <= score <= 1.0 for score in raw_scores):
+            base_scores = raw_scores
+        elif high > low:
+            base_scores = [(score - low) / (high - low) for score in raw_scores]
+        else:
+            base_scores = [1.0 for _score in raw_scores]
+
+        intents = set((query.metadata or {}).get("intents") or [])
+        top_base = max(base_scores, default=0.0)
+        reranked: list[MemoryCandidate] = []
+        food_terms = {"火锅", "芒果", "食物", "吃", "爱吃", "口味", "饭", "菜", "忌口", "餐"}
+        non_food_terms = {"颜色", "蓝色", "音乐", "游戏", "跑步", "安静", "地点"}
+        preference_terms = {"喜欢", "偏好", "爱好"}
+        dislike_terms = {"不喜欢", "讨厌", "厌恶", "忌口"}
+
+        for rank, (original, base_score) in enumerate(zip(candidates, base_scores), start=1):
+            item = self._clone_candidate(original)
+            text = f"{item.summary} {item.content}".lower()
+            eligible = base_score >= 0.2 or rank <= 5
+            boost = 0.0
+            penalty = 0.0
+            reasons: list[str] = []
+            if eligible and "food_preference" in intents and any(term in text for term in food_terms):
+                boost += base_score * 0.25
+                reasons.append("food_domain_match")
+            elif "food_preference" in intents and any(term in text for term in non_food_terms):
+                penalty += base_score * 0.15
+                reasons.append("food_domain_mismatch")
+            if eligible and "preference_general" in intents and any(term in text for term in preference_terms):
+                boost += base_score * 0.08
+                reasons.append("preference_match")
+            if eligible and "dislike" in intents and any(term in text for term in dislike_terms):
+                boost += base_score * 0.12
+                reasons.append("dislike_match")
+            if eligible and "identity" in intents and item.kind in {"identity", "profile", "fact"}:
+                boost += base_score * 0.2
+                reasons.append("identity_kind_match")
+
+            boost = min(boost, base_score * 0.3)
+            penalty = min(penalty, base_score * 0.3)
+            final_score = min(max(base_score + boost - penalty, 0.0), 1.0)
+            if top_base > 0.0 and base_score < top_base * 0.5:
+                final_score = min(final_score, max(top_base - 1e-6, 0.0))
+            breakdown = dict(item.metadata.get("_score_breakdown") or {})
+            breakdown["intent"] = {
+                "boost": round(boost, 4),
+                "penalty": round(penalty, 4),
+                "reasons": reasons,
+            }
+            item.metadata["_base_relevance_score"] = round(base_score, 6)
+            item.metadata["_intent_boost"] = round(boost, 6)
+            item.metadata["_intent_penalty"] = round(penalty, 6)
+            item.metadata["_final_relevance_score"] = round(final_score, 6)
+            item.metadata["_score_breakdown"] = breakdown
+            item.relevance_score = final_score
+            reranked.append(item)
+        return sorted(reranked, key=self._stable_sort_key)
+
+    def _finalize_candidates(self, query: MemoryQuery, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
+        rerank_enabled = bool((query.metadata or {}).get("intent_rerank_enabled", False))
+        ranked = list(candidates)
+        if rerank_enabled:
+            try:
+                ranked = self._intent_rerank(query, self._deduplicate_candidates(ranked))
+            except Exception as exc:
+                logger.warning(f"[MemoryRetrievalService] intent rerank degraded: {exc}")
+                self._mark_degraded(query, "intent_rerank")
+                ranked = list(candidates)
+        limit = max(int(query.top_k or 5), 1)
+        if bool((query.metadata or {}).get("adaptive_top_k_enabled", False)) and ranked:
+            high_confidence_count = sum(
+                1 for item in ranked if float(item.confidence if item.confidence is not None else 0.5) >= 0.6
+            )
+            if high_confidence_count > 0:
+                limit = min(limit, high_confidence_count)
+            else:
+                eligible = [
+                    item for item in ranked
+                    if self._get_candidate_sort_score(item) >= 0.15
+                ]
+                limit = min(limit, 3, len(eligible)) if eligible else 0
+        selected = ranked[:limit]
+        trace = self._trace_bucket(query)
+        trace["retrieval"] = {
+            "candidate_count": len(candidates),
+            "selected_ids": [str(item.id or "") for item in selected],
+            "candidates": self._candidate_trace_payload(selected),
+        }
+        if bool((query.metadata or {}).get("memory_retrieval_debug_trace_enabled", False)):
+            trace["retrieval_debug"] = {
+                "query": str(query.query or ""),
+                "candidates": self._candidate_trace_payload(ranked, include_content=True),
+            }
+        return selected
+
     async def retrieve(self, query: MemoryQuery) -> list[MemoryCandidate]:
         if query.policy == "deep" or (query.think_level is not None and query.think_level >= 3):
             return await self.retrieve_deep(query)
-        return await self._retrieve_queries(query, [query.query], top_k=query.top_k)
+        candidate_limit = self._candidate_limit(query)
+        candidates = await self._retrieve_queries(
+            query,
+            [query.query],
+            top_k=query.top_k,
+            candidate_pool_limit=candidate_limit,
+        )
+        return self._finalize_candidates(query, candidates)
 
     async def retrieve_deep(self, query: MemoryQuery) -> list[MemoryCandidate]:
         queries = [query.query]
@@ -119,15 +349,30 @@ class MemoryRetrievalService:
             if guidance:
                 for item in candidates:
                     item.metadata.setdefault("deep_guidance", guidance)
-            return candidates[: max(int(query.top_k or 5), 1)]
+            return self._finalize_candidates(query, candidates)
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep retrieval degraded: {exc}")
-            return await self._retrieve_queries(query, [query.query], top_k=query.top_k)
+            candidates = await self._retrieve_queries(
+                query,
+                [query.query],
+                top_k=query.top_k,
+                candidate_pool_limit=self._candidate_limit(query),
+            )
+            return self._finalize_candidates(query, candidates)
 
-    async def _retrieve_queries(self, query: MemoryQuery, queries: list[str], *, top_k: int | None = None) -> list[MemoryCandidate]:
+    async def _retrieve_queries(
+        self,
+        query: MemoryQuery,
+        queries: list[str],
+        *,
+        top_k: int | None = None,
+        candidate_pool_limit: int | None = None,
+    ) -> list[MemoryCandidate]:
         candidates: list[MemoryCandidate] = []
         seen: set[str] = set()
+        self._trace_bucket(query)
         limit = max(int(top_k or query.top_k or 5), 1)
+        collection_limit = max(int(candidate_pool_limit or limit), limit)
         for query_text in queries:
             # NOTE: include_feedback and retrieve_keys are intentionally NOT
             # copied — both are deprecated dead fields (see MemoryQuery
@@ -155,21 +400,23 @@ class MemoryRetrievalService:
                     continue
                 seen.add(item.id)
                 candidates.append(item)
-            if len(candidates) >= limit:
+            if len(candidates) >= collection_limit:
                 break  # ponytail: M11 — stop early instead of wasting more queries
-        return candidates[:limit]
+        return candidates[:collection_limit]
 
     async def _retrieve_once(self, query: MemoryQuery) -> list[MemoryCandidate]:
         visibility_mode = str(query.metadata.get("visibility_mode") or "")
         query_layers = {str(item) for item in query.layers or [] if str(item).strip()}
         trace = self._trace_bucket(query)
         if query.intent == "jargon" or query_layers == {"jargon"}:
-            trace.setdefault("search_steps", []).append({
-                "query": str(query.query or ""),
+            search_step = {
                 "layers": sorted(query_layers),
                 "visibility_mode": visibility_mode,
                 "allow_stale": bool(query.allow_stale),
-            })
+            }
+            if bool(query.metadata.get("memory_retrieval_debug_trace_enabled", False)):
+                search_step["query"] = str(query.query or "")
+            trace.setdefault("search_steps", []).append(search_step)
             results = await self.jargon_policy.search(
                 query=query.query,
                 session_id=query.session_id,
@@ -185,12 +432,14 @@ class MemoryRetrievalService:
             last_step["top_k_scores"] = trace.pop("top_k_scores", [])
             return results
         if query.intent == "expression_pattern" or query_layers == {"expression_pattern"}:
-            trace.setdefault("search_steps", []).append({
-                "query": str(query.query or ""),
+            search_step = {
                 "layers": sorted(query_layers),
                 "visibility_mode": visibility_mode,
                 "allow_stale": bool(query.allow_stale),
-            })
+            }
+            if bool(query.metadata.get("memory_retrieval_debug_trace_enabled", False)):
+                search_step["query"] = str(query.query or "")
+            trace.setdefault("search_steps", []).append(search_step)
             return await self.expression_pattern_policy.search(
                 query=query.query,
                 session_id=query.session_id,
@@ -210,6 +459,7 @@ class MemoryRetrievalService:
             persona_id=query.persona_id,
             layers=query.layers,
             top_k=limit,
+            candidate_limit=self._explicit_candidate_limit(query),
             exclude_ids=query.exclude_ids,
             allow_stale=query.allow_stale,
             visibility_mode=visibility_mode,
@@ -218,9 +468,11 @@ class MemoryRetrievalService:
         canonical_results, hybrid_results = await asyncio.gather(canonical_task, hybrid_task, return_exceptions=True)
         if isinstance(canonical_results, Exception):
             logger.warning(f"[MemoryRetrievalService] canonical search degraded: {canonical_results}")
+            self._mark_degraded(query, "canonical")
             canonical_results = []
         if isinstance(hybrid_results, Exception):
             logger.warning(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
+            self._mark_degraded(query, "hybrid")
             hybrid_results = []
         candidates = self._fuse_candidates(canonical_results, hybrid_results, query)
         exclude_kinds = {str(item) for item in query.exclude_kinds or [] if str(item).strip()}
@@ -240,6 +492,7 @@ class MemoryRetrievalService:
             )
         except Exception as exc:
             logger.debug(f"[MemoryRetrievalService] hybrid engine search failed: {exc}")
+            self._mark_degraded(query, "hybrid")
             return []
 
         excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
@@ -267,8 +520,13 @@ class MemoryRetrievalService:
                 canonical = canonical_map.get(canonical_id)
                 if not canonical:
                     continue
-                canonical.relevance_score = max(float(candidate.relevance_score or 0.0), float(canonical.relevance_score or 0.0))
-                candidate = canonical
+                hydrated = self._clone_candidate(canonical)
+                hydrated.relevance_score = max(float(candidate.relevance_score or 0.0), float(hydrated.relevance_score or 0.0))
+                hydrated.metadata["matched_by"] = sorted(
+                    set(self._matched_sources(hydrated.metadata.get("matched_by")))
+                    | set(self._matched_sources(candidate.metadata.get("matched_by")))
+                )
+                candidate = hydrated
             candidates.append(candidate)
         # Filter out excluded/deleted
         final_candidates = []
@@ -296,17 +554,18 @@ class MemoryRetrievalService:
     ) -> list[MemoryCandidate]:
         excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
         merged: dict[str, MemoryCandidate] = {}
-        for c in canonical or []:
+        for original in canonical or []:
+            c = self._clone_candidate(original)
             if c.id in excluded:
                 continue
-            c.metadata = dict(c.metadata or {})
             c.metadata["_canon_score"] = float(c.relevance_score or 0.0)
             c.metadata.setdefault("_hybrid_score", 0.0)
+            c.metadata["matched_by"] = self._matched_sources(c.metadata.get("matched_by")) or ["canonical_fts"]
             merged[c.id] = c
-        for h in hybrid or []:
+        for original in hybrid or []:
+            h = self._clone_candidate(original)
             if h.id in excluded:
                 continue
-            h.metadata = dict(h.metadata or {})
             if h.id in merged:
                 existing = merged[h.id]
                 existing.metadata["_hybrid_score"] = max(
@@ -317,9 +576,14 @@ class MemoryRetrievalService:
                     float(existing.metadata.get("_canon_score", 0.0)),
                     float(existing.relevance_score or 0.0),
                 )
+                existing.metadata["matched_by"] = sorted(
+                    set(self._matched_sources(existing.metadata.get("matched_by")))
+                    | set(self._matched_sources(h.metadata.get("matched_by")))
+                )
             else:
                 h.metadata.setdefault("_canon_score", 0.0)
                 h.metadata["_hybrid_score"] = float(h.relevance_score or 0.0)
+                h.metadata["matched_by"] = self._matched_sources(h.metadata.get("matched_by")) or ["legacy_hybrid"]
                 merged[h.id] = h
 
         for item in merged.values():

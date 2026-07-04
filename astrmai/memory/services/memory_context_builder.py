@@ -13,7 +13,20 @@ class MemoryContextBuilder:
     def _clean(text: str) -> str:
         return " ".join(str(text or "").split())
 
-    def select(self, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
+    def select(self, candidates: list[MemoryCandidate], *, max_items: int | None = None) -> list[MemoryCandidate]:
+        limit = self.max_items if max_items is None else max(int(max_items or 1), 1)
+        if any("_final_relevance_score" in (item.metadata or {}) for item in candidates):
+            ranked = sorted(
+                candidates,
+                key=lambda item: (
+                    -float((item.metadata or {}).get("_final_relevance_score", item.relevance_score) or 0.0),
+                    -float((item.metadata or {}).get("_base_relevance_score", item.relevance_score) or 0.0),
+                    -len(set((item.metadata or {}).get("matched_by") or [])),
+                    -float(item.updated_at or item.created_at or 0.0),
+                    str(item.id or ""),
+                ),
+            )
+            return ranked[:limit]
         ranked = sorted(
             candidates,
             key=lambda item: (
@@ -25,12 +38,18 @@ class MemoryContextBuilder:
             ),
             reverse=True,
         )
-        return ranked[: self.max_items]
+        return ranked[:limit]
 
-    def render_prompt_block(self, candidates: list[MemoryCandidate], *, guidance: str = "") -> tuple[str, str]:
+    def render_prompt_block(
+        self,
+        candidates: list[MemoryCandidate],
+        *,
+        guidance: str = "",
+        max_items: int | None = None,
+    ) -> tuple[str, str]:
         lines: list[str] = []
         budget = self.max_chars
-        selected = self.select(candidates)
+        selected = self.select(candidates, max_items=max_items)
         for item in selected:
             if item.kind == "jargon":
                 meaning = self._clean(str((item.metadata or {}).get("meaning") or item.summary or ""))

@@ -179,6 +179,39 @@ class MemoryObserverGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_record_formats_named_pipeline_stages_for_timeline(self):
+        async def _run():
+            from astrmai.memory.services.memory_observer import MemoryObserver
+
+            hub = _ObservabilityHub()
+            observer = MemoryObserver(observability_hub=hub)
+            stages = (
+                ("instant_gate", "backfill_started"),
+                ("memory_pipeline", "worker_spawned"),
+                ("memory_pipeline", "idle_timeout"),
+                ("memory_pipeline", "maintenance_rolled_back"),
+                ("session_summarizer", "topic_summarizer_degraded"),
+            )
+
+            formatted = []
+            for component, stage in stages:
+                event = await observer.record(
+                    chat_id="chat-stages",
+                    component=component,
+                    stage=stage,
+                )
+                formatted.append(observer.format_timeline_item(event))
+
+            for item, (component, stage) in zip(formatted, stages):
+                self.assertNotEqual(item["display_title"], f"{component}.{stage}")
+                self.assertEqual(item["display_kind"], stage)
+            self.assertEqual(
+                [record["title"] for record in hub.records],
+                [item["display_title"] for item in formatted],
+            )
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

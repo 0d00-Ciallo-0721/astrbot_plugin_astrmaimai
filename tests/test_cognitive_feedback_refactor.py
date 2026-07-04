@@ -1,10 +1,12 @@
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -144,6 +146,377 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
 
         self.assertIn("normal memory content", recalled)
         self.assertNotIn("cognitive_feedback", recalled)
+
+    def test_memory_engine_record_cognitive_feedback_writes_feedback_request(self):
+        engine = self._memory_engine()
+        captured = []
+
+        async def _write(request):
+            captured.append(request)
+            return "feedback-memory-id"
+
+        engine.write_service = SimpleNamespace(write=_write)
+
+        asyncio.run(
+            engine.record_cognitive_feedback(
+                session_id="chat-1",
+                source="Agency",
+                summary="Use fewer repeated jokes",
+                guidance="Prefer direct answers",
+                tags=[" Joke ", "joke", "Tone"],
+                importance=0.7,
+            )
+        )
+
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(request.kind, "feedback")
+        self.assertEqual(request.source, "agency")
+        self.assertEqual(request.session_id, "chat-1")
+        self.assertEqual(request.visibility, "tool_only")
+        self.assertEqual(request.tags, ["joke", "tone"])
+        self.assertTrue(request.metadata["cognitive_feedback"])
+        self.assertEqual(request.metadata["guidance"], "Prefer direct answers")
+        self.assertTrue(request.dedup_key.startswith("feedback:chat-1:agency:"))
+        self.assertIn("[cognitive_feedback:agency]", request.content)
+        self.assertEqual(engine._cognitive_feedback_cache["chat-1"][0].summary, "Use fewer repeated jokes")
+
+    def test_memory_engine_get_cognitive_feedback_merges_cache_and_db_rows(self):
+        cache_engine = self._memory_engine()
+        now = time.time()
+        cache_engine._remember_cognitive_feedback(
+            self.memory_mod.CognitiveFeedbackSignal(
+                source="agency",
+                chat_id="chat-1",
+                summary="cache summary",
+                guidance="cache guidance",
+                timestamp=now,
+                importance=0.6,
+            )
+        )
+
+        db_calls = []
+
+        async def _empty_query(query, params=(), *, db_path=None):
+            db_calls.append((query, params, db_path))
+            return []
+
+        cache_engine._run_documents_query = _empty_query
+
+        cache_signals = asyncio.run(cache_engine.get_cognitive_feedback("chat-1", limit=5))
+
+        self.assertEqual([item.source for item in cache_signals], ["agency"])
+        self.assertEqual(cache_signals[0].summary, "cache summary")
+        self.assertEqual(len(db_calls), 1)
+
+        db_engine = self._memory_engine()
+        db_calls.clear()
+        parse_calls = []
+
+        async def _query(query, params=(), *, db_path=None):
+            db_calls.append((query, params, db_path))
+            return [
+                (
+                    "[cognitive_feedback:diary]\nsummary: db summary\nguidance: db guidance\ntags: calm, calm, focus",
+                    json.dumps({"importance": 0.9}),
+                    now - 10,
+                ),
+                ("plain memory", "{}", now),
+            ]
+
+        db_engine._run_documents_query = _query
+
+        def _parse(text, *, chat_id, timestamp=0.0, importance=0.5):
+            parse_calls.append((text, chat_id, timestamp, importance))
+            if "cognitive_feedback:diary" not in str(text):
+                return None
+            return self.memory_mod.CognitiveFeedbackSignal(
+                source="diary",
+                chat_id=chat_id,
+                summary="db summary",
+                guidance="db guidance",
+                tags=["calm", "focus"],
+                timestamp=timestamp,
+                importance=importance,
+            )
+
+        db_engine._parse_cognitive_feedback_content = _parse
+
+        db_signals = asyncio.run(db_engine.get_cognitive_feedback("chat-1", limit=5))
+        diary_only = asyncio.run(db_engine.get_cognitive_feedback("chat-1", limit=5, sources={"diary"}))
+
+        self.assertEqual(len(db_calls), 2)
+        self.assertEqual(len(parse_calls), 4)
+        self.assertEqual([item.source for item in db_signals], ["diary"])
+        self.assertEqual(db_signals[0].summary, "db summary")
+        self.assertEqual(db_signals[0].guidance, "db guidance")
+        self.assertEqual(db_signals[0].tags, ["calm", "focus"])
+        self.assertEqual(db_signals[0].importance, 0.9)
+        self.assertEqual([item.source for item in diary_only], ["diary"])
+        self.assertEqual(asyncio.run(db_engine.get_cognitive_feedback("", limit=5)), [])
+
+    def test_memory_engine_disable_cognitive_feedback_filters_and_cleans_ttl(self):
+        engine = self._memory_engine()
+        old_key = "old|agency|summary|guidance"
+        engine._disabled_cognitive_feedback_keys[old_key] = time.time() - engine.DISABLE_TTL_SEC - 1
+        signal = self.memory_mod.CognitiveFeedbackSignal(
+            source="agency",
+            chat_id="chat-1",
+            summary="summary",
+            guidance="guidance",
+            timestamp=time.time(),
+        )
+
+        engine.disable_cognitive_feedback(signal)
+
+        self.assertNotIn(old_key, engine._disabled_cognitive_feedback_keys)
+        self.assertIn(engine._cognitive_feedback_key_str(signal), engine._disabled_cognitive_feedback_keys)
+
+    def test_memory_engine_parse_cognitive_feedback_content(self):
+        parsed = self.memory_mod.MemoryEngine._parse_cognitive_feedback_content(
+            "[cognitive_feedback:Agency]\nsummary: Be concise\nguidance: Avoid loops\ntags: Tone, tone, Direct",
+            chat_id="chat-1",
+            timestamp=123.0,
+            importance=0.8,
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.source, "Agency")
+        self.assertEqual(parsed.chat_id, "chat-1")
+        self.assertEqual(parsed.summary, "Be concise")
+        self.assertEqual(parsed.guidance, "Avoid loops")
+        self.assertEqual(parsed.tags, ["tone", "direct"])
+        self.assertEqual(parsed.timestamp, 123.0)
+        self.assertEqual(parsed.importance, 0.8)
+        self.assertIsNone(
+            self.memory_mod.MemoryEngine._parse_cognitive_feedback_content("plain memory", chat_id="chat-1")
+        )
+        self.assertIsNone(
+            self.memory_mod.MemoryEngine._parse_cognitive_feedback_content(
+                "[cognitive_feedback:agency]\ntags: only-tags",
+                chat_id="chat-1",
+            )
+        )
+
+    def test_memory_engine_store_topic_results_merges_similar_existing_topic(self):
+        engine = self._memory_engine()
+        written = []
+        merged = []
+
+        class _RetrievalService:
+            async def retrieve(self, query):
+                self.query = query
+                return [
+                    SimpleNamespace(
+                        id="topic-old",
+                        content="Alice prefers concise summaries about deployment readiness.",
+                        kind="topic",
+                        tags=["deployment"],
+                        confidence=0.75,
+                    )
+                ]
+
+        class _WriteService:
+            async def write(self, request):
+                written.append(request)
+                return "topic-new"
+
+        class _MaintenanceService:
+            async def mark_merged(self, ids, superseded_by):
+                merged.append((ids, superseded_by))
+
+        engine.retrieval_service = _RetrievalService()
+        engine.write_service = _WriteService()
+        engine.maintenance_service = _MaintenanceService()
+
+        asyncio.run(
+            engine.store_topic_results(
+                [
+                    {
+                        "summary": "Alice prefers concise summaries about deployment readiness.",
+                        "topic_keywords": ["deployment", "readiness"],
+                        "importance": 0.9,
+                    }
+                ],
+                session_id="chat-1",
+                persona_id="persona-1",
+            )
+        )
+
+        self.assertEqual(len(written), 1)
+        request = written[0]
+        self.assertEqual(request.kind, "topic")
+        self.assertEqual(request.session_id, "chat-1")
+        self.assertEqual(request.persona_id, "persona-1")
+        self.assertIn("Supplement:", request.content)
+        self.assertEqual(request.metadata["merged_from"], ["topic-old"])
+        self.assertEqual(merged, [(["topic-old"], "topic-new")])
+
+    def test_memory_engine_ensure_faiss_initialized_ready_fast_path(self):
+        engine = self._memory_engine()
+        engine._is_ready = True
+
+        self.assertTrue(asyncio.run(engine._ensure_faiss_initialized()))
+
+    def test_memory_engine_initialize_wires_services_and_runs_legacy_imports(self):
+        engine = self._memory_engine()
+        calls = []
+
+        class _Store:
+            async def initialize(self):
+                calls.append("store.initialize")
+
+            async def import_legacy_documents(self):
+                calls.append("legacy.documents")
+
+            async def import_persona_cache(self):
+                calls.append("legacy.persona")
+
+        class _BM25:
+            def __init__(self, db_path):
+                calls.append(("bm25", db_path))
+
+            async def initialize(self):
+                calls.append("bm25.initialize")
+
+        class _Service:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        engine.v2_store = _Store()
+
+        async def _legacy_events():
+            calls.append("legacy.events")
+
+        async def _legacy_jargons():
+            calls.append("legacy.jargons")
+
+        async def _legacy_patterns():
+            calls.append("legacy.patterns")
+
+        engine.import_legacy_memory_events = _legacy_events
+        engine.import_legacy_jargons = _legacy_jargons
+        engine.import_legacy_expression_patterns = _legacy_patterns
+
+        with patch.multiple(
+            self.memory_mod,
+            MemoryIndexProjector=_Service,
+            MemoryWriteService=_Service,
+            MemoryRetrievalService=_Service,
+            ExpressionPatternService=_Service,
+            MemoryInjectionService=_Service,
+            MemoryToolService=_Service,
+            MemoryMaintenanceService=_Service,
+            MemoryMigrationService=_Service,
+            BM25Retriever=_BM25,
+        ):
+            asyncio.run(engine.initialize())
+
+        self.assertIs(engine.v2_store.index_projector, engine.index_projector)
+        self.assertIsInstance(engine.write_service, _Service)
+        self.assertIsInstance(engine.retrieval_service, _Service)
+        self.assertEqual(
+            calls,
+            [
+                "store.initialize",
+                "legacy.documents",
+                "legacy.persona",
+                "legacy.events",
+                "legacy.jargons",
+                "legacy.patterns",
+                ("bm25", engine.db_path),
+                "bm25.initialize",
+            ],
+        )
+
+    def test_memory_engine_start_background_tasks_wires_and_starts_pipeline(self):
+        engine = self._memory_engine()
+        engine.db_service = SimpleNamespace(raw_trace_store="trace-store", event_bus="db-events")
+        engine.observability_hub = "observability"
+        started = []
+
+        class _Component:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        class _Pipeline(_Component):
+            async def start(self):
+                started.append(self)
+
+        with patch.multiple(
+            self.memory_mod,
+            MemoryObserver=_Component,
+            SessionMemorySummarizer=_Component,
+            InstantMemoryGate=_Component,
+            MemoryTurnPipeline=_Pipeline,
+        ):
+            asyncio.run(engine.start_background_tasks())
+
+        self.assertEqual(started, [engine.memory_pipeline])
+        self.assertEqual(engine.memory_observer.args, ("trace-store",))
+        self.assertEqual(engine.memory_observer.kwargs["observability_hub"], "observability")
+        self.assertIs(engine.memory_pipeline.kwargs["observer"], engine.memory_observer)
+        self.assertEqual(engine.memory_pipeline.kwargs["event_bus"], "db-events")
+
+    def test_memory_engine_legacy_imports_mark_applied_without_db_service(self):
+        engine = self._memory_engine()
+        migrations = []
+
+        class _Store:
+            async def migration_applied(self, version):
+                return False
+
+            async def record_migration(self, version, **kwargs):
+                migrations.append((version, kwargs))
+
+        engine.v2_store = _Store()
+        engine.db_service = None
+
+        async def _run_imports():
+            return await asyncio.gather(
+                engine.import_legacy_memory_events(),
+                engine.import_legacy_jargons(),
+                engine.import_legacy_expression_patterns(),
+            )
+
+        results = asyncio.run(_run_imports())
+
+        self.assertEqual(results, [0, 0, 0])
+        self.assertEqual(
+            [item[0] for item in migrations],
+            ["2_memory_event_import", "2_jargon_import", "2_expression_pattern_import"],
+        )
+        self.assertTrue(all(item[1]["status"] == "applied" for item in migrations))
+
+    def test_memory_engine_get_recent_memories_filters_feedback_rows(self):
+        engine = self._memory_engine()
+        queries = []
+
+        async def _ready():
+            return True
+
+        async def _query(query, params=(), *, db_path=None):
+            queries.append((query, params, db_path))
+            if query.startswith("PRAGMA"):
+                return [(0, "page_content"), (1, "metadata")]
+            return [
+                ("visible memory",),
+                ("[cognitive_feedback:agency]\nsummary: hidden",),
+                ("",),
+            ]
+
+        engine._ensure_faiss_initialized = _ready
+        engine._run_documents_query = _query
+
+        result = asyncio.run(engine.get_recent_memories("chat-1", hours=12))
+
+        self.assertEqual(result, ["visible memory"])
+        self.assertEqual(len(queries), 2)
+        self.assertIn("SELECT page_content", queries[1][0])
+        self.assertEqual(queries[1][1][0], "chat-1")
+        self.assertEqual(queries[1][2], engine.db_path)
 
     def test_agency_reflection_bridge_flushes_after_threshold(self):
         runtime = self.runtime_mod.AgencyRuntimeStore()

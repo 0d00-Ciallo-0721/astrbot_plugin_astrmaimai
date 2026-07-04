@@ -144,7 +144,8 @@ class PromptRefinerLightweightPortedTests(unittest.TestCase):
         memory_decision = event.get_extra("astrmai_turn_context").memory
         self.assertTrue(memory_decision.injected)
         self.assertEqual(memory_decision.source, "proactive_recall+memory_v2")
-        self.assertIn("earlier lore reminder", memory_decision.summary_preview)
+        self.assertNotIn("earlier lore reminder", memory_decision.summary_preview)
+        self.assertIn("proactive memory fragment", memory_decision.summary_preview)
 
     def test_refiner_records_no_result_memory_decision(self):
         memory_engine = self._make_memory_engine(result="")

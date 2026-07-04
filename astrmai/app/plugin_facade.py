@@ -191,6 +191,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("frequency_controller", getattr(self.runtime, "frequency_controller", None)),
             ("private_chat_manager", getattr(self.runtime, "private_chat_manager", None)),
             ("attention_gate", getattr(self.runtime, "attention_gate", None)),
+            ("reply_engine", getattr(self.runtime, "reply_engine", None)),
             ("evolution", getattr(self.runtime, "evolution", None)),
             ("memory_engine", getattr(self.runtime, "memory_engine", None)),
             ("judge", getattr(self.runtime, "judge", None)),

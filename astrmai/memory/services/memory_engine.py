@@ -84,14 +84,45 @@ class MemoryEngine:
         self._init_failures = 0
         self._next_retry_time = 0.0
         self._index_consistency_repaired = False
+        self._force_index_rebuild = False
         self._learning_event_history = []
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
         self._disabled_cognitive_feedback_keys: dict[str, float] = {}
         self.v2_store = MemoryV2Store(self.v2_db_path, data_path=self.data_path, legacy_db_path=self.db_path)
         # Sub-components that depend on self are initialized in initialize()
 
+    @staticmethod
+    def _configured_embedding_models(config, fallback: list | None = None) -> list:
+        configured = []
+        if hasattr(config, "provider") and getattr(config.provider, "embedding_models", None):
+            configured = getattr(config.provider, "embedding_models", None) or []
+        elif fallback is not None:
+            configured = fallback
+        return [str(item).strip() for item in configured if str(item).strip()]
+
     def refresh_config(self, config):
+        old_embedding_models = list(self.embedding_models or [])
         self.config = config
+        if getattr(self, "injection_service", None) is not None:
+            self.injection_service.refresh_config(config)
+        self.embedding_models = self._configured_embedding_models(config)
+        if self.embedding_models != old_embedding_models:
+            self.faiss_db = None
+            self.vec_retriever = None
+            self.retriever = None
+            self._is_ready = False
+            self._init_failures = 0
+            self._next_retry_time = 0.0
+            self._index_consistency_repaired = False
+            self._force_index_rebuild = True
+
+    def _reset_vector_index_file(self) -> None:
+        index_path = self.data_path / "vectors.index"
+        try:
+            if index_path.exists():
+                index_path.unlink()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] vector index reset degraded: {exc}")
 
     def _remember_learning_event(self, event_name: str, payload: dict | None) -> None:
         event_payload = dict(payload or {})
@@ -221,6 +252,8 @@ class MemoryEngine:
                 return True
 
             try:
+                if self._force_index_rebuild:
+                    self._reset_vector_index_file()
                 self.faiss_db = FaissVecDB(
                     doc_store_path=str(self.data_path / "docs.db"),
                     index_store_path=str(self.data_path / "vectors.index"),
@@ -238,9 +271,10 @@ class MemoryEngine:
             self.retriever = HybridRetriever(self.bm25_retriever, self.vec_retriever, config=self.config)
             self._is_ready = True
             self._init_failures = 0
-            if not await self.v2_store.migration_applied("2_index_rebuild"):
+            if self._force_index_rebuild or not await self.v2_store.migration_applied("2_index_rebuild"):
                 try:
                     rebuilt = await self.index_projector.rebuild_all()
+                    self._force_index_rebuild = False
                     await self.v2_store.record_migration("2_index_rebuild", status="applied", detail=f"rebuilt={rebuilt}")
                 except Exception as exc:
                     await self.v2_store.record_migration("2_index_rebuild", status="failed", detail=str(exc)[:500])

@@ -61,6 +61,13 @@ class MemoryV2Store:
         self._session_locks_guard = asyncio.Lock()
 
     @staticmethod
+    def _resolve_search_limit(top_k: int, candidate_limit: int | None) -> int:
+        result_limit = max(int(top_k or 5), 1)
+        if candidate_limit is None:
+            return max(result_limit * 8, 20)
+        return max(int(candidate_limit), result_limit, 1)
+
+    @staticmethod
     def _normalize_lock_scope(session_id: str) -> str:
         clean = str(session_id or "").strip()
         return clean if clean else "__global__"
@@ -124,6 +131,51 @@ class MemoryV2Store:
                     for i in range(len(seg) - 1):
                         terms.append(f'"{seg[i:i+2]}"')
         return " OR ".join(terms)
+
+    @staticmethod
+    def _fallback_search_terms(text: str) -> list[str]:
+        import re
+
+        weak_terms = {
+            "什么",
+            "那个",
+            "这个",
+            "上次",
+            "记得",
+            "还记",
+            "还记得",
+            "一下",
+            "知道",
+            "告诉",
+            "吗",
+            "呢",
+            "啊",
+            "呀",
+        }
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        def add(term: str) -> None:
+            normalized = str(term or "").strip().lower()
+            if normalized and normalized not in weak_terms and normalized not in seen:
+                seen.add(normalized)
+                terms.append(normalized)
+
+        for raw in str(text or "").split():
+            add(raw)
+        for seg in re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", str(text or "")):
+            add(seg)
+            if not re.fullmatch(r"[a-zA-Z0-9]+", seg) and len(seg) > 1:
+                for i in range(len(seg) - 1):
+                    add(seg[i:i + 2])
+        return terms
+
+    @staticmethod
+    def _fallback_min_overlap(query_text: str, terms: list[str]) -> int:
+        has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in str(query_text or ""))
+        if has_cjk and len(terms) >= 4:
+            return 2
+        return 1
 
     async def _sync_fts(self, db, memory_id: str, *, delete_only: bool = False) -> None:
         await db.execute("DELETE FROM canonical_fts WHERE memory_id = ?", (memory_id,))
@@ -721,6 +773,7 @@ class MemoryV2Store:
         persona_id: str = "",
         layers: list[str] | None = None,
         top_k: int = 5,
+        candidate_limit: int | None = None,
         exclude_ids: list[str] | None = None,
         allow_stale: bool = False,
         visibility_mode: str = "",
@@ -730,12 +783,14 @@ class MemoryV2Store:
         if not query_text:
             return []
         fts_query = self._build_fts_query(query_text)
-        lowered_terms = [term.lower() for term in query_text.split() if term.strip()]
+        lowered_terms = self._fallback_search_terms(query_text)
         statuses = [ACTIVE_STATUS]
         if allow_stale:
             statuses.append(STALE_STATUS)
         exclude = {str(item) for item in exclude_ids or [] if str(item).strip()}
         layer_set = {str(item) for item in layers or [] if str(item).strip()}
+        result_limit = max(int(top_k or 5), 1)
+        search_limit = self._resolve_search_limit(result_limit, candidate_limit)
         if visibility_mode == "auto":
             allowed_visibility = {"auto_and_tool"}
         elif visibility_mode == "tool":
@@ -774,7 +829,7 @@ class MemoryV2Store:
                     ORDER BY fts_score ASC, cm.update_time DESC
                     LIMIT ?
                     """,
-                    (fts_query, *params, max(int(top_k or 5) * 8, 20)),
+                    (fts_query, *params, search_limit),
                 )
                 rows = await cursor.fetchall()
                 candidates = []
@@ -783,8 +838,10 @@ class MemoryV2Store:
                     if candidate.id in exclude:
                         continue
                     candidate.relevance_score = 1.0 / (1.0 + max(0.0, (float(row[20] or 0.0) if len(row) > 20 else 0.0)))
+                    candidate.metadata = dict(candidate.metadata or {})
+                    candidate.metadata["matched_by"] = ["canonical_fts"]
                     candidates.append(candidate)
-            else:
+            if not fts_query or not candidates:
                 cursor = await db.execute(
                     f"""
                     SELECT id, kind, source, summary, content, session_id, sender_id, persona_id,
@@ -795,7 +852,7 @@ class MemoryV2Store:
                     ORDER BY update_time DESC
                     LIMIT ?
                     """,
-                    (*params, max(int(top_k or 5) * 8, 20)),
+                    (*params, search_limit),
                 )
                 rows = await cursor.fetchall()
                 candidates = []
@@ -808,13 +865,15 @@ class MemoryV2Store:
                     haystack = f"{summary}\n{content}".lower()
                     if lowered_terms:
                         overlap = sum(1 for term in lowered_terms if term in haystack)
-                        if overlap <= 0:
+                        if overlap < self._fallback_min_overlap(query_text, lowered_terms):
                             continue
                         relevance = min(1.0, overlap / max(len(lowered_terms), 1))
                     else:
-                        relevance = 0.1
+                        continue
                     candidate = self._row_to_candidate(row)
                     candidate.relevance_score = relevance
+                    candidate.metadata = dict(candidate.metadata or {})
+                    candidate.metadata["matched_by"] = ["fallback"]
                     candidates.append(candidate)
 
         candidates.sort(
@@ -827,7 +886,7 @@ class MemoryV2Store:
             ),
             reverse=True,
         )
-        selected = candidates[: max(int(top_k or 5), 1)]
+        selected = candidates[:result_limit]
         if selected:
             restore_ids = [
                 item.id

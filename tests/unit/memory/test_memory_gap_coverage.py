@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
@@ -309,6 +310,59 @@ class MemoryGapCoverageTests(unittest.TestCase):
         result = asyncio.run(engine.search_memories("query", top_k=3, session_id="chat-1"))
 
         self.assertEqual(result, [])
+
+    def test_memory_engine_refresh_config_updates_embedding_models_and_invalidates_vector_state(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        old_config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["ed-old"]), memory=SimpleNamespace(recall_top_k=5))
+        new_config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["ed-new"]), memory=SimpleNamespace(recall_top_k=9))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=old_config), config=old_config)
+        engine.faiss_db = object()
+        engine.vec_retriever = object()
+        engine.retriever = object()
+        engine._is_ready = True
+        engine._init_failures = 3
+        engine._next_retry_time = 123.0
+        engine._index_consistency_repaired = True
+
+        engine.refresh_config(new_config)
+
+        self.assertIs(engine.config, new_config)
+        self.assertEqual(engine.embedding_models, ["ed-new"])
+        self.assertIsNone(engine.faiss_db)
+        self.assertIsNone(engine.vec_retriever)
+        self.assertIsNone(engine.retriever)
+        self.assertFalse(engine._is_ready)
+        self.assertEqual(engine._init_failures, 0)
+        self.assertEqual(engine._next_retry_time, 0.0)
+        self.assertFalse(engine._index_consistency_repaired)
+        self.assertTrue(engine._force_index_rebuild)
+
+    def test_memory_engine_refresh_config_can_clear_embedding_models(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        old_config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["ed-old"]), memory=SimpleNamespace(recall_top_k=5))
+        new_config = SimpleNamespace(provider=SimpleNamespace(embedding_models=[]), memory=SimpleNamespace(recall_top_k=9))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=old_config), config=old_config)
+
+        engine.refresh_config(new_config)
+
+        self.assertEqual(engine.embedding_models, [])
+        self.assertTrue(engine._force_index_rebuild)
+
+    def test_memory_engine_vector_index_reset_only_removes_rebuildable_index_file(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+        config = SimpleNamespace(provider=SimpleNamespace(embedding_models=["ed-old"]), memory=SimpleNamespace(recall_top_k=5))
+        engine = memory_engine_mod.MemoryEngine(SimpleNamespace(), SimpleNamespace(config=config), config=config)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            engine.data_path = Path(temp_dir)
+            index_path = engine.data_path / "vectors.index"
+            docs_path = engine.data_path / "docs.db"
+            index_path.write_text("old-vector-index", encoding="utf-8")
+            docs_path.write_text("documents", encoding="utf-8")
+
+            engine._reset_vector_index_file()
+
+            self.assertFalse(index_path.exists())
+            self.assertTrue(docs_path.exists())
 
     def test_memory_engine_recall_query_and_search_render_retrieval_results(self):
         memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")

@@ -137,6 +137,107 @@ class TopicSummarizerGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_process_history_builds_structured_topic_result(self):
+        from astrmai.memory.services.topic_summarizer import TopicSummarizer
+
+        summarizer = TopicSummarizer()
+        captured = []
+
+        async def _summarize(segments, session_id=""):
+            captured.append((segments, session_id))
+            return ["Deployment readiness discussion"]
+
+        summarizer._batch_summarize = _summarize
+        messages = [
+            {
+                "sender": "alice" if index % 2 == 0 else "bob",
+                "content": f"nice deployment readiness update {index}",
+                "timestamp": index * 10,
+            }
+            for index in range(12)
+        ]
+
+        result = asyncio.run(summarizer.process_history(messages, session_id="chat-1"))
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][1], "chat-1")
+        self.assertEqual(len(captured[0][0]), 1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["summary"], "Deployment readiness discussion")
+        self.assertEqual(result[0]["sentiment"], "positive")
+        self.assertEqual(result[0]["message_count"], 12)
+        self.assertEqual(result[0]["duration_minutes"], 110 / 60)
+        self.assertCountEqual(result[0]["participants"], ["alice", "bob"])
+        self.assertLessEqual(len(result[0]["topic_keywords"]), 5)
+
+    def test_calculate_sentiment_handles_positive_negative_and_neutral_text(self):
+        from astrmai.memory.services.topic_summarizer import TopicSegment, TopicSummarizer
+
+        summarizer = TopicSummarizer()
+
+        positive = summarizer._calculate_sentiment(
+            TopicSegment(messages=[{"content": "nice work"}, {"content": "still nice"}])
+        )
+        negative = summarizer._calculate_sentiment(
+            TopicSegment(messages=[{"content": "sb response"}, {"content": "plain"}])
+        )
+        neutral = summarizer._calculate_sentiment(
+            TopicSegment(messages=[{"content": "deployment status update"}])
+        )
+
+        self.assertEqual(positive, 1.0)
+        self.assertEqual(negative, -1.0)
+        self.assertEqual(neutral, 0.0)
+
+    def test_calculate_importance_uses_all_weighted_factors(self):
+        from astrmai.memory.services.topic_summarizer import TopicSegment, TopicSummarizer
+
+        segment = TopicSegment(
+            participants=["a", "b", "c", "d", "e"],
+            start_time=0,
+            end_time=900,
+            message_count=45,
+            sentiment_score=-0.5,
+        )
+
+        self.assertEqual(TopicSummarizer()._calculate_importance(segment), 0.9)
+
+    def test_extract_keywords_handles_mixed_chinese_and_english_text(self):
+        from astrmai.memory.services.topic_summarizer import TopicSegment, TopicSummarizer
+
+        segment = TopicSegment(
+            messages=[
+                {"content": "记忆系统 deploy deploy"},
+                {"content": "记忆系统 memory"},
+            ]
+        )
+
+        keywords = TopicSummarizer()._extract_keywords(segment)
+
+        self.assertIn("记忆系统", keywords)
+        self.assertIn("de", keywords)
+        self.assertNotIn("deploy", keywords)
+
+    def test_sentiment_to_label_covers_boundary_values(self):
+        from astrmai.memory.services.topic_summarizer import TopicSummarizer
+
+        labels = [
+            TopicSummarizer._sentiment_to_label(score)
+            for score in (-1.0, -0.31, 0.0, 0.29, 1.0)
+        ]
+
+        self.assertEqual(labels, ["negative", "negative", "neutral", "neutral", "positive"])
+
+    def test_tokenize_handles_cjk_ascii_and_mixed_text(self):
+        from astrmai.memory.services.topic_summarizer import TopicSummarizer
+
+        self.assertEqual(TopicSummarizer._tokenize("记忆系统"), ["记忆系统"])
+        self.assertEqual(TopicSummarizer._tokenize("deploy"), ["de", "ep", "pl", "lo", "oy"])
+        self.assertEqual(
+            TopicSummarizer._tokenize("记忆 AI memory"),
+            ["记忆", "AI", "me", "em", "mo", "or", "ry"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

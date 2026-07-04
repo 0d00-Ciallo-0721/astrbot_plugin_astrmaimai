@@ -10,9 +10,10 @@ import json
 
 from astrbot.api import logger
 
-from ..contracts.memory_query import MemoryInjectionBundle, MemoryInjectionTrace, MemoryQuery
+from ..contracts.memory_query import MemoryInjectionBundle, MemoryInjectionTrace
 from ..contracts.retrieval_trace import RetrievalTrace
 from .memory_context_builder import MemoryContextBuilder
+from .memory_query_builder import MemoryQueryBuilder
 from .memory_retrieval_service import MemoryRetrievalService
 
 
@@ -35,6 +36,13 @@ class MemoryInjectionService:
         self.config = config
         max_items = int(getattr(getattr(config, "memory", None), "recall_top_k", 5) or 5) if config else 5
         self.context_builder = MemoryContextBuilder(max_items=max_items)
+        self.query_builder = MemoryQueryBuilder(config)
+
+    def refresh_config(self, config) -> None:
+        self.config = config
+        max_items = int(getattr(getattr(config, "memory", None), "recall_top_k", 5) or 5) if config else 5
+        self.context_builder.max_items = max(max_items, 1)
+        self.query_builder.config = config
 
     @staticmethod
     def _preview(text: str, limit: int = 160) -> str:
@@ -45,18 +53,26 @@ class MemoryInjectionService:
     def _build_trace_summary(query, trace_payload, trace, skip_reason):
         selected = trace_payload.get("selected")
         retrieved = trace_payload.get("retrieved")
+        query_builder = trace_payload.get("query_builder")
+        retrieval = trace_payload.get("retrieval")
+        search_steps = [
+            {key: value for key, value in step.items() if key != "query"}
+            for step in list(trace_payload.get("search_steps") or [])
+            if isinstance(step, dict)
+        ]
         return {
             "tool": "auto_injection",
             "policy": str(getattr(query, "policy", "") or ""),
             "visibility_mode": str((getattr(query, "metadata", {}) or {}).get("visibility_mode") or ""),
-            "rewritten_queries": list(trace_payload.get("rewritten_queries") or []),
+            "rewritten_queries": [],
             "retrieve_keys": list(getattr(query, "retrieve_keys", []) or []),
-            "search_steps": list(trace_payload.get("search_steps") or []),
+            "search_steps": search_steps,
             "selected_ids": list(getattr(trace, "selected_ids", []) or []),
             "selected_count": int(getattr(trace, "selected_count", 0) or 0),
             "candidate_count": int(getattr(trace, "candidate_count", 0) or 0),
             "retrieved_count": len(retrieved) if isinstance(retrieved, list) else 0,
-            "guidance_preview": str(trace_payload.get("guidance") or "")[:160],
+            "query_builder": dict(query_builder) if isinstance(query_builder, dict) else {},
+            "retrieval": dict(retrieval) if isinstance(retrieval, dict) else {},
             "skip_reason": str(skip_reason or getattr(trace, "skip_reason", "") or ""),
             "error": str(trace_payload.get("error") or ""),
         }
@@ -67,21 +83,24 @@ class MemoryInjectionService:
         if not db_service or not hasattr(db_service, "save_retrieval_trace_async"):
             return
         trace_payload = dict((getattr(query, "metadata", {}) or {}).get("_trace", {}) or {})
+        debug_enabled = bool((getattr(query, "metadata", {}) or {}).get("memory_retrieval_debug_trace_enabled", False))
+        persisted_query = str(getattr(query, "query", "") or "") if debug_enabled else ""
         tool_calls = [{
             "tool": "auto_injection",
-            "query": str(getattr(query, "query", "") or ""),
             "memory_ids": list(getattr(trace, "selected_ids", []) or []),
             "search_steps": list(trace_payload.get("search_steps") or []),
             "skip_reason": str(skip_reason or ""),
         }]
+        if debug_enabled:
+            tool_calls[0]["query"] = persisted_query
         try:
             trace_summary = self._build_trace_summary(query, trace_payload, trace, skip_reason)
             record = RetrievalTrace(
                 trace_id=getattr(trace, "trace_id", "") or "",
                 chat_id=str(getattr(event, "unified_msg_origin", "") or ""),
                 sender_name=str(event.get_sender_name() or "") if hasattr(event, "get_sender_name") else "",
-                query=str(getattr(query, "query", "") or ""),
-                planner_question=str(getattr(query, "query", "") or ""),
+                query=persisted_query,
+                planner_question=persisted_query,
                 tool_calls=json.dumps(tool_calls, ensure_ascii=False),
                 trace_summary=json.dumps(trace_summary, ensure_ascii=False),
                 selected_memory_ids=json.dumps(list(getattr(trace, "selected_ids", []) or []), ensure_ascii=False),
@@ -181,8 +200,10 @@ class MemoryInjectionService:
 
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
         persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")
-        query = MemoryQuery(
-            query=current_query,
+        query = self.query_builder.build(
+            event=event,
+            raw_query=current_query,
+            prompt_envelope=prompt_envelope,
             session_id=chat_id,
             persona_id=persona_id,
             sender_id=str(event.get_sender_id() or "") if hasattr(event, "get_sender_id") else "",
@@ -198,14 +219,15 @@ class MemoryInjectionService:
         if not candidates:
             return skipped("no_result")
 
-        selected = self.context_builder.select(candidates)
+        selected = self.context_builder.select(candidates, max_items=query.top_k)
         trace.injected = True
         trace.source = "memory_v2"
         trace.layers = list(dict.fromkeys(item.kind for item in selected if item.kind))
         trace.selected_count = len(selected)
         trace.selected_ids = [item.id for item in selected]
-        rendered, guidance = self.context_builder.render_prompt_block(selected)
-        trace.summary_preview = self._preview(rendered)
+        rendered, guidance = self.context_builder.render_prompt_block(selected, max_items=query.top_k)
+        debug_trace_enabled = bool(query.metadata.get("memory_retrieval_debug_trace_enabled", False))
+        trace.summary_preview = self._preview(rendered) if debug_trace_enabled else ""
         decision.source = trace.source
         decision.layers = list(trace.layers)
         decision.selected_ids = list(trace.selected_ids)

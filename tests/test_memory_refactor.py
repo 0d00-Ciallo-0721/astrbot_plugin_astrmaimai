@@ -572,6 +572,142 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertTrue(result["instant_gate_hit"])
         self.assertEqual(result["pending_messages"], 4)
 
+    def test_compat_summarizer_ingest_committed_turn_degrades_without_pipeline(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(memory_pipeline=None),
+            config=gateway.config,
+        )
+
+        result = asyncio.run(
+            summarizer.ingest_committed_turn("chat-none", "hello", "hi", source="reply_post_send")
+        )
+
+        self.assertEqual(
+            result,
+            {"performed": False, "reason": "memory_pipeline_unavailable", "source": "reply_post_send"},
+        )
+
+    def test_compat_summarizer_ingest_committed_turn_preserves_source_when_record_skips(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        class _Pipeline:
+            def build_turn(self, **kwargs):
+                return SimpleNamespace(**kwargs)
+
+            async def record_turn(self, turn):
+                return {"performed": False, "reason": "not_eligible"}
+
+            async def process_instant_gate(self, turn):
+                raise AssertionError("instant gate should not run when record_turn skips")
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(memory_pipeline=_Pipeline()),
+            config=gateway.config,
+        )
+
+        result = asyncio.run(
+            summarizer.ingest_committed_turn("chat-skip", "hello", "hi", source="reply_post_send")
+        )
+
+        self.assertEqual(result, {"performed": False, "reason": "not_eligible", "source": "reply_post_send"})
+
+    def test_compat_summarizer_start_and_stop_toggle_periodic_task(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=SimpleNamespace(),
+            config=gateway.config,
+        )
+
+        async def _run():
+            await summarizer.start()
+            first_task = summarizer._periodic_task
+            await summarizer.start()
+            second_task = summarizer._periodic_task
+            await summarizer.stop()
+            await asyncio.sleep(0)
+            return first_task, second_task
+
+        first_task, second_task = asyncio.run(_run())
+
+        self.assertIs(first_task, second_task)
+        self.assertFalse(summarizer._running)
+        self.assertTrue(first_task.cancelled() or first_task.done())
+
+    def test_compat_summarizer_periodic_loop_runs_eligible_sessions_and_prunes(self):
+        sys.modules.pop("astrmai.memory.services.summarizer", None)
+        compat_mod = importlib.import_module("astrmai.memory.services.summarizer")
+        compat_mod = importlib.reload(compat_mod)
+
+        calls = []
+
+        class _Pipeline:
+            _session_history_buffer = {"chat-eligible": {"buffer": ["u", "a"]}}
+
+            async def describe_session_eligibility(self, chat_id):
+                calls.append(("describe", chat_id))
+                return {"eligible": True}
+
+            async def run_maintenance_for_session(self, chat_id):
+                calls.append(("maintenance", chat_id))
+                return {"performed": True}
+
+        class _Engine:
+            def __init__(self):
+                self.memory_pipeline = _Pipeline()
+
+            async def prune_low_importance(self, threshold):
+                calls.append(("prune", threshold))
+
+        gateway = SimpleNamespace(context=SimpleNamespace(astrmai=None), config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=2, cleanup_interval=3600, prune_threshold=0.4)))
+        summarizer = compat_mod.ChatHistorySummarizer(
+            context=SimpleNamespace(astrmai_plugin=None),
+            gateway=gateway,
+            engine=_Engine(),
+            config=gateway.config,
+        )
+        summarizer._running = True
+        summarizer.check_interval = 0
+        original_sleep = compat_mod.asyncio.sleep
+        sleep_calls = {"count": 0}
+
+        async def _sleep(_seconds):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] > 1:
+                raise asyncio.CancelledError()
+
+        compat_mod.asyncio.sleep = _sleep
+        try:
+            asyncio.run(summarizer._periodic_check_loop())
+        finally:
+            compat_mod.asyncio.sleep = original_sleep
+
+        self.assertEqual(
+            calls,
+            [
+                ("describe", "chat-eligible"),
+                ("maintenance", "chat-eligible"),
+                ("prune", 0.4),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
