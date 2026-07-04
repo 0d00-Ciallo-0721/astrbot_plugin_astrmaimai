@@ -224,6 +224,20 @@ class MemoryToolService:
             return_exceptions=True,
         )
         sections: list[str] = []
+        for label, result in (
+            ("memory", memory),
+            ("profile", profile),
+            ("nodes", nodes),
+            ("reflection", reflection),
+            ("jargon", jargon),
+        ):
+            if isinstance(result, BaseException):
+                logger.debug(f"[MemoryToolService] {label} lookup raised: {result}")
+        memory = None if isinstance(memory, BaseException) else memory
+        profile = None if isinstance(profile, BaseException) else profile
+        nodes = None if isinstance(nodes, BaseException) else nodes
+        reflection = None if isinstance(reflection, BaseException) else reflection
+        jargon = None if isinstance(jargon, BaseException) else jargon
         if memory:
             sections.append(memory)
         if jargon:

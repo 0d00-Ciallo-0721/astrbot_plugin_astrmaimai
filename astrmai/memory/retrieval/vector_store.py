@@ -66,12 +66,17 @@ class VectorRetriever:
 
         out = []
         for result in faiss_results:
-            doc_data = result.data
+            doc_data = getattr(result, "data", {}) or {}
+            doc_id = doc_data.get("id")
+            content = doc_data.get("text")
+            if doc_id is None or content is None:
+                logger.warning(f"[VectorStore] skipping malformed Faiss result: {doc_data}")
+                continue
             out.append(SearchResult(
-                doc_id=doc_data["id"],
-                score=result.similarity, # 原生引擎已归一化
-                content=doc_data["text"],
-                metadata=doc_data["metadata"],
+                doc_id=doc_id,
+                score=float(getattr(result, "similarity", 0.0) or 0.0),
+                content=content,
+                metadata=dict(doc_data.get("metadata") or {}),
                 source="vector"
             ))
             

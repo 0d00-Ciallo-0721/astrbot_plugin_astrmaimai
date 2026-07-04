@@ -191,8 +191,15 @@ class PrivateChatManager:
         key = self._session_key(user_id, chat_id)
         if key not in self._sessions:
             if len(self._sessions) >= self.MAX_SESSIONS:
-                oldest = min(self._sessions.items(), key=lambda x: x[1].last_message_time)
-                self.close_session(oldest[0])
+                evictable_sessions = [
+                    item for item in self._sessions.items()
+                    if not getattr(item[1], "is_bot_waiting", False)
+                ]
+                if not evictable_sessions:
+                    logger.warning("[PrivateChat] session limit reached; all sessions are waiting")
+                else:
+                    oldest = min(evictable_sessions, key=lambda x: x[1].last_message_time)
+                    self.close_session(oldest[0])
             self._sessions[key] = PrivateSession(user_id=user_id)
         return self._sessions[key]
 

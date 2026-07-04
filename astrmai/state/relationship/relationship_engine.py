@@ -328,6 +328,13 @@ class RelationshipEngine:
         """
         vec = self.get_or_create(user_id)
         now = time.time()
+        try:
+            intensity = float(intensity)
+        except (TypeError, ValueError):
+            intensity = 1.0
+        if not math.isfinite(intensity):
+            intensity = 1.0
+        intensity = max(0.1, min(3.0, intensity))
 
         # 0. 自动衰减检查
         self._apply_decay(vec, now)
@@ -356,7 +363,7 @@ class RelationshipEngine:
             saturated_delta = self._log_saturation(raw_delta, current_val)
 
             # 3.2 强度乘数
-            saturated_delta *= max(0.1, min(3.0, intensity))
+            saturated_delta *= intensity
 
             # 3.3 共振放大 (连续正面互动)，按事件级别统一计算一次放大因子。
             saturated_delta *= streak_multiplier
@@ -499,10 +506,10 @@ class RelationshipEngine:
         ascii_words = ("sb", "cnm", "nmsl")
         if any(re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", lower) for word in ascii_words):
             return True
-        chinese_words = ("傻逼", "去死", "白痴", "废物", "脑残", "鍌婚€?", "鍘绘", "鐧界棿", "搴熺墿", "鑴戞畫")
+        chinese_words = ("傻逼", "去死", "白痴", "废物", "脑残")
         if any(word in lower for word in chinese_words):
             return True
-        roll_words = ("滚开", "滚蛋", "滚出去", "滚远点", "快滚", "给我滚", "婊氬紑")
+        roll_words = ("滚开", "滚蛋", "滚出去", "滚远点", "快滚", "给我滚")
         stripped = lower.strip()
         return stripped == "滚" or any(word in stripped for word in roll_words)
 

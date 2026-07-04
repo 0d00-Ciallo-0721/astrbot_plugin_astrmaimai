@@ -23,8 +23,15 @@ class PreparedImage:
 class ImagePipeline:
     @staticmethod
     def prepare_image(base64_data: str) -> Optional[PreparedImage]:
-        image_bytes = base64.b64decode(base64_data)
-        image_format = Image.open(io.BytesIO(image_bytes)).format.lower()
+        try:
+            image_bytes = base64.b64decode(base64_data)
+            image = Image.open(io.BytesIO(image_bytes))
+            image_format = (image.format or "").lower()
+        except Exception as exc:
+            logger.error(f"[VisualPipeline] image prepare failed: {exc}")
+            return None
+        if not image_format:
+            return None
         if image_format in ["gif", "webp"]:
             transformed_b64 = ImagePipeline.transform_gif(base64_data)
             if not transformed_b64:

@@ -15,6 +15,8 @@ def build_prompt_envelope(
     last_assistant_reply: str,
     near_context_priority: bool,
 ):
+    freshness_budget = getattr(focus_context, "freshness_budget", None)
+    freshness_state = getattr(freshness_budget, "state", None) or FreshnessState.FRESH
     return PromptEnvelope(
         raw_user_text=focus_message_text,
         recent_transcript=recent_transcript,
@@ -28,7 +30,7 @@ def build_prompt_envelope(
         near_context_priority=near_context_priority,
         reply_mode=focus_context.reply_mode,
         social_state=focus_context.social_state,
-        freshness_state=focus_context.freshness_budget.state or FreshnessState.FRESH,
+        freshness_state=freshness_state,
         thread_signature=focus_context.thread_signature,
         guidance_lines=planner._build_guidance_lines(focus_context.reply_mode),
     )

@@ -43,7 +43,7 @@ def infer_provider_capabilities(model_or_provider_id: str) -> ProviderCapabiliti
 
     return ProviderCapabilities(
         provider_family="unknown",
-        supports_native_prompt_cache=True,
+        supports_native_prompt_cache=False,
         supports_remote_session=False,
         supports_cache_control=False,
     )

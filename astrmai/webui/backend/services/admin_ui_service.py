@@ -91,7 +91,13 @@ class AdminUiService:
         if where:
             # ponytail: M16 — respect table param even when where clause is present
             if table == "MemoryEvent":
-                return await DashboardRepository(self.db_factory).count_table(table)
+                try:
+                    async with self.db_factory() as db:
+                        async with db.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params) as cursor:
+                            row = await cursor.fetchone()
+                            return int(row[0] if row else 0)
+                except Exception:
+                    return 0
             from ..repositories import CanonicalMemoryRepository
             return await CanonicalMemoryRepository(self.db_factory).count(where=where, params=params)
         return await DashboardRepository(self.db_factory).count_table(table)

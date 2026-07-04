@@ -35,18 +35,21 @@ class CronHeartbeatGuard:
         revived = 0
         now = time.time()
         for snap in snapshots:
-            if snap.run_once and snap.run_at and snap.run_at < now:
-                await self.db_service.deactivate_cron_snapshot(snap.job_id)
-                continue
-            if not snap.job_id or not str(snap.job_id).strip():
-                continue
-            if snap.job_id not in active_job_ids:
-                logger.info(
-                    f"[CronGuard] reviving job '{snap.name}' "
-                    f"from session '{getattr(snap, 'target_origin', '')}' (id={snap.job_id})"
-                )
-                if await self._revive_job(cron_mgr, snap):
-                    revived += 1
+            try:
+                if snap.run_once and snap.run_at and snap.run_at < now:
+                    await self.db_service.deactivate_cron_snapshot(snap.job_id)
+                    continue
+                if not snap.job_id or not str(snap.job_id).strip():
+                    continue
+                if snap.job_id not in active_job_ids:
+                    logger.info(
+                        f"[CronGuard] reviving job '{snap.name}' "
+                        f"from session '{getattr(snap, 'target_origin', '')}' (id={snap.job_id})"
+                    )
+                    if await self._revive_job(cron_mgr, snap):
+                        revived += 1
+            except Exception as exc:
+                logger.error(f"[CronGuard] failed to restore job '{getattr(snap, 'job_id', '')}': {exc}")
         return revived
 
     async def run_heartbeat(self):
@@ -92,13 +95,16 @@ class CronHeartbeatGuard:
         active_job_ids = {str(getattr(job, "id", getattr(job, "job_id", job))) for job in active_jobs}
         now = time.time()
         for snap in snapshots:
-            if snap.run_once and snap.run_at and snap.run_at < now:
-                await self.db_service.deactivate_cron_snapshot(snap.job_id)
-                continue
-            if not snap.job_id or not str(snap.job_id).strip():
-                continue
-            if snap.job_id not in active_job_ids:
-                await self._revive_job(cron_mgr, snap)
+            try:
+                if snap.run_once and snap.run_at and snap.run_at < now:
+                    await self.db_service.deactivate_cron_snapshot(snap.job_id)
+                    continue
+                if not snap.job_id or not str(snap.job_id).strip():
+                    continue
+                if snap.job_id not in active_job_ids:
+                    await self._revive_job(cron_mgr, snap)
+            except Exception as exc:
+                logger.error(f"[CronGuard] heartbeat restore failed for '{getattr(snap, 'job_id', '')}': {exc}")
 
     async def _revive_job(self, cron_mgr, snap) -> bool:
         payload = self._decode_payload(getattr(snap, "payload", {}))

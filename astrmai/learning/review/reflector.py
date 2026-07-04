@@ -106,7 +106,6 @@ class ExpressionReflector:
 
 返回 JSON 数组: [{{"index": 1, "score": 8, "feedback": "简评"}}]"""
 
-        batch_consumed = False
         try:
             result = await self.gateway.call_data_process_task(
                 prompt,
@@ -115,12 +114,12 @@ class ExpressionReflector:
                 base_origin="",
             )
             scores = self._parse_scores(result)
+            if not scores:
+                logger.warning("[Reflector] empty score payload from LLM; keeping batch for retry")
+                return
 
-            # ponytail: only remove batch after LLM succeeds — prevents data loss on failure
-            async with self._lock:
-                self._pending_reflections = self._pending_reflections[len(batch):]
-                batch_consumed = True
-
+            # Ack the batch only after LLM scoring and weight updates both succeed.
+            weight_update_failed = False
             for score_item in scores:
                 idx = score_item.get("index", 0) - 1
                 score = score_item.get("score", 5)
@@ -132,18 +131,26 @@ class ExpressionReflector:
 
                     if score <= 2:
                         # 低分: 降权
-                        await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=-0.3, pattern_id=pattern_id)
-                        logger.info(f"[Reflector] 📉 表达效果不佳 (得分:{score}): 「{expression}」已降权")
+                        adjusted = await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=-0.3, pattern_id=pattern_id)
+                        weight_update_failed = weight_update_failed or not adjusted
+                        if adjusted:
+                            logger.info(f"[Reflector] 📉 表达效果不佳 (得分:{score}): 「{expression}」已降权")
                     elif score >= 9:
                         # 高分: 加权
-                        await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=0.15, pattern_id=pattern_id)
-                        logger.debug(f"[Reflector] 📈 表达效果极佳 (得分:{score}): 「{expression}」已加权")
+                        adjusted = await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=0.15, pattern_id=pattern_id)
+                        weight_update_failed = weight_update_failed or not adjusted
+                        if adjusted:
+                            logger.debug(f"[Reflector] 📈 表达效果极佳 (得分:{score}): 「{expression}」已加权")
+
+            if weight_update_failed:
+                logger.warning("[Reflector] weight update failed after LLM success; keeping batch for retry")
+                return
+
+            async with self._lock:
+                self._pending_reflections = self._pending_reflections[len(batch):]
 
         except Exception as e:
             logger.debug(f"[Reflector] 批量反思失败: {e}")
-            # ponytail: M12 — remove failed batch to prevent infinite retry of same items
-            if batch_consumed:
-                logger.debug("[Reflector] batch already consumed before weight update failure")
 
     async def auto_audit(self, group_id: str):
         """
@@ -252,13 +259,13 @@ class ExpressionReflector:
             logger.debug(f"[Reflector] pattern reject degraded: {e}")
         return False
 
-    async def _adjust_canonical_pattern_weight(self, group_id: str, situation: str, expression: str, delta: float, pattern_id: str = ""):
+    async def _adjust_canonical_pattern_weight(self, group_id: str, situation: str, expression: str, delta: float, pattern_id: str = "") -> bool:
         """调整表达模式的权重"""
         try:
             service = self._pattern_service()
             if service and hasattr(service, "adjust_weight") and pattern_id:
                 await service.adjust_weight(str(pattern_id), delta)
-                return
+                return True
 
             # ponytail: fallback — try to adjust weight via get_patterns + save_pattern
             patterns = service.get_active_patterns(group_id) if service and hasattr(service, "get_active_patterns") else []
@@ -268,9 +275,11 @@ class ExpressionReflector:
                     save_fn = getattr(service, "save_" + "pattern", None)
                     if save_fn and pattern_id:
                         await save_fn(p)
-                    break
+                    return True
+            return True
         except Exception as e:
             logger.debug(f"[Reflector] 权重调整失败: {e}")
+            return False
 
     @staticmethod
     def _text_similarity(t1: str, t2: str) -> float:

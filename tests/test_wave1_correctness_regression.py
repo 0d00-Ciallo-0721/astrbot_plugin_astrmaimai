@@ -128,7 +128,7 @@ class Wave1CorrectnessRegressionTests(unittest.TestCase):
         self.assertEqual(stats["failures"], 0)
         self.assertEqual(stats["calls"], 1)
 
-    def test_reflector_weight_failure_does_not_consume_next_batch(self):
+    def test_reflector_weight_failure_keeps_batch_for_retry(self):
         sys.modules.pop("astrmai.learning.review.reflector", None)
         from astrmai.learning.review.reflector import ExpressionReflector
 
@@ -161,7 +161,7 @@ class Wave1CorrectnessRegressionTests(unittest.TestCase):
 
         self.assertEqual(
             [item["pattern_id"] for item in reflector._pending_reflections],
-            ["8", "9"],
+            [str(index) for index in range(10)],
         )
 
     def test_bm25_orders_more_relevant_document_first_and_normalizes_high(self):

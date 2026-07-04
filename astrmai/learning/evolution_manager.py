@@ -173,7 +173,7 @@ class EvolutionManager:
         def _normalized_key(value: str) -> str:
             return "".join(str(value or "").strip().lower().split())
 
-        count = 0
+        requests: list[MemoryWriteRequest] = []
         for jargon in jargons:
             content = str(self._field(jargon, "content", "") or "").strip()
             if not content:
@@ -188,7 +188,7 @@ class EvolutionManager:
             review_status = self._normalize_jargon_review_status(self._field(jargon, "review_status", "review_pending"))
             status = "rejected" if review_status == "rejected" else "review_pending"
             visibility = "maintenance_only"
-            await writer.write(
+            requests.append(
                 MemoryWriteRequest(
                     source="learning_jargon",
                     kind="jargon",
@@ -214,7 +214,19 @@ class EvolutionManager:
                     status=status,
                 )
             )
-            count += 1
+
+        count = 0
+        failures: list[str] = []
+        for request in requests:
+            try:
+                memory_id = await writer.write(request)
+            except Exception as exc:
+                failures.append(f"{request.content}: {exc}")
+                continue
+            if memory_id:
+                count += 1
+        if failures:
+            raise RuntimeError("jargon write failures: " + "; ".join(failures[:3]))
         return count
 
     async def process_feedback(self, event: AstrMessageEvent, is_command: bool = False):

@@ -99,7 +99,7 @@ class EmbeddingClient:
             providers = self.context.get_all_embedding_providers()
             if providers:
                 p = providers[0]
-                safe_id = getattr(p, 'id', getattr(getattr(p, 'meta', None), 'name', 'Unknown'))
+                safe_id = getattr(p, 'id', None) or getattr(getattr(p, 'meta', None), 'name', 'Unknown')
                 logger.info(f"[Embedding] 兜底策略：已自动选择系统中可用的 Embedding Provider: {safe_id}")
                 return p
                 

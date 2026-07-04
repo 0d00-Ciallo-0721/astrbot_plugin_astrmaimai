@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from astrbot.api import logger
 
 from ..presentation.dto.message_scope import IngressDecision
@@ -19,6 +21,7 @@ class PluginFacade(RuntimeFacadeProtocol):
     def __init__(self, runtime: PluginRuntimeContext):
         self.runtime = runtime
         self.lifecycle_manager = PluginLifecycleManager(runtime)
+        self._hot_config_lock = threading.RLock()
         self.runtime.bind_system2_callback(self._system2_entry)
         # ponytail: WebUI adapter registration failure is logged but silently
         # swallowed — admin pages work without it. Surface to user if audit page
@@ -165,7 +168,18 @@ class PluginFacade(RuntimeFacadeProtocol):
 
     # ── config hot-apply ────────────────────────────────────────────
 
+    def _get_hot_config_lock(self):
+        lock = getattr(self, "_hot_config_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._hot_config_lock = lock
+        return lock
+
     def apply_hot_config(self, config_dict: dict, parsed_config) -> bool:
+        with self._get_hot_config_lock():
+            return self._apply_hot_config_locked(config_dict, parsed_config)
+
+    def _apply_hot_config_locked(self, config_dict: dict, parsed_config) -> bool:
         """热应用配置到运行时。遍历所有组件刷新。"""
         old_raw_config = dict(getattr(self.runtime, "raw_config", {}) or {})
         old_config = getattr(self.runtime, "config", None)

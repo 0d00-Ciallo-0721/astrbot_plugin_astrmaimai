@@ -190,6 +190,8 @@ class DreamAgent:
         try:
             event = await asyncio.to_thread(self._get_event_by_id, event_id)
             if event:
+                if event.get("error"):
+                    return f"读取失败: {event.get('error', '')}"
                 return (
                     f"叙事: {event.get('narrative', '')}\n"
                     f"情感: {event.get('emotion', '')}\n"
@@ -212,6 +214,9 @@ class DreamAgent:
                     session_id=session_id,
                     importance=0.7,
                 )
+                if not str(new_memory_id or "").strip():
+                    logger.warning("[DreamAgent] merge write was skipped; no canonical memory id returned")
+                    return "合并失败: 新记忆写入被过滤或失败"
                 canonical_ids = []
                 for event_id in event_ids:
                     finder = getattr(getattr(self.memory_engine, "v2_store", None), "find_ids_by_source_ref", None)
@@ -275,6 +280,30 @@ class DreamAgent:
             return f"Updated memory {event_id}"
         except Exception as exc:
             return f"更新失败: {exc}"
+
+    async def _resolve_canonical_ids(self, event_ids: List[str]) -> tuple[list[str], list[str]]:
+        canonical_ids: list[str] = []
+        unresolved_legacy_ids: list[str] = []
+        v2_store = getattr(self.memory_engine, "v2_store", None) if self.memory_engine else None
+        finder = getattr(v2_store, "find_ids_by_source_ref", None)
+        for event_id in event_ids:
+            normalized = str(event_id or "").strip()
+            if not normalized:
+                continue
+            if self._is_canonical_memory_id(normalized):
+                canonical_ids.append(normalized)
+                continue
+            found = list(await finder(f"MemoryEvent:{normalized}")) if finder else []
+            if found:
+                canonical_ids.extend(str(item) for item in found if str(item or "").strip())
+            else:
+                unresolved_legacy_ids.append(normalized)
+        return list(dict.fromkeys(canonical_ids)), list(dict.fromkeys(unresolved_legacy_ids))
+
+    @staticmethod
+    def _is_canonical_memory_id(event_id: str) -> bool:
+        normalized = str(event_id or "").strip()
+        return normalized.startswith(("mem_", "memory_", "canon_"))
 
     async def _tool_delete(self, params: Dict) -> str:
         event_id = params.get("event_id", "")
@@ -358,7 +387,7 @@ class DreamAgent:
                     }
         except Exception as exc:
             logger.warning(f"[DreamAgent] failed to read legacy memory event {event_id}: {exc}")
-            raise
+            return {"error": str(exc)}
         return None
 
     def _delete_event(self, event_id: str):

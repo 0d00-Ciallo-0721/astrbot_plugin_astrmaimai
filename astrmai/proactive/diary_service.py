@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from astrbot.api import logger
@@ -19,7 +20,10 @@ class DiaryService:
     async def run_once(self, active_states):
         async with self._bg_semaphore:
             persona_id = getattr(self.config.persona, "persona_id", "") or "global"
-            cache = self.persistence.load_persona_cache()
+            if hasattr(self.persistence, "load_persona_cache_async"):
+                cache = await self.persistence.load_persona_cache_async()
+            else:
+                cache = await asyncio.to_thread(self.persistence.load_persona_cache)
             persona_data = cache.get(persona_id, {})
             summary = persona_data.get("summary", "")
             persona_injection = f"\n[你的核心人设]: {summary}\n" if summary else ""

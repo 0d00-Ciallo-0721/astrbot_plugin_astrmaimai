@@ -369,13 +369,39 @@ class PluginRuntimeContext:
 
     def build_capability_overview_sync(self) -> dict[str, Any]:
         from .. import multimodal as multimodal_mod
+        try:
+            cron_guard_status = self.cron_guard.describe_status() if self.cron_guard else {"running": False}
+        except Exception as exc:
+            cron_guard_status = {"running": False, "error": str(exc)}
+        try:
+            task_status = (
+                self.proactive_task.describe_status()
+                if self.proactive_task and hasattr(self.proactive_task, "describe_status")
+                else {"running": False}
+            )
+        except Exception as exc:
+            task_status = {"running": False, "error": str(exc)}
+        try:
+            dream_scheduler_status = (
+                self.proactive_task.dream_scheduler.describe_status()
+                if self.proactive_task and getattr(self.proactive_task, "dream_scheduler", None)
+                else {
+                    "dream_visible": self.feature_flags.dream_visible,
+                    "interval_seconds": 0,
+                    "last_dream_time": 0.0,
+                    "dream_agent_bound": False,
+                    "dream_generator_bound": False,
+                }
+            )
+        except Exception as exc:
+            dream_scheduler_status = {"dream_visible": self.feature_flags.dream_visible, "error": str(exc)}
 
         return {
             "workmode": {
                 "enabled": self.feature_flags.work_mode_enabled,
                 "agents": self.sys3_router.get_static_agent_names() if self.sys3_router else [],
                 "router": {},
-                "cron_guard": self.cron_guard.describe_status() if self.cron_guard else {"running": False},
+                "cron_guard": cron_guard_status,
             },
             "multimodal": multimodal_mod.describe_multimodal_capabilities(
                 self.visual_cortex,
@@ -385,18 +411,8 @@ class PluginRuntimeContext:
             "proactive": {
                 "enabled": self.feature_flags.proactive_enabled,
                 "dream_visible": self.feature_flags.dream_visible,
-                "task_status": self.proactive_task.describe_status()
-                if self.proactive_task and hasattr(self.proactive_task, "describe_status")
-                else {"running": False},
-                "dream_scheduler": self.proactive_task.dream_scheduler.describe_status()
-                if self.proactive_task and getattr(self.proactive_task, "dream_scheduler", None)
-                else {
-                    "dream_visible": self.feature_flags.dream_visible,
-                    "interval_seconds": 0,
-                    "last_dream_time": 0.0,
-                    "dream_agent_bound": False,
-                    "dream_generator_bound": False,
-                },
+                "task_status": task_status,
+                "dream_scheduler": dream_scheduler_status,
                 "review_dispatcher": {"ready": False, "pending": 0},
             },
         }

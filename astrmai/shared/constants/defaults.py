@@ -71,6 +71,12 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
         except (TypeError, ValueError):
             return default
 
+    def _probability_enabled(raw: Any) -> bool:
+        try:
+            return int(float(str(raw or 0))) > 0
+        except (TypeError, ValueError):
+            return False
+
     provider = getattr(config, "provider", None)
     infra = getattr(config, "infra", None)
     global_settings = getattr(config, "global_settings", None)
@@ -104,7 +110,7 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
             vision_enabled=bool(getattr(vision, "enable_vision", True)),
             proactive_enabled=bool(getattr(life, "enable_proactive", True)),
             dream_visible=bool(getattr(life, "dream_visible", False)),
-            meme_enabled=bool(int(getattr(reply, "meme_probability", 0) or 0) > 0),
+            meme_enabled=_probability_enabled(getattr(reply, "meme_probability", 0)),
             dialogue_store_enabled=bool(getattr(getattr(config, "conversation", None), "enable_dialogue_store", True)),
             context_compaction_enabled=bool(getattr(getattr(config, "conversation", None), "enable_context_compaction", True)),
             prefix_caching_enabled=bool(getattr(getattr(config, "conversation", None), "enable_prefix_caching", True)),

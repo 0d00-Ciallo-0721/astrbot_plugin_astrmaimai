@@ -60,7 +60,7 @@ def compute_temporal_boost(
     scoring = config or DEFAULT_MEMORY_SCORING
     alpha = min(max(float(scoring.deep_temporal_alpha or 0.0), 0.0), 1.0)
     if float(candidate.created_at or 0.0) <= 0.0:
-        return alpha + (1.0 - alpha) * 1.0
+        return alpha
     # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
     now_ts = float(now or time.time())
     age_seconds = max(0.0, now_ts - float(candidate.created_at or 0.0))

@@ -52,11 +52,19 @@ class MessageScope:
     @classmethod
     def from_event(cls, event: Any) -> "MessageScope":
         umo, platform_type, entity_id = resolve_event_scope(event)
+        try:
+            sender_id = str(event.get_sender_id())
+        except Exception:
+            sender_id = ""
+        try:
+            group_id = str(event.get_group_id() or "")
+        except Exception:
+            group_id = ""
         return cls(
             umo=umo,
             platform_type=platform_type,
             entity_id=entity_id,
             self_id=get_event_self_id(event),
-            sender_id=str(event.get_sender_id()),
-            group_id=str(event.get_group_id() or ""),
+            sender_id=sender_id,
+            group_id=group_id,
         )

@@ -160,19 +160,19 @@ class TopicSummarizer:
             return []
 
         # 按时间排序
-        sorted_msgs = sorted(messages, key=lambda m: m.get("timestamp", 0))
+        sorted_msgs = sorted(messages, key=lambda m: self._coerce_timestamp(m.get("timestamp", 0)))
 
         segments: List[TopicSegment] = []
         current = TopicSegment()
-        current.start_time = sorted_msgs[0].get("timestamp", 0)
+        current.start_time = self._coerce_timestamp(sorted_msgs[0].get("timestamp", 0))
 
         for i, msg in enumerate(sorted_msgs):
-            ts = msg.get("timestamp", 0)
+            ts = self._coerce_timestamp(msg.get("timestamp", 0))
 
             # 检查是否需要断裂
             should_split = False
             if i > 0:
-                prev_ts = sorted_msgs[i - 1].get("timestamp", 0)
+                prev_ts = self._coerce_timestamp(sorted_msgs[i - 1].get("timestamp", 0))
                 gap = ts - prev_ts
 
                 # 条件1: 超过静默阈值
@@ -185,7 +185,7 @@ class TopicSummarizer:
                         should_split = True
 
             if should_split and len(current.messages) >= self.MIN_SEGMENT_MESSAGES:
-                current.end_time = sorted_msgs[i - 1].get("timestamp", 0)
+                current.end_time = self._coerce_timestamp(sorted_msgs[i - 1].get("timestamp", 0))
                 segments.append(current)
                 current = TopicSegment()
                 current.start_time = ts
@@ -194,10 +194,17 @@ class TopicSummarizer:
 
         # 最后一个段
         if current.messages:
-            current.end_time = sorted_msgs[-1].get("timestamp", 0)
+            current.end_time = self._coerce_timestamp(sorted_msgs[-1].get("timestamp", 0))
             segments.append(current)
 
         return segments
+
+    @staticmethod
+    def _coerce_timestamp(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _detect_topic_shift(self, recent_msgs: List[Dict], new_msg: Dict) -> bool:
         """

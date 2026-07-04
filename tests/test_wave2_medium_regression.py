@@ -69,6 +69,42 @@ class Wave2MediumRegressionTests(unittest.TestCase):
             ["0", "1", "2"],
         )
 
+    def test_reflector_retains_batch_when_weight_update_fails_after_llm_success(self):
+        sys.modules.pop("astrmai.learning.review.reflector", None)
+        from astrmai.learning.review.reflector import ExpressionReflector
+
+        class _Gateway:
+            async def call_data_process_task(self, *args, **kwargs):
+                return [{"index": 1, "score": 10}]
+
+        class _PatternService:
+            async def adjust_weight(self, pattern_id, delta):
+                raise TimeoutError("store locked")
+
+        reflector = ExpressionReflector(
+            SimpleNamespace(memory_engine=SimpleNamespace(expression_pattern_service=_PatternService())),
+            _Gateway(),
+        )
+        reflector._pending_reflections = [
+            {
+                "pattern_id": f"pattern-{index}",
+                "chat_id": "chat-1",
+                "situation": "situation",
+                "expression": f"expression-{index}",
+                "reply": "reply",
+                "reaction": "",
+                "time": float(index),
+            }
+            for index in range(3)
+        ]
+
+        asyncio.run(reflector.reflect_batch("chat-1"))
+
+        self.assertEqual(
+            [item["pattern_id"] for item in reflector._pending_reflections],
+            ["pattern-0", "pattern-1", "pattern-2"],
+        )
+
     def test_detected_fact_memory_ids_are_marked_as_promoted(self):
         from astrmai.memory.dream.promotion_engine import MemoryPromotionEngine
 

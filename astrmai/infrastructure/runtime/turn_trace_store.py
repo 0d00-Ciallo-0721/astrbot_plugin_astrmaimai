@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,21 @@ class TurnTraceSampleStore:
         ) as tmp_file:
             tmp_file.write(serialized)
             tmp_path = Path(tmp_file.name)
-        os.replace(tmp_path, self.path)
+        for attempt in range(3):
+            try:
+                os.replace(tmp_path, self.path)
+                return
+            except PermissionError:
+                if attempt >= 2:
+                    break
+                time.sleep(0.05 * (attempt + 1))
+        try:
+            self.path.write_text(serialized, encoding="utf-8")
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     async def append(self, sample: dict[str, Any]) -> None:
         chat_id = str(sample.get("chat_id", "") or "")

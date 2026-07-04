@@ -24,10 +24,16 @@ class MemoryPersistenceMixin:
 
     def search_nodes(self, query: str, limit: int = 3, include_description: bool = True) -> List[MemoryNode]:
         with self.get_session() as session:
-            lower_query = f"%{query.lower()}%"
-            conditions = [MemoryNode.name.like(lower_query)]
+            escaped_query = (
+                str(query or "").lower()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            lower_query = f"%{escaped_query}%"
+            conditions = [MemoryNode.name.like(lower_query, escape="\\")]
             if include_description:
-                conditions.append(MemoryNode.description.like(lower_query))
+                conditions.append(MemoryNode.description.like(lower_query, escape="\\"))
             statement = (
                 select(MemoryNode)
                 .where(or_(*conditions))

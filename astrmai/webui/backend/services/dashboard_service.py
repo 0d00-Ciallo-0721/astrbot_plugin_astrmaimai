@@ -45,14 +45,31 @@ class DashboardService:
 
     async def get_snapshot(self) -> dict:
         db_path = default_db_path()
-        counts = await self._repo.snapshot_counts()
+        degraded: dict[str, str] = {}
+        try:
+            counts = await self._repo.snapshot_counts()
+        except Exception as exc:
+            counts = {}
+            degraded["counts"] = str(exc)
+        try:
+            diagnostics = await self.plugin_api.get_runtime_diagnostics()
+        except Exception as exc:
+            diagnostics = {"status": "degraded", "error": str(exc)}
+            degraded["diagnostics"] = str(exc)
+        try:
+            capabilities = await self.plugin_api.get_capability_overview()
+        except Exception as exc:
+            capabilities = {"status": "degraded", "error": str(exc)}
+            degraded["capabilities"] = str(exc)
         return {
             "db_size_kb": self._db_size_kb(db_path),
             "webui_mem_mb": self._process_memory_mb(),
             "sys_cpu_percent": self._cpu_percent(),
             "sys_mem_percent": self._memory_percent(),
-            "diagnostics": await self.plugin_api.get_runtime_diagnostics(),
-            "capabilities": await self.plugin_api.get_capability_overview(),
+            "diagnostics": diagnostics,
+            "capabilities": capabilities,
+            "degraded": bool(degraded),
+            "degraded_components": degraded,
             **counts,
         }
 

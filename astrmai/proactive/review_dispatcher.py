@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
 
@@ -21,6 +23,7 @@ class ReviewDispatcher:
                     await self.reflect_tracker.mark_request_sent(str(item.get("pattern_id", "") or ""))
             except Exception as exc:
                 logger.warning(f"[Life] review dispatch degraded: {exc}")
+                await asyncio.sleep(0.2)
 
     async def describe_status(self) -> dict:
         if not self.reflect_tracker:
