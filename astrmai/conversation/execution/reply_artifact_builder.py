@@ -364,6 +364,7 @@ class ReplyArtifactMixin:
         context = getattr(self.state_engine.gateway, "context", None)
         if not context:
             logger.error("[ReplyService] gateway context missing, unable to send message")
+            artifact.metadata["send_status"] = "failed"
             return False
 
         send_key = ""
@@ -397,6 +398,7 @@ class ReplyArtifactMixin:
                         send_key_hash=_hash_send_key(send_key),
                     )
                     logger.info(f"[ReplyService] skipped duplicate final send for {chat_id}: {send_key}")
+                    artifact.metadata["send_status"] = "duplicate_blocked"
                     return False
                 debug_trace(
                     event,
@@ -420,6 +422,7 @@ class ReplyArtifactMixin:
                 send_key = ""
 
         outbound_message_ids: list[str] = []
+        sent_segment_count = 0
         try:
             for index, seg in enumerate(artifact.segments):
                 freshness_state, stale_reason = await self._check_reply_freshness(event, event.unified_msg_origin)
@@ -440,6 +443,7 @@ class ReplyArtifactMixin:
                 if sent_result is not None:
                     outbound_message_ids.append(str(sent_result))
                 artifact.sent = True
+                sent_segment_count += 1
                 if not event.get_extra("astrmai_reply_sent", False):
                     emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
 
@@ -447,7 +451,20 @@ class ReplyArtifactMixin:
                     delay = self._segment_send_delay(seg, str(artifact.metadata.get("delay_profile", "default") or "default"))
                     await asyncio.sleep(delay)
         except Exception as exc:
-            if send_key and runtime_coordinator is not None and hasattr(runtime_coordinator, "mark_send_failed"):
+            if artifact.sent:
+                artifact.metadata["send_status"] = "partial_sent"
+                artifact.metadata["sent_segment_count"] = sent_segment_count
+                logger.warning(
+                    f"[ReplyService] segmented reply partially sent for {chat_id}: {exc}"
+                )
+            else:
+                artifact.metadata["send_status"] = "failed"
+            if (
+                not artifact.sent
+                and send_key
+                and runtime_coordinator is not None
+                and hasattr(runtime_coordinator, "mark_send_failed")
+            ):
                 try:
                     failure_reason = str(exc) or "send_exception"
                     await runtime_coordinator.mark_send_failed(chat_id, send_key, failure_reason)
@@ -464,7 +481,14 @@ class ReplyArtifactMixin:
                     )
                 except Exception:
                     logger.debug("[ReplyService] send claim failure marking degraded", exc_info=True)
-            raise
+            if not artifact.sent:
+                raise
+        if artifact.sent and sent_segment_count < len(artifact.segments):
+            artifact.metadata["send_status"] = "partial_sent"
+            artifact.metadata["sent_segment_count"] = sent_segment_count
+            sent_text = "\n".join(artifact.segments[:sent_segment_count]).strip()
+            artifact.visible_text = sent_text
+            artifact.persistable_text = sent_text
         if outbound_message_ids:
             event.set_extra("astrmai_reply_outbound_message_ids", outbound_message_ids[:])
         if send_key and runtime_coordinator is not None and hasattr(runtime_coordinator, "commit_send"):

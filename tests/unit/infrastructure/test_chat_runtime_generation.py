@@ -65,7 +65,7 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
         self.assertEqual(claim["status"], "committed")
         self.assertEqual(claim["outbound_message_ids"], ["msg-1", "msg-2"])
 
-    def test_mark_send_failed_keeps_claimed_key_blocked(self):
+    def test_mark_send_failed_allows_same_turn_retry(self):
         coordinator = ChatRuntimeCoordinator()
 
         async def _run():
@@ -79,7 +79,10 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertEqual(claim["status"], "failed")
         self.assertEqual(len(claim["error"]), 300)
-        self.assertFalse(duplicate)
+        self.assertTrue(duplicate)
+        retried = asyncio.run(coordinator.get_send_claim("chat-1", "send-key"))
+        self.assertEqual(retried["status"], "claimed")
+        self.assertEqual(retried["error"], "")
 
     def test_empty_send_key_is_not_claimed(self):
         coordinator = ChatRuntimeCoordinator()

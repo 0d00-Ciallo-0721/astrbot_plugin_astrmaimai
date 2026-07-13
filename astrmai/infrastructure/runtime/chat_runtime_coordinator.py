@@ -191,7 +191,16 @@ class ChatRuntimeCoordinator:
             return False
         async with self._lock:
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
-            if normalized_send_key in state.send_claims:
+            existing = state.send_claims.get(normalized_send_key)
+            if existing is not None and existing.status == "failed":
+                existing.status = "claimed"
+                existing.claimed_at = time.time()
+                existing.committed_at = 0.0
+                existing.outbound_message_ids = []
+                existing.error = ""
+                self._increment_metric_locked("send_claim_retried")
+                return True
+            if existing is not None:
                 self._increment_metric_locked("send_claim_exists")
                 return False
             if len(state.send_claims) >= self.MAX_SEND_CLAIMS_PER_CHAT:

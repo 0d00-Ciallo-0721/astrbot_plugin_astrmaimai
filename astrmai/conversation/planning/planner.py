@@ -130,6 +130,28 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             runtime_coordinator=runtime_coordinator,
         )
 
+    def refresh_config(self, config) -> None:
+        self.prefix_caching_enabled = bool(
+            getattr(getattr(config, "conversation", None), "enable_prefix_caching", True)
+        )
+        owned_components = (
+            self.context_engine,
+            self.prompt_refiner,
+            self.cognitive_loop,
+            self.goal_manager,
+            self.action_modifier,
+            self.expression_selector,
+            self.executor,
+        )
+        for component in owned_components:
+            if component is None:
+                continue
+            refresh = getattr(component, "refresh_config", None)
+            if callable(refresh):
+                refresh(config)
+            else:
+                component.config = config
+
     async def _update_turn_trace_runtime(
         self,
         event: AstrMessageEvent,
@@ -474,9 +496,25 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 names.append(name)
         return names
 
+    @staticmethod
+    def _executed_tool_names(event: AstrMessageEvent | None) -> list[str]:
+        if event is None or not hasattr(event, "get_extra"):
+            return []
+        trace = event.get_extra("astrmai_tool_execution_trace", [])
+        if not isinstance(trace, list):
+            return []
+        names: list[str] = []
+        for item in trace:
+            if not isinstance(item, dict) or str(item.get("status", "success")) != "success":
+                continue
+            name = str(item.get("tool_name", "") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
     @classmethod
-    def _cooldown_tags_from_tools(cls, tools, decision: CognitiveDecision | None, reply_text: str | None) -> list[str]:
-        tool_names = set(cls._tool_names(tools))
+    def _cooldown_tags_from_execution(cls, event, decision: CognitiveDecision | None, reply_text: str | None) -> list[str]:
+        tool_names = set(cls._executed_tool_names(event))
         tags: set[str] = set()
         if {"proactive_meme", "meme_resonance_action"} & tool_names:
             tags.add("meme")
@@ -492,15 +530,16 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tags.add("long_reply")
         return sorted(tags)
 
-    def _record_agency_reflection(self, chat_id: str, reply_text: str | None, tools, decision: CognitiveDecision | None) -> None:
+    def _record_agency_reflection(self, chat_id: str, reply_text: str | None, event, decision: CognitiveDecision | None) -> None:
         reply_need = getattr(decision, "reply_need", "reply") if decision else "reply"
         social_intent = getattr(decision, "social_intent", "answer") if decision else "answer"
         action_tier = getattr(decision, "action_tier", "") if decision else ""
+        executed_tools = self._executed_tool_names(event)
         action_tier = action_tier or ""
         if not action_tier:
-            action_tier = "tool" if tools else "none"
-        action_taken = "reply" if reply_text else ("tool" if tools else "none")
-        tags = self._cooldown_tags_from_tools(tools, decision, reply_text)
+            action_tier = "tool" if executed_tools else "none"
+        action_taken = "reply" if reply_text else ("tool" if executed_tools else "none")
+        tags = self._cooldown_tags_from_execution(event, decision, reply_text)
         note_parts = []
         if decision and getattr(decision, "state_bias", ""):
             note_parts.append(str(decision.state_bias))
@@ -1283,7 +1322,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     logger.info(
                         f"[{chat_id}] CognitiveLoop decision={cognitive_decision.reply_need}; planner execution skipped."
                     )
-                    self._record_agency_reflection(chat_id, None, None, cognitive_decision)
+                    self._record_agency_reflection(chat_id, None, event, cognitive_decision)
                     self._record_conversation_continuity(
                         chat_id,
                         prompt_envelope,
@@ -1381,7 +1420,21 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         final_system_prompt: str,
     ):
         if reply_text is None:
-            self._record_agency_reflection(chat_id, None, None, cognitive_decision)
+            execution_status = str(event.get_extra("astrmai_execution_status", "") or "")
+            execution_signal = str(event.get_extra("astrmai_execution_signal", "") or "")
+            if execution_signal == "wait" or execution_status == "skipped_wait":
+                trace_status = "skipped_wait"
+                skipped_reason = "wait"
+            elif execution_status == "stale_drop":
+                trace_status = "stale_drop"
+                skipped_reason = "stale"
+            elif execution_status:
+                trace_status = execution_status
+                skipped_reason = execution_status
+            else:
+                trace_status = "no_visible_reply"
+                skipped_reason = "no_visible_reply"
+            self._record_agency_reflection(chat_id, None, event, cognitive_decision)
             self._record_conversation_continuity(
                 chat_id,
                 prompt_envelope,
@@ -1392,13 +1445,22 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 is_lightweight_event=bool(planning_context.get("is_lightweight_event", False)),
             )
             self._apply_turn_continuity_context(event, chat_id)
-            await self._remember_turn_trace(chat_id, event, status="stale_drop")
+            try:
+                await self._settle_no_send_relationship_event(
+                    event,
+                    chat_id,
+                    skipped_reason=skipped_reason,
+                )
+            except Exception as exc:
+                logger.debug(f"[Planner] executor no-send settlement degraded: {exc}")
+            await self._finalize_proactive_event(event, None)
+            await self._remember_turn_trace(chat_id, event, status=trace_status)
             return None
 
         await self._record_planner_dialogue_segment(event, chat_id, reply_text, focus_context=focus_context)
         await self._update_turn_trace_runtime(event, chat_id, prompt_envelope=prompt_envelope, reply_text=reply_text)
         await self._record_expression_pattern_usage(event, chat_id, reply_text)
-        self._record_agency_reflection(chat_id, reply_text, tools, cognitive_decision)
+        self._record_agency_reflection(chat_id, reply_text, event, cognitive_decision)
         self._record_conversation_continuity(
             chat_id,
             prompt_envelope,

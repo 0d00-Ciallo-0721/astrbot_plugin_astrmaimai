@@ -37,6 +37,12 @@ class ContextEngine:
         self._prefix_meta_by_chat: Dict[str, Dict[str, Any]] = {}
         self.prefix_caching_enabled = bool(getattr(getattr(self.config, "conversation", None), "enable_prefix_caching", True))
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+        self.prefix_caching_enabled = bool(
+            getattr(getattr(config, "conversation", None), "enable_prefix_caching", True)
+        )
+
     def get_last_prefix_hash(self, chat_id: str) -> str:
         if not self.prefix_caching_enabled:
             return ""

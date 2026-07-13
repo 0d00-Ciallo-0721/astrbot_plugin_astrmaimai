@@ -549,6 +549,24 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertIn("main_intent=tease", memory.calls[0]["summary"])
         self.assertIn("Avoid repeating", memory.calls[0]["guidance"])
 
+    def test_agency_runtime_uses_monotonic_clock_for_record_and_expiry(self):
+        runtime = self.runtime_mod.AgencyRuntimeStore()
+
+        with unittest.mock.patch.object(self.runtime_mod, "monotonic", return_value=100.0):
+            item = runtime.record(
+                chat_id="chat-1",
+                reply_need="reply",
+                social_intent="answer",
+                action_tier="chat",
+                action_taken="reply",
+                reply_preview="ok",
+                cooldown_tags=["meme"],
+            )
+
+        self.assertEqual(item.timestamp, 100.0)
+        self.assertEqual(runtime.recent("chat-1", now=100.0 + 30 * 60), [item])
+        self.assertEqual(runtime.recent("chat-1", now=100.0 + 30 * 60 + 0.01), [])
+
     def test_cognitive_loop_reads_long_term_feedback_in_hidden_prompt(self):
         gateway = _FakeGateway(
             [

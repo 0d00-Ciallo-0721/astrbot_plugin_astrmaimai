@@ -572,6 +572,114 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertNotIn("current_goal=", planner.executor.calls[-1]["prompt"])
         self.assertNotIn("goal_status=", planner.executor.calls[-1]["prompt"])
 
+    def test_agency_cooldown_uses_executed_tool_trace_not_available_tools(self):
+        planner = self._make_planner(None)
+        event = _FakeEvent(text="hello")
+        decision = self.planner_mod.CognitiveDecision(action="reply", reply_need="reply")
+
+        planner._record_agency_reflection(
+            event.unified_msg_origin,
+            "reply",
+            event,
+            decision,
+        )
+
+        self.assertNotIn("meme", planner.agency_runtime.cooldown_tags(event.unified_msg_origin))
+
+        event.set_extra(
+            "astrmai_tool_execution_trace",
+            [{"tool_name": "proactive_meme", "status": "success"}],
+        )
+        planner._record_agency_reflection(
+            event.unified_msg_origin,
+            "reply",
+            event,
+            decision,
+        )
+
+        self.assertIn("meme", planner.agency_runtime.cooldown_tags(event.unified_msg_origin))
+
+    def test_planner_refresh_config_updates_owned_components_without_resetting_state(self):
+        planner = self._make_planner(None)
+        marker = object()
+        planner.cognitive_decision_history = [marker]
+        new_config = SimpleNamespace(
+            conversation=SimpleNamespace(enable_prefix_caching=False),
+            life=SimpleNamespace(
+                intimate_tool_threshold=30,
+                hostile_threshold=-30,
+                energy_exhaustion=0.2,
+            ),
+        )
+
+        planner.refresh_config(new_config)
+        planner.refresh_config(new_config)
+
+        self.assertFalse(planner.prefix_caching_enabled)
+        self.assertIs(planner.context_engine.config, new_config)
+        self.assertIs(planner.prompt_refiner.config, new_config)
+        self.assertIs(planner.cognitive_loop.config, new_config)
+        self.assertIs(planner.goal_manager.config, new_config)
+        self.assertIs(planner.action_modifier.config, new_config)
+        self.assertIs(planner.expression_selector.config, new_config)
+        self.assertIs(planner.executor.config, new_config)
+        self.assertEqual(planner.cognitive_decision_history, [marker])
+
+    def test_executor_wait_finalizes_proactive_once_without_dialogue_write(self):
+        planner = self._make_planner(None)
+        event = _FakeEvent(text="wait")
+        event.set_extra("astrmai_is_proactive_event", True)
+        event.set_extra("astrmai_execution_signal", "wait")
+        event.set_extra("astrmai_execution_status", "skipped_wait")
+        completions = []
+        trace_statuses = []
+        dialogue_writes = []
+
+        async def _completion(sent, preview):
+            completions.append((sent, preview))
+
+        async def _settle(*args, **kwargs):
+            return None
+
+        async def _trace(chat_id, ev, *, status):
+            trace_statuses.append(status)
+
+        async def _dialogue(*args, **kwargs):
+            dialogue_writes.append(args)
+
+        event.set_extra("astrmai_proactive_completion_callback", _completion)
+        planner._record_agency_reflection = lambda *args, **kwargs: None
+        planner._record_conversation_continuity = lambda *args, **kwargs: None
+        planner._apply_turn_continuity_context = lambda *args, **kwargs: None
+        planner._settle_no_send_relationship_event = _settle
+        planner._remember_turn_trace = _trace
+        planner._record_planner_dialogue_segment = _dialogue
+
+        async def _run():
+            kwargs = dict(
+                event=event,
+                chat_id=event.unified_msg_origin,
+                reply_text=None,
+                focus_context=None,
+                prompt_envelope=SimpleNamespace(),
+                tools=[_NamedTool("proactive_meme")],
+                cognitive_decision=None,
+                side_inputs={},
+                planning_context={},
+                is_fast_mode=False,
+                is_all_mode=False,
+                is_tool_call_mode=True,
+                final_system_prompt="",
+            )
+            await planner._finalize_plan_result(**kwargs)
+            await planner._finalize_plan_result(**kwargs)
+
+        asyncio.run(_run())
+
+        self.assertEqual(completions, [(False, "")])
+        self.assertEqual(trace_statuses, ["skipped_wait", "skipped_wait"])
+        self.assertEqual(dialogue_writes, [])
+
     def test_planner_wait_decision_does_not_refresh_conversation_goal(self):
         first_decision = self.planner_mod.CognitiveDecision(
             action="reply",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import re
 import time
 from types import SimpleNamespace
@@ -59,6 +60,7 @@ class AttentionGate:
     ATTENTION_WINDOW_TTL_SECONDS = 180.0
     ATTENTION_WINDOW_MAX_EVENTS = 12
     BACKGROUND_TASK_MAX_CONCURRENCY = 8
+    MESSAGE_DEDUP_FALLBACK_TTL_SECONDS = 2.0
 
     def __init__(
         self,
@@ -103,8 +105,7 @@ class AttentionGate:
         self._background_tasks: set[asyncio.Task] = set()
         self._session_tasks: set[asyncio.Task] = set()
         self._background_task_semaphore = asyncio.Semaphore(self.BACKGROUND_TASK_MAX_CONCURRENCY)
-        # ponytail: dedup cache is FIFO-evicted at 256 entries, no time-based TTL.
-        # Entry persists until pushed out by 256 newer messages — acceptable for message dedup.
+        # Platform IDs persist until FIFO eviction; content fallbacks use a short TTL.
         self._global_message_cache = collections.OrderedDict()
         self.perception_builder = PerceptionBuilder(self)
         self.window_buffer = AttentionWindowBuffer(self)
@@ -139,11 +140,16 @@ class AttentionGate:
 
     async def clear_chat_state(self, chat_id: str) -> bool:
         removed = False
+        removed_session = None
         async with self._pool_lock:
-            removed = self.focus_pools.pop(chat_id, None) is not None or removed
+            removed_session = self.focus_pools.pop(chat_id, None)
+            removed = removed_session is not None or removed
             removed = self._proactive_dispatching.pop(chat_id, None) is not None or removed
             removed = self._deferred_messages.pop(chat_id, None) is not None or removed
             removed = self._proactive_injection_lock.pop(chat_id, None) is not None or removed
+        removed = bool(
+            await self._cancel_session_workers(chat_id, session=removed_session)
+        ) or removed
         compaction = getattr(self, "context_compaction", None)
         if compaction is not None and hasattr(compaction, "clear_chat_state"):
             try:
@@ -151,6 +157,38 @@ class AttentionGate:
             except Exception as exc:
                 logger.debug(f"[AttentionGate] context compaction clear degraded for {chat_id}: {exc}")
         return removed
+
+    async def _cancel_session_workers(
+        self,
+        chat_id: str | None = None,
+        *,
+        session: SessionContext | None = None,
+    ) -> int:
+        tasks = []
+        sessions = []
+        for task in list(self._session_tasks):
+            worker_context = getattr(task, "_worker_context", None)
+            worker_chat_id = str(getattr(worker_context, "chat_id", "") or "")
+            if chat_id is not None and worker_chat_id != str(chat_id):
+                continue
+            worker_session = getattr(worker_context, "session", None)
+            if session is not None and worker_session is not session:
+                continue
+            tasks.append(task)
+            if worker_session is not None and all(existing is not worker_session for existing in sessions):
+                sessions.append(worker_session)
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for session in sessions:
+            async with session.lock:
+                session.is_evaluating = False
+                if chat_id is not None:
+                    session.accumulation_pool.clear()
+        return len(tasks)
 
     async def _extract_image_base64(self, image_component):
         return await extract_image_base64(self, image_component)
@@ -579,6 +617,36 @@ class AttentionGate:
         timestamp = float(getattr(event, "timestamp", 0.0) or 0.0)
         return f"{sender_id}:{timestamp}:{preview_text(str(getattr(event, 'message_str', '') or ''), 40)}"
 
+    def _build_message_dedup_key(self, event: AstrMessageEvent) -> tuple[str, bool]:
+        chat_id = str(getattr(event, "unified_msg_origin", "") or "")
+        message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
+        if message_id:
+            return f"message:{chat_id}:{message_id}", False
+        sender_id = str(event.get_sender_id() or "")
+        content = str(getattr(event, "message_str", "") or "")
+        image_refs = (
+            event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+            or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
+            or []
+        )
+        content = f"{content}\n{repr(image_refs)}"
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:20]
+        return f"fallback:{chat_id}:{sender_id}:{digest}", True
+
+    def _claim_message(self, event: AstrMessageEvent, *, now: float | None = None) -> bool:
+        message_cache = self._ensure_global_msg_cache()
+        message_key, is_fallback = self._build_message_dedup_key(event)
+        current_time = time.time() if now is None else float(now)
+        previous_time = message_cache.get(message_key)
+        if previous_time is not None:
+            if not is_fallback or current_time - float(previous_time) <= self.MESSAGE_DEDUP_FALLBACK_TTL_SECONDS:
+                return False
+            message_cache.pop(message_key, None)
+        message_cache[message_key] = current_time
+        while len(message_cache) > 256:
+            message_cache.popitem(last=False)
+        return True
+
     async def _append_dialogue_segment(self, event: AstrMessageEvent) -> None:
         store = getattr(self, "dialogue_store", None)
         if store is None:
@@ -821,13 +889,8 @@ class AttentionGate:
             )
             return "PROACTIVE_BLOCKED"
 
-        message_cache = self._ensure_global_msg_cache()
-        message_id = self._build_message_id(event)
-        if message_id in message_cache:
+        if not self._claim_message(event):
             return "DUPLICATED"
-        message_cache[message_id] = time.time()
-        while len(message_cache) > 256:
-            message_cache.popitem(last=False)
 
         perception = self.perception_builder.build(event)
         context = perception.as_event_context()

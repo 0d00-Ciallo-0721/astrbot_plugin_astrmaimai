@@ -175,6 +175,20 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertEqual(payload["first_person_rewrite"], "short prompt")
         self.assertEqual(gateway.calls, [])
 
+    def test_persona_summarizer_refresh_config_updates_only_config_reference(self):
+        persistence = _FakePersistence()
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        cache = summarizer.cache
+        pending_tasks = summarizer.pending_tasks
+        new_config = SimpleNamespace(performance=SimpleNamespace(summary_threshold=123))
+
+        summarizer.refresh_config(new_config)
+
+        self.assertIs(summarizer.config, new_config)
+        self.assertIs(summarizer.cache, cache)
+        self.assertIs(summarizer.pending_tasks, pending_tasks)
+
     def test_persona_summary_empty_prompt_uses_ready_fallback_without_gateway(self):
         from config import AstrMaiConfig
 

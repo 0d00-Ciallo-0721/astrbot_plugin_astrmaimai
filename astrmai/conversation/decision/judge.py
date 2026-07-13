@@ -18,6 +18,16 @@ class Judge:
     判官 (System 1: Fused 3-State Version)
     职责: 决定 System 2 的初步动作倾向 (REPLY, WAIT, IGNORE)
     """
+    BASE_ACTIONS = ("REPLY", "WAIT", "IGNORE")
+    TOOL_ACTION = "TOOL_CALL"
+    ACTION_DESCRIPTIONS = {
+        "REPLY": "需要立刻回复（包含问题、提及你、或顺着话题聊）",
+        "WAIT": "话似乎没说完，稍微等等看",
+        "IGNORE": "没兴趣理会的闲聊或刷屏",
+        "TOOL_CALL": "明确的指令求助，需要调用外部工具",
+    }
+    TASK_KEYWORDS = ("帮我", "查", "写", "翻译", "分析", "搜索", "提醒")
+
     def __init__(self, gateway: GlobalModelGateway, state_engine: StateEngine, config=None):
         self.gateway = gateway
         self.state_engine = state_engine
@@ -35,6 +45,13 @@ class Judge:
     def refresh_config(self, config):
         self.config = config
 
+    @classmethod
+    def _available_action_names(cls, message: str) -> tuple[str, ...]:
+        actions = list(cls.BASE_ACTIONS)
+        if any(keyword in str(message or "") for keyword in cls.TASK_KEYWORDS):
+            actions.append(cls.TOOL_ACTION)
+        return tuple(actions)
+
 # ==========================================
     # [新增 P1-T1] 动态行为修饰器
     # ==========================================
@@ -43,20 +60,10 @@ class Judge:
         动态行为修饰器：根据状态 + 概率 + 关键词条件，
         构建当前可用的动作列表文本，注入 Judge Prompt。
         """
-        actions = [
-            "REPLY: 需要立刻回复（包含问题、提及你、或顺着话题聊）",
-            "WAIT: 话似乎没说完，稍微等等看",
-            "IGNORE: 没兴趣理会的闲聊或刷屏",
-        ]
-        
-        # TOOL_CALL: 仅当消息含有任务性关键词时激活
-        task_keywords = ["帮我", "查", "写", "翻译", "分析", "搜索", "提醒"]
-        if any(kw in message for kw in task_keywords):
-            actions.append("TOOL_CALL: 明确的指令求助，需要调用外部工具")
-        
-        # ponytail: M4 — FETCH_KNOWLEDGE and RETHINK_GOAL were offered to LLM but silently downgraded;
-        # removed from prompt to avoid misleading the LLM. Planner handles all action routing.
-        return "\n".join(f"- {a}" for a in actions)
+        return "\n".join(
+            f"- {action}: {self.ACTION_DESCRIPTIONS[action]}"
+            for action in self._available_action_names(message)
+        )
 
     # ==========================================
     # [修改 P1-T1, P1-T2] 主判决函数
@@ -403,6 +410,8 @@ class Judge:
             # 🟢 [新增 P1-T1] 动态可用动作构建
             # =====================================================================
             available_actions = self._build_dynamic_actions(state, message, window_events_count)
+            available_action_names = self._available_action_names(message)
+            action_schema = '"|"'.join(available_action_names)
 
             # =====================================================================
             # 【正常执行 System 1 唤醒大模型判决】
@@ -421,7 +430,7 @@ class Judge:
             1. 意图判决 (action): 请从以下【当前可用动作】中选择一个：
             {available_actions}
             
-            2. 潜意识生成 (thought): **仅当 action 为 REPLY、TOOL_CALL、FETCH_KNOWLEDGE 或 RETHINK_GOAL 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
+            2. 潜意识生成 (thought): **仅当 action 为 REPLY 或 TOOL_CALL 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
             
             3. 记忆提取 (retrieve_keys): **仅当 action 为 REPLY 时**才需要判断当前回复需要调用你脑海中的哪部分【人格记忆 (retrieve_keys)】。如果 action 为 WAIT 或 IGNORE，或者只是极简单的日常寒暄，列表请严格保持为空 []。
             
@@ -442,7 +451,7 @@ class Judge:
             请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
             {{
                 "reason": "极简的判定理由，例如：'有人在提问' 或 '顺着刚才的话题在聊'（限20字内）",
-                "action": "REPLY"|"WAIT"|"IGNORE"|"TOOL_CALL"|"FETCH_KNOWLEDGE"|"RETHINK_GOAL",
+                "action": "{action_schema}",
                 "thought": "【仅当 action 选中需要回复的类型时生成】第一人称的真实内心戏。不回复请严格输出空字符串 \"\"",
                 "relevance": int(1-10),
                 "necessity": float(1.0-10.0),
@@ -499,8 +508,7 @@ class Judge:
                 plan.meta["retrieve_keys"] = keys
                 
                 # 🟢 [修改 P1-T1] 校验扩展的合法动作并执行降级处理
-                valid_actions = ["REPLY", "WAIT", "IGNORE", "TOOL_CALL"]
-                if plan.action not in valid_actions:
+                if plan.action not in available_action_names:
                     plan.action = "IGNORE"
                 # ponytail: M4 — FETCH_KNOWLEDGE/RETHINK_GOAL downgrade removed; actions no longer offered to LLM
 

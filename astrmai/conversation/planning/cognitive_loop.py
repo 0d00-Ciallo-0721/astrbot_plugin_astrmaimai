@@ -117,6 +117,9 @@ class CognitiveLoop:
         self.state_engine = state_engine
         self.config = config if config is not None else getattr(gateway, "config", None)
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     def _lane_key(self, chat_id: str) -> LaneKey:
         return LaneKey(subsystem="sys2", task_family="cognitive_loop", scope_id=chat_id)
 

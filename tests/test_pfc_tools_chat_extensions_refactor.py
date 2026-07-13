@@ -82,6 +82,21 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             api.calls,
             [("set_msg_emoji_like", {"message_id": "msg-1", "emoji_id": self.mod.QQ_MESSAGE_EMOJI_OPTIONS["approve"][0]})],
         )
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace"),
+            [{"tool_name": "message_emoji_like_action", "status": "success"}],
+        )
+
+    def test_wait_tool_records_actual_execution(self):
+        event = _FakeEvent(group_id="12345")
+
+        result = asyncio.run(self.mod.WaitTool().call(_wrap_event(event)))
+
+        self.assertEqual(result, "[SYSTEM_WAIT_SIGNAL]")
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace"),
+            [{"tool_name": "wait_and_listen", "status": "success"}],
+        )
 
     def test_group_sign_tool_blocks_private_chat(self):
         event = _FakeEvent(group_id=None)

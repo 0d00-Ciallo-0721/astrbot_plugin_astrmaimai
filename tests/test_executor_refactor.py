@@ -81,6 +81,8 @@ class _FakeReplyService:
 
     async def handle_reply(self, event, text, chat_id):
         self.calls.append((chat_id, text))
+        event.set_extra("astrmai_reply_sent", True)
+        return SimpleNamespace(sent=True, blocked_reason="", persistable_text=text)
 
 
 class _FakeEvolution:
@@ -201,6 +203,7 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(event.get_extra("astrmai_execution_signal"), "wait")
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "skipped_wait")
         self.assertEqual(reply_service.calls, [])
 
     def test_chat_tool_tier_limits_runtime_max_steps(self):
@@ -413,7 +416,8 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         result = asyncio.run(_run())
 
-        self.assertIsNone(result)
+        self.assertEqual(result, "fallback")
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "fallback_sent")
         self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "fallback")])
         trace_log = event.get_extra("astrmai_trace_log", [])
         exhausted = [record for record in trace_log if record.get("stage") == "execution.executor.model_pool_exhausted"]
@@ -441,6 +445,70 @@ class RefactoredExecutorTests(unittest.TestCase):
         asyncio.run(_run())
 
         self.assertEqual(reply_service.calls, [])
+
+    def test_stale_reply_artifact_does_not_update_evolution(self):
+        gateway = _FakeGateway()
+        evolution = _FakeEvolution()
+
+        class _StaleReplyService:
+            async def handle_reply(self, event, text, chat_id):
+                return SimpleNamespace(
+                    sent=False,
+                    blocked_reason="stale_generation",
+                    metadata={"send_status": "failed"},
+                )
+
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_StaleReplyService(),
+            evolution_manager=evolution,
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        result = asyncio.run(executor.execute(event, "prompt", "system"))
+
+        self.assertIsNone(result)
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "stale_drop")
+        self.assertEqual(evolution.calls, [])
+
+    def test_send_failure_retries_next_model_and_commits_only_successful_reply(self):
+        gateway = _FakeGateway(
+            models=["model-a", "model-b"],
+            chat_responses={"model-a": "first", "model-b": "second"},
+        )
+        evolution = _FakeEvolution()
+
+        class _RetryReplyService:
+            def __init__(self):
+                self.calls = []
+
+            async def handle_reply(self, event, text, chat_id):
+                self.calls.append(text)
+                if text == "first":
+                    raise RuntimeError("transport failed")
+                event.set_extra("astrmai_reply_sent", True)
+                return SimpleNamespace(sent=True, blocked_reason="", persistable_text=text, metadata={})
+
+        reply_service = _RetryReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=evolution,
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        result = asyncio.run(executor.execute(event, "prompt", "system"))
+
+        self.assertEqual(result, "second")
+        self.assertEqual(reply_service.calls, ["first", "second"])
+        self.assertEqual(
+            evolution.calls,
+            [(event.unified_msg_origin, "bot-1", "second")],
+        )
 
     def test_text_mode_pool_exhausted_trace_includes_gateway_cooldown_skips(self):
         gateway = _CooldownAwareFakeGateway(
@@ -470,7 +538,8 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         result = asyncio.run(_run())
 
-        self.assertIsNone(result)
+        self.assertEqual(result, "fallback")
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "fallback_sent")
         trace_log = event.get_extra("astrmai_trace_log", [])
         exhausted = [record for record in trace_log if record.get("stage") == "execution.executor.model_pool_exhausted"]
         self.assertEqual(exhausted[0]["attempted_models"], ["model-b"])
@@ -499,7 +568,8 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         result = asyncio.run(_run())
 
-        self.assertIsNone(result)
+        self.assertEqual(result, "fallback")
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "fallback_sent")
         trace_log = event.get_extra("astrmai_trace_log", [])
         failure_records = [record for record in trace_log if record.get("stage") == "execution.executor.model_failure"]
         self.assertEqual(len(failure_records), 2)

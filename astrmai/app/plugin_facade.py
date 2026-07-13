@@ -190,6 +190,15 @@ class PluginFacade(RuntimeFacadeProtocol):
         """热应用配置到运行时。遍历所有组件刷新。"""
         old_raw_config = dict(getattr(self.runtime, "raw_config", {}) or {})
         old_config = getattr(self.runtime, "config", None)
+        new_work_mode_enabled = bool(
+            getattr(getattr(parsed_config, "sys3", None), "enable_work_mode", False)
+        )
+        if new_work_mode_enabled and (
+            getattr(self.runtime, "sys3_router", None) is None
+            or getattr(self.runtime, "cron_guard", None) is None
+        ):
+            logger.warning("[AstrMai] Sys3 enablement requires a full restart; runtime stack is not initialized.")
+            return False
         components = [
             ("gateway", getattr(self.runtime, "gateway", None)),
             ("lane_manager", getattr(self.runtime, "lane_manager", None)),
@@ -200,6 +209,9 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("group_reply_wait_manager", getattr(self.runtime, "group_reply_wait_manager", None)),
             ("attention_gate", getattr(self.runtime, "attention_gate", None)),
             ("reply_engine", getattr(self.runtime, "reply_engine", None)),
+            ("system2_planner", getattr(self.runtime, "system2_planner", None)),
+            ("context_compaction", getattr(self.runtime, "context_compaction", None)),
+            ("persona_summarizer", getattr(self.runtime, "persona_summarizer", None)),
             ("evolution", getattr(self.runtime, "evolution", None)),
             ("memory_engine", getattr(self.runtime, "memory_engine", None)),
             ("judge", getattr(self.runtime, "judge", None)),
@@ -635,6 +647,9 @@ class PluginFacade(RuntimeFacadeProtocol):
         """
         if not self.runtime.feature_flags.work_mode_enabled:
             yield event.plain_result("Sys3 work mode is disabled. Please enable it in WebUI first.")
+            return
+        if self.runtime.sys3_router is None or self.runtime.cron_guard is None:
+            yield event.plain_result("Sys3 runtime is unavailable. Restart AstrBot to finish enabling work mode.")
             return
 
         task_query = event.message_str.replace("/work", "").strip()

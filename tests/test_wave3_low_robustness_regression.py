@@ -92,6 +92,46 @@ class Wave3LowRobustnessRegressionTests(unittest.TestCase):
 
         self.assertEqual([item.goal for item in goals], ["valid"])
 
+    def test_goal_manager_successful_empty_list_clears_old_goals(self):
+        from astrmai.conversation.planning.goal_service import ConversationGoal, GoalManager
+
+        class _Gateway:
+            config = SimpleNamespace()
+
+            async def call_data_process_task(self, **kwargs):
+                return []
+
+        manager = GoalManager(_Gateway())
+        manager._goals["chat-1"] = [ConversationGoal(goal="old", reasoning="old")]
+
+        asyncio.run(manager.analyze_and_update("chat-1", "topic finished"))
+
+        self.assertEqual(manager._goals.get("chat-1", []), [])
+
+    def test_goal_manager_parse_failure_preserves_old_goals(self):
+        from astrmai.conversation.planning.goal_service import ConversationGoal, GoalManager
+
+        class _Gateway:
+            config = SimpleNamespace()
+
+            async def call_data_process_task(self, **kwargs):
+                return "not-json"
+
+        manager = GoalManager(_Gateway())
+        old_goal = ConversationGoal(goal="old", reasoning="old")
+        manager._goals["chat-1"] = [old_goal]
+
+        asyncio.run(manager.analyze_and_update("chat-1", "keep talking"))
+
+        self.assertEqual(manager._goals["chat-1"], [old_goal])
+
+    def test_goal_manager_invalid_nonempty_list_is_parse_failure(self):
+        from astrmai.conversation.planning.goal_service import GoalManager
+
+        manager = object.__new__(GoalManager)
+
+        self.assertIsNone(manager._parse_goals([{"goal": ["bad"]}]))
+
     def test_memory_injection_trace_persist_failure_is_logged(self):
         from astrmai.memory.contracts.memory_query import MemoryInjectionTrace, MemoryQuery
         from astrmai.memory.services.memory_injection_service import MemoryInjectionService

@@ -27,6 +27,9 @@ class PersonaSummarizer:
         self._lock = asyncio.Lock()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     def _handle_background_task_result(self, task: asyncio.Task) -> None:
         self.pending_tasks = {k: v for k, v in self.pending_tasks.items() if v is not task}
         try:

@@ -52,6 +52,31 @@ class _FakeEvent:
 
 
 class RefactoredOutboundErrorPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _runtime(mode="block_only", admin_ids=None):
+        return type(
+            "Runtime",
+            (),
+            {
+                "host_bridge": _FakeHostBridge(),
+                "config": type(
+                    "Config",
+                    (),
+                    {
+                        "global_settings": type(
+                            "GlobalSettings",
+                            (),
+                            {
+                                "enable_error_interception": True,
+                                "error_interception_mode": mode,
+                                "admin_ids": list(admin_ids or []),
+                            },
+                        )()
+                    },
+                )(),
+            },
+        )()
+
     def test_ghost_message_is_dropped(self):
         policy_mod = __import__(
             "astrmai.conversation.execution.outbound_error_policy",
@@ -93,7 +118,17 @@ class RefactoredOutboundErrorPolicyTests(unittest.TestCase):
                 "config": type(
                     "Config",
                     (),
-                    {"global_settings": type("GlobalSettings", (), {"enable_error_interception": True, "admin_ids": ["1001"]})()},
+                    {
+                        "global_settings": type(
+                            "GlobalSettings",
+                            (),
+                            {
+                                "enable_error_interception": True,
+                                "error_interception_mode": "block_and_stop",
+                                "admin_ids": ["1001"],
+                            },
+                        )()
+                    },
                 )(),
             },
         )()
@@ -108,6 +143,25 @@ class RefactoredOutboundErrorPolicyTests(unittest.TestCase):
             event.bot.api.calls,
             [("send_private_msg", {"user_id": 1001, "message": "alert:Traceback: boom"})],
         )
+
+    def test_error_interception_modes_keep_distinct_clear_and_stop_semantics(self):
+        policy_mod = __import__(
+            "astrmai.conversation.execution.outbound_error_policy",
+            fromlist=["intercept_outbound_error"],
+        )
+        policy_mod.extract_result_text = lambda result: result._text
+
+        expectations = {
+            "log_only": (False, False),
+            "block_only": (True, False),
+            "block_and_stop": (True, True),
+        }
+        for mode, (cleared, stopped) in expectations.items():
+            with self.subTest(mode=mode):
+                event = _FakeEvent("Traceback: boom")
+                asyncio.run(policy_mod.intercept_outbound_error(self._runtime(mode), event))
+                self.assertEqual(event.get_result() is None, cleared)
+                self.assertEqual(event._stopped, stopped)
 
 
 if __name__ == "__main__":

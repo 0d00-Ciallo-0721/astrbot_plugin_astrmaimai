@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from time import monotonic
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -75,7 +74,7 @@ class AgencyRuntimeStore:
         cooldown_tags: Iterable[str] = (),
     ) -> AgencyReflection:
         item = AgencyReflection(
-            timestamp=time.time(),
+            timestamp=monotonic(),
             chat_id=chat_id,
             reply_need=str(reply_need or ""),
             social_intent=str(social_intent or ""),

@@ -160,10 +160,12 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         event = FakeEvent("user-1", "Alice", "old question")
         event.set_extra("astrmai_timestamp", base_ts)
 
-        asyncio.run(engine.handle_reply(event, "this reply is stale", event.unified_msg_origin))
+        artifact = asyncio.run(engine.handle_reply(event, "this reply is stale", event.unified_msg_origin))
 
         self.assertEqual(state_engine.gateway.context.sent, [])
         self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+        self.assertFalse(artifact.sent)
+        self.assertTrue(artifact.blocked_reason)
 
     def test_stale_turn_generation_is_skipped_even_without_timestamp(self):
         state_engine = FakeStateEngine()
@@ -178,10 +180,12 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             SimpleNamespace(chat_id=event.unified_msg_origin, thread_id=event.unified_msg_origin, generation=1),
         )
 
-        asyncio.run(engine.handle_reply(event, "this reply is stale", event.unified_msg_origin))
+        artifact = asyncio.run(engine.handle_reply(event, "this reply is stale", event.unified_msg_origin))
 
         self.assertEqual(state_engine.gateway.context.sent, [])
         self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+        self.assertFalse(artifact.sent)
+        self.assertTrue(artifact.blocked_reason)
         trace_log = event.get_extra("astrmai_trace_log", [])
         self.assertTrue(any(item.get("stage") == "reply.blocked_stale_generation" for item in trace_log))
         stale_records = [item for item in trace_log if item.get("stage") == "reply.blocked_stale_generation"]
@@ -483,9 +487,61 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         service._settle_post_send = _noop_post_send
         event = FakeEvent("user-1", "Alice", "send-failed")
 
-        asyncio.run(service.handle_reply(event, "will-not-write-memory", event.unified_msg_origin))
+        mirrored = []
+
+        async def _mirror(**kwargs):
+            mirrored.append(kwargs)
+
+        service._sync_native_history_mirror = _mirror
+        artifact = asyncio.run(service.handle_reply(event, "will-not-write-memory", event.unified_msg_origin))
 
         self.assertNotIn(event.unified_msg_origin, pipeline._session_history_buffer)
+        self.assertEqual(mirrored, [])
+        self.assertFalse(artifact.sent)
+        self.assertEqual(artifact.blocked_reason, "send_failed")
+
+    def test_partial_segment_send_is_committed_and_does_not_trigger_model_retry(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        coordinator = _ClaimingRuntimeCoordinator()
+        calls = []
+
+        async def _partial_send(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 2:
+                raise RuntimeError("second segment failed")
+            return "msg-1"
+
+        state_engine.gateway.context.send_message = _partial_send
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=1,
+            ),
+        )
+
+        artifact = service._build_visible_reply_artifact("first\n\nsecond", event=event)
+        service._build_visible_reply_artifact = lambda *args, **kwargs: artifact
+        result = asyncio.run(service.handle_reply(event, "first\n\nsecond", event.unified_msg_origin))
+
+        self.assertTrue(result.sent)
+        self.assertEqual(result.metadata["send_status"], "partial_sent")
+        self.assertEqual(result.persistable_text, "first")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(coordinator.commits), 1)
+        self.assertEqual(coordinator.commits[0][2], ["msg-1"])
 
     def test_failed_send_triggers_light_no_send_affection_settlement(self):
         state_engine = FakeStateEngine()

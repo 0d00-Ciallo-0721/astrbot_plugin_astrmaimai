@@ -207,6 +207,7 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         # ponytail: surface the failure to the user instead of silently dropping the message (R10)
         fallback_text = _runtime_fallback_text(facade)
         yield event.plain_result(fallback_text or "处理出错，请稍后重试")
+        event.stop_event()
         return
     debug_trace(event, "ingress.after_attention", status=status, direct_call=is_direct_call)
 

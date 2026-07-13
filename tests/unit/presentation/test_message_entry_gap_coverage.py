@@ -323,7 +323,7 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
             self._collect(facade, event),
             [{"type": "plain", "text": "runtime fallback"}],
         )
-        self.assertFalse(event.stopped)
+        self.assertTrue(event.stopped)
 
     def test_reflect_feedback_yields_response_and_stops_event(self):
         facade = _Facade()

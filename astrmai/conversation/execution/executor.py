@@ -59,6 +59,9 @@ class ConcurrentExecutor:
         self._global_lock = asyncio.Lock()
         self._native_vision_breakers: dict[str, float] = {}
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     def _build_vision_bundle(
         self,
         event: AstrMessageEvent,
@@ -113,7 +116,13 @@ class ConcurrentExecutor:
             return
         if not hasattr(source_event, "get_extra") or not hasattr(target_event, "set_extra"):
             return
-        for key in ("astrmai_request_trace", "astrmai_post_hook_system_hash"):
+        for key in (
+            "astrmai_request_trace",
+            "astrmai_post_hook_system_hash",
+            "astrmai_tool_execution_trace",
+            "astrmai_pending_actions",
+            "astrmai_bypass_mood_analysis",
+        ):
             value = source_event.get_extra(key, None)
             if value is not None:
                 target_event.set_extra(key, value)
@@ -518,10 +527,29 @@ class ConcurrentExecutor:
             return False
         return True
 
-    async def _finalize_reply(self, event: AstrMessageEvent, chat_id: str, bot_id: str, reply_text: str, *, trace_mode: str, model: str) -> str:
-        await self.reply_engine.handle_reply(event, reply_text, chat_id)
+    async def _finalize_reply(self, event: AstrMessageEvent, chat_id: str, bot_id: str, reply_text: str, *, trace_mode: str, model: str) -> Optional[str]:
+        artifact = await self.reply_engine.handle_reply(event, reply_text, chat_id)
+        sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
+        if not sent:
+            metadata = getattr(artifact, "metadata", {}) or {}
+            send_status = str(metadata.get("send_status", "") or "")
+            blocked_reason = str(getattr(artifact, "blocked_reason", "") or "")
+            if "stale" in blocked_reason:
+                event.set_extra("astrmai_execution_status", "stale_drop")
+            elif send_status == "duplicate_blocked":
+                event.set_extra("astrmai_execution_status", "duplicate_blocked")
+            else:
+                event.set_extra("astrmai_execution_status", "send_failed")
+                raise RuntimeError(blocked_reason or send_status or "visible reply was not sent")
+            return None
         if hasattr(self.evolution_manager, "process_bot_reply"):
             await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
+        event.set_extra(
+            "astrmai_execution_status",
+            "partial_sent"
+            if str((getattr(artifact, "metadata", {}) or {}).get("send_status", "")) == "partial_sent"
+            else "sent",
+        )
         debug_trace(
             event,
             "execution.executor.exit",
@@ -621,8 +649,7 @@ class ConcurrentExecutor:
         logger.error(f"[{chat_id}] all chat models exhausted: {last_error}")
         if raise_on_exhaustion:
             raise RuntimeError(last_error or "chat model pool exhausted")
-        await self._handle_fatal_fallback(event, chat_id, f"all chat models exhausted:\n{last_error}")
-        return None
+        return await self._handle_fatal_fallback(event, chat_id, f"all chat models exhausted:\n{last_error}")
 
     async def _run_tool_mode(
         self,
@@ -681,6 +708,7 @@ class ConcurrentExecutor:
                 if "[SYSTEM_WAIT_SIGNAL]" in reply_text:
                     if hasattr(event, "set_extra"):
                         event.set_extra("astrmai_execution_signal", "wait")
+                        event.set_extra("astrmai_execution_status", "skipped_wait")
                     debug_trace(event, "execution.executor.wait_signal", model=provider_id)
                     return None
                 if "[TERMINAL_YIELD]:" in reply_text:
@@ -741,12 +769,11 @@ class ConcurrentExecutor:
         logger.error(f"[{chat_id}] all tool models exhausted: {last_error}")
         if raise_on_exhaustion:
             raise RuntimeError(last_error or "tool model pool exhausted")
-        await self._handle_fatal_fallback(
+        return await self._handle_fatal_fallback(
             event,
             chat_id,
             last_error if last_error else "tool model pool exhausted",
         )
-        return None
 
     async def execute(
         self,
@@ -769,18 +796,21 @@ class ConcurrentExecutor:
         if chat_lock is None:
             logger.warning(f"[{chat_id}] executor dropped because pending tasks exceeded budget")
             debug_trace(event, "execution.executor.dropped", reason="too_many_pending")
+            event.set_extra("astrmai_execution_status", "pending_drop")
             return None
 
         try:
             models = self.gateway.get_agent_models()
             if not models:
                 logger.error(f"[{chat_id}] no configured agent model")
+                event.set_extra("astrmai_execution_status", "fatal_no_send")
                 return None
 
             runtime = self._execution_runtime_values(event, chat_id)
             try:
                 event._is_final_reply_phase = True
                 if not await self._check_pre_model_freshness(event, chat_id, "executor calculation"):
+                    event.set_extra("astrmai_execution_status", "stale_drop")
                     debug_trace(event, "execution.executor.stale_drop", reason="freshness_check_failed")
                     return None
 
@@ -873,14 +903,13 @@ class ConcurrentExecutor:
                 )
             except Exception as exc:
                 logger.error(f"[{chat_id}] executor core crashed: {exc}")
-                await self._handle_fatal_fallback(event, chat_id, f"executor core exception:\n{exc}")
-                return None
+                return await self._handle_fatal_fallback(event, chat_id, f"executor core exception:\n{exc}")
             finally:
                 if hasattr(event, "_is_final_reply_phase"):
                     delattr(event, "_is_final_reply_phase")
         finally:
             await self._release_chat_execution_lock(chat_id, using_runtime_coordinator, chat_lock)
-    async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str):
+    async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str) -> Optional[str]:
         logger.error(f"[{chat_id}] fatal executor fallback triggered")
         if str(event.get_extra("astrmai_execution_status", "") or "") == "stale_drop":
             debug_trace(
@@ -889,17 +918,23 @@ class ConcurrentExecutor:
                 reason="stale_drop",
                 error_preview=preview_text(error_detail, 120),
             )
-            return
+            return None
         fallback_msg = getattr(self.config.reply, "fallback_text", "(temporary silence...)")
-        await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
+        try:
+            artifact = await self.reply_engine.handle_reply(event, fallback_msg, chat_id)
+            sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
+        except Exception as exc:
+            sent = False
+            logger.error(f"[{chat_id}] fatal fallback send failed: {exc}")
+        event.set_extra("astrmai_execution_status", "fallback_sent" if sent else "fatal_no_send")
 
         config_global = getattr(self.config, "global_settings", None)
         if not (config_global and getattr(config_global, "enable_error_interception", True)):
-            return
+            return fallback_msg if sent else None
 
         admin_ids = getattr(config_global, "admin_ids", [])
         if not admin_ids:
-            return
+            return fallback_msg if sent else None
 
         from astrbot.api.event import MessageChain
 
@@ -918,6 +953,7 @@ class ConcurrentExecutor:
                 logger.debug(f"[Executor] pushed alert to admin {admin_id}")
             except Exception as exc:
                 logger.error(f"[Executor] failed to push alert to admin {admin_id}: {exc}")
+        return fallback_msg if sent else None
 
 
 __all__ = ["ConcurrentExecutor"]

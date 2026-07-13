@@ -83,7 +83,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
     ):
         debug_trace(event, "execution.reply.enter", chat_id=chat_id, raw_preview=preview_text(str(raw_text or ""), 120))
         if not raw_text:
-            return
+            return VisibleReplyArtifact("", [], "", blocked_reason="empty_reply")
 
         reply_mode = self._resolve_reply_mode(event)
         freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
@@ -103,7 +103,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 skipped_reason=str(artifact.blocked_reason or "blocked"),
                 anchor_event=anchor_event,
             )
-            return
+            return artifact
         if freshness_state == FreshnessState.EXPIRED:
             logger.info(
                 f"[ReplyService] skipped stale reply for {chat_id}: {stale_reason} | preview={preview_text(artifact.visible_text, 80)!r}"
@@ -114,27 +114,28 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 skipped_reason="stale",
                 anchor_event=anchor_event,
             )
-            return
+            return artifact
 
         sender_name = event.get_sender_name() or "群友"
         rich_text = event.get_extra("astrmai_rich_text", event.message_str)
         formatted_user_text = f"{sender_name}: {rich_text}"
-        await self._sync_native_history_mirror(
-            event=event,
-            chat_id=chat_id,
-            user_text=formatted_user_text,
-            assistant_text=artifact.persistable_text,
-        )
-
         at_targets = self._merge_wait_targets(event, pending_actions)
         if not await self._send_segments(event, chat_id, artifact, at_targets):
+            artifact.blocked_reason = artifact.blocked_reason or "send_failed"
+            artifact.metadata.setdefault("send_status", "failed")
             await self._settle_no_send_affection(
                 event,
                 chat_id,
                 skipped_reason="send_failed",
                 anchor_event=anchor_event,
             )
-            return
+            return artifact
+        await self._sync_native_history_mirror(
+            event=event,
+            chat_id=chat_id,
+            user_text=formatted_user_text,
+            assistant_text=artifact.persistable_text,
+        )
         await self._ingest_memory_turn(
             event,
             chat_id,
@@ -149,6 +150,8 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             window_events=window_events,
             anchor_event=anchor_event,
         )
+        artifact.metadata.setdefault("send_status", "sent")
+        return artifact
 
 
 __all__ = ["ReplyService"]

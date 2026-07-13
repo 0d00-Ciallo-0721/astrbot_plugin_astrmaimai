@@ -194,6 +194,20 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_shutdown_task_collection_includes_attention_session_workers(self):
+        from astrmai.shared.helpers.plugin_helpers import collect_background_tasks
+
+        background = object()
+        session_worker = object()
+        owner = SimpleNamespace(
+            _background_tasks={background},
+            _session_tasks={session_worker},
+        )
+
+        collected = collect_background_tasks(owner)
+
+        self.assertEqual(set(collected), {background, session_worker})
+
 
 if __name__ == "__main__":
     unittest.main()

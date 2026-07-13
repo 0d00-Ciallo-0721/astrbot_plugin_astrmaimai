@@ -165,7 +165,9 @@ async def cleanup_stale_focus_pools(attention_gate: Any, ttl_seconds: float = 86
 def collect_background_tasks(*owners: Any) -> list[Any]:
     tasks: list[Any] = []
     for owner in owners:
-        if owner is None or not hasattr(owner, "_background_tasks"):
+        if owner is None:
             continue
-        tasks.extend(list(getattr(owner, "_background_tasks")))
+        for attr_name in ("_background_tasks", "_session_tasks"):
+            if hasattr(owner, attr_name):
+                tasks.extend(list(getattr(owner, attr_name)))
     return tasks

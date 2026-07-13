@@ -45,6 +45,35 @@ class _FakeEvent:
     def get_result(self):
         return self._result
 
+    def get_group_id(self):
+        return "group-1"
+
+    def get_sender_id(self):
+        return "user-1"
+
+    def get_sender_name(self):
+        return "Alice"
+
+    def get_self_id(self):
+        return "bot-1"
+
+
+class _FakeHostBridge:
+    def is_ghost_sentinel(self, text):
+        return text == "[[ghost]]"
+
+    def should_intercept_error(self, text, enabled=True):
+        return enabled and "Traceback" in text
+
+
+class _FakePrivateEvent(_FakeEvent):
+    def __init__(self):
+        super().__init__()
+        self.unified_msg_origin = "default:FriendMessage:user-1"
+
+    def get_group_id(self):
+        return None
+
 
 class RefactoredExternalResultBridgeTests(unittest.TestCase):
     def test_bridge_injects_attention_event_and_records_bot_reply(self):
@@ -78,6 +107,76 @@ class RefactoredExternalResultBridgeTests(unittest.TestCase):
             runtime.evolution.calls,
             [("default:GroupMessage:group-1", "bot-1", "(内置插件执行结果): 任务完成[图片]")],
         )
+
+
+    def test_trusted_external_result_bypasses_self_filter_and_preserves_scope(self):
+        bridge_mod = importlib.import_module("astrmai.conversation.ingress.external_result_bridge")
+        runtime = types.SimpleNamespace(
+            attention_gate=_FakeAttentionGate(),
+            evolution=_FakeEvolution(),
+            host_bridge=_FakeHostBridge(),
+            config=types.SimpleNamespace(
+                global_settings=types.SimpleNamespace(
+                    external_result_sources=["trusted_plugin"],
+                    enable_error_interception=True,
+                )
+            ),
+        )
+        event = _FakeEvent()
+        event._extra.update(
+            {
+                "astrmai_is_self_reply": True,
+                "astrmai_loop_source": "trusted_plugin",
+            }
+        )
+
+        asyncio.run(bridge_mod.bridge_external_plugin_result(runtime, event))
+
+        self.assertEqual(len(runtime.attention_gate.calls), 1)
+        chat_id, payload = runtime.attention_gate.calls[0]
+        self.assertEqual(chat_id, event.unified_msg_origin)
+        self.assertEqual(payload["unified_msg_origin"], event.unified_msg_origin)
+        self.assertEqual(payload["group_id"], "group-1")
+        self.assertEqual(payload["sender_id"], "bot-1")
+        self.assertEqual(payload["self_id"], "bot-1")
+        self.assertEqual(payload["extra"]["astrmai_origin_sender_id"], "user-1")
+
+    def test_hidden_error_result_is_not_injected_or_recorded(self):
+        bridge_mod = importlib.import_module("astrmai.conversation.ingress.external_result_bridge")
+        runtime = types.SimpleNamespace(
+            attention_gate=_FakeAttentionGate(),
+            evolution=_FakeEvolution(),
+            host_bridge=_FakeHostBridge(),
+            config=types.SimpleNamespace(
+                global_settings=types.SimpleNamespace(
+                    external_result_sources=["astrbot_builtin"],
+                    enable_error_interception=True,
+                )
+            ),
+        )
+        event = _FakeEvent()
+        event._result = types.SimpleNamespace(chain=[_Plain("Traceback: boom")])
+
+        asyncio.run(bridge_mod.bridge_external_plugin_result(runtime, event))
+
+        self.assertEqual(runtime.attention_gate.calls, [])
+        self.assertEqual(runtime.evolution.calls, [])
+
+    def test_private_external_result_keeps_private_origin_without_group_scope(self):
+        bridge_mod = importlib.import_module("astrmai.conversation.ingress.external_result_bridge")
+        runtime = types.SimpleNamespace(
+            attention_gate=_FakeAttentionGate(),
+            evolution=_FakeEvolution(),
+        )
+        event = _FakePrivateEvent()
+
+        asyncio.run(bridge_mod.bridge_external_plugin_result(runtime, event))
+
+        chat_id, payload = runtime.attention_gate.calls[0]
+        self.assertEqual(chat_id, "default:FriendMessage:user-1")
+        self.assertEqual(payload["unified_msg_origin"], chat_id)
+        self.assertEqual(payload["group_id"], "")
+        self.assertEqual(payload["sender_id"], "bot-1")
 
 
 if __name__ == "__main__":

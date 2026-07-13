@@ -28,10 +28,11 @@ class _FakeSensors:
 
 
 class _FakeEvent:
-    def __init__(self, sender_id, sender_name, text, extras=None, components=None):
+    def __init__(self, sender_id, sender_name, text, extras=None, components=None, message_id=None):
         self.message_str = text
         self.unified_msg_origin = "default:GroupMessage:group-1"
-        self.message_obj = SimpleNamespace(message=components or [], message_id=f"{sender_id}:{text}")
+        resolved_message_id = f"{sender_id}:{text}" if message_id is None else message_id
+        self.message_obj = SimpleNamespace(message=components or [], message_id=resolved_message_id)
         self.timestamp = 123.0
         self._extra = dict(extras or {})
         self._sender_id = sender_id
@@ -151,6 +152,82 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(focus_thread["core_events"], [bot_event, focus_event])
         self.assertEqual(focus_thread["ambient_events"], [unrelated])
+
+    def test_message_dedup_prefers_platform_message_id_and_expires_fallback(self):
+        first = _FakeEvent("user-1", "Alice", "same", message_id="message-1")
+        second = _FakeEvent("user-1", "Alice", "same", message_id="message-2")
+        replay = _FakeEvent("user-1", "Alice", "changed", message_id="message-1")
+
+        self.assertTrue(self.gate._claim_message(first, now=10.0))
+        self.assertTrue(self.gate._claim_message(second, now=10.1))
+        self.assertFalse(self.gate._claim_message(replay, now=10.2))
+
+        fallback = _FakeEvent("user-1", "Alice", "same", message_id="")
+        fallback_replay = _FakeEvent("user-1", "Alice", "same", message_id="")
+        fallback_later = _FakeEvent("user-1", "Alice", "same", message_id="")
+        self.assertTrue(self.gate._claim_message(fallback, now=20.0))
+        self.assertFalse(self.gate._claim_message(fallback_replay, now=20.5))
+        self.assertTrue(
+            self.gate._claim_message(
+                fallback_later,
+                now=20.0 + self.gate.MESSAGE_DEDUP_FALLBACK_TTL_SECONDS + 0.1,
+            )
+        )
+
+    def test_clear_chat_state_cancels_owned_session_worker(self):
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            session.is_evaluating = True
+            self.gate.focus_pools["group-1"] = session
+            started = asyncio.Event()
+
+            async def pending_worker():
+                started.set()
+                await asyncio.Event().wait()
+
+            task = asyncio.create_task(pending_worker())
+            task._worker_context = SimpleNamespace(chat_id="group-1", session=session, self_id="bot-1")
+            self.gate._session_tasks.add(task)
+            task.add_done_callback(self.gate._handle_session_worker_result)
+            await started.wait()
+
+            removed = await self.gate.clear_chat_state("group-1")
+            return removed, task, session
+
+        removed, task, session = asyncio.run(_run())
+
+        self.assertTrue(removed)
+        self.assertTrue(task.cancelled())
+        self.assertFalse(session.is_evaluating)
+        self.assertNotIn("group-1", self.gate.focus_pools)
+
+    def test_session_worker_cancel_does_not_cancel_replacement_session(self):
+        async def _run():
+            old_session = self.gate_mod.SessionContext()
+            new_session = self.gate_mod.SessionContext()
+
+            async def pending_worker():
+                await asyncio.Event().wait()
+
+            old_task = asyncio.create_task(pending_worker())
+            new_task = asyncio.create_task(pending_worker())
+            old_task._worker_context = SimpleNamespace(chat_id="group-1", session=old_session, self_id="bot-1")
+            new_task._worker_context = SimpleNamespace(chat_id="group-1", session=new_session, self_id="bot-1")
+            self.gate._session_tasks.update({old_task, new_task})
+            old_task.add_done_callback(self.gate._handle_session_worker_result)
+            new_task.add_done_callback(self.gate._handle_session_worker_result)
+            await asyncio.sleep(0)
+
+            await self.gate._cancel_session_workers("group-1", session=old_session)
+            new_still_running = not new_task.done()
+            new_task.cancel()
+            await asyncio.gather(new_task, return_exceptions=True)
+            return old_task, new_still_running
+
+        old_task, new_still_running = asyncio.run(_run())
+
+        self.assertTrue(old_task.cancelled())
+        self.assertTrue(new_still_running)
 
     def test_resolve_event_context_keeps_reply_image_footprints_without_direct_vision(self):
         event = _FakeEvent(

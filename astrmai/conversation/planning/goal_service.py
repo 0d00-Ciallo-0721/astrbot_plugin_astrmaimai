@@ -10,7 +10,6 @@
 - 支持"结束对话"特殊目标作为中止信号
 """
 import time
-from time import monotonic
 import asyncio
 import json
 import re
@@ -51,6 +50,9 @@ class GoalManager:
         self._goals: Dict[str, List[ConversationGoal]] = {}  # chat_id -> goals
         self._locks: Dict[str, asyncio.Lock] = {}
         self._lock_mutex = asyncio.Lock()
+
+    def refresh_config(self, config) -> None:
+        self.config = config
 
     async def _get_lock(self, chat_id: str) -> asyncio.Lock:
         """安全获取或创建群组级锁"""
@@ -119,7 +121,10 @@ class GoalManager:
                 )
                 new_goals = self._parse_goals(result)
 
-                if new_goals:
+                if new_goals is not None:
+                    if not new_goals:
+                        self._goals.pop(chat_id, None)
+                        return ""
                     # 老化处理: 未被新一轮提及的旧目标 stale_count +1
                     self._age_unreferenced_goals(chat_id, new_goals)
 
@@ -185,13 +190,13 @@ class GoalManager:
             )
             if matched:
                 g.stale_count = 0
-                g.last_referenced = monotonic()
+                g.last_referenced = time.time()
             else:
                 g.stale_count += 1
 
-    def _parse_goals(self, raw) -> List[ConversationGoal]:
+    def _parse_goals(self, raw) -> Optional[List[ConversationGoal]]:
         """安全解析 LLM 返回的目标列表"""
-        items = []
+        items = None
         if isinstance(raw, list):
             items = raw
         elif isinstance(raw, str):
@@ -200,7 +205,10 @@ class GoalManager:
                 try:
                     items = json.loads(match.group(0))
                 except json.JSONDecodeError:
-                    pass
+                    return None
+
+        if not isinstance(items, list):
+            return None
 
         goals = []
         for item in items:
@@ -210,6 +218,8 @@ class GoalManager:
                     goal=goal_value.strip()[:30],  # 强制限长
                     reasoning=str(item.get("reasoning", ""))
                 ))
+        if items and not goals:
+            return None
         return goals
 
     def _format_goals_for_prompt(self, goals: List[ConversationGoal]) -> str:

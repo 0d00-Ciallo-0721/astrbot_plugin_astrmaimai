@@ -53,11 +53,14 @@ class ActionModifier:
     ENERGY_EXHAUSTION = 0.1
 
     def __init__(self, config=None):
+        self.refresh_config(config)
+
+    def refresh_config(self, config) -> None:
         self.config = config
-        if config and hasattr(config, 'life'):
-            self.INTIMATE_THRESHOLD = getattr(config.life, 'intimate_tool_threshold', 20)
-            self.HOSTILE_THRESHOLD = getattr(config.life, 'hostile_threshold', -20)
-            self.ENERGY_EXHAUSTION = getattr(config.life, 'energy_exhaustion', 0.1)
+        life = getattr(config, 'life', None)
+        self.INTIMATE_THRESHOLD = getattr(life, 'intimate_tool_threshold', 20)
+        self.HOSTILE_THRESHOLD = getattr(life, 'hostile_threshold', -20)
+        self.ENERGY_EXHAUSTION = getattr(life, 'energy_exhaustion', 0.1)
 
     @staticmethod
     def _state_float(state, key: str, default: float) -> float:
@@ -306,6 +309,9 @@ class ExpressionSelector:
         self.config = config if config else gateway.config
         self.pattern_service = pattern_service
         self._recent_pattern_keys: dict[str, List[tuple[str, str]]] = {}
+
+    def refresh_config(self, config) -> None:
+        self.config = config
 
     async def select(
         self,

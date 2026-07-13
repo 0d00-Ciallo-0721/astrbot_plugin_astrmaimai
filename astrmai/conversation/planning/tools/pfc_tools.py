@@ -36,10 +36,23 @@ def _set_pending_actions(event, pending_actions: list[dict[str, Any]]) -> None:
     event.set_extra("astrmai_pending_actions", pending_actions)
 
 
+def _record_tool_execution(event, tool_name: str, *, status: str = "success") -> None:
+    trace = event.get_extra("astrmai_tool_execution_trace", [])
+    trace = list(trace) if isinstance(trace, list) else []
+    trace.append({"tool_name": str(tool_name or ""), "status": str(status or "success")})
+    event.set_extra("astrmai_tool_execution_trace", trace[-32:])
+
+
 def _append_pending_action(event, action: dict[str, Any]) -> None:
     pending_actions = _get_pending_actions(event)
     pending_actions.append(action)
     _set_pending_actions(event, pending_actions)
+    tool_name = {
+        "reaction": "message_reaction_action",
+        "like": "proactive_like_action",
+    }.get(str(action.get("action") or ""), "")
+    if tool_name:
+        _record_tool_execution(event, tool_name)
 
 
 def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
@@ -48,6 +61,14 @@ def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
         return False
     pending_actions.append(action)
     _set_pending_actions(event, pending_actions)
+    tool_name = {
+        "at": "construct_at_event",
+        "meme": "proactive_meme",
+        "terminal_reread": "meme_resonance_action",
+        "withdraw": "regret_and_withdraw_action",
+    }.get(str(action.get("action") or ""), "")
+    if tool_name:
+        _record_tool_execution(event, tool_name)
     return True
 
 
@@ -93,6 +114,7 @@ class WaitTool(FunctionTool[AstrAgentContext]):
     parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        _record_tool_execution(_get_current_event(context), self.name)
         return "[SYSTEM_WAIT_SIGNAL]"
 
 
@@ -341,6 +363,7 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
             else:
                 await api.call_action("send_poke", user_id=_coerce_action_identifier(target_id))
             logger.info(f"[ProactivePokeTool] poked target={target_id} group={group_id}")
+            _record_tool_execution(current_event, self.name)
             return f"已主动戳了 {display_name}，请继续生成自然的文字回应。"
         except Exception as exc:
             logger.error(f"[ProactivePokeTool] execution failed: {exc}")
@@ -393,6 +416,7 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
             logger.info(
                 f"[MessageEmojiLikeTool] liked message={message_id} tone={selected_tone or tone or 'random'} emoji={emoji_id}"
             )
+            _record_tool_execution(current_event, self.name)
             return f"已给当前消息加了一个 QQ 表情回复（{selected_tone or tone or 'random'}）。"
         except Exception as exc:
             logger.error(f"[MessageEmojiLikeTool] execution failed: {exc}")
@@ -418,6 +442,7 @@ class GroupSignTool(FunctionTool[AstrAgentContext]):
         try:
             await api.call_action("set_group_sign", group_id=str(group_id))
             logger.info(f"[GroupSignTool] signed group={group_id}")
+            _record_tool_execution(current_event, self.name)
             return "已完成当前群签到。"
         except Exception as exc:
             logger.error(f"[GroupSignTool] execution failed: {exc}")
@@ -541,6 +566,7 @@ class TopicHijackTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         fake_status = str(kwargs.get("fake_status", "") or "").strip() or "正忙着"
+        _record_tool_execution(_get_current_event(context), self.name)
         return (
             "[SYSTEM OVERRIDE] 立刻停止回答原话题。"
             f"请以“我现在{fake_status}”为现实前提，简短、口语化地把话题拐开。"
@@ -567,6 +593,7 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
         cover_message = str(kwargs.get("cover_message", "") or "").strip()
         if not private_message or not cover_message:
             return "执行失败：private_message 和 cover_message 都不能为空。"
+        _record_tool_execution(_get_current_event(context), self.name)
         return (
             "[SYSTEM OVERRIDE] 你已经决定转入私聊。"
             f"请把群内最终话术写成：{cover_message}。"

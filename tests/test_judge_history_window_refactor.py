@@ -134,6 +134,26 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_prompt_and_parser_share_the_same_dynamic_action_set(self):
+        persistence = _LegacyHistoryPersistence()
+        gateway = _ResultGateway({"action": "FETCH_KNOWLEDGE", "reason": "removed"})
+        judge = self.mod.Judge(gateway, _FakeStateEngine(persistence), config=gateway.config)
+
+        plan = asyncio.run(
+            judge.evaluate(
+                chat_id="default:GroupMessage:group-1",
+                message="ordinary chat",
+                is_force_wakeup=False,
+                persona_summary="persona",
+                window_events_count=1,
+            )
+        )
+
+        prompt = gateway.prompts[-1]
+        self.assertNotIn("FETCH_KNOWLEDGE", prompt)
+        self.assertNotIn("RETHINK_GOAL", prompt)
+        self.assertEqual(plan.action, "IGNORE")
+
     def test_normal_judge_history_keeps_only_recent_timestamped_records(self):
         now = time.time()
         recent_ts = now - 120

@@ -31,7 +31,10 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
         memory_engine = _Component(config)
         attention_gate = _Component(config)
         lane_manager = _Component(config)
+        context_compaction = _Component(config)
+        persona_summarizer = _Component(config)
         proactive_task = _FailingComponent(config) if failing else _Component(config)
+        system2_planner = _Component(config)
         runtime = SimpleNamespace(
             raw_config={"reply": {"fallback_text": config.reply.fallback_text}},
             config=config,
@@ -48,7 +51,12 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
             memory_engine=memory_engine,
             judge=_Component(config),
             proactive_task=proactive_task,
+            system2_planner=system2_planner,
             reply_engine=reply_service,
+            context_compaction=context_compaction,
+            persona_summarizer=persona_summarizer,
+            sys3_router=None,
+            cron_guard=None,
             bind_system2_callback=lambda callback: None,
             rebuild_infrastructure_settings=lambda: None,
             sync_host_compat_attrs=lambda: None,
@@ -81,6 +89,9 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(memory_engine.config.memory.recall_top_k, 9)
         self.assertIs(attention_gate.config, new_config)
         self.assertFalse(attention_gate.config.attention.focus_thread_enabled)
+        self.assertIs(runtime.context_compaction.config, new_config)
+        self.assertIs(runtime.persona_summarizer.config, new_config)
+        self.assertIs(runtime.system2_planner.config, new_config)
 
     def test_reply_service_refresh_config_is_idempotent_and_preserves_runtime_state(self):
         from config import AstrMaiConfig
@@ -123,6 +134,44 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(reply_service.no_segment_limit, old_config.reply.no_segment_max_len)
         self.assertIs(memory_engine.config, old_config)
         self.assertIs(attention_gate.config, old_config)
+        self.assertIs(runtime.context_compaction.config, old_config)
+        self.assertIs(runtime.persona_summarizer.config, old_config)
+        self.assertIs(runtime.system2_planner.config, old_config)
+
+    def test_hot_enable_work_mode_requires_runtime_stack_and_keeps_old_config(self):
+        from config import AstrMaiConfig
+
+        old_config = AstrMaiConfig(sys3={"enable_work_mode": False})
+        new_config = AstrMaiConfig(sys3={"enable_work_mode": True})
+        facade, runtime, _reply_service, _memory_engine, _attention_gate = self._facade(old_config)
+
+        ok = facade.apply_hot_config({"sys3": {"enable_work_mode": True}}, new_config)
+
+        self.assertFalse(ok)
+        self.assertIs(runtime.config, old_config)
+        self.assertFalse(runtime.config.sys3.enable_work_mode)
+
+    def test_sys3_direct_reports_restart_required_when_stack_is_missing(self):
+        import asyncio
+        from config import AstrMaiConfig
+
+        config = AstrMaiConfig(sys3={"enable_work_mode": True})
+        facade, runtime, _reply_service, _memory_engine, _attention_gate = self._facade(config)
+        runtime.rebuild_infrastructure_settings()
+        runtime.feature_flags = SimpleNamespace(work_mode_enabled=True)
+        event = SimpleNamespace(
+            message_str="/work test",
+            unified_msg_origin="default:GroupMessage:group-1",
+            plain_result=lambda text: text,
+        )
+
+        async def _collect():
+            return [item async for item in facade.enter_sys3_direct(event)]
+
+        result = asyncio.run(_collect())
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("restart", result[0].lower())
 
 
 if __name__ == "__main__":

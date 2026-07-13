@@ -31,12 +31,11 @@ async def intercept_outbound_error(runtime, event) -> None:
         return
 
     logger.warning(f"[AstrMai-ErrorGuard] 拦截到系统报错，已阻止下发: {message_str[:50]}...")
-    event.set_result(None)
-
-    mode = getattr(runtime.config.global_settings, "error_interception_mode", "block_only") or "block_only"
+    mode = str(getattr(runtime.config.global_settings, "error_interception_mode", "block_only") or "block_only")
     if mode == "log_only":
         return
-    if hasattr(event, "stop_event"):
+    event.set_result(None)
+    if mode == "block_and_stop" and hasattr(event, "stop_event"):
         event.stop_event()
 
     debug_trace(event, "execution.outbound.error_intercepted", preview=preview_text(message_str, 100))

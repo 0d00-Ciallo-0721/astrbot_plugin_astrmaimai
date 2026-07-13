@@ -47,6 +47,9 @@ class PromptRefiner:
         self.config = config
         self.react_retriever = react_retriever
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     @staticmethod
     def _format_memory_block(memory_text: str) -> str:
         cleaned = str(memory_text or "").strip()
