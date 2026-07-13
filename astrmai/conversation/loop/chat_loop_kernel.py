@@ -545,6 +545,12 @@ class ChatLoopKernel:
             self._trace_tick(state, snapshot, decision, dispatch_result, pre_state_summary)
             raise
         self._apply_post_dispatch_state(state, decision, dispatch_result)
+        if (
+            trigger == "message"
+            and str(state.wait_mode or "none") == "none"
+            and bool(getattr(self.group_reply_wait_manager, "threaded_enabled", False))
+        ):
+            await self._sync_wait_from_adapters(state, chat_id, event)
         await self._state_store.save(state)
         self._trace_tick(state, snapshot, decision, dispatch_result, pre_state_summary)
         return ChatLoopTickResult(state=state, snapshot=snapshot, decision=decision, dispatch_result=dispatch_result)
@@ -1461,6 +1467,10 @@ class ChatLoopKernel:
             except Exception:
                 pass
         if not self._has_active_wait(state):
+            return False
+        if state.wait_scope == "group" and bool(
+            getattr(self.group_reply_wait_manager, "threaded_enabled", False)
+        ):
             return False
         sender_id = self._event_sender_id(event)
         if state.wait_target_ids and sender_id and sender_id in state.wait_target_ids:

@@ -104,6 +104,9 @@ class RuntimeFacadeProtocol(Protocol):
     def get_runtime_coordinator(self) -> Any:
         ...
 
+    def get_conversation_concurrency_flags(self) -> Any:
+        ...
+
     def get_reflector(self) -> Any:
         ...
 
@@ -179,6 +182,9 @@ class RuntimeFacadeProtocol(Protocol):
 
     def check_message_scope_access(self, scope: Any) -> Any:
         """Check whether a message scope is allowed; returns IngressDecision."""
+        ...
+
+    async def prepare_conversation_turn(self, event: Any, scope: Any) -> None:
         ...
 
     async def handle_group_reply_wait(self, event: Any, scope: Any) -> str:

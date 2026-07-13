@@ -323,7 +323,7 @@ class MessageToReplyPipelineIntegrationTests(unittest.TestCase):
         self.assertNotIn("[TERMINAL_YIELD]", sent_text)
         self.assertIsNotNone(event.get_extra("astrmai_turn_context"))
         self.assertIn("收到", sent_text, {"trace": event.get_extra("astrmai_trace_log"), "gateway": gateway.calls})
-        self.assertNotEqual(persistence.chat_states["group-1"].mood, 0.0)
+        self.assertNotEqual(persistence.chat_states[event.unified_msg_origin].mood, 0.0)
         self.assertIn(event.unified_msg_origin, memory_pipeline._session_history_buffer)
 
 

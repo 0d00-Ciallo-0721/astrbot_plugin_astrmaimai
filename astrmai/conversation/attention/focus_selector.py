@@ -10,20 +10,21 @@ def score_focus_candidate(gate, candidate, normalized_events):
     attention_config = getattr(gate.config, "attention", None)
     same_speaker_window = int(getattr(getattr(gate.config, "attention", None), "thread_same_speaker_followup_sec", 8) or 8)
     reply_priority_enabled = bool(getattr(attention_config, "thread_reply_priority_enabled", True))
+    is_historical = bool(candidate.event.get_extra("astrmai_attention_historical", False))
 
-    if candidate.is_reply_to_bot and reply_priority_enabled:
+    if candidate.is_reply_to_bot and reply_priority_enabled and not is_historical:
         score += 1000
         reason = "reply_to_bot"
-    elif candidate.is_at_bot and reply_priority_enabled:
+    elif candidate.is_at_bot and reply_priority_enabled and not is_historical:
         score += 800
         reason = "at_bot"
-    elif candidate.is_direct_wakeup and reply_priority_enabled:
+    elif candidate.is_direct_wakeup and reply_priority_enabled and not is_historical:
         score += 700
         reason = "direct_wakeup"
-    elif candidate.has_direct_vision:
+    elif candidate.has_direct_vision and not is_historical:
         score += 500
         reason = "direct_vision_request"
-    elif candidate.is_near_context_query:
+    elif candidate.is_near_context_query and not is_historical:
         score += 350
         reason = "near_context_followup"
 
@@ -57,10 +58,10 @@ def select_focus_event(gate, events, self_id: str, normalized_events=None):
             focus_event = events[-1]
             return focus_event, [event for event in events if event is not focus_event], "fallback_last_event"
         for event in reversed(candidates):
-            if gate._is_reply_to_bot_event(event, self_id):
+            if not event.get_extra("astrmai_attention_historical", False) and gate._is_reply_to_bot_event(event, self_id):
                 return event, [item for item in events if item is not event], "reply_to_bot"
         for event in reversed(candidates):
-            if gate._is_direct_wakeup_event(event, self_id):
+            if not event.get_extra("astrmai_attention_historical", False) and gate._is_direct_wakeup_event(event, self_id):
                 return event, [item for item in events if item is not event], "direct_wakeup"
         focus_event = candidates[-1]
         return focus_event, [item for item in events if item is not focus_event], "fallback_last_event"

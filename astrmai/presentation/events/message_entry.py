@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
+from ...conversation.concurrency.controls import (
+    record_conversation_concurrency_trace,
+    resolve_conversation_concurrency_flags,
+)
+from ...conversation.contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ...conversation.ingress.command_guard import check_framework_command
 from ...conversation.ingress.dedupe import build_message_signature_text, check_message_dedup
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
@@ -25,11 +31,71 @@ def _runtime_fallback_text(facade: RuntimeFacadeProtocol) -> str:
         return ""
 
 
+def _resolve_message_id(event) -> str:
+    message_obj = getattr(event, "message_obj", None)
+    candidates = [
+        getattr(message_obj, "message_id", None),
+        getattr(message_obj, "id", None),
+        getattr(event, "message_id", None),
+    ]
+    for candidate in candidates:
+        normalized = str(candidate or "").strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: MessageScope) -> None:
+    prepare_turn = getattr(facade, "prepare_conversation_turn", None)
+    if callable(prepare_turn):
+        try:
+            await prepare_turn(event, scope)
+            return
+        except Exception:
+            logger.debug("[AstrMai] facade prepare_conversation_turn degraded", exc_info=True)
+    try:
+        getter = getattr(facade, "get_runtime_coordinator", None)
+        runtime_coordinator = getter() if callable(getter) else None
+    except Exception:
+        logger.debug("[AstrMai] failed to resolve runtime coordinator for turn identity", exc_info=True)
+        runtime_coordinator = None
+    if runtime_coordinator is None or not hasattr(runtime_coordinator, "advance_generation"):
+        return
+    mode = "private" if scope.is_private_chat else "group"
+    thread_id = build_p0_thread_id(mode, scope.chat_id)
+    try:
+        generation = await runtime_coordinator.advance_generation(scope.chat_id, thread_id)
+    except Exception:
+        logger.debug("[AstrMai] failed to advance turn generation", exc_info=True)
+        return
+    created_at = time.time()
+    turn = TurnIdentity(
+        mode=mode,
+        chat_id=scope.chat_id,
+        thread_id=thread_id,
+        generation=generation,
+        sender_id=scope.sender_id,
+        input_message_ids=tuple(item for item in (_resolve_message_id(event),) if item),
+        created_at=created_at,
+    )
+    event.set_extra("astrmai_turn_identity", turn)
+    event.set_extra("astrmai_turn_mode", mode)
+    event.set_extra("astrmai_turn_thread_id", thread_id)
+    event.set_extra("astrmai_turn_generation", generation)
+    event.set_extra("astrmai_turn_created_at", created_at)
+    debug_trace(event, "ingress.turn_bound", chat_id=scope.chat_id, thread_id=thread_id, generation=generation, mode=mode)
+
+
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     scope = MessageScope.from_event(event)
     msg = event.message_str.strip() if event.message_str else ""
     msg_str = build_message_signature_text(event)
-    debug_trace(event, "ingress.enter", chat_id=scope.chat_id, sender_id=scope.sender_id, preview=preview_text(msg_str, 80))
+    try:
+        flag_getter = getattr(facade, "get_conversation_concurrency_flags", None)
+        concurrency_flags = flag_getter() if callable(flag_getter) else resolve_conversation_concurrency_flags(None)
+    except Exception:
+        logger.debug("[AstrMai] failed to resolve conversation concurrency flags", exc_info=True)
+        concurrency_flags = resolve_conversation_concurrency_flags(None)
 
     if check_message_dedup(event).should_stop:
         debug_trace(event, "ingress.stop", reason="duplicate_message")
@@ -68,6 +134,32 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         logger.exception("[AstrMai] check_message_scope_access failed — denying by default")
         event.stop_event()
         return
+
+    if (
+        concurrency_flags.non_conversational_guard_enabled
+        and bool(event.get_extra("astrmai_non_conversational", False))
+    ):
+        record_conversation_concurrency_trace(
+            event,
+            "non_conversational_blocked",
+            chat_id=scope.chat_id,
+            mode="private" if scope.is_private_chat else "group",
+            debug_enabled=concurrency_flags.debug_trace_enabled,
+        )
+        try:
+            coordinator_getter = getattr(facade, "get_runtime_coordinator", None)
+            coordinator = coordinator_getter() if callable(coordinator_getter) else None
+            if coordinator is not None and hasattr(coordinator, "record_concurrency_event"):
+                await coordinator.record_concurrency_event("non_conversational_blocked")
+        except Exception:
+            logger.debug("[AstrMai] non-conversational metric degraded", exc_info=True)
+        debug_trace(event, "ingress.stop", reason="non_conversational")
+        event.stop_event()
+        return
+
+    debug_trace(event, "ingress.enter", chat_id=scope.chat_id, sender_id=scope.sender_id, preview=preview_text(msg_str, 80))
+
+    await _bind_turn_identity(facade, event, scope)
 
     try:
         group_wait_result = await facade.handle_group_reply_wait(event, scope)

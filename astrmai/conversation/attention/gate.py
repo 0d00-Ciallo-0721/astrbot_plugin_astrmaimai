@@ -12,6 +12,8 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
 from ..contracts.turn_context import ensure_turn_context
+from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
+from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
 from .decision_router import AttentionDecisionRouter
@@ -317,18 +319,45 @@ class AttentionGate:
                 break
         return count
 
-    async def _run_background_task(self, coro):
+    async def _run_managed_system2_task(self, coro, event):
+        task = asyncio.current_task()
+        turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
+        coordinator = self.runtime_coordinator
+        registered = True
+        if coordinator is not None and hasattr(coordinator, "register_turn_task"):
+            registered = await coordinator.register_turn_task(turn, task)
+        if not registered:
+            if hasattr(coro, "close"):
+                coro.close()
+            return None
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_system2_failure(event, exc)
+            return None
+        finally:
+            if coordinator is not None and hasattr(coordinator, "unregister_turn_task"):
+                await coordinator.unregister_turn_task(turn, task)
+
+    async def _run_background_task(self, coro, event=None):
         async with self._background_task_semaphore:
+            if event is not None:
+                return await self._run_managed_system2_task(coro, event)
             return await coro
 
-    def _fire_background_task(self, coro):
-        task = asyncio.create_task(self._run_background_task(coro))
+    def _fire_background_task(self, coro, event=None):
+        task = asyncio.create_task(self._run_background_task(coro, event))
+        task._astrmai_inner_coro = coro
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
         return task
 
-    def _fire_priority_task(self, coro):
-        task = asyncio.create_task(coro)
+    def _fire_priority_task(self, coro, event=None):
+        managed_coro = self._run_managed_system2_task(coro, event) if event is not None else coro
+        task = asyncio.create_task(managed_coro)
+        task._astrmai_inner_coro = coro
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
         return task
@@ -336,6 +365,9 @@ class AttentionGate:
     def _handle_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)
         if task.cancelled():
+            inner_coro = getattr(task, "_astrmai_inner_coro", None)
+            if hasattr(inner_coro, "close"):
+                inner_coro.close()
             return
         try:
             task.result()
@@ -394,6 +426,9 @@ class AttentionGate:
     def _handle_background_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)
         if task.cancelled():
+            inner_coro = getattr(task, "_astrmai_inner_coro", None)
+            if hasattr(inner_coro, "close"):
+                inner_coro.close()
             return
         exc = task.exception()
         if exc is not None:
@@ -433,6 +468,72 @@ class AttentionGate:
             except Exception as exc:
                 logger.debug(f"[AttentionGate] runtime activity mark degraded: {exc}")
         return now
+
+    async def _ensure_turn_identity(self, event: AstrMessageEvent, chat_id: str, is_private: bool) -> None:
+        if event.get_extra("astrmai_turn_identity", None) is not None:
+            return
+        conversation_config = getattr(self.config, "conversation", None)
+        if not bool(getattr(conversation_config, "conversation_generation_enabled", True)):
+            return
+        coordinator = self.runtime_coordinator
+        if coordinator is None or not hasattr(coordinator, "advance_generation"):
+            return
+        mode = "private" if is_private else "group"
+        if not is_private and bool(getattr(conversation_config, "group_thread_wait_enabled", False)):
+            resolution = resolve_group_thread(event, chat_id)
+            thread_id = resolution.thread_id
+            event.set_extra("astrmai_group_thread_source", resolution.source)
+            event.set_extra("astrmai_group_thread_confidence", resolution.confidence)
+        else:
+            thread_id = build_p0_thread_id(mode, chat_id)
+        generation = await coordinator.advance_generation(chat_id, thread_id)
+        created_at = time.time()
+        turn = TurnIdentity(
+            mode=mode,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            generation=generation,
+            sender_id=str(event.get_sender_id() or ""),
+            input_message_ids=tuple(item for item in (self._build_message_id(event),) if item),
+            created_at=created_at,
+        )
+        event.set_extra("astrmai_turn_identity", turn)
+        event.set_extra("astrmai_turn_mode", mode)
+        event.set_extra("astrmai_turn_thread_id", thread_id)
+        event.set_extra("astrmai_turn_generation", generation)
+        event.set_extra("astrmai_turn_created_at", created_at)
+
+    async def _handle_system2_failure(self, event: AstrMessageEvent, exc: Exception) -> None:
+        logger.error(f"[Attention Task Error] {exc}", exc_info=exc)
+        coordinator = self.runtime_coordinator
+        turn = event.get_extra("astrmai_turn_identity", None)
+        if coordinator is not None and hasattr(coordinator, "is_current_turn"):
+            if not await coordinator.is_current_turn(turn):
+                return
+        if event.get_extra("astrmai_system2_failure_handled", False):
+            return
+        event.set_extra("astrmai_system2_failure_handled", True)
+        reply_sent = bool(event.get_extra("astrmai_reply_sent", False))
+        if not reply_sent and hasattr(event, "send") and hasattr(event, "plain_result"):
+            fallback_text = str(
+                getattr(getattr(self.config, "reply", None), "fallback_text", "")
+                or "（陷入了短暂的沉默...）"
+            )
+            try:
+                await event.send(event.plain_result(fallback_text))
+                event.set_extra("astrmai_reply_sent", True)
+                reply_sent = True
+            except Exception as send_exc:
+                logger.error(f"[AttentionGate] failed to send System2 fallback: {send_exc}")
+        callback = event.get_extra("astrmai_proactive_completion_callback", None)
+        if callback is not None and not event.get_extra("astrmai_proactive_completed", False):
+            event.set_extra("astrmai_proactive_completed", True)
+            try:
+                result = callback(reply_sent, "")
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as callback_exc:
+                logger.error(f"[AttentionGate] proactive completion callback failed: {callback_exc}")
 
     async def _record_dialogue_segment_from_event(self, chat_id: str, event: AstrMessageEvent) -> None:
         store = getattr(self, "dialogue_store", None)
@@ -529,7 +630,7 @@ class AttentionGate:
 
     def _resolve_event_context(self, event: AstrMessageEvent) -> dict[str, Any]:
         group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
-        chat_id = group_id or str(getattr(event, "unified_msg_origin", "") or "default")
+        chat_id = str(getattr(event, "unified_msg_origin", "") or group_id or "default")
         self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
         sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
         msg_str = str(getattr(event, "message_str", "") or "")
@@ -558,11 +659,8 @@ class AttentionGate:
         turn_context.attention.is_fast_mode = bool(fast_mode)
         sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
         await self._record_event_activity(chat_id, event, sender_id)
-        session = await self._get_or_create_session(chat_id)
-        async with session.lock:
-            session.accumulation_pool = [event]
         if self.sys2_process:
-            self._fire_priority_task(self.sys2_process(event, [event]))
+            self._fire_priority_task(self.sys2_process(event, [event]), event)
         return "ENGAGED"
 
     async def _handle_force_engage(self, event: AstrMessageEvent, chat_id: str) -> str | None:
@@ -740,6 +838,8 @@ class AttentionGate:
         extracted_images = context["extracted_images"]
         is_private = context["is_private"]
 
+        await self._ensure_turn_identity(event, chat_id, is_private)
+
         debug_trace(event, "attention_ingress", chat_id=chat_id, sender_id=sender_id, preview=preview_text(msg_str, 80))
 
         session = await self._get_or_create_session(chat_id)
@@ -773,8 +873,13 @@ class AttentionGate:
 
         if is_private and self.private_chat_manager and not is_strong_wakeup:
             try:
-                await self.private_chat_manager.signal_new_message(sender_id, msg_str, chat_id=chat_id)
-                return "PRIVATE_WAIT"
+                wait_signaled = await self.private_chat_manager.signal_new_message(
+                    sender_id,
+                    msg_str,
+                    chat_id=chat_id,
+                )
+                if wait_signaled:
+                    return "PRIVATE_WAIT"
             except Exception as exc:
                 logger.warning(
                     f"[AttentionGate] private chat wait signal failed for {chat_id}, "
@@ -918,7 +1023,10 @@ class AttentionGate:
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
                         if self.sys2_process:
-                            task = self._fire_background_task(self.sys2_process(focus_event, focus_thread.all_thread_events()))
+                            task = self._fire_background_task(
+                                self.sys2_process(focus_event, focus_thread.all_thread_events()),
+                                focus_event,
+                            )
 
             async with session.lock:
                 if session.accumulation_pool:

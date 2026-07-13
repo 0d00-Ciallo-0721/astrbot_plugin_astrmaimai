@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .runtime_contracts import FreshnessState
+
+try:
+    from astrbot.api import logger
+except Exception:
+    logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SendClaimState:
+    status: str = "claimed"
+    outbound_message_ids: List[str] = field(default_factory=list)
+    error: str = ""
+    claimed_at: float = field(default_factory=time.time)
+    committed_at: float = 0.0
 
 
 @dataclass
@@ -21,12 +36,19 @@ class ChatRuntimeState:
     latest_activity_preview: str = ""
     latest_activity_thread_signature: str = ""
     activity_times: List[float] = field(default_factory=list)
+    turn_generations: Dict[str, int] = field(default_factory=dict)
+    active_turn_tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
+    send_claims: Dict[str, SendClaimState] = field(default_factory=dict)
 
 
 class ChatRuntimeCoordinator:
+    MAX_THREAD_GENERATIONS_PER_CHAT = 128
+    MAX_SEND_CLAIMS_PER_CHAT = 256
+
     def __init__(self) -> None:
         self._states: Dict[str, ChatRuntimeState] = {}
         self._lock = asyncio.Lock()
+        self._concurrency_metrics: Dict[str, int] = {}
 
     async def _get_state(self, chat_id: str) -> ChatRuntimeState:
         async with self._lock:
@@ -79,6 +101,163 @@ class ChatRuntimeCoordinator:
     async def get_wait_target_name(self, chat_id: str) -> str:
         state = await self._get_state(chat_id)
         return state.wait_target_name
+
+    @staticmethod
+    def _normalize_thread_key(chat_id: str, thread_id: str) -> tuple[str, str]:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_thread_id = str(thread_id or "").strip() or normalized_chat_id
+        return normalized_chat_id, normalized_thread_id
+
+    async def advance_generation(self, chat_id: str, thread_id: str) -> int:
+        normalized_chat_id, normalized_thread_id = self._normalize_thread_key(chat_id, thread_id)
+        stale_task: asyncio.Task | None = None
+        async with self._lock:
+            state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
+            if (
+                normalized_thread_id not in state.turn_generations
+                and len(state.turn_generations) >= self.MAX_THREAD_GENERATIONS_PER_CHAT
+            ):
+                state.turn_generations.pop(next(iter(state.turn_generations)), None)
+            next_generation = int(state.turn_generations.get(normalized_thread_id, 0) or 0) + 1
+            state.turn_generations[normalized_thread_id] = next_generation
+            stale_task = state.active_turn_tasks.pop(normalized_thread_id, None)
+            self._increment_metric_locked("generation_advanced")
+            if stale_task is not None and not stale_task.done():
+                self._increment_metric_locked("stale_turn_cancelled")
+        if stale_task is not None and not stale_task.done():
+            stale_task.cancel()
+        return next_generation
+
+    async def register_turn_task(self, turn: Any, task: asyncio.Task) -> bool:
+        if turn is None:
+            return True
+        chat_id, thread_id = self._normalize_thread_key(
+            getattr(turn, "chat_id", ""),
+            getattr(turn, "thread_id", ""),
+        )
+        generation = int(getattr(turn, "generation", 0) or 0)
+        if not chat_id or not thread_id or generation <= 0:
+            return True
+        previous_task: asyncio.Task | None = None
+        async with self._lock:
+            state = self._states.setdefault(chat_id, ChatRuntimeState())
+            if int(state.turn_generations.get(thread_id, 0) or 0) != generation:
+                self._increment_metric_locked("stale_turn_rejected")
+                return False
+            previous_task = state.active_turn_tasks.get(thread_id)
+            state.active_turn_tasks[thread_id] = task
+        if previous_task is not None and previous_task is not task and not previous_task.done():
+            previous_task.cancel()
+        return True
+
+    async def unregister_turn_task(self, turn: Any, task: asyncio.Task) -> None:
+        if turn is None:
+            return
+        chat_id, thread_id = self._normalize_thread_key(
+            getattr(turn, "chat_id", ""),
+            getattr(turn, "thread_id", ""),
+        )
+        async with self._lock:
+            state = self._states.get(chat_id)
+            if state is not None and state.active_turn_tasks.get(thread_id) is task:
+                state.active_turn_tasks.pop(thread_id, None)
+
+    async def current_generation(self, chat_id: str, thread_id: str) -> int:
+        normalized_chat_id, normalized_thread_id = self._normalize_thread_key(chat_id, thread_id)
+        async with self._lock:
+            state = self._states.get(normalized_chat_id)
+            if not state:
+                return 0
+            return int(state.turn_generations.get(normalized_thread_id, 0) or 0)
+
+    async def is_current_turn(self, turn: Any) -> bool:
+        if turn is None:
+            return True
+        try:
+            chat_id = str(getattr(turn, "chat_id", "") or "").strip()
+            thread_id = str(getattr(turn, "thread_id", "") or "").strip()
+            generation = int(getattr(turn, "generation", 0) or 0)
+        except Exception:
+            logger.debug("[ChatRuntimeCoordinator] malformed turn identity; preserving legacy reply behavior", exc_info=True)
+            return True
+        if not chat_id or not thread_id or generation <= 0:
+            return True
+        return await self.current_generation(chat_id, thread_id) == generation
+
+    async def claim_send(self, chat_id: str, send_key: str) -> bool:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_send_key = str(send_key or "").strip()
+        if not normalized_send_key:
+            return False
+        async with self._lock:
+            state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
+            if normalized_send_key in state.send_claims:
+                self._increment_metric_locked("send_claim_exists")
+                return False
+            if len(state.send_claims) >= self.MAX_SEND_CLAIMS_PER_CHAT:
+                state.send_claims.pop(next(iter(state.send_claims)), None)
+            state.send_claims[normalized_send_key] = SendClaimState()
+            self._increment_metric_locked("send_claimed")
+            return True
+
+    async def commit_send(self, chat_id: str, send_key: str, outbound_message_ids: List[str] | None = None) -> None:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_send_key = str(send_key or "").strip()
+        if not normalized_send_key:
+            return
+        async with self._lock:
+            state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
+            claim = state.send_claims.setdefault(normalized_send_key, SendClaimState())
+            claim.status = "committed"
+            claim.outbound_message_ids = list(dict.fromkeys(str(item) for item in (outbound_message_ids or []) if str(item)))
+            claim.committed_at = time.time()
+            self._increment_metric_locked("send_committed")
+
+    async def mark_send_failed(self, chat_id: str, send_key: str, error: str = "") -> None:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_send_key = str(send_key or "").strip()
+        if not normalized_send_key:
+            return
+        async with self._lock:
+            state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
+            claim = state.send_claims.setdefault(normalized_send_key, SendClaimState())
+            claim.status = "failed"
+            claim.error = str(error or "")[:300]
+            self._increment_metric_locked("send_failed")
+
+    async def get_send_claim(self, chat_id: str, send_key: str) -> Optional[dict]:
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_send_key = str(send_key or "").strip()
+        if not normalized_send_key:
+            return None
+        async with self._lock:
+            state = self._states.get(normalized_chat_id)
+            if not state:
+                return None
+            claim = state.send_claims.get(normalized_send_key)
+            if not claim:
+                return None
+            return {
+                "status": claim.status,
+                "outbound_message_ids": claim.outbound_message_ids[:],
+                "error": claim.error,
+                "claimed_at": float(claim.claimed_at or 0.0),
+                "committed_at": float(claim.committed_at or 0.0),
+            }
+
+    def _increment_metric_locked(self, event_name: str, amount: int = 1) -> None:
+        key = str(event_name or "unknown")
+        self._concurrency_metrics[key] = int(self._concurrency_metrics.get(key, 0) or 0) + max(
+            0, int(amount or 0)
+        )
+
+    async def record_concurrency_event(self, event_name: str, amount: int = 1) -> None:
+        async with self._lock:
+            self._increment_metric_locked(event_name, amount)
+
+    async def get_concurrency_metrics(self) -> dict[str, int]:
+        async with self._lock:
+            return dict(self._concurrency_metrics)
 
     async def mark_activity(
         self,
@@ -148,11 +327,21 @@ class ChatRuntimeCoordinator:
                 "recent_activity_count": len(recent_5m),
                 "executor_pending": int(state.executor_pending or 0),
                 "wait_targets": state.wait_targets[:],
+                "turn_generations": dict(state.turn_generations),
+                "active_turn_task_count": len(state.active_turn_tasks),
+                "send_claim_count": len(state.send_claims),
             }
 
     async def clear_runtime_state(self, chat_id: str) -> bool:
+        tasks: list[asyncio.Task] = []
         async with self._lock:
-            return self._states.pop(chat_id, None) is not None
+            state = self._states.pop(chat_id, None)
+            if state is not None:
+                tasks = list(state.active_turn_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        return state is not None
 
     async def prune_inactive(self, max_idle_sec: float = 1800) -> int:
         now = time.time()

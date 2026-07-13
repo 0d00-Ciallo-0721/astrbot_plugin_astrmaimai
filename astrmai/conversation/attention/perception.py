@@ -13,7 +13,7 @@ class PerceptionBuilder:
 
     def build(self, event: Any) -> PerceptionSnapshot:
         group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
-        chat_id = group_id or str(getattr(event, "unified_msg_origin", "") or "default")
+        chat_id = str(getattr(event, "unified_msg_origin", "") or group_id or "default")
         self_id = str(getattr(event, "get_self_id", lambda: "")() or "")
         sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "")
         sender_name = str(getattr(event, "get_sender_name", lambda: "")() or "")

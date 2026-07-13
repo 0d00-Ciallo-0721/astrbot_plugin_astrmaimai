@@ -332,7 +332,12 @@ class PluginBootstrap:
     def _build_interaction_stack(self, runtime: PluginRuntimeContext) -> InteractionServices:
         frequency_controller = FrequencyController(config=runtime.config)
         private_chat_manager = PrivateChatManager(config=runtime.config)
-        group_reply_wait_manager = GroupReplyWaitManager()
+        conversation_config = getattr(runtime.config, "conversation", None)
+        group_reply_wait_manager = GroupReplyWaitManager(
+            threaded_enabled=bool(
+                getattr(conversation_config, "group_thread_wait_enabled", False)
+            )
+        )
         attention_gate = AttentionGate(
             state_engine=runtime.state_engine,
             judge=runtime.judge,

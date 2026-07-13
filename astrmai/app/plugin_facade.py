@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from astrbot.api import logger
 
+from ..conversation.concurrency.controls import (
+    record_conversation_concurrency_trace,
+    resolve_conversation_concurrency_flags,
+)
+from ..conversation.contracts.turn_identity import TurnIdentity, build_p0_thread_id
+from ..conversation.threading.group_thread_resolver import resolve_group_thread
 from ..presentation.dto.message_scope import IngressDecision
 from ..presentation.events.error_interceptor import intercept_and_notify_errors
 from ..presentation.events.message_entry import handle_global_message
@@ -190,6 +197,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("sensors", getattr(self.runtime, "sensors", None)),
             ("frequency_controller", getattr(self.runtime, "frequency_controller", None)),
             ("private_chat_manager", getattr(self.runtime, "private_chat_manager", None)),
+            ("group_reply_wait_manager", getattr(self.runtime, "group_reply_wait_manager", None)),
             ("attention_gate", getattr(self.runtime, "attention_gate", None)),
             ("reply_engine", getattr(self.runtime, "reply_engine", None)),
             ("evolution", getattr(self.runtime, "evolution", None)),
@@ -254,10 +262,96 @@ class PluginFacade(RuntimeFacadeProtocol):
 
         return _check(self.runtime, scope)
 
+    @staticmethod
+    def _resolve_turn_message_id(event) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        candidates = [
+            getattr(message_obj, "message_id", None),
+            getattr(message_obj, "id", None),
+            getattr(event, "message_id", None),
+        ]
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if normalized:
+                return normalized
+        return ""
+
+    async def prepare_conversation_turn(self, event, scope) -> None:
+        runtime_coordinator = getattr(self.runtime, "runtime_coordinator", None)
+        if runtime_coordinator is None or not hasattr(runtime_coordinator, "advance_generation"):
+            return
+        flags = self.get_conversation_concurrency_flags()
+        if not flags.generation_enabled:
+            return
+        mode = "private" if getattr(scope, "is_private_chat", False) else "group"
+        chat_id = str(getattr(scope, "chat_id", "") or "")
+        if mode == "group" and flags.group_thread_wait_enabled:
+            thread_resolution = resolve_group_thread(event, chat_id)
+            thread_id = thread_resolution.thread_id
+            event.set_extra("astrmai_group_thread_source", thread_resolution.source)
+            event.set_extra("astrmai_group_thread_confidence", thread_resolution.confidence)
+        elif mode == "group":
+            thread_id = chat_id
+            event.set_extra("astrmai_group_thread_source", "gray_switch_disabled")
+            event.set_extra("astrmai_group_thread_confidence", 0.0)
+        else:
+            thread_id = build_p0_thread_id(mode, chat_id)
+        generation = await runtime_coordinator.advance_generation(chat_id, thread_id)
+        created_at = time.time()
+        turn = TurnIdentity(
+            mode=mode,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            generation=generation,
+            sender_id=str(getattr(scope, "sender_id", "") or ""),
+            input_message_ids=tuple(item for item in (self._resolve_turn_message_id(event),) if item),
+            created_at=created_at,
+        )
+        event.set_extra("astrmai_turn_identity", turn)
+        event.set_extra("astrmai_turn_mode", mode)
+        event.set_extra("astrmai_turn_thread_id", thread_id)
+        event.set_extra("astrmai_turn_generation", generation)
+        event.set_extra("astrmai_turn_created_at", created_at)
+        record_conversation_concurrency_trace(
+            event,
+            "turn_created",
+            chat_id=chat_id,
+            mode=mode,
+            thread_id=thread_id,
+            generation=generation,
+            resolver_source=event.get_extra("astrmai_group_thread_source", ""),
+            debug_enabled=flags.debug_trace_enabled,
+            debug_factory=lambda: {
+                "input_message_ids": list(turn.input_message_ids),
+            },
+        )
+
     async def handle_group_reply_wait(self, event, scope) -> str:
         if not event.get_group_id() or not self.runtime.group_reply_wait_manager:
             return "NONE"
+        thread_id = str(event.get_extra("astrmai_turn_thread_id", "") or "")
         group_wait_result = self.runtime.group_reply_wait_manager.handle_incoming_message(event)
+        if group_wait_result != "NONE":
+            record_conversation_concurrency_trace(
+                event,
+                "group_wait",
+                chat_id=scope.chat_id,
+                mode="group",
+                thread_id=thread_id,
+                wait_scope="thread" if self.get_conversation_concurrency_flags().group_thread_wait_enabled else "chat",
+                wait_resume_reason=group_wait_result.lower(),
+                debug_enabled=self.get_conversation_concurrency_flags().debug_trace_enabled,
+            )
+            metric_name = {
+                "RESUME": "group_wait_resumed",
+                "OBSERVED": "group_wait_observed",
+                "EXPIRED": "group_wait_expired",
+            }.get(group_wait_result)
+            coordinator = getattr(self.runtime, "runtime_coordinator", None)
+            if metric_name and coordinator is not None and hasattr(
+                coordinator, "record_concurrency_event"
+            ):
+                await coordinator.record_concurrency_event(metric_name)
         if getattr(self.runtime, "chat_loop_kernel", None) is not None:
             if group_wait_result == "RESUME":
                 await self.runtime.chat_loop_kernel.resume_wait(
@@ -268,13 +362,22 @@ class PluginFacade(RuntimeFacadeProtocol):
                 )
             elif group_wait_result == "EXPIRED":
                 await self.runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
-            group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
+            if self.get_conversation_concurrency_flags().group_thread_wait_enabled:
+                group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
+            else:
+                group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(
+                    scope.chat_id,
+                    thread_id=thread_id,
+                )
             if group_wait_info:
                 await self.runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
         return group_wait_result
 
     def is_debug_mode(self) -> bool:
         return getattr(self.runtime.config.global_settings, "debug_mode", False)
+
+    def get_conversation_concurrency_flags(self):
+        return resolve_conversation_concurrency_flags(getattr(self.runtime, "config", None))
 
     def track_incoming_user_activity(self, user_id: str) -> None:
         if user_id and self.runtime.lifecycle.manager:
@@ -307,6 +410,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             self.runtime.group_reply_wait_manager.cancel_wait(
                 event.unified_msg_origin,
                 reason=f"interrupted_by_{status.lower()}",
+                thread_id=str(event.get_extra("astrmai_turn_thread_id", "") or ""),
             )
 
     def suppress_default_llm_if_engaged(self, event, status, is_direct_call):
@@ -632,7 +736,10 @@ class PluginFacade(RuntimeFacadeProtocol):
                 elif reply_sent and main_event.get_group_id() and self.runtime.group_reply_wait_manager:
                     if self.runtime.group_reply_wait_manager.register_from_reply_event(main_event):
                         if getattr(self.runtime, "chat_loop_kernel", None) is not None:
-                            payload = self.runtime.group_reply_wait_manager.get_wait_info(chat_id)
+                            payload = self.runtime.group_reply_wait_manager.get_wait_info(
+                                chat_id,
+                                thread_id=str(main_event.get_extra("astrmai_turn_thread_id", "") or ""),
+                            )
                             if payload:
                                 await self.runtime.chat_loop_kernel.arm_group_wait(chat_id, payload)
             except LLMCascadeFailureException:

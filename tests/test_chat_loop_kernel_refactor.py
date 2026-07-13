@@ -403,6 +403,52 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.decision.reason, "wait_state:wait_targets")
         self.assertEqual(result.decision.metadata["wait_scope"], "runtime_wait_targets")
 
+    def test_threaded_group_wait_manager_remains_routing_authority(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _ThreadedGroupWaitManager:
+            threaded_enabled = True
+
+            def get_wait_info(self, chat_id):
+                return {
+                    "target_user_id": "user-1",
+                    "target_name": "Alice",
+                    "thread_signature": "thread-b",
+                    "remaining_seconds": 30,
+                    "remaining_messages": 3,
+                    "reason": "thread_wait",
+                }
+
+        async def _message_handler(event):
+            return "BUFFERED"
+
+        kernel = self.kernel_mod.ChatLoopKernel(
+            runtime_coordinator=_Coordinator(),
+            message_handler=_message_handler,
+        )
+        kernel.bind_signal_sources(group_reply_wait_manager=_ThreadedGroupWaitManager())
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            group_id="group-1",
+            text="different thread",
+        )
+
+        result = asyncio.run(
+            kernel.tick(
+                chat_id="default:GroupMessage:group-1",
+                trigger="message",
+                event=event,
+            )
+        )
+
+        self.assertEqual(result.decision.action, "INTERRUPT_WAIT")
+        self.assertEqual(result.state.wait_mode, "group_reply")
+        self.assertEqual(result.state.wait_status, "armed")
+
     def test_private_wait_forces_wait_during_heartbeat(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):

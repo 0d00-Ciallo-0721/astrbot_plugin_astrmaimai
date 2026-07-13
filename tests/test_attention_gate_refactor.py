@@ -66,11 +66,13 @@ class _FakePrivateEvent(_FakeEvent):
 
 
 class _FakePrivateChatManager:
-    def __init__(self):
+    def __init__(self, signaled=True):
         self.calls = []
+        self.signaled = signaled
 
     async def signal_new_message(self, user_id, message_str, chat_id=""):
         self.calls.append((user_id, message_str, chat_id))
+        return self.signaled
 
 
 class _SequenceJudge:
@@ -210,7 +212,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_group_direct_wakeup"), True)
         turn_context = event.get_extra("astrmai_turn_context")
         self.assertIsNotNone(turn_context)
-        self.assertEqual(turn_context.perception.chat_id, "group-1")
+        self.assertEqual(turn_context.perception.chat_id, "default:GroupMessage:group-1")
         self.assertTrue(turn_context.perception.is_strong_wakeup)
         self.assertEqual(turn_context.attention.retrieve_keys, ["CORE_ONLY"])
         self.assertTrue(turn_context.attention.is_fast_mode)
@@ -406,6 +408,115 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertAlmostEqual(event.get_extra("astrmai_primary_mood_value"), -0.35)
         self.assertEqual(event.get_extra("astrmai_primary_mood_source"), "attention_ingress")
 
+    def test_private_message_without_active_wait_continues_normal_attention(self):
+        manager = _FakePrivateChatManager(signaled=False)
+        self.gate.private_chat_manager = manager
+        event = _FakePrivateEvent("user-1", "Alice", "hello")
+
+        async def _run():
+            status = await self.gate.process_event(event)
+            await asyncio.sleep(0)
+            for task in list(self.gate._session_tasks):
+                task.cancel()
+            await asyncio.gather(*list(self.gate._session_tasks), return_exceptions=True)
+            return status
+
+        status = asyncio.run(_run())
+
+        self.assertEqual(status, "BUFFERED")
+        self.assertEqual(manager.calls, [("user-1", "hello", "default:FriendMessage:user-1")])
+
+    def test_group_perception_uses_unified_origin_as_chat_id(self):
+        event = _FakeEvent("user-1", "Alice", "hello")
+        event.unified_msg_origin = "napcat-a:GroupMessage:group-1"
+
+        perception = self.gate.perception_builder.build(event)
+
+        self.assertEqual(perception.chat_id, "napcat-a:GroupMessage:group-1")
+
+    def test_immediate_engage_preserves_existing_accumulation_pool(self):
+        pending = _FakeEvent("user-2", "Bob", "pending")
+        current = _FakeEvent("user-1", "Alice", "AstrMai", extras={"wakeup": True})
+
+        async def _run():
+            session = await self.gate._get_or_create_session(current.unified_msg_origin)
+            session.accumulation_pool = [pending]
+            result = await self.gate._engage_immediately(current, current.unified_msg_origin, ["ALL"], fast_mode=True)
+            return result, session.accumulation_pool
+
+        result, pool = asyncio.run(_run())
+
+        self.assertEqual(result, "ENGAGED")
+        self.assertEqual(pool, [pending])
+
+    def test_historical_direct_wakeup_does_not_steal_focus_from_current_message(self):
+        historical = _FakeEvent("user-1", "Alice", "AstrMai", extras={"wakeup": True})
+        current = _FakeEvent("user-2", "Bob", "current message")
+
+        async def _run():
+            session = await self.gate._get_or_create_session(current.unified_msg_origin)
+            self.gate._append_attention_window(session, [historical], timestamp=time.time())
+            merged = self.gate._merge_attention_window(session, [current])
+            return self.gate._select_focus_event(merged, "bot-1")[0]
+
+        focus = asyncio.run(_run())
+
+        self.assertIs(focus, current)
+
+    def test_force_engage_event_bypassing_facade_gets_turn_identity(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        self.gate.runtime_coordinator = coordinator_mod.ChatRuntimeCoordinator()
+        self.gate.config.conversation = SimpleNamespace(
+            conversation_generation_enabled=True,
+            group_thread_wait_enabled=True,
+        )
+        event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "proactive",
+            extras={"astrmai_force_engage": True},
+        )
+
+        status = asyncio.run(self.gate.process_event(event))
+        turn = event.get_extra("astrmai_turn_identity")
+
+        self.assertEqual(status, "ENGAGED")
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn.chat_id, "default:GroupMessage:group-1")
+        self.assertEqual(turn.thread_id, "sender:user-1")
+        self.assertEqual(turn.generation, 1)
+
+    def test_background_system2_failure_sends_one_fallback_and_completes_proactive(self):
+        event = _FakeEvent("user-1", "Alice", "hello")
+        sent = []
+        completed = []
+
+        async def _send(result):
+            sent.append(result)
+
+        async def _completion(reply_sent, preview):
+            completed.append((reply_sent, preview))
+
+        async def _fail():
+            raise RuntimeError("planner failed")
+
+        event.send = _send
+        event.plain_result = lambda text: text
+        event.set_extra("astrmai_proactive_completion_callback", _completion)
+        self.gate.config.reply = SimpleNamespace(fallback_text="fallback")
+
+        async def _run():
+            await self.gate._run_managed_system2_task(_fail(), event)
+            await self.gate._handle_system2_failure(event, RuntimeError("duplicate"))
+
+        asyncio.run(_run())
+
+        self.assertEqual(sent, ["fallback"])
+        self.assertEqual(completed, [(True, "")])
+        self.assertTrue(event.get_extra("astrmai_reply_sent", False))
+
     def test_process_event_applies_primary_mood_before_fast_wakeup_engage(self):
         calls = []
 
@@ -424,7 +535,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         status = asyncio.run(self.gate.process_event(event))
 
         self.assertEqual(status, "ENGAGED")
-        self.assertEqual(calls, [("group-1", "AstrMai")])
+        self.assertEqual(calls, [("default:GroupMessage:group-1", "AstrMai")])
         self.assertTrue(event.get_extra("astrmai_primary_mood_applied"))
         self.assertEqual(event.get_extra("astrmai_primary_mood_source"), "attention_ingress")
 

@@ -83,18 +83,20 @@ class PrivateChatManager:
         else:
             self.timeout_sec = self.DEFAULT_TIMEOUT_SEC
 
-    async def signal_new_message(self, user_id: str, message_str: str = "", chat_id: str = ""):
+    async def signal_new_message(self, user_id: str, message_str: str = "", chat_id: str = "") -> bool:
         session = self._get_or_create_session(user_id, chat_id)
         self._bind_chat_session(chat_id, user_id)
         session.last_message_time = monotonic()
         session.turn_count += 1
 
+        if not session.is_bot_waiting:
+            return False
+
         if message_str:
             session.pending_messages.append(message_str)
-
-        if session.is_bot_waiting:
-            session.new_message_event.set()
-            logger.debug(f"[PrivateChat] message interrupted waiting session for {user_id}")
+        session.new_message_event.set()
+        logger.debug(f"[PrivateChat] message interrupted waiting session for {user_id}")
+        return True
 
     async def wait_for_new_message(
         self,

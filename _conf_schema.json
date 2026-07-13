@@ -179,6 +179,36 @@
         "default": false,
         "hint": "开启后，上下文压缩将基于 Token 估算值（而非纯消息条数）判断是否触发，避免长消息导致上下文溢出。字符/4 粗略估算，零依赖。"
       },
+      "conversation_generation_enabled": {
+        "description": "启用对话轮次 generation 防线",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后回退到旧版回复时序，仅用于故障灰度回滚。"
+      },
+      "reply_send_claim_enabled": {
+        "description": "启用 final 回复幂等发送",
+        "type": "bool",
+        "default": true,
+        "hint": "防止同一轮 final 被多个异步入口重复发送。"
+      },
+      "group_thread_wait_enabled": {
+        "description": "启用群聊分线程等待隔离",
+        "type": "bool",
+        "default": false,
+        "hint": "灰度开启后 GroupWait 与 generation 按群内线程隔离；关闭时保持整群范围旧行为。"
+      },
+      "non_conversational_guard_enabled": {
+        "description": "隔离测试与控制消息",
+        "type": "bool",
+        "default": true,
+        "hint": "阻止已标记为 non-conversational 的消息进入聊天状态机。"
+      },
+      "conversation_concurrency_debug_trace_enabled": {
+        "description": "启用对话并发调试轨迹",
+        "type": "bool",
+        "default": false,
+        "hint": "仅排障时开启；默认 summary trace 不记录用户或回复正文。"
+      },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
         "type": "float",
@@ -311,6 +341,12 @@
         "type": "float",
         "default": 2.0,
         "hint": "短时间内连续出现的消息会先聚合，再统一判断要不要回复。"
+      },
+      "judge_timeout": {
+        "description": "System1 Judge timeout seconds",
+        "type": "float",
+        "default": 3.0,
+        "hint": "Maximum time to wait for the lightweight attention judge before passing through."
       },
       "bg_pool_size": {
         "description": "后台观察缓存条数",
@@ -464,6 +500,30 @@
         "type": "int",
         "default": 5,
         "hint": "每次最多取回多少条相关记忆参与回答。"
+      },
+      "memory_query_builder_enabled": {
+        "description": "Enable memory query builder",
+        "type": "bool",
+        "default": true,
+        "hint": "Enable layered query metadata for memory retrieval. Disable to fall back to legacy query behavior."
+      },
+      "intent_rerank_enabled": {
+        "description": "Enable intent-aware memory rerank",
+        "type": "bool",
+        "default": false,
+        "hint": "When enabled, memory candidates can be reranked by query intent after deduplication."
+      },
+      "adaptive_top_k_enabled": {
+        "description": "Enable adaptive memory top-k",
+        "type": "bool",
+        "default": false,
+        "hint": "When enabled, memory retrieval may adjust candidate and injection counts by intent and prompt budget."
+      },
+      "memory_retrieval_debug_trace_enabled": {
+        "description": "Enable detailed memory retrieval debug trace",
+        "type": "bool",
+        "default": false,
+        "hint": "Debug trace may include detailed query and candidate information. Keep disabled for normal use."
       },
       "deep_temporal_alpha": {
         "description": "deep retrieval 鏃堕棿浠叉潈淇濆簳绯绘暟",
@@ -635,6 +695,24 @@
         "default": 5,
         "hint": "记忆积累太少时不会进入 dream 流程。"
       },
+      "intimate_tool_threshold": {
+        "description": "Intimate tool threshold",
+        "type": "float",
+        "default": 20.0,
+        "hint": "Relationship score threshold for enabling more intimate proactive tools."
+      },
+      "hostile_threshold": {
+        "description": "Hostile relationship threshold",
+        "type": "float",
+        "default": -20.0,
+        "hint": "Relationship score threshold for applying hostile tool restrictions."
+      },
+      "energy_exhaustion": {
+        "description": "Energy exhaustion threshold",
+        "type": "float",
+        "default": 0.1,
+        "hint": "When energy is below this value, high-cost chat tools are restricted."
+      },
       "dream_visible": {
         "description": "公开发送梦境文本",
         "type": "bool",
@@ -796,6 +874,18 @@
         "type": "bool",
         "default": false,
         "hint": "开启后，Bot 可以进入更偏任务执行、工具调用的工作流。"
+      },
+      "max_steps": {
+        "description": "Sys3 direct maximum steps",
+        "type": "int",
+        "default": 30,
+        "hint": "Maximum tool-loop steps for direct Sys3 work-mode entry."
+      },
+      "tool_timeout": {
+        "description": "Sys3 direct timeout seconds",
+        "type": "int",
+        "default": 120,
+        "hint": "Tool-loop timeout for direct Sys3 work-mode entry."
       },
       "computer_agent_sandbox_enabled": {
         "description": "启用 ComputerAgent 代码执行",

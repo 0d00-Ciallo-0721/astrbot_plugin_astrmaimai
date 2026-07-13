@@ -59,6 +59,16 @@ class AttentionWindowBuffer:
 
     def merge(self, session: Any, batch_events: list[Any]) -> list[Any]:
         window_events = self.prune(session)
+        batch_ids = {self.gate._build_message_id(event) for event in batch_events}
+        for event in window_events:
+            if hasattr(event, "set_extra"):
+                event.set_extra(
+                    "astrmai_attention_historical",
+                    self.gate._build_message_id(event) not in batch_ids,
+                )
+        for event in batch_events:
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_attention_historical", False)
         merged_events: list[Any] = []
         seen_ids: set[str] = set()
         for event in list(window_events) + list(batch_events):

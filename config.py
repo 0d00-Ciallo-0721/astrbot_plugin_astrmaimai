@@ -63,6 +63,7 @@ class System1Config(BaseModel):
 
 class AttentionConfig(BaseModel):
     debounce_window: float = Field(default=2.0, ge=0.0)
+    judge_timeout: float = Field(default=3.0, ge=0.1, description="System1 Judge attention gate timeout in seconds")
     bg_pool_size: int = Field(default=20, ge=1)
     throttle_probability: float = Field(default=0.1, ge=0.0, le=1.0)
     throttle_min_entropy: int = Field(default=2, ge=0)
@@ -124,6 +125,9 @@ class LifeConfig(BaseModel):
     min_memory_events_to_dream: int = Field(default=5, ge=1, description="进入 dream 整理前需要的最少长期记忆事件数")
     dream_visible: bool = Field(default=False, description="是否将梦境文本主动发送给指定会话")
     dream_send_target: str = Field(default="", description="梦境可见时的目标会话 ID，留空则发送回当前 dream session")
+    intimate_tool_threshold: float = Field(default=20.0, description="关系达到该阈值后允许更亲近的主动工具")
+    hostile_threshold: float = Field(default=-20.0, description="关系低于该阈值时进入敌意工具限制")
+    energy_exhaustion: float = Field(default=0.1, ge=0.0, le=1.0, description="精力低于该值时限制高消耗聊天工具")
 
 
 class ReplyConfig(BaseModel):
@@ -152,6 +156,11 @@ class ConversationConfig(BaseModel):
     enable_dialogue_store: bool = Field(default=True)
     enable_context_compaction: bool = Field(default=True)
     enable_prefix_caching: bool = Field(default=True)
+    conversation_generation_enabled: bool = Field(default=True, repr=False)
+    reply_send_claim_enabled: bool = Field(default=True, repr=False)
+    group_thread_wait_enabled: bool = Field(default=False, repr=False)
+    non_conversational_guard_enabled: bool = Field(default=True, repr=False)
+    conversation_concurrency_debug_trace_enabled: bool = Field(default=False, repr=False)
     hot_zone_ttl_seconds: float = Field(default=30.0, ge=0.0)
     warm_zone_ttl_seconds: float = Field(default=300.0, ge=0.0)
     warm_zone_max_tokens: int = Field(default=1200, ge=1)
@@ -213,6 +222,8 @@ class VisionConfig(BaseModel):
 
 class Sys3Settings(BaseModel):
     enable_work_mode: bool = Field(default=False, description="是否启用 Sys3 工作任务模式")
+    max_steps: int = Field(default=30, ge=1, description="Sys3 direct work-mode tool loop maximum steps")
+    tool_timeout: int = Field(default=120, ge=1, description="Sys3 direct work-mode tool loop timeout in seconds")
     computer_agent_sandbox_enabled: bool = Field(
         default=False,
         description="是否启用 ComputerAgent 的代码执行能力（需管理员权限）。开启后 ComputerAgent 才能加载 Python/Shell 工具。注意：此功能在宿主机直执，请仅在受信任环境开启。",

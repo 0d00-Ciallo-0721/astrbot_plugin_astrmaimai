@@ -6,7 +6,11 @@ import time
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ...infrastructure.runtime.trace_runtime import preview_text
+from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
+from ..concurrency.controls import (
+    record_conversation_concurrency_trace,
+    resolve_conversation_concurrency_flags,
+)
 from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy
 
@@ -48,6 +52,37 @@ class ReplyFreshnessMixin:
         return not latest_ts or latest_ts <= event_ts
 
     async def _check_reply_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
+        concurrency_flags = resolve_conversation_concurrency_flags(getattr(self, "config", None))
+        if (
+            concurrency_flags.generation_enabled
+            and self.runtime_coordinator
+            and hasattr(self.runtime_coordinator, "is_current_turn")
+        ):
+            turn = event.get_extra("astrmai_turn_identity", None)
+            try:
+                if turn is not None and not await self.runtime_coordinator.is_current_turn(turn):
+                    debug_trace(
+                        event,
+                        "reply.blocked_stale_generation",
+                        chat_id=getattr(turn, "chat_id", chat_id),
+                        thread_id=getattr(turn, "thread_id", ""),
+                        generation=getattr(turn, "generation", ""),
+                    )
+                    record_conversation_concurrency_trace(
+                        event,
+                        "reply_blocked",
+                        debug_enabled=concurrency_flags.debug_trace_enabled,
+                        chat_id=getattr(turn, "chat_id", chat_id),
+                        thread_id=getattr(turn, "thread_id", ""),
+                        generation=getattr(turn, "generation", ""),
+                        blocked_reason="stale_generation",
+                    )
+                    if hasattr(self.runtime_coordinator, "record_concurrency_event"):
+                        await self.runtime_coordinator.record_concurrency_event("stale_generation")
+                    return FreshnessState.EXPIRED, "stale_generation"
+            except Exception:
+                logger.debug("[ReplyService] turn generation freshness check degraded", exc_info=True)
+
         event_ts = float(event.get_extra("astrmai_timestamp", 0.0) or 0.0)
         if event_ts <= 0:
             return FreshnessState.FRESH, ""

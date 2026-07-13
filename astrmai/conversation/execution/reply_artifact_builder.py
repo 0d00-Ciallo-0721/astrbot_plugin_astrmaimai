@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from typing import Any, List, Sequence
 
@@ -26,8 +27,14 @@ except ImportError:  # pragma: no cover
 
 from ...infrastructure.compat.legacy_compat import emit_legacy_reply_runtime_extras
 from ...infrastructure.gateway.output_guard import is_sendable_segment, sanitize_visible_reply_text
+from ...infrastructure.runtime.trace_runtime import debug_trace
+from ..concurrency.controls import (
+    record_conversation_concurrency_trace,
+    resolve_conversation_concurrency_flags,
+)
 from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
+from ..contracts.turn_identity import build_turn_send_key
 
 
 def _component_instance(cls: Any, value: Any, attr_name: str, **kwargs: Any):
@@ -47,6 +54,10 @@ def _plain_component(text: str):
 
 def _at_component(uid: Any):
     return _component_instance(Comp.At, uid, "qq", qq=uid)
+
+
+def _hash_send_key(send_key: str) -> str:
+    return hashlib.sha256(str(send_key or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 class ReplyArtifactMixin:
@@ -347,7 +358,6 @@ class ReplyArtifactMixin:
         return round(min(2.0, max(0.5, delay)), 2)
 
     async def _send_segments(self, event: AstrMessageEvent, chat_id: str, artifact: VisibleReplyArtifact, at_targets: Sequence[str]) -> bool:
-        del chat_id
         from astrbot.api.event import MessageChain
 
         emit_legacy_reply_runtime_extras(event, artifact=artifact, is_self_reply=True)
@@ -356,27 +366,135 @@ class ReplyArtifactMixin:
             logger.error("[ReplyService] gateway context missing, unable to send message")
             return False
 
-        for index, seg in enumerate(artifact.segments):
-            freshness_state, stale_reason = await self._check_reply_freshness(event, event.unified_msg_origin)
-            if freshness_state == FreshnessState.EXPIRED:
-                logger.info(
-                    f"[ReplyService] stopped stale segmented reply for {event.unified_msg_origin}: {stale_reason} | segment_index={index}"
+        send_key = ""
+        runtime_coordinator = getattr(self, "runtime_coordinator", None)
+        turn = event.get_extra("astrmai_turn_identity", None)
+        concurrency_flags = resolve_conversation_concurrency_flags(getattr(self, "config", None))
+        if (
+            concurrency_flags.send_claim_enabled
+            and turn is not None
+            and runtime_coordinator is not None
+            and hasattr(runtime_coordinator, "claim_send")
+        ):
+            try:
+                send_key = build_turn_send_key(turn, "final")
+                if not await runtime_coordinator.claim_send(chat_id, send_key):
+                    debug_trace(
+                        event,
+                        "reply.duplicate_final_blocked",
+                        chat_id=chat_id,
+                        thread_id=getattr(turn, "thread_id", ""),
+                        generation=getattr(turn, "generation", ""),
+                    )
+                    record_conversation_concurrency_trace(
+                        event,
+                        "send_claim",
+                        debug_enabled=concurrency_flags.debug_trace_enabled,
+                        chat_id=chat_id,
+                        thread_id=getattr(turn, "thread_id", ""),
+                        generation=getattr(turn, "generation", ""),
+                        claim_status="duplicate",
+                        send_key_hash=_hash_send_key(send_key),
+                    )
+                    logger.info(f"[ReplyService] skipped duplicate final send for {chat_id}: {send_key}")
+                    return False
+                debug_trace(
+                    event,
+                    "reply.send_claimed",
+                    chat_id=chat_id,
+                    thread_id=getattr(turn, "thread_id", ""),
+                    generation=getattr(turn, "generation", ""),
                 )
-                break
+                record_conversation_concurrency_trace(
+                    event,
+                    "send_claim",
+                    debug_enabled=concurrency_flags.debug_trace_enabled,
+                    chat_id=chat_id,
+                    thread_id=getattr(turn, "thread_id", ""),
+                    generation=getattr(turn, "generation", ""),
+                    claim_status="claimed",
+                    send_key_hash=_hash_send_key(send_key),
+                )
+            except Exception:
+                logger.debug("[ReplyService] send claim degraded; preserving legacy send behavior", exc_info=True)
+                send_key = ""
 
-            chain = MessageChain()
-            if index == 0 and at_targets:
-                for target_id in at_targets:
-                    uid: Any = int(target_id) if str(target_id).isdigit() else target_id
-                    chain.chain.append(_at_component(uid))
-                chain.chain.append(_plain_component(" "))
-            chain.chain.append(_plain_component(seg))
-            await context.send_message(event.unified_msg_origin, chain)
-            artifact.sent = True
-            if not event.get_extra("astrmai_reply_sent", False):
-                emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
+        outbound_message_ids: list[str] = []
+        try:
+            for index, seg in enumerate(artifact.segments):
+                freshness_state, stale_reason = await self._check_reply_freshness(event, event.unified_msg_origin)
+                if freshness_state == FreshnessState.EXPIRED:
+                    logger.info(
+                        f"[ReplyService] stopped stale segmented reply for {event.unified_msg_origin}: {stale_reason} | segment_index={index}"
+                    )
+                    break
 
-            if index < len(artifact.segments) - 1:
-                delay = self._segment_send_delay(seg, str(artifact.metadata.get("delay_profile", "default") or "default"))
-                await asyncio.sleep(delay)
+                chain = MessageChain()
+                if index == 0 and at_targets:
+                    for target_id in at_targets:
+                        uid: Any = int(target_id) if str(target_id).isdigit() else target_id
+                        chain.chain.append(_at_component(uid))
+                    chain.chain.append(_plain_component(" "))
+                chain.chain.append(_plain_component(seg))
+                sent_result = await context.send_message(event.unified_msg_origin, chain)
+                if sent_result is not None:
+                    outbound_message_ids.append(str(sent_result))
+                artifact.sent = True
+                if not event.get_extra("astrmai_reply_sent", False):
+                    emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
+
+                if index < len(artifact.segments) - 1:
+                    delay = self._segment_send_delay(seg, str(artifact.metadata.get("delay_profile", "default") or "default"))
+                    await asyncio.sleep(delay)
+        except Exception as exc:
+            if send_key and runtime_coordinator is not None and hasattr(runtime_coordinator, "mark_send_failed"):
+                try:
+                    failure_reason = str(exc) or "send_exception"
+                    await runtime_coordinator.mark_send_failed(chat_id, send_key, failure_reason)
+                    debug_trace(event, "reply.send_failed", chat_id=chat_id, reason=failure_reason)
+                    record_conversation_concurrency_trace(
+                        event,
+                        "send_claim",
+                        debug_enabled=concurrency_flags.debug_trace_enabled,
+                        chat_id=chat_id,
+                        thread_id=getattr(turn, "thread_id", "") if turn is not None else "",
+                        generation=getattr(turn, "generation", "") if turn is not None else "",
+                        claim_status="failed",
+                        send_key_hash=_hash_send_key(send_key),
+                    )
+                except Exception:
+                    logger.debug("[ReplyService] send claim failure marking degraded", exc_info=True)
+            raise
+        if outbound_message_ids:
+            event.set_extra("astrmai_reply_outbound_message_ids", outbound_message_ids[:])
+        if send_key and runtime_coordinator is not None and hasattr(runtime_coordinator, "commit_send"):
+            try:
+                if artifact.sent:
+                    await runtime_coordinator.commit_send(chat_id, send_key, outbound_message_ids)
+                    debug_trace(event, "reply.send_committed", chat_id=chat_id, sent_count=len(outbound_message_ids))
+                    record_conversation_concurrency_trace(
+                        event,
+                        "send_claim",
+                        debug_enabled=concurrency_flags.debug_trace_enabled,
+                        chat_id=chat_id,
+                        thread_id=getattr(turn, "thread_id", "") if turn is not None else "",
+                        generation=getattr(turn, "generation", "") if turn is not None else "",
+                        claim_status="committed",
+                        send_key_hash=_hash_send_key(send_key),
+                    )
+                elif hasattr(runtime_coordinator, "mark_send_failed"):
+                    await runtime_coordinator.mark_send_failed(chat_id, send_key, "not_sent")
+                    debug_trace(event, "reply.send_failed", chat_id=chat_id, reason="not_sent")
+                    record_conversation_concurrency_trace(
+                        event,
+                        "send_claim",
+                        debug_enabled=concurrency_flags.debug_trace_enabled,
+                        chat_id=chat_id,
+                        thread_id=getattr(turn, "thread_id", "") if turn is not None else "",
+                        generation=getattr(turn, "generation", "") if turn is not None else "",
+                        claim_status="failed",
+                        send_key_hash=_hash_send_key(send_key),
+                    )
+            except Exception:
+                logger.debug("[ReplyService] send claim commit degraded", exc_info=True)
         return artifact.sent

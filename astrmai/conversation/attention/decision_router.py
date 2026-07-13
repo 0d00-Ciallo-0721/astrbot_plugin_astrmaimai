@@ -64,7 +64,11 @@ class AttentionDecisionRouter:
                     logger.debug(f"[AttentionGate] primary mood update degraded: {exc}")
         message = self.build_judge_window_message(events) or str(getattr(focus_event, "message_str", "") or "")
         # ponytail: judgment timeout configurable; default 3.0s (was 2.0s) for cold-start LLM resilience
-        judge_timeout = float(getattr(getattr(self.gate, "config", None), "judge_timeout", 3.0) or 3.0)
+        attention_config = getattr(getattr(self.gate, "config", None), "attention", None)
+        judge_timeout = float(
+            getattr(attention_config, "judge_timeout", getattr(getattr(self.gate, "config", None), "judge_timeout", 3.0))
+            or 3.0
+        )
         try:
             result = await asyncio.wait_for(
                 self.gate.judge.evaluate(

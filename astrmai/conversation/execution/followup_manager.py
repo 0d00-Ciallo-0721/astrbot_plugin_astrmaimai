@@ -77,7 +77,7 @@ class FollowupManager:
         if wait_targets:
             await self._mark_followup_cooldown(chat_id)
 
-        is_private = bool(main_event.get_extra("is_private_chat", False))
+        is_private = not bool(main_event.get_group_id())
         if is_private and self.runtime.private_chat_manager:
             sender_id = str(main_event.get_sender_id())
             if getattr(self.runtime, "chat_loop_kernel", None) is not None:

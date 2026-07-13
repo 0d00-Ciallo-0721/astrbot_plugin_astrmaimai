@@ -19,6 +19,9 @@ _EXPORTS = {
     "build_turn_trace_summary": ".turn_context",
     "ensure_turn_context": ".turn_context",
     "get_turn_context": ".turn_context",
+    "TurnIdentity": ".turn_identity",
+    "build_p0_thread_id": ".turn_identity",
+    "build_turn_send_key": ".turn_identity",
 }
 
 __all__ = list(_EXPORTS)

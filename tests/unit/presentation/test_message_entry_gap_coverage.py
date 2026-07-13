@@ -10,12 +10,13 @@ from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
 
 class _Event:
-    def __init__(self, *, sender_id="user-1", self_id="bot-1", text="hello"):
-        self.unified_msg_origin = "default:GroupMessage:group-1"
+    def __init__(self, *, sender_id="user-1", self_id="bot-1", text="hello", group_id="group-1"):
+        self.unified_msg_origin = f"default:GroupMessage:{group_id}" if group_id else f"default:FriendMessage:{sender_id}"
         self.message_str = text
-        self.message_obj = SimpleNamespace(self_id=self_id, message=[])
+        self.message_obj = SimpleNamespace(self_id=self_id, message=[], message_id="msg-1")
         self._sender_id = sender_id
         self._self_id = self_id
+        self._group_id = group_id
         self._extra = {}
         self.stopped = False
 
@@ -26,7 +27,7 @@ class _Event:
         return "Alice"
 
     def get_group_id(self):
-        return "group-1"
+        return self._group_id
 
     def get_self_id(self):
         return self._self_id
@@ -48,6 +49,7 @@ class _Event:
 class _Facade:
     def __init__(self):
         self.calls = []
+        self.runtime_coordinator = None
 
     async def handle_poke(self, _event):
         self.calls.append("poke")
@@ -90,6 +92,9 @@ class _Facade:
     @staticmethod
     def get_runtime_config():
         return SimpleNamespace(reply=SimpleNamespace(fallback_text="runtime fallback"))
+
+    def get_runtime_coordinator(self):
+        return self.runtime_coordinator
 
 
 class MessageEntryGapCoverageTests(unittest.TestCase):
@@ -182,6 +187,83 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertFalse(event.stopped)
         self.assertIn("scope_access", facade.calls)
         self.assertIn("attention", facade.calls)
+
+    def test_valid_message_binds_turn_identity_before_group_wait(self):
+        facade = _Facade()
+        event = _Event()
+
+        class _Coordinator:
+            def __init__(self):
+                self.calls = []
+
+            async def advance_generation(self, chat_id, thread_id):
+                self.calls.append((chat_id, thread_id))
+                return 7
+
+        coordinator = _Coordinator()
+        facade.runtime_coordinator = coordinator
+
+        self.assertEqual(self._collect(facade, event), [])
+
+        turn = event.get_extra("astrmai_turn_identity")
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn.mode, "group")
+        self.assertEqual(turn.chat_id, "default:GroupMessage:group-1")
+        self.assertEqual(turn.thread_id, "default:GroupMessage:group-1")
+        self.assertEqual(turn.generation, 7)
+        self.assertEqual(turn.input_message_ids, ("msg-1",))
+        self.assertEqual(coordinator.calls, [("default:GroupMessage:group-1", "default:GroupMessage:group-1")])
+        self.assertIn("group_wait", facade.calls)
+
+    def test_private_message_binds_private_thread_identity(self):
+        facade = _Facade()
+        event = _Event(group_id="")
+
+        class _Coordinator:
+            async def advance_generation(self, chat_id, thread_id):
+                self.call = (chat_id, thread_id)
+                return 3
+
+        coordinator = _Coordinator()
+        facade.runtime_coordinator = coordinator
+
+        self.assertEqual(self._collect(facade, event), [])
+
+        turn = event.get_extra("astrmai_turn_identity")
+        self.assertEqual(turn.mode, "private")
+        self.assertEqual(turn.thread_id, "private:default:FriendMessage:user-1")
+        self.assertEqual(turn.generation, 3)
+        self.assertEqual(coordinator.call, ("default:FriendMessage:user-1", "private:default:FriendMessage:user-1"))
+
+    def test_message_entry_uses_facade_prepare_conversation_turn_when_available(self):
+        facade = _Facade()
+        event = _Event()
+        calls = []
+
+        async def _prepare(_event, scope):
+            calls.append(("prepare", scope.chat_id))
+            _event.set_extra("prepared_by_facade", True)
+
+        facade.prepare_conversation_turn = _prepare
+        facade.runtime_coordinator = object()
+
+        self.assertEqual(self._collect(facade, event), [])
+
+        self.assertEqual(calls, [("prepare", "default:GroupMessage:group-1")])
+        self.assertTrue(event.get_extra("prepared_by_facade", False))
+        self.assertIsNone(event.get_extra("astrmai_turn_identity"))
+
+    def test_non_conversational_message_stops_before_group_wait(self):
+        facade = _Facade()
+        event = _Event(text="[AMTEST] status")
+        event.set_extra("astrmai_non_conversational", True)
+
+        self.assertEqual(self._collect(facade, event), [])
+
+        self.assertTrue(event.stopped)
+        self.assertIsNone(event.get_extra("astrmai_turn_identity"))
+        self.assertNotIn("group_wait", facade.calls)
+        self.assertNotIn("attention", facade.calls)
 
     def test_framework_command_decision_stops_event(self):
         facade = _Facade()

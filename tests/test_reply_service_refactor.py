@@ -22,6 +22,34 @@ class _FakeRuntimeCoordinator:
         return self.latest_activity
 
 
+class _StaleTurnRuntimeCoordinator:
+    async def is_current_turn(self, _turn):
+        return False
+
+
+class _ClaimingRuntimeCoordinator:
+    def __init__(self):
+        self.claims = set()
+        self.commits = []
+        self.claim_calls = []
+
+    async def is_current_turn(self, _turn):
+        return True
+
+    async def claim_send(self, _chat_id, send_key):
+        self.claim_calls.append(send_key)
+        if send_key in self.claims:
+            return False
+        self.claims.add(send_key)
+        return True
+
+    async def commit_send(self, chat_id, send_key, outbound_message_ids=None):
+        self.commits.append((chat_id, send_key, list(outbound_message_ids or [])))
+
+    async def mark_send_failed(self, chat_id, send_key, error=""):
+        self.commits.append((chat_id, send_key, [f"failed:{error}"]))
+
+
 async def _noop_post_send(*args, **kwargs):
     return None
 
@@ -136,6 +164,141 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertEqual(state_engine.gateway.context.sent, [])
         self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+
+    def test_stale_turn_generation_is_skipped_even_without_timestamp(self):
+        state_engine = FakeStateEngine()
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=_StaleTurnRuntimeCoordinator(),
+        )
+        event = FakeEvent("user-1", "Alice", "old question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            SimpleNamespace(chat_id=event.unified_msg_origin, thread_id=event.unified_msg_origin, generation=1),
+        )
+
+        asyncio.run(engine.handle_reply(event, "this reply is stale", event.unified_msg_origin))
+
+        self.assertEqual(state_engine.gateway.context.sent, [])
+        self.assertFalse(event.get_extra("astrmai_reply_sent", False))
+        trace_log = event.get_extra("astrmai_trace_log", [])
+        self.assertTrue(any(item.get("stage") == "reply.blocked_stale_generation" for item in trace_log))
+        stale_records = [item for item in trace_log if item.get("stage") == "reply.blocked_stale_generation"]
+        self.assertNotIn("this reply is stale", str(stale_records))
+
+    def test_generation_flag_off_preserves_legacy_send_for_stale_turn(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.conversation = SimpleNamespace(conversation_generation_enabled=False)
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=_StaleTurnRuntimeCoordinator(),
+        )
+        event = FakeEvent("user-1", "Alice", "old question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            SimpleNamespace(chat_id=event.unified_msg_origin, thread_id=event.unified_msg_origin, generation=1),
+        )
+
+        asyncio.run(engine.handle_reply(event, "legacy answer", event.unified_msg_origin))
+
+        self.assertEqual(len(state_engine.gateway.context.sent), 1)
+        self.assertTrue(event.get_extra("astrmai_reply_sent", False))
+
+    def test_duplicate_final_send_for_same_turn_is_blocked(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity, build_turn_send_key
+
+        state_engine = FakeStateEngine()
+        coordinator = _ClaimingRuntimeCoordinator()
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        turn = TurnIdentity(
+            mode="group",
+            chat_id=event.unified_msg_origin,
+            thread_id=event.unified_msg_origin,
+            generation=1,
+        )
+        event.set_extra("astrmai_turn_identity", turn)
+
+        asyncio.run(engine.handle_reply(event, "first answer", event.unified_msg_origin))
+        asyncio.run(engine.handle_reply(event, "duplicate answer", event.unified_msg_origin))
+
+        self.assertEqual(len(state_engine.gateway.context.sent), 1)
+        self.assertEqual(coordinator.commits[0][1], build_turn_send_key(turn, "final"))
+        trace_log = event.get_extra("astrmai_trace_log", [])
+        stages = [item.get("stage") for item in trace_log]
+        self.assertIn("reply.send_claimed", stages)
+        self.assertIn("reply.send_committed", stages)
+        self.assertIn("reply.duplicate_final_blocked", stages)
+        claim_records = [item for item in trace_log if str(item.get("stage", "")).startswith("reply.")]
+        self.assertNotIn("first answer", str(claim_records))
+        self.assertNotIn("duplicate answer", str(claim_records))
+
+    def test_send_claim_flag_off_preserves_legacy_duplicate_send_path(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        state_engine.config.conversation = SimpleNamespace(reply_send_claim_enabled=False)
+        coordinator = _ClaimingRuntimeCoordinator()
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=1,
+            ),
+        )
+
+        asyncio.run(engine.handle_reply(event, "first answer", event.unified_msg_origin))
+        asyncio.run(engine.handle_reply(event, "second answer", event.unified_msg_origin))
+
+        self.assertEqual(len(state_engine.gateway.context.sent), 2)
+        self.assertEqual(coordinator.claim_calls, [])
+        self.assertEqual(coordinator.commits, [])
+
+    def test_send_exception_marks_claim_failed_before_reraising(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        coordinator = _ClaimingRuntimeCoordinator()
+
+        async def _raise_send(*_args, **_kwargs):
+            raise RuntimeError("transport failed")
+
+        state_engine.gateway.context.send_message = _raise_send
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=1,
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "transport failed"):
+            asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
+
+        self.assertEqual(len(coordinator.commits), 1)
+        self.assertIn("failed:transport failed", coordinator.commits[0][2])
 
     def test_short_multi_sentence_reply_stays_single(self):
         service = self._service(max_len=80)

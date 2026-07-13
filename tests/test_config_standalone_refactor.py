@@ -19,6 +19,13 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertTrue(hasattr(config, "conversation"))
         self.assertEqual(config.conversation.compaction_trigger_segments, 40)
         self.assertEqual(config.conversation.compaction_keep_recent_segments, 16)
+        self.assertTrue(config.memory.memory_query_builder_enabled)
+        self.assertFalse(config.memory.intent_rerank_enabled)
+        self.assertFalse(config.memory.adaptive_top_k_enabled)
+        self.assertFalse(config.memory.memory_retrieval_debug_trace_enabled)
+        self.assertEqual(config.attention.judge_timeout, 3.0)
+        self.assertEqual(config.sys3.max_steps, 30)
+        self.assertEqual(config.sys3.tool_timeout, 120)
         self.assertEqual(config.evolution.jargon_min_count, 2)
 
     def test_astrmai_config_accepts_conversation_and_memory_namespace_fields(self):
@@ -92,6 +99,15 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(evolution_items["jargon_min_count"]["default"], 2)
         self.assertEqual(schema["conversation"]["items"]["compaction_trigger_segments"]["default"], 40)
         self.assertEqual(schema["conversation"]["items"]["compaction_keep_recent_segments"]["default"], 16)
+        memory_items = schema["memory"]["items"]
+        self.assertTrue(memory_items["memory_query_builder_enabled"]["default"])
+        self.assertFalse(memory_items["intent_rerank_enabled"]["default"])
+        self.assertFalse(memory_items["adaptive_top_k_enabled"]["default"])
+        self.assertFalse(memory_items["memory_retrieval_debug_trace_enabled"]["default"])
+        self.assertEqual(schema["attention"]["items"]["judge_timeout"]["default"], 3.0)
+        self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)
+        self.assertEqual(schema["sys3"]["items"]["tool_timeout"]["default"], 120)
+        self.assertEqual(schema["life"]["items"]["energy_exhaustion"]["default"], 0.1)
 
 
 if __name__ == "__main__":

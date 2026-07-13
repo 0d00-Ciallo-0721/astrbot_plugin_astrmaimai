@@ -72,6 +72,7 @@ class _FakePrivateChatManager:
 
     async def signal_new_message(self, user_id, message_str, chat_id=""):
         self.calls.append((user_id, message_str, chat_id))
+        return True
 
 
 class _FakeRuntimeCoordinator:
@@ -184,7 +185,7 @@ class AttentionPrivateChatTests(unittest.TestCase):
         self.assertGreater(event.get_extra("astrmai_timestamp", 0.0), 0.0)
         self.assertEqual(len(runtime_coordinator.calls), 1)
         chat_id, timestamp, sender_id, sender_name, preview, thread_signature = runtime_coordinator.calls[0]
-        self.assertEqual(chat_id, "group-1")
+        self.assertEqual(chat_id, "default:GroupMessage:group-1")
         self.assertEqual(sender_id, "user-1")
         self.assertEqual(sender_name, "Alice")
         self.assertEqual(preview, "抱抱")

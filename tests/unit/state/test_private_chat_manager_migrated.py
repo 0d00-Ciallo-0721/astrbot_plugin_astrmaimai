@@ -5,21 +5,47 @@ from astrmai.state.private_chat.private_chat_manager import PrivateChatManager
 
 
 class PrivateChatManagerMigratedTests(unittest.TestCase):
-    def test_wait_for_new_message_uses_buffered_message_arrived_before_wait(self):
+    def test_message_without_active_wait_is_not_buffered(self):
         manager = PrivateChatManager()
 
         async def _run():
-            await manager.signal_new_message("user-1", "hello", chat_id="default:FriendMessage:user-1")
-            has_reply = await manager.wait_for_new_message(
+            signaled = await manager.signal_new_message(
                 "user-1",
-                timeout=0.01,
+                "hello",
                 chat_id="default:FriendMessage:user-1",
             )
             pending = manager.get_pending_messages("user-1")
-            return has_reply, pending
+            return signaled, pending
 
-        has_reply, pending = asyncio.run(_run())
+        signaled, pending = asyncio.run(_run())
 
+        self.assertFalse(signaled)
+        self.assertEqual(pending, [])
+
+    def test_message_interrupting_active_wait_is_buffered_and_signaled(self):
+        manager = PrivateChatManager()
+
+        async def _run():
+            waiter = asyncio.create_task(
+                manager.wait_for_new_message(
+                    "user-1",
+                    timeout=0.2,
+                    chat_id="default:FriendMessage:user-1",
+                )
+            )
+            await asyncio.sleep(0)
+            signaled = await manager.signal_new_message(
+                "user-1",
+                "hello",
+                chat_id="default:FriendMessage:user-1",
+            )
+            has_reply = await waiter
+            pending = manager.get_pending_messages("user-1")
+            return signaled, has_reply, pending
+
+        signaled, has_reply, pending = asyncio.run(_run())
+
+        self.assertTrue(signaled)
         self.assertTrue(has_reply)
         self.assertEqual(pending, ["hello"])
 
