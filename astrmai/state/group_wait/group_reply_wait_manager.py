@@ -63,7 +63,7 @@ class GroupReplyWaitManager:
 
     def refresh_config(self, config) -> None:
         conversation = getattr(config, "conversation", None)
-        enabled = bool(getattr(conversation, "group_thread_wait_enabled", False))
+        enabled = bool(getattr(conversation, "group_thread_wait_enabled", True))
         if enabled == self.threaded_enabled:
             return
         with self._states_lock:

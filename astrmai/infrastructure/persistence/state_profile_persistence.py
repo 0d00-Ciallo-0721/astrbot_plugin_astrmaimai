@@ -271,3 +271,21 @@ class StateProfilePersistenceMixin:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (chat_id, sender_id, has_image, json.dumps(image_urls, ensure_ascii=False), False, time.time()))
             await db.commit()
+
+    async def mark_last_message_vision_executed(self, chat_id: str, sender_id: str) -> None:
+        """Mark the latest matching image message after the vision barrier ran."""
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE lastmessagemetadatadb
+                SET vl_executed = 1
+                WHERE id = (
+                    SELECT id FROM lastmessagemetadatadb
+                    WHERE chat_id = ? AND sender_id = ? AND has_image = 1
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                )
+                """,
+                (chat_id, sender_id),
+            )
+            await db.commit()

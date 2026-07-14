@@ -26,7 +26,7 @@ from .vision_binding import extract_image_base64, extract_image_base64_from_url
 from .window_buffer import AttentionWindowBuffer
 
 
-class _SyntheticExternalEvent:
+class _SyntheticExternalEvent(AstrMessageEvent):
     def __init__(self, data: dict[str, Any]):
         self._data = dict(data or {})
         self._extra = dict(self._data.get("extra", {}) or {})
@@ -73,6 +73,7 @@ class AttentionGate:
         persona_summarizer=None,
         frequency_controller=None,
         private_chat_manager=None,
+        private_turn_coordinator=None,
         runtime_coordinator=None,
         chat_loop_kernel=None,
     ):
@@ -85,6 +86,7 @@ class AttentionGate:
         self.persona_summarizer = persona_summarizer
         self.frequency_controller = frequency_controller
         self.private_chat_manager = private_chat_manager
+        self.private_turn_coordinator = private_turn_coordinator
         self.runtime_coordinator = runtime_coordinator
         self.chat_loop_kernel = chat_loop_kernel
         self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
@@ -113,6 +115,8 @@ class AttentionGate:
 
     def refresh_config(self, config):
         self.config = config
+        if self.private_turn_coordinator is not None:
+            self.private_turn_coordinator.refresh_config(config)
 
     def get_proactive_lock(self, chat_id: str) -> asyncio.Lock:
         """Return a per-chat lock for proactive injection serialization."""
@@ -517,7 +521,7 @@ class AttentionGate:
         if coordinator is None or not hasattr(coordinator, "advance_generation"):
             return
         mode = "private" if is_private else "group"
-        if not is_private and bool(getattr(conversation_config, "group_thread_wait_enabled", False)):
+        if not is_private and bool(getattr(conversation_config, "group_thread_wait_enabled", True)):
             resolution = resolve_group_thread(event, chat_id)
             thread_id = resolution.thread_id
             event.set_extra("astrmai_group_thread_source", resolution.source)
@@ -892,6 +896,13 @@ class AttentionGate:
         if not self._claim_message(event):
             return "DUPLICATED"
 
+        private_ingress = not bool(event.get_group_id())
+        sensor_checked = False
+        if private_ingress:
+            if not await self._passes_sensor_filters(event, str(getattr(event, "message_str", "") or "")):
+                return "FILTERED"
+            sensor_checked = True
+
         perception = self.perception_builder.build(event)
         context = perception.as_event_context()
         chat_id = context["chat_id"]
@@ -907,7 +918,9 @@ class AttentionGate:
 
         session = await self._get_or_create_session(chat_id)
 
-        await self._apply_primary_mood_update(event, chat_id, msg_str)
+        defer_private_context = bool(is_private and self.private_turn_coordinator is not None)
+        if not defer_private_context:
+            await self._apply_primary_mood_update(event, chat_id, msg_str)
 
         forced = await self._handle_force_engage(event, chat_id)
         if forced:
@@ -924,11 +937,30 @@ class AttentionGate:
         if is_reply:
             event.set_extra("astrmai_reply_wakeup", True)
 
-        fast_result = await self._handle_fast_wakeup(event, chat_id, is_strong_wakeup)
+        if not is_private and is_strong_wakeup:
+            prepare_direct_event = getattr(self.private_turn_coordinator, "prepare_direct_event", None)
+            if callable(prepare_direct_event):
+                try:
+                    await prepare_direct_event(event, chat_id)
+                except Exception as exc:
+                    logger.warning(
+                        f"[AttentionGate] direct group vision barrier degraded for {chat_id}: {exc}",
+                        exc_info=True,
+                    )
+            perception = self.perception_builder.build(event)
+            context = perception.as_event_context()
+            msg_str = context["msg_str"]
+            extracted_images = context["extracted_images"]
+            is_direct = perception.is_direct_wakeup
+            is_at_bot = perception.is_at_bot
+            is_reply = perception.is_reply_to_bot
+            is_strong_wakeup = perception.is_strong_wakeup
+
+        fast_result = None if is_private else await self._handle_fast_wakeup(event, chat_id, is_strong_wakeup)
         if fast_result:
             return fast_result
 
-        if not await self._passes_sensor_filters(event, msg_str):
+        if not sensor_checked and not await self._passes_sensor_filters(event, msg_str):
             return "FILTERED"
 
         if self._should_ignore_passive_group_image(is_private, extracted_images, is_strong_wakeup):
@@ -942,7 +974,7 @@ class AttentionGate:
                     chat_id=chat_id,
                 )
                 if wait_signaled:
-                    return "PRIVATE_WAIT"
+                    logger.debug(f"[AttentionGate] private wait resumed without consuming message for {chat_id}")
             except Exception as exc:
                 logger.warning(
                     f"[AttentionGate] private chat wait signal failed for {chat_id}, "
@@ -967,7 +999,8 @@ class AttentionGate:
             return repeater_result
 
         await self._record_event_activity(chat_id, event, sender_id)
-        await self._append_dialogue_segment(event)
+        if not defer_private_context:
+            await self._append_dialogue_segment(event)
 
         async with session.lock:
             session.accumulation_pool.append(event)
@@ -1018,13 +1051,36 @@ class AttentionGate:
     ):
         current_is_strong_wakeup = is_strong_wakeup
         while True:
-            await asyncio.sleep(self._compute_debounce_delay(session, is_private, current_is_strong_wakeup))
+            if is_private and self.private_turn_coordinator is not None:
+                await self.private_turn_coordinator.wait_for_input_stability(session)
+            else:
+                await asyncio.sleep(self._compute_debounce_delay(session, is_private, current_is_strong_wakeup))
             async with session.lock:
                 batch_events = list(session.accumulation_pool)
                 session.accumulation_pool.clear()
-                merged_events = self._merge_attention_window(session, batch_events)
 
             if batch_events:
+                if is_private and self.private_turn_coordinator is not None:
+                    await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
+                    async with session.lock:
+                        if session.accumulation_pool:
+                            session.accumulation_pool = batch_events + list(session.accumulation_pool)
+                            current_is_strong_wakeup = False
+                            continue
+                    for prepared_event in batch_events:
+                        self.perception_builder.build(prepared_event)
+                        if not bool(prepared_event.get_extra("astrmai_private_context_recorded", False)):
+                            rich_text = str(
+                                prepared_event.get_extra(
+                                    "astrmai_rich_text",
+                                    getattr(prepared_event, "message_str", ""),
+                                )
+                                or ""
+                            )
+                            await self._apply_primary_mood_update(prepared_event, chat_id, rich_text)
+                            await self._append_dialogue_segment(prepared_event)
+                            prepared_event.set_extra("astrmai_private_context_recorded", True)
+                merged_events = self._merge_attention_window(session, batch_events)
                 events = await self._format_and_filter_messages(merged_events)
                 if events:
                     normalized = self._build_normalized_events(events, self_id)
@@ -1086,10 +1142,18 @@ class AttentionGate:
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
                         if self.sys2_process:
-                            task = self._fire_background_task(
-                                self.sys2_process(focus_event, focus_thread.all_thread_events()),
-                                focus_event,
-                            )
+                            if is_private:
+                                try:
+                                    await self.sys2_process(focus_event, focus_thread.all_thread_events())
+                                except asyncio.CancelledError:
+                                    raise
+                                except Exception as exc:
+                                    logger.error(f"[AttentionGate] private System2 dispatch failed for {chat_id}: {exc}", exc_info=True)
+                            else:
+                                self._fire_background_task(
+                                    self.sys2_process(focus_event, focus_thread.all_thread_events()),
+                                    focus_event,
+                                )
 
             async with session.lock:
                 if session.accumulation_pool:

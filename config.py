@@ -139,7 +139,7 @@ class ReplyConfig(BaseModel):
     follow_up_probability: float = Field(default=0.2, ge=0.0, le=1.0, description="首条回复发出后，继续自然补一句的概率 (0.0~1.0)")
     stale_reply_max_age_sec: float = Field(default=0.0, ge=0.0, description="允许聊天回复保留时效性的最长秒数；0 表示自动按系统超时推导")
     segment_min_len: int = Field(default=15, ge=1, description="允许拆成多条发送前，单条内容至少要达到的长度")
-    no_segment_max_len: int = Field(default=120, ge=1, description="不超过这个长度时，尽量作为一条完整消息发出")
+    no_segment_max_len: int = Field(default=120, ge=1, description="允许智能分段的长度上限；达到或超过此长度时整条发送，双换行除外")
     meme_probability: int = Field(default=60, ge=0, le=100, description="在适合的场景下附带表情包的概率百分比")
     emotion_mapping: List[str] = Field(
         default=[
@@ -149,7 +149,8 @@ class ReplyConfig(BaseModel):
             "neutral: 平静、客观、陈述",
             "curious: 好奇、提问、困惑",
             "surprise: 惊讶、意外",
-        ]
+        ],
+        description="表情标签及其模型识别说明；标签名同时对应 AstrBot 数据目录下 memes_data/memes 中的同名文件夹",
     )
     typing_speed_factor: float = Field(default=0.1, ge=0.0, description="模拟打字等待的强度系数，越大看起来越像在慢慢打字")
     enable_content_safety_filter: bool = Field(default=False, description="启用基础内容安全过滤（NSFW/自残/PII 检测）")
@@ -161,7 +162,7 @@ class ConversationConfig(BaseModel):
     enable_prefix_caching: bool = Field(default=True)
     conversation_generation_enabled: bool = Field(default=True, repr=False)
     reply_send_claim_enabled: bool = Field(default=True, repr=False)
-    group_thread_wait_enabled: bool = Field(default=False, repr=False)
+    group_thread_wait_enabled: bool = Field(default=True, repr=False)
     non_conversational_guard_enabled: bool = Field(default=True, repr=False)
     conversation_concurrency_debug_trace_enabled: bool = Field(default=False, repr=False)
     hot_zone_ttl_seconds: float = Field(default=30.0, ge=0.0)
@@ -235,6 +236,10 @@ class Sys3Settings(BaseModel):
 
 class PrivateChatConfig(BaseModel):
     wait_timeout_sec: int = Field(default=300, ge=1, description="单次私聊等待反馈强制休眠阈值(秒)")
+    input_settle_sec: float = Field(default=1.5, ge=0.0, le=10.0, description="私聊连续输入聚合等待时间(秒)")
+    image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=60.0, description="私聊图片文件解析超时时间(秒)")
+    image_barrier_timeout_sec: float = Field(default=45.0, ge=1.0, le=180.0, description="私聊单张图片识别超时时间(秒)")
+    image_analysis_retries: int = Field(default=2, ge=1, le=5, description="私聊图片识别失败重试次数")
 
 
 class AstrMaiConfig(BaseModel):

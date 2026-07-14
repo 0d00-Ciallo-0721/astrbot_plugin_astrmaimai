@@ -22,7 +22,7 @@ class PrivateChatManagerMigratedTests(unittest.TestCase):
         self.assertFalse(signaled)
         self.assertEqual(pending, [])
 
-    def test_message_interrupting_active_wait_is_buffered_and_signaled(self):
+    def test_message_interrupting_active_wait_is_signaled_without_consuming_input(self):
         manager = PrivateChatManager()
 
         async def _run():
@@ -47,7 +47,7 @@ class PrivateChatManagerMigratedTests(unittest.TestCase):
 
         self.assertTrue(signaled)
         self.assertTrue(has_reply)
-        self.assertEqual(pending, ["hello"])
+        self.assertEqual(pending, [])
 
     def test_group_chat_id_does_not_alias_friend_session_with_same_numeric_tail(self):
         manager = PrivateChatManager()

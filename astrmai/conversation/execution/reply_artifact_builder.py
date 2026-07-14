@@ -222,17 +222,18 @@ class ReplyArtifactMixin:
         force_segment: bool = False,
     ) -> tuple[List[str], str]:
         del reply_mode
-        if policy.segment_strategy == "single":
-            return self._single_segment(text), "policy_single"
         has_forced_paragraph = force_segment or "\n\n" in text
-        if len(text) <= self.no_segment_limit and not has_forced_paragraph:
-            return self._single_segment(text), "within_single_limit"
+        if policy.segment_strategy == "single" and not has_forced_paragraph:
+            return self._single_segment(text), "policy_single"
+        if not has_forced_paragraph:
+            if len(text) < self.segmentation_threshold:
+                return self._single_segment(text), "below_segment_min"
+            if len(text) >= self.no_segment_limit:
+                return self._single_segment(text), "at_or_above_segment_limit"
         segments = self.segmenter.segment(text)
         if not segments:
             return [], "empty_after_segment"
         if is_proactive:
-            if len(text) <= self.no_segment_limit:
-                return self._single_segment(text), "proactive_single"
             return self._cap_segments(segments, 2), "proactive_limited"
         if policy.segment_strategy == "gentle_two_step":
             gentle_segments = self._cap_segments(segments, 2)

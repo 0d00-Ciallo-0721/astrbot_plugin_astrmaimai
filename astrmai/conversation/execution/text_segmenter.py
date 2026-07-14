@@ -91,11 +91,7 @@ class TextSegmenter:
         if current_len < self.min_length:
             return False
         if combined_len <= self.max_length:
-            return bool(
-                current_len >= max(self.min_length * 2, int(self.max_length * 0.72))
-                and unit_len >= self.min_length
-                and self._starts_with_continuation(unit)
-            )
+            return unit_len >= self.min_length
         if unit_len < self.min_length:
             return bool(current_len >= self.max_length and self._is_natural_tail(unit))
         return True

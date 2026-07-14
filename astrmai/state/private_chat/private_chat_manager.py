@@ -93,10 +93,8 @@ class PrivateChatManager:
         if not session.is_bot_waiting:
             return False
 
-        if message_str:
-            session.pending_messages.append(message_str)
         session.new_message_event.set()
-        logger.debug(f"[PrivateChat] message interrupted waiting session for {user_id}")
+        logger.debug(f"[PrivateChat] message resumed waiting session for {user_id}")
         return True
 
     async def wait_for_new_message(

@@ -22,6 +22,16 @@ class PreparedImage:
 
 class ImagePipeline:
     @staticmethod
+    def _safe_json_tags(value) -> list:
+        if isinstance(value, list):
+            return value
+        try:
+            parsed = json.loads(str(value or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    @staticmethod
     def prepare_image(base64_data: str) -> Optional[PreparedImage]:
         try:
             image_bytes = base64.b64decode(base64_data)

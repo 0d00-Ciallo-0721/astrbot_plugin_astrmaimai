@@ -124,7 +124,7 @@ class AttentionPrivateChatTests(unittest.TestCase):
 
         self.assertIs(gate.private_chat_manager, manager)
 
-    def test_private_chat_message_signals_wait_manager(self):
+    def test_private_chat_message_signals_wait_manager_without_being_consumed(self):
         config = SimpleNamespace(
             attention=SimpleNamespace(max_message_length=100),
             system1=SimpleNamespace(wakeup_words=[]),
@@ -146,7 +146,7 @@ class AttentionPrivateChatTests(unittest.TestCase):
 
         result = asyncio.run(_run())
 
-        self.assertEqual(result, "PRIVATE_WAIT")
+        self.assertEqual(result, "BUFFERED")
         self.assertEqual(manager.calls, [("user-1", "hello", "default:FriendMessage:user-1")])
 
     def test_fast_wakeup_path_marks_runtime_activity(self):

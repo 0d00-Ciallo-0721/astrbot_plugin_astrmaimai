@@ -98,6 +98,41 @@ class VisualCortexRefactorTests(unittest.TestCase):
         self.assertIn("chat-1:pic-1", stored)
         self.assertEqual(stored["chat-1:pic-1"].description, "test")
 
+    def test_visual_prompt_requests_detailed_image_and_emoji_transcription(self):
+        captured = {}
+
+        class _Gateway:
+            async def call_vision_task(self, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "type": "image",
+                    "description": "一张用于测试的普通图片",
+                    "emotion_tags": ["中性"],
+                }
+
+        cortex = self.visual_mod.VisualCortex(_Gateway(), db_service=None)
+        result = asyncio.run(
+            cortex.analyze_image_path("pic-prompt", "image.png", scope_id="chat-1")
+        )
+
+        self.assertEqual(result["description"], "一张用于测试的普通图片")
+        combined_prompt = f'{captured["prompt"]}\n{captured["system_prompt"]}'
+        for requirement in (
+            "普通图片",
+            "主体",
+            "可见文字",
+            "表情包",
+            "也必须先完整描述画面内容",
+            "情绪强度",
+            "表达意图",
+            "不得猜测",
+            "只输出一个 JSON 对象",
+        ):
+            self.assertIn(requirement, combined_prompt)
+        self.assertIn('"type"', captured["system_prompt"])
+        self.assertIn('"description"', captured["system_prompt"])
+        self.assertIn('"emotion_tags"', captured["system_prompt"])
+
     def test_worker_marks_queue_item_done_when_processing_raises(self):
         async def _run():
             cortex = self.visual_mod.VisualCortex(gateway=None, db_service=None)

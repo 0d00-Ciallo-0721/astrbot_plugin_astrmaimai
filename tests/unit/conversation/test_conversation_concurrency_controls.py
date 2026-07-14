@@ -20,7 +20,7 @@ class _Event:
 
 
 class ConversationConcurrencyControlsTests(unittest.TestCase):
-    def test_defaults_keep_p0_guards_on_and_p1_gray_switch_off(self):
+    def test_defaults_enable_group_thread_isolation(self):
         flags = resolve_conversation_concurrency_flags(SimpleNamespace())
 
         self.assertEqual(
@@ -28,7 +28,7 @@ class ConversationConcurrencyControlsTests(unittest.TestCase):
             ConversationConcurrencyFlags(
                 generation_enabled=True,
                 send_claim_enabled=True,
-                group_thread_wait_enabled=False,
+                group_thread_wait_enabled=True,
                 non_conversational_guard_enabled=True,
                 debug_trace_enabled=False,
             ),

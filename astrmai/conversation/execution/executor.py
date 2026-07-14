@@ -67,6 +67,7 @@ class ConcurrentExecutor:
         event: AstrMessageEvent,
         direct_vision_urls: Optional[list[str]],
     ) -> VisionBundle:
+        barrier_complete = bool(event.get_extra("astrmai_vision_barrier_complete", False))
         focus_context = event.get_extra("astrmai_focus_thread_context", None)
         if isinstance(focus_context, FocusThreadContext):
             bundle = focus_context.vision_bundle
@@ -74,7 +75,7 @@ class ConcurrentExecutor:
             direct_urls = list(dict.fromkeys(list(bundle.direct_image_urls or []) + list(direct_vision_urls or [])))
             return VisionBundle(
                 image_urls=image_urls,
-                direct_image_urls=direct_urls,
+                direct_image_urls=[] if barrier_complete else direct_urls,
                 is_direct_request=bundle.is_direct_request or bool(direct_urls),
                 is_image_only=bundle.is_image_only,
                 source=bundle.source or "focus_thread",
@@ -83,7 +84,7 @@ class ConcurrentExecutor:
         urls = list(dict.fromkeys(list(direct_vision_urls or [])))
         return VisionBundle(
             image_urls=urls,
-            direct_image_urls=urls[:],
+            direct_image_urls=[] if barrier_complete else urls[:],
             is_direct_request=bool(urls),
             is_image_only=bool(urls and not (event.message_str or "").strip()),
             source="event_extra",

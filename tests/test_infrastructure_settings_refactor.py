@@ -241,7 +241,8 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
                     yield from iter_display_text(value, f"{path}[{index}]")
 
         for path, display_text in iter_display_text(schema):
-            self.assertNotRegex(display_text, r"[A-Za-z]", path)
+            readable_text = display_text.replace("{AstrBot 数据目录}/memes_data/memes/<标签名>/", "")
+            self.assertNotRegex(readable_text, r"[A-Za-z]", path)
             self.assertNotRegex(display_text, r"[鏃鍊鐑绯绘浠鎴鍖�€]", path)
 
 

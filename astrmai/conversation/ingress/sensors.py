@@ -216,6 +216,7 @@ class PreFilters:
         except (TypeError, ValueError):
             probability = 1.0
         probability = max(0.0, min(1.0, probability))
+        force_direct_vision = bool(direct_vision_urls) and (is_private or has_at_bot)
 
         selected_direct = bool(direct_vision_urls)
         vision_direct_skip_reason = ""
@@ -223,7 +224,7 @@ class PreFilters:
             selected_direct = False
             vision_direct_skip_reason = "disabled"
             logger.debug("[AstrMai-Sensor] vision direct path skipped: disabled")
-        elif direct_vision_urls and random.random() > probability:
+        elif direct_vision_urls and not force_direct_vision and random.random() > probability:
             selected_direct = False
             vision_direct_skip_reason = "probability_gate"
             logger.debug(
@@ -235,7 +236,8 @@ class PreFilters:
             event.set_extra("direct_image_refs", direct_vision_urls)
             logger.debug(
                 "[AstrMai-Sensor] vision direct path selected "
-                f"(urls={len(direct_vision_urls)}, probability={probability:.2f})"
+                f"(urls={len(direct_vision_urls)}, probability={probability:.2f}, "
+                f"forced={force_direct_vision})"
             )
         else:
             vision_direct_skip_reason = "not_direct_path"

@@ -138,6 +138,20 @@ class ReverseSessionMainHookTests(unittest.TestCase):
         self.assertEqual(trace["post_hook_system_hash"], event.get_extra("astrmai_post_hook_system_hash"))
         self.assertEqual(trace["provider_visible_system_hash"], event.get_extra("astrmai_post_hook_system_hash"))
 
+    def test_plugin_initialize_starts_runtime_after_hot_reload(self):
+        plugin = object.__new__(self.main_mod.AstrMaiPlugin)
+        calls = []
+
+        class _Facade:
+            async def on_program_start(self):
+                calls.append("start")
+
+        plugin.facade = _Facade()
+
+        asyncio.run(plugin.initialize())
+
+        self.assertEqual(calls, ["start"])
+
 
 if __name__ == "__main__":
     unittest.main()

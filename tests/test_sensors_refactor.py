@@ -90,7 +90,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         reply.chain = chain
         return reply
 
-    def test_private_image_probability_gate_skips_direct_vision_but_keeps_extracted_urls(self):
+    def test_private_image_bypasses_probability_gate(self):
         filters = self.sensors_mod.PreFilters(self._config(probability=0.0))
         filters._commands_loaded = True
 
@@ -103,10 +103,10 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(event.get_extra("extracted_image_urls"), ["private.jpg"])
-        self.assertFalse(event.get_extra("vision_direct_selected"))
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "probability_gate")
-        self.assertFalse(event.get_extra("astrmai_is_direct_vision_request"))
-        self.assertFalse(event.get_extra("direct_vision_urls"))
+        self.assertTrue(event.get_extra("vision_direct_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
+        self.assertTrue(event.get_extra("astrmai_is_direct_vision_request"))
+        self.assertEqual(event.get_extra("direct_vision_urls"), ["private.jpg"])
 
     def test_private_image_respects_vision_disable_switch(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=False, probability=1.0))
@@ -141,7 +141,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertTrue(event.get_extra("astrmai_is_direct_vision_request"))
         self.assertEqual(event.get_extra("direct_vision_urls"), ["private.jpg"])
 
-    def test_group_reply_image_probability_gate_keeps_extracted_urls(self):
+    def test_group_at_reply_image_bypasses_probability_gate(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
         filters._commands_loaded = True
 
@@ -158,10 +158,52 @@ class RefactoredSensorsTests(unittest.TestCase):
         result = asyncio.run(filters.should_process_message(event))
 
         self.assertTrue(result)
-        self.assertFalse(event.get_extra("vision_direct_selected"))
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "probability_gate")
-        self.assertFalse(event.get_extra("direct_vision_urls"))
+        self.assertTrue(event.get_extra("vision_direct_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
+        self.assertEqual(event.get_extra("direct_vision_urls"), ["reply.jpg"])
         self.assertEqual(event.get_extra("extracted_image_urls"), ["reply.jpg"])
+
+    def test_group_at_inline_image_bypasses_probability_gate(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
+        filters._commands_loaded = True
+
+        event = _FakeEvent(
+            group_id="group-1",
+            text="你看",
+            components=[
+                self._at_component("bot-1"),
+                self._plain_component("你看"),
+                self._image_component(file_path="inline.jpg"),
+            ],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertTrue(event.get_extra("vision_direct_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
+        self.assertTrue(event.get_extra("astrmai_is_direct_vision_request"))
+        self.assertEqual(event.get_extra("direct_vision_urls"), ["inline.jpg"])
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["inline.jpg"])
+
+    def test_passive_group_image_keeps_original_non_direct_behavior(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
+        filters._commands_loaded = True
+
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[self._image_component(file_path="passive.jpg")],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertFalse(event.get_extra("vision_direct_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "not_direct_path")
+        self.assertFalse(event.get_extra("astrmai_is_direct_vision_request"))
+        self.assertTrue(event.get_extra("astrmai_is_passive_image_share"))
+        self.assertFalse(event.get_extra("direct_vision_urls"))
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["passive.jpg"])
 
     def test_group_reply_image_disable_switch_still_keeps_extracted_urls(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=False, probability=1.0))

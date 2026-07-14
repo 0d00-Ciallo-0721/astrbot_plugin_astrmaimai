@@ -14,9 +14,10 @@ from ...infrastructure.runtime.lane_manager import LaneKey
 MOOD_SYSTEM_PROMPT = """
 You are AstrMai's mood analyzer.
 Read the current user message and return only JSON:
-{"mood_tag": "happy|sad|angry|neutral|curious|surprise", "mood_value": float}
+{"mood_tag": "<one available tag>", "mood_value": float}
 
 Rules:
+- Choose mood_tag only from the Available mood tags provided in the request.
 - Choose the dominant felt affect toward the bot in this turn.
 - Sarcasm, passive aggression, or mock praise are negative, not happy.
 - Mixed affect should not be flattened into happy if clear hurt, complaint, or tension is present.
@@ -46,10 +47,10 @@ class MoodManager:
             for item in mapping_list:
                 if ":" in item:
                     k, v = item.split(":", 1)
-                    mapping[k.strip()] = v.strip()
+                    mapping[k.strip().lower()] = v.strip()
                 elif "：" in item:
                     k, v = item.split("：", 1)
-                    mapping[k.strip()] = v.strip()
+                    mapping[k.strip().lower()] = v.strip()
         if not mapping:
             mapping = {
                 "happy": "positive, glad, relieved, affectionate",
@@ -121,7 +122,7 @@ class MoodManager:
         if not parsed_successfully or ("mood_tag" not in data and "mood_value" not in data):
             logger.debug(f"[MoodManager] structured parse failed, trying regex extraction: {clean_str[:80]}...")
             tag_match = re.search(
-                r'(?:"|\')?mood_tag(?:"|\')?\s*[:：]\s*(?:"|\')?([a-zA-Z0-9_]+)(?:"|\')?',
+                r'(?:"|\')?mood_tag(?:"|\')?\s*[:：]\s*(?:"|\')?([\w-]+)(?:"|\')?',
                 clean_str,
                 re.IGNORECASE,
             )
@@ -152,7 +153,9 @@ class MoodManager:
         mood_tag = str(data.get("mood_tag", "") or "").strip().lower()
         if not mood_tag and "mood_value" not in data:
             return None
-        if mood_tag not in self.VALID_TAGS:
+        valid_tags = set(getattr(self, "emotion_mapping", {}) or {}) or set(self.VALID_TAGS)
+        valid_tags.add("neutral")
+        if mood_tag not in valid_tags:
             mood_tag = "neutral"
         try:
             mood_value = float(data.get("mood_value", fallback_mood))

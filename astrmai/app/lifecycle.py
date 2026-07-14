@@ -19,6 +19,7 @@ class PluginLifecycleManager:
         self._background_tasks = runtime.background_tasks
         self._startup_task: asyncio.Task[Any] | None = None
         self._shutdown_requested = False
+        self._terminated = False
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
@@ -50,9 +51,16 @@ class PluginLifecycleManager:
             logger.warning(f"[AstrMai] Memory engine start degraded: {exc}")
 
     async def on_program_start(self) -> None:
-        logger.info("[AstrMai] AstrBot Loaded. Starting system initialization from refactoring workspace...")
-        if self._startup_task is not None and not self._startup_task.done():
+        if self._terminated:
+            logger.warning("[AstrMai] runtime startup rejected reason=terminated")
             return
+        if self.runtime.status.is_running and self.runtime.status.lifecycle_started:
+            logger.debug("[AstrMai] runtime startup skipped reason=already_running")
+            return
+        if self._startup_task is not None and not self._startup_task.done():
+            logger.debug("[AstrMai] runtime startup skipped reason=in_progress")
+            return
+        logger.info("[AstrMai] Starting system initialization from refactoring workspace...")
         self._shutdown_requested = False
         self.runtime.status.is_running = False
         self.runtime.status.lifecycle_started = False
@@ -295,6 +303,7 @@ class PluginLifecycleManager:
 
     async def terminate(self) -> None:
         logger.info("[AstrMai] 正在终止进程并卸载资源...")
+        self._terminated = True
         self._shutdown_requested = True
         self.runtime.set_boot_phase("shutdown.start")
 

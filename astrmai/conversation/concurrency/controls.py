@@ -15,7 +15,7 @@ except Exception:
 class ConversationConcurrencyFlags:
     generation_enabled: bool = True
     send_claim_enabled: bool = True
-    group_thread_wait_enabled: bool = False
+    group_thread_wait_enabled: bool = True
     non_conversational_guard_enabled: bool = True
     debug_trace_enabled: bool = False
 
@@ -41,7 +41,7 @@ def resolve_conversation_concurrency_flags(config: Any) -> ConversationConcurren
     return ConversationConcurrencyFlags(
         generation_enabled=bool(getattr(conversation, "conversation_generation_enabled", True)),
         send_claim_enabled=bool(getattr(conversation, "reply_send_claim_enabled", True)),
-        group_thread_wait_enabled=bool(getattr(conversation, "group_thread_wait_enabled", False)),
+        group_thread_wait_enabled=bool(getattr(conversation, "group_thread_wait_enabled", True)),
         non_conversational_guard_enabled=bool(
             getattr(conversation, "non_conversational_guard_enabled", True)
         ),

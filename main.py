@@ -97,9 +97,17 @@ class AstrMaiPlugin(Star):
             weight_delta=weight_delta,
         )
 
+    async def initialize(self) -> None:
+        """Start the runtime whenever AstrBot activates or hot-reloads the plugin."""
+        await self._ensure_runtime_started("plugin_initialize")
+
+    async def _ensure_runtime_started(self, source: str) -> None:
+        logger.info(f"[AstrMai] runtime startup requested source={source}")
+        await self.facade.on_program_start()
+
     @filter.on_astrbot_loaded()
     async def on_program_start(self):
-        await self.facade.on_program_start()
+        await self._ensure_runtime_started("astrbot_loaded")
 
     # ponytail: on_llm_request runs BEFORE persona injection. Reverse session block may be overwritten.
     @filter.on_llm_request()

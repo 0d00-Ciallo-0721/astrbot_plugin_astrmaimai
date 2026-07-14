@@ -216,7 +216,7 @@
       "group_thread_wait_enabled": {
         "description": "启用群聊分线程等待隔离",
         "type": "bool",
-        "default": false,
+        "default": true,
         "hint": "开启后，群聊等待状态和对话轮次会按群内话题线程隔离，减少不同用户或不同话题互相串扰；关闭后使用整群共用状态。"
       },
       "non_conversational_guard_enabled": {
@@ -316,10 +316,10 @@
         "hint": "内容太短时，不会再拆成多条发送，避免一句话被切得太碎。"
       },
       "no_segment_max_len": {
-        "description": "优先整条发送的长度上限",
+        "description": "允许智能分段的长度上限",
         "type": "int",
         "default": 120,
-        "hint": "当回复不超过这个长度时，会尽量一次性整条发出，而不是拆成多条。"
+        "hint": "回复达到最短长度且严格小于这个值时，才允许按句子结构智能分段；遇到句号、问号或感叹号时，相邻句子长度足够就会拆成独立气泡。达到或超过这个值时整条发送，正文中的双换行始终会强制分段。"
       },
       "meme_probability": {
         "description": "附带表情包的概率（%）",
@@ -328,7 +328,7 @@
         "hint": "值越高，机器人越容易在合适的场景附带表情包。不是每次都会发，只是更容易触发。"
       },
       "emotion_mapping": {
-        "description": "情绪与表情包文件夹的对应关系",
+        "description": "表情标签与模型识别说明",
         "type": "list",
         "default": [
           "happy: 积极、开心、感谢",
@@ -338,7 +338,7 @@
           "curious: 好奇、提问、困惑",
           "surprise: 惊讶、意外"
         ],
-        "hint": "左边是系统识别到的情绪标签，右边是要使用的表情包文件夹名。请保证文件夹名称和实际资源目录一致。"
+        "hint": "每项格式为“标签名: 给模型看的情绪说明”。左侧标签名同时是表情包文件夹名，图片目录为“{AstrBot 数据目录}/memes_data/memes/<标签名>/”。例如新增“庆祝: 兴奋、期待、庆祝”后，请在上述根目录下建立“庆祝”文件夹并放入图片；模型会自动看到并可选择该标签。默认的中性标签只表示不发送表情包。"
       },
       "typing_speed_factor": {
         "description": "模拟打字等待强度",
@@ -480,6 +480,30 @@
         "type": "int",
         "default": 300,
         "hint": "机器人在私聊里回复后，会在这段时间内保持“等你继续说”的状态。"
+      },
+      "input_settle_sec": {
+        "description": "私聊连续输入等待时间（秒）",
+        "type": "float",
+        "default": 1.5,
+        "hint": "用户连续发送多句话时，机器人会等待这段时间确认输入结束，再合并理解并回复一次。"
+      },
+      "image_resolve_timeout_sec": {
+        "description": "私聊图片读取超时时间（秒）",
+        "type": "float",
+        "default": 15.0,
+        "hint": "从消息平台获取图片文件时最多等待多久。"
+      },
+      "image_barrier_timeout_sec": {
+        "description": "私聊单张图片识别超时时间（秒）",
+        "type": "float",
+        "default": 45.0,
+        "hint": "图片识别完成后才会构建完整上下文并决定是否回复。"
+      },
+      "image_analysis_retries": {
+        "description": "私聊图片识别重试次数",
+        "type": "int",
+        "default": 2,
+        "hint": "视觉模型临时失败时自动重试；全部失败后会明确按图片读取失败处理，不会猜测内容。"
       }
     }
   },
@@ -880,10 +904,10 @@
         "hint": "关闭后，机器人不会分析图片内容。"
       },
       "image_recognition_probability": {
-        "description": "图片进入识别流程的概率",
+        "description": "普通图片进入识别流程的概率",
         "type": "float",
         "default": 0.5,
-        "hint": "用于控制看图频率。值越高，机器人越容易主动处理图片。"
+        "hint": "用于控制普通场景的看图频率。私聊图片以及群聊中明确 @ 机器人的图片始终会尝试识别，不受此概率影响；关闭“启用看图能力”后则所有图片都不会识别。"
       },
       "use_native_main_reply_vision": {
         "description": "主回复原生识图直通开关",

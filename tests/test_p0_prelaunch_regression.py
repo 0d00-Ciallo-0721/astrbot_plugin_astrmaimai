@@ -49,6 +49,27 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(results[0].doc_id, 7)
         self.assertEqual(results[0].content, "ok")
 
+    def test_vector_store_normalizes_framework_metadata_formats(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            async def retrieve(self, **kwargs):
+                return [
+                    SimpleNamespace(data={"id": 1, "text": "dict", "metadata": {"kind": "fact"}}, similarity=0.9),
+                    SimpleNamespace(data={"id": 2, "text": "json", "metadata": '{"kind": "preference"}'}, similarity=0.8),
+                    SimpleNamespace(data={"id": 3, "text": "bad", "metadata": "{bad-json"}, similarity=0.7),
+                    SimpleNamespace(data={"id": 4, "text": "none", "metadata": None}, similarity=0.6),
+                ]
+
+        results = asyncio.run(VectorRetriever(_Faiss()).search("hello", k=4))
+
+        self.assertEqual([item.metadata for item in results], [
+            {"kind": "fact"},
+            {"kind": "preference"},
+            {},
+            {},
+        ])
+
     def test_dream_update_resolves_legacy_id_to_canonical_memory(self):
         from astrmai.memory.dream.dream_agent import DreamAgent
 

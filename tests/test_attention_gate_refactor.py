@@ -463,7 +463,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertAlmostEqual(focus.get_extra("astrmai_primary_mood_value"), 0.45)
         self.assertEqual(focus.get_extra("astrmai_primary_mood_source"), "attention_pre_judge")
 
-    def test_process_event_applies_primary_mood_before_private_wait(self):
+    def test_process_event_resumes_private_wait_without_consuming_message(self):
         calls = []
 
         async def _update_mood(chat_id, text):
@@ -477,7 +477,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         status = asyncio.run(self.gate.process_event(event))
 
-        self.assertEqual(status, "PRIVATE_WAIT")
+        self.assertEqual(status, "BUFFERED")
         self.assertEqual(calls, [("default:FriendMessage:user-1", "今天有点难受")])
         self.assertEqual(manager.calls, [("user-1", "今天有点难受", "default:FriendMessage:user-1")])
         self.assertTrue(event.get_extra("astrmai_primary_mood_applied"))
@@ -502,6 +502,211 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(status, "BUFFERED")
         self.assertEqual(manager.calls, [("user-1", "hello", "default:FriendMessage:user-1")])
+
+    def test_private_messages_wait_for_quiet_window_and_dispatch_once_in_order(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.conversation.attention.private_turn_coordinator"
+        )
+        self.gate.config.private_chat = SimpleNamespace(input_settle_sec=0.03)
+        self.gate.private_turn_coordinator = coordinator_mod.PrivateTurnCoordinator(
+            config=self.gate.config,
+            image_resolver=None,
+            visual_cortex=None,
+        )
+        captured = []
+
+        async def fake_sys2(event, events):
+            captured.append([item.message_str for item in events])
+
+        self.gate.sys2_process = fake_sys2
+
+        async def _run():
+            first = _FakePrivateEvent("user-1", "Alice", "第一句")
+            second = _FakePrivateEvent("user-1", "Alice", "第二句")
+            first_status = await self.gate.process_event(first)
+            await asyncio.sleep(0.015)
+            second_status = await self.gate.process_event(second)
+            await asyncio.sleep(0.08)
+            return first_status, second_status
+
+        first_status, second_status = asyncio.run(_run())
+
+        self.assertEqual((first_status, second_status), ("BUFFERED", "BUFFERED"))
+        self.assertEqual(captured, [["第一句", "第二句"]])
+
+    def test_private_direct_wakeup_still_uses_buffered_serial_path(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.conversation.attention.private_turn_coordinator"
+        )
+        self.gate.config.private_chat = SimpleNamespace(input_settle_sec=0.01)
+        self.gate.private_turn_coordinator = coordinator_mod.PrivateTurnCoordinator(
+            config=self.gate.config,
+            image_resolver=None,
+            visual_cortex=None,
+        )
+        event = _FakePrivateEvent("user-1", "Alice", "AstrMai", extras={"wakeup": True})
+
+        async def _run():
+            status = await self.gate.process_event(event)
+            await asyncio.sleep(0.03)
+            return status
+
+        status = asyncio.run(_run())
+
+        self.assertEqual(status, "BUFFERED")
+
+    def test_private_message_arriving_during_vision_barrier_joins_same_reply_batch(self):
+        class _BlockingBarrier:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.calls = 0
+
+            async def wait_for_input_stability(self, session):
+                return None
+
+            async def prepare_batch(self, events, chat_id):
+                self.calls += 1
+                if self.calls == 1:
+                    self.started.set()
+                    await self.release.wait()
+
+        barrier = _BlockingBarrier()
+        self.gate.private_turn_coordinator = barrier
+        captured = []
+
+        async def fake_sys2(event, events):
+            captured.append([item.message_str for item in events])
+
+        self.gate.sys2_process = fake_sys2
+
+        async def _run():
+            first = _FakePrivateEvent("user-1", "Alice", "先看图片")
+            second = _FakePrivateEvent("user-1", "Alice", "补充说明")
+            await self.gate.process_event(first)
+            await barrier.started.wait()
+            await self.gate.process_event(second)
+            barrier.release.set()
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+
+        self.assertGreaterEqual(barrier.calls, 2)
+        self.assertEqual(captured, [["先看图片", "补充说明"]])
+
+    def test_private_system2_runs_are_serial_for_same_chat(self):
+        class _ImmediateCoordinator:
+            async def wait_for_input_stability(self, session):
+                return None
+
+            async def prepare_batch(self, events, chat_id):
+                return None
+
+        self.gate.private_turn_coordinator = _ImmediateCoordinator()
+        first_started = asyncio.Event()
+        first_release = asyncio.Event()
+        calls = []
+        active = 0
+        max_active = 0
+
+        async def fake_sys2(event, events):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(event.message_str)
+            try:
+                if len(calls) == 1:
+                    first_started.set()
+                    await first_release.wait()
+            finally:
+                active -= 1
+
+        self.gate.sys2_process = fake_sys2
+
+        async def _run():
+            await self.gate.process_event(_FakePrivateEvent("user-1", "Alice", "第一轮"))
+            await first_started.wait()
+            await self.gate.process_event(_FakePrivateEvent("user-1", "Alice", "第二轮"))
+            await asyncio.sleep(0.01)
+            calls_before_release = list(calls)
+            first_release.set()
+            await asyncio.sleep(0.05)
+            return calls_before_release
+
+        calls_before_release = asyncio.run(_run())
+
+        self.assertEqual(calls_before_release, ["第一轮"])
+        self.assertEqual(calls, ["第一轮", "第二轮"])
+        self.assertEqual(max_active, 1)
+
+    def test_private_mood_update_runs_after_vision_context_is_ready(self):
+        class _VisionCoordinator:
+            async def wait_for_input_stability(self, session):
+                return None
+
+            async def prepare_batch(self, events, chat_id):
+                for event in events:
+                    event.set_extra("astrmai_rich_text", "你看\n[图片转述：一只白猫坐在窗边]")
+                    event.set_extra("astrmai_vision_barrier_complete", True)
+
+        mood_inputs = []
+
+        async def update_mood(chat_id, text):
+            mood_inputs.append(text)
+            return "calm", 0.1
+
+        self.gate.private_turn_coordinator = _VisionCoordinator()
+        self.gate.state_engine.update_mood = update_mood
+
+        async def _run():
+            await self.gate.process_event(_FakePrivateEvent("user-1", "Alice", "你看"))
+            await asyncio.sleep(0.03)
+
+        asyncio.run(_run())
+
+        self.assertEqual(mood_inputs, ["你看\n[图片转述：一只白猫坐在窗边]"])
+
+    def test_group_direct_image_waits_for_visual_context_before_fast_dispatch(self):
+        class _GroupVisionBarrier:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_config(self, config):
+                return None
+
+            async def prepare_direct_event(self, event, chat_id):
+                self.calls.append((event.message_str, chat_id))
+                event.set_extra("astrmai_rich_text", "你看\n[图片转述：一只白猫坐在窗边]")
+                event.set_extra("astrmai_vision_barrier_complete", True)
+
+        barrier = _GroupVisionBarrier()
+        self.gate.private_turn_coordinator = barrier
+        captured = []
+
+        async def fake_sys2(event, events):
+            captured.append(
+                (
+                    event.get_extra("astrmai_rich_text", ""),
+                    event.get_extra("astrmai_vision_barrier_complete", False),
+                )
+            )
+
+        self.gate.sys2_process = fake_sys2
+        event = _FakeEvent("user-1", "Alice", "你看", extras={"wakeup": True})
+
+        async def _run():
+            status = await self.gate.process_event(event)
+            await asyncio.sleep(0.02)
+            return status
+
+        status = asyncio.run(_run())
+
+        self.assertEqual(status, "ENGAGED")
+        self.assertEqual(
+            barrier.calls,
+            [("你看", "default:GroupMessage:group-1")],
+        )
+        self.assertEqual(captured, [("你看\n[图片转述：一只白猫坐在窗边]", True)])
 
     def test_group_perception_uses_unified_origin_as_chat_id(self):
         event = _FakeEvent("user-1", "Alice", "hello")
@@ -646,9 +851,11 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
     def test_inject_external_event_routes_through_kernel_when_bound(self):
         calls = []
+        expected_event_type = self.gate_mod.AstrMessageEvent
 
         class _Kernel:
             async def tick(self, *, chat_id, trigger, event=None):
+                assert isinstance(event, expected_event_type)
                 calls.append(
                     (
                         chat_id,

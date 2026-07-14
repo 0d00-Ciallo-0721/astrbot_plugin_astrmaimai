@@ -185,6 +185,87 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_startup_is_idempotent_after_runtime_becomes_ready(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            status = RuntimeStatus()
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                set_boot_phase=lambda phase: status.set_phase(phase),
+            )
+            manager = PluginLifecycleManager(runtime)
+            calls = []
+
+            async def _complete_startup():
+                calls.append("startup")
+                status.is_running = True
+                status.lifecycle_started = True
+
+            manager._complete_startup = _complete_startup
+
+            await manager.on_program_start()
+            await manager._startup_task
+            await manager.on_program_start()
+
+            self.assertEqual(calls, ["startup"])
+
+        asyncio.run(_run())
+
+    def test_startup_is_idempotent_while_initialization_is_in_progress(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            status = RuntimeStatus()
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                set_boot_phase=lambda phase: status.set_phase(phase),
+            )
+            manager = PluginLifecycleManager(runtime)
+            release = asyncio.Event()
+            calls = []
+
+            async def _complete_startup():
+                calls.append("startup")
+                await release.wait()
+
+            manager._complete_startup = _complete_startup
+
+            await manager.on_program_start()
+            first_task = manager._startup_task
+            await manager.on_program_start()
+            await asyncio.sleep(0)
+
+            self.assertIs(manager._startup_task, first_task)
+            self.assertEqual(calls, ["startup"])
+
+            release.set()
+            await first_task
+
+        asyncio.run(_run())
+
+    def test_terminated_lifecycle_cannot_be_restarted_by_late_hook(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            manager = PluginLifecycleManager(runtime)
+
+            await manager.terminate()
+            await manager.on_program_start()
+
+            self.assertIsNone(manager._startup_task)
+            self.assertFalse(runtime.status.lifecycle_started)
+
+        asyncio.run(_run())
+
     def test_terminate_cancels_tracked_background_tasks(self):
         async def _run():
             from astrmai.app.lifecycle import PluginLifecycleManager

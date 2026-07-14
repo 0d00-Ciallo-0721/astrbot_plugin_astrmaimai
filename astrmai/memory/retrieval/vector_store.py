@@ -1,3 +1,4 @@
+import json
 import time
 from typing import List, Dict, Any, Optional
 from astrbot.api import logger
@@ -16,6 +17,21 @@ class VectorRetriever:
         # ID 映射缓存优化 (int_id -> uuid)
         self._id_cache: Dict[int, str] = {}
         self._cache_max_size = 1000
+
+    @staticmethod
+    def _normalize_metadata(raw_metadata: Any) -> Dict[str, Any]:
+        if isinstance(raw_metadata, dict):
+            return dict(raw_metadata)
+        if isinstance(raw_metadata, str):
+            try:
+                parsed = json.loads(raw_metadata)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.warning("[VectorStore] ignoring malformed JSON metadata from Faiss result")
+                return {}
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning("[VectorStore] ignoring non-object JSON metadata from Faiss result")
+        return {}
 
     async def add_document(self, content: str, metadata: Dict[str, Any] = None) -> int:
         """存入文本，返回 document id (由 FaissVecDB 底层的 DocumentStorage 提供的主键)"""
@@ -76,7 +92,7 @@ class VectorRetriever:
                 doc_id=doc_id,
                 score=float(getattr(result, "similarity", 0.0) or 0.0),
                 content=content,
-                metadata=dict(doc_data.get("metadata") or {}),
+                metadata=self._normalize_metadata(doc_data.get("metadata")),
                 source="vector"
             ))
             

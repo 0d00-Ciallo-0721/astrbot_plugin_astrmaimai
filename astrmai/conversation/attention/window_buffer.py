@@ -11,10 +11,11 @@ class AttentionWindowBuffer:
         self.gate = gate
 
     def compute_debounce_delay(self, session: Any, is_private: bool, is_strong_wakeup: bool) -> float:
+        if is_private:
+            private_config = getattr(getattr(self.gate, "config", None), "private_chat", None)
+            return max(0.0, float(getattr(private_config, "input_settle_sec", 1.5) or 0.0))
         if is_strong_wakeup:
             return 0.10
-        if is_private:
-            return 0.20
         gap = time.time() - float(getattr(session, "last_active_user_time", 0.0) or 0.0)
         if gap < 1.0:
             return 0.25

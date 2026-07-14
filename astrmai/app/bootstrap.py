@@ -10,6 +10,7 @@ from ..conversation.ingress.sensors import PreFilters
 from ..conversation.attention.context_compaction import ContextCompactionEngine
 from ..conversation.attention.gate import AttentionGate
 from ..conversation.attention.group_dialogue_store import GroupDialogueStore
+from ..conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 from ..conversation.decision.judge import Judge
 from ..conversation.execution.reply_service import ReplyService
 from ..conversation.execution.system2_runner import System2Runner
@@ -39,6 +40,7 @@ from ..learning import (
 from ..learning.review.expression_governance_runner import ExpressionGovernanceRunner
 from ..memory import MemoryEngine, PersonaSummarizer, ReActRetriever
 from ..multimodal.visual_cortex import VisualCortex
+from ..multimodal.napcat_image_resolver import NapCatImageResolver
 from ..proactive import ProactiveTask
 from ..proactive.proactive_task import ProactiveDeps
 from ..proactive.review_dispatcher import ReviewDispatcher
@@ -337,10 +339,17 @@ class PluginBootstrap:
     def _build_interaction_stack(self, runtime: PluginRuntimeContext) -> InteractionServices:
         frequency_controller = FrequencyController(config=runtime.config)
         private_chat_manager = PrivateChatManager(config=runtime.config)
+        vision_cache_dir = Path(getattr(runtime.persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache")) / "vision"
+        private_turn_coordinator = PrivateTurnCoordinator(
+            config=runtime.config,
+            image_resolver=NapCatImageResolver(vision_cache_dir),
+            visual_cortex=runtime.visual_cortex,
+            persistence=runtime.persistence,
+        )
         conversation_config = getattr(runtime.config, "conversation", None)
         group_reply_wait_manager = GroupReplyWaitManager(
             threaded_enabled=bool(
-                getattr(conversation_config, "group_thread_wait_enabled", False)
+                getattr(conversation_config, "group_thread_wait_enabled", True)
             )
         )
         attention_gate = AttentionGate(
@@ -353,6 +362,7 @@ class PluginBootstrap:
             visual_cortex=runtime.visual_cortex,
             frequency_controller=frequency_controller,
             private_chat_manager=private_chat_manager,
+            private_turn_coordinator=private_turn_coordinator,
             runtime_coordinator=runtime.runtime_coordinator,
         )
         return InteractionServices(

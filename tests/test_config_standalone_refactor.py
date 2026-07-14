@@ -108,6 +108,9 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)
         self.assertEqual(schema["sys3"]["items"]["tool_timeout"]["default"], 120)
         self.assertEqual(schema["life"]["items"]["energy_exhaustion"]["default"], 0.1)
+        meme_mapping_hint = schema["reply"]["items"]["emotion_mapping"]["hint"]
+        self.assertIn("memes_data/memes/<标签名>/", meme_mapping_hint)
+        self.assertIn("给模型看的情绪说明", meme_mapping_hint)
 
 
 if __name__ == "__main__":

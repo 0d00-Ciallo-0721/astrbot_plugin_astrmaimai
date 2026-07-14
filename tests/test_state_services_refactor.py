@@ -281,6 +281,49 @@ class StateRefactorTests(unittest.TestCase):
         self.assertEqual(tag, "sad")
         self.assertAlmostEqual(mood_value, -0.35)
 
+    def test_mood_manager_accepts_configured_custom_meme_tag(self):
+        class _Gateway:
+            def __init__(self):
+                self.config = SimpleNamespace(provider=SimpleNamespace(task_models=[]))
+
+        config = SimpleNamespace(
+            reply=SimpleNamespace(emotion_mapping=["excited: 兴奋、期待、庆祝"]),
+            provider=SimpleNamespace(task_models=[]),
+        )
+        manager = self.mood_mod.MoodManager(_Gateway(), config=config)
+
+        normalized = manager._normalize_result(
+            {"mood_tag": "EXCITED", "mood_value": 0.8},
+            current_mood=0.0,
+        )
+
+        self.assertEqual(normalized, ("excited", 0.8))
+
+    def test_mood_manager_prompt_exposes_custom_meme_tag_to_model(self):
+        observed = {}
+
+        class _Gateway:
+            def __init__(self):
+                self.config = SimpleNamespace(provider=SimpleNamespace(task_models=[]))
+                self.lane_manager = None
+
+            async def call_mood_task(self, prompt, system_prompt=None):
+                observed["prompt"] = prompt
+                observed["system_prompt"] = system_prompt
+                return {"mood_tag": "excited", "mood_value": 0.7}
+
+        config = SimpleNamespace(
+            reply=SimpleNamespace(emotion_mapping=["excited: 兴奋、期待、庆祝"]),
+            provider=SimpleNamespace(task_models=[]),
+        )
+        manager = self.mood_mod.MoodManager(_Gateway(), config=config)
+
+        tag, mood_value = asyncio.run(manager.analyze_mood("太好了，终于成功了！", 0.0))
+
+        self.assertEqual((tag, mood_value), ("excited", 0.7))
+        self.assertIn("excited=兴奋、期待、庆祝", observed["prompt"])
+        self.assertIn("Available mood tags", observed["system_prompt"])
+
     def test_mood_manager_fallback_keeps_sarcasm_negative(self):
         tag, mood_value = self.mood_mod.MoodManager._fallback_analyze_local("你可真行啊，又把事情搞砸了，真棒。", 0.0)
 

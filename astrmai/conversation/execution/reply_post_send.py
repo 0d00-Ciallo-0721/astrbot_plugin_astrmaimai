@@ -149,13 +149,10 @@ class ReplyPostSendMixin:
         return str(getattr(getattr(config, "persona", None), "persona_id", "") or "")
 
     def _resolve_post_send_tag(self, bypassed_tag: str | None) -> tuple[str, bool]:
-        if not bypassed_tag:
+        tag = str(bypassed_tag or "").strip().lower()
+        if not tag:
             return "neutral", False
-        if bypassed_tag == "happy":
-            return "happy", True
-        if bypassed_tag in ["sad", "angry"]:
-            return bypassed_tag, True
-        return bypassed_tag, True
+        return tag, False
 
     async def _collect_affection_target(
         self,

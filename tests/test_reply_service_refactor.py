@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 from tests.helpers.reply_engine_stubs import (
@@ -329,21 +330,31 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(len(coordinator.commits), 1)
         self.assertIn("failed:transport failed", coordinator.commits[0][2])
 
-    def test_short_multi_sentence_reply_stays_single(self):
+    def test_reply_below_segment_limit_splits_complete_sentences(self):
         service = self._service(max_len=80)
 
-        artifact = service._build_visible_reply_artifact("I get what you mean. We can keep this simple for now.")
+        artifact = service._build_visible_reply_artifact("I get what you mean! We can keep this simple for now?")
 
-        self.assertEqual(len(artifact.segments), 1)
-        self.assertEqual(artifact.metadata["segment_reason"], "within_single_limit")
+        self.assertEqual(len(artifact.segments), 2)
+        self.assertEqual(artifact.metadata["segment_reason"], "natural_segmenter")
 
-    def test_long_reply_uses_natural_segments_and_caps_at_three(self):
-        service = self._service(max_len=36)
-        text = (
-            "I was still thinking about that point. "
-            "The stuck feeling may be information overload, not lack of effort. "
-            "Let's peel out the smallest next step first."
+    def test_natural_chinese_reply_splits_into_two_chat_bubbles(self):
+        service = self._service(min_len=15, max_len=120)
+        text = "晚上好呀～✨ 妃爱刚还在想哥哥会不会来找我呢，结果你就来了！唉嘿嘿♡ 今天辛苦啦，有没有好好吃晚饭呀？"
+
+        artifact = service._build_visible_reply_artifact(text)
+
+        self.assertEqual(
+            artifact.segments,
+            [
+                "晚上好呀～✨ 妃爱刚还在想哥哥会不会来找我呢，结果你就来了！",
+                "唉嘿嘿♡ 今天辛苦啦，有没有好好吃晚饭呀？",
+            ],
         )
+
+    def test_reply_below_segment_limit_can_split_and_caps_at_three(self):
+        service = self._service(max_len=80)
+        text = ("A" * 60) + "。不过" + ("B" * 15) + "。"
 
         artifact = service._build_visible_reply_artifact(text)
 
@@ -351,10 +362,38 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertLessEqual(len(artifact.segments), 3)
         self.assertEqual(artifact.metadata["segment_reason"], "natural_segmenter")
 
+    def test_reply_at_or_above_segment_limit_stays_single(self):
+        service = self._service(max_len=80)
+
+        at_limit = service._build_visible_reply_artifact("A" * 80)
+        above_limit = service._build_visible_reply_artifact("B" * 81)
+
+        self.assertEqual(at_limit.segments, ["A" * 80])
+        self.assertEqual(above_limit.segments, ["B" * 81])
+        self.assertEqual(at_limit.metadata["segment_reason"], "at_or_above_segment_limit")
+        self.assertEqual(above_limit.metadata["segment_reason"], "at_or_above_segment_limit")
+
+    def test_reply_below_minimum_segment_length_stays_single(self):
+        service = self._service(min_len=15, max_len=120)
+
+        artifact = service._build_visible_reply_artifact("短句不会拆分")
+
+        self.assertEqual(artifact.segments, ["短句不会拆分"])
+        self.assertEqual(artifact.metadata["segment_reason"], "below_segment_min")
+
     def test_forced_paragraph_boundary_can_split_below_single_limit(self):
         service = self._service(max_len=200)
 
         artifact = service._build_visible_reply_artifact("First paragraph.\n\nSecond paragraph.")
+
+        self.assertEqual(len(artifact.segments), 2)
+        self.assertEqual(artifact.metadata["segment_reason"], "natural_segmenter")
+
+    def test_forced_paragraph_boundary_splits_above_segment_limit(self):
+        service = self._service(max_len=80)
+        text = ("A" * 90) + "\n\n" + ("B" * 90)
+
+        artifact = service._build_visible_reply_artifact(text)
 
         self.assertEqual(len(artifact.segments), 2)
         self.assertEqual(artifact.metadata["segment_reason"], "natural_segmenter")
@@ -823,6 +862,35 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(observed["calls"], 0)
+
+    def test_post_send_meme_tag_uses_configured_probability(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.meme_probability = 37
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "今天值得庆祝")
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(
+                service._settle_post_send(
+                    event,
+                    event.unified_msg_origin,
+                    bypassed_tag="excited",
+                    window_events=[event],
+                    anchor_event=event,
+                )
+            )
+
+        self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "excited")
+        self.assertEqual(send_meme.await_args.kwargs["probability"], 37)
 
     def test_merge_wait_targets_preserves_existing_targets_before_pending_actions(self):
         service = self._service()
