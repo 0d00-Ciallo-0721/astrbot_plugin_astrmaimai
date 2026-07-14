@@ -70,6 +70,25 @@ class PrivateChatManagerMigratedTests(unittest.TestCase):
         self.assertIsNotNone(friend_info)
         self.assertIsNone(group_info)
 
+    def test_session_eviction_removes_exact_friend_reverse_mapping(self):
+        manager = PrivateChatManager()
+
+        for index in range(manager.MAX_SESSIONS + 1):
+            user_id = f"user-{index}"
+            chat_id = f"default:FriendMessage:{user_id}"
+            manager._get_or_create_session(user_id, chat_id)
+            manager._bind_chat_session(chat_id, user_id)
+
+        self.assertEqual(len(manager._sessions), manager.MAX_SESSIONS)
+        self.assertEqual(len(manager._chat_to_user), manager.MAX_SESSIONS)
+        self.assertNotIn("default:FriendMessage:user-0", manager._chat_to_user)
+        self.assertTrue(
+            all(
+                any(key.endswith(f"::{chat_id}") for key in manager._sessions)
+                for chat_id in manager._chat_to_user
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

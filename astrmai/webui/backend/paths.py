@@ -30,9 +30,8 @@ def default_config_path() -> str:
 
 
 def default_persona_cache_path() -> str:
-    return env_or_default_path("ASTRMAI_PERSONA_CACHE_PATH", plugin_data_path("persona_cache.json"))
+    return env_or_default_path("ASTRMAI_PERSONA_CACHE_PATH", plugin_data_path("cache", "persona_cache.json"))
 
 
 def default_schema_path() -> str:
     return env_or_default_path("ASTRMAI_CONF_SCHEMA_PATH", PLUGIN_ROOT / "_conf_schema.json")
-

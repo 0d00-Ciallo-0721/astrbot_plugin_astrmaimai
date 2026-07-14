@@ -147,7 +147,6 @@ class PluginLifecycleManager:
         except Exception as exc:
             self.runtime.mark_degraded("workmode.cron_guard_reload", str(exc))
             logger.warning(f"[AstrMai] Workmode guard reload degraded: {exc}")
-            return
         try:
             self.track_task(self.runtime.cron_guard.run_heartbeat())
             self.runtime.status.cron_guard_started = True

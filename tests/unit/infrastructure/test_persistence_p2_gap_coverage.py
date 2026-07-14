@@ -79,6 +79,26 @@ class PersistenceP2GapCoverageTests(unittest.TestCase):
         self.assertEqual(active_before[0].note, "updated")
         self.assertEqual(active_after, [])
 
+    def test_cron_snapshot_identity_replacement_commits_as_one_state(self):
+        from astrmai.infrastructure.persistence.orm_models import CronSnapshot
+
+        async def _run():
+            await self.persistence.save_cron_snapshot(
+                CronSnapshot(job_id="old-job", name="daily", target_origin="umo", is_active=True)
+            )
+            await self.persistence.replace_cron_snapshot(
+                "old-job",
+                CronSnapshot(job_id="new-job", name="daily", target_origin="umo", is_active=True),
+            )
+
+        asyncio.run(_run())
+
+        with self.persistence.get_session() as session:
+            old_snapshot = session.get(CronSnapshot, "old-job")
+            new_snapshot = session.get(CronSnapshot, "new-job")
+        self.assertFalse(old_snapshot.is_active)
+        self.assertTrue(new_snapshot.is_active)
+
     def test_memory_nodes_reflection_and_retrieval_trace_roundtrip(self):
         from astrmai.infrastructure.persistence.orm_models import MemoryNode, MemoryRetrievalTrace
 

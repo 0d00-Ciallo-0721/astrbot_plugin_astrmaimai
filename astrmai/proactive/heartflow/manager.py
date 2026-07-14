@@ -720,13 +720,12 @@ class HeartflowManager:
         return decision
 
     def _recent_visible_candidate_cooldown(self, chat_id: str, now: float) -> bool:
-        for decision in reversed(self._impulse_decisions_by_chat.get(chat_id, [])):
-            if not decision.visible_candidate_allowed:
-                continue
-            if now - float(decision.timestamp or 0.0) <= self.VISIBLE_CANDIDATE_COOLDOWN_SECONDS:
-                return True
-            return False
-        return False
+        session = self._sessions.get(chat_id)
+        return bool(
+            session
+            and session.last_visible_candidate_ts > 0
+            and now - float(session.last_visible_candidate_ts or 0.0) <= self.VISIBLE_CANDIDATE_COOLDOWN_SECONDS
+        )
 
     def _build_impulse_decision(
         self,
@@ -855,8 +854,16 @@ class HeartflowManager:
                 "time_bucket": decision.safety_checks.get("time_bucket", ""),
             },
         )
+
+        async def _commit_visible_cooldown(reply_sent: bool, _reply_preview: str = "") -> None:
+            if not reply_sent:
+                return
+            session = self._sessions.get(state.chat_id)
+            if session is not None:
+                session.last_visible_candidate_ts = time.time()
+
         try:
-            dispatch_decision = await self.dispatcher.dispatch(intent)
+            dispatch_decision = await self.dispatcher.dispatch(intent, on_complete=_commit_visible_cooldown)
         except Exception as exc:
             decision.visible_candidate_allowed = False
             decision.requires_synthetic_event = False
@@ -959,7 +966,6 @@ class HeartflowManager:
             session.consecutive_prepare_count += 1
             session.consecutive_observe_count = 0
         elif decision.action_type == "proactive_candidate":
-            session.last_visible_candidate_ts = decision.timestamp
             session.consecutive_observe_count = 0
             session.consecutive_no_reply_count = 0
             session.consecutive_prepare_count = 0

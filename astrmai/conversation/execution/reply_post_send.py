@@ -248,10 +248,17 @@ class ReplyPostSendMixin:
         if tag and tag != "neutral":
             final_prob = 100 if force_meme_flag else self.meme_probability
             global_context = getattr(self.state_engine.gateway, "context", None)
-            await send_meme(
-                event=event,
-                emotion_tag=tag,
-                probability=final_prob,
-                memes_dir=MEMES_DIR,
-                context=global_context,
-            )
+            try:
+                await send_meme(
+                    event=event,
+                    emotion_tag=tag,
+                    probability=final_prob,
+                    memes_dir=MEMES_DIR,
+                    context=global_context,
+                )
+            except Exception as exc:
+                logger.warning(f"[ReplyService] optional meme send degraded: {exc}")
+                try:
+                    event.set_extra("astrmai_meme_send_degraded", True)
+                except Exception:
+                    pass

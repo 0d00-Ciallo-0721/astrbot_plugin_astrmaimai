@@ -79,6 +79,35 @@ class MemeServiceRefactorTests(unittest.TestCase):
         self.assertEqual(sent[0][0], "group-1")
         self.assertTrue(sent[0][1])
 
+    def test_send_meme_adapter_failure_is_best_effort(self):
+        memes_dir = Path(self.temp_dir.name) / "happy"
+        memes_dir.mkdir(parents=True, exist_ok=True)
+        (memes_dir / "a.png").write_bytes(b"fake")
+        extras = {}
+
+        class _Event:
+            unified_msg_origin = "group-1"
+
+            def set_extra(self, key, value):
+                extras[key] = value
+
+        class _Context:
+            async def send_message(self, _origin, _chain):
+                raise RuntimeError("adapter unavailable")
+
+        result = asyncio.run(
+            self.sender_mod.send_meme(
+                event=_Event(),
+                emotion_tag="happy",
+                probability=100,
+                memes_dir=Path(self.temp_dir.name),
+                context=_Context(),
+            )
+        )
+
+        self.assertFalse(result)
+        self.assertTrue(extras["astrmai_meme_send_degraded"])
+
 
 if __name__ == "__main__":
     unittest.main()

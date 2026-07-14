@@ -103,7 +103,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
         class _Db:
             def execute(self, query):
-                if "UserProfile" in query:
+                if "user_profiles" in query:
                     return _Cursor(3)
                 if "FROM canonical_memories" in query and "status, metadata" in query:
                     return _Cursor(
@@ -417,8 +417,8 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(detail["data"]["id"], "mem-ui-1")
         self.assertTrue(deleted["changed"])
         self.assertEqual(legacy_event["mode"], "canonical_redirect")
-        self.assertTrue(legacy_rows[0]["legacy"])
-        self.assertEqual(legacy_rows[0]["canonical_id"], "mem-ui-1")
+        self.assertTrue(any(item["legacy"] for item in legacy_rows))
+        self.assertTrue(any(not item["legacy"] and item["id"] == legacy_event["canonical_id"] for item in legacy_rows))
         self.assertEqual(legacy_delete["mode"], "canonical_soft_delete")
 
     def test_memory_ui_service_runtime_bound_canonical_actions_use_services_not_sql_fallback(self):
@@ -2328,7 +2328,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             async def run():
                 db = await aiosqlite.connect(db_path)
                 try:
-                    await db.execute("CREATE TABLE UserProfile (id TEXT)")
+                    await db.execute("CREATE TABLE user_profiles (id TEXT)")
                     await db.execute("CREATE TABLE MemoryEvent (id TEXT)")
                     await db.execute("CREATE TABLE canonical_memories (id TEXT)")
                     await db.commit()
@@ -2345,12 +2345,12 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
                 repo = repo_mod.DashboardRepository(db_factory)
                 counts = [
-                    await repo.count_table("UserProfile"),
+                    await repo.count_table("user_profiles"),
                     await repo.count_table("MemoryEvent"),
                     await repo.count_table("canonical_memories"),
                 ]
                 with self.assertRaises(ValueError):
-                    await repo.count_table("UserProfile; DROP TABLE MemoryEvent")
+                    await repo.count_table("user_profiles; DROP TABLE MemoryEvent")
                 return counts
 
             self.assertEqual(asyncio.run(run()), [0, 0, 0])

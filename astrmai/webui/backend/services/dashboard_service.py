@@ -48,6 +48,8 @@ class DashboardService:
         degraded: dict[str, str] = {}
         try:
             counts = await self._repo.snapshot_counts()
+            count_errors = dict(counts.pop("_degraded", {}) or {})
+            degraded.update({f"counts.{key}": value for key, value in count_errors.items()})
         except Exception as exc:
             counts = {}
             degraded["counts"] = str(exc)

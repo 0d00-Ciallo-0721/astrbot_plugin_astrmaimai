@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.original_ported.helpers import _install_astrbot_stubs
 from tests.helpers.reply_engine_stubs import install_reply_engine_stubs
@@ -115,6 +116,28 @@ class ReplyEngineOutputGuardPortedTests(unittest.TestCase):
         self.assertNotIn("[RollingSummary]", sent_text)
         self.assertIn("hmm", sent_text)
         self.assertIn("Do not be sad", sent_text)
+
+    def test_optional_meme_failure_does_not_change_successful_text_reply(self):
+        async def _raise_meme_error(**_kwargs):
+            raise RuntimeError("meme adapter unavailable")
+
+        state_engine = _FakeStateEngine()
+        service = self.reply_mod.ReplyService(state_engine=state_engine, mood_manager=SimpleNamespace())
+        event = _FakeEvent(text="hello")
+
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=_raise_meme_error):
+            artifact = asyncio.run(
+                service.handle_reply(
+                    event,
+                    "A normal successful reply.",
+                    event.unified_msg_origin,
+                    bypassed_tag="happy",
+                )
+            )
+
+        self.assertEqual(artifact.metadata["send_status"], "sent")
+        self.assertEqual(len(state_engine.gateway.context.sent), 1)
+        self.assertTrue(event.get_extra("astrmai_meme_send_degraded"))
 
 
 if __name__ == "__main__":

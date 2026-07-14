@@ -18,6 +18,8 @@ class CronHeartbeatGuard:
         self.db_service = db_service
         self.context = context
         self._is_running = True
+        self._revival_lock = asyncio.Lock()
+        self._pending_snapshot_swaps: dict[str, str] = {}
 
     async def reload_all_lost_jobs(self) -> int:
         cron_mgr = getattr(self.context, "cron_manager", None)
@@ -42,6 +44,21 @@ class CronHeartbeatGuard:
                 if not snap.job_id or not str(snap.job_id).strip():
                     continue
                 if snap.job_id not in active_job_ids:
+                    pending_job_id = self._pending_snapshot_swaps.get(str(snap.job_id), "")
+                    if pending_job_id and pending_job_id in active_job_ids:
+                        await self._sync_revived_snapshot(
+                            snap,
+                            payload=self._decode_payload(getattr(snap, "payload", {})),
+                            run_at=self._resolve_run_at(snap, self._decode_payload(getattr(snap, "payload", {}))),
+                            new_job_id=pending_job_id,
+                        )
+                        self._pending_snapshot_swaps.pop(str(snap.job_id), None)
+                        continue
+                    if pending_job_id:
+                        self._pending_snapshot_swaps.pop(str(snap.job_id), None)
+                    existing_job = self._find_matching_host_job(snap, active_jobs)
+                    if existing_job is not None and await self._reconcile_existing_host_job(snap, existing_job):
+                        continue
                     logger.info(
                         f"[CronGuard] reviving job '{snap.name}' "
                         f"from session '{getattr(snap, 'target_origin', '')}' (id={snap.job_id})"
@@ -102,28 +119,107 @@ class CronHeartbeatGuard:
                 if not snap.job_id or not str(snap.job_id).strip():
                     continue
                 if snap.job_id not in active_job_ids:
+                    pending_job_id = self._pending_snapshot_swaps.get(str(snap.job_id), "")
+                    if pending_job_id and pending_job_id in active_job_ids:
+                        await self._sync_revived_snapshot(
+                            snap,
+                            payload=self._decode_payload(getattr(snap, "payload", {})),
+                            run_at=self._resolve_run_at(snap, self._decode_payload(getattr(snap, "payload", {}))),
+                            new_job_id=pending_job_id,
+                        )
+                        self._pending_snapshot_swaps.pop(str(snap.job_id), None)
+                        continue
+                    if pending_job_id:
+                        self._pending_snapshot_swaps.pop(str(snap.job_id), None)
+                    existing_job = self._find_matching_host_job(snap, active_jobs)
+                    if existing_job is not None and await self._reconcile_existing_host_job(snap, existing_job):
+                        continue
                     await self._revive_job(cron_mgr, snap)
             except Exception as exc:
                 logger.error(f"[CronGuard] heartbeat restore failed for '{getattr(snap, 'job_id', '')}': {exc}")
 
     async def _revive_job(self, cron_mgr, snap) -> bool:
+        async with self._revival_lock:
+            payload = self._decode_payload(getattr(snap, "payload", {}))
+            run_at = self._resolve_run_at(snap, payload)
+            add_method = getattr(cron_mgr, "add_active_job", None) or getattr(cron_mgr, "add_basic_job", None)
+            if add_method is None:
+                return False
+
+            result, id_hint_used = await self._call_add_job(
+                add_method,
+                snap=snap,
+                payload=payload,
+                run_at=run_at,
+            )
+            new_job_id = self._extract_job_id(result)
+            if not new_job_id and id_hint_used:
+                new_job_id = str(snap.job_id)
+            old_job_id = str(getattr(snap, "job_id", "") or "")
+            if new_job_id:
+                self._pending_snapshot_swaps[old_job_id] = new_job_id
+            try:
+                await self._sync_revived_snapshot(snap, payload=payload, run_at=run_at, new_job_id=new_job_id)
+            except Exception:
+                if new_job_id:
+                    removed = await self._remove_host_job(cron_mgr, new_job_id)
+                    if removed:
+                        self._pending_snapshot_swaps.pop(old_job_id, None)
+                raise
+            self._pending_snapshot_swaps.pop(old_job_id, None)
+            return True
+
+    @classmethod
+    def _find_matching_host_job(cls, snap, active_jobs):
+        expected_name = str(getattr(snap, "name", "") or "").strip()
+        if not expected_name:
+            return None
+        expected_payload = cls._decode_payload(getattr(snap, "payload", {}))
+        expected_cron = getattr(snap, "cron_expression", None)
+        matches = []
+        for job in active_jobs or []:
+            name = str(getattr(job, "name", "") or "").strip()
+            raw_payload = getattr(job, "payload", None)
+            if name != expected_name or raw_payload is None or not cls._extract_job_id(job):
+                continue
+            if cls._decode_payload(raw_payload) != expected_payload:
+                continue
+            actual_cron = getattr(job, "cron_expression", None)
+            if expected_cron is not None and actual_cron is not None and actual_cron != expected_cron:
+                continue
+            matches.append(job)
+        return matches[0] if len(matches) == 1 else None
+
+    async def _reconcile_existing_host_job(self, snap, existing_job) -> bool:
+        existing_job_id = self._extract_job_id(existing_job)
+        if not existing_job_id:
+            return False
         payload = self._decode_payload(getattr(snap, "payload", {}))
         run_at = self._resolve_run_at(snap, payload)
-        add_method = getattr(cron_mgr, "add_active_job", None) or getattr(cron_mgr, "add_basic_job", None)
-        if add_method is None:
-            return False
-
-        result, id_hint_used = await self._call_add_job(
-            add_method,
-            snap=snap,
+        await self._sync_revived_snapshot(
+            snap,
             payload=payload,
             run_at=run_at,
+            new_job_id=existing_job_id,
         )
-        new_job_id = self._extract_job_id(result)
-        if not new_job_id and id_hint_used:
-            new_job_id = str(snap.job_id)
-        await self._sync_revived_snapshot(snap, payload=payload, run_at=run_at, new_job_id=new_job_id)
         return True
+
+    @staticmethod
+    async def _remove_host_job(cron_mgr, job_id: str) -> bool:
+        remover = getattr(cron_mgr, "delete_job", None) or getattr(cron_mgr, "remove_job", None)
+        if remover is None:
+            logger.error(f"[CronGuard] cannot compensate host job {job_id}: delete API unavailable")
+            return False
+        try:
+            result = remover(job_id)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is False:
+                return False
+            return True
+        except Exception as exc:
+            logger.error(f"[CronGuard] failed to compensate host job {job_id}: {exc}")
+            return False
 
     @staticmethod
     def _decode_payload(payload) -> dict:
@@ -186,23 +282,26 @@ class CronHeartbeatGuard:
     async def _sync_revived_snapshot(self, snap, *, payload: dict, run_at, new_job_id: str) -> None:
         old_job_id = str(getattr(snap, "job_id", "") or "")
         if new_job_id and hasattr(self.db_service, "save_cron_snapshot"):
-            if new_job_id != old_job_id and hasattr(self.db_service, "deactivate_cron_snapshot"):
-                await self.db_service.deactivate_cron_snapshot(old_job_id)
             from ...infrastructure.persistence.orm_models import CronSnapshot
 
-            await self.db_service.save_cron_snapshot(
-                CronSnapshot(
-                    job_id=new_job_id,
-                    name=getattr(snap, "name", ""),
-                    cron_expression=getattr(snap, "cron_expression", None),
-                    run_at=run_at.timestamp() if run_at else None,
-                    run_once=bool(getattr(snap, "run_once", False)),
-                    target_origin=str(getattr(snap, "target_origin", "") or ""),
-                    payload=json.dumps(payload, ensure_ascii=False),
-                    note="revived by CronHeartbeatGuard",
-                    is_active=True,
-                )
+            replacement = CronSnapshot(
+                job_id=new_job_id,
+                name=getattr(snap, "name", ""),
+                cron_expression=getattr(snap, "cron_expression", None),
+                run_at=run_at.timestamp() if run_at else None,
+                run_once=bool(getattr(snap, "run_once", False)),
+                target_origin=str(getattr(snap, "target_origin", "") or ""),
+                payload=json.dumps(payload, ensure_ascii=False),
+                note="revived by CronHeartbeatGuard",
+                is_active=True,
             )
+            replace_snapshot = getattr(self.db_service, "replace_cron_snapshot", None)
+            if callable(replace_snapshot):
+                await replace_snapshot(old_job_id, replacement)
+            else:
+                if new_job_id != old_job_id and hasattr(self.db_service, "deactivate_cron_snapshot"):
+                    await self.db_service.deactivate_cron_snapshot(old_job_id)
+                await self.db_service.save_cron_snapshot(replacement)
             return
         if old_job_id and hasattr(self.db_service, "deactivate_cron_snapshot"):
             await self.db_service.deactivate_cron_snapshot(old_job_id)

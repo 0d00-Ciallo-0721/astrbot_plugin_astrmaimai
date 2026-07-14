@@ -8,7 +8,7 @@ from typing import Any, Callable
 class DashboardRepository:
     """Encapsulates raw SQL queries for dashboard data."""
 
-    _COUNT_TABLE_WHITELIST = frozenset({"UserProfile", "MemoryEvent", "canonical_memories"})
+    _COUNT_TABLE_WHITELIST = frozenset({"user_profiles", "MemoryEvent", "canonical_memories"})
 
     def __init__(self, db_factory: Callable):
         self.db_factory = db_factory
@@ -16,27 +16,21 @@ class DashboardRepository:
     async def count_table(self, table: str) -> int:
         if table not in self._COUNT_TABLE_WHITELIST:
             raise ValueError(f"Table {table!r} is not in the allowed whitelist")
-        try:
-            async with self.db_factory() as db:
-                async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
-                    row = await cursor.fetchone()
-                    return int(row[0] if row else 0)
-        except sqlite3.OperationalError:
-            return 0
+        async with self.db_factory() as db:
+            async with db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
+                row = await cursor.fetchone()
+                return int(row[0] if row else 0)
 
     async def count_pending_expression_reviews(self) -> int:
-        try:
-            async with self.db_factory() as db:
-                async with db.execute(
-                    """
-                    SELECT status, metadata
-                    FROM canonical_memories
-                    WHERE kind = 'expression_pattern'
-                    """
-                ) as cursor:
-                    rows = await cursor.fetchall()
-        except sqlite3.OperationalError:
-            return 0
+        async with self.db_factory() as db:
+            async with db.execute(
+                """
+                SELECT status, metadata
+                FROM canonical_memories
+                WHERE kind = 'expression_pattern'
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
         count = 0
         for row in rows:
             status = str(row[0] or "").strip().lower()
@@ -76,14 +70,27 @@ class DashboardRepository:
                 stats["rejected"] += 1
         return stats["total"], stats["pending"], stats["approved"], stats["rejected"]
 
-    async def snapshot_counts(self) -> dict[str, int]:
+    async def snapshot_counts(self) -> dict[str, Any]:
         """Return {total_users, total_memory_events, total_canonical_memories, pending_reviews}."""
-        return {
-            "total_users": await self.count_table("UserProfile"),
-            "total_memory_events": await self.count_table("MemoryEvent"),
-            "total_canonical_memories": await self.count_table("canonical_memories"),
-            "pending_reviews": await self.count_pending_expression_reviews(),
-        }
+        result: dict[str, Any] = {}
+        degraded: dict[str, str] = {}
+        for key, table in (
+            ("total_users", "user_profiles"),
+            ("total_memory_events", "MemoryEvent"),
+            ("total_canonical_memories", "canonical_memories"),
+        ):
+            try:
+                result[key] = await self.count_table(table)
+            except sqlite3.OperationalError as exc:
+                result[key] = None
+                degraded[key] = str(exc)
+        try:
+            result["pending_reviews"] = await self.count_pending_expression_reviews()
+        except sqlite3.OperationalError as exc:
+            result["pending_reviews"] = None
+            degraded["pending_reviews"] = str(exc)
+        result["_degraded"] = degraded
+        return result
 
 
 __all__ = ["DashboardRepository"]

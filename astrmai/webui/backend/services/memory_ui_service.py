@@ -158,16 +158,27 @@ class MemoryUiService:
         )
 
     async def list_events(self):
+        canonical = await self.list_canonical(kind="event", limit=100)
+        canonical_items = []
+        canonical_ids: set[str] = set()
+        for row in list(canonical.get("items", []) or []):
+            item = dict(row)
+            item["legacy"] = False
+            item["canonical_id"] = str(item.get("id") or "")
+            canonical_ids.add(item["canonical_id"])
+            canonical_items.append(item)
         async with self.db_factory() as db:
             async with db.execute("SELECT * FROM MemoryEvent ORDER BY id DESC LIMIT 100") as cursor:
                 rows = await cursor.fetchall()
-                items = []
+                legacy_items = []
                 for row in rows:
                     item = dict(row)
                     item["legacy"] = True
                     item["canonical_id"] = self._extract_canonical_id(item)
-                    items.append(item)
-                return items
+                    if item["canonical_id"] and item["canonical_id"] in canonical_ids:
+                        continue
+                    legacy_items.append(item)
+                return (canonical_items + legacy_items)[:100]
 
     @staticmethod
     def _extract_canonical_id(item: dict) -> str:
@@ -552,7 +563,7 @@ class MemoryUiService:
             tags = [item.strip() for item in tags.split(",") if item.strip()]
         request = MemoryWriteRequest(
             source=str(data.get("source_layer") or "webui_legacy_event"),
-            kind=str(data.get("memory_kind") or "event"),
+            kind="event",
             session_id=str(data.get("session_id") or "PLUGIN_PAGE_SMOKE"),
             content=content,
             summary=content[:240],
@@ -628,10 +639,15 @@ class MemoryUiService:
                     "message": "Legacy MemoryEvent writes are disabled; canonical runtime is unavailable.",
                 }
 
-    async def delete_event(self, event_id: int) -> dict[str, object]:
+    async def delete_event(self, event_id: str | int) -> dict[str, object]:
+        raw_event_id = str(event_id or "").strip()
+        if raw_event_id and not raw_event_id.isdigit():
+            result = await self.delete_canonical(raw_event_id)
+            result.update({"legacy": False, "mode": "canonical_soft_delete"})
+            return result
         async with self.db_factory() as db:
             try:
-                async with db.execute("SELECT * FROM MemoryEvent WHERE id = ?", (event_id,)) as cursor:
+                async with db.execute("SELECT * FROM MemoryEvent WHERE id = ?", (int(raw_event_id or 0),)) as cursor:
                     row = await cursor.fetchone()
                 item = dict(row) if row else {}
             except Exception:

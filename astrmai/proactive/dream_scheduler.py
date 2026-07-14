@@ -18,6 +18,7 @@ class DreamScheduler:
         self.promotion_engine = None
         self._db_service = None
         self._last_dream_time = 0.0
+        self._pending_completions: dict[str, dict] = {}
         self._dream_interval = getattr(getattr(config, "life", None), "dream_interval_min", 30) * 60
 
     def refresh_config(self, config) -> None:
@@ -83,11 +84,20 @@ class DreamScheduler:
         if not self.dream_agent or not self.dream_generator:
             return {"performed": False, "reason": "dependencies_unavailable", "session_id": str(session_id or ""), "throttle_scope": "global"}
         async with self._bg_semaphore:
-            # ponytail: R2 — throttle check inside semaphore to prevent concurrent bypass
+            # Keep the throttle check inside semaphore so concurrent sessions cannot bypass it.
+            request_key = str(session_id or "__global__")
+            pending = self._pending_completions.get(request_key)
+            if pending is None and self._pending_completions:
+                return {
+                    "performed": False,
+                    "reason": "dream_completion_pending",
+                    "session_id": str(session_id or ""),
+                    "throttle_scope": "global",
+                }
             now_ts = time.time()
-            if now_ts - self._last_dream_time < self._dream_interval:
+            if pending is None and now_ts - self._last_dream_time < self._dream_interval:
                 return {"performed": False, "reason": "dream_global_cooldown", "session_id": str(session_id or ""), "throttle_scope": "global"}
-            if session_id:
+            if pending is None and session_id:
                 eligibility = self.describe_session_eligibility(session_id, time.time())
                 if not eligibility.get("eligible", False):
                     return {
@@ -96,73 +106,120 @@ class DreamScheduler:
                         "session_id": str(eligibility.get("session_id", session_id) or ""),
                         "throttle_scope": "global",
                     }
-            min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
-            _original_min_events = self.dream_agent.MIN_EVENTS_TO_DREAM
-            try:
-                self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
-                dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
-            finally:
-                self.dream_agent.MIN_EVENTS_TO_DREAM = _original_min_events
-            if not dream_log:
-                return {"performed": False, "reason": "no_dream_log", "session_id": str(session_id or ""), "throttle_scope": "global"}
-
-            if not session_id:
-                session_id = getattr(self.dream_agent, "_last_session_id", "global")
-            persona_name = getattr(getattr(self.config, "persona", None), "name", "Mai")
-            dream_text = await self.dream_generator.generate(
-                dream_log=dream_log,
-                persona_name=persona_name,
-                session_id=session_id,
-            )
-            maintenance = self.dream_generator.build_maintenance_result(dream_log, session_id=session_id)
-            promotion_report = {}
-            if self.promotion_engine is not None and hasattr(self.promotion_engine, "run_audit"):
+            if pending is None:
+                min_events = getattr(self.config.life, "min_memory_events_to_dream", getattr(self.dream_agent, "MIN_EVENTS_TO_DREAM", 5))
+                original_min_events = self.dream_agent.MIN_EVENTS_TO_DREAM
                 try:
-                    promotion_report = await self.promotion_engine.run_audit(str(session_id or ""), maintenance)
-                except Exception as exc:
-                    logger.debug(f"[DreamScheduler] promotion audit degraded: {exc}")
+                    self.dream_agent.MIN_EVENTS_TO_DREAM = min_events
+                    dream_log = await self.dream_agent.run_dream_cycle(session_id=session_id)
+                finally:
+                    self.dream_agent.MIN_EVENTS_TO_DREAM = original_min_events
+                if not dream_log:
+                    return {"performed": False, "reason": "no_dream_log", "session_id": str(session_id or ""), "throttle_scope": "global"}
 
-            if self.memory_engine and hasattr(self.memory_engine, "record_cognitive_feedback"):
+                resolved_session_id = str(session_id or getattr(self.dream_agent, "_last_session_id", "global") or "global")
+                persona_name = getattr(getattr(self.config, "persona", None), "name", "Mai")
+                dream_text = await self.dream_generator.generate(
+                    dream_log=dream_log,
+                    persona_name=persona_name,
+                    session_id=resolved_session_id,
+                )
+                maintenance = self.dream_generator.build_maintenance_result(dream_log, session_id=resolved_session_id)
+                promotion_report = {}
+                if self.promotion_engine is not None and hasattr(self.promotion_engine, "run_audit"):
+                    try:
+                        promotion_report = await self.promotion_engine.run_audit(resolved_session_id, maintenance)
+                    except Exception as exc:
+                        logger.debug(f"[DreamScheduler] promotion audit degraded: {exc}")
+                pending = {
+                    "session_id": resolved_session_id,
+                    "dream_text": str(dream_text or ""),
+                    "maintenance": maintenance,
+                    "promotion_report": promotion_report,
+                    "feedback_done": not bool(self.memory_engine and hasattr(self.memory_engine, "record_cognitive_feedback")),
+                    "diary_memory_done": not bool(dream_text and self.memory_engine and hasattr(self.memory_engine, "add_memory")),
+                    "maintenance_memory_done": not bool(dream_text and self.memory_engine and hasattr(self.memory_engine, "add_memory")),
+                    "visible_send_done": not bool(dream_text and self.dream_visible),
+                }
+                self._pending_completions[request_key] = pending
+
+            session_id = str(pending["session_id"])
+            dream_text = str(pending["dream_text"] or "")
+            maintenance = dict(pending["maintenance"] or {})
+            failures: list[str] = []
+
+            if not pending["feedback_done"]:
                 try:
                     await self.memory_engine.record_cognitive_feedback(
-                        session_id=str(session_id),
+                        session_id=session_id,
                         source="dream",
                         summary=str(maintenance.get("summary", "") or ""),
                         guidance=self._maintenance_guidance(maintenance.get("tags", [])),
                         tags=list(maintenance.get("tags", []) or []),
                         importance=0.6,
                     )
+                    pending["feedback_done"] = True
                 except Exception as exc:
-                    logger.debug(f"[DreamScheduler] feedback write-back degraded: {exc}")
+                    failures.append("feedback")
+                    logger.warning(f"[DreamScheduler] feedback write-back degraded: {exc}")
 
-            if dream_text and self.memory_engine and hasattr(self.memory_engine, "add_memory"):
+            if not pending["diary_memory_done"]:
                 try:
                     await self.memory_engine.add_memory(
                         content=f"[梦境日记] {dream_text}",
                         session_id="__dream_diary__",
                         importance=0.5,
                     )
+                    pending["diary_memory_done"] = True
+                except Exception as exc:
+                    failures.append("diary_memory")
+                    logger.warning(f"[DreamScheduler] diary write-back degraded: {exc}")
+
+            if not pending["maintenance_memory_done"]:
+                try:
                     await self.memory_engine.add_memory(
                         content=f"[dream_maintenance] {maintenance['summary']}",
-                        session_id=str(session_id),
+                        session_id=session_id,
                         importance=0.65,
                     )
+                    pending["maintenance_memory_done"] = True
                 except Exception as exc:
-                    logger.debug(f"[DreamScheduler] memory write-back degraded: {exc}")
+                    failures.append("maintenance_memory")
+                    logger.warning(f"[DreamScheduler] maintenance write-back degraded: {exc}")
 
-            if dream_text and self.dream_visible:
+            if not pending["visible_send_done"]:
                 target = getattr(self.config.life, "dream_send_target", "") or session_id
                 try:
                     await self.context.send_message(target, MessageChain().message(dream_text))
+                    pending["visible_send_done"] = True
                 except Exception as exc:
+                    failures.append("visible_send")
                     logger.warning(f"[DreamScheduler] dream push degraded: {exc}")
+
+            stage_status = {
+                key: bool(pending[key])
+                for key in ("feedback_done", "diary_memory_done", "maintenance_memory_done", "visible_send_done")
+            }
+            if not all(stage_status.values()):
+                return {
+                    "performed": False,
+                    "degraded": True,
+                    "reason": "dream_completion_incomplete",
+                    "failures": failures,
+                    "stage_status": stage_status,
+                    "session_id": session_id,
+                    "throttle_scope": "global",
+                }
+
+            self._pending_completions.pop(request_key, None)
             self._last_dream_time = time.time()
             return {
                 "performed": True,
-                "session_id": str(session_id or ""),
+                "session_id": session_id,
                 "dream_visible": bool(dream_text and self.dream_visible),
                 "summary": str(maintenance.get("summary", "") or ""),
-                "promotion_report": promotion_report,
+                "promotion_report": pending["promotion_report"],
+                "stage_status": stage_status,
                 "throttle_scope": "global",
             }
 
@@ -224,6 +281,7 @@ class DreamScheduler:
             "last_dream_time": self._last_dream_time,
             "dream_agent_bound": self.dream_agent is not None,
             "dream_generator_bound": self.dream_generator is not None,
+            "pending_completions": len(self._pending_completions),
             "throttle_scope": "global",
         }
 

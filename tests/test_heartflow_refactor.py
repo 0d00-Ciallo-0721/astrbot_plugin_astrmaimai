@@ -212,7 +212,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             def __init__(self):
                 self.intents = []
 
-            async def dispatch(self, intent):
+            async def dispatch(self, intent, *, on_complete=None):
                 self.intents.append(intent)
                 return SimpleNamespace(allowed=True, synthetic_event_queued=True, safety_checks={})
 
@@ -497,7 +497,7 @@ class HeartflowRefactorTests(unittest.TestCase):
             def __init__(self):
                 self.intents = []
 
-            async def dispatch(self, intent):
+            async def dispatch(self, intent, *, on_complete=None):
                 self.intents.append(intent)
                 return SimpleNamespace(
                     allowed=True,
@@ -652,14 +652,7 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertFalse(waiting.visible_candidate_allowed)
         self.assertEqual(waiting.blocked_reason, "user_waiting")
 
-        manager._remember_impulse_decision(
-            self.heartflow_mod.HeartflowImpulseDecision(
-                chat_id="chat-1",
-                timestamp=now - 120,
-                pulse_type="proactive_hint",
-                visible_candidate_allowed=True,
-            )
-        )
+        session.last_visible_candidate_ts = now - 120
         cooldown = manager._build_impulse_decision(
             session,
             state,
@@ -906,6 +899,70 @@ class HeartflowRefactorTests(unittest.TestCase):
         self.assertIsNotNone(decision)
         self.assertIn("Heartflow state", gateway.calls[0]["prompt"])
         self.assertIn("join carefully", gateway.calls[0]["prompt"])
+
+    def test_visible_candidate_cooldown_commits_only_after_reply_sent(self):
+        class _Dispatcher:
+            callback = None
+
+            async def dispatch(self, _intent, *, on_complete=None):
+                self.callback = on_complete
+                return SimpleNamespace(
+                    allowed=True,
+                    synthetic_event_queued=True,
+                    intent_id="intent-1",
+                    blocked_reason="",
+                    safety_checks={},
+                )
+
+        dispatcher = _Dispatcher()
+        manager = self.heartflow_mod.HeartflowManager(dispatcher=dispatcher)
+        now = time.time()
+        session = self.heartflow_mod.HeartflowSessionState(
+            chat_id="chat-1",
+            started_at=now - 10,
+            last_activity_ts=now - 5,
+            last_tick_ts=now,
+            expires_at=now + 60,
+        )
+        manager._sessions["chat-1"] = session
+        state = self.heartflow_mod.HeartflowChatState(
+            chat_id="chat-1",
+            last_tick_ts=now,
+            last_activity_ts=now - 5,
+            interest=0.9,
+            engagement=0.8,
+            talk_willingness=0.9,
+            silence_pressure=0.9,
+            fatigue=0.1,
+            mood_bias=0.2,
+            current_focus="active topic",
+            recent_impulse="proactive_hint",
+        )
+        pulse = self.heartflow_mod.HeartflowPulse(
+            chat_id="chat-1",
+            timestamp=now,
+            pulse_type="proactive_hint",
+            reason="eligible",
+            guidance="reply lightly",
+            suggested_social_intent="join",
+            suggested_action_tier="chat",
+            urgency=0.9,
+        )
+        decision = self.heartflow_mod.HeartflowImpulseDecision(
+            chat_id="chat-1",
+            timestamp=now,
+            pulse_type="proactive_hint",
+            visible_candidate_allowed=True,
+            requires_synthetic_event=True,
+            hidden_only=False,
+        )
+
+        asyncio.run(manager._maybe_dispatch_visible_candidate(state, pulse, decision))
+        self.assertEqual(session.last_visible_candidate_ts, 0.0)
+        asyncio.run(dispatcher.callback(False, ""))
+        self.assertEqual(session.last_visible_candidate_ts, 0.0)
+        asyncio.run(dispatcher.callback(True, "sent"))
+        self.assertGreater(session.last_visible_candidate_ts, 0.0)
 
 
 if __name__ == "__main__":

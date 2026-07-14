@@ -114,11 +114,11 @@ function asItems(value) {
 }
 
 function schedulerReport() {
-  return state.schedulerDueSelection?.data?.report || {};
+  return state.schedulerDueSelection?.report || {};
 }
 
 function schedulerOverview() {
-  return state.schedulerStatus?.data?.overview || {};
+  return state.schedulerStatus?.overview || {};
 }
 
 function observabilityTimelinePath() {
@@ -188,6 +188,9 @@ function apiErrorMessage(payload) {
 function unwrapResponse(result) {
   if (result && (result.status === "error" || result.ok === false)) {
     throw new Error(apiErrorMessage(result));
+  }
+  if (result && Object.prototype.hasOwnProperty.call(result, "data") && (result.status || "runtime_bound" in result)) {
+    return result.data;
   }
   return result;
 }
@@ -479,9 +482,9 @@ async function renderDashboardOverview() {
     safeFetch(() => api.get("/cognition/observability/overview"), {}),
   ]);
   state.observabilityOverview = observabilityOverview;
-  const healthData = health.data || {};
+  const healthData = health || {};
   const running = Boolean(healthData.running);
-  const obs = observabilityOverview.data || {};
+  const obs = observabilityOverview || {};
   const obsSnapshot = obs.snapshot || {};
   dashboardShell(`
     <div class="health-strip ${running ? "ok" : "warn"}">
@@ -495,11 +498,11 @@ async function renderDashboardOverview() {
       ${metric("总用户数", snapshot.total_users)}
       ${metric("待审核项", snapshot.pending_reviews)}
       ${metric("记忆事件", snapshot.total_memory_events)}
-      ${metric("数据库大小", snapshot.database_size || "-")}
+      ${metric("数据库大小", `${snapshot.db_size_kb ?? 0} KB`)}
     </div>
     <div class="grid two">
-      ${section("能力矩阵", "Capabilities", `<pre>${json(capabilities.data || capabilities)}</pre>`)}
-      ${section("模型与健康诊断", "Models / Health", `<pre>${json({ models: models.data || models, health: healthData })}</pre>`)}
+      ${section("能力矩阵", "Capabilities", `<pre>${json(capabilities)}</pre>`)}
+      ${section("模型与健康诊断", "Models / Health", `<pre>${json({ models, health: healthData })}</pre>`)}
     </div>
     ${section("Observability Overview", "统一观测摘要与最近异常。", `
       <div class="grid">
@@ -598,7 +601,7 @@ async function renderDashboardHeartflow() {
   `;
   });
   dashboardShell(`
-    ${section("心智流状态", "Heartflow manager describe_status()", `<pre>${json(status.data || status)}</pre>`)}
+    ${section("心智流状态", "Heartflow manager describe_status()", `<pre>${json(status)}</pre>`)}
     ${section("Heartflow Sessions", "Session / Rhythm / Hidden Action", table(["Chat", "Talk", "Interest", "Silence", "Hidden Action", "Session", "Talk Freq", "Insert", "Reply", "Score", "Topic", "Rhythm", "Cooldowns", "操作"], rows))}
   `);
   content().insertAdjacentHTML("beforeend", section("Impulse Safety", "Heartflow impulse safety decisions: v1 only records candidate state; dispatch_enabled=false means no visible message is sent.", table(["Time", "Chat", "Pulse", "Candidate", "Synthetic", "Dispatch", "Queued", "Safety"], impulseRows)));
@@ -607,7 +610,7 @@ async function renderDashboardHeartflow() {
   content().insertAdjacentHTML("beforeend", section("topic-digests", "HeartflowTopicDigest 写入 cognitive feedback 的记录与跳过原因。", table(["Time", "Chat", "Status", "Summary", "Tags", "Importance"], digestRows)));
   $$('[data-hidden-context]').forEach((button) => button.addEventListener("click", async () => {
     const result = await api.get(`/heartflow/chats/${segment(button.dataset.hiddenContext)}/hidden-context`);
-    openModal("Heartflow Hidden Context", `<pre>${json(result.data || result)}</pre>`);
+    openModal("Heartflow Hidden Context", `<pre>${json(result)}</pre>`);
   }));
   $$('[data-heartflow-impulses]').forEach((button) => button.addEventListener("click", async () => {
     const chatId = button.dataset.heartflowImpulses;
@@ -668,7 +671,7 @@ function renderSchedulerDiagnosticsSection() {
   const overview = schedulerOverview();
   const report = schedulerReport();
   const selected = asItems(report.selected).slice(0, 6);
-  const chatData = state.schedulerChatLoop?.data || {};
+  const chatData = state.schedulerChatLoop || {};
   const emptyState = chatData.state_present === false
     ? `<div class="empty-state compact"><p>暂无 loop state。该 chat 尚未进入 scheduler 跟踪。</p></div>`
     : "";
@@ -680,7 +683,7 @@ function renderSchedulerDiagnosticsSection() {
     "Chat Loop Kernel 在 AstrBot 插件页内的调度摘要、批次配额与单 chat 诊断。",
     `
       <div class="grid">
-        ${metric("Profile", state.schedulerStatus?.data?.scheduler_policy?.active_profile || "balanced")}
+        ${metric("Profile", state.schedulerStatus?.scheduler_policy?.active_profile || "balanced")}
         ${metric("Poll Mode", overview.scheduler_poll_mode || "-")}
         ${metric("Poll Interval", overview.scheduler_poll_interval ?? 0)}
         ${metric("Due Chats", overview.due_chat_count ?? 0)}
@@ -690,12 +693,12 @@ function renderSchedulerDiagnosticsSection() {
       <div class="grid two">
         ${section("Batch / Backpressure", "", `
           <div class="chip-row">
-            ${statusChip(`busy_backpressure: ${state.schedulerStatus?.data?.proactive?.busy_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.data?.proactive?.busy_backpressure_active ? "warn" : "ok")}
-            ${statusChip(`maintenance_backpressure: ${state.schedulerStatus?.data?.proactive?.maintenance_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.data?.proactive?.maintenance_backpressure_active ? "warn" : "ok")}
+            ${statusChip(`busy_backpressure: ${state.schedulerStatus?.proactive?.busy_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.proactive?.busy_backpressure_active ? "warn" : "ok")}
+            ${statusChip(`maintenance_backpressure: ${state.schedulerStatus?.proactive?.maintenance_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.proactive?.maintenance_backpressure_active ? "warn" : "ok")}
           </div>
-          <pre>${json(state.schedulerStatus?.data?.proactive?.scheduler_batch_plan || {})}</pre>
-          <pre>${json(state.schedulerStatus?.data?.proactive?.quota_skip_counts || {})}</pre>
-          <pre>${json(state.schedulerStatus?.data?.proactive?.poll_mode_transition || {})}</pre>
+          <pre>${json(state.schedulerStatus?.proactive?.scheduler_batch_plan || {})}</pre>
+          <pre>${json(state.schedulerStatus?.proactive?.quota_skip_counts || {})}</pre>
+          <pre>${json(state.schedulerStatus?.proactive?.poll_mode_transition || {})}</pre>
         `)}
         ${section("Chat Loop Drill-down", "", `
           <div class="form-grid single">
@@ -940,8 +943,8 @@ async function renderDashboardTools() {
   `);
   dashboardShell(`
     <div class="grid two">
-      ${section("工具层级", "chat / guarded / full tool tier", `<pre>${json(status.data || status)}</pre>`)}
-      ${section("工具策略", "Tool policy rules", `<pre>${json(policy.data || policy)}</pre>`)}
+      ${section("工具层级", "chat / guarded / full tool tier", `<pre>${json(status)}</pre>`)}
+      ${section("工具策略", "Tool policy rules", `<pre>${json(policy)}</pre>`)}
     </div>
     ${section("工具链观测 Tools", "最近工具调用轨迹。", table(["Chat", "Tier", "工具数", "详情"], rows))}
   `);
@@ -976,9 +979,9 @@ async function loadLearning() {
     safeFetch(() => api.get("/learning/cooldowns"), {}),
   ]);
   const cards = [
-    ["造梦空间", "Dream Agent", dream.data || dream, "执行造梦序列", "run-dream"],
-    ["日记写作", "Diary Agent", diary.data || diary, "撰写今日日记", "run-diary"],
-    ["沉淀审核", "Reflect / Learning", learning.data || learning, "基于会话触发", ""],
+    ["造梦空间", "Dream Agent", dream, "执行造梦序列", "run-dream"],
+    ["日记写作", "Diary Agent", diary, "撰写今日日记", "run-diary"],
+    ["沉淀审核", "Reflect / Learning", learning, "基于会话触发", ""],
   ].map(([title, subtitle, data, action, key]) => `
     <article class="feature-card">
       <div><h3>${title}</h3><p>${subtitle}</p><pre>${json(data)}</pre></div>
@@ -1019,8 +1022,8 @@ async function loadLearning() {
     ${pageHeader("主动学习与任务", "监控 AI 的独立思考周期、夜间造梦及反思过滤池。")}
     <div class="feature-grid">${cards}</div>
     <div class="grid two">
-      ${section("主动组件调度 Proactive", "Proactive / Wakeup 状态。", `<pre>${json({ proactive: proactive.data || proactive, wakeup: wakeup.data || wakeup })}</pre>`)}
-      ${section("表达冷却", "Expression selector cooldowns", `<pre>${json(cooldowns.data || cooldowns)}</pre>`)}
+      ${section("主动组件调度 Proactive", "Proactive / Wakeup 状态。", `<pre>${json({ proactive, wakeup })}</pre>`)}
+      ${section("表达冷却", "Expression selector cooldowns", `<pre>${json(cooldowns)}</pre>`)}
     </div>
     ${section("主动意图轨迹", "Wakeup / Heartflow 候选经安全裁决后进入主链路的结果。", table(["时间", "Chat", "来源", "状态", "阻断", "预览"], intentRows))}
     ${section("记忆反馈", "Memory feedback sources 与反馈列表。", `<div class="chip-row">${sourceChips || "<span class='muted'>暂无来源</span>"}</div>${table(["Chat", "来源", "摘要", "指引", "操作"], feedbackRows)}`)}
@@ -1047,7 +1050,7 @@ function bindLearningActions() {
   }));
   $$('[data-chat-runtime]').forEach((button) => button.addEventListener("click", async () => {
     const result = await api.get(`/chats/${segment(button.dataset.chatRuntime)}/runtime`);
-    openModal("Chat Runtime", `<pre>${json(result.data || result)}</pre>`);
+    openModal("Chat Runtime", `<pre>${json(result)}</pre>`);
   }));
   $$('[data-run-reflect]').forEach((button) => button.addEventListener("click", async () => {
     await api.post("/learning/reflect/run-once", { chat_id: button.dataset.runReflect });
@@ -1063,16 +1066,24 @@ function bindLearningActions() {
 
 async function loadReviews() {
   showLoading("正在读取表达审核...");
+  const reviewState = state.cache.reviews.all;
   const [pending, all] = await Promise.all([
     safeFetch(() => api.get("/reviews/pending"), { items: [] }),
-    safeFetch(() => api.get("/reviews?page_size=50"), { items: [] }),
+    safeFetch(() => api.get(`/reviews?page=${reviewState.page}&page_size=${reviewState.page_size}`), reviewState),
   ]);
   const pendingItems = asItems(pending);
   const allItems = asItems(all);
+  state.cache.reviews.pending = pendingItems;
+  state.cache.reviews.all = {
+    items: allItems,
+    total: Number(all.total ?? allItems.length),
+    page: Number(all.page ?? reviewState.page),
+    page_size: Number(all.page_size ?? reviewState.page_size),
+  };
   const rows = (state.reviewTab === "pending" ? pendingItems : allItems).map((item) => `
     <tr>
       <td>${escapeHtml(item.id || item.review_id || "-")}</td>
-      <td>${escapeHtml(item.text || item.pattern || item.content || "-")}</td>
+      <td>${escapeHtml(item.expression || item.text || item.pattern || item.content || "-")}</td>
       <td>${escapeHtml(item.status || "pending")}</td>
       <td>${escapeHtml(item.weight ?? "-")}</td>
       <td class="row-actions">
@@ -1087,10 +1098,19 @@ async function loadReviews() {
       { id: "pending", label: "待审队列" },
       { id: "all", label: "全量库查阅" },
     ], "review-tab")}
-    ${section(state.reviewTab === "pending" ? "待审队列" : "全量库查阅", "批准、驳回或查看表达语料。", table(["ID", "内容", "状态", "权重", "操作"], rows))}
+    ${section(state.reviewTab === "pending" ? "待审队列" : "全量库查阅", "批准、驳回或查看表达语料。", `${table(["ID", "内容", "状态", "权重", "操作"], rows)}${state.reviewTab === "all" ? `
+      <div class="row-actions">
+        <button class="ghost-button" data-review-page="${state.cache.reviews.all.page - 1}" type="button" ${state.cache.reviews.all.page <= 1 ? "disabled" : ""}>上一页</button>
+        <span>第 ${state.cache.reviews.all.page} / ${Math.max(1, Math.ceil(state.cache.reviews.all.total / state.cache.reviews.all.page_size))} 页，共 ${state.cache.reviews.all.total} 条</span>
+        <button class="ghost-button" data-review-page="${state.cache.reviews.all.page + 1}" type="button" ${state.cache.reviews.all.page * state.cache.reviews.all.page_size >= state.cache.reviews.all.total ? "disabled" : ""}>下一页</button>
+      </div>` : ""}`)}
   `;
   $$('[data-review-tab]').forEach((button) => button.addEventListener("click", () => {
     state.reviewTab = button.dataset.reviewTab;
+    loadReviews();
+  }));
+  $$('[data-review-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.reviews.all.page = Math.max(1, Number(button.dataset.reviewPage || 1));
     loadReviews();
   }));
   bindReviewActions();
@@ -1257,7 +1277,7 @@ async function loadPersonaSlices() {
   state.cache.personaSlicesError = null;
   try {
     const result = await api.get("/persona/slices");
-    state.cache.personaSlices = result.data || result;
+    state.cache.personaSlices = result;
   } catch (error) {
     state.cache.personaSlices = {};
     state.cache.personaSlicesError = error.message || String(error);

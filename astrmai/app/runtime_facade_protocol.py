@@ -116,6 +116,9 @@ class RuntimeFacadeProtocol(Protocol):
     def get_persona_summarizer(self) -> Any:
         ...
 
+    def get_persistence(self) -> Any:
+        ...
+
     def get_state_engine(self) -> Any:
         ...
 

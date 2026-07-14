@@ -697,6 +697,29 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(result["reason"], "dream_global_cooldown")
         self.assertEqual(result["throttle_scope"], "global")
 
+    def test_diary_jitter_cancellation_does_not_commit_daily_marker(self):
+        task = self.mod.ProactiveTask.__new__(self.mod.ProactiveTask)
+        task._last_diary_date = ""
+        task._diary_pending_date = "2026-07-14"
+        task.state_engine = SimpleNamespace(get_active_states=lambda: [])
+        task.diary_service = SimpleNamespace(
+            run_once=lambda *_args, **_kwargs: asyncio.sleep(0, result={"failed": 0})
+        )
+        original_sleep = self.mod.asyncio.sleep
+
+        async def _cancel(_delay, **_kwargs):
+            raise asyncio.CancelledError
+
+        self.mod.asyncio.sleep = _cancel
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(task._run_daily_diary_task_with_jitter("2026-07-14"))
+        finally:
+            self.mod.asyncio.sleep = original_sleep
+
+        self.assertEqual(task._last_diary_date, "")
+        self.assertEqual(task._diary_pending_date, "")
+
     def test_group_profile_target_prefers_top_non_self_speaker(self):
         task = self.mod.ProactiveTask.__new__(self.mod.ProactiveTask)
         task._db_service = SimpleNamespace(

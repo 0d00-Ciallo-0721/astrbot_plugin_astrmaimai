@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -227,6 +228,18 @@ class PluginApiAdapter:
 
     def get_state_engine(self) -> Any:
         return self._call_facade("get_state_engine")
+
+    def get_persistence(self) -> Any:
+        persistence = self._call_facade("get_persistence")
+        if persistence is not None:
+            return persistence
+        state_engine = self.get_state_engine()
+        if state_engine is not None:
+            persistence = getattr(state_engine, "persistence", None)
+            if persistence is not None:
+                return persistence
+        memory_engine = self.get_memory_engine()
+        return getattr(memory_engine, "persistence", None) if memory_engine is not None else None
 
     def get_auto_check_task(self) -> Any:
         return self._call_facade("get_auto_check_task")
@@ -465,10 +478,42 @@ class PluginApiAdapter:
             return dict(APPLY_STATUS)
 
     async def read_persona_cache(self) -> dict[str, Any]:
+        persistence = self.get_persistence()
+        if persistence is not None:
+            loader = getattr(persistence, "load_persona_cache_async", None)
+            if callable(loader):
+                return dict(await loader() or {})
+            loader = getattr(persistence, "load_persona_cache", None)
+            if callable(loader):
+                return dict(await asyncio.to_thread(loader) or {})
         return self._read_json(self.persona_cache_path)
 
     async def write_persona_cache(self, data: dict[str, Any]) -> None:
-        self._write_json(self.persona_cache_path, data)
+        persistence = self.get_persistence()
+        summarizer = self.get_persona_summarizer()
+
+        async def _persist_and_sync() -> None:
+            if persistence is not None:
+                saver = getattr(persistence, "save_persona_cache_async", None)
+                if callable(saver):
+                    await saver(data)
+                else:
+                    saver = getattr(persistence, "save_persona_cache", None)
+                    if callable(saver):
+                        await asyncio.to_thread(saver, data)
+                    else:
+                        self._write_json(self.persona_cache_path, data)
+            else:
+                self._write_json(self.persona_cache_path, data)
+            if summarizer is not None and hasattr(summarizer, "cache"):
+                summarizer.cache = dict(data)
+
+        lock = getattr(summarizer, "_lock", None) if summarizer is not None else None
+        if lock is not None and hasattr(lock, "__aenter__"):
+            async with lock:
+                await _persist_and_sync()
+        else:
+            await _persist_and_sync()
 
 __all__ = [
     "PluginApiAdapter",

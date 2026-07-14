@@ -713,6 +713,109 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertIn("今天没有显著事件。", captured_prompt["prompt"])
         self.assertEqual(memory.memory_calls[0]["content"], "[内部日记] quiet diary summary")
 
+    def test_diary_retries_only_failed_chat_and_continues_batch(self):
+        class _Memory:
+            def __init__(self):
+                self.recent_calls = []
+                self.memory_calls = []
+                self.fail_chat_a = True
+
+            async def get_recent_memories(self, group_id, hours=24):
+                self.recent_calls.append(group_id)
+                if group_id == "chat-a" and self.fail_chat_a:
+                    self.fail_chat_a = False
+                    raise RuntimeError("temporary read failure")
+                return []
+
+            async def add_memory(self, **kwargs):
+                self.memory_calls.append(kwargs)
+
+        class _Registry:
+            def render_template(self, _template_id, _variables):
+                return SimpleNamespace(prompt="diary", system_prompt="system")
+
+        async def _call_lane(*_args, **_kwargs):
+            return "summary"
+
+        memory = _Memory()
+        service = self.diary_mod.DiaryService(
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=memory,
+            config=SimpleNamespace(persona=SimpleNamespace(persona_id="global")),
+            call_background_lane=_call_lane,
+            semaphore=asyncio.Semaphore(1),
+            prompt_registry=_Registry(),
+        )
+        states = [SimpleNamespace(chat_id="chat-a"), SimpleNamespace(chat_id="chat-b")]
+
+        first = asyncio.run(service.run_once(states, diary_date="2026-07-14"))
+        second = asyncio.run(service.run_once(states, diary_date="2026-07-14"))
+
+        self.assertEqual((first["succeeded"], first["failed"]), (1, 1))
+        self.assertEqual((second["succeeded"], second["failed"]), (1, 0))
+        self.assertEqual(memory.recent_calls, ["chat-a", "chat-b", "chat-a"])
+        self.assertEqual([call["session_id"] for call in memory.memory_calls], ["chat-b", "chat-a"])
+
+    def test_dream_retry_resumes_failed_stage_without_regeneration(self):
+        class _Memory:
+            def __init__(self):
+                self.add_calls = []
+                self.maintenance_failures = 1
+
+            async def record_cognitive_feedback(self, **_kwargs):
+                return None
+
+            async def add_memory(self, **kwargs):
+                self.add_calls.append(kwargs["session_id"])
+                if kwargs["session_id"] == "chat-1" and self.maintenance_failures:
+                    self.maintenance_failures -= 1
+                    raise RuntimeError("temporary write failure")
+
+        class _Agent:
+            MIN_EVENTS_TO_DREAM = 5
+            _last_session_id = "chat-1"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def run_dream_cycle(self, session_id=None):
+                self.calls += 1
+                return "dream log"
+
+        class _Generator:
+            async def generate(self, **_kwargs):
+                return "dream text"
+
+            def build_maintenance_result(self, _dream_log, session_id="global"):
+                return {"summary": "maintenance", "tags": []}
+
+        memory = _Memory()
+        agent = _Agent()
+        scheduler = self.dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=memory,
+            config=SimpleNamespace(
+                life=SimpleNamespace(dream_interval_min=1, min_memory_events_to_dream=5, dream_time_ranges=[]),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+            semaphore=asyncio.Semaphore(1),
+            dream_visible=False,
+        )
+        scheduler.bind_dependencies(agent, _Generator())
+
+        first = asyncio.run(scheduler.run_once_for_session("chat-1"))
+        pending_after_first = scheduler.describe_status()["pending_completions"]
+        second = asyncio.run(scheduler.run_once_for_session("chat-1"))
+
+        self.assertFalse(first["performed"])
+        self.assertTrue(first["degraded"])
+        self.assertEqual(pending_after_first, 1)
+        self.assertEqual(scheduler.describe_status()["pending_completions"], 0)
+        self.assertTrue(second["performed"])
+        self.assertEqual(agent.calls, 1)
+        self.assertEqual(memory.add_calls.count("__dream_diary__"), 1)
+        self.assertEqual(memory.add_calls.count("chat-1"), 2)
+
     def test_diary_service_should_run_covers_full_early_morning_window(self):
         service = self.diary_mod.DiaryService(
             persistence=None,

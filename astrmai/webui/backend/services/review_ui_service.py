@@ -73,28 +73,44 @@ class ReviewUiService:
             "content_list": json.dumps(metadata.get("content_samples") or [], ensure_ascii=False),
             "last_review_time": float(metadata.get("last_review_time") or 0.0),
             "last_active_time": float(metadata.get("last_active_time") or row.get("last_access_time") or 0.0),
-            "create_time": float(row.get("create_time") or 0.0),
+            "create_time": float(row.get("create_time") or row.get("created_at") or 0.0),
             "status": str(row.get("status") or "review_pending"),
             "legacy": False,
         }
 
     async def _list_canonical_reviews(self, *, status=None, group_id=None, keyword=None, page: int = 1, page_size: int = 20):
         offset = max(page - 1, 0) * page_size
-        try:
-            async with self.db_factory() as db:
-                async with db.execute(
-                    """
-                    SELECT id, session_id, source, content, status, create_time, last_access_time, metadata
-                    FROM canonical_memories
-                    WHERE kind = 'expression_pattern'
-                    ORDER BY update_time DESC, create_time DESC
-                    LIMIT ?
-                    """,
-                    (max(page * page_size * 4, page_size * 8),),
-                ) as cursor:
-                    rows = [dict(row) for row in await cursor.fetchall()]
-        except sqlite3.OperationalError:
-            return {"items": [], "total": 0, "page": page, "page_size": page_size}
+        get_store = getattr(self.plugin_api, "get_v2_store", None) if self.plugin_api else None
+        store = get_store() if callable(get_store) else None
+        rows: list[dict] = []
+        if store is not None and hasattr(store, "list_canonical"):
+            store_offset = 0
+            while True:
+                result = await store.list_canonical(
+                    kind="expression_pattern",
+                    limit=500,
+                    offset=store_offset,
+                    include_inactive=True,
+                )
+                batch = [dict(item) for item in list(result.get("items", []) or [])]
+                rows.extend(batch)
+                store_offset += len(batch)
+                if not batch or store_offset >= int(result.get("total", 0) or 0):
+                    break
+        else:
+            try:
+                async with self.db_factory() as db:
+                    async with db.execute(
+                        """
+                        SELECT id, session_id, source, content, status, create_time, last_access_time, metadata
+                        FROM canonical_memories
+                        WHERE kind = 'expression_pattern'
+                        ORDER BY update_time DESC, create_time DESC
+                        """
+                    ) as cursor:
+                        rows = [dict(row) for row in await cursor.fetchall()]
+            except sqlite3.OperationalError:
+                return {"items": [], "total": 0, "page": page, "page_size": page_size}
         items = [self._canonical_to_review_item(row) for row in rows]
         filtered = []
         normalized_status = str(status or "").strip().lower()
@@ -148,16 +164,23 @@ class ReviewUiService:
             page_size = max(1, min(int(page_size or 20), 200))
         except (TypeError, ValueError):
             page_size = 20
-        offset = (page - 1) * page_size
-        facade_items = await self.plugin_api.list_recent_reviews(group_id=group_id or "", limit=max(page * page_size, page_size))
-        if self._runtime_bound():
+        get_store = getattr(self.plugin_api, "get_v2_store", None) if self.plugin_api else None
+        if self._runtime_bound() and not callable(get_store) and self.db_factory is None:
+            facade_items = await self.plugin_api.list_recent_reviews(group_id=group_id or "", limit=10000)
+            normalized_status = str(status or "").strip().lower()
+            normalized_keyword = str(keyword or "").strip().lower()
             filtered = []
-            for item in facade_items:
-                if status and str(item.get("review_status") or item.get("status") or "") != str(status):
+            for raw_item in facade_items:
+                item = self._normalize_item(dict(raw_item))
+                item_status = str(item.get("review_status") or item.get("status") or "").strip().lower()
+                if normalized_status and item_status != normalized_status:
                     continue
-                if keyword and str(keyword).lower() not in f"{item.get('situation', '')} {item.get('expression', '')}".lower():
-                    continue
-                filtered.append(self._normalize_item(dict(item)))
+                if normalized_keyword:
+                    haystack = f"{item.get('situation', '')} {item.get('expression', '')}".lower()
+                    if normalized_keyword not in haystack:
+                        continue
+                filtered.append(item)
+            offset = (page - 1) * page_size
             return {
                 "items": filtered[offset : offset + page_size],
                 "total": len(filtered),

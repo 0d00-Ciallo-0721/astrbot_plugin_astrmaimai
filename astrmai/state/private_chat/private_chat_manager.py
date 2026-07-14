@@ -160,9 +160,7 @@ class PrivateChatManager:
         prefix = f"{user_id}::"
         keys_to_close.extend(k for k in self._sessions if k.startswith(prefix))
         for key in keys_to_close:
-            session = self._sessions.pop(key, None)
-            if session:
-                session.new_message_event.set()
+            self._remove_session_key(key)
         stale_chat_ids = [chat_id for chat_id, mapped_user_id in self._chat_to_user.items() if mapped_user_id == user_id]
         for chat_id in stale_chat_ids:
             self._chat_to_user.pop(chat_id, None)
@@ -178,15 +176,7 @@ class PrivateChatManager:
                 if silence_min > max_silence_min and not session.is_bot_waiting:
                     stale.append(uid)
             for uid in stale:
-                self.close_session(uid)
-            # ponytail: belt-and-suspenders — close_session handles _chat_to_user by user_id,
-            # but also sweep any orphaned chat_id mappings
-            orphaned_chat_ids = [
-                cid for cid, mapped_uid in list(self._chat_to_user.items())
-                if mapped_uid in stale
-            ]
-            for cid in orphaned_chat_ids:
-                self._chat_to_user.pop(cid, None)
+                self._remove_session_key(uid)
             if stale:
                 logger.debug(f"[PrivateChat] cleaned {len(stale)} stale sessions")
 
@@ -202,9 +192,32 @@ class PrivateChatManager:
                     logger.warning("[PrivateChat] session limit reached; all sessions are waiting")
                 else:
                     oldest = min(evictable_sessions, key=lambda x: x[1].last_message_time)
-                    self.close_session(oldest[0])
+                    self._remove_session_key(oldest[0])
             self._sessions[key] = PrivateSession(user_id=user_id)
         return self._sessions[key]
+
+    def _remove_session_key(self, key: str) -> None:
+        session = self._sessions.pop(key, None)
+        if session is None:
+            return
+        session.new_message_event.set()
+        if "::" in key:
+            _, chat_id = key.split("::", 1)
+            self._chat_to_user.pop(chat_id, None)
+            return
+        user_id = str(session.user_id or key)
+        has_other_session = any(
+            other.user_id == user_id
+            for other in self._sessions.values()
+        )
+        if not has_other_session:
+            stale_chat_ids = [
+                chat_id
+                for chat_id, mapped_user_id in self._chat_to_user.items()
+                if mapped_user_id == user_id
+            ]
+            for chat_id in stale_chat_ids:
+                self._chat_to_user.pop(chat_id, None)
 
     def _bind_chat_session(self, chat_id: str, user_id: str) -> None:
         chat_id = str(chat_id or "").strip()

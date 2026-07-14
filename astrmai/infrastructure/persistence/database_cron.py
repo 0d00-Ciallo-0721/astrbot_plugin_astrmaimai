@@ -39,6 +39,38 @@ class CronPersistenceMixin:
 
         return await asyncio.to_thread(_sync)
 
+    async def replace_cron_snapshot(self, old_job_id: str, snapshot) -> None:
+        def _sync():
+            with self.get_session() as session:
+                new_job_id = str(snapshot.job_id or "")
+                old_id = str(old_job_id or "")
+                existing = session.get(CronSnapshot, new_job_id)
+                if existing:
+                    existing.name = snapshot.name
+                    existing.cron_expression = snapshot.cron_expression
+                    existing.run_at = snapshot.run_at
+                    existing.run_once = snapshot.run_once
+                    existing.target_origin = snapshot.target_origin
+                    existing.payload = snapshot.payload
+                    existing.note = snapshot.note
+                    existing.is_active = True
+                    existing.updated_at = time.time()
+                    session.add(existing)
+                else:
+                    snapshot.updated_at = time.time()
+                    snapshot.is_active = True
+                    session.add(snapshot)
+                if old_id and old_id != new_job_id:
+                    previous = session.get(CronSnapshot, old_id)
+                    if previous:
+                        previous.is_active = False
+                        previous.updated_at = time.time()
+                        session.add(previous)
+                session.commit()
+
+        async with self._db_lock:
+            await asyncio.to_thread(_sync)
+
     async def deactivate_cron_snapshot(self, job_id: str) -> None:
         def _sync():
             with self.get_session() as session:

@@ -19,6 +19,7 @@ class GroupSigninService:
         self.persistence = persistence
         self.dispatcher = dispatcher
         self.config = config
+        self._last_run = {"status": "idle", "signed": 0, "partial": 0, "failed": 0}
 
     @staticmethod
     def _extract_group_id(chat_id: str) -> str:
@@ -54,15 +55,35 @@ class GroupSigninService:
         bucket = cls._state_bucket(state)
         return str(bucket.get("last_date", "") or "") == str(today or "")
 
-    async def _mark_signed(self, state, *, today: str, now_ts: float) -> None:
+    async def _persist_marker(
+        self,
+        state,
+        *,
+        today: str,
+        now_ts: float,
+        status: str,
+        rollback_on_failure: bool = False,
+    ) -> bool:
         bucket = self._state_bucket(state)
+        previous = dict(bucket)
         bucket["last_date"] = str(today or "")
-        bucket["last_success_ts"] = float(now_ts)
+        bucket["status"] = str(status or "")
+        bucket["updated_at"] = float(now_ts)
+        if status == "complete":
+            bucket["last_success_ts"] = float(now_ts)
         state.is_dirty = True
         try:
             await self.persistence.save_chat_state(str(getattr(state, "chat_id", "") or ""), state)
+            return True
         except Exception as exc:
-            logger.error(f"[GroupSigninService] failed to persist sign state for {getattr(state, 'chat_id', '')}: {exc}")
+            if rollback_on_failure:
+                bucket.clear()
+                bucket.update(previous)
+            logger.error(
+                f"[GroupSigninService] failed to persist sign marker status={status} "
+                f"for {getattr(state, 'chat_id', '')}: {exc}"
+            )
+            return False
 
     @staticmethod
     def _build_guidance() -> str:
@@ -135,6 +156,7 @@ class GroupSigninService:
             return
 
         today = self._today_string(now_ts)
+        stats = {"status": "completed", "signed": 0, "partial": 0, "failed": 0}
         for state in self.state_engine.get_active_states():
             chat_id = str(getattr(state, "chat_id", "") or "").strip()
             group_id = self._extract_group_id(chat_id)
@@ -142,17 +164,51 @@ class GroupSigninService:
                 continue
             if self._already_signed_today(state, today):
                 continue
+            intent_saved = await self._persist_marker(
+                state,
+                today=today,
+                now_ts=now_ts,
+                status="intent",
+                rollback_on_failure=True,
+            )
+            if not intent_saved:
+                stats["failed"] += 1
+                continue
             success = await self._sign_group(group_id)
             if not success:
+                bucket = self._state_bucket(state)
+                bucket["last_date"] = ""
+                await self._persist_marker(
+                    state,
+                    today="",
+                    now_ts=now_ts,
+                    status="failed",
+                )
+                stats["failed"] += 1
                 continue
-            await self._mark_signed(state, today=today, now_ts=now_ts)
+            completed = await self._persist_marker(
+                state,
+                today=today,
+                now_ts=now_ts,
+                status="complete",
+            )
+            if not completed:
+                stats["partial"] += 1
+                continue
             logger.info(f"[GroupSigninService] signed active group={group_id}")
             await self._dispatch_after_sign(chat_id, group_id)
+            stats["signed"] += 1
+        if stats["partial"]:
+            stats["status"] = "partial"
+        elif stats["failed"]:
+            stats["status"] = "degraded"
+        self._last_run = stats
 
     def describe_status(self) -> dict[str, Any]:
         return {
             "sign_hour": self.SIGN_HOUR,
             "state_key": self.STATE_KEY,
+            "last_run": dict(self._last_run),
         }
 
 

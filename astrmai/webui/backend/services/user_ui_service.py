@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import asynccontextmanager
 from typing import Any
 
 
@@ -34,8 +35,27 @@ _MANUAL_LOCK_FIELDS = {
 
 
 class UserUiService:
-    def __init__(self, db_factory):
+    def __init__(self, db_factory, state_engine=None):
         self.db_factory = db_factory
+        self.state_engine = state_engine
+
+    @property
+    def _profile_service(self):
+        return getattr(self.state_engine, "user_profile_service", None) if self.state_engine else None
+
+    @asynccontextmanager
+    async def _mutation_lock(self, user_id: str):
+        service = self._profile_service
+        if service is None or not hasattr(service, "_get_user_lock"):
+            yield
+            return
+        async with service._get_user_lock(user_id):
+            yield
+
+    async def _sync_runtime_profile(self, user_id: str, row: dict[str, Any] | None) -> None:
+        service = self._profile_service
+        if service is not None and hasattr(service, "replace_cached_profile"):
+            await service.replace_cached_profile(user_id, row, lock_held=True)
 
     @staticmethod
     def _parse_json(value: Any, default: Any):
@@ -54,6 +74,7 @@ class UserUiService:
         row_dict["tags"] = self._parse_json(row_dict.get("tags"), [])
         row_dict["group_footprints"] = self._parse_json(row_dict.get("group_footprints"), {})
         row_dict["profile_metadata"] = self._parse_json(row_dict.get("profile_metadata"), {})
+        row_dict["relationship_vector"] = self._parse_json(row_dict.get("relationship_vector"), {})
         return row_dict
 
     @staticmethod
@@ -105,103 +126,69 @@ class UserUiService:
             return await self._load_row(db, user_id)
 
     async def update_user(self, user_id: str, data: dict[str, Any]) -> dict[str, str]:
-        async with self.db_factory() as db:
-            existing = await self._load_row(db, user_id)
-            if not existing:
-                return {"status": "not_found"}
-            updates: list[str] = []
-            params: list[Any] = []
-            manual_fields: list[str] = []
+        async with self._mutation_lock(user_id):
+            async with self.db_factory() as db:
+                existing = await self._load_row(db, user_id)
+                if not existing:
+                    return {"status": "not_found"}
+                updates: list[str] = []
+                params: list[Any] = []
+                manual_fields: list[str] = []
 
-            for key in EDITABLE_FIELDS:
-                if key not in data:
-                    continue
-                value = data[key]
-                if key == "tags":
-                    value = json.dumps(self._normalize_tags(value), ensure_ascii=False)
-                elif key == "social_score":
-                    value = float(value or 0.0)
-                else:
-                    value = str(value or "").strip()
-                updates.append(f"{key} = ?")
-                params.append(value)
-                if key in _MANUAL_LOCK_FIELDS:
-                    manual_fields.append(key)
+                for key in EDITABLE_FIELDS:
+                    if key not in data:
+                        continue
+                    value = data[key]
+                    if key == "tags":
+                        value = json.dumps(self._normalize_tags(value), ensure_ascii=False)
+                    elif key == "social_score":
+                        value = float(value or 0.0)
+                    else:
+                        value = str(value or "").strip()
+                    updates.append(f"{key} = ?")
+                    params.append(value)
+                    if key in _MANUAL_LOCK_FIELDS:
+                        manual_fields.append(key)
 
-            profile_metadata = dict(existing.get("profile_metadata", {}) or {})
-            profile_metadata = self._merge_manual_locks(profile_metadata, manual_fields)
-            updates.append("profile_metadata = ?")
-            params.append(json.dumps(profile_metadata, ensure_ascii=False))
+                profile_metadata = dict(existing.get("profile_metadata", {}) or {})
+                profile_metadata = self._merge_manual_locks(profile_metadata, manual_fields)
+                updates.append("profile_metadata = ?")
+                params.append(json.dumps(profile_metadata, ensure_ascii=False))
 
-            if updates:
                 params.append(user_id)
                 await db.execute(f"UPDATE user_profiles SET {', '.join(updates)} WHERE user_id = ?", params)
                 await db.commit()
+                updated = await self._load_row(db, user_id)
+                await self._sync_runtime_profile(user_id, updated)
+                if "social_score" in data and self.state_engine is not None:
+                    relationship = getattr(self.state_engine, "relationship_engine", None)
+                    if relationship is not None and hasattr(relationship, "align_social_score"):
+                        relationship.align_social_score(user_id, float(data.get("social_score") or 0.0))
         return {"status": "ok"}
 
     async def delete_user(self, user_id: str) -> dict[str, str]:
-        async with self.db_factory() as db:
-            await db.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
-            await db.commit()
+        async with self._mutation_lock(user_id):
+            async with self.db_factory() as db:
+                await db.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
+                await db.commit()
+            await self._sync_runtime_profile(user_id, None)
+            relationship = getattr(self.state_engine, "relationship_engine", None) if self.state_engine else None
+            vectors = getattr(relationship, "_vectors", None)
+            if isinstance(vectors, dict):
+                vectors.pop(user_id, None)
         return {"status": "ok"}
 
     async def add_slice(self, user_id: str, slice_type: str, content: str) -> dict[str, Any] | None:
         if slice_type not in SLICE_FIELDS:
             raise ValueError("Invalid slice type")
 
-        async with self.db_factory() as db:
-            row = await self._load_row(db, user_id)
-            if not row:
-                return None
-            slices = list(row.get(slice_type, []) or [])
-            slices.append(str(content or "").strip())
-            profile_metadata = self._merge_manual_locks(dict(row.get("profile_metadata", {}) or {}), [slice_type])
-            await db.execute(
-                f"UPDATE user_profiles SET {slice_type} = ?, profile_metadata = ? WHERE user_id = ?",
-                (
-                    json.dumps(slices, ensure_ascii=False),
-                    json.dumps(profile_metadata, ensure_ascii=False),
-                    user_id,
-                ),
-            )
-            await db.commit()
-        return {"status": "ok", "items": slices}
-
-    async def update_slice(self, user_id: str, index: int, slice_type: str, content: str) -> dict[str, str] | None:
-        if slice_type not in SLICE_FIELDS:
-            raise ValueError("Invalid slice type")
-
-        async with self.db_factory() as db:
-            row = await self._load_row(db, user_id)
-            if not row:
-                return None
-            slices = list(row.get(slice_type, []) or [])
-            if index < 0 or index >= len(slices):
-                raise IndexError("Index out of bounds")
-            slices[index] = str(content or "").strip()
-            profile_metadata = self._merge_manual_locks(dict(row.get("profile_metadata", {}) or {}), [slice_type])
-            await db.execute(
-                f"UPDATE user_profiles SET {slice_type} = ?, profile_metadata = ? WHERE user_id = ?",
-                (
-                    json.dumps(slices, ensure_ascii=False),
-                    json.dumps(profile_metadata, ensure_ascii=False),
-                    user_id,
-                ),
-            )
-            await db.commit()
-        return {"status": "ok"}
-
-    async def delete_slice(self, user_id: str, index: int, slice_type: str) -> dict[str, str] | None:
-        if slice_type not in SLICE_FIELDS:
-            raise ValueError("Invalid slice type")
-
-        async with self.db_factory() as db:
-            row = await self._load_row(db, user_id)
-            if not row:
-                return None
-            slices = list(row.get(slice_type, []) or [])
-            if 0 <= index < len(slices):
-                slices.pop(index)
+        async with self._mutation_lock(user_id):
+            async with self.db_factory() as db:
+                row = await self._load_row(db, user_id)
+                if not row:
+                    return None
+                slices = list(row.get(slice_type, []) or [])
+                slices.append(str(content or "").strip())
                 profile_metadata = self._merge_manual_locks(dict(row.get("profile_metadata", {}) or {}), [slice_type])
                 await db.execute(
                     f"UPDATE user_profiles SET {slice_type} = ?, profile_metadata = ? WHERE user_id = ?",
@@ -212,6 +199,58 @@ class UserUiService:
                     ),
                 )
                 await db.commit()
+                await self._sync_runtime_profile(user_id, await self._load_row(db, user_id))
+        return {"status": "ok", "items": slices}
+
+    async def update_slice(self, user_id: str, index: int, slice_type: str, content: str) -> dict[str, str] | None:
+        if slice_type not in SLICE_FIELDS:
+            raise ValueError("Invalid slice type")
+
+        async with self._mutation_lock(user_id):
+            async with self.db_factory() as db:
+                row = await self._load_row(db, user_id)
+                if not row:
+                    return None
+                slices = list(row.get(slice_type, []) or [])
+                if index < 0 or index >= len(slices):
+                    raise IndexError("Index out of bounds")
+                slices[index] = str(content or "").strip()
+                profile_metadata = self._merge_manual_locks(dict(row.get("profile_metadata", {}) or {}), [slice_type])
+                await db.execute(
+                    f"UPDATE user_profiles SET {slice_type} = ?, profile_metadata = ? WHERE user_id = ?",
+                    (
+                        json.dumps(slices, ensure_ascii=False),
+                        json.dumps(profile_metadata, ensure_ascii=False),
+                        user_id,
+                    ),
+                )
+                await db.commit()
+                await self._sync_runtime_profile(user_id, await self._load_row(db, user_id))
+        return {"status": "ok"}
+
+    async def delete_slice(self, user_id: str, index: int, slice_type: str) -> dict[str, str] | None:
+        if slice_type not in SLICE_FIELDS:
+            raise ValueError("Invalid slice type")
+
+        async with self._mutation_lock(user_id):
+            async with self.db_factory() as db:
+                row = await self._load_row(db, user_id)
+                if not row:
+                    return None
+                slices = list(row.get(slice_type, []) or [])
+                if 0 <= index < len(slices):
+                    slices.pop(index)
+                    profile_metadata = self._merge_manual_locks(dict(row.get("profile_metadata", {}) or {}), [slice_type])
+                    await db.execute(
+                        f"UPDATE user_profiles SET {slice_type} = ?, profile_metadata = ? WHERE user_id = ?",
+                        (
+                            json.dumps(slices, ensure_ascii=False),
+                            json.dumps(profile_metadata, ensure_ascii=False),
+                            user_id,
+                        ),
+                    )
+                    await db.commit()
+                    await self._sync_runtime_profile(user_id, await self._load_row(db, user_id))
         return {"status": "ok"}
 
 

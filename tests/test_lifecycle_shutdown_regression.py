@@ -208,6 +208,39 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         self.assertEqual(set(collected), {background, session_worker})
 
+    def test_workmode_heartbeat_starts_when_initial_reload_fails(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            runtime = self._build_runtime(calls)
+
+            class _CronGuard:
+                async def reload_all_lost_jobs(self):
+                    calls.append("reload")
+                    raise RuntimeError("temporary db outage")
+
+                async def run_heartbeat(self):
+                    calls.append("heartbeat")
+
+            runtime.workmode.cron_guard = _CronGuard()
+            manager = PluginLifecycleManager(runtime)
+            tracked = []
+
+            def _track(coro):
+                tracked.append(coro)
+                coro.close()
+                return SimpleNamespace()
+
+            manager.track_task = _track
+            await manager.start_workmode_guard()
+
+            self.assertEqual(calls, ["reload"])
+            self.assertEqual(len(tracked), 1)
+            self.assertTrue(runtime.status.cron_guard_started)
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

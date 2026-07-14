@@ -138,6 +138,9 @@ class AstrMaiAdminPageApi:
     def _memory(self) -> MemoryUiService:
         return MemoryUiService(get_db, self.plugin_api)
 
+    def _users(self) -> UserUiService:
+        return UserUiService(get_db, self.plugin_api.get_state_engine())
+
     async def dashboard(self, request: Any) -> dict[str, Any]:
         return await DashboardService(self.plugin_api, get_db).get_snapshot()
 
@@ -470,7 +473,7 @@ class AstrMaiAdminPageApi:
         return await self._memory().create_event(await self._body(request))
 
     async def delete_memory_event(self, request: Any) -> dict[str, Any]:
-        return await self._memory().delete_event(self._int(self._path(request).get("id")))
+        return await self._memory().delete_event(str(self._path(request).get("id", "")))
 
     async def list_reflections(self, request: Any) -> Any:
         month = str(self._query(request).get("month", "") or "")
@@ -521,21 +524,21 @@ class AstrMaiAdminPageApi:
         return await self._memory().reject_jargon(str(self._path(request).get("id", "")))
 
     async def users(self, request: Any) -> Any:
-        return await UserUiService(get_db).list_users()
+        return await self._users().list_users()
 
     async def user(self, request: Any) -> dict[str, Any]:
-        record = await UserUiService(get_db).get_user(str(self._path(request).get("user_id", "")))
+        record = await self._users().get_user(str(self._path(request).get("user_id", "")))
         return record or {"status": "error", "message": "User not found"}
 
     async def update_user(self, request: Any) -> dict[str, Any]:
-        return await UserUiService(get_db).update_user(str(self._path(request).get("user_id", "")), await self._body(request))
+        return await self._users().update_user(str(self._path(request).get("user_id", "")), await self._body(request))
 
     async def delete_user(self, request: Any) -> dict[str, Any]:
-        return await UserUiService(get_db).delete_user(str(self._path(request).get("user_id", "")))
+        return await self._users().delete_user(str(self._path(request).get("user_id", "")))
 
     async def add_user_slice(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
-        result = await UserUiService(get_db).add_slice(
+        result = await self._users().add_slice(
             str(self._path(request).get("user_id", "")),
             str(body.get("type", "")),
             str(body.get("content", "")),
@@ -544,7 +547,7 @@ class AstrMaiAdminPageApi:
 
     async def update_user_slice(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
-        result = await UserUiService(get_db).update_slice(
+        result = await self._users().update_slice(
             str(self._path(request).get("user_id", "")),
             self._int(self._path(request).get("index")),
             str(body.get("type", "")),
@@ -554,7 +557,7 @@ class AstrMaiAdminPageApi:
 
     async def delete_user_slice(self, request: Any) -> dict[str, Any]:
         query = self._query(request)
-        result = await UserUiService(get_db).delete_slice(
+        result = await self._users().delete_slice(
             str(self._path(request).get("user_id", "")),
             self._int(self._path(request).get("index")),
             str(query.get("type", "")),
@@ -563,7 +566,7 @@ class AstrMaiAdminPageApi:
 
     async def delete_user_slice_post(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
-        result = await UserUiService(get_db).delete_slice(
+        result = await self._users().delete_slice(
             str(self._path(request).get("user_id", "")),
             self._int(self._path(request).get("index")),
             str(body.get("type", "")),

@@ -507,6 +507,9 @@ class PluginFacade(RuntimeFacadeProtocol):
     def get_persona_summarizer(self):
         return getattr(self.runtime, "persona_summarizer", None)
 
+    def get_persistence(self):
+        return getattr(self.runtime, "persistence", None)
+
     def get_state_engine(self):
         return getattr(self.runtime, "state_engine", None)
 

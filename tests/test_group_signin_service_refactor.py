@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import importlib
 import sys
 import tempfile
@@ -35,7 +36,7 @@ class _FakePersistence:
         self.saved = []
 
     async def save_chat_state(self, chat_id, state):
-        self.saved.append((chat_id, dict(getattr(state, "group_config", {}) or {})))
+        self.saved.append((chat_id, copy.deepcopy(getattr(state, "group_config", {}) or {})))
 
 
 class GroupSigninServiceRefactorTests(unittest.TestCase):
@@ -76,7 +77,9 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         self.assertEqual(dispatcher.intents[0].chat_id, "default:GroupMessage:12345")
         self.assertEqual(state.group_config["group_signin"]["last_date"], "2026-01-18")
         self.assertTrue(state.is_dirty)
-        self.assertEqual(len(persistence.saved), 1)
+        self.assertEqual(len(persistence.saved), 2)
+        self.assertEqual(persistence.saved[0][1]["group_signin"]["status"], "intent")
+        self.assertEqual(persistence.saved[1][1]["group_signin"]["status"], "complete")
 
     def test_run_once_skips_duplicate_same_day(self):
         state = SimpleNamespace(
@@ -104,7 +107,50 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
 
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(dispatcher.intents, [])
-        self.assertEqual(persistence.saved, [])
+        self.assertEqual(len(persistence.saved), 2)
+        self.assertEqual(persistence.saved[-1][1]["group_signin"]["status"], "failed")
+        self.assertEqual(state.group_config["group_signin"]["last_date"], "")
+
+    def test_persist_failure_after_external_success_is_partial_and_not_repeated_after_restart(self):
+        class _FailFinalPersistence:
+            def __init__(self):
+                self.calls = 0
+                self.persisted = None
+
+            async def save_chat_state(self, _chat_id, state):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("db locked")
+                self.persisted = copy.deepcopy(state.group_config)
+
+        state = SimpleNamespace(chat_id="default:GroupMessage:12345", group_config={}, is_dirty=False)
+        api = _FakeApi()
+        dispatcher = _FakeDispatcher()
+        persistence = _FailFinalPersistence()
+        service = self._build_service(states=[state], api=api, dispatcher=dispatcher, persistence=persistence)
+
+        asyncio.run(service.run_once(now_ts=1768695000.0))
+
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(dispatcher.intents, [])
+        self.assertEqual(service.describe_status()["last_run"]["status"], "partial")
+
+        restarted_state = SimpleNamespace(
+            chat_id=state.chat_id,
+            group_config=copy.deepcopy(persistence.persisted),
+            is_dirty=False,
+        )
+        restarted_api = _FakeApi()
+        restarted_dispatcher = _FakeDispatcher()
+        restarted = self._build_service(
+            states=[restarted_state],
+            api=restarted_api,
+            dispatcher=restarted_dispatcher,
+        )
+        asyncio.run(restarted.run_once(now_ts=1768695000.0))
+
+        self.assertEqual(restarted_api.calls, [])
+        self.assertEqual(restarted_dispatcher.intents, [])
 
     def test_run_once_before_window_skips_all_groups(self):
         state = SimpleNamespace(chat_id="default:GroupMessage:12345", group_config={}, is_dirty=False)

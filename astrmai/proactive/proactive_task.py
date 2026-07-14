@@ -71,6 +71,7 @@ class ProactiveTask:
         self._profile_semaphore = asyncio.Semaphore(1)
         self._last_profile_run = 0.0
         self._last_diary_date = ""
+        self._diary_pending_date = ""
         self._last_global_maintenance_run = 0.0
         self._last_due_chat_count = 0
         self._last_skipped_not_due_count = 0
@@ -519,9 +520,19 @@ class ProactiveTask:
                 await self.auto_check_task.run_once(state.chat_id)
         await self.review_dispatcher.dispatch_pending()
 
-    async def _run_daily_diary_task_with_jitter(self):
-        await asyncio.sleep(random.randint(1, 300))
-        await self.diary_service.run_once(self.state_engine.get_active_states())
+    async def _run_daily_diary_task_with_jitter(self, diary_date: str):
+        try:
+            await asyncio.sleep(random.randint(1, 300))
+            report = await self.diary_service.run_once(
+                self.state_engine.get_active_states(),
+                diary_date=diary_date,
+            )
+            report = dict(report or {})
+            if int(report.get("failed", 0) or 0) == 0:
+                self._last_diary_date = diary_date
+        finally:
+            if self._diary_pending_date == diary_date:
+                self._diary_pending_date = ""
 
     async def handle_chat_heartbeat(self, chat_id: str, snapshot, decision) -> dict:
         decision.metadata["dispatch_mode"] = "observe_only"
@@ -803,8 +814,10 @@ class ProactiveTask:
                     self._last_profile_run = now
 
                 if run_maintenance and self.diary_service.should_run(self._last_diary_date, now):
-                    self._last_diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
-                    self._fire_background_task(self._run_daily_diary_task_with_jitter())
+                    diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
+                    if self._diary_pending_date != diary_date:
+                        self._diary_pending_date = diary_date
+                        self._fire_background_task(self._run_daily_diary_task_with_jitter(diary_date))
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -839,6 +852,7 @@ class ProactiveTask:
             "dream_ready": self.dream_agent is not None,
             "last_profile_run": self._last_profile_run,
             "last_diary_date": self._last_diary_date,
+            "diary_pending_date": self._diary_pending_date,
             "background_tasks": len(self._background_tasks),
             "dream_scheduler": self.dream_scheduler.describe_status(),
             "heartflow": self.heartflow_manager.describe_status(),

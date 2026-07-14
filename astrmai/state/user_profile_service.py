@@ -42,6 +42,34 @@ class UserProfileService:
         else:
             self.user_profiles.clear()
 
+    async def replace_cached_profile(
+        self,
+        user_id: str,
+        data: Dict[str, Any] | None,
+        *,
+        lock_held: bool = False,
+    ) -> UserProfile | None:
+        """Synchronize an externally persisted profile with the live cached object."""
+
+        def _replace() -> UserProfile | None:
+            current = self.user_profiles.get(user_id)
+            if current is None:
+                return None
+            if data is not None:
+                fields = UserProfile.__dataclass_fields__
+                replacement = UserProfile(**{key: value for key, value in data.items() if key in fields})
+            else:
+                replacement = UserProfile(user_id=user_id, name=_DEFAULT_PROFILE_NAME)
+            for field_name in UserProfile.__dataclass_fields__:
+                setattr(current, field_name, getattr(replacement, field_name))
+            current.is_dirty = False
+            return current
+
+        if lock_held:
+            return _replace()
+        async with self._get_user_lock(user_id):
+            return _replace()
+
     async def _flush_profile(self, user_id: str, profile):
         """ponytail: immediately persist a dirty profile"""
         if not profile.is_dirty:
