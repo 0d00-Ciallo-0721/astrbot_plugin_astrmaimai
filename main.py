@@ -192,7 +192,7 @@ class AstrMaiPlugin(Star):
     # that return content before on_global_message fires will silently suppress
     # AstrMai. Consider priority=1 if suppression is observed in the field.
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
-    async def on_group_membership_notice(self, event: AstrMessageEvent):
+    async def on_group_membership_notice(self, event: AstrMessageEvent, *args, **kwargs):
         try:
             if await self.facade.handle_group_membership_notice(event):
                 event.stop_event()
@@ -200,7 +200,7 @@ class AstrMaiPlugin(Star):
             logger.exception("[AstrMai] group membership notice hook failed")
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
-    async def on_global_message(self, event: AstrMessageEvent):
+    async def on_global_message(self, event: AstrMessageEvent, *args, **kwargs):
         if event.get_extra("heartflow_is_command"):
             return
         async for result in self.facade.on_global_message(event):

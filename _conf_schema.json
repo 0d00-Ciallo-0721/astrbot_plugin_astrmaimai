@@ -13,7 +13,7 @@
         "description": "启用私聊接管",
         "type": "bool",
         "default": false,
-        "hint": "开启后，Bot 会接管和它的私聊消息；关闭时只处理群聊内的相关消息。"
+        "hint": "开启后，机器人会接管发给它的私聊消息；关闭时只处理群聊内的相关消息。"
       },
       "command_prefixes": {
         "description": "系统命令前缀",
@@ -22,7 +22,7 @@
         "hint": "以这些前缀开头的内容会优先按命令处理，而不是进入普通聊天流程。"
       },
       "whitelist_ids": {
-        "description": "白名单会话列表（UMO）",
+        "description": "白名单会话列表（统一会话标识）",
         "type": "list",
         "default": [],
         "hint": "填入指定会话后，这些会话会尽量跳过常规拦截和限流策略。适合重要群或测试群。"
@@ -50,7 +50,7 @@
         "type": "string",
         "default": "block_only",
         "options": ["block_and_stop", "block_only", "log_only"],
-        "hint": "block_and_stop: 阻止+停止事件 / block_only: 仅阻止消息 / log_only: 仅记录日志"
+        "hint": "可选择：拦截并停止后续处理、仅拦截错误消息、仅记录日志。一般建议选择“仅拦截错误消息”。"
       }
     }
   },
@@ -86,26 +86,48 @@
         "description": "向量检索模型池",
         "type": "list",
         "default": [],
-        "hint": "用于记忆检索和向量搜索。这里应填写 Embedding 模型，而不是普通聊天模型。"
+        "hint": "用于记忆检索和向量搜索。这里应填写向量化模型，而不是普通聊天模型。"
       }
     }
   },
   "persona": {
     "title": "人设绑定",
     "type": "object",
+    "description": "人设与自我认知",
     "items": {
       "persona_id": {
-        "title": "固定人设 ID",
+        "title": "固定人设标识",
         "type": "string",
         "default": "",
-        "description": "要绑定的人设 ID",
+        "description": "要绑定的人设标识",
         "hint": "留空时，会按当前会话使用独立人设；填写后，所有会话都会共用这一个人设。"
       },
       "include_self_lore_in_prompt": {
-        "description": "自动注入 self_lore",
+        "description": "自动加入自我知识",
         "type": "bool",
         "default": false,
-        "hint": "开启后 Bot 的自我知识（从人设提取的事实）会自动注入系统提示词。关闭时仅通过 self_lore_query 工具手动查询。"
+        "hint": "开启后，机器人会把从人设中提取的自我知识自动加入系统提示词；关闭后，仅在需要时通过工具查询。"
+      },
+      "component_max_retries": {
+        "title": "单个步骤重试次数",
+        "type": "int",
+        "default": 3,
+        "description": "人格压缩步骤单轮失败时的重试次数",
+        "hint": "模型偶尔超时会自动重试。通常保持 3 次即可，网络不稳定时可以适当增加。"
+      },
+      "retry_interval_sec": {
+        "title": "首次重新尝试间隔",
+        "type": "float",
+        "default": 15.0,
+        "description": "人格初始化连续失败后的首次等待秒数",
+        "hint": "核心人格或后台切片失败后，会等待这些秒数再重新尝试。"
+      },
+      "retry_max_interval_sec": {
+        "title": "最大重新尝试间隔",
+        "type": "float",
+        "default": 300.0,
+        "description": "人格初始化反复失败时的最长等待秒数",
+        "hint": "重试间隔会逐步增加，但不会超过这个数值，避免持续请求故障模型。"
       }
     }
   },
@@ -129,13 +151,13 @@
         "description": "强唤醒词列表",
         "type": "list",
         "default": [],
-        "hint": "消息以这些词开头时，会更容易触发 Bot 立刻响应。"
+        "hint": "消息以这些词开头时，会更容易触发机器人立刻响应。"
       },
       "nicknames": {
-        "description": "Bot 常用称呼",
+        "description": "机器人常用称呼",
         "type": "list",
         "default": [],
-        "hint": "填写别人平时怎么叫 Bot，方便它在群里识别自己被提到。"
+        "hint": "填写大家平时怎么称呼机器人，方便它在群里识别自己是否被提到。"
       },
       "extra_command_list": {
         "description": "直接触发工具的命令",
@@ -147,7 +169,7 @@
         "description": "关键词反应规则",
         "type": "list",
         "default": [],
-        "hint": "格式示例：'原神:你对这个话题会特别兴奋'。用于让 Bot 对某些词有更稳定的性格反应。"
+        "hint": "格式示例：'原神:你对这个话题会特别兴奋'。用于让机器人对某些词表现出更稳定的性格反应。"
       }
     }
   },
@@ -174,40 +196,40 @@
         "hint": "开启后，较稳定的系统提示前缀会尝试缓存复用，降低重复构建成本。"
       },
       "enable_token_estimator": {
-        "description": "启用 Token 估算压缩",
+        "description": "启用文本用量估算压缩",
         "type": "bool",
         "default": false,
-        "hint": "开启后，上下文压缩将基于 Token 估算值（而非纯消息条数）判断是否触发，避免长消息导致上下文溢出。字符/4 粗略估算，零依赖。"
+        "hint": "开启后，会按文本长度估算上下文用量，而不是只看消息条数，避免少量超长消息撑满上下文。"
       },
       "conversation_generation_enabled": {
-        "description": "启用对话轮次 generation 防线",
+        "description": "启用对话轮次版本防线",
         "type": "bool",
         "default": true,
         "hint": "关闭后回退到旧版回复时序，仅用于故障灰度回滚。"
       },
       "reply_send_claim_enabled": {
-        "description": "启用 final 回复幂等发送",
+        "description": "启用最终回复防重复发送",
         "type": "bool",
         "default": true,
-        "hint": "防止同一轮 final 被多个异步入口重复发送。"
+        "hint": "防止同一轮最终回复被多个异步流程重复发送。"
       },
       "group_thread_wait_enabled": {
         "description": "启用群聊分线程等待隔离",
         "type": "bool",
         "default": false,
-        "hint": "灰度开启后 GroupWait 与 generation 按群内线程隔离；关闭时保持整群范围旧行为。"
+        "hint": "开启后，群聊等待状态和对话轮次会按群内话题线程隔离，减少不同用户或不同话题互相串扰；关闭后使用整群共用状态。"
       },
       "non_conversational_guard_enabled": {
         "description": "隔离测试与控制消息",
         "type": "bool",
         "default": true,
-        "hint": "阻止已标记为 non-conversational 的消息进入聊天状态机。"
+        "hint": "阻止已标记为测试、控制等非对话用途的消息进入聊天状态机。"
       },
       "conversation_concurrency_debug_trace_enabled": {
         "description": "启用对话并发调试轨迹",
         "type": "bool",
         "default": false,
-        "hint": "仅排障时开启；默认 summary trace 不记录用户或回复正文。"
+        "hint": "仅在排查并发问题时开启；默认的概要轨迹不会记录用户消息或回复正文。"
       },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
@@ -219,16 +241,16 @@
         "description": "温区保留时长（秒）",
         "type": "float",
         "default": 300.0,
-        "hint": "较近但不那么新的片段会进入温区，供 prompt 参考。"
+        "hint": "较近但不那么新的片段会进入温区，供提示词参考。"
       },
       "warm_zone_max_tokens": {
-        "description": "温区最大 token 预算",
+        "description": "温区最大文本用量",
         "type": "int",
         "default": 1200,
-        "hint": "温区 transcript 的长度上限，避免 prompt 过长。"
+        "hint": "限制温区对话原文的长度，避免提示词过长。"
       },
       "compaction_provider_id": {
-        "description": "压缩摘要使用的模型 ID",
+        "description": "压缩摘要使用的模型标识",
         "type": "string",
         "default": "",
         "hint": "留空时使用默认逻辑；填写后可指定更适合摘要的模型。"
@@ -240,10 +262,10 @@
         "hint": "当同一会话累计片段达到这个数量时，会尝试生成冷区摘要。"
       },
       "compaction_trigger_tokens": {
-        "description": "触发压缩的 token 阈值",
+        "description": "触发压缩的文本用量阈值",
         "type": "int",
         "default": 1800,
-        "hint": "当会话累计 token 接近这个值时，会尝试压缩旧片段。"
+        "hint": "当会话累计文本用量接近这个值时，会尝试压缩旧片段。"
       },
       "compaction_keep_recent_segments": {
         "description": "压缩后保留的最近片段数",
@@ -252,7 +274,7 @@
         "hint": "压缩时会保留最近这几条消息，其余内容进入冷区摘要。"
       },
       "compaction_summary_max_tokens": {
-        "description": "冷区摘要最大 token 预算",
+        "description": "冷区摘要最大文本用量",
         "type": "int",
         "default": 450,
         "hint": "控制冷区摘要本身的长度上限。"
@@ -267,13 +289,13 @@
         "description": "普通聊天时的接话积极度",
         "type": "float",
         "default": 0.7,
-        "hint": "值越高，Bot 越愿意主动接话、顺着聊下去；值越低，Bot 会更克制，更少插话。"
+        "hint": "值越高，机器人越愿意主动接话、顺着聊下去；值越低，机器人会更克制，更少插话。"
       },
       "follow_up_probability": {
         "description": "回复后再补一句的概率",
         "type": "float",
         "default": 0.2,
-        "hint": "控制 Bot 回完第一句后，是否会再自然补一句。0 表示几乎不会补，1 表示经常会补。"
+        "hint": "控制机器人回完第一句后，是否会再自然补一句。0 表示不会追加，1 表示每次都尝试追加。"
       },
       "stale_reply_max_age_sec": {
         "description": "聊天回复的最长有效时长（秒）",
@@ -303,7 +325,7 @@
         "description": "附带表情包的概率（%）",
         "type": "int",
         "default": 60,
-        "hint": "值越高，Bot 越容易在合适的场景顺手带一个表情包。不是每次都会发，只是更容易触发。"
+        "hint": "值越高，机器人越容易在合适的场景附带表情包。不是每次都会发，只是更容易触发。"
       },
       "emotion_mapping": {
         "description": "情绪与表情包文件夹的对应关系",
@@ -328,7 +350,7 @@
         "description": "启用基础内容安全过滤",
         "type": "bool",
         "default": false,
-        "hint": "开启后检测 NSFW/自残/PII 内容并替换为 fallback_text。关闭时不做内容安全检测。"
+        "hint": "开启后，会检测不适宜内容、自残风险和个人身份信息，并把高风险回复替换为兜底文本；关闭后不进行这项检测。"
       }
     }
   },
@@ -343,22 +365,22 @@
         "hint": "短时间内连续出现的消息会先聚合，再统一判断要不要回复。"
       },
       "judge_timeout": {
-        "description": "System1 Judge timeout seconds",
+        "description": "快速注意力判断超时（秒）",
         "type": "float",
         "default": 3.0,
-        "hint": "Maximum time to wait for the lightweight attention judge before passing through."
+        "hint": "轻量注意力判断超过这个时间仍未完成时，会直接放行消息，避免聊天被判断流程卡住。"
       },
       "bg_pool_size": {
         "description": "后台观察缓存条数",
         "type": "int",
         "default": 20,
-        "hint": "用于保留最近一段群聊窗口，帮助 Bot 判断当前该接哪条消息。"
+        "hint": "用于保留最近一段群聊窗口，帮助机器人判断当前该接哪条消息。"
       },
       "throttle_probability": {
         "description": "低优先级窗口放行概率",
         "type": "float",
         "default": 0.1,
-        "hint": "用于降频。值越低，Bot 越不容易对低价值内容插话。"
+        "hint": "用于降低无关回复频率。值越低，机器人越不容易对低价值内容插话。"
       },
       "throttle_min_entropy": {
         "description": "最小有效文本量",
@@ -382,7 +404,7 @@
         "description": "启用主线程识别",
         "type": "bool",
         "default": true,
-        "hint": "开启后，Bot 会优先寻找“当前真正该回复的消息线程”，而不是机械地回复最后一条。"
+        "hint": "开启后，机器人会优先寻找当前真正该回复的话题线程，而不是机械地回复最后一条消息。"
       },
       "focus_thread_core_max_messages": {
         "description": "主线程核心消息上限",
@@ -409,10 +431,10 @@
         "hint": "同一个人在这个时间内连发多条时，会更倾向于视为同一段表达。"
       },
       "thread_reply_priority_enabled": {
-        "description": "回复/@Bot 消息优先",
+        "description": "回复或提及机器人消息优先",
         "type": "bool",
         "default": true,
-        "hint": "开启后，明确回复 Bot、@Bot 或直接唤醒 Bot 的消息会优先成为本轮焦点。"
+        "hint": "开启后，明确回复、提及或直接唤醒机器人的消息会优先成为本轮焦点。"
       },
       "affection_weights": {
         "description": "情绪归因权重",
@@ -445,7 +467,7 @@
         "description": "高风险敏感词列表",
         "type": "list",
         "default": ["傻逼", "弱智", "滚", "死", "妈", "废物", "神经", "有病"],
-        "hint": "情感路由权重词：当 Bot 情绪为愤怒/悲伤且消息含这些词时，发言者获得更高的情感权重。这不是内容安全过滤，不会拦截或屏蔽消息。"
+        "hint": "当机器人处于愤怒或悲伤状态，且消息包含这些词时，会提高该发言者的情感关注度。这不是内容安全过滤，不会拦截或屏蔽消息。"
       }
     }
   },
@@ -457,7 +479,7 @@
         "description": "私聊等待下一句时长（秒）",
         "type": "int",
         "default": 300,
-        "hint": "Bot 在私聊里回复后，会在这段时间内保持“等你继续说”的状态。"
+        "hint": "机器人在私聊里回复后，会在这段时间内保持“等你继续说”的状态。"
       }
     }
   },
@@ -469,7 +491,7 @@
         "description": "启用深度回忆模式",
         "type": "bool",
         "default": true,
-        "hint": "开启后，Bot 会用更复杂的多步检索方式回忆历史；关闭后会更省资源。"
+        "hint": "开启后，机器人会用多步检索和重排方式查找历史记忆，效果更全面但耗时更高；关闭后使用普通召回。"
       },
       "prune_threshold": {
         "description": "记忆清理阈值",
@@ -496,79 +518,88 @@
         "hint": "当记忆或对话积累到一定规模后，会更倾向于做摘要压缩。"
       },
       "recall_top_k": {
-        "description": "单次回忆条数上限",
+        "description": "单次召回记忆条数",
         "type": "int",
         "default": 5,
-        "hint": "每次最多取回多少条相关记忆参与回答。"
+        "hint": "每次回答最多选取多少条相关记忆。数值越大，参考内容越多，也会占用更多上下文。一般建议保持 5。"
       },
       "memory_query_builder_enabled": {
-        "description": "Enable memory query builder",
+        "description": "启用分层记忆查询",
         "type": "bool",
         "default": true,
-        "hint": "Enable layered query metadata for memory retrieval. Disable to fall back to legacy query behavior."
+        "hint": "开启后，会区分用户原话、实际检索词和上下文补充信息，提高短句和指代问题的召回效果；关闭后使用旧版查询方式。建议开启。"
       },
       "intent_rerank_enabled": {
-        "description": "Enable intent-aware memory rerank",
+        "description": "启用按问题意图重排记忆",
         "type": "bool",
         "default": false,
-        "hint": "When enabled, memory candidates can be reranked by query intent after deduplication."
+        "hint": "开启后，会在候选记忆合并去重后，根据当前问题的意图重新排序。可能改变召回顺序，建议先小范围验证。"
       },
       "adaptive_top_k_enabled": {
-        "description": "Enable adaptive memory top-k",
+        "description": "启用自适应记忆召回数量",
         "type": "bool",
         "default": false,
-        "hint": "When enabled, memory retrieval may adjust candidate and injection counts by intent and prompt budget."
+        "hint": "开启后，会根据问题类型和提示词剩余空间，自动调整初步候选数量及最终参与回答的记忆条数；关闭后使用固定条数。"
       },
       "memory_retrieval_debug_trace_enabled": {
-        "description": "Enable detailed memory retrieval debug trace",
+        "description": "启用详细记忆检索调试轨迹",
         "type": "bool",
         "default": false,
-        "hint": "Debug trace may include detailed query and candidate information. Keep disabled for normal use."
+        "hint": "开启后，调试轨迹可能记录完整查询、上下文词和候选详情。日常使用建议关闭，避免日志过多或记录敏感内容。"
       },
       "deep_temporal_alpha": {
-        "description": "deep retrieval 鏃堕棿浠叉潈淇濆簳绯绘暟",
+        "description": "深度召回的时间权重保底系数",
         "type": "float",
-        "default": 0.7
+        "default": 0.7,
+        "hint": "控制旧记忆在时间衰减后至少保留多少权重。范围为 0 到 1；值越高，旧记忆越不容易因时间久远被降权。一般建议保持 0.7。"
       },
       "deep_temporal_tau_seconds": {
-        "description": "deep retrieval 鏃堕棿琛板噺褰掍竴鍖栫獥鍙ｏ紙绉掞級",
+        "description": "深度召回的时间衰减周期（秒）",
         "type": "float",
-        "default": 86400.0
+        "default": 86400.0,
+        "hint": "控制记忆随时间变旧的速度。数值越大，衰减越慢；86400 秒等于 1 天。"
       },
       "deep_temporal_lambda_default": {
-        "description": "鏅€氳蹇嗙殑 deep retrieval 鏃堕棿琛板噺寮哄害",
+        "description": "普通记忆的时间衰减强度",
         "type": "float",
-        "default": 1.0
+        "default": 1.0,
+        "hint": "控制普通记忆受时间影响的程度。数值越大，旧的普通记忆降权越快。一般建议保持 1。"
       },
       "deep_temporal_lambda_fact": {
-        "description": "fact 绫昏蹇嗙殑 deep retrieval 缂撹“琛板噺寮哄害",
+        "description": "事实记忆的时间衰减强度",
         "type": "float",
-        "default": 0.1
+        "default": 0.1,
+        "hint": "控制姓名、身份、长期偏好等事实记忆的时间衰减。数值越小，事实保留得越久。一般建议保持 0.1。"
       },
       "deep_temporal_candidate_pool_factor": {
-        "description": "deep retrieval 鍊欓€夋睜鏀惧ぇ鍊嶆暟",
+        "description": "深度召回候选池放大倍数",
         "type": "int",
-        "default": 4
+        "default": 4,
+        "hint": "初步召回时，会按最终所需条数的这个倍数收集候选，再进行重排。数值越大，召回可能更全面，但耗时和资源占用也更高。"
       },
       "deep_temporal_candidate_pool_min": {
-        "description": "deep retrieval 鍊欓€夋睜鏈€灏忔潯鏁?",
+        "description": "深度召回候选池最少条数",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "hint": "无论最终需要多少条记忆，深度召回初步阶段至少保留这么多候选。一般建议保持 20。"
       },
       "deep_temporal_llm_window": {
-        "description": "deep retrieval 缁忔湰鍦版椂闂翠话瑁佸悗鍏佽 LLM 寰皟鐨勬渶澶ф潯鏁?",
+        "description": "允许模型精排的候选条数上限",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "hint": "本地时间排序后，最多把多少条候选交给模型进一步调整顺序。数值越大，精排更全面，但模型调用成本也更高。"
       },
       "maintenance_hot_beta": {
-        "description": "maintenance 鐑害鍒嗙殑鏃堕棿涓庤闂粺璁℃潈閲?",
+        "description": "记忆热度中的时间新鲜度权重",
         "type": "float",
-        "default": 0.7
+        "default": 0.7,
+        "hint": "维护记忆时，用于平衡最近访问时间和累计访问次数。值越高越看重最近是否访问，值越低越看重历史访问次数。"
       },
       "maintenance_temporal_stale_hot_threshold": {
-        "description": "maintenance 鍩轰簬鐑害鎵规爣 stale 鐨勯槇鍊?",
+        "description": "自动标记过时记忆的热度阈值",
         "type": "float",
-        "default": 0.35
+        "default": 0.35,
+        "hint": "维护时，热度低于这个值的记忆更容易被标记为过时。数值越高，清理越积极。一般建议保持 0.35。"
       },
       "min_memory_confidence": {
         "description": "记忆写入最低置信度",
@@ -579,9 +610,10 @@
         "hint": "低于此置信度的记忆不会被持久化。设为 0 则不启用此门控。"
       },
       "auto_recall_probability": {
+        "description": "无明确回忆词时的自动召回概率",
         "type": "float",
         "default": 0.0,
-        "hint": "自动记忆召回概率（0.0=禁用, 1.0=每次触发）"
+        "hint": "当消息没有“之前”“记得”等明显回忆词时，仍主动尝试查找记忆的概率。0 表示不额外触发，1 表示每条消息都尝试。一般建议先保持 0。"
       }
     }
   },
@@ -593,13 +625,13 @@
         "description": "启用表达习惯学习",
         "type": "bool",
         "default": true,
-        "hint": "开启后，Bot 会从群聊里学习大家常用的表达方式、梗和语气。"
+        "hint": "开启后，机器人会从群聊里学习大家常用的表达方式、梗和语气。"
       },
       "enable_relationship_engine": {
         "description": "启用关系变化引擎",
         "type": "bool",
         "default": true,
-        "hint": "开启后，Bot 会根据互动频率和态度变化，动态更新对不同用户的熟悉度和关系感。"
+        "hint": "开启后，机器人会根据互动频率和态度变化，动态更新对不同用户的熟悉度和关系感。"
       },
       "min_mining_context": {
         "description": "学习所需最小上下文量",
@@ -656,14 +688,16 @@
         "hint": "只有同一黑话在群内累计出现到这个次数后，才会进入自动审核。"
       },
       "review_runner_interval_sec": {
+        "description": "表达审核运行间隔（秒）",
         "type": "int",
         "default": 60,
-        "hint": "表情审查运行间隔（秒），范围 30-600"
+        "hint": "后台多久检查一次待审核的表达，允许范围为 30 到 600 秒。"
       },
       "review_runner_min_interval_sec": {
+        "description": "同一会话表达审核最短间隔（秒）",
         "type": "int",
         "default": 45,
-        "hint": "表情审查最小间隔（秒），防止同一聊天连续触发"
+        "hint": "同一会话两次表达审核之间至少间隔多久，避免短时间连续触发。"
       }
     }
   },
@@ -675,7 +709,7 @@
         "description": "启用主动发言",
         "type": "bool",
         "default": true,
-        "hint": "关闭后 Bot 不会主动打破沉默。开启时 Bot 可能根据上下文主动发起话题。"
+        "hint": "关闭后，机器人不会主动打破沉默；开启后，机器人可能根据上下文主动发起话题。"
       },
       "dream_interval_min": {
         "description": "梦境整理触发间隔（分钟）",
@@ -693,25 +727,25 @@
         "description": "触发梦境整理的最少记忆数",
         "type": "int",
         "default": 5,
-        "hint": "记忆积累太少时不会进入 dream 流程。"
+        "hint": "记忆积累太少时不会进入梦境整理流程。"
       },
       "intimate_tool_threshold": {
-        "description": "Intimate tool threshold",
+        "description": "允许亲密互动工具的关系分数阈值",
         "type": "float",
         "default": 20.0,
-        "hint": "Relationship score threshold for enabling more intimate proactive tools."
+        "hint": "用户关系分数达到这个值后，才允许使用更亲密的主动互动工具。数值越高，启用条件越严格。"
       },
       "hostile_threshold": {
-        "description": "Hostile relationship threshold",
+        "description": "限制敌意互动的关系分数阈值",
         "type": "float",
         "default": -20.0,
-        "hint": "Relationship score threshold for applying hostile tool restrictions."
+        "hint": "用户关系分数低于这个值后，会限制部分不适合敌对关系的互动工具。"
       },
       "energy_exhaustion": {
-        "description": "Energy exhaustion threshold",
+        "description": "精力不足限制阈值",
         "type": "float",
         "default": 0.1,
-        "hint": "When energy is below this value, high-cost chat tools are restricted."
+        "hint": "机器人的精力低于这个值时，会限制消耗较高的聊天工具。"
       },
       "dream_visible": {
         "description": "公开发送梦境文本",
@@ -723,7 +757,7 @@
         "description": "梦境文本发送目标",
         "type": "string",
         "default": "",
-        "hint": "留空时默认发回当前 dream 会话；填写后可固定发送到指定会话。"
+        "hint": "留空时默认发回当前梦境整理会话；填写后可固定发送到指定会话。"
       },
       "proactive_quiet_hours": {
         "description": "主动开口安静时段",
@@ -741,7 +775,7 @@
         "description": "主动发言所需最低精力",
         "type": "float",
         "default": 0.6,
-        "hint": "精力低于这个值时，Bot 会更克制，不太会主动打破沉默。"
+        "hint": "精力低于这个值时，机器人会更克制，不太会主动打破沉默。"
       },
       "wakeup_cost": {
         "description": "主动发言消耗",
@@ -771,7 +805,7 @@
         "description": "最低回复精力阈值",
         "type": "float",
         "default": 0.1,
-        "hint": "精力过低时，Bot 会更不愿意回应。"
+        "hint": "精力过低时，机器人会更不愿意回应。"
       },
       "cost_per_reply": {
         "description": "每次回复消耗",
@@ -789,7 +823,7 @@
         "description": "进入恢复状态所需安静时长（分钟）",
         "type": "int",
         "default": 60,
-        "hint": "足够安静一段时间后，Bot 会更容易恢复精力。"
+        "hint": "足够安静一段时间后，机器人会更容易恢复精力。"
       }
     }
   },
@@ -819,7 +853,7 @@
   },
   "agent": {
     "type": "object",
-    "description": "System 2 推理参数",
+    "description": "深度推理参数",
     "items": {
       "max_steps": {
         "description": "最大推理步数",
@@ -843,13 +877,13 @@
         "description": "启用看图能力",
         "type": "bool",
         "default": true,
-        "hint": "关闭后，Bot 不会再分析图片内容。"
+        "hint": "关闭后，机器人不会分析图片内容。"
       },
       "image_recognition_probability": {
         "description": "图片进入识别流程的概率",
         "type": "float",
         "default": 0.5,
-        "hint": "用于控制看图频率。值越高，Bot 越容易主动处理图片。"
+        "hint": "用于控制看图频率。值越高，机器人越容易主动处理图片。"
       },
       "use_native_main_reply_vision": {
         "description": "主回复原生识图直通开关",
@@ -867,31 +901,31 @@
   },
   "sys3": {
     "type": "object",
-    "description": "工作模式（Sys3）",
+    "description": "工作模式（三阶段）",
     "items": {
       "enable_work_mode": {
         "description": "启用工作模式",
         "type": "bool",
         "default": false,
-        "hint": "开启后，Bot 可以进入更偏任务执行、工具调用的工作流。"
+        "hint": "开启后，机器人可以进入更偏任务执行和工具调用的工作流程。"
       },
       "max_steps": {
-        "description": "Sys3 direct maximum steps",
+        "description": "工作模式直接执行的最大步骤数",
         "type": "int",
         "default": 30,
-        "hint": "Maximum tool-loop steps for direct Sys3 work-mode entry."
+        "hint": "直接进入工作模式后，单次任务最多允许执行多少个工具步骤。数值越大，可完成的任务更复杂，但耗时也可能更长。"
       },
       "tool_timeout": {
-        "description": "Sys3 direct timeout seconds",
+        "description": "工作模式直接执行超时（秒）",
         "type": "int",
         "default": 120,
-        "hint": "Tool-loop timeout for direct Sys3 work-mode entry."
+        "hint": "直接进入工作模式后，工具执行超过这个时间会中止，避免任务长时间卡住。"
       },
       "computer_agent_sandbox_enabled": {
-        "description": "启用 ComputerAgent 代码执行",
+        "description": "启用计算机代码执行工具",
         "type": "bool",
         "default": false,
-        "hint": "开启后 ComputerAgent 才能加载 Python/Shell 工具。注意：此功能在宿主机直执，请仅在受信任环境开启。关闭时 ComputerAgent 会优雅降级并提示用户。"
+        "hint": "开启后，计算机代理可以在宿主机直接运行脚本和命令。此功能风险较高，只应在受信任环境中开启；关闭后会自动降级并提示用户。"
       }
     }
   },
@@ -924,7 +958,7 @@
         "hint": "同一时间最多允许多少个模型请求同时进行。数值过大可能更容易触发限流。"
       },
       "rate_limit_model_cooldown_sec": {
-        "description": "模型触发 429/rate limit 后的运行期冷却时间（秒）",
+        "description": "模型请求过多或被限流后的冷却时间（秒）",
         "type": "int",
         "default": 120,
         "hint": "某个模型被限速后，后续请求会在这段时间内优先跳过它并尝试其他候选模型。"

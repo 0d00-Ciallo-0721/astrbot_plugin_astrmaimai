@@ -1,6 +1,7 @@
 # astrmai/Brain/persona_summarizer.py
 import hashlib
 import asyncio
+import copy
 import json
 import time
 from typing import Dict, Any, Tuple
@@ -16,6 +17,17 @@ class PersonaSummarizer:
     人设摘要/压缩管理器 (System 2)
     职责: 将冗长的 System Prompt 压缩为高密度的核心特征与风格指南，减少 Token 消耗。
     """
+    REQUIRED_SHARDS = (
+        "logic_style",
+        "speech_style",
+        "world_view",
+        "timeline",
+        "relations",
+        "skills",
+        "values",
+        "secrets",
+    )
+
     def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None, memory_engine=None):
         self.persistence = persistence
         self.gateway = gateway
@@ -25,8 +37,10 @@ class PersonaSummarizer:
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁
         self.pending_tasks: Dict[str, asyncio.Task] = {}
+        self.pending_core_tasks: Dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._cache_generations: Dict[str, int] = {}
+        self._verified_core_hashes: Dict[str, str] = {}
         self._closed = False
         self._lock = asyncio.Lock()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
@@ -51,7 +65,7 @@ class PersonaSummarizer:
             return None
         generation = self._cache_generations.setdefault(cache_key, 0)
         task = safe_create_task(
-            self._generate_all_shards_background(original_prompt, cache_key),
+            self._run_enrichment_until_complete(original_prompt, cache_key),
             name=f"persona-shards:{cache_key}",
             track_set=self._background_tasks,
         )
@@ -60,9 +74,36 @@ class PersonaSummarizer:
         self.pending_tasks[cache_key] = task
         return task
 
+    async def _run_enrichment_until_complete(self, original_prompt: str, cache_key: str) -> None:
+        initial_delay, max_delay = self._retry_delay_bounds()
+        delay = initial_delay
+        while not self._closed:
+            try:
+                try:
+                    await self._generate_all_shards_background(
+                        original_prompt,
+                        cache_key,
+                        raise_on_failure=True,
+                    )
+                except TypeError as exc:
+                    if "raise_on_failure" not in str(exc):
+                        raise
+                    await self._generate_all_shards_background(original_prompt, cache_key)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[PersonaSummarizer] enrichment retry scheduled [{cache_key}] "
+                    f"in {delay:.1f}s: {exc}"
+                )
+                await asyncio.sleep(delay)
+                delay = min(max_delay, delay * 2)
+
     async def _invalidate_if_prompt_changed(self, cache_key: str, original_prompt: str) -> bool:
         expected_hash = self._compute_hash(original_prompt)
         stale_task = None
+        stale_core_task = None
         async with self._lock:
             cached = self.cache.get(cache_key)
             if not isinstance(cached, dict):
@@ -75,10 +116,15 @@ class PersonaSummarizer:
                 return False
             self._cache_generations[cache_key] = self._cache_generations.get(cache_key, 0) + 1
             self.cache.pop(cache_key, None)
+            self._verified_core_hashes.pop(cache_key, None)
             stale_task = self.pending_tasks.pop(cache_key, None)
+            stale_core_task = self.pending_core_tasks.pop(cache_key, None)
         if stale_task and not stale_task.done():
             stale_task.cancel()
             await asyncio.gather(stale_task, return_exceptions=True)
+        if stale_core_task and stale_core_task is not asyncio.current_task() and not stale_core_task.done():
+            stale_core_task.cancel()
+            await asyncio.gather(stale_core_task, return_exceptions=True)
         memory_engine = getattr(self, "memory_engine", None)
         if memory_engine and hasattr(memory_engine, "clear_persona_lore"):
             try:
@@ -91,13 +137,14 @@ class PersonaSummarizer:
         self._closed = True
         for cache_key in list(self._cache_generations):
             self._cache_generations[cache_key] += 1
-        tasks = list({*self._background_tasks, *self.pending_tasks.values()})
+        tasks = list({*self._background_tasks, *self.pending_tasks.values(), *self.pending_core_tasks.values()})
         for task in tasks:
             if task and not task.done():
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.pending_tasks.clear()
+        self.pending_core_tasks.clear()
         self._background_tasks.clear()
 
     def _compute_hash(self, text: str) -> str:
@@ -168,13 +215,106 @@ class PersonaSummarizer:
             template_envelope=envelope,
         )
 
-    async def _persist_cache(self) -> None:
+    def _component_max_retries(self) -> int:
+        persona_config = getattr(self.config, "persona", None)
+        return max(1, int(getattr(persona_config, "component_max_retries", 3) or 3))
+
+    def _retry_delay_bounds(self) -> tuple[float, float]:
+        persona_config = getattr(self.config, "persona", None)
+        initial = max(0.1, float(getattr(persona_config, "retry_interval_sec", 15.0) or 15.0))
+        maximum = max(initial, float(getattr(persona_config, "retry_max_interval_sec", 300.0) or 300.0))
+        return initial, maximum
+
+    async def _persist_cache(self, *, strict: bool = False) -> None:
         if self._closed:
             return
-        if hasattr(self.persistence, "save_persona_cache_async"):
-            await self.persistence.save_persona_cache_async(self.cache)
+        snapshot = copy.deepcopy(self.cache)
+        if strict and hasattr(self.persistence, "save_persona_cache_strict_async"):
+            await self.persistence.save_persona_cache_strict_async(snapshot)
+        elif strict and hasattr(self.persistence, "save_persona_cache_strict"):
+            await asyncio.to_thread(self.persistence.save_persona_cache_strict, snapshot)
+        elif hasattr(self.persistence, "save_persona_cache_async"):
+            result = await self.persistence.save_persona_cache_async(snapshot)
+            if strict and result is False:
+                raise OSError("persona cache persistence failed")
         else:
-            self.persistence.save_persona_cache(self.cache)
+            result = self.persistence.save_persona_cache(snapshot)
+            if strict and result is False:
+                raise OSError("persona cache persistence failed")
+
+    def _cache_key(self, persona_id: str, session_id: str) -> str:
+        normalized = str(persona_id or "").strip()
+        return normalized or f"session_{session_id}"
+
+    def _core_cache_is_ready(self, payload: Dict[str, Any], original_prompt: str) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if str(payload.get("raw_hash", "") or "") != self._compute_hash(original_prompt):
+            return False
+        components = payload.get("core_components", {})
+        if not isinstance(components, dict) or any(
+            components.get(name) != "completed" for name in ("summary", "style", "first_person_rewrite")
+        ):
+            return False
+        if not original_prompt:
+            return bool(str(payload.get("style", "") or "").strip())
+        return all(
+            str(payload.get(name, "") or "").strip()
+            for name in ("summary", "style", "first_person_rewrite")
+        ) and str(payload.get("style", "") or "").strip() != "数据解析中..."
+
+    async def _verify_persisted_core(self, cache_key: str, original_prompt: str) -> None:
+        loader = getattr(self.persistence, "load_persona_cache_async", None)
+        if callable(loader):
+            persisted = await loader()
+        else:
+            persisted = await asyncio.to_thread(self.persistence.load_persona_cache)
+        payload = persisted.get(cache_key) if isinstance(persisted, dict) else None
+        if not self._core_cache_is_ready(payload, original_prompt):
+            raise OSError(f"persona core cache verification failed: {cache_key}")
+        self._verified_core_hashes[cache_key] = self._compute_hash(original_prompt)
+
+    def _full_cache_is_ready(
+        self,
+        payload: Dict[str, Any],
+        original_prompt: str,
+        *,
+        include_self_lore: bool,
+    ) -> bool:
+        if not self._core_cache_is_ready(payload, original_prompt) or not payload.get("is_full_ready", False):
+            return False
+        if include_self_lore and not payload.get("self_lore_ready", False):
+            return False
+        if payload.get("shards_not_required", False):
+            return True
+        shards = payload.get("shards", {})
+        shard_status = payload.get("shard_status", {})
+        if not isinstance(shards, dict) or not isinstance(shard_status, dict):
+            return False
+        return all(
+            shard_status.get(name) == "completed" and bool(str(shards.get(name, "") or "").strip())
+            for name in self.REQUIRED_SHARDS
+        )
+
+    async def _verify_persisted_full(
+        self,
+        cache_key: str,
+        original_prompt: str,
+        *,
+        include_self_lore: bool,
+    ) -> None:
+        loader = getattr(self.persistence, "load_persona_cache_async", None)
+        if callable(loader):
+            persisted = await loader()
+        else:
+            persisted = await asyncio.to_thread(self.persistence.load_persona_cache)
+        payload = persisted.get(cache_key) if isinstance(persisted, dict) else None
+        if not self._full_cache_is_ready(
+            payload,
+            original_prompt,
+            include_self_lore=include_self_lore,
+        ):
+            raise OSError(f"persona full cache verification failed: {cache_key}")
 
     async def _build_first_person_rewrite(
         self,
@@ -183,6 +323,8 @@ class PersonaSummarizer:
         summary: str,
         style: str,
         cache_key: str,
+        max_retries: int | None = None,
+        raise_on_failure: bool = False,
     ) -> str:
         base_summary = str(summary or original_prompt or "").strip()
         if not base_summary:
@@ -205,161 +347,258 @@ Rules:
 - Do not mention prompts, AI, tools, or system instructions.
 - Output plain text only, within 120 characters if possible.
 """
-        try:
-            if self.prompt_registry is not None:
-                envelope = self.prompt_registry.render_template(
-                    PromptTemplateId.PERSONA_FIRST_PERSON_REWRITE,
-                    {
-                        "original_prompt": original_prompt,
-                        "summary": summary,
-                        "style": style,
-                    },
-                )
-                res = await self._call_persona_lane(
-                    envelope.prompt,
-                    cache_key,
-                    system_prompt=envelope.system_prompt,
-                    is_json=False,
-                    template_envelope=envelope,
-                )
-            else:
-                res = await self._call_persona_lane(
-                    prompt,
-                    cache_key,
-                    system_prompt="Rewrite persona summaries into concise first-person self-awareness text.",
-                    is_json=False,
-                )
-        except Exception as exc:
-            logger.warning(f"[PersonaSummarizer] first-person rewrite failed [{cache_key}]: {exc}")
-            return ""
-        rewritten = str(res or "").strip()
-        if len(rewritten) < 4:
-            return ""
-        return rewritten
-
-    async def get_summary(self, original_prompt: str, persona_id: str = "", session_id: str = "global") -> Dict[str, Any]:
-        """
-        [修改] 基于 Persona ID 获取人设切片。全面替换缓存文件的保存为异步。
-        :param original_prompt: 原始人设文本（用于首次生成）。
-        :param persona_id: 配置中填写的唯一 ID。
-        :param session_id: 如果 ID 为空，用 session_id 做兜底（实现千人千面缓存）。
-        """
-        # 接入 Config 阈值
-        summary_threshold = self.config.performance.summary_threshold
-
-        # 1. 确定 Cache Key (ID 优先)
-        if persona_id and persona_id.strip():
-            cache_key = persona_id.strip()
-        else:
-            cache_key = f"session_{session_id}"
-
-        if self._closed:
-            return {
-                "summary": original_prompt,
-                "first_person_rewrite": original_prompt,
-                "style": "保持原始风格",
-                "shards": {},
-                "is_full_ready": True,
-                "raw": original_prompt,
-                "raw_hash": self._compute_hash(original_prompt),
-                "timestamp": time.time(),
-            }
-
-        await self._invalidate_if_prompt_changed(cache_key, original_prompt)
-
-        # ==========================================
-        # 🟢 [核心修复] 2. 查缓存与自愈机制 (Fast Path & Self-Healing)
-        # ==========================================
-        if cache_key in self.cache:
-            cached_data = dict(self.cache[cache_key])
-            
-            # 检查是否陷入了“半成品死锁” (缓存未就绪，且当前没有后台任务在跑)
-            is_ready = cached_data.get("is_full_ready", False)
-            is_running = cache_key in self.pending_tasks
-            
-            if not is_ready and not is_running:
-                logger.warning(f"[PersonaSummarizer] ⚠️ 发现 [{cache_key}] 的切片处于中断死锁状态，正在触发自愈机制，重新拉起后台提取任务！")
-                # 从残缺缓存中提取原始长文本，重新拉起后台任务
-                raw_text = cached_data.get("raw", original_prompt)
-                self._start_shard_task(raw_text, cache_key)
-
-            if not str(cached_data.get("first_person_rewrite", "") or "").strip():
-                rewritten = await self._build_first_person_rewrite(
-                    original_prompt=str(cached_data.get("raw", original_prompt) or original_prompt or ""),
-                    summary=str(cached_data.get("summary", "") or original_prompt or ""),
-                    style=str(cached_data.get("style", "") or ""),
-                    cache_key=cache_key,
-                )
-                if rewritten:
-                    cached_data["first_person_rewrite"] = rewritten
-                    self.cache[cache_key] = cached_data
-                    await self._persist_cache()
+        attempts = max(1, int(max_retries or self._component_max_retries()))
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                if self.prompt_registry is not None:
+                    envelope = self.prompt_registry.render_template(
+                        PromptTemplateId.PERSONA_FIRST_PERSON_REWRITE,
+                        {
+                            "original_prompt": original_prompt,
+                            "summary": summary,
+                            "style": style,
+                        },
+                    )
+                    res = await self._call_persona_lane(
+                        envelope.prompt,
+                        cache_key,
+                        system_prompt=envelope.system_prompt,
+                        is_json=False,
+                        template_envelope=envelope,
+                    )
                 else:
-                    cached_data["first_person_rewrite"] = str(cached_data.get("summary", "") or original_prompt or "")
-            return cached_data
+                    res = await self._call_persona_lane(
+                        prompt,
+                        cache_key,
+                        system_prompt="Rewrite persona summaries into concise first-person self-awareness text.",
+                        is_json=False,
+                    )
+                rewritten = str(res or "").strip()
+                if len(rewritten) >= 4:
+                    return rewritten
+                last_error = ValueError("first-person rewrite result is too short")
+            except Exception as exc:
+                last_error = exc
+            logger.warning(
+                f"[PersonaSummarizer] first-person rewrite failed [{cache_key}] "
+                f"({attempt + 1}/{attempts}): {last_error}"
+            )
+            if attempt + 1 < attempts:
+                await asyncio.sleep(1.5)
+        if raise_on_failure:
+            raise RuntimeError(f"first-person rewrite failed for {cache_key}") from last_error
+        return ""
 
-        # 3. 缓存完全未命中（新 ID 或新会话），启动全新生成流程
-        if not original_prompt or len(original_prompt) < summary_threshold:
-            return {
-                "summary": original_prompt,
-                "first_person_rewrite": original_prompt,
-                "style": "保持原始风格",
-                "shards": {},
-                "is_full_ready": True,
-                "raw": original_prompt,
-                "timestamp": time.time()
-            }
-
+    async def _checkpoint_core_component(
+        self,
+        cache_key: str,
+        original_prompt: str,
+        component: str,
+        value: str,
+    ) -> None:
         async with self._lock:
-            # 双重检查锁
-            if cache_key in self.cache:
-                return self.cache[cache_key]
-                
-            logger.info(f"[PersonaSummarizer] 🆕 未找到 ID [{cache_key}] 的缓存，开始构建新的人设切片...")
-            
-            # ==========================================
-            # 🟢 阶段一：单独执行核心身份提取 -> 写入 JSON
-            # ==========================================
-            summary = await self._summarize_core_identity_with_retry(original_prompt, cache_key)
-            
-            new_cache_data = {
-                "summary": summary,
-                "first_person_rewrite": "",
-                "style": "数据解析中...", # 临时占位
-                "shards": {},
-                "is_full_ready": False,
-                "raw": original_prompt,
-                "raw_hash": self._compute_hash(original_prompt),
-                "timestamp": time.time()
-            }
-            self.cache[cache_key] = new_cache_data
-            self._cache_generations.setdefault(cache_key, 0)
-            
-            # 第一次保存到 JSON
-            await self._persist_cache()
-                
-            # ==========================================
-            # 🟢 阶段二：单独执行语言风格提取 -> 更新 JSON
-            # ==========================================
-            style = await self._summarize_style_with_retry(original_prompt, cache_key)
+            payload = self.cache.setdefault(cache_key, {})
+            payload.update(
+                {
+                    "raw": original_prompt,
+                    "raw_hash": self._compute_hash(original_prompt),
+                    "timestamp": time.time(),
+                    "core_ready": False,
+                    "is_full_ready": False,
+                }
+            )
+            payload.setdefault("summary", "")
+            payload.setdefault("style", "数据解析中...")
+            payload.setdefault("first_person_rewrite", "")
+            payload.setdefault("shards", {})
+            payload.setdefault("shard_status", {})
+            payload.setdefault("core_components", {})
+            payload[component] = value
+            payload["core_components"][component] = "completed"
+            await self._persist_cache(strict=True)
+
+    async def _initialize_core(self, original_prompt: str, cache_key: str) -> Dict[str, Any]:
+        threshold = int(getattr(getattr(self.config, "performance", None), "summary_threshold", 300) or 300)
+        if not original_prompt or len(original_prompt) < threshold:
+            include_self_lore = bool(
+                getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False)
+            )
+            async with self._lock:
+                self.cache[cache_key] = {
+                    "summary": original_prompt,
+                    "first_person_rewrite": original_prompt,
+                    "style": "保持原始风格",
+                    "shards": {},
+                    "shard_status": {},
+                    "core_components": {
+                        "summary": "completed",
+                        "style": "completed",
+                        "first_person_rewrite": "completed",
+                    },
+                    "core_ready": True,
+                    "persona_state": "core_ready",
+                    "is_full_ready": not include_self_lore,
+                    "self_lore_ready": not include_self_lore,
+                    "shards_not_required": True,
+                    "raw": original_prompt,
+                    "raw_hash": self._compute_hash(original_prompt),
+                    "timestamp": time.time(),
+                }
+                await self._persist_cache(strict=True)
+            await self._verify_persisted_core(cache_key, original_prompt)
+            return dict(self.cache[cache_key])
+
+        payload = self.cache.get(cache_key, {})
+        components = payload.get("core_components", {}) if isinstance(payload, dict) else {}
+        retries = self._component_max_retries()
+        legacy_summary = str(payload.get("summary", "") or "").strip()
+        if components.get("summary") == "completed" and legacy_summary:
+            summary = str(payload["summary"])
+        elif legacy_summary and not legacy_summary.startswith("[系统降级提取]"):
+            summary = legacy_summary
+            await self._checkpoint_core_component(cache_key, original_prompt, "summary", summary)
+        else:
+            try:
+                summary = await self._summarize_core_identity_with_retry(
+                    original_prompt,
+                    cache_key,
+                    max_retries=retries,
+                    raise_on_failure=True,
+                )
+            except TypeError as exc:
+                if "max_retries" not in str(exc) and "raise_on_failure" not in str(exc):
+                    raise
+                summary = await self._summarize_core_identity_with_retry(original_prompt, cache_key)
+            await self._checkpoint_core_component(cache_key, original_prompt, "summary", summary)
+
+        payload = self.cache.get(cache_key, {})
+        components = payload.get("core_components", {}) if isinstance(payload, dict) else {}
+        legacy_style = str(payload.get("style", "") or "").strip()
+        if components.get("style") == "completed" and legacy_style not in {"", "数据解析中..."}:
+            style = str(payload["style"])
+        elif legacy_style not in {"", "数据解析中..."}:
+            style = legacy_style
+            await self._checkpoint_core_component(cache_key, original_prompt, "style", style)
+        else:
+            try:
+                style = await self._summarize_style_with_retry(
+                    original_prompt,
+                    cache_key,
+                    max_retries=retries,
+                    raise_on_failure=True,
+                )
+            except TypeError as exc:
+                if "max_retries" not in str(exc) and "raise_on_failure" not in str(exc):
+                    raise
+                style = await self._summarize_style_with_retry(original_prompt, cache_key)
+            await self._checkpoint_core_component(cache_key, original_prompt, "style", style)
+
+        payload = self.cache.get(cache_key, {})
+        components = payload.get("core_components", {}) if isinstance(payload, dict) else {}
+        legacy_rewrite = str(payload.get("first_person_rewrite", "") or "").strip()
+        if components.get("first_person_rewrite") == "completed" and legacy_rewrite:
+            first_person_rewrite = str(payload["first_person_rewrite"])
+        elif legacy_rewrite and legacy_rewrite != summary:
+            first_person_rewrite = legacy_rewrite
+            await self._checkpoint_core_component(
+                cache_key,
+                original_prompt,
+                "first_person_rewrite",
+                first_person_rewrite,
+            )
+        else:
             first_person_rewrite = await self._build_first_person_rewrite(
                 original_prompt=original_prompt,
                 summary=summary,
                 style=style,
                 cache_key=cache_key,
+                max_retries=retries,
+                raise_on_failure=True,
             )
-            
-            # 更新字典并第二次保存
-            self.cache[cache_key]["style"] = style
-            self.cache[cache_key]["first_person_rewrite"] = first_person_rewrite or summary
-            await self._persist_cache()
-            
-            # ==========================================
-            # 🟢 阶段三：抛出后台任务生成 8 大维度
-            # ==========================================
+            await self._checkpoint_core_component(
+                cache_key,
+                original_prompt,
+                "first_person_rewrite",
+                first_person_rewrite,
+            )
+
+        async with self._lock:
+            self.cache[cache_key]["core_ready"] = True
+            self.cache[cache_key]["persona_state"] = "core_ready"
+            self.cache[cache_key]["core_completed_at"] = time.time()
+            await self._persist_cache(strict=True)
+        await self._verify_persisted_core(cache_key, original_prompt)
+        return dict(self.cache[cache_key])
+
+    async def ensure_core_ready(
+        self,
+        original_prompt: str,
+        persona_id: str = "",
+        session_id: str = "global",
+    ) -> Dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("persona summarizer is closed")
+        cache_key = self._cache_key(persona_id, session_id)
+        await self._invalidate_if_prompt_changed(cache_key, original_prompt)
+        cached = self.cache.get(cache_key)
+        if self._core_cache_is_ready(cached, original_prompt):
+            include_self_lore = bool(
+                getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False)
+            )
+            if cached.get("is_full_ready", False) and not self._full_cache_is_ready(
+                cached,
+                original_prompt,
+                include_self_lore=include_self_lore,
+            ):
+                async with self._lock:
+                    cached["is_full_ready"] = False
+                    cached["persona_state"] = "core_ready"
+                    await self._persist_cache(strict=True)
+            expected_hash = self._compute_hash(original_prompt)
+            if self._verified_core_hashes.get(cache_key) != expected_hash:
+                await self._verify_persisted_core(cache_key, original_prompt)
+            return dict(cached)
+
+        async with self._lock:
+            task = self.pending_core_tasks.get(cache_key)
+            if task is None or task.done():
+                task = safe_create_task(
+                    self._initialize_core(original_prompt, cache_key),
+                    name=f"persona-core:{cache_key}",
+                    track_set=self._background_tasks,
+                )
+                self.pending_core_tasks[cache_key] = task
+        try:
+            return await task
+        finally:
+            if self.pending_core_tasks.get(cache_key) is task and task.done():
+                self.pending_core_tasks.pop(cache_key, None)
+
+    async def get_summary(self, original_prompt: str, persona_id: str = "", session_id: str = "global") -> Dict[str, Any]:
+        cache_key = self._cache_key(persona_id, session_id)
+        try:
+            payload = await self.ensure_core_ready(original_prompt, persona_id=persona_id, session_id=session_id)
+        except Exception as exc:
+            logger.warning(f"[PersonaSummarizer] core persona unavailable [{cache_key}]: {exc}")
+            cached = self.cache.get(cache_key, {})
+            return {
+                "summary": str(cached.get("summary", "") or original_prompt or ""),
+                "first_person_rewrite": str(
+                    cached.get("first_person_rewrite", "") or cached.get("summary", "") or original_prompt or ""
+                ),
+                "style": str(cached.get("style", "") or "保持原始风格"),
+                "shards": dict(cached.get("shards", {}) or {}),
+                "is_full_ready": False,
+                "core_ready": False,
+                "raw": original_prompt,
+                "raw_hash": self._compute_hash(original_prompt),
+                "timestamp": time.time(),
+            }
+
+        if not payload.get("is_full_ready", False) and cache_key not in self.pending_tasks:
             self._start_shard_task(original_prompt, cache_key)
-            
-            return new_cache_data
+        return dict(payload)
 
 # [新增] 核心后台调度器：全维度切片提取引擎
     async def _generate_all_shards_background(
@@ -367,6 +606,7 @@ Rules:
         original_prompt: str,
         cache_key: str,
         generation: int | None = None,
+        raise_on_failure: bool = False,
     ):
         """
         后台静默提取 8 大维度切片任务。
@@ -387,21 +627,44 @@ Rules:
         # 🟢 [Phase 8] 触发原典清洗与向量化重铸
         # ==========================================
         try:
-            if getattr(self, 'memory_engine', None):
-                logger.info(f"[PersonaSummarizer] 🧹 检测到人设重建，准备清空旧版并重铸 {cache_key} 的潜意识原典...")
-                await self.memory_engine.clear_persona_lore(cache_key)
-                if not self._generation_is_current(cache_key, active_generation):
-                    return
-                await self.memory_engine.add_persona_lore(original_prompt, cache_key)
-            else:
-                logger.warning("[PersonaSummarizer] ⚠️ 未能找到 memory_engine (未注入)，跳过原典入库。")
+            include_self_lore = bool(
+                getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False)
+            )
+            cached_payload = self.cache.get(cache_key, {})
+            if include_self_lore and not bool(cached_payload.get("self_lore_ready", False)):
+                if getattr(self, 'memory_engine', None):
+                    logger.info(f"[PersonaSummarizer] 🧹 检测到人设重建，准备清空旧版并重铸 {cache_key} 的潜意识原典...")
+                    await self.memory_engine.clear_persona_lore(cache_key)
+                    if not self._generation_is_current(cache_key, active_generation):
+                        return
+                    lore_id = await self.memory_engine.add_persona_lore(original_prompt, cache_key)
+                    if not str(lore_id or "").strip():
+                        raise RuntimeError("self-lore write returned an empty memory id")
+                    async with self._lock:
+                        if self._generation_is_current(cache_key, active_generation) and cache_key in self.cache:
+                            self.cache[cache_key]["self_lore_ready"] = True
+                            await self._persist_cache(strict=True)
+                else:
+                    raise RuntimeError("memory_engine is unavailable for self-lore initialization")
+            elif not include_self_lore:
+                async with self._lock:
+                    if cache_key in self.cache:
+                        self.cache[cache_key]["self_lore_ready"] = True
+                        await self._persist_cache(strict=True)
         except Exception as e:
             logger.error(f"[PersonaSummarizer] ⚠️ 潜意识原典重铸失败 (防宕机隔离): {e}")
+            if raise_on_failure:
+                raise
 
         try:
-            shards = {}
+            cached_payload = self.cache.get(cache_key, {})
+            shards = dict(cached_payload.get("shards", {}) or {})
+            shard_status = dict(cached_payload.get("shard_status", {}) or {})
+            for shard_name in self.REQUIRED_SHARDS:
+                if str(shards.get(shard_name, "") or "").strip():
+                    shard_status.setdefault(shard_name, "completed")
             # 顺序调用 8 大维度切片提取 (依赖下方的具体子函数)
-            shard_builders = (
+            shard_builders = () if bool(cached_payload.get("shards_not_required", False)) else (
                 ("logic_style", self._summarize_logic_style),
                 ("speech_style", self._summarize_speech_style),
                 ("world_view", self._summarize_world_view),
@@ -414,20 +677,57 @@ Rules:
             for shard_name, builder in shard_builders:
                 if not self._generation_is_current(cache_key, active_generation):
                     return
-                shards[shard_name] = await builder(original_prompt, cache_key)
+                if shard_status.get(shard_name) == "completed" and shard_name in shards:
+                    continue
+                try:
+                    value = await builder(original_prompt, cache_key, raise_on_failure=True)
+                except TypeError as exc:
+                    if "raise_on_failure" not in str(exc):
+                        raise
+                    value = await builder(original_prompt, cache_key)
+                normalized_value = str(value or "").strip()
+                if not normalized_value:
+                    raise ValueError(f"persona shard returned empty content: {shard_name}")
+                shards[shard_name] = normalized_value
+                shard_status[shard_name] = "completed"
+                async with self._lock:
+                    if not self._generation_is_current(cache_key, active_generation) or cache_key not in self.cache:
+                        return
+                    self.cache[cache_key]["shards"] = dict(shards)
+                    self.cache[cache_key]["shard_status"] = dict(shard_status)
+                    self.cache[cache_key]["is_full_ready"] = False
+                    await self._persist_cache(strict=True)
 
             # 获取原子锁，安全写回内存并解除失忆状态
             async with self._lock:
                 if self._generation_is_current(cache_key, active_generation) and cache_key in self.cache:
-                    self.cache[cache_key]["shards"] = shards
+                    shards_not_required = bool(self.cache[cache_key].get("shards_not_required", False))
+                    if not shards_not_required and any(
+                        shard_status.get(name) != "completed" for name in self.REQUIRED_SHARDS
+                    ):
+                        raise RuntimeError("persona shard set is incomplete")
+                    if include_self_lore and not bool(self.cache[cache_key].get("self_lore_ready", False)):
+                        raise RuntimeError("persona self-lore is incomplete")
+                    self.cache[cache_key]["shards"] = dict(shards)
+                    self.cache[cache_key]["shard_status"] = dict(shard_status)
                     self.cache[cache_key]["is_full_ready"] = True
-                    
-                    # 异步/同步持久化到磁盘
-                    if hasattr(self.persistence, 'save_persona_cache_async'):
-                        await self.persistence.save_persona_cache_async(self.cache)
-                    else:
-                        self.persistence.save_persona_cache(self.cache)
-                        
+                    self.cache[cache_key]["persona_state"] = "full_ready"
+                    self.cache[cache_key]["full_completed_at"] = time.time()
+                    await self._persist_cache(strict=True)
+
+            try:
+                await self._verify_persisted_full(
+                    cache_key,
+                    original_prompt,
+                    include_self_lore=include_self_lore,
+                )
+            except Exception:
+                async with self._lock:
+                    if cache_key in self.cache:
+                        self.cache[cache_key]["is_full_ready"] = False
+                        self.cache[cache_key]["persona_state"] = "enriching"
+                raise
+
             logger.info(f"[PersonaSummarizer] ✅ [{cache_key}] 的 8 大维度人格切片已全部提取并组装完毕，角色完全降临！")
             
         except asyncio.CancelledError:
@@ -435,15 +735,24 @@ Rules:
             raise
         except Exception as e:
             logger.error(f"[PersonaSummarizer] ❌ [{cache_key}] 的切片任务发生严重异常: {e}")
+            if raise_on_failure:
+                raise
         finally:
             # 无论成功失败，必须从任务挂起池中安全注销自己，防止内存泄漏和僵尸任务
-            current_task = asyncio.current_task()
-            pending_task = self.pending_tasks.get(cache_key)
-            if pending_task is current_task or not isinstance(pending_task, asyncio.Task):
-                self.pending_tasks.pop(cache_key, None)
+            if not raise_on_failure:
+                current_task = asyncio.current_task()
+                pending_task = self.pending_tasks.get(cache_key)
+                if pending_task is current_task or not isinstance(pending_task, asyncio.Task):
+                    self.pending_tasks.pop(cache_key, None)
 
 # [修改] 替换 call_judge 为 call_persona_task
-    async def _summarize_core_identity_with_retry(self, original_prompt: str, cache_key: str, max_retries: int = 3) -> str:
+    async def _summarize_core_identity_with_retry(
+        self,
+        original_prompt: str,
+        cache_key: str,
+        max_retries: int = 3,
+        raise_on_failure: bool = False,
+    ) -> str:
         """核心身份提取：带重试机制与智能正则兜底"""
         logger.info(f"[PersonaSummarizer] 🧠 正在提取核心身份骨架 (最大重试: {max_retries}次)...")
         prompt = f"""
@@ -463,6 +772,7 @@ Rules:
 - 必须严格控制在 200 字以内！字字珠玑，彻底剥离所有生平背景、冗长故事和无关配角。
 - 必须直接输出纯文本，绝对禁止包含“好的”、“根据设定”、“在这份人设中”、“该角色”等废话前缀或后缀。
 """
+        last_error: Exception | None = None
         for attempt in range(max_retries):
             try:
                 res = await self._call_persona_template(
@@ -475,8 +785,10 @@ Rules:
                 )
                 if res and len(str(res).strip()) > 10:
                     return str(res).strip()
+                last_error = ValueError("core identity result is too short")
                 logger.warning(f"[PersonaSummarizer] ⚠️ 核心身份提取结果过短，准备重试 ({attempt+1}/{max_retries})")
             except Exception as e:
+                last_error = e
                 logger.warning(f"[PersonaSummarizer] ❌ 核心身份提取请求失败 ({attempt+1}/{max_retries}): {e}")
             
             await asyncio.sleep(1.5) # 错峰重试，避免并发限流
@@ -484,6 +796,9 @@ Rules:
         # ==========================================
         # 🛡️ 智能兜底：不再无脑截断，尝试正则抓取关键信息
         # ==========================================
+        if raise_on_failure:
+            raise RuntimeError(f"core identity extraction failed for {cache_key}") from last_error
+
         import re
         logger.error(f"[PersonaSummarizer] 🚨 核心身份提取彻底失败，触发智能降级兜底！")
         # 尝试抓取包含“姓名”、“身份”、“性格”的段落
@@ -491,7 +806,13 @@ Rules:
         fallback_text = match.group(0).strip()[:150] if match else original_prompt[:150]
         return f"[系统降级提取] {fallback_text}...\n(注：角色记忆正在缓慢恢复中)"
 
-    async def _summarize_style_with_retry(self, original_prompt: str, cache_key: str, max_retries: int = 3) -> str:
+    async def _summarize_style_with_retry(
+        self,
+        original_prompt: str,
+        cache_key: str,
+        max_retries: int = 3,
+        raise_on_failure: bool = False,
+    ) -> str:
         """语言风格提取：带重试机制与安全兜底"""
         logger.info(f"[PersonaSummarizer] 🗣️ 正在提取语言风格与排版规范 (最大重试: {max_retries}次)...")
         prompt = f"""
@@ -513,6 +834,7 @@ Rules:
 - 语言必须具有强烈的“约束感”（如：必须使用...，严禁输出...），确保能直接作为系统规则约束最终的对话模型。
 - 将四点融合成一段高密度的规则说明，不要输出 JSON 或 markdown 代码块。
 """
+        last_error: Exception | None = None
         for attempt in range(max_retries):
             try:
                 res = await self._call_persona_template(
@@ -525,16 +847,21 @@ Rules:
                 )
                 if res and len(str(res).strip()) > 5:
                     return str(res).strip()
+                last_error = ValueError("persona style result is too short")
             except Exception as e:
+                last_error = e
                 logger.warning(f"[PersonaSummarizer] ❌ 语言风格提取请求失败 ({attempt+1}/{max_retries}): {e}")
             
             await asyncio.sleep(1.5)
+
+        if raise_on_failure:
+            raise RuntimeError(f"persona style extraction failed for {cache_key}") from last_error
 
         # 🛡️ 安全兜底：赋予基础的二次元扮演防护
         return "保持自然、简短的对话风格，拒绝使用AI助手的机械回复格式，严禁长篇大论，贴合人设原本的语气。"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_logic_style(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_logic_style(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 性格逻辑 (logic_style)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【性格逻辑】维度的深度切片。
@@ -569,10 +896,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] logic_style slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_speech_style(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_speech_style(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 语言风格 (speech_style)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【语言风格】维度的深度切片。
@@ -607,10 +936,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] speech_style slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_world_view(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_world_view(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 世界观 (world_view)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【世界观】维度的深度切片。
@@ -640,10 +971,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] world_view slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_timeline(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_timeline(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 生平经历 (timeline)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【生平经历】维度的深度切片。
@@ -673,10 +1006,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] timeline slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_relations(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_relations(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 人际关系 (relations)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【人际关系】维度的深度切片。
@@ -706,10 +1041,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] relations slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_skills(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_skills(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 技能能力 (skills)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【技能能力】维度的深度切片。
@@ -737,10 +1074,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] skills slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_values(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_values(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 价值观 (values)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【价值观】维度的深度切片。
@@ -769,10 +1108,12 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] values slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"
 
     # [修改] 替换 call_planner 为 call_persona_task
-    async def _summarize_secrets(self, original_prompt: str, cache_key: str) -> str:
+    async def _summarize_secrets(self, original_prompt: str, cache_key: str, raise_on_failure: bool = False) -> str:
         logger.info("[PersonaSummarizer] 🧠 正在后台提取切片: 深层秘密 (secrets)...")
         prompt = f"""
 你的任务是从以下[原始人设]中提取出【深层秘密】维度的深度切片。
@@ -802,4 +1143,6 @@ Rules:
             )
         except Exception:
             logger.exception(f"[AstrMai-persona] secrets slice failed for {cache_key}", exc_info=True)
+            if raise_on_failure:
+                raise
             return "无"

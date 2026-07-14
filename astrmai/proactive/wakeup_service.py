@@ -5,7 +5,10 @@ import time
 from types import SimpleNamespace
 
 from astrbot.api import logger
-from config import LifeConfig
+if __package__ and __package__.count(".") >= 2:
+    from ...config import LifeConfig
+else:
+    from config import LifeConfig
 
 from ..infrastructure.context_economy import PromptTemplateId
 from ..memory.contracts.memory_query import MemoryQuery

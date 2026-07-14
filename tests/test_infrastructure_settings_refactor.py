@@ -198,6 +198,52 @@ class InfrastructureSettingsRefactorTests(unittest.TestCase):
         self.assertNotIn("deep_temporal_alpha", global_items)
         self.assertNotIn("maintenance_temporal_stale_hot_threshold", global_items)
 
+    def test_schema_display_text_is_readable_chinese(self):
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        memory_items = schema["memory"]["items"]
+        fields = (
+            "recall_top_k",
+            "memory_query_builder_enabled",
+            "intent_rerank_enabled",
+            "adaptive_top_k_enabled",
+            "memory_retrieval_debug_trace_enabled",
+            "deep_temporal_alpha",
+            "deep_temporal_tau_seconds",
+            "deep_temporal_lambda_default",
+            "deep_temporal_lambda_fact",
+            "deep_temporal_candidate_pool_factor",
+            "deep_temporal_candidate_pool_min",
+            "deep_temporal_llm_window",
+            "maintenance_hot_beta",
+            "maintenance_temporal_stale_hot_threshold",
+            "auto_recall_probability",
+        )
+
+        for field in fields:
+            item = memory_items[field]
+            display_text = f'{item.get("description", "")} {item.get("hint", "")}'
+            self.assertTrue(item.get("description"), field)
+            self.assertTrue(item.get("hint"), field)
+            self.assertRegex(display_text, r"[\u4e00-\u9fff]", field)
+            self.assertNotRegex(display_text, r"[鏃鍊鐑绯绘浠鎴鍖]", field)
+
+        def iter_display_text(node, path="$"):
+            if isinstance(node, dict):
+                for key in ("title", "description", "hint"):
+                    value = node.get(key)
+                    if isinstance(value, str):
+                        yield f"{path}.{key}", value
+                for key, value in node.items():
+                    yield from iter_display_text(value, f"{path}.{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    yield from iter_display_text(value, f"{path}[{index}]")
+
+        for path, display_text in iter_display_text(schema):
+            self.assertNotRegex(display_text, r"[A-Za-z]", path)
+            self.assertNotRegex(display_text, r"[鏃鍊鐑绯绘浠鎴鍖�€]", path)
+
 
 class PersistenceBoundaryRefactorTests(unittest.TestCase):
     def setUp(self):

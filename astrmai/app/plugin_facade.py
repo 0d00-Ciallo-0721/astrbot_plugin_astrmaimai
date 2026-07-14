@@ -190,6 +190,21 @@ class PluginFacade(RuntimeFacadeProtocol):
         """热应用配置到运行时。遍历所有组件刷新。"""
         old_raw_config = dict(getattr(self.runtime, "raw_config", {}) or {})
         old_config = getattr(self.runtime, "config", None)
+        old_persona = getattr(old_config, "persona", None)
+        new_persona = getattr(parsed_config, "persona", None)
+        old_persona_fingerprint = (
+            str(getattr(old_persona, "persona_id", "") or "").strip(),
+            bool(getattr(old_persona, "include_self_lore_in_prompt", False)),
+            int(getattr(getattr(old_config, "performance", None), "summary_threshold", 300) or 300),
+        )
+        new_persona_fingerprint = (
+            str(getattr(new_persona, "persona_id", "") or "").strip(),
+            bool(getattr(new_persona, "include_self_lore_in_prompt", False)),
+            int(getattr(getattr(parsed_config, "performance", None), "summary_threshold", 300) or 300),
+        )
+        if old_persona_fingerprint != new_persona_fingerprint:
+            logger.info("[AstrMai] persona configuration changed; restart is required before activating it.")
+            return False
         new_work_mode_enabled = bool(
             getattr(getattr(parsed_config, "sys3", None), "enable_work_mode", False)
         )
@@ -388,6 +403,16 @@ class PluginFacade(RuntimeFacadeProtocol):
 
     def is_debug_mode(self) -> bool:
         return getattr(self.runtime.config.global_settings, "debug_mode", False)
+
+    def is_runtime_ready(self) -> bool:
+        status = self.runtime.status
+        return bool(status.is_running and status.lifecycle_started and status.persona_state in {"core_ready", "enriching", "full_ready", "enrichment_degraded"})
+
+    def get_runtime_startup_message(self) -> str:
+        state = str(getattr(self.runtime.status, "persona_state", "pending") or "pending")
+        if state == "core_failed":
+            return "人格初始化暂时失败，正在自动重试，请稍后再试。"
+        return "人格正在初始化，完成后才能开始聊天，请稍候。"
 
     def get_conversation_concurrency_flags(self):
         return resolve_conversation_concurrency_flags(getattr(self.runtime, "config", None))

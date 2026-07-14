@@ -129,6 +129,60 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
             self.assertFalse(runtime.status.foreign_commands_loaded)
             self.assertEqual(runtime.runtime_coordinator._states, {})
 
+            asyncio.run(_run())
+
+    def test_persona_core_initialization_retries_before_becoming_ready(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+            from astrmai.app.runtime_context import RuntimeStatus
+
+            attempts = []
+
+            class _Summarizer:
+                REQUIRED_SHARDS = ("logic_style",)
+
+                def __init__(self):
+                    self.pending_tasks = {}
+                    self.cache = {}
+
+                @staticmethod
+                def _cache_key(persona_id, _session_id):
+                    return persona_id
+
+                async def ensure_core_ready(self, *_args, **_kwargs):
+                    attempts.append("attempt")
+                    if len(attempts) == 1:
+                        raise RuntimeError("temporary persona timeout")
+                    return {
+                        "core_ready": True,
+                        "is_full_ready": True,
+                        "self_lore_ready": True,
+                        "shard_status": {"logic_style": "completed"},
+                    }
+
+            status = RuntimeStatus()
+            runtime = SimpleNamespace(
+                background_tasks=set(),
+                lifecycle=SimpleNamespace(manager=None),
+                status=status,
+                config=SimpleNamespace(
+                    persona=SimpleNamespace(retry_interval_sec=1, retry_max_interval_sec=1)
+                ),
+                context_engine=SimpleNamespace(resolve_active_persona=lambda: ("persona", "raw prompt")),
+                persona_summarizer=_Summarizer(),
+                set_boot_phase=lambda phase: status.set_phase(phase),
+                mark_degraded=lambda component, reason: status.mark_degraded(component, reason),
+            )
+            manager = PluginLifecycleManager(runtime)
+            manager._persona_retry_bounds = lambda: (0.0, 0.0)
+
+            await manager._initialize_persona_core_until_ready()
+
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue(status.persona_persisted)
+            self.assertEqual(status.persona_state, "full_ready")
+            self.assertEqual(status.persona_completed_shards, 1)
+
         asyncio.run(_run())
 
     def test_terminate_cancels_tracked_background_tasks(self):

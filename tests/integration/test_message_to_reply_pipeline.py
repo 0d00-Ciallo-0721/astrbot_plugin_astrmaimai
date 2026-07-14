@@ -305,6 +305,9 @@ class MessageToReplyPipelineIntegrationTests(unittest.TestCase):
             ),
             interaction=InteractionServices(attention_gate=gate),
         )
+        runtime.status.is_running = True
+        runtime.status.lifecycle_started = True
+        runtime.status.persona_state = "core_ready"
         facade = PluginFacade(runtime)
         event = _Event(text="Mai")
 

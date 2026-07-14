@@ -23,8 +23,8 @@ class TestConfSchemaGarbledText(unittest.TestCase):
         with open(schema_path, encoding="utf-8") as f:
             cls.schema = json.load(f)
 
-    def test_memory_section_has_garbled_text_detected(self):
-        """deep_temporal_* fields have garbled Chinese descriptions — CONFIRMED BUG."""
+    def test_memory_section_has_no_garbled_text(self):
+        """Memory descriptions remain valid UTF-8 Chinese after schema edits."""
         memory = self.schema.get("memory", {}).get("items", {})
 
         garbled_markers = ["鏃堕棿", "琛板噺", "绯绘暟", "绐楀彛", "璁板繂"]  # common mojibake
@@ -37,11 +37,11 @@ class TestConfSchemaGarbledText(unittest.TestCase):
                     found_garbled.append((field_name, desc[:80]))
                     break
 
-        self.assertGreater(len(found_garbled), 0,
-                           f"CONFIRMED: {len(found_garbled)} fields in memory section have garbled text. "
-                           f"Fields: {[f[0] for f in found_garbled]}. "
-                           f"This is the mojibake bug — file was double-encoded.")
-        print(f"\n    [CONFIRMED] {len(found_garbled)} garbled memory field(s): {[f[0] for f in found_garbled]}")
+        self.assertEqual(
+            found_garbled,
+            [],
+            f"Memory config contains mojibake: {[field[0] for field in found_garbled]}",
+        )
 
     def test_count_garbled_fields(self):
         """Count how many fields across the entire schema have garbled text."""
@@ -74,12 +74,11 @@ class TestConfSchemaGarbledText(unittest.TestCase):
             for field in garbled_fields:
                 print(f"      {field}")
 
-        # This is informational — we don't assert zero because the bug is known
-        self.assertLessEqual(garbled_count, 20,
-                             f"Found {garbled_count} garbled fields. "
-                             f"Should be 0 or very few. Check encoding pipeline.")
-        self.assertGreater(garbled_count, 0,
-                           "If 0 garbled fields, the bug may be fixed — update this test.")
+        self.assertEqual(
+            garbled_count,
+            0,
+            f"Found mojibake fields: {garbled_fields}",
+        )
 
 
 if __name__ == "__main__":

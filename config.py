@@ -40,6 +40,9 @@ class PersonaConfig(BaseModel):
         description="人设唯一ID。不填则默认为当前对话ID（实现千人千面）。若填写则强制绑定该ID（实现单一人设）。",
     )
     include_self_lore_in_prompt: bool = Field(default=False, description="是否在系统提示词中自动注入 self_lore 知识")
+    component_max_retries: int = Field(default=3, ge=1, le=10, description="每个人格生成步骤单轮最多重试次数")
+    retry_interval_sec: float = Field(default=15.0, ge=1.0, description="人格初始化失败后的首次重试间隔")
+    retry_max_interval_sec: float = Field(default=300.0, ge=1.0, description="人格初始化连续失败时的最大重试间隔")
 
 
 class AgentConfig(BaseModel):

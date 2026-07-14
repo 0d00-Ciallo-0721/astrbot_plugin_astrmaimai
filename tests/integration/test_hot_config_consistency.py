@@ -182,6 +182,19 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
         self.assertIs(runtime.config, old_config)
         self.assertFalse(runtime.config.sys3.enable_work_mode)
 
+    def test_persona_change_requires_restart_and_keeps_live_runtime_on_old_persona(self):
+        from config import AstrMaiConfig
+
+        old_config = AstrMaiConfig(persona={"persona_id": "old-persona"})
+        new_config = AstrMaiConfig(persona={"persona_id": "new-persona"})
+        facade, runtime, _reply_service, _memory_engine, _attention_gate = self._facade(old_config)
+
+        ok = facade.apply_hot_config({"persona": {"persona_id": "new-persona"}}, new_config)
+
+        self.assertFalse(ok)
+        self.assertIs(runtime.config, old_config)
+        self.assertEqual(runtime.config.persona.persona_id, "old-persona")
+
     def test_sys3_direct_reports_restart_required_when_stack_is_missing(self):
         import asyncio
         from config import AstrMaiConfig

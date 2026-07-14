@@ -316,7 +316,8 @@ class ContextEngine:
             return rendered[: self.COLD_SUMMARY_BACKGROUND_MAX_CHARS]
         return rendered[: self.COLD_SUMMARY_BACKGROUND_MAX_CHARS - 3].rstrip() + "..."
 
-    async def _load_persona_payload(self, chat_id: str, retrieve_keys: list[str], is_fast_mode: bool) -> dict[str, Any]:
+    def resolve_active_persona(self) -> tuple[str, str]:
+        """Resolve the configured persona id and its source prompt for startup and chat."""
         target_persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")
         raw_prompt = str(getattr(getattr(self.config, "persona", None), "prompt", "") or "")
         if target_persona_id and not raw_prompt:
@@ -329,6 +330,10 @@ class ContextEngine:
                 "[AstrMai] No persona configured — using built-in default persona. "
                 "Set persona_id in plugin config or configure a persona in AstrBot WebUI."
             )
+        return target_persona_id.strip(), raw_prompt
+
+    async def _load_persona_payload(self, chat_id: str, retrieve_keys: list[str], is_fast_mode: bool) -> dict[str, Any]:
+        target_persona_id, raw_prompt = self.resolve_active_persona()
 
         persona_data = await self.summarizer.get_summary(
             original_prompt=raw_prompt,

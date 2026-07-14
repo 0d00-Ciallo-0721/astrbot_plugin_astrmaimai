@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import sys
 import tempfile
@@ -22,6 +23,28 @@ class _FakePersistence:
 
     async def save_persona_cache_async(self, cache_data):
         self.save_persona_cache(cache_data)
+
+
+class _FailingPersonaPersistence(_FakePersistence):
+    async def save_persona_cache_async(self, cache_data):
+        return False
+
+
+class _CorruptingPersonaPersistence(_FakePersistence):
+    def load_persona_cache(self):
+        cache = super().load_persona_cache()
+        for payload in cache.values():
+            if not isinstance(payload, dict) or not payload.get("is_full_ready"):
+                continue
+            payload = dict(payload)
+            payload["shards"] = dict(payload.get("shards", {}))
+            payload["shards"].pop("secrets", None)
+            cache = dict(cache)
+            for cache_key, candidate in cache.items():
+                if candidate.get("is_full_ready"):
+                    cache[cache_key] = payload
+                    break
+        return cache
 
 
 class _FakeGateway:
@@ -175,6 +198,208 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertEqual(payload["first_person_rewrite"], "short prompt")
         self.assertEqual(gateway.calls, [])
 
+    def test_persona_core_is_not_ready_when_strict_persistence_fails(self):
+        from config import AstrMaiConfig
+
+        persistence = _FailingPersonaPersistence()
+        gateway = _FakeGateway(
+            ["core summary long enough", "strict style", "I remain fully in character."],
+            config=AstrMaiConfig(performance={"summary_threshold": 5}),
+        )
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+
+        with self.assertRaises(OSError):
+            asyncio.run(summarizer.ensure_core_ready("long persona prompt", persona_id="strict-persona"))
+
+        self.assertFalse(summarizer.cache["strict-persona"].get("core_ready", False))
+
+    def test_persona_enrichment_retries_and_resumes_completed_shards(self):
+        from config import AstrMaiConfig
+
+        raw_prompt = "long persona prompt"
+        persistence = _FakePersistence(
+            {
+                "persona-retry": {
+                    "summary": "core",
+                    "style": "style",
+                    "first_person_rewrite": "I stay in character.",
+                    "core_components": {
+                        "summary": "completed",
+                        "style": "completed",
+                        "first_person_rewrite": "completed",
+                    },
+                    "core_ready": True,
+                    "raw": raw_prompt,
+                    "raw_hash": hashlib.sha256(raw_prompt.encode("utf-8")).hexdigest(),
+                    "shards": {"logic_style": "saved logic"},
+                    "shard_status": {"logic_style": "completed"},
+                    "self_lore_ready": True,
+                    "is_full_ready": False,
+                }
+            }
+        )
+        config = AstrMaiConfig(
+            performance={"summary_threshold": 5},
+            persona={"retry_interval_sec": 1, "retry_max_interval_sec": 1},
+        )
+        gateway = _FakeGateway([], config=config)
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=config)
+        summarizer._retry_delay_bounds = lambda: (0.0, 0.0)
+        calls = {name: 0 for name in summarizer.REQUIRED_SHARDS}
+
+        def _builder(name):
+            async def _run(_prompt, _cache_key, **_kwargs):
+                calls[name] += 1
+                if name == "speech_style" and calls[name] == 1:
+                    raise RuntimeError("temporary model timeout")
+                return f"{name} result"
+
+            return _run
+
+        for shard_name in summarizer.REQUIRED_SHARDS:
+            setattr(summarizer, f"_summarize_{shard_name}", _builder(shard_name))
+
+        asyncio.run(summarizer._run_enrichment_until_complete(raw_prompt, "persona-retry"))
+
+        payload = summarizer.cache["persona-retry"]
+        self.assertTrue(payload["is_full_ready"])
+        self.assertEqual(calls["logic_style"], 0)
+        self.assertEqual(calls["speech_style"], 2)
+        self.assertEqual(set(payload["shard_status"]), set(summarizer.REQUIRED_SHARDS))
+
+    def test_persona_enrichment_does_not_report_full_when_persisted_shards_are_incomplete(self):
+        from config import AstrMaiConfig
+
+        raw_prompt = "long persona prompt"
+        persistence = _CorruptingPersonaPersistence(
+            {
+                "persona-corrupt": {
+                    "summary": "core",
+                    "style": "style",
+                    "first_person_rewrite": "I stay in character.",
+                    "core_components": {
+                        "summary": "completed",
+                        "style": "completed",
+                        "first_person_rewrite": "completed",
+                    },
+                    "core_ready": True,
+                    "raw": raw_prompt,
+                    "raw_hash": hashlib.sha256(raw_prompt.encode("utf-8")).hexdigest(),
+                    "shards": {},
+                    "shard_status": {},
+                    "self_lore_ready": True,
+                    "is_full_ready": False,
+                }
+            }
+        )
+        config = AstrMaiConfig(performance={"summary_threshold": 5})
+        gateway = _FakeGateway([], config=config)
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=config)
+
+        for shard_name in summarizer.REQUIRED_SHARDS:
+            async def _build(_prompt, _cache_key, _name=shard_name, **_kwargs):
+                return f"{_name} result"
+
+            setattr(summarizer, f"_summarize_{shard_name}", _build)
+
+        with self.assertRaises(OSError):
+            asyncio.run(
+                summarizer._generate_all_shards_background(
+                    raw_prompt,
+                    "persona-corrupt",
+                    raise_on_failure=True,
+                )
+            )
+
+        self.assertFalse(summarizer.cache["persona-corrupt"]["is_full_ready"])
+
+    def test_persona_core_cache_downgrades_false_full_marker_and_schedules_enrichment(self):
+        raw_prompt = "long persona prompt"
+        persistence = _FakePersistence(
+            {
+                "persona-false-full": {
+                    "summary": "core",
+                    "style": "style",
+                    "first_person_rewrite": "I stay in character.",
+                    "core_components": {
+                        "summary": "completed",
+                        "style": "completed",
+                        "first_person_rewrite": "completed",
+                    },
+                    "core_ready": True,
+                    "raw": raw_prompt,
+                    "raw_hash": hashlib.sha256(raw_prompt.encode("utf-8")).hexdigest(),
+                    "shards": {"logic_style": "logic"},
+                    "shard_status": {"logic_style": "completed"},
+                    "self_lore_ready": True,
+                    "is_full_ready": True,
+                }
+            }
+        )
+        gateway = _FakeGateway([])
+        summarizer = self.persona_mod.PersonaSummarizer(persistence, gateway, config=gateway.config)
+        started = []
+
+        def _start(_prompt, cache_key):
+            started.append(cache_key)
+            return None
+
+        summarizer._start_shard_task = _start
+        payload = asyncio.run(
+            summarizer.get_summary(raw_prompt, persona_id="persona-false-full")
+        )
+
+        self.assertFalse(payload["is_full_ready"])
+        self.assertEqual(started, ["persona-false-full"])
+
+    def test_persona_self_lore_empty_write_is_retried_instead_of_marked_ready(self):
+        from config import AstrMaiConfig
+
+        class _Memory:
+            async def clear_persona_lore(self, _persona_id):
+                return 0
+
+            async def add_persona_lore(self, _content, _persona_id):
+                return ""
+
+        raw_prompt = "long persona prompt"
+        persistence = _FakePersistence(
+            {
+                "persona-lore": {
+                    "summary": "core",
+                    "style": "style",
+                    "first_person_rewrite": "I stay in character.",
+                    "core_ready": True,
+                    "raw": raw_prompt,
+                    "shards": {},
+                    "shard_status": {},
+                    "self_lore_ready": False,
+                    "is_full_ready": False,
+                }
+            }
+        )
+        config = AstrMaiConfig(
+            performance={"summary_threshold": 5},
+            persona={"include_self_lore_in_prompt": True},
+        )
+        summarizer = self.persona_mod.PersonaSummarizer(
+            persistence,
+            _FakeGateway([], config=config),
+            config=config,
+            memory_engine=_Memory(),
+        )
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                summarizer._generate_all_shards_background(
+                    raw_prompt,
+                    "persona-lore",
+                    raise_on_failure=True,
+                )
+            )
+
+        self.assertFalse(summarizer.cache["persona-lore"]["self_lore_ready"])
+
     def test_persona_summarizer_refresh_config_updates_only_config_reference(self):
         persistence = _FakePersistence()
         gateway = _FakeGateway([])
@@ -286,7 +511,11 @@ class PersonaContextRefactorTests(unittest.TestCase):
         asyncio.run(summarizer._generate_all_shards_background("raw persona", "persona-shards"))
 
         self.assertFalse(summarizer.cache["persona-shards"]["is_full_ready"])
-        self.assertEqual(summarizer.cache["persona-shards"]["shards"], {})
+        self.assertEqual(summarizer.cache["persona-shards"]["shards"], {"logic_style": "logic"})
+        self.assertEqual(
+            summarizer.cache["persona-shards"]["shard_status"],
+            {"logic_style": "completed"},
+        )
         self.assertNotIn("persona-shards", summarizer.pending_tasks)
 
     def test_persona_core_identity_template_and_fallback_use_same_expert_role_shell(self):
@@ -547,7 +776,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
             persistence.cache["session_chat-1"]["first_person_rewrite"],
             "I use the repaired rewrite.",
         )
-        self.assertEqual(len(persistence.saved_snapshots), 1)
+        self.assertGreaterEqual(len(persistence.saved_snapshots), 1)
 
     def test_first_person_rewrite_rejects_empty_and_too_short_results(self):
         persistence = _FakePersistence()

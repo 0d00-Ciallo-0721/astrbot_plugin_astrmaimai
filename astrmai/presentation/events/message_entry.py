@@ -135,6 +135,20 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         event.stop_event()
         return
 
+    readiness_check = getattr(facade, "is_runtime_ready", None)
+    if callable(readiness_check) and not readiness_check():
+        try:
+            direct_call = scope.is_private_chat or is_direct_call_event(event)
+        except Exception:
+            direct_call = scope.is_private_chat
+        if direct_call:
+            message_getter = getattr(facade, "get_runtime_startup_message", None)
+            message = message_getter() if callable(message_getter) else "人格正在初始化，请稍后再试。"
+            yield event.plain_result(message)
+        debug_trace(event, "ingress.stop", reason="runtime_not_ready")
+        event.stop_event()
+        return
+
     if (
         concurrency_flags.non_conversational_guard_enabled
         and bool(event.get_extra("astrmai_non_conversational", False))

@@ -73,6 +73,12 @@ class RuntimeStatus:
     lifecycle_started: bool = False
     work_mode_enabled: bool = False
     memory_initialized: bool = False
+    persona_state: str = "pending"
+    persona_cache_key: str = ""
+    persona_completed_shards: int = 0
+    persona_persisted: bool = False
+    persona_self_lore_ready: bool = False
+    persona_last_error: str = ""
     foreign_commands_loaded: bool = False
     proactive_started: bool = False
     visual_started: bool = False
@@ -97,6 +103,12 @@ class RuntimeStatus:
             "lifecycle_started": self.lifecycle_started,
             "work_mode_enabled": self.work_mode_enabled,
             "memory_initialized": self.memory_initialized,
+            "persona_state": self.persona_state,
+            "persona_cache_key": self.persona_cache_key,
+            "persona_completed_shards": self.persona_completed_shards,
+            "persona_persisted": self.persona_persisted,
+            "persona_self_lore_ready": self.persona_self_lore_ready,
+            "persona_last_error": self.persona_last_error,
             "foreign_commands_loaded": self.foreign_commands_loaded,
             "proactive_started": self.proactive_started,
             "visual_started": self.visual_started,

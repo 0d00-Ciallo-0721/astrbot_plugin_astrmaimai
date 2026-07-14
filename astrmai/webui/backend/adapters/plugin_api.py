@@ -415,6 +415,8 @@ class PluginApiAdapter:
             "vision.",
             "sys3.",
             "life.",
+            "persona.",
+            "performance.summary_threshold",
             "memory.embedding_models",
         )
         return any(any(key.startswith(prefix) for prefix in reload_prefixes) for key in changed_keys)

@@ -513,6 +513,11 @@ class HostMockValidationTests(unittest.TestCase):
             runtime = SimpleNamespace(
                 background_tasks=set(),
                 lifecycle=SimpleNamespace(manager=None),
+                status=SimpleNamespace(
+                    is_running=True,
+                    lifecycle_started=True,
+                    persona_state="core_ready",
+                ),
                 config=SimpleNamespace(
                     global_settings=SimpleNamespace(
                         debug_mode=False,

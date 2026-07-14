@@ -158,6 +158,29 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertTrue(event.stopped)
         self.assertEqual(facade.calls, [])
 
+    def test_runtime_persona_gate_blocks_private_message_before_attention(self):
+        facade = _Facade()
+        facade.is_runtime_ready = lambda: False
+        facade.get_runtime_startup_message = lambda: "人格正在初始化"
+        event = _Event(group_id="")
+
+        result = self._collect(facade, event)
+
+        self.assertEqual(result, [{"type": "plain", "text": "人格正在初始化"}])
+        self.assertTrue(event.stopped)
+        self.assertNotIn("attention", facade.calls)
+
+    def test_runtime_persona_gate_silently_blocks_ordinary_group_message(self):
+        facade = _Facade()
+        facade.is_runtime_ready = lambda: False
+        event = _Event(group_id="group-1")
+
+        result = self._collect(facade, event)
+
+        self.assertEqual(result, [])
+        self.assertTrue(event.stopped)
+        self.assertNotIn("attention", facade.calls)
+
     def test_framework_command_exception_is_caught_and_processing_continues(self):
         facade = _Facade()
         event = _Event()

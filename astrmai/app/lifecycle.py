@@ -17,6 +17,8 @@ class PluginLifecycleManager:
     def __init__(self, runtime: PluginRuntimeContext):
         self.runtime = runtime
         self._background_tasks = runtime.background_tasks
+        self._startup_task: asyncio.Task[Any] | None = None
+        self._shutdown_requested = False
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
@@ -49,9 +51,32 @@ class PluginLifecycleManager:
 
     async def on_program_start(self) -> None:
         logger.info("[AstrMai] AstrBot Loaded. Starting system initialization from refactoring workspace...")
+        if self._startup_task is not None and not self._startup_task.done():
+            return
+        self._shutdown_requested = False
+        self.runtime.status.is_running = False
+        self.runtime.status.lifecycle_started = False
+        self.runtime.status.persona_state = "pending"
+        self.runtime.set_boot_phase("lifecycle.starting")
+        self._startup_task = self.track_task(self._complete_startup())
+
+    def _persona_retry_bounds(self) -> tuple[float, float]:
+        persona_config = getattr(self.runtime.config, "persona", None)
+        initial = max(0.1, float(getattr(persona_config, "retry_interval_sec", 15.0) or 15.0))
+        maximum = max(initial, float(getattr(persona_config, "retry_max_interval_sec", 300.0) or 300.0))
+        return initial, maximum
+
+    async def _complete_startup(self) -> None:
         logger.info("[AstrMai] Initializing Memory Engine...")
         await self.initialize_memory()
-        logger.info("[AstrMai] boot phase: memory initialized")
+        if self._shutdown_requested:
+            return
+        logger.info("[AstrMai] boot phase: memory initialization completed")
+
+        await self._initialize_persona_core_until_ready()
+        if self._shutdown_requested:
+            return
+        logger.info("[AstrMai] boot phase: persona core ready and persisted")
 
         init_meme_storage()
         await self.load_command_metadata()
@@ -73,6 +98,85 @@ class PluginLifecycleManager:
         self.runtime.status.lifecycle_started = True
         self.runtime.set_boot_phase("runtime.running")
         logger.info("[AstrMai] boot complete — runtime running")
+
+    async def _initialize_persona_core_until_ready(self) -> None:
+        summarizer = getattr(self.runtime, "persona_summarizer", None)
+        context_engine = getattr(self.runtime, "context_engine", None)
+        if summarizer is None or context_engine is None:
+            raise RuntimeError("persona runtime is unavailable")
+        persona_id, raw_prompt = context_engine.resolve_active_persona()
+        cache_key = summarizer._cache_key(persona_id, "global")
+        self.runtime.status.persona_cache_key = cache_key
+        initial_delay, max_delay = self._persona_retry_bounds()
+        delay = initial_delay
+        while not self._shutdown_requested:
+            self.runtime.status.persona_state = "core_initializing"
+            self.runtime.status.persona_last_error = ""
+            self.runtime.set_boot_phase("lifecycle.persona_core")
+            try:
+                payload = await summarizer.ensure_core_ready(
+                    raw_prompt,
+                    persona_id=persona_id,
+                    session_id="global",
+                )
+                self.runtime.status.persona_state = "core_ready"
+                self.runtime.status.persona_persisted = True
+                self.runtime.status.persona_self_lore_ready = bool(payload.get("self_lore_ready", False))
+                shards = payload.get("shard_status", {})
+                self.runtime.status.persona_completed_shards = sum(
+                    1 for name in summarizer.REQUIRED_SHARDS if shards.get(name) == "completed"
+                )
+                enrichment_task = summarizer.pending_tasks.get(cache_key)
+                if not payload.get("is_full_ready", False) and enrichment_task is None:
+                    enrichment_task = summarizer._start_shard_task(raw_prompt, cache_key)
+                if enrichment_task is not None:
+                    self.track_task(self._monitor_persona_enrichment(cache_key, enrichment_task))
+                elif payload.get("is_full_ready", False):
+                    self.runtime.status.persona_state = "full_ready"
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.runtime.status.persona_state = "core_failed"
+                self.runtime.status.persona_persisted = False
+                self.runtime.status.persona_last_error = str(exc)
+                self.runtime.mark_degraded("persona.core", str(exc))
+                logger.warning(
+                    f"[AstrMai] persona core initialization failed; retrying in {delay:.1f}s: {exc}"
+                )
+                await asyncio.sleep(delay)
+                delay = min(max_delay, delay * 2)
+
+    async def _monitor_persona_enrichment(self, cache_key: str, task: asyncio.Task[Any]) -> None:
+        self.runtime.status.persona_state = "enriching"
+        try:
+            while not task.done() and not self._shutdown_requested:
+                payload = self.runtime.persona_summarizer.cache.get(cache_key, {})
+                shard_status = payload.get("shard_status", {}) if isinstance(payload, dict) else {}
+                self.runtime.status.persona_completed_shards = sum(
+                    1
+                    for name in self.runtime.persona_summarizer.REQUIRED_SHARDS
+                    if shard_status.get(name) == "completed"
+                )
+                self.runtime.status.persona_self_lore_ready = bool(payload.get("self_lore_ready", False))
+                await asyncio.sleep(2)
+            await asyncio.gather(task)
+            payload = self.runtime.persona_summarizer.cache.get(cache_key, {})
+            shard_status = payload.get("shard_status", {}) if isinstance(payload, dict) else {}
+            self.runtime.status.persona_completed_shards = sum(
+                1
+                for name in self.runtime.persona_summarizer.REQUIRED_SHARDS
+                if shard_status.get(name) == "completed"
+            )
+            self.runtime.status.persona_self_lore_ready = bool(payload.get("self_lore_ready", False))
+            self.runtime.status.persona_state = "full_ready" if payload.get("is_full_ready", False) else "enrichment_degraded"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.runtime.status.persona_state = "enrichment_degraded"
+            self.runtime.status.persona_last_error = str(exc)
+            self.runtime.mark_degraded("persona.enrichment", str(exc))
+            logger.warning(f"[AstrMai] persona enrichment monitor degraded: {exc}")
 
     async def load_command_metadata(self) -> None:
         self.runtime.set_boot_phase("lifecycle.commands")
@@ -191,6 +295,7 @@ class PluginLifecycleManager:
 
     async def terminate(self) -> None:
         logger.info("[AstrMai] 正在终止进程并卸载资源...")
+        self._shutdown_requested = True
         self.runtime.set_boot_phase("shutdown.start")
 
         try:
@@ -304,6 +409,12 @@ class PluginLifecycleManager:
         self.runtime.status.work_mode_enabled = False
         # Subsystem initialization flags
         self.runtime.status.memory_initialized = False
+        self.runtime.status.persona_state = "pending"
+        self.runtime.status.persona_cache_key = ""
+        self.runtime.status.persona_completed_shards = 0
+        self.runtime.status.persona_persisted = False
+        self.runtime.status.persona_self_lore_ready = False
+        self.runtime.status.persona_last_error = ""
         self.runtime.status.proactive_started = False
         self.runtime.status.visual_started = False
         self.runtime.status.cron_guard_started = False

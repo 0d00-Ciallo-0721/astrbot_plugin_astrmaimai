@@ -582,7 +582,7 @@ class MemoryEngine:
         )
 
     async def add_persona_lore(self, content: str, persona_id: str = None):
-        await self.write_service.write(
+        return await self.write_service.write(
             MemoryWriteRequest(
                 source="persona_lore",
                 kind="persona_lore",

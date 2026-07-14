@@ -1,4 +1,8 @@
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from astrmai.conversation.ingress import dedupe
@@ -36,6 +40,47 @@ class FinalReviewFollowupTests(unittest.TestCase):
 
         self.assertFalse(first.should_stop)
         self.assertTrue(duplicate.should_stop)
+
+    def test_plugin_imports_as_package_without_plugin_root_on_sys_path(self):
+        plugin_root = Path(__file__).resolve().parents[2]
+        script = (
+            "import sys; "
+            f"sys.path.insert(0, {str(plugin_root.parent)!r}); "
+            f"import {plugin_root.name}.main as plugin_main; "
+            "assert plugin_main.AstrMaiPlugin.__name__ == 'AstrMaiPlugin'"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", script],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_global_event_handlers_accept_host_context_arguments(self):
+        plugin_root = Path(__file__).resolve().parents[2]
+        script = (
+            "import inspect, sys; "
+            f"sys.path.insert(0, {str(plugin_root.parent)!r}); "
+            f"from {plugin_root.name}.main import AstrMaiPlugin; "
+            "inspect.signature(AstrMaiPlugin.on_global_message).bind(object(), object(), 1, 2, 3); "
+            "inspect.signature(AstrMaiPlugin.on_group_membership_notice).bind(object(), object(), 1, 2, 3)"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", script],
+                cwd=temp_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
 
 if __name__ == "__main__":
