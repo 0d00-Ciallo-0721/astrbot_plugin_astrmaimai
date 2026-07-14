@@ -8,7 +8,7 @@ from astrbot.api import logger
 from ...conversation.contracts.reply_artifact import VisibleReplyArtifact
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
 from .output_guard import is_safe_visible_text
-from .provider_capabilities import infer_provider_capabilities
+from .provider_capabilities import resolve_provider_capabilities
 
 try:
     from json_repair import repair_json
@@ -17,6 +17,9 @@ except ImportError:
 
 
 class GatewayResultMixin:
+    def _provider_capabilities(self, provider_id: str):
+        return resolve_provider_capabilities(getattr(self, "context", None), provider_id)
+
     @staticmethod
     def _stable_hash_text(text: Any) -> str:
         normalized = str(text or "")
@@ -52,15 +55,33 @@ class GatewayResultMixin:
     def _extract_usage(self, resp: Any) -> Dict[str, int]:
         usage = getattr(resp, "usage", None)
         input_tokens = self._read_usage_field(usage, "input", "input_tokens", "prompt_tokens")
-        input_cached = self._read_usage_field(usage, "input_cached", "cached_tokens")
+        input_cached = self._read_usage_field(
+            usage,
+            "input_cached",
+            "cached_tokens",
+            "cache_read_input_tokens",
+        )
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        if prompt_details is None and isinstance(usage, dict):
+            prompt_details = usage.get("prompt_tokens_details")
+        nested_cached_supported = self._has_usage_field(
+            prompt_details,
+            "cached_tokens",
+            "cache_read_input_tokens",
+        )
+        if not input_cached and nested_cached_supported:
+            input_cached = self._read_usage_field(
+                prompt_details,
+                "cached_tokens",
+                "cache_read_input_tokens",
+            )
         output_tokens = self._read_usage_field(usage, "output", "output_tokens", "completion_tokens")
         cached_usage_supported = self._has_usage_field(
             usage,
             "input_cached",
             "cached_tokens",
             "cache_read_input_tokens",
-            "prompt_tokens_details",
-        )
+        ) or nested_cached_supported
         return {
             "input_tokens": input_tokens,
             "input_cached": input_cached,
@@ -155,7 +176,7 @@ class GatewayResultMixin:
         skipped_cooldown_models: Optional[List[Dict[str, Any]]] = None,
         cooldown_overridden: bool = False,
     ) -> LLMCallResult:
-        capabilities = infer_provider_capabilities(model_id) if model_id else None
+        capabilities = self._provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
             ok=True,
             text=text,
@@ -185,7 +206,7 @@ class GatewayResultMixin:
         raw_completion: str = "",
         economy: Optional[Dict[str, Any]] = None,
     ) -> LLMCallResult:
-        capabilities = infer_provider_capabilities(model_id) if model_id else None
+        capabilities = self._provider_capabilities(model_id) if model_id else None
         return LLMCallResult(
             ok=False,
             error_kind=error_kind,

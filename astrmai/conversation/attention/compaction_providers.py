@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from astrbot.api import logger
 
 from ...infrastructure.context_economy import PromptTemplateId, WorkloadFamily
 from ...infrastructure.context_economy.models import WorkloadTrace
-from ...infrastructure.gateway.provider_capabilities import infer_provider_capabilities
+from ...infrastructure.gateway.output_guard import looks_like_provider_failure_text
+from ...infrastructure.gateway.provider_capabilities import resolve_provider_capabilities
 from ...infrastructure.runtime.lane_manager import LaneKey
 
 
@@ -37,6 +39,27 @@ class CompactionProviderMixin:
         if prompt_registry is None:
             return None
         return prompt_registry.render_template(template_id, {"lines_text": lines_text})
+
+    def _compaction_provider_timeout_seconds(self) -> float:
+        gateway_timeout = getattr(self.gateway, "_api_timeout", None) if self.gateway else None
+        if callable(gateway_timeout):
+            try:
+                return max(0.01, min(60.0, float(gateway_timeout())))
+            except (TypeError, ValueError):
+                pass
+        settings = getattr(self.gateway, "settings", None) if self.gateway else None
+        try:
+            configured = float(getattr(settings, "api_timeout", 60.0) or 60.0)
+        except (TypeError, ValueError):
+            configured = 60.0
+        return max(0.01, min(60.0, configured))
+
+    def _compaction_provider_capabilities(self, provider_id: str):
+        resolver = getattr(self.gateway, "_provider_capabilities", None) if self.gateway else None
+        if callable(resolver):
+            return resolver(provider_id)
+        context = getattr(self.gateway, "context", None) if self.gateway else None
+        return resolve_provider_capabilities(context, provider_id)
 
     @staticmethod
     def _compaction_lane_key(chat_id: str) -> LaneKey:
@@ -77,7 +100,7 @@ class CompactionProviderMixin:
         )
         policy = economy.resolve_policy(request)
         kwargs: dict[str, Any] = {}
-        caps = infer_provider_capabilities(provider_id)
+        caps = self._compaction_provider_capabilities(provider_id)
         if policy is None:
             trace = WorkloadTrace(
                 workload_family=WorkloadFamily.COMPACTION_SUMMARY.value,
@@ -171,11 +194,14 @@ class CompactionProviderMixin:
                 dynamic_payload_text,
             )
             try:
-                response = await context.llm_generate(
-                    chat_provider_id=provider_id,
-                    system_prompt=system_prompt,
-                    prompt=prompt,
-                    **request_kwargs,
+                response = await asyncio.wait_for(
+                    context.llm_generate(
+                        chat_provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        **request_kwargs,
+                    ),
+                    timeout=self._compaction_provider_timeout_seconds(),
                 )
             except Exception as exc:
                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
@@ -191,6 +217,9 @@ class CompactionProviderMixin:
                         logger.warning(f"[Compaction] lane session expiry degraded: {lane_exc}")
                 continue
             content = getattr(response, "completion_text", response)
+            if looks_like_provider_failure_text(str(content or "")):
+                logger.warning(f"[{chat_id}] compaction provider {provider_id} returned failure text")
+                continue
             clipped = self._clip_summary(str(content or "").strip())
             if clipped:
                 if getattr(self.gateway, "context_economy", None):
@@ -249,11 +278,14 @@ class CompactionProviderMixin:
                 dynamic_payload_text,
             )
             try:
-                response = await context.llm_generate(
-                    chat_provider_id=provider_id,
-                    system_prompt=system_prompt,
-                    prompt=prompt,
-                    **request_kwargs,
+                response = await asyncio.wait_for(
+                    context.llm_generate(
+                        chat_provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        **request_kwargs,
+                    ),
+                    timeout=self._compaction_provider_timeout_seconds(),
                 )
             except Exception as exc:
                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
@@ -270,6 +302,9 @@ class CompactionProviderMixin:
                 continue
             content = getattr(response, "completion_text", response)
             rendered = str(content or "").strip()
+            if looks_like_provider_failure_text(rendered):
+                logger.warning(f"[{chat_id}] compaction provider {provider_id} returned failure text")
+                continue
             if rendered:
                 if getattr(self.gateway, "context_economy", None):
                     self.gateway.context_economy.record_trace(WorkloadTrace(**trace_payload))

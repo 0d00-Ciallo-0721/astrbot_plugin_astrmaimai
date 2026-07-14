@@ -55,5 +55,47 @@ class GatewayResultMigratedTests(unittest.TestCase):
             ["semantic_system_hash_stable", "provider_visible_hash_stable"],
         )
 
+    def test_extract_usage_reads_top_level_cache_read_tokens(self):
+        usage = self.mixin._extract_usage(
+            SimpleNamespace(
+                usage={
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "cache_read_input_tokens": 35,
+                }
+            )
+        )
+
+        self.assertEqual(usage["input_cached"], 35)
+        self.assertTrue(usage["cached_usage_supported"])
+
+    def test_extract_usage_reads_nested_prompt_token_details(self):
+        usage = self.mixin._extract_usage(
+            SimpleNamespace(
+                usage=SimpleNamespace(
+                    prompt_tokens=80,
+                    completion_tokens=8,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=24),
+                )
+            )
+        )
+
+        self.assertEqual(usage["input_cached"], 24)
+        self.assertTrue(usage["cached_usage_supported"])
+
+    def test_unknown_prompt_token_details_do_not_claim_cache_evidence_support(self):
+        usage = self.mixin._extract_usage(
+            SimpleNamespace(
+                usage={
+                    "prompt_tokens": 80,
+                    "completion_tokens": 8,
+                    "prompt_tokens_details": {"audio_tokens": 4},
+                }
+            )
+        )
+
+        self.assertEqual(usage["input_cached"], 0)
+        self.assertFalse(usage["cached_usage_supported"])
+
 
 __all__ = ["GatewayResultMigratedTests"]

@@ -49,6 +49,7 @@ class ChatRuntimeCoordinator:
         self._states: Dict[str, ChatRuntimeState] = {}
         self._lock = asyncio.Lock()
         self._concurrency_metrics: Dict[str, int] = {}
+        self._generation_sequence = 0
 
     async def _get_state(self, chat_id: str) -> ChatRuntimeState:
         async with self._lock:
@@ -118,7 +119,8 @@ class ChatRuntimeCoordinator:
                 and len(state.turn_generations) >= self.MAX_THREAD_GENERATIONS_PER_CHAT
             ):
                 state.turn_generations.pop(next(iter(state.turn_generations)), None)
-            next_generation = int(state.turn_generations.get(normalized_thread_id, 0) or 0) + 1
+            self._generation_sequence += 1
+            next_generation = self._generation_sequence
             state.turn_generations[normalized_thread_id] = next_generation
             stale_task = state.active_turn_tasks.pop(normalized_thread_id, None)
             self._increment_metric_locked("generation_advanced")

@@ -371,6 +371,9 @@ class ReplyArtifactMixin:
         runtime_coordinator = getattr(self, "runtime_coordinator", None)
         turn = event.get_extra("astrmai_turn_identity", None)
         concurrency_flags = resolve_conversation_concurrency_flags(getattr(self, "config", None))
+        response_kind = str(event.get_extra("astrmai_response_kind", "final") or "final").strip()
+        if response_kind not in {"final", "follow_up"}:
+            response_kind = "final"
         if (
             concurrency_flags.send_claim_enabled
             and turn is not None
@@ -378,14 +381,15 @@ class ReplyArtifactMixin:
             and hasattr(runtime_coordinator, "claim_send")
         ):
             try:
-                send_key = build_turn_send_key(turn, "final")
+                send_key = build_turn_send_key(turn, response_kind)
                 if not await runtime_coordinator.claim_send(chat_id, send_key):
                     debug_trace(
                         event,
-                        "reply.duplicate_final_blocked",
+                        "reply.duplicate_final_blocked" if response_kind == "final" else "reply.duplicate_follow_up_blocked",
                         chat_id=chat_id,
                         thread_id=getattr(turn, "thread_id", ""),
                         generation=getattr(turn, "generation", ""),
+                        response_kind=response_kind,
                     )
                     record_conversation_concurrency_trace(
                         event,
@@ -397,7 +401,7 @@ class ReplyArtifactMixin:
                         claim_status="duplicate",
                         send_key_hash=_hash_send_key(send_key),
                     )
-                    logger.info(f"[ReplyService] skipped duplicate final send for {chat_id}: {send_key}")
+                    logger.info(f"[ReplyService] skipped duplicate {response_kind} send for {chat_id}: {send_key}")
                     artifact.metadata["send_status"] = "duplicate_blocked"
                     return False
                 debug_trace(

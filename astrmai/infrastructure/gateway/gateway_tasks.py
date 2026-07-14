@@ -52,6 +52,13 @@ class GatewayTaskMixin:
             logger.error("[Gateway] vision task requested without vision models configured")
             return {}
 
+        router = getattr(self, "router", None)
+        if router is not None:
+            vision_models = router.get_ranked_models(
+                "vision",
+                vision_models,
+                cooldown_checker=self._is_model_cooldown,
+            )
         image_urls = [image_data] if image_data else None
         attempted_models: List[str] = []
         if lane_key and self.lane_manager:
@@ -79,6 +86,7 @@ class GatewayTaskMixin:
                         prefix_hash=prefix_hash,
                         persona_id=persona_id,
                         template_envelope=template_envelope,
+                        result_validator=self._normalize_vision_failure_reason,
                     )
                     parsed = result.parsed_json or {}
                     is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
@@ -151,6 +159,7 @@ class GatewayTaskMixin:
                     image_urls=image_urls,
                     use_fallback=False,
                     workload_policy=workload_policy,
+                    result_validator=self._normalize_vision_failure_reason,
                 )
                 parsed = result.parsed_json or {}
                 is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)

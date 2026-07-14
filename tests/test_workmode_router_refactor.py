@@ -87,6 +87,27 @@ class WorkmodeRouterRefactorTests(unittest.TestCase):
         self.assertIn("dynamic_alpha", names)
         self.assertEqual(len(light.tools), len(names))
 
+    def test_planner_tools_preserve_raw_function_tool_contract_and_gateway(self):
+        gateway = SimpleNamespace(name="astrmai-gateway")
+        context = SimpleNamespace(subagent_orchestrator=SimpleNamespace(handoffs=[]))
+        router = self.router_mod.Sys3Router(
+            SimpleNamespace(),
+            context,
+            db_service=None,
+            gateway=gateway,
+        )
+
+        async def _run():
+            agents = await router.get_all_agents()
+            planner_tools = await router.get_light_tools_for_planner()
+            return agents, planner_tools
+
+        agents, planner_tools = asyncio.run(_run())
+
+        self.assertEqual(planner_tools.tools, agents)
+        self.assertTrue(all(getattr(tool, "handler", None) is None for tool in planner_tools.tools))
+        self.assertTrue(all(getattr(tool, "_gateway", None) is gateway for tool in agents))
+
 
 if __name__ == "__main__":
     unittest.main()

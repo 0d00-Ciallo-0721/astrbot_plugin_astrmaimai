@@ -64,11 +64,6 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
             raise RuntimeError(f"[Sys3/{self.name}] astr_agent_ctx.context={ctx}, .event={event}; AstrBot API may have changed")
 
         try:
-            provider_id = await ctx.get_current_chat_provider_id(event.unified_msg_origin)
-        except Exception as exc:
-            raise RuntimeError(f"[Sys3/{self.name}] 无法获取 Provider ID: {exc}") from exc
-
-        try:
             tools = await self.get_tool_set(ctx, event)
         except Exception as exc:
             logger.error(f"[Sys3/{self.name}] 获取工具集失败: {exc}")
@@ -89,7 +84,7 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
 
         try:
             # 优先走 Gateway（享受模型路由/重试/冷却）
-            gateway = getattr(ctx, "gateway", None)
+            gateway = getattr(self, "_gateway", None) or getattr(ctx, "gateway", None)
             if gateway is not None:
                 from ...infrastructure.runtime.lane_manager import LaneKey
                 models = gateway.get_agent_models() if hasattr(gateway, "get_agent_models") else []
@@ -108,6 +103,10 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
                 logger.info(f"[Sys3/{self.name}] 任务完成 (via Gateway)，结果长度: {len(result_text)} 字")
                 return result_text
             # 回退：裸 AstrBot provider
+            try:
+                provider_id = await ctx.get_current_chat_provider_id(event.unified_msg_origin)
+            except Exception as exc:
+                raise RuntimeError(f"[Sys3/{self.name}] 无法获取 Provider ID: {exc}") from exc
             llm_resp = await ctx.tool_loop_agent(
                 event=event,
                 chat_provider_id=provider_id,

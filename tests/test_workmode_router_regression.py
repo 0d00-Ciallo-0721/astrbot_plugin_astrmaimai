@@ -1,9 +1,4 @@
-"""Regression tests for Sys3 light tool handler injection fix (R1).
-
-Verifies that get_light_tools_for_planner() injects handler references
-from _raw_agent_map so that tool_loop_agent can invoke SubAgents without
-ValueError("Tool must have a valid handler or override 'run' method.").
-"""
+"""Regression tests for the Sys3 planner FunctionTool contract."""
 
 import asyncio
 import importlib
@@ -98,9 +93,8 @@ class Sys3LightToolRegressionTests(unittest.TestCase):
     def setUpClass(cls):
         _install_sys3_stubs()
 
-    def test_light_tool_handler_is_set_after_get_light_tools(self):
-        """After get_light_tools_for_planner(), every SubAgent light tool
-        must have a non-None handler so _execute_local won't raise ValueError."""
+    def test_planner_tools_keep_real_subagent_call_contract(self):
+        """Planner tools must retain the real SubAgent call override and schema."""
         router_mod = importlib.import_module("astrmai.workmode.router")
 
         # Build a minimal Sys3Router with no dynamic agents
@@ -114,18 +108,19 @@ class Sys3LightToolRegressionTests(unittest.TestCase):
             light_set = await router.get_light_tools_for_planner()
             return light_set.tools
 
-        light_tools = asyncio.run(_run())
+        planner_tools = asyncio.run(_run())
 
-        self.assertGreater(len(light_tools), 0, "Expected at least one SubAgent")
+        self.assertGreater(len(planner_tools), 0, "Expected at least one SubAgent")
 
         static_names = router.get_static_agent_names()
-        for tool in light_tools:
+        for tool in planner_tools:
             name = getattr(tool, "name", "")
             if name in static_names:
-                self.assertIsNotNone(
-                    tool.handler,
-                    f"Light tool '{name}' must have handler injected from _raw_agent_map",
+                self.assertTrue(
+                    hasattr(tool, "call") and callable(tool.call),
+                    f"Planner tool '{name}' must preserve its SubAgent call override",
                 )
+                self.assertIn("query", getattr(tool, "parameters", {}).get("properties", {}))
 
     def test_raw_agent_map_is_populated_after_get_all_agents(self):
         """_raw_agent_map must be populated after get_all_agents() is called."""

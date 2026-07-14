@@ -10,7 +10,6 @@ from ..runtime.runtime_contracts import LLMCallResult
 from ..runtime.trace_runtime import append_trace_stage, preview_text
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
-from .provider_capabilities import infer_provider_capabilities
 
 
 class GatewayLaneMixin:
@@ -93,37 +92,50 @@ class GatewayLaneMixin:
         protocol_type: Optional[str] = None,
         debug_log_prefix: str = "",
     ) -> None:
-        self.context_economy.record_trace(workload_trace)
-        if event is not None and hasattr(event, "set_extra"):
-            event.set_extra("astrmai_cache_affinity_enabled", bool(workload_trace.cache_affinity_enabled))
-            event.set_extra(
-                "astrmai_cached_usage_supported",
-                bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
-            )
-        self._record_event_request_trace(
-            event,
-            system_prompt=system_prompt,
-            prompt=prompt,
-            request_kwargs=request_kwargs,
-            provider_family=provider_family,
-            model_id=model_id,
-            usage=usage,
-        )
-        if artifact_text:
-            artifact = self._build_lane_artifact(result, artifact_text)
-            await self.lane_manager.append_visible_reply_artifact(
-                lane_key=effective_lane_key,
-                base_origin=base_origin,
-                raw_user_text=raw_user_text or prompt,
-                artifact=artifact,
-                token_usage=usage.get("total_tokens", 0),
-                prefix_hash=workload_policy.effective_prefix_hash,
+        if workload_trace is not None:
+            try:
+                self.context_economy.record_trace(workload_trace)
+            except Exception as exc:
+                logger.warning(f"[Gateway] lane economy trace degraded after successful call: {exc}")
+        try:
+            if event is not None and hasattr(event, "set_extra"):
+                event.set_extra(
+                    "astrmai_cache_affinity_enabled",
+                    bool(getattr(workload_trace, "cache_affinity_enabled", False)),
+                )
+                event.set_extra(
+                    "astrmai_cached_usage_supported",
+                    bool((usage or {}).get("cached_usage_supported", False) or int((usage or {}).get("input_cached", 0) or 0) > 0),
+                )
+            self._record_event_request_trace(
+                event,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                request_kwargs=request_kwargs,
+                provider_family=provider_family,
                 model_id=model_id,
-                persona_id=persona_id,
-                template_id=workload_policy.template_id,
-                schema_id=workload_policy.schema_id,
-                persona_core_version=workload_policy.persona_core_version,
+                usage=usage,
             )
+        except Exception as exc:
+            logger.warning(f"[Gateway] lane request trace degraded after successful call: {exc}")
+        if artifact_text:
+            try:
+                artifact = self._build_lane_artifact(result, artifact_text)
+                await self.lane_manager.append_visible_reply_artifact(
+                    lane_key=effective_lane_key,
+                    base_origin=base_origin,
+                    raw_user_text=raw_user_text or prompt,
+                    artifact=artifact,
+                    token_usage=usage.get("total_tokens", 0),
+                    prefix_hash=workload_policy.effective_prefix_hash,
+                    model_id=model_id,
+                    persona_id=persona_id,
+                    template_id=workload_policy.template_id,
+                    schema_id=workload_policy.schema_id,
+                    persona_core_version=workload_policy.persona_core_version,
+                )
+            except Exception as exc:
+                logger.warning(f"[Gateway] lane history degraded after successful call: {exc}")
         trace_kwargs: Dict[str, Any] = {
             "workload_family": workload_policy.family.value,
             "lane_key": effective_lane_key.as_log_key(),
@@ -138,11 +150,46 @@ class GatewayLaneMixin:
             trace_kwargs["protocol_passthrough"] = protocol_passthrough
         if protocol_type is not None:
             trace_kwargs["protocol_type"] = protocol_type
-        append_trace_stage(event, stage_name, **trace_kwargs)
+        try:
+            append_trace_stage(event, stage_name, **trace_kwargs)
+        except Exception as exc:
+            logger.warning(f"[Gateway] lane stage trace degraded after successful call: {exc}")
         if self._debug_mode():
             logger.debug(
                 f"[Gateway] {debug_log_prefix}lane={effective_lane_key.as_log_key()} raw_user_text={preview_text(raw_user_text or prompt, 120)!r} history_roles_tail={self._history_roles_tail(history)}"
             )
+
+    async def _safe_finalize_success_artifacts(self, **kwargs: Any) -> None:
+        try:
+            await self._finalize_success_artifacts(**kwargs)
+        except Exception as exc:
+            logger.warning(f"[Gateway] lane finalizer degraded after successful call: {exc}")
+
+    def _safe_extract_tool_usage(self, response: Any) -> Dict[str, int]:
+        try:
+            return self._extract_usage(response)
+        except Exception as exc:
+            logger.warning(f"[Gateway] tool usage extraction degraded after successful call: {exc}")
+            return {}
+
+    async def _safe_record_tool_benchmark(self, **kwargs: Any) -> None:
+        try:
+            await self._record_benchmark_sample(**kwargs)
+        except Exception as exc:
+            logger.warning(f"[Gateway] tool benchmark degraded after successful call: {exc}")
+
+    def _tool_loop_total_timeout(self, tool_timeout: float, max_steps: int) -> float:
+        """Bound the whole agent run without multiplying the budget by logical steps."""
+        del max_steps
+        return max(float(self._api_timeout()), max(0.1, float(tool_timeout or 0.0)))
+
+    @staticmethod
+    def _tool_side_effect_count(event: Any) -> int:
+        if event is None or not hasattr(event, "get_extra"):
+            return 0
+        trace = event.get_extra("astrmai_tool_execution_trace", [])
+        pending = event.get_extra("astrmai_pending_actions", [])
+        return len(trace if isinstance(trace, list) else []) + len(pending if isinstance(pending, list) else [])
 
     def _lane_debug_meta(
         self,
@@ -166,7 +213,7 @@ class GatewayLaneMixin:
 
     def _lane_request_kwargs(self, lane_umo: str, workload_policy: WorkloadPolicy) -> Callable[[str], Dict[str, Any]]:
         def _factory(actual_model: str) -> Dict[str, Any]:
-            capabilities = infer_provider_capabilities(actual_model)
+            capabilities = self._provider_capabilities(actual_model)
             kwargs: Dict[str, Any] = {}
             if self.lane_manager and workload_policy.use_provider_session and capabilities.supports_remote_session:
                 kwargs["session_id"] = self.context_economy.build_provider_session_id(
@@ -237,6 +284,7 @@ class GatewayLaneMixin:
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
         event: Any = None,
+        result_validator: Optional[Callable[[Any], tuple[bool, str]]] = None,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -272,6 +320,7 @@ class GatewayLaneMixin:
                 image_urls=image_urls,
                 use_fallback=use_fallback,
                 workload_policy=workload_policy,
+                result_validator=result_validator,
             )
 
         if not models:
@@ -315,6 +364,7 @@ class GatewayLaneMixin:
             request_kwargs_factory=self._lane_request_kwargs(lane_umo, workload_policy),
             workload_policy=workload_policy,
             record_economy=False,
+            result_validator=result_validator,
         )
         if not result.model_id:
             # 防御性回退：_elastic_call_result 成功路径必定设置 model_id；
@@ -324,7 +374,7 @@ class GatewayLaneMixin:
                 f"[Gateway] chat_in_lane_result: result.model_id unexpectedly empty "
                 f"(pool={lane_key.task_family}), falling back to models[0]={model_hint}"
             )
-        provider_caps = infer_provider_capabilities(result.model_id)
+        provider_caps = self._provider_capabilities(result.model_id)
         provider_session_id = ""
         if workload_policy.use_provider_session and provider_caps.supports_remote_session:
             provider_session_id = self.context_economy.build_provider_session_id(
@@ -337,7 +387,7 @@ class GatewayLaneMixin:
             policy=workload_policy,
             lane_umo=lane_umo,
             actual_model=result.model_id or model_hint,
-            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
+            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) not in models),
             lane_rotated=bool(lane_runtime_meta.get("lane_rotated", False)),
             lane_rotate_reason=str(lane_runtime_meta.get("lane_rotate_reason", "") or ""),
             provider_family=result.provider_family or provider_caps.provider_family,
@@ -347,7 +397,7 @@ class GatewayLaneMixin:
         )
         result.economy = workload_trace.as_dict()
         assistant_content = json.dumps(result.parsed_json, ensure_ascii=False) if is_json else result.text
-        await self._finalize_success_artifacts(
+        await self._safe_finalize_success_artifacts(
             event=event,
             result=result,
             workload_trace=workload_trace,
@@ -368,7 +418,7 @@ class GatewayLaneMixin:
                 "cache_control": {"type": "ephemeral"} if (workload_policy.use_cache_hint and provider_caps.supports_cache_control) else None,
             },
             artifact_text=assistant_content,
-            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) != workload_policy.primary_model),
+            fallback_used=bool((result.model_id or model_hint) and (result.model_id or model_hint) not in models),
             skipped_cooldown_models=tuple(result.skipped_cooldown_models),
             cooldown_overridden=bool(result.cooldown_overridden),
             lane_umo=lane_umo,
@@ -410,9 +460,44 @@ class GatewayLaneMixin:
         )
         return result.text
 
+    async def tool_chat_in_lane_result(
+        self,
+        lane_key: LaneKey,
+        base_origin: str,
+        event: Any,
+        prompt: str,
+        system_prompt: str,
+        tools: Any,
+        models: List[str],
+        max_steps: int,
+        timeout: int,
+        image_urls: Optional[List[str]] = None,
+        prefix_hash: str = "",
+        persona_id: str = "",
+        raw_user_text: str = "",
+        template_envelope: Optional[PromptEnvelope] = None,
+    ) -> LLMCallResult:
+        async with self._global_semaphore:
+            return await self._tool_chat_in_lane_result_unlimited(
+                lane_key=lane_key,
+                base_origin=base_origin,
+                event=event,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                tools=tools,
+                models=models,
+                max_steps=max_steps,
+                timeout=timeout,
+                image_urls=image_urls,
+                prefix_hash=prefix_hash,
+                persona_id=persona_id,
+                raw_user_text=raw_user_text,
+                template_envelope=template_envelope,
+            )
+
     # ponytail: ~200 lines duplicated from _elastic_call_result. Refactor when
     # tool_chat diverges significantly or test coverage of both paths is sufficient.
-    async def tool_chat_in_lane_result(
+    async def _tool_chat_in_lane_result_unlimited(
         self,
         lane_key: LaneKey,
         base_origin: str,
@@ -482,12 +567,27 @@ class GatewayLaneMixin:
         lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
         last_error = ""
         last_raw_completion = ""
+        last_failure_kind = None
         attempted_models: List[str] = []
-        for model_id in attempt_queue:
-            attempted_models.append(model_id)
+        max_retries = max(0, int(self._max_retries()))
+        backoff_factor = max(0.0, float(self._backoff_factor()))
+        attempt_plan = [
+            (model_id, attempt)
+            for model_id in attempt_queue
+            for attempt in range(max_retries + 1)
+        ]
+        blocked_models: set[str] = set()
+        abort_after_side_effect = False
+        for model_id, attempt in attempt_plan:
+            if model_id in blocked_models:
+                continue
+            if model_id not in attempted_models:
+                attempted_models.append(model_id)
             report_pool = lane_key.task_family if model_id in primary_models else "fallback"
-            capabilities = infer_provider_capabilities(model_id)
+            capabilities = self._provider_capabilities(model_id)
             tool_kwargs = self._lane_request_kwargs(lane_umo, workload_policy)(model_id)
+            side_effect_count_before = self._tool_side_effect_count(event)
+            last_raw_completion = ""
             try:
                 response = await asyncio.wait_for(
                     self.context.tool_loop_agent(
@@ -502,7 +602,7 @@ class GatewayLaneMixin:
                         tool_call_timeout=timeout,
                         **tool_kwargs,
                     ),
-                    timeout=self._api_timeout(),
+                    timeout=self._tool_loop_total_timeout(timeout, max_steps),
                 )
                 reply_text = getattr(response, "completion_text", "") or ""
                 last_raw_completion = reply_text
@@ -511,7 +611,7 @@ class GatewayLaneMixin:
                 stripped_reply = reply_text.strip()
                 if "[SYSTEM_WAIT_SIGNAL]" in stripped_reply or "[TERMINAL_YIELD]:" in stripped_reply:
                     self.router.report_success(report_pool, model_id)
-                    usage = self._extract_usage(response)
+                    usage = self._safe_extract_tool_usage(response)
                     _tool_log_meta = {
                         "lane_key": effective_lane_key.as_log_key(),
                         "conversation_id": conversation_id,
@@ -530,27 +630,43 @@ class GatewayLaneMixin:
                         workload_policy=workload_policy,
                         usage=usage,
                     )
-                    self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                    try:
+                        self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                    except Exception as exc:
+                        logger.warning(f"[Gateway] tool usage logging degraded after successful call: {exc}")
                     provider_session_id = str(tool_kwargs.get("session_id", "") or "")
-                    workload_trace = self.context_economy.build_trace(
-                        policy=workload_policy,
-                        lane_umo=lane_umo,
-                        actual_model=model_id,
-                        fallback_used=bool(model_id != workload_policy.primary_model),
-                        lane_rotated=bool(lane_runtime_meta.get("lane_rotated", False)),
-                        lane_rotate_reason=str(lane_runtime_meta.get("lane_rotate_reason", "") or ""),
-                        provider_family=capabilities.provider_family,
-                        provider_session_id=provider_session_id,
-                        provider_session_enabled=bool(provider_session_id),
-                        provider_cache_hint_enabled=bool("cache_control" in tool_kwargs),
-                    )
+                    try:
+                        workload_trace = self.context_economy.build_trace(
+                            policy=workload_policy,
+                            lane_umo=lane_umo,
+                            actual_model=model_id,
+                            fallback_used=bool(model_id not in primary_models),
+                            lane_rotated=bool(lane_runtime_meta.get("lane_rotated", False)),
+                            lane_rotate_reason=str(lane_runtime_meta.get("lane_rotate_reason", "") or ""),
+                            provider_family=capabilities.provider_family,
+                            provider_session_id=provider_session_id,
+                            provider_session_enabled=bool(provider_session_id),
+                            provider_cache_hint_enabled=bool("cache_control" in tool_kwargs),
+                        )
+                    except Exception as exc:
+                        workload_trace = None
+                        logger.warning(f"[Gateway] tool economy trace degraded after successful call: {exc}")
                     result = self._build_success_result(
                         text=stripped_reply,
                         model_id=model_id,
                         usage=usage,
-                        economy=workload_trace.as_dict(),
+                        economy=workload_trace.as_dict() if workload_trace is not None else {},
                     )
-                    await self._finalize_success_artifacts(
+                    await self._safe_record_tool_benchmark(
+                        usage=usage,
+                        model_id=model_id,
+                        provider_family=capabilities.provider_family,
+                        workload_policy=workload_policy,
+                        economy_payload=result.economy,
+                        fallback_used=bool(model_id not in primary_models),
+                        provider_session_id=provider_session_id,
+                    )
+                    await self._safe_finalize_success_artifacts(
                         event=event,
                         result=result,
                         workload_trace=workload_trace,
@@ -568,7 +684,7 @@ class GatewayLaneMixin:
                         provider_family=capabilities.provider_family,
                         request_kwargs=tool_kwargs,
                         artifact_text=stripped_reply.split("[TERMINAL_YIELD]:", 1)[1].strip() if "[TERMINAL_YIELD]:" in stripped_reply else None,
-                        fallback_used=bool(model_id != workload_policy.primary_model),
+                        fallback_used=bool(model_id not in primary_models),
                         skipped_cooldown_models=tuple(skipped_cooldown_models),
                         cooldown_overridden=bool(cooldown_overridden),
                         lane_umo=lane_umo,
@@ -587,7 +703,7 @@ class GatewayLaneMixin:
                     raise ValueError(failure_kind)
 
                 self.router.report_success(report_pool, model_id)
-                usage = self._extract_usage(response)
+                usage = self._safe_extract_tool_usage(response)
                 _tool_log_meta = {
                     "lane_key": effective_lane_key.as_log_key(),
                     "conversation_id": conversation_id,
@@ -606,27 +722,43 @@ class GatewayLaneMixin:
                     workload_policy=workload_policy,
                     usage=usage,
                 )
-                self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                try:
+                    self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                except Exception as exc:
+                    logger.warning(f"[Gateway] tool usage logging degraded after successful call: {exc}")
                 provider_session_id = str(tool_kwargs.get("session_id", "") or "")
-                workload_trace = self.context_economy.build_trace(
-                    policy=workload_policy,
-                    lane_umo=lane_umo,
-                    actual_model=model_id,
-                    fallback_used=bool(model_id != workload_policy.primary_model),
-                    lane_rotated=bool(lane_runtime_meta.get("lane_rotated", False)),
-                    lane_rotate_reason=str(lane_runtime_meta.get("lane_rotate_reason", "") or ""),
-                    provider_family=capabilities.provider_family,
-                    provider_session_id=provider_session_id,
-                    provider_session_enabled=bool(provider_session_id),
-                    provider_cache_hint_enabled=bool("cache_control" in tool_kwargs),
-                )
+                try:
+                    workload_trace = self.context_economy.build_trace(
+                        policy=workload_policy,
+                        lane_umo=lane_umo,
+                        actual_model=model_id,
+                        fallback_used=bool(model_id not in primary_models),
+                        lane_rotated=bool(lane_runtime_meta.get("lane_rotated", False)),
+                        lane_rotate_reason=str(lane_runtime_meta.get("lane_rotate_reason", "") or ""),
+                        provider_family=capabilities.provider_family,
+                        provider_session_id=provider_session_id,
+                        provider_session_enabled=bool(provider_session_id),
+                        provider_cache_hint_enabled=bool("cache_control" in tool_kwargs),
+                    )
+                except Exception as exc:
+                    workload_trace = None
+                    logger.warning(f"[Gateway] tool economy trace degraded after successful call: {exc}")
                 result = self._build_success_result(
                     text=safe_text,
                     model_id=model_id,
                     usage=usage,
-                    economy=workload_trace.as_dict(),
+                    economy=workload_trace.as_dict() if workload_trace is not None else {},
                 )
-                await self._finalize_success_artifacts(
+                await self._safe_record_tool_benchmark(
+                    usage=usage,
+                    model_id=model_id,
+                    provider_family=capabilities.provider_family,
+                    workload_policy=workload_policy,
+                    economy_payload=result.economy,
+                    fallback_used=bool(model_id not in primary_models),
+                    provider_session_id=provider_session_id,
+                )
+                await self._safe_finalize_success_artifacts(
                     event=event,
                     result=result,
                     workload_trace=workload_trace,
@@ -644,7 +776,7 @@ class GatewayLaneMixin:
                     provider_family=capabilities.provider_family,
                     request_kwargs=tool_kwargs,
                     artifact_text=result.text,
-                    fallback_used=bool(model_id != workload_policy.primary_model),
+                    fallback_used=bool(model_id not in primary_models),
                     skipped_cooldown_models=tuple(skipped_cooldown_models),
                     cooldown_overridden=bool(cooldown_overridden),
                     lane_umo=lane_umo,
@@ -653,8 +785,14 @@ class GatewayLaneMixin:
                 return result
             except Exception as exc:
                 last_error = str(exc)
-                last_failure_kind = self._classify_failure_kind(last_error)
-                is_fatal = self._is_fatal_failure(last_error)
+                last_failure_kind = self._classify_failure_kind(last_error, error=exc)
+                is_fatal = self._is_fatal_failure(last_error, error=exc)
+                side_effect_recorded = self._tool_side_effect_count(event) > side_effect_count_before
+                retry_same_model = bool(not is_fatal and not side_effect_recorded and attempt < max_retries)
+                if not retry_same_model:
+                    blocked_models.add(model_id)
+                has_later_model = any(candidate not in blocked_models for candidate in attempt_queue)
+                will_retry_or_switch = bool(retry_same_model or (not side_effect_recorded and has_later_model))
                 self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
                 cooldown_meta = self._open_model_cooldown(report_pool, model_id, f"{last_error} {last_raw_completion}")
                 append_trace_stage(
@@ -665,7 +803,7 @@ class GatewayLaneMixin:
                     lane_umo=lane_umo,
                     prefix_hash=workload_policy.stable_prefix_hash,
                     model_id=model_id,
-                    fallback_used=bool(model_id != workload_policy.primary_model),
+                    fallback_used=bool(model_id not in primary_models),
                     failure_kind=last_failure_kind.value,
                     failure_reason=preview_text(last_error, 160),
                     attempted_models=list(attempted_models),
@@ -674,18 +812,34 @@ class GatewayLaneMixin:
                     model_cooldown_until=cooldown_meta.get("until", 0.0),
                     cooldown_reason=cooldown_meta.get("reason", ""),
                     raw_completion=last_raw_completion,
-                    will_retry_or_switch=bool(model_id != attempt_queue[-1]),
+                    will_retry_or_switch=will_retry_or_switch,
                 )
+                if side_effect_recorded:
+                    abort_after_side_effect = True
+                    logger.error(
+                        f"[Gateway] tool_loop failure after recorded side effect; retry disabled for {model_id}: {last_error[:120]}"
+                    )
+                    break
                 if is_fatal:
                     logger.error(f"[Gateway] fatal tool_loop failure {model_id}: {last_error[:120]}")
+                elif retry_same_model:
+                    logger.warning(
+                        f"[Gateway] tool_loop model {model_id} failed "
+                        f"({attempt + 1}/{max_retries + 1}), retrying: {last_error}"
+                    )
+                    if backoff_factor > 0:
+                        await asyncio.sleep(backoff_factor ** attempt)
                 else:
                     logger.warning(f"[Gateway] tool_loop model {model_id} failed, trying next: {last_error}")
                 continue
 
+        if abort_after_side_effect:
+            logger.warning("[Gateway] tool_loop cascade stopped to avoid repeating tool side effects")
+
         raise LLMCascadeFailureException(
             f"tool_loop model pool exhausted: {last_error}",
             pool_name=lane_key.task_family,
-            last_failure_kind=self._classify_failure_kind(last_error).value if last_error else "unknown",
+            last_failure_kind=last_failure_kind.value if last_failure_kind is not None else "unknown",
             attempted_models=attempted_models,
             model_id=attempted_models[-1] if attempted_models else "",
             raw_completion=last_raw_completion,

@@ -272,7 +272,12 @@ class PluginBootstrap:
             logger.info("[AstrMai] Sys3 (Work) enabled by config.")
             try:
                 return WorkModeServices(
-                    sys3_router=Sys3Router(runtime.config, self.context, runtime.db_service),
+                    sys3_router=Sys3Router(
+                        runtime.config,
+                        self.context,
+                        runtime.db_service,
+                        gateway=runtime.gateway,
+                    ),
                     cron_guard=CronHeartbeatGuard(runtime.db_service, self.context),
                 )
             except Exception as exc:

@@ -8,7 +8,6 @@ from ..context_economy import WorkloadPolicy
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
-from .provider_capabilities import infer_provider_capabilities
 
 
 class GatewayCallMixin:
@@ -175,6 +174,7 @@ class GatewayCallMixin:
         request_kwargs_factory: Optional[Callable[[str], Dict[str, Any]]] = None,
         workload_policy: Optional[WorkloadPolicy] = None,
         record_economy: bool = True,
+        result_validator: Optional[Callable[[Any], tuple[bool, str]]] = None,
     ) -> LLMCallResult:
         async with self._global_semaphore:
             primary_models, attempt_queue = self._build_attempt_queue(
@@ -275,7 +275,7 @@ class GatewayCallMixin:
 
                         usage = self._extract_usage(response)
                         log_meta = dict(debug_meta or {})
-                        log_meta["provider"] = infer_provider_capabilities(model_id).provider_family
+                        log_meta["provider"] = self._provider_capabilities(model_id).provider_family
                         if llm_kwargs.get("session_id"):
                             log_meta["request_session_id"] = str(llm_kwargs["session_id"])
                         if llm_kwargs.get("cache_control"):
@@ -288,6 +288,10 @@ class GatewayCallMixin:
 
                         if is_json:
                             parsed_json = self._parse_json_completion(content)
+                            if result_validator is not None:
+                                is_valid, validation_error = result_validator(parsed_json)
+                                if not is_valid:
+                                    raise ValueError(validation_error or "invalid_result")
                             self.router.report_success(report_pool, model_id)
                             economy_payload = await self._record_success_artifacts(
                                 report_pool=report_pool,

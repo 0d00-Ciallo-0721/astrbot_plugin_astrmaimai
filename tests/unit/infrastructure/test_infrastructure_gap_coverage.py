@@ -140,6 +140,41 @@ class InfrastructureGapCoverageTests(unittest.TestCase):
         self.assertEqual(len(conversation_ids), 1)
         self.assertEqual(conversation_manager.new_calls, 1)
 
+    def test_lane_manager_concurrent_append_preserves_both_exchanges(self):
+        from astrmai.infrastructure.runtime.lane_manager import LaneKey, LaneManager
+
+        conversation_manager = _ConcurrentConversationManager()
+        manager = LaneManager(conversation_manager)
+        lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+
+        async def _run():
+            await asyncio.gather(
+                manager.append_exchange(
+                    lane_key,
+                    "default:GroupMessage:group-1",
+                    "user-a",
+                    "assistant-a",
+                ),
+                manager.append_exchange(
+                    lane_key,
+                    "default:GroupMessage:group-1",
+                    "user-b",
+                    "assistant-b",
+                ),
+            )
+            return await manager.get_lane_history(
+                lane_key,
+                "default:GroupMessage:group-1",
+            )
+
+        history = asyncio.run(_run())
+        contents = [item.get("content") for item in history]
+
+        self.assertIn("user-a", contents)
+        self.assertIn("assistant-a", contents)
+        self.assertIn("user-b", contents)
+        self.assertIn("assistant-b", contents)
+
     def test_event_bus_stop_allows_workers_to_restart_on_next_publish(self):
         from astrmai.infrastructure.runtime.event_bus import EventBus
 

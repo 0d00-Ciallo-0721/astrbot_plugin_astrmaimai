@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.planner_stubs import install_planner_stubs
 from tests.original_ported.helpers import _install_astrbot_stubs
@@ -679,6 +680,55 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertEqual(completions, [(False, "")])
         self.assertEqual(trace_statuses, ["skipped_wait", "skipped_wait"])
         self.assertEqual(dialogue_writes, [])
+
+    def test_follow_up_uses_independent_response_kind_and_restores_event_state(self):
+        planner = self._make_planner(None)
+        event = _FakeEvent(text="follow up please")
+        observed_response_kinds = []
+
+        async def _should_follow(*args, **kwargs):
+            return "one more thought"
+
+        async def _execute(**kwargs):
+            observed_response_kinds.append(kwargs["event"].get_extra("astrmai_response_kind"))
+            return "follow-up"
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        planner._should_follow_up = _should_follow
+        planner.executor.execute = _execute
+        planner._record_planner_dialogue_segment = _noop
+        planner._update_turn_trace_runtime = _noop
+        planner._record_expression_pattern_usage = _noop
+        planner._finalize_proactive_event = _noop
+        planner._remember_turn_trace = _noop
+        planner._record_agency_reflection = lambda *args, **kwargs: None
+        planner._record_conversation_continuity = lambda *args, **kwargs: None
+        planner._apply_turn_continuity_context = lambda *args, **kwargs: None
+
+        async def _run():
+            with patch.object(self.planner_mod.asyncio, "sleep", new=_noop):
+                await planner._finalize_plan_result(
+                    event=event,
+                    chat_id=event.unified_msg_origin,
+                    reply_text="first reply",
+                    focus_context=None,
+                    prompt_envelope=SimpleNamespace(),
+                    tools=None,
+                    cognitive_decision=None,
+                    side_inputs={},
+                    planning_context={},
+                    is_fast_mode=False,
+                    is_all_mode=False,
+                    is_tool_call_mode=False,
+                    final_system_prompt="system",
+                )
+
+        asyncio.run(_run())
+
+        self.assertEqual(observed_response_kinds, ["follow_up"])
+        self.assertIsNone(event.get_extra("astrmai_response_kind"))
 
     def test_planner_wait_decision_does_not_refresh_conversation_goal(self):
         first_decision = self.planner_mod.CognitiveDecision(

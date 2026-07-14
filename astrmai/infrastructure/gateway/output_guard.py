@@ -28,44 +28,6 @@ def looks_like_harmful_content(text: str) -> bool:
     return False
 
 
-PROVIDER_FAILURE_MARKERS = (
-    "request_id",
-    "request id",
-    "status code",
-    "http status",
-    "http 状态码",
-    "json 响应",
-    "完整 api 响应",
-    "完整api响应",
-    "usagemetadata",
-    "prompttokencount",
-    "totaltokencount",
-    "finishreason",
-    "safety_ratings",
-    "safetyratings",
-    "safety filter",
-    "安全过滤",
-    "安全限制",
-    "内容可能已被过滤",
-    "被安全过滤器拦截",
-    "没有生成任何文本",
-    "没有生成任何内容",
-    "没有生成有效回复",
-    "api 没有生成任何内容",
-    "api 没有返回任何内容",
-    "response:",
-    "all chat models failed",
-    "permissiondeniederror",
-    "permission denied",
-    "you've reached your usage limit",
-    "usage limit",
-    "quota",
-    "rate limit",
-    "too many requests",
-    "error code: 403",
-    "error code: 429",
-)
-
 PROMPT_SCAFFOLD_MARKERS = (
     "[rollingsummary]",
     "较早对话摘要",
@@ -131,9 +93,24 @@ ROLE_PREFIX_RE = re.compile(r"^(user|assistant|system)\s*:\s*", re.IGNORECASE)
 TIME_PREFIX_RE = re.compile(r"^\[[0-2]?\d:[0-5]\d(?::[0-5]\d)?\]\s*")
 SECTION_SEPARATOR_RE = re.compile(r"^---[^\r\n]{1,80}---$")
 PUNCT_FRAGMENT_RE = re.compile(r"^[\s'\"`{}\[\]():,._-]+$")
-REQUEST_ID_LINE_RE = re.compile(r"^\(?\s*request[_\s-]*id\s*[:：]", re.IGNORECASE)
-STATUS_LINE_RE = re.compile(r"^\(?\s*(http\s*)?status\s*code\s*[:：]", re.IGNORECASE)
-HTTP_STATUS_CN_RE = re.compile(r"^http\s*状态码\s*[:：]", re.IGNORECASE)
+REQUEST_ID_LINE_RE = re.compile(
+    r"^\(?\s*request[_\s-]*id\s*[:：]\s*[\w.-]+\s*\)?$",
+    re.IGNORECASE,
+)
+STATUS_LINE_RE = re.compile(
+    r"^\(?\s*(http\s*)?status\s*code\s*[:：]\s*[1-5]\d{2}\s*\)?$",
+    re.IGNORECASE,
+)
+HTTP_STATUS_CN_RE = re.compile(
+    r"^\(?\s*http\s*状态码\s*[:：]\s*[1-5]\d{2}\s*\)?$",
+    re.IGNORECASE,
+)
+JSON_RESPONSE_LINE_RE = re.compile(r"^(json\s*(response|响应)|完整\s*api\s*响应)\s*[:：]", re.IGNORECASE)
+PROVIDER_FAILURE_PREFIX_RE = re.compile(
+    r"^\s*(all chat models failed|permissiondeniederror\s*:|permission denied error\s*:|"
+    r"error code\s*[:：]\s*(403|429)\b)",
+    re.IGNORECASE,
+)
 SAFETY_JSON_RE = re.compile(
     r"(finishreason|usagemetadata|prompttokencount|totaltokencount|safety_ratings)",
     re.IGNORECASE,
@@ -182,9 +159,38 @@ def looks_like_provider_failure_text(text: str) -> bool:
     if not normalized:
         return False
     lowered = normalized.lower()
-    if any(marker in lowered for marker in PROVIDER_FAILURE_MARKERS):
+    if PROVIDER_FAILURE_PREFIX_RE.search(normalized):
         return True
-    if SAFETY_JSON_RE.search(lowered):
+    if any(
+        marker in lowered
+        for marker in (
+            "you've reached your usage limit",
+            "没有生成任何文本",
+            "没有生成任何内容",
+            "没有生成有效回复",
+            "api 没有生成任何内容",
+            "api 没有返回任何内容",
+            "被安全过滤器拦截",
+        )
+    ):
+        return True
+    envelope_fields = 0
+    has_json_envelope = False
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if REQUEST_ID_LINE_RE.match(stripped):
+            envelope_fields += 1
+        elif STATUS_LINE_RE.match(stripped) or HTTP_STATUS_CN_RE.match(stripped):
+            envelope_fields += 1
+        elif JSON_RESPONSE_LINE_RE.match(stripped):
+            envelope_fields += 1
+            has_json_envelope = True
+    if envelope_fields >= 2:
+        return True
+    if has_json_envelope and (
+        SAFETY_JSON_RE.search(lowered)
+        or re.search(r"[\"'](candidates|error|usage_metadata|usagemetadata)[\"']\s*:", normalized, re.IGNORECASE)
+    ):
         return True
     if JSON_FRAGMENT_RE.match(normalized):
         try:
@@ -195,6 +201,9 @@ def looks_like_provider_failure_text(text: str) -> bool:
             return True
         if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
             if any(key in parsed[0] for key in ("finishReason", "safetyRatings", "usageMetadata")):
+                return True
+        if parsed is None and re.search(r"['\"]error['\"]\s*:", normalized, re.IGNORECASE):
+            if any(marker in lowered for marker in ("usage limit", "rate limit", "permission denied", "error code")):
                 return True
     return False
 

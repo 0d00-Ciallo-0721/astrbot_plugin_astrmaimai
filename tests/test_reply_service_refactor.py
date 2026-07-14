@@ -543,6 +543,92 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(len(coordinator.commits), 1)
         self.assertEqual(coordinator.commits[0][2], ["msg-1"])
 
+    def test_stale_during_segmented_send_persists_only_delivered_text(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        sent = []
+
+        async def _send(_origin, chain):
+            sent.append(chain)
+            return f"msg-{len(sent)}"
+
+        state_engine.gateway.context.send_message = _send
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        service._settle_post_send = _noop_post_send
+        freshness_checks = 0
+
+        async def _freshness(*args, **kwargs):
+            nonlocal freshness_checks
+            freshness_checks += 1
+            if freshness_checks >= 3:
+                return self.reply_mod.FreshnessState.EXPIRED, "newer_turn"
+            return self.reply_mod.FreshnessState.FRESH, ""
+
+        service._check_reply_freshness = _freshness
+        event = FakeEvent("user-1", "Alice", "question")
+        mirrored = []
+
+        async def _mirror(**kwargs):
+            mirrored.append(kwargs)
+
+        service._sync_native_history_mirror = _mirror
+        artifact = service._build_visible_reply_artifact("first\n\nsecond", event=event)
+        service._build_visible_reply_artifact = lambda *args, **kwargs: artifact
+
+        result = asyncio.run(service.handle_reply(event, "first\n\nsecond", event.unified_msg_origin))
+
+        self.assertTrue(result.sent)
+        self.assertEqual(result.metadata["send_status"], "partial_sent")
+        self.assertEqual(result.metadata["sent_segment_count"], 1)
+        self.assertEqual(result.persistable_text, "first")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(mirrored[0]["assistant_text"], "first")
+
+    def test_final_and_follow_up_have_independent_exactly_once_claims(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        coordinator = _ClaimingRuntimeCoordinator()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=7,
+            ),
+        )
+
+        async def _run():
+            first = service._build_visible_reply_artifact("first", event=event)
+            first_sent = await service._send_segments(event, event.unified_msg_origin, first, [])
+            event.set_extra("astrmai_response_kind", "follow_up")
+            follow = service._build_visible_reply_artifact("follow", event=event)
+            follow_sent = await service._send_segments(event, event.unified_msg_origin, follow, [])
+            duplicate = service._build_visible_reply_artifact("duplicate", event=event)
+            duplicate_sent = await service._send_segments(event, event.unified_msg_origin, duplicate, [])
+            return first_sent, follow_sent, duplicate_sent
+
+        first_sent, follow_sent, duplicate_sent = asyncio.run(_run())
+
+        self.assertTrue(first_sent)
+        self.assertTrue(follow_sent)
+        self.assertFalse(duplicate_sent)
+        self.assertEqual(len(coordinator.commits), 2)
+        self.assertTrue(coordinator.claim_calls[0].endswith(":final"))
+        self.assertTrue(coordinator.claim_calls[1].endswith(":follow_up"))
+        self.assertEqual(coordinator.claim_calls[1], coordinator.claim_calls[2])
+
     def test_failed_send_triggers_light_no_send_affection_settlement(self):
         state_engine = FakeStateEngine()
         observed = {}

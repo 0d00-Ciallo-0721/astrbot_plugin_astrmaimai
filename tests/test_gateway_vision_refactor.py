@@ -24,6 +24,34 @@ class _VisionContext:
         return _VisionResponse(self.responses.pop(0))
 
 
+class _Conversation:
+    def __init__(self, history=None):
+        self.history = list(history or [])
+
+
+class _ConversationManager:
+    def __init__(self):
+        self.current = {}
+        self.conversations = {}
+
+    async def get_curr_conversation_id(self, unified_msg_origin):
+        return self.current.get(unified_msg_origin)
+
+    async def new_conversation(self, unified_msg_origin, **_kwargs):
+        conversation_id = f"conv-{len(self.conversations) + 1}"
+        self.current[unified_msg_origin] = conversation_id
+        self.conversations[conversation_id] = _Conversation()
+        return conversation_id
+
+    async def get_conversation(self, _unified_msg_origin, conversation_id, create_if_not_exists=False):
+        if create_if_not_exists:
+            self.conversations.setdefault(conversation_id, _Conversation())
+        return self.conversations.get(conversation_id)
+
+    async def update_conversation(self, _unified_msg_origin, conversation_id=None, history=None, **_kwargs):
+        self.conversations[conversation_id] = _Conversation(history)
+
+
 class GatewayVisionRefactorTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -75,6 +103,80 @@ class GatewayVisionRefactorTests(unittest.TestCase):
 
         self.assertEqual(result["description"], "a cat on the desk")
         self.assertEqual([call["chat_provider_id"] for call in context.calls], ["vision-a", "vision-b"])
+        stats = gateway.router.get_stats()["vision"]["models"]
+        self.assertEqual(stats["vision-a"]["failures"], 1)
+        self.assertEqual(stats["vision-b"]["failures"], 0)
+
+    def test_call_vision_task_uses_router_health_order(self):
+        context = _VisionContext(
+            ['{"description": "healthy result", "emotion_tags": ["calm"]}']
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[], vision_models=["vision-a", "vision-b"]),
+            ),
+        )
+        gateway.router.get_ranked_models("vision", ["vision-a", "vision-b"])
+        gateway.router.report_failure("vision", "vision-a")
+
+        result = asyncio.run(
+            gateway.call_vision_task(
+                image_data="image.png",
+                prompt="Analyze",
+                system_prompt="Return JSON",
+            )
+        )
+
+        self.assertEqual(result["description"], "healthy result")
+        self.assertEqual([call["chat_provider_id"] for call in context.calls], ["vision-b"])
+
+    def test_call_vision_task_does_not_persist_invalid_lane_result(self):
+        lane_mod = importlib.import_module("astrmai.infrastructure.runtime.lane_manager")
+        context = _VisionContext(
+            [
+                '{"description": "", "emotion_tags": []}',
+                '{"description": "valid image", "emotion_tags": ["calm"]}',
+            ]
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[], vision_models=["vision-a", "vision-b"]),
+            ),
+        )
+        lane_manager = lane_mod.LaneManager(_ConversationManager())
+        appended_artifacts = []
+        original_append = lane_manager.append_visible_reply_artifact
+
+        async def _capture_append(**kwargs):
+            appended_artifacts.append(kwargs["artifact"].persistable_text)
+            return await original_append(**kwargs)
+
+        lane_manager.append_visible_reply_artifact = _capture_append
+        gateway.set_lane_manager(lane_manager)
+        lane_key = lane_mod.LaneKey(
+            subsystem="bg",
+            task_family="vision",
+            scope_id="chat-1",
+            scope_kind="chat",
+        )
+
+        result = asyncio.run(
+            gateway.call_vision_task(
+                image_data="image.png",
+                prompt="Analyze",
+                system_prompt="Return JSON",
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+            )
+        )
+        self.assertEqual(result["description"], "valid image")
+        self.assertEqual(len(appended_artifacts), 1)
+        self.assertNotIn('"description": ""', appended_artifacts[0])
+        self.assertIn("valid image", appended_artifacts[0])
 
     def test_call_vision_task_skips_cooled_vision_model(self):
         context = _VisionContext(

@@ -26,6 +26,16 @@ class _FakeContext:
             raise RuntimeError("simulated provider failure")
         return _FakeResponse()
 
+    def get_provider_by_id(self, provider_id):
+        provider_types = {
+            "claude-3-5-sonnet": "anthropic",
+            "dify-agent": "dify",
+        }
+        provider_type = provider_types.get(provider_id)
+        if not provider_type:
+            return None
+        return SimpleNamespace(meta=lambda: SimpleNamespace(type=provider_type))
+
 
 class GatewayLaneRequestKwargsTests(unittest.TestCase):
     def setUp(self):

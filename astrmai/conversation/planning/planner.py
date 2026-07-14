@@ -1490,12 +1490,17 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     " Never repeat what you already said just now!)"
                 )
                 await asyncio.sleep(random.uniform(1.0, 3.5))
-                await self.executor.execute(
-                    event=event,
-                    system_prompt=final_system_prompt,
-                    prompt=follow_prompt,
-                    tools=None,
-                )
+                previous_response_kind = event.get_extra("astrmai_response_kind", None)
+                event.set_extra("astrmai_response_kind", "follow_up")
+                try:
+                    await self.executor.execute(
+                        event=event,
+                        system_prompt=final_system_prompt,
+                        prompt=follow_prompt,
+                        tools=None,
+                    )
+                finally:
+                    event.set_extra("astrmai_response_kind", previous_response_kind)
         elif reply_text:
             blocked_modes = []
             if is_fast_mode:

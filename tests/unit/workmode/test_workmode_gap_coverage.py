@@ -140,6 +140,32 @@ class WorkmodeGapCoverageTests(unittest.TestCase):
             datetime.fromisoformat("2031-02-03T04:05:06+00:00").timestamp(),
         )
 
+    def test_static_agent_uses_injected_gateway_pool_without_host_provider(self):
+        observed = {}
+
+        class _Gateway:
+            def get_agent_models(self):
+                return ["agent-primary", "agent-fallback"]
+
+            async def tool_chat_in_lane_result(self, **kwargs):
+                observed.update(kwargs)
+                return SimpleNamespace(text="handled by configured pool")
+
+        agent = self.cron_mod.CronAgent(db_service=None)
+        agent._gateway = _Gateway()
+        wrapper = SimpleNamespace(
+            context=SimpleNamespace(
+                context=SimpleNamespace(),
+                event=SimpleNamespace(unified_msg_origin="chat-1"),
+            )
+        )
+
+        result = asyncio.run(agent.call(wrapper, query="create reminder"))
+
+        self.assertEqual(result, "handled by configured pool")
+        self.assertEqual(observed["models"], ["agent-primary", "agent-fallback"])
+        self.assertEqual(observed["prompt"], "create reminder")
+
     def test_handoff_registry_removes_agents_no_longer_active(self):
         alpha = SimpleNamespace(name="dynamic_alpha", active=True)
         beta = SimpleNamespace(name="dynamic_beta", active=True)

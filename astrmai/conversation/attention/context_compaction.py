@@ -9,7 +9,6 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.context_economy import PromptTemplateId, WorkloadFamily
-from ...infrastructure.gateway.provider_capabilities import infer_provider_capabilities
 from ...infrastructure.runtime.lane_manager import LaneKey
 from .compaction_providers import CompactionProviderMixin
 from .topic_units import ColdSummaryStructure, SECTION_ORDER, TopicUnit

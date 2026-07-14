@@ -206,25 +206,34 @@ class LaneStorageMixin:
             schema_id=schema_id,
             persona_core_version=persona_core_version,
         )
-        user_turn = self.build_history_turn("user", user_content)
-        assistant_turn = self.build_history_turn("assistant", assistant_content)
-        if user_turn:
-            history.append(user_turn)
-        if assistant_turn:
-            history.append(assistant_turn)
-        return await self.save_lane_history(
-            lane_key=lane_key,
-            lane_umo=lane_umo,
-            conversation_id=conversation_id,
-            history=history,
-            token_usage=token_usage,
-            prefix_hash=prefix_hash,
-            model_id=model_id,
-            persona_id=persona_id,
-            template_id=template_id,
-            schema_id=schema_id,
-            persona_core_version=persona_core_version,
-        )
+        lane_lock = await self._get_lane_lock(lane_umo)
+        async with lane_lock:
+            conversation_id = await self.conversation_manager.get_curr_conversation_id(lane_umo) or conversation_id
+            conversation = await self.conversation_manager.get_conversation(
+                lane_umo,
+                conversation_id,
+                create_if_not_exists=True,
+            )
+            history = self._normalize_history(self._load_history(conversation), lane_key)
+            user_turn = self.build_history_turn("user", user_content)
+            assistant_turn = self.build_history_turn("assistant", assistant_content)
+            if user_turn:
+                history.append(user_turn)
+            if assistant_turn:
+                history.append(assistant_turn)
+            return await self.save_lane_history(
+                lane_key=lane_key,
+                lane_umo=lane_umo,
+                conversation_id=conversation_id,
+                history=history,
+                token_usage=token_usage,
+                prefix_hash=prefix_hash,
+                model_id=model_id,
+                persona_id=persona_id,
+                template_id=template_id,
+                schema_id=schema_id,
+                persona_core_version=persona_core_version,
+            )
 
     async def append_visible_reply_artifact(
         self,

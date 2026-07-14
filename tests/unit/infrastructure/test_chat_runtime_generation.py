@@ -6,7 +6,7 @@ from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeC
 
 
 class ChatRuntimeGenerationTests(unittest.TestCase):
-    def test_advance_generation_increments_per_thread(self):
+    def test_advance_generation_uses_monotonic_unique_sequence(self):
         coordinator = ChatRuntimeCoordinator()
 
         async def _run():
@@ -16,7 +16,7 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
             other_chat = await coordinator.advance_generation("chat-2", "thread-a")
             return first, second, other_thread, other_chat
 
-        self.assertEqual(asyncio.run(_run()), (1, 2, 1, 1))
+        self.assertEqual(asyncio.run(_run()), (1, 2, 3, 4))
 
     def test_current_generation_returns_zero_without_state(self):
         coordinator = ChatRuntimeCoordinator()
@@ -112,6 +112,22 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
             snapshot["send_claim_count"],
             coordinator.MAX_SEND_CLAIMS_PER_CHAT,
         )
+
+    def test_evicted_thread_generation_is_never_reused(self):
+        coordinator = ChatRuntimeCoordinator()
+
+        async def _run():
+            original = await coordinator.advance_generation("chat-1", "thread-a")
+            for index in range(coordinator.MAX_THREAD_GENERATIONS_PER_CHAT):
+                await coordinator.advance_generation("chat-1", f"thread-{index}")
+            replacement = await coordinator.advance_generation("chat-1", "thread-a")
+            stale = SimpleNamespace(chat_id="chat-1", thread_id="thread-a", generation=original)
+            return original, replacement, await coordinator.is_current_turn(stale)
+
+        original, replacement, stale_is_current = asyncio.run(_run())
+
+        self.assertGreater(replacement, original)
+        self.assertFalse(stale_is_current)
 
     def test_concurrency_metrics_count_generation_and_duplicate_claims(self):
         coordinator = ChatRuntimeCoordinator()

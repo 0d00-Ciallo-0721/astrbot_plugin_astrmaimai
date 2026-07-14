@@ -28,6 +28,23 @@ class P2PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(caps.provider_family, "unknown")
         self.assertFalse(caps.supports_native_prompt_cache)
 
+    def test_custom_provider_id_does_not_infer_capabilities_from_model_name(self):
+        from astrmai.infrastructure.gateway.provider_capabilities import infer_provider_capabilities
+
+        caps = infer_provider_capabilities("my-claude-compatible-proxy")
+
+        self.assertEqual(caps.provider_family, "unknown")
+        self.assertFalse(caps.supports_cache_control)
+
+    def test_provider_metadata_can_explicitly_declare_family(self):
+        from astrmai.infrastructure.gateway.provider_capabilities import infer_provider_capabilities
+
+        provider = SimpleNamespace(meta=lambda: SimpleNamespace(type="anthropic"))
+        caps = infer_provider_capabilities(provider)
+
+        self.assertEqual(caps.provider_family, "anthropic")
+        self.assertTrue(caps.supports_cache_control)
+
     def test_raw_trace_store_falls_back_when_replace_is_locked(self):
         from astrmai.infrastructure.runtime.raw_trace_store import RawTraceEventStore
 

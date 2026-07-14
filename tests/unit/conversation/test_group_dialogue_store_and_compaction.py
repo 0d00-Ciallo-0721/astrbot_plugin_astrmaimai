@@ -401,7 +401,11 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
             engine = ContextCompactionEngine(
                 store,
                 gateway=SimpleNamespace(
-                    context=SimpleNamespace(),
+                    context=SimpleNamespace(
+                        get_provider_by_id=lambda _provider_id: SimpleNamespace(
+                            meta=lambda: SimpleNamespace(type="dify")
+                        )
+                    ),
                     context_economy=economy,
                     lane_manager=LaneManager(SimpleNamespace()),
                 ),
@@ -443,6 +447,52 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
             template_stats = snapshot["_templates"]["compaction_summary_v2@v2"]
             self.assertEqual(template_stats["provider_session_usage_rate"], 1.0)
             self.assertEqual(template_stats["provider_session_reuse_rate"], 0.5)
+
+        asyncio.run(run())
+
+    def test_compaction_times_out_provider_and_tries_next_candidate(self):
+        class FakeContext:
+            async def get_current_chat_provider_id(self, _chat_id):
+                return "provider-ok"
+
+            async def llm_generate(self, chat_provider_id, **_kwargs):
+                if chat_provider_id == "provider-hangs":
+                    await asyncio.Event().wait()
+                return SimpleNamespace(completion_text="[topics]\n- recovered summary")
+
+        async def run():
+            engine = ContextCompactionEngine(
+                GroupDialogueStore(),
+                provider_id="provider-hangs",
+                gateway=SimpleNamespace(context=FakeContext()),
+            )
+            engine._compaction_provider_timeout_seconds = lambda: 0.01
+            segment = SimpleNamespace(speaker_name="Alice", speaker_id="u1", content="hello", is_bot=False)
+
+            summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
+
+            self.assertEqual(summary, "[topics]\n- recovered summary")
+
+        asyncio.run(run())
+
+    def test_compaction_rejects_provider_failure_body(self):
+        class FakeContext:
+            async def get_current_chat_provider_id(self, _chat_id):
+                return "provider-bad"
+
+            async def llm_generate(self, **_kwargs):
+                return SimpleNamespace(completion_text="All chat models failed: quota exhausted")
+
+        async def run():
+            engine = ContextCompactionEngine(
+                GroupDialogueStore(),
+                gateway=SimpleNamespace(context=FakeContext()),
+            )
+            segment = SimpleNamespace(speaker_name="Alice", speaker_id="u1", content="hello", is_bot=False)
+
+            summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
+
+            self.assertEqual(summary, "")
 
         asyncio.run(run())
 
