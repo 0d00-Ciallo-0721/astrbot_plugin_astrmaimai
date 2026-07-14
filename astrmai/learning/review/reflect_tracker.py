@@ -73,6 +73,16 @@ class ReflectTracker:
         async with self._lock:
             return [item.copy() for item in self._pending.values() if not item.get("sent")]
 
+    async def claim_unsent_requests(self) -> List[Dict]:
+        async with self._lock:
+            claimed: List[Dict] = []
+            for item in self._pending.values():
+                if item.get("sent"):
+                    continue
+                item["sent"] = True
+                claimed.append(item.copy())
+            return claimed
+
     async def mark_request_sent(self, pattern_id: str) -> None:
         async with self._lock:
             pid = str(pattern_id or "")

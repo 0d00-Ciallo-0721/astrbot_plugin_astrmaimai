@@ -240,6 +240,9 @@ class Round11RuntimeContractTests(unittest.TestCase):
         self.assertIn("item.expression || item.text", app_js)
         self.assertIn("data-review-page", app_js)
         self.assertIn("snapshot.db_size_kb ?? 0", app_js)
+        self.assertIn('snapshot.total_users ?? "—"', app_js)
+        self.assertIn('snapshot.pending_reviews ?? "—"', app_js)
+        self.assertIn('snapshot.total_memory_events ?? "—"', app_js)
 
 
 if __name__ == "__main__":

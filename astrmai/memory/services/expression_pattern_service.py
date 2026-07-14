@@ -353,6 +353,40 @@ class ExpressionPatternService:
             return None
         return await self.get_pattern(pattern_id)
 
+    async def adjust_weight_once(
+        self,
+        pattern_id: str,
+        delta: float,
+        *,
+        operation_id: str,
+    ) -> ExpressionPatternRecord | None:
+        operation_key = str(operation_id or "").strip()
+        if not operation_key:
+            return await self.adjust_weight(pattern_id, delta)
+        current = await self.get_pattern(pattern_id)
+        if not current:
+            return None
+        metadata = dict(current.metadata or {})
+        applied = metadata.get("applied_weight_operation_ids", [])
+        if not isinstance(applied, list):
+            applied = []
+        applied_ids = [str(item) for item in applied if str(item or "").strip()]
+        if operation_key in applied_ids:
+            return current
+        metadata["weight"] = max(
+            0.0,
+            min(
+                3.0,
+                self._safe_float(metadata.get("weight"), self._safe_float(current.weight, 1.0)) + float(delta or 0.0),
+            ),
+        )
+        metadata["last_active_time"] = time.time()
+        metadata["applied_weight_operation_ids"] = [*applied_ids, operation_key][-128:]
+        changed = await self.store.update_memory(str(pattern_id), metadata=metadata)
+        if not changed:
+            return None
+        return await self.get_pattern(pattern_id)
+
     @staticmethod
     def _safe_float(value, default: float) -> float:
         """Parse float without falsy-or-default trap (0.0 is valid)."""

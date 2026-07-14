@@ -134,6 +134,7 @@ class ExpressionReflector:
                             expression,
                             delta=-0.3,
                             pattern_id=pattern_id,
+                            operation_id=str(item.get("reflection_id") or ""),
                         )
                         if adjusted:
                             logger.info(f"[Reflector] 📉 表达效果不佳 (得分:{score}): 「{expression}」已降权")
@@ -144,6 +145,7 @@ class ExpressionReflector:
                             expression,
                             delta=0.15,
                             pattern_id=pattern_id,
+                            operation_id=str(item.get("reflection_id") or ""),
                         )
                         if adjusted:
                             logger.debug(f"[Reflector] 📈 表达效果极佳 (得分:{score}): 「{expression}」已加权")
@@ -295,10 +297,25 @@ class ExpressionReflector:
             logger.debug(f"[Reflector] pattern reject degraded: {e}")
         return False
 
-    async def _adjust_canonical_pattern_weight(self, group_id: str, situation: str, expression: str, delta: float, pattern_id: str = "") -> bool:
+    async def _adjust_canonical_pattern_weight(
+        self,
+        group_id: str,
+        situation: str,
+        expression: str,
+        delta: float,
+        pattern_id: str = "",
+        operation_id: str = "",
+    ) -> bool:
         """调整表达模式的权重"""
         try:
             service = self._pattern_service()
+            if service and pattern_id and operation_id and hasattr(service, "adjust_weight_once"):
+                await service.adjust_weight_once(
+                    str(pattern_id),
+                    delta,
+                    operation_id=str(operation_id),
+                )
+                return True
             if service and hasattr(service, "adjust_weight") and pattern_id:
                 await service.adjust_weight(str(pattern_id), delta)
                 return True

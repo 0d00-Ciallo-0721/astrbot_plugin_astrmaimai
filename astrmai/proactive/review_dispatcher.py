@@ -14,15 +14,23 @@ class ReviewDispatcher:
     async def dispatch_pending(self):
         if not self.reflect_tracker:
             return
-        requests = await self.reflect_tracker.get_unsent_requests()
+        claim_requests = getattr(self.reflect_tracker, "claim_unsent_requests", None)
+        uses_claim = callable(claim_requests)
+        requests = await claim_requests() if uses_claim else await self.reflect_tracker.get_unsent_requests()
         for item in requests:
+            pattern_id = str(item.get("pattern_id", "") or "")
             try:
                 umo = self._normalize_umo(item.get("umo") or item.get("group_id", ""))
                 await self.context.send_message(umo, MessageChain().message(item["question"]))
-                if hasattr(self.reflect_tracker, "mark_request_sent"):
-                    await self.reflect_tracker.mark_request_sent(str(item.get("pattern_id", "") or ""))
+                if not uses_claim and hasattr(self.reflect_tracker, "mark_request_sent"):
+                    await self.reflect_tracker.mark_request_sent(pattern_id)
             except Exception as exc:
                 logger.warning(f"[Life] review dispatch degraded: {exc}")
+                if uses_claim and hasattr(self.reflect_tracker, "requeue_request"):
+                    try:
+                        await self.reflect_tracker.requeue_request(pattern_id)
+                    except Exception as requeue_exc:
+                        logger.warning(f"[Life] review dispatch requeue degraded: {requeue_exc}")
                 await asyncio.sleep(0.2)
 
     async def describe_status(self) -> dict:

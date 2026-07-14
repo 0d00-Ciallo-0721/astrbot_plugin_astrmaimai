@@ -449,6 +449,63 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.state.wait_mode, "group_reply")
         self.assertEqual(result.state.wait_status, "armed")
 
+    def test_threaded_group_wait_snapshot_aggregates_and_refreshes_all_threads(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _ThreadedGroupWaitManager:
+            threaded_enabled = True
+
+            def __init__(self):
+                self.waits = [
+                    {
+                        "target_user_id": "user-1",
+                        "target_name": "Alice",
+                        "thread_signature": "thread-a",
+                        "remaining_seconds": 20,
+                        "remaining_messages": 2,
+                        "reason": "thread_wait",
+                    },
+                    {
+                        "target_user_id": "user-2",
+                        "target_name": "Bob",
+                        "thread_signature": "thread-b",
+                        "remaining_seconds": 40,
+                        "remaining_messages": 3,
+                        "reason": "thread_wait",
+                    },
+                ]
+
+            def list_waits(self, chat_id):
+                return list(self.waits)
+
+            def get_wait_info(self, chat_id):
+                return self.waits[-1] if self.waits else None
+
+        manager = _ThreadedGroupWaitManager()
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(group_reply_wait_manager=manager)
+
+        async def _run():
+            first = await kernel.tick(chat_id="default:GroupMessage:group-1", trigger="heartbeat")
+            first_state = (
+                list(first.state.wait_target_ids),
+                first.state.wait_message_budget,
+                first.state.wait_expires_at,
+            )
+            manager.waits = []
+            second = await kernel.tick(chat_id="default:GroupMessage:group-1", trigger="heartbeat")
+            return first_state, second
+
+        first_state, second = asyncio.run(_run())
+
+        self.assertEqual(first_state[0], ["user-1", "user-2"])
+        self.assertEqual(first_state[1], 5)
+        self.assertLess(first_state[2], 1_000_000_000)
+        self.assertEqual(second.state.wait_mode, "none")
+        self.assertEqual(second.state.wait_target_ids, [])
+
     def test_private_wait_forces_wait_during_heartbeat(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):
@@ -476,6 +533,20 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.decision.reason, "wait_state:private_wait")
         self.assertEqual(result.decision.metadata["wait_scope"], "private")
         self.assertEqual(bridge_calls, [])
+
+    def test_private_wait_timeout_uses_monotonic_clock(self):
+        kernel = self.kernel_mod.ChatLoopKernel()
+
+        async def _run():
+            return await kernel.arm_private_wait(
+                "default:FriendMessage:user-1",
+                {"user_id": "user-1", "timeout": 30, "message_budget": 1},
+            )
+
+        state = asyncio.run(_run())
+
+        self.assertGreater(state.wait_expires_at, state.wait_started_at)
+        self.assertLess(state.wait_expires_at, 1_000_000_000)
 
     def test_heartbeat_prefers_wakeup_signal_when_eligible(self):
         class _Coordinator:

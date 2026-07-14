@@ -1002,6 +1002,24 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(request.kind, "fact")
             self.assertTrue(payload["fallback_used"])
             self.assertEqual(payload["decision_action"], "legacy_fallback")
+            self.assertIn(":zlj:identity:", request.dedup_key)
+
+            other_request, _ = await gate._build_split_write_request(
+                source="instant_gate",
+                raw_text="????",
+                extracted_fact="??",
+                turn=self.contracts.CommittedMemoryTurn(
+                    turn_id="turn-fallback-2",
+                    chat_id="chat-1",
+                    sender_id="other-user",
+                    user_text="????",
+                    assistant_text="?",
+                    source="test",
+                    committed_at=4001.0,
+                ),
+                category="identity",
+            )
+            self.assertNotEqual(request.dedup_key, other_request.dedup_key)
 
         asyncio.run(run())
 

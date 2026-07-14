@@ -22,7 +22,13 @@ def check_message_dedup(event, ttl_seconds: float = 1.5) -> IngressDecision:
     msg_str = build_message_signature_text(event)
     sender_id = str(event.get_sender_id())
     chat_id = str(event.unified_msg_origin)
-    fingerprint = f"{chat_id}_{sender_id}_{msg_str}"
+    message_obj = getattr(event, "message_obj", None)
+    message_id = str(
+        getattr(message_obj, "message_id", "")
+        or getattr(event, "message_id", "")
+        or ""
+    ).strip()
+    fingerprint = f"{chat_id}_{sender_id}_id:{message_id}" if message_id else f"{chat_id}_{sender_id}_text:{msg_str}"
     now = monotonic()
 
     # ponytail: asyncio single-threaded, no lock needed

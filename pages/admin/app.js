@@ -495,9 +495,9 @@ async function renderDashboardOverview() {
       </div>
     </div>
     <div class="grid">
-      ${metric("总用户数", snapshot.total_users)}
-      ${metric("待审核项", snapshot.pending_reviews)}
-      ${metric("记忆事件", snapshot.total_memory_events)}
+      ${metric("总用户数", snapshot.total_users ?? "—")}
+      ${metric("待审核项", snapshot.pending_reviews ?? "—")}
+      ${metric("记忆事件", snapshot.total_memory_events ?? "—")}
       ${metric("数据库大小", `${snapshot.db_size_kb ?? 0} KB`)}
     </div>
     <div class="grid two">

@@ -13,6 +13,17 @@ from astrmai.state.relationship.relationship_engine import (
 
 
 class StateSubservicesMigratedTests(unittest.TestCase):
+    def test_frequency_controller_refreshes_derived_frequency_without_losing_records(self):
+        old_config = SimpleNamespace(reply=SimpleNamespace(base_frequency=0.4))
+        new_config = SimpleNamespace(reply=SimpleNamespace(base_frequency=0.9))
+        controller = FrequencyController(old_config)
+        record = controller._get_record('chat-1')
+
+        controller.refresh_config(new_config)
+
+        self.assertEqual(controller.BASE_FREQ, 0.9)
+        self.assertIs(controller._get_record('chat-1'), record)
+
     def test_frequency_controller_honors_mentions(self):
         controller = FrequencyController()
         self.assertTrue(controller.should_reply('chat-1', is_mentioned=True))

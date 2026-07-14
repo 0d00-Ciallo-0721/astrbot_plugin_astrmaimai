@@ -61,7 +61,7 @@ class JargonAutoCheckTask:
             return []
         rows = await store.list_candidates(
             kinds=["jargon"],
-            statuses=["review_pending", "rejected"],
+            statuses=["active", "review_pending", "rejected"],
             limit=max(int(limit or 500), 1),
             include_inactive=True,
         )
@@ -70,6 +70,8 @@ class JargonAutoCheckTask:
             metadata = dict(candidate.metadata or {})
             review_status = self._normalized_review_status(metadata.get("review_status") or candidate.status or "review_pending")
             if review_status not in {"review_pending", "pending_human", "rejected", "approved"}:
+                continue
+            if review_status == "approved" and metadata.get("projection_status") != "pending":
                 continue
             groups.append(self._scope_id(candidate.session_id))
         return list(dict.fromkeys(groups))
@@ -101,7 +103,7 @@ class JargonAutoCheckTask:
         rows = await store.list_candidates(
             session_id="" if scope == "GLOBAL" else scope,
             kinds=["jargon"],
-            statuses=["review_pending"],
+            statuses=["active", "review_pending"],
             limit=max(limit * 6, 60),
             include_inactive=True,
         )

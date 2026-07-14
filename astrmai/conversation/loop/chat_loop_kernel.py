@@ -421,7 +421,7 @@ class ChatLoopKernel:
 
     async def arm_private_wait(self, chat_id: str, payload: dict[str, Any]) -> ChatLoopState:
         state = await self._state_store.get_or_create(str(chat_id or ""))
-        now = time.time()
+        now = monotonic()
         wait_timeout = float(payload.get("timeout", 0.0) or 0.0)
         expires_at = now + wait_timeout if wait_timeout > 0 else 0.0
         self._apply_wait_arm(
@@ -1158,7 +1158,14 @@ class ChatLoopKernel:
         self._heartbeat_pass_context = context
 
     async def _build_snapshot(self, state: ChatLoopState, chat_id: str, trigger: str, event: Any) -> ChatLoopSnapshot:
-        self._expire_wait_if_needed(state)
+        threaded_group_mirror = bool(
+            getattr(self.group_reply_wait_manager, "threaded_enabled", False)
+            and state.wait_scope == "group"
+        )
+        if threaded_group_mirror:
+            await self._sync_wait_from_adapters(state, chat_id, event)
+        else:
+            self._expire_wait_if_needed(state)
         self._prune_expired_cooldowns(state)
 
         runtime_snapshot: dict[str, Any] = {}
@@ -1178,7 +1185,7 @@ class ChatLoopKernel:
         has_new_message = trigger in {"message", "external"}
         message_signal = "user_message" if trigger == "message" else ("external_event" if trigger == "external" else "")
 
-        if state.wait_mode == "none":
+        if state.wait_mode == "none" and not threaded_group_mirror:
             await self._sync_wait_from_adapters(state, chat_id, event)
 
         group_wait_state = self._wait_state_payload(state) if state.wait_scope == "group" else {}
@@ -1255,21 +1262,28 @@ class ChatLoopKernel:
         return snapshot
 
     async def _sync_wait_from_adapters(self, state: ChatLoopState, chat_id: str, event: Any) -> None:
+        had_threaded_group_wait = bool(
+            getattr(self.group_reply_wait_manager, "threaded_enabled", False)
+            and state.wait_scope == "group"
+        )
         group_payload = await self._collect_group_wait_state(chat_id)
         if group_payload:
+            now = monotonic()
             self._apply_wait_arm(
                 state,
                 wait_mode="group_reply",
                 wait_scope="group",
-                target_ids=[group_payload.get("target_user_id", "")],
+                target_ids=group_payload.get("target_user_ids") or [group_payload.get("target_user_id", "")],
                 target_name=str(group_payload.get("target_name", "") or ""),
                 thread_signature=str(group_payload.get("thread_signature", "") or ""),
-                started_at=time.time(),
-                expires_at=time.time() + float(group_payload.get("remaining_seconds", 0.0) or 0.0),
+                started_at=now,
+                expires_at=now + float(group_payload.get("remaining_seconds", 0.0) or 0.0),
                 message_budget=int(group_payload.get("remaining_messages", 0) or 0),
                 reason=str(group_payload.get("reason", "group_wait_sync") or "group_wait_sync"),
             )
             return  # ponytail: group wait blocks private wait in same chat
+        if had_threaded_group_wait:
+            self._clear_wait_state(state, status="expired", reason="group_wait_manager_cleared")
 
         private_payload = self._collect_private_wait_state(chat_id, event)
         if private_payload and bool(private_payload.get("is_bot_waiting", False)):
@@ -1291,6 +1305,21 @@ class ChatLoopKernel:
         if manager is None or not hasattr(manager, "get_wait_info"):
             return {}
         try:
+            if bool(getattr(manager, "threaded_enabled", False)) and hasattr(manager, "list_waits"):
+                waits = [dict(item or {}) for item in (manager.list_waits(chat_id) or []) if item]
+                if not waits:
+                    return {}
+                target_ids = self._dedupe_ids([item.get("target_user_id", "") for item in waits])
+                return {
+                    "target_user_id": target_ids[0] if target_ids else "",
+                    "target_user_ids": target_ids,
+                    "target_name": str(waits[0].get("target_name", "") or "") if len(waits) == 1 else "",
+                    "thread_signature": str(waits[0].get("thread_signature", "") or "") if len(waits) == 1 else "",
+                    "remaining_seconds": max(float(item.get("remaining_seconds", 0.0) or 0.0) for item in waits),
+                    "remaining_messages": sum(max(int(item.get("remaining_messages", 0) or 0), 0) for item in waits),
+                    "reason": str(waits[0].get("reason", "thread_wait") or "thread_wait") if len(waits) == 1 else "threaded_group_wait_aggregate",
+                    "wait_count": len(waits),
+                }
             payload = manager.get_wait_info(chat_id)
             return dict(payload or {})
         except Exception as exc:

@@ -13,6 +13,8 @@ from astrmai.learning.review.expression_governance_runner import ExpressionGover
 from astrmai.learning.review.jargon_auto_check_task import JargonAutoCheckTask
 from astrmai.learning.review.reflect_tracker import ReflectTracker
 from astrmai.learning.review.reflector import ExpressionReflector
+from astrmai.memory.contracts.memory_query import MemoryCandidate
+from astrmai.memory.services.expression_pattern_service import ExpressionPatternService
 from astrmai.proactive.review_dispatcher import ReviewDispatcher
 from astrmai.proactive.dream_scheduler import DreamScheduler
 
@@ -149,7 +151,7 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
 
         attempts = {"p0": 0, "p1": 0}
 
-        async def _adjust(group_id, situation, expression, delta, pattern_id=""):
+        async def _adjust(group_id, situation, expression, delta, pattern_id="", operation_id=""):
             attempts[pattern_id] += 1
             return not (pattern_id == "p1" and attempts[pattern_id] == 1)
 
@@ -164,6 +166,76 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reflector._pending_reflections, [])
         self.assertEqual(attempts, {"p0": 1, "p1": 2})
         self.assertEqual(gateway.calls, 1)
+
+    async def test_expression_weight_operation_is_idempotent_after_commit_ack_failure(self):
+        candidate = MemoryCandidate(
+            id="p1",
+            kind="expression_pattern",
+            source="learning_expression_pattern",
+            summary="hello",
+            content="hello",
+            session_id="group-1",
+            metadata={"weight": 1.0},
+        )
+
+        class _CommittedThenRaisedStore:
+            def __init__(self):
+                self.calls = 0
+
+            async def get_canonical(self, pattern_id, include_inactive=False):
+                return candidate
+
+            async def update_memory(self, pattern_id, **kwargs):
+                self.calls += 1
+                candidate.metadata = dict(kwargs["metadata"])
+                if self.calls == 1:
+                    raise RuntimeError("ack lost after commit")
+                return 1
+
+        store = _CommittedThenRaisedStore()
+        service = ExpressionPatternService(store, write_service=None)
+
+        with self.assertRaisesRegex(RuntimeError, "ack lost"):
+            await service.adjust_weight_once("p1", 0.15, operation_id="reflection-1")
+        result = await service.adjust_weight_once("p1", 0.15, operation_id="reflection-1")
+
+        self.assertEqual(store.calls, 1)
+        self.assertAlmostEqual(result.weight, 1.15)
+
+    async def test_review_dispatch_claims_once_and_requeues_failed_send(self):
+        pattern = SimpleNamespace(id="p1", group_id="group-1", situation="chat", expression="hello")
+        tracker = ReflectTracker(SimpleNamespace(), _Gateway())
+        tracker.queue_review_request(pattern)
+
+        class _Context:
+            def __init__(self):
+                self.calls = 0
+                self.fail_first = False
+
+            async def send_message(self, umo, chain):
+                self.calls += 1
+                await asyncio.sleep(0)
+                if self.fail_first and self.calls == 1:
+                    raise RuntimeError("send failed")
+
+        concurrent_context = _Context()
+        concurrent_dispatcher = ReviewDispatcher(concurrent_context, tracker)
+        await asyncio.gather(
+            concurrent_dispatcher.dispatch_pending(),
+            concurrent_dispatcher.dispatch_pending(),
+        )
+        self.assertEqual(concurrent_context.calls, 1)
+
+        retry_tracker = ReflectTracker(SimpleNamespace(), _Gateway())
+        retry_tracker.queue_review_request(pattern)
+        retry_context = _Context()
+        retry_context.fail_first = True
+        retry_dispatcher = ReviewDispatcher(retry_context, retry_tracker)
+        await retry_dispatcher.dispatch_pending()
+        self.assertEqual(len(await retry_tracker.get_unsent_requests()), 1)
+        await retry_dispatcher.dispatch_pending()
+        self.assertEqual(retry_context.calls, 2)
+        self.assertEqual(await retry_tracker.get_unsent_requests(), [])
 
     async def test_reflector_serializes_overlapping_consumers(self):
         gateway = _Gateway([{"index": 1, "score": 5}, {"index": 2, "score": 5}, {"index": 3, "score": 5}])
@@ -266,6 +338,41 @@ class Round9LearningReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidate.status, "active")
         self.assertEqual(candidate.metadata["projection_status"], "projected")
         self.assertEqual(gateway.calls, 1)
+
+    async def test_active_jargon_with_pending_projection_is_recovered_without_llm(self):
+        candidate = SimpleNamespace(
+            id="j-active",
+            kind="jargon",
+            session_id="group-1",
+            source="learning_jargon",
+            content="大鸟",
+            summary="团本首领",
+            tags=["jargon"],
+            importance=0.6,
+            confidence=0.8,
+            status="active",
+            visibility="auto_and_tool",
+            metadata={
+                "meaning": "团本首领",
+                "count": 3,
+                "review_status": "approved",
+                "projection_status": "pending",
+            },
+        )
+        store = _JargonStore(candidate)
+        projector = _FlakyProjector()
+        projector.results = [True]
+        gateway = _Gateway({"decision": "approved"})
+        db = SimpleNamespace(memory_engine=SimpleNamespace(v2_store=store, index_projector=projector))
+        task = JargonAutoCheckTask(db, gateway, config=_config())
+
+        self.assertEqual(await task.list_governance_groups(), ["group-1"])
+        processed = await task.run_once("group-1")
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(candidate.metadata["projection_status"], "projected")
+        self.assertEqual(gateway.calls, 0)
+        self.assertEqual(await task.list_governance_groups(), [])
 
     async def test_governance_hot_refresh_updates_interval_and_children(self):
         children = []

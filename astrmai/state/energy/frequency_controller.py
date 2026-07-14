@@ -67,6 +67,10 @@ class FrequencyController:
 
     def refresh_config(self, config):
         self.config = config
+        if config and hasattr(config, 'reply'):
+            self.BASE_FREQ = config.reply.base_frequency
+        else:
+            self.BASE_FREQ = self.DEFAULT_BASE_FREQ
 
     def should_reply(
         self,

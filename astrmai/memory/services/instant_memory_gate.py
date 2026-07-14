@@ -108,11 +108,12 @@ class InstantMemoryGate:
         claims = []
         decision = None
         fallback_used = False
+        subject_id = str(turn.sender_id or turn.chat_id or "")
         try:
             claims = await self.claim_extractor.extract(
                 user_text=str(raw_text or ""),
                 assistant_text=str(extracted_fact or ""),
-                subject_id=str(turn.sender_id or turn.chat_id or ""),
+                subject_id=subject_id,
                 turn_id=str(turn.turn_id or ""),
                 context_hint=source,
             )
@@ -211,7 +212,7 @@ class InstantMemoryGate:
                 "instant_write": True,
                 "authority_eav": True,
             },
-            dedup_key=f"{fallback_prefix}:{turn.chat_id}:{category}:{str(extracted_fact or raw_text or '')[:60]}",
+            dedup_key=f"{fallback_prefix}:{subject_id}:{category}:{str(extracted_fact or raw_text or '')[:60]}",
             created_at=float(turn.committed_at or 0.0),
         )
         return request, {
