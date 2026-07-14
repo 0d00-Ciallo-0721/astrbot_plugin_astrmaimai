@@ -32,6 +32,12 @@ class ReflectTracker:
         pattern_id = str(pattern.id)
         group_id = str(getattr(pattern, "group_id", "") or "")
         umo = self._normalize_umo(getattr(pattern, "umo", "") or getattr(pattern, "unified_msg_origin", "") or group_id)
+        existing = self._pending.get(pattern_id)
+        if existing:
+            existing["question"] = self._build_question(pattern, reason=reason, replacement=replacement)
+            existing["group_id"] = group_id
+            existing["umo"] = umo
+            return
         self._pending[pattern_id] = {
             "pattern_id": pattern_id,
             "group_id": group_id,
@@ -39,7 +45,17 @@ class ReflectTracker:
             "question": self._build_question(pattern, reason=reason, replacement=replacement),
             "created_at": time.time(),
             "sent": False,
+            "processing": False,
         }
+
+    async def requeue_request(self, pattern_id: str) -> bool:
+        async with self._lock:
+            item = self._pending.get(str(pattern_id or ""))
+            if not item:
+                return False
+            item["sent"] = False
+            item["processing"] = False
+            return True
 
     def _build_question(self, pattern: ExpressionPattern, reason: str = "", replacement: str = "") -> str:
         suffix = f"\nAI 备注：{reason}" if reason else ""
@@ -91,6 +107,7 @@ class ReflectTracker:
                 or item.get("umo") == event_umo
                 or item.get("umo") == normalized_event_umo
             ]
+            candidates = [item for item in candidates if not item.get("processing")]
         if not candidates:
             return None
 
@@ -100,13 +117,16 @@ class ReflectTracker:
         if pattern_id is None:
             return None
 
-        # ponytail: atomically pop inside lock to prevent TOCTOU double-processing
         async with self._lock:
-            self._pending.pop(str(pattern_id), None)
+            pending = self._pending.get(str(pattern_id))
+            if not pending or pending.get("processing"):
+                return None
+            pending["processing"] = True
 
         decision = await self._parse_feedback(event.unified_msg_origin, text)
         if not decision:
-            return None
+            await self._release_claim(str(pattern_id))
+            return f"表达审核 #{pattern_id} 暂未处理，请稍后重试。"
 
         kwargs = {"modified_by": f"human:{sender_id}"}
         action = decision.get("decision")
@@ -144,17 +164,32 @@ class ReflectTracker:
                 }
             )
         else:
+            await self._release_claim(str(pattern_id))
             return None
 
-        service = self._pattern_service()
-        if service and hasattr(service, "update_review"):
-            updated = await service.update_review(str(pattern_id), **kwargs)
-        else:
-            legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
-            updated = await self.db.update_pattern_review_async(legacy_id, **kwargs)
+        try:
+            service = self._pattern_service()
+            if service and hasattr(service, "update_review"):
+                updated = await service.update_review(str(pattern_id), **kwargs)
+            else:
+                legacy_id = int(pattern_id) if str(pattern_id).isdigit() else pattern_id
+                updated = await self.db.update_pattern_review_async(legacy_id, **kwargs)
+        except Exception as exc:
+            logger.warning(f"[ReflectTracker] 人工审核持久化失败 #{pattern_id}: {exc}")
+            await self._release_claim(str(pattern_id))
+            return f"表达审核 #{pattern_id} 暂未处理，请稍后重试。"
         if not updated:
-            return None
+            await self._release_claim(str(pattern_id))
+            return f"表达审核 #{pattern_id} 暂未处理，请稍后重试。"
+        async with self._lock:
+            self._pending.pop(str(pattern_id), None)
         return f"已处理表达审核 #{pattern_id}：{action}"
+
+    async def _release_claim(self, pattern_id: str) -> None:
+        async with self._lock:
+            item = self._pending.get(str(pattern_id or ""))
+            if item:
+                item["processing"] = False
 
     async def _parse_feedback(self, chat_id: str, text: str) -> Optional[dict]:
         lowered = text.lower()

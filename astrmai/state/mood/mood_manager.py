@@ -1,6 +1,7 @@
 import asyncio
 import ast
 import json
+import math
 import re
 from typing import Any, Tuple
 
@@ -35,20 +36,22 @@ class MoodManager:
     def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
         self.config = config if config else gateway.config
-        self.emotion_mapping = {}
+        self.emotion_mapping = self._build_emotion_mapping(self.config)
 
-        if hasattr(self.config, "reply") and hasattr(self.config.reply, "emotion_mapping"):
-            mapping_list = self.config.reply.emotion_mapping
+    @staticmethod
+    def _build_emotion_mapping(config) -> dict[str, str]:
+        mapping = {}
+        if hasattr(config, "reply") and hasattr(config.reply, "emotion_mapping"):
+            mapping_list = config.reply.emotion_mapping
             for item in mapping_list:
                 if ":" in item:
                     k, v = item.split(":", 1)
-                    self.emotion_mapping[k.strip()] = v.strip()
+                    mapping[k.strip()] = v.strip()
                 elif "：" in item:
                     k, v = item.split("：", 1)
-                    self.emotion_mapping[k.strip()] = v.strip()
-
-        if not self.emotion_mapping:
-            self.emotion_mapping = {
+                    mapping[k.strip()] = v.strip()
+        if not mapping:
+            mapping = {
                 "happy": "positive, glad, relieved, affectionate",
                 "sad": "hurt, low, apologetic, disappointed",
                 "angry": "annoyed, hostile, blaming, rejecting",
@@ -56,6 +59,12 @@ class MoodManager:
                 "curious": "wondering, asking, probing",
                 "surprise": "unexpected, startled, sudden turn",
             }
+        return mapping
+
+    def refresh_config(self, config) -> None:
+        mapping = self._build_emotion_mapping(config)
+        self.config = config
+        self.emotion_mapping = mapping
 
     @staticmethod
     def _extract_lane_text_result(result: Any) -> Any:
@@ -134,15 +143,23 @@ class MoodManager:
     def _normalize_result(self, data: dict[str, Any], current_mood: float) -> tuple[str, float] | None:
         if not isinstance(data, dict):
             return None
+        try:
+            fallback_mood = float(current_mood)
+        except (TypeError, ValueError):
+            fallback_mood = 0.0
+        if not math.isfinite(fallback_mood):
+            fallback_mood = 0.0
         mood_tag = str(data.get("mood_tag", "") or "").strip().lower()
         if not mood_tag and "mood_value" not in data:
             return None
         if mood_tag not in self.VALID_TAGS:
             mood_tag = "neutral"
         try:
-            mood_value = float(data.get("mood_value", current_mood))
+            mood_value = float(data.get("mood_value", fallback_mood))
         except (TypeError, ValueError):
-            mood_value = float(current_mood)
+            mood_value = fallback_mood
+        if not math.isfinite(mood_value):
+            mood_value = fallback_mood
         mood_value = max(-1.0, min(1.0, mood_value))
         return mood_tag or "neutral", mood_value
 

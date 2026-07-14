@@ -153,7 +153,7 @@ class ReviewPersistenceMixin:
         with self.get_session() as session:
             statement = select(ExpressionPattern).where(
                 ExpressionPattern.rejected == False,
-                ExpressionPattern.review_status.in_(["pending", "revision_needed", "pending_human"]),
+                ExpressionPattern.review_status.in_(["pending", "revision_needed"]),
             )
             if group_id:
                 statement = statement.where(ExpressionPattern.group_id == group_id)

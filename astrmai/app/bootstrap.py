@@ -459,6 +459,7 @@ class PluginBootstrap:
             jargon_auto_check_task=jargon_auto_check_task,
             review_dispatcher=review_dispatcher,
             interval_seconds=getattr(getattr(runtime.config, "evolution", None), "review_runner_interval_sec", 60),
+            config=runtime.config,
         )
         if runtime.system2_planner is not None:
             runtime.system2_planner.reflector = reflector

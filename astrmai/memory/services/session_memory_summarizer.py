@@ -31,6 +31,17 @@ class SessionMemorySummarizer:
         self.claim_extractor = MemoryClaimExtractor(gateway)
         self.conflict_resolver = MemoryConflictResolver()
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+        memory_config = getattr(config, "memory", None)
+        self.check_interval = getattr(memory_config, "cleanup_interval", 3600)
+        self.msg_threshold = getattr(memory_config, "summary_threshold", 30)
+        refresh = getattr(self.topic_summarizer, "refresh_config", None)
+        if callable(refresh):
+            refresh(config)
+        else:
+            self.topic_summarizer.config = config
+
     async def extract_and_summarize_history(self, session_id: str, days: int = 1):
         plugin = getattr(self.context, "astrmai_plugin", None) or getattr(self.gateway.context, "astrmai", None)
         if not plugin or not hasattr(plugin, "db_service"):

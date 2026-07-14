@@ -30,6 +30,9 @@ class JargonAutoCheckTask:
         self.config = config if config else gateway.config
         self._last_run_at: dict[str, float] = {}
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     def _store(self):
         return getattr(getattr(self.db, "memory_engine", None), "v2_store", None)
 
@@ -108,7 +111,13 @@ class JargonAutoCheckTask:
                 continue
             metadata = dict(candidate.metadata or {})
             review_status = self._normalized_review_status(metadata.get("review_status") or candidate.status or "review_pending")
-            if review_status not in {"review_pending", "pending_human"}:
+            if review_status == "approved" and metadata.get("projection_status") == "pending":
+                if await self._activate_approved_candidate(candidate, metadata):
+                    processed += 1
+                if processed >= limit:
+                    break
+                continue
+            if review_status != "review_pending":
                 continue
             count = int(metadata.get("count") or 0)
             has_evidence = bool(str(metadata.get("meaning") or "").strip()) or bool(metadata.get("examples")) or float(candidate.confidence or 0.0) >= 0.2
@@ -183,8 +192,13 @@ class JargonAutoCheckTask:
         if decision == "approved":
             metadata["review_status"] = "approved"
             metadata["review_suggestion"] = ""
-            next_status = "active"
-            visibility = "auto_and_tool"
+            metadata["projection_status"] = "pending"
+            await self._activate_approved_candidate(candidate, metadata)
+            logger.info(
+                f"[JargonAutoCheck] 黑话审核完成 #{candidate.id}: decision={decision}, "
+                f"group={self._scope_id(candidate.session_id)}, reason={reason or 'n/a'}"
+            )
+            return
         elif decision == "rejected":
             metadata["review_status"] = "rejected"
             metadata["review_suggestion"] = ""
@@ -210,6 +224,52 @@ class JargonAutoCheckTask:
             f"[JargonAutoCheck] 黑话审核完成 #{candidate.id}: decision={decision}, "
             f"group={self._scope_id(candidate.session_id)}, reason={reason or 'n/a'}"
         )
+
+    async def _activate_approved_candidate(self, candidate, metadata: dict) -> bool:
+        store = self._store()
+        if not store:
+            return False
+        pending_metadata = dict(metadata or {})
+        pending_metadata["review_status"] = "approved"
+        pending_metadata["projection_status"] = "pending"
+        changed = await store.update_memory(
+            str(candidate.id),
+            summary=str(pending_metadata.get("meaning") or candidate.summary or candidate.content or "")[:240],
+            status="active",
+            metadata=pending_metadata,
+            visibility="auto_and_tool",
+        )
+        if not changed:
+            return False
+
+        projector = self._projector()
+        projected = True
+        if projector:
+            try:
+                projected = await projector.project(str(candidate.id))
+            except Exception as exc:
+                projected = False
+                logger.warning(f"[JargonAutoCheck] 黑话投影失败 #{candidate.id}: {exc}")
+        if projected is False:
+            await store.update_memory(
+                str(candidate.id),
+                status="review_pending",
+                metadata=pending_metadata,
+                visibility="maintenance_only",
+            )
+            if projector and hasattr(projector, "cleanup_deleted"):
+                await projector.cleanup_deleted([str(candidate.id)])
+            return False
+
+        projected_metadata = dict(pending_metadata)
+        projected_metadata["projection_status"] = "projected" if projector else "not_required"
+        await store.update_memory(
+            str(candidate.id),
+            status="active",
+            metadata=projected_metadata,
+            visibility="auto_and_tool",
+        )
+        return True
 
 
 __all__ = ["JargonAutoCheckTask"]

@@ -25,10 +25,33 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
     def _facade(self, config, *, failing=False):
         from astrmai.app.plugin_facade import PluginFacade
         from astrmai.conversation.execution.reply_service import ReplyService
+        from astrmai.memory.services.memory_engine import MemoryEngine
 
         state_engine = _Component(config)
         reply_service = ReplyService(state_engine, mood_manager=SimpleNamespace(), config=config)
-        memory_engine = _Component(config)
+        memory_engine = MemoryEngine.__new__(MemoryEngine)
+        memory_engine.config = config
+        memory_engine.embedding_models = []
+        for name in (
+            "injection_service",
+            "retrieval_service",
+            "write_service",
+            "retriever",
+            "session_summarizer",
+            "instant_gate",
+            "maintenance_service",
+            "tool_service",
+        ):
+            setattr(memory_engine, name, _Component(config))
+        memory_engine.memory_pipeline = _Component(config)
+
+        def _refresh_pipeline(next_config):
+            memory_engine.memory_pipeline.config = next_config
+            memory_engine.memory_pipeline.seen.append(next_config)
+            memory_engine.session_summarizer.refresh_config(next_config)
+            memory_engine.instant_gate.refresh_config(next_config)
+
+        memory_engine.memory_pipeline.refresh_config = _refresh_pipeline
         attention_gate = _Component(config)
         lane_manager = _Component(config)
         context_compaction = _Component(config)
@@ -133,6 +156,14 @@ class HotConfigConsistencyIntegrationTests(unittest.TestCase):
         self.assertEqual(reply_service.segmentation_threshold, old_config.reply.segment_min_len)
         self.assertEqual(reply_service.no_segment_limit, old_config.reply.no_segment_max_len)
         self.assertIs(memory_engine.config, old_config)
+        for name in (
+            "session_summarizer",
+            "instant_gate",
+            "memory_pipeline",
+            "maintenance_service",
+            "tool_service",
+        ):
+            self.assertIs(getattr(memory_engine, name).config, old_config)
         self.assertIs(attention_gate.config, old_config)
         self.assertIs(runtime.context_compaction.config, old_config)
         self.assertIs(runtime.persona_summarizer.config, old_config)

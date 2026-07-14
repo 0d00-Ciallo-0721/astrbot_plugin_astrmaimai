@@ -216,7 +216,7 @@ class ExpressionPatternService:
         return [
             item
             for item in rows
-            if str(item.review_status or "").strip().lower() in {"pending", "revision_needed", "pending_human"}
+            if str(item.review_status or "").strip().lower() in {"pending", "revision_needed"}
         ][: max(int(limit or 20), 1)]
 
     async def list_governance_groups(self, *, limit: int = 500) -> list[str]:

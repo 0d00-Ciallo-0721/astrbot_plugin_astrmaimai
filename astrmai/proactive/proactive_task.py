@@ -169,7 +169,10 @@ class ProactiveTask:
             "dream_agent",
         ):
             service = getattr(self, service_name, None)
-            if service is not None and hasattr(service, "config"):
+            refresh = getattr(service, "refresh_config", None)
+            if callable(refresh):
+                refresh(self.config)
+            elif service is not None and hasattr(service, "config"):
                 service.config = self.config
 
     async def _call_background_lane(
@@ -798,8 +801,6 @@ class ProactiveTask:
                 if now - self._last_profile_run > 3600:
                     await self._run_profiling_task()
                     self._last_profile_run = now
-
-                await self._run_reflection_tasks()
 
                 if run_maintenance and self.diary_service.should_run(self._last_diary_date, now):
                     self._last_diary_date = time.strftime("%Y-%m-%d", time.localtime(now))

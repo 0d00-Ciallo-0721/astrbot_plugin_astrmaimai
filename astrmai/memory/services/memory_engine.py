@@ -111,6 +111,21 @@ class MemoryEngine:
             self.write_service.refresh_config(config)
         if getattr(self, "retriever", None) is not None and hasattr(self.retriever, "refresh_config"):
             self.retriever.refresh_config(config)
+        pipeline = getattr(self, "memory_pipeline", None)
+        pipeline_refresh = getattr(pipeline, "refresh_config", None)
+        if callable(pipeline_refresh):
+            pipeline_refresh(config)
+        else:
+            for attr in ("session_summarizer", "instant_gate"):
+                component = getattr(self, attr, None)
+                refresh = getattr(component, "refresh_config", None)
+                if callable(refresh):
+                    refresh(config)
+        for attr in ("maintenance_service", "tool_service"):
+            component = getattr(self, attr, None)
+            refresh = getattr(component, "refresh_config", None)
+            if callable(refresh):
+                refresh(config)
         self.embedding_models = self._configured_embedding_models(config)
         if self.embedding_models != old_embedding_models:
             self.faiss_db = None

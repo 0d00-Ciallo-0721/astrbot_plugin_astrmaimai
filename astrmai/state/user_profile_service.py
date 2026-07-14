@@ -47,7 +47,7 @@ class UserProfileService:
         if not profile.is_dirty:
             return
         try:
-            await self.persistence.save_user_profile(user_id, profile.as_dict())
+            await self.persistence.save_user_profile(profile)
             profile.is_dirty = False
         except Exception as exc:
             from astrbot.api import logger
@@ -174,7 +174,14 @@ class UserProfileService:
             else:
                 meta.pop("relationship_vector", None)
 
-    async def update_social_score(self, user_id: str, score: float, relationship_vector: dict = None) -> UserProfile:
+    async def update_social_score(
+        self,
+        user_id: str,
+        score: float,
+        relationship_vector: dict = None,
+        *,
+        touch_activity: bool = True,
+    ) -> UserProfile:
         async with self._get_user_lock(user_id):
             now = time.time()
             profile = self.user_profiles.get(user_id)
@@ -197,7 +204,10 @@ class UserProfileService:
             profile.social_score = score
             if relationship_vector:
                 profile.relationship_vector = relationship_vector
-            self._touch_profile(profile, now=now)
+            if touch_activity:
+                self._touch_profile(profile, now=now)
+            else:
+                profile.is_dirty = True
             await self._save_profile(profile)
             return profile
 

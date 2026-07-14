@@ -192,6 +192,8 @@ class InfrastructureGapCoverageTests(unittest.TestCase):
             await asyncio.sleep(0.05)
             await event_bus.stop()
             self.assertFalse(event_bus._workers_started)
+            self.assertEqual(event_bus.subscribers, {})
+            event_bus.subscribe("infra.test", _capture)
             await event_bus.publish("infra.test", {"value": 2})
             await asyncio.sleep(0.05)
             await event_bus.stop()

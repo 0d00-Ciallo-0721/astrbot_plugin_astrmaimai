@@ -52,9 +52,41 @@ class EvolutionManager:
         self._mining_locks: Dict[str, asyncio.Lock] = {}
         self._lock_mutex = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
+        self._mining_tasks: Dict[str, asyncio.Task] = {}
 
     def refresh_config(self, config):
         self.config = config
+        evolution = getattr(config, "evolution", None)
+        self.recorder.window_seconds = max(int(getattr(evolution, "mining_window_sec", 60) or 60), 10)
+        self.recorder.min_messages = max(
+            int(
+                getattr(
+                    evolution,
+                    "mining_window_min_messages",
+                    getattr(evolution, "mining_trigger", 20),
+                )
+                or 20
+            ),
+            2,
+        )
+        self.recorder.cooldown_seconds = max(int(getattr(evolution, "mining_cooldown_sec", 60) or 60), 5)
+        self.bot_reply_recorder.fallback_text = getattr(
+            getattr(config, "reply", None),
+            "fallback_text",
+            self.bot_reply_recorder.fallback_text,
+        )
+        self.expression_miner.config = config
+        self.expression_miner.candidate_extractor.min_count = max(
+            int(getattr(evolution, "expression_min_count", 2) or 2),
+            1,
+        )
+        self.expression_miner.enricher.config = config
+        self.jargon_miner.candidate_extractor.min_count = max(
+            int(getattr(evolution, "jargon_min_count", 2) or 2),
+            1,
+        )
+        if self.jargon_miner.enricher is not None:
+            self.jargon_miner.enricher.config = config
 
     async def _get_mining_lock(self, group_id: str) -> asyncio.Lock:
         async with self._lock_mutex:
@@ -66,6 +98,23 @@ class EvolutionManager:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
+        return task
+
+    def _schedule_mining_if_triggered(self, group_id: str, triggered: bool) -> None:
+        group_id = str(group_id or "")
+        if not triggered or not group_id:
+            return
+        current = self._mining_tasks.get(group_id)
+        if current is not None and not current.done():
+            return
+        task = self._fire_background_task(self._try_trigger_mining(group_id))
+        self._mining_tasks[group_id] = task
+
+        def _release(done_task: asyncio.Task) -> None:
+            if self._mining_tasks.get(group_id) is done_task:
+                self._mining_tasks.pop(group_id, None)
+
+        task.add_done_callback(_release)
 
     def _handle_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)
@@ -241,8 +290,8 @@ class EvolutionManager:
             sender_name="SELF",
             content=processed_content,
         )
-        self.recorder.record(event.unified_msg_origin)
-        self._fire_background_task(self._try_trigger_mining(event.unified_msg_origin))
+        triggered = self.recorder.record(event.unified_msg_origin)
+        self._schedule_mining_if_triggered(event.unified_msg_origin, triggered)
 
     async def record_user_message(self, event: AstrMessageEvent):
         rich_text = event.get_extra("astrmai_rich_text", event.message_str)
@@ -252,7 +301,8 @@ class EvolutionManager:
             sender_name=event.get_sender_name(),
             content=rich_text,
         )
-        self.recorder.record(event.unified_msg_origin)
+        triggered = self.recorder.record(event.unified_msg_origin)
+        self._schedule_mining_if_triggered(event.unified_msg_origin, triggered)
         payload = UserMessageRecordedEvent(
             chat_id=str(event.unified_msg_origin),
             sender_id=str(event.get_sender_id() or ""),
@@ -357,13 +407,15 @@ class EvolutionManager:
 
     async def _try_trigger_mining(self, group_id: str):
         unprocessed_logs = await self._load_unprocessed_logs(group_id, limit=100)
-        threshold = getattr(self.config.evolution, "mining_trigger", 20)
+        threshold = self.recorder.min_messages
         if len(unprocessed_logs) >= threshold:
             await self.process_logs_and_mine(group_id, unprocessed_logs)
 
     async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
         recorded = await self.bot_reply_recorder.record(chat_id, bot_id, reply_text)
         if recorded:
+            triggered = self.recorder.record(chat_id)
+            self._schedule_mining_if_triggered(chat_id, triggered)
             payload = BotReplyRecordedEvent(
                 chat_id=str(chat_id),
                 bot_id=str(bot_id),

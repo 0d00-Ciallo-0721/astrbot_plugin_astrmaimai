@@ -213,6 +213,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("context_compaction", getattr(self.runtime, "context_compaction", None)),
             ("persona_summarizer", getattr(self.runtime, "persona_summarizer", None)),
             ("evolution", getattr(self.runtime, "evolution", None)),
+            ("expression_governance_runner", getattr(self.runtime, "expression_governance_runner", None)),
             ("memory_engine", getattr(self.runtime, "memory_engine", None)),
             ("judge", getattr(self.runtime, "judge", None)),
             ("proactive_task", getattr(self.runtime, "proactive_task", None)),

@@ -30,6 +30,9 @@ class InstantMemoryGate:
         self.claim_extractor = MemoryClaimExtractor(gateway)
         self.conflict_resolver = MemoryConflictResolver()
 
+    def refresh_config(self, config: Any) -> None:
+        self.config = config
+
     async def process_committed_turn(self, turn: CommittedMemoryTurn) -> InstantGateResult:
         if turn.is_proactive:
             return InstantGateResult()

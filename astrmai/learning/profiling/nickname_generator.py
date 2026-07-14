@@ -10,9 +10,9 @@ class NicknameGenerator:
         return preferred or display_name or "未知用户"
 
     def build_template_payload(self, profile, persona_summary: str = "") -> dict[str, str]:
-        analysis = getattr(profile, "persona_analysis", "") or "鏆傛棤鐢诲儚"
+        analysis = getattr(profile, "persona_analysis", "") or "暂无画像"
         tags = getattr(profile, "tags", []) or []
-        tags_text = ", ".join(str(item) for item in tags) if tags else "鏆傛棤"
+        tags_text = ", ".join(str(item) for item in tags) if tags else "暂无"
         return {
             "persona_summary": str(persona_summary or "").strip(),
             "name": str(getattr(profile, "name", "") or "").strip(),

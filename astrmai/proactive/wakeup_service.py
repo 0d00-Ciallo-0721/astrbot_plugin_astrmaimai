@@ -179,13 +179,19 @@ class WakeupService:
             if not reply_sent:
                 logger.info(f"[Life] proactive wakeup skipped by planner: {getattr(target_state, 'chat_id', '')}")
                 return
-            try:
+            next_wakeup_timestamp = time.time() + wakeup_cooldown
+            settle = getattr(self.state_engine, "settle_proactive_wakeup", None)
+            if callable(settle):
+                await settle(
+                    target_state.chat_id,
+                    amount=wakeup_cost,
+                    next_wakeup_timestamp=next_wakeup_timestamp,
+                )
+            else:
                 await self.state_engine.consume_energy(target_state.chat_id, amount=wakeup_cost)
-            except TypeError:
-                await self.state_engine.consume_energy(target_state.chat_id)
-            target_state.next_wakeup_timestamp = time.time() + wakeup_cooldown
-            target_state.is_dirty = True
-            await self.persistence.save_chat_state(target_state)
+                target_state.next_wakeup_timestamp = next_wakeup_timestamp
+                target_state.is_dirty = True
+                await self.persistence.save_chat_state(target_state.chat_id, target_state)
             logger.info(f"[Life] proactive wakeup sent via main chain: {str(reply_preview or '')[:80]}")
 
         try:

@@ -32,7 +32,13 @@ class DecayService:
             logger.debug(f"[Life] profile decay listing degraded: {exc}")
             active_profiles = []
         for profile in active_profiles:
-            if now - (getattr(profile, "last_access_time", 0) or 0) <= 86400:
+            metadata = getattr(profile, "profile_metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+                profile.profile_metadata = metadata
+            last_decay = float(metadata.get("last_relationship_decay_time", 0.0) or 0.0)
+            last_activity = float(getattr(profile, "last_access_time", 0.0) or 0.0)
+            if now - max(last_activity, last_decay) <= 86400:
                 continue
             old_score = float(profile.social_score or 0.0)
             if old_score > 10:
@@ -46,15 +52,15 @@ class DecayService:
             else:
                 delta = 0
             if delta != 0:
-                profile.last_access_time = now
+                metadata["last_relationship_decay_time"] = now
                 try:
-                    await self.state_engine.update_social_score_from_fact(profile.user_id, delta)
+                    await self.state_engine.update_social_score_from_fact(
+                        profile.user_id,
+                        delta,
+                        touch_activity=False,
+                    )
                 except Exception as exc:
                     logger.debug(f"[Life] profile social decay degraded: {exc}")
-
-        enable_rel_engine = getattr(self.config.evolution, "enable_relationship_engine", True) if hasattr(self.config, "evolution") else True
-        if enable_rel_engine and hasattr(self.state_engine, "relationship_engine"):
-            self.state_engine.relationship_engine.apply_global_decay()
 
         if not self.memory_engine or not hasattr(self.memory_engine, "apply_daily_decay"):
             return

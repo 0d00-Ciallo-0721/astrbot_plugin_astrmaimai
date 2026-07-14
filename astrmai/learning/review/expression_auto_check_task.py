@@ -33,6 +33,9 @@ class ExpressionAutoCheckTask:
         self.config = config if config else gateway.config
         self._last_run_at: dict[str, float] = {}
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     async def run_once(self, group_id: Optional[str] = None) -> int:
         now = monotonic()
         scope = str(group_id or "__global__")
@@ -53,6 +56,8 @@ class ExpressionAutoCheckTask:
             patterns = await self.db.list_reviewable_patterns_async(group_id=group_id, limit=limit)
         processed = 0
         for pattern in patterns:
+            if str(getattr(pattern, "review_status", "") or "").strip().lower() == "pending_human":
+                continue
             if int(getattr(pattern, "count", 1) or 1) < min_count:
                 continue
             result = await self._review_pattern(pattern)

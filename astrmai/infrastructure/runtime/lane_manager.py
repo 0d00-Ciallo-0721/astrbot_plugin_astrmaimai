@@ -75,7 +75,9 @@ class LaneManager(LaneHistoryMixin, LaneStorageMixin):
         self._active_lane_count = 0
 
     def refresh_config(self, config):
+        settings = build_infrastructure_settings(config).lane
         self.config = config
+        self.settings = settings
 
     def get_policy(self, lane_key: LaneKey) -> LanePolicy:
         return self.DEFAULT_POLICIES.get(

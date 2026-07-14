@@ -17,6 +17,7 @@ class ExpressionGovernanceRunner:
         jargon_auto_check_task=None,
         review_dispatcher=None,
         interval_seconds: int = 60,
+        config=None,
     ):
         self.state_engine = state_engine
         self.pattern_service = pattern_service
@@ -24,9 +25,23 @@ class ExpressionGovernanceRunner:
         self.auto_check_task = auto_check_task
         self.jargon_auto_check_task = jargon_auto_check_task
         self.review_dispatcher = review_dispatcher
+        self.config = config
         self.interval_seconds = max(int(interval_seconds or 60), 15)
         self._is_running = False
         self._task = None
+
+    def refresh_config(self, config) -> None:
+        self.config = config
+        self.interval_seconds = max(
+            int(getattr(getattr(config, "evolution", None), "review_runner_interval_sec", 60) or 60),
+            15,
+        )
+        for component in (self.reflector, self.auto_check_task, self.jargon_auto_check_task):
+            refresh = getattr(component, "refresh_config", None)
+            if callable(refresh):
+                refresh(config)
+            elif component is not None and hasattr(component, "config"):
+                component.config = config
 
     async def start(self):
         if self._is_running:

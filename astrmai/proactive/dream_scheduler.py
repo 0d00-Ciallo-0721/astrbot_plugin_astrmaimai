@@ -20,6 +20,12 @@ class DreamScheduler:
         self._last_dream_time = 0.0
         self._dream_interval = getattr(getattr(config, "life", None), "dream_interval_min", 30) * 60
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+        life = getattr(config, "life", None)
+        self._dream_interval = max(int(getattr(life, "dream_interval_min", 30) or 30), 1) * 60
+        self.dream_visible = bool(getattr(life, "dream_visible", self.dream_visible))
+
     def bind_dependencies(self, dream_agent, dream_generator, db_service=None, promotion_engine=None):
         self.dream_agent = dream_agent
         self.dream_generator = dream_generator

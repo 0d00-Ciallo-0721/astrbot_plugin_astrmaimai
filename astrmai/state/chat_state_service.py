@@ -4,6 +4,7 @@ import asyncio
 import copy
 import datetime
 import inspect
+import math
 import time
 from time import monotonic
 from typing import Any, Dict, List
@@ -32,6 +33,7 @@ class ChatStateService:
         # ponytail: threading.Lock guards dict mutations, held for trivial ops only — safe in asyncio
         self._pool_lock_mutex = threading.Lock()
         self._last_lock_prune: float = 0.0
+        self._chat_generations: Dict[str, int] = {}
 
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         # ponytail: FIFO eviction when >500 locks. Python 3.7+ dict is insertion-ordered.
@@ -41,9 +43,13 @@ class ChatStateService:
         MAX_CHAT_LOCKS = 500
         if len(self._chat_locks) > MAX_CHAT_LOCKS and now - self._last_lock_prune > 300:
             excess = len(self._chat_locks) - 300
-            keys_to_remove = list(self._chat_locks.keys())[:excess]
+            keys_to_remove = [
+                key for key, lock in self._chat_locks.items()
+                if key != chat_id and not lock.locked()
+            ][:excess]
             for key in keys_to_remove:
                 self._chat_locks.pop(key, None)
+                self._chat_generations.pop(key, None)
             self._last_lock_prune = now
         # Move current chat_id to end (LRU approximation in Python 3.7+ ordered dict)
         if chat_id in self._chat_locks:
@@ -52,6 +58,19 @@ class ChatStateService:
         if chat_id not in self._chat_locks:
             self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
+
+    def _chat_generation(self, chat_id: str) -> int:
+        return self._chat_generations.get(chat_id, 0)
+
+    def _is_current_generation(self, chat_id: str, generation: int) -> bool:
+        return self._chat_generation(chat_id) == generation
+
+    @staticmethod
+    def _is_finite_number(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
 
     def _touch_state(self, state: ChatState, now: float) -> ChatState:
         state.last_access_time = now
@@ -85,8 +104,14 @@ class ChatStateService:
         return state
 
     @staticmethod
-    def _clamp_mood(value: float) -> float:
-        return max(-1.0, min(1.0, value))
+    def _clamp_mood(value: float, fallback: float = 0.0) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(fallback)
+        if not math.isfinite(numeric):
+            numeric = float(fallback)
+        return max(-1.0, min(1.0, numeric))
 
     def _mark_dirty(self, state: ChatState) -> ChatState:
         state.is_dirty = True
@@ -128,7 +153,10 @@ class ChatStateService:
         return state
 
     async def get_state(self, chat_id: str) -> ChatState:
+        generation = self._chat_generation(chat_id)
         async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
             return await self._get_state_inner(chat_id)
 
     def _check_daily_reset(self, state: ChatState) -> None:
@@ -147,7 +175,7 @@ class ChatStateService:
     async def clear_chat_state(self, chat_id: str) -> bool:
         async with self._get_chat_lock(chat_id):
             removed = self.chat_states.pop(chat_id, None) is not None
-            self._chat_locks.pop(chat_id, None)
+            self._chat_generations[chat_id] = self._chat_generation(chat_id) + 1
             return removed
 
     async def atomic_update_mood(
@@ -156,7 +184,17 @@ class ChatStateService:
         delta: float = 0.0,
         absolute_val: float | None = None,
     ) -> float:
+        if absolute_val is not None and not self._is_finite_number(absolute_val):
+            state = self.chat_states.get(chat_id)
+            return float(getattr(state, "mood", 0.0) or 0.0)
+        if absolute_val is None and not self._is_finite_number(delta):
+            state = self.chat_states.get(chat_id)
+            return float(getattr(state, "mood", 0.0) or 0.0)
+        generation = self._chat_generation(chat_id)
         async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                state = self.chat_states.get(chat_id)
+                return float(getattr(state, "mood", 0.0) or 0.0)
             state = await self._get_state_inner(chat_id)
             apply_natural_decay(state, self.config)
             if absolute_val is not None:
@@ -171,7 +209,10 @@ class ChatStateService:
             return state.mood
 
     async def mark_energy_consumed(self, chat_id: str, amount: float) -> ChatState:
+        generation = self._chat_generation(chat_id)
         async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
             state = await self._get_state_inner(chat_id)
             old_energy = state.energy
             state.energy = max(0.0, old_energy - amount)
@@ -186,8 +227,26 @@ class ChatStateService:
                 logger.exception(f"[ChatState] DB save failed for {chat_id} in mark_energy_consumed")
             return state
 
-    async def should_drop_by_energy(self, chat_id: str, msg_count: int, energy_manager: EnergyManager) -> bool:
+    async def settle_wakeup(self, chat_id: str, amount: float, next_wakeup_timestamp: float) -> ChatState:
+        generation = self._chat_generation(chat_id)
         async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
+            state = await self._get_state_inner(chat_id)
+            state.energy = max(0.0, float(state.energy or 0.0) - float(amount or 0.0))
+            state.total_replies += 1
+            state.last_reply_time = time.time()
+            state.next_wakeup_timestamp = float(next_wakeup_timestamp or 0.0)
+            state.is_dirty = True
+            await self.persistence.save_chat_state(chat_id, state)
+            state.is_dirty = False
+            return state
+
+    async def should_drop_by_energy(self, chat_id: str, msg_count: int, energy_manager: EnergyManager) -> bool:
+        generation = self._chat_generation(chat_id)
+        async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return False
             state = await self._get_state_inner(chat_id)
             should_drop = energy_manager.should_drop_by_energy(state, msg_count)
             if getattr(state, "is_dirty", False):
@@ -216,10 +275,15 @@ class StateEngine:
     def refresh_config(self, config):
         """ponytail: hot-reload config into state engine and sub-components"""
         self.config = config
+        self.chat_state_service.config = config
         for attr in ("mood_manager", "energy_manager", "relationship_engine"):
             comp = getattr(self, attr, None)
             if comp is not None:
-                comp.config = config
+                refresh = getattr(comp, "refresh_config", None)
+                if callable(refresh):
+                    refresh(config)
+                else:
+                    comp.config = config
 
     async def _load_profile_with_relationship(self, user_id: str) -> UserProfile:
         profile = await self.user_profile_service.get_user_profile(user_id)
@@ -304,6 +368,7 @@ class StateEngine:
         return await self._load_profile_with_relationship(user_id)
 
     async def update_mood(self, chat_id: str, text: str):
+        generation = self.chat_state_service._chat_generation(chat_id)
         # Phase 1: snapshot read from current state without mutating the cached object.
         state = await self.get_state(chat_id)
         snapshot_state = copy.deepcopy(state)
@@ -312,10 +377,18 @@ class StateEngine:
 
         # Phase 2: LLM analysis (no lock — parallel-safe, no blocking)
         tag, new_value = await self._resolve_mood_analysis(chat_id, text, snapshot_mood)
+        try:
+            mood_is_finite = math.isfinite(float(new_value))
+        except (TypeError, ValueError):
+            mood_is_finite = False
+        if not mood_is_finite:
+            return tag, snapshot_mood
 
         # Phase 3: CAS write under lock
         lock = self.chat_state_service._get_chat_lock(chat_id)
         async with lock:
+            if not self.chat_state_service._is_current_generation(chat_id, generation):
+                return tag, snapshot_mood
             current_state = await self.chat_state_service._get_state_inner(chat_id)
             apply_natural_decay(current_state, self.config)
             current_mood = current_state.mood
@@ -331,7 +404,13 @@ class StateEngine:
             current_state.is_dirty = False
             return tag, current_state.mood
 
-    async def update_social_score_from_fact(self, user_id: str, impact_score: float):
+    async def update_social_score_from_fact(
+        self,
+        user_id: str,
+        impact_score: float,
+        *,
+        touch_activity: bool = True,
+    ):
         profile = await self.user_profile_service.get_user_profile(user_id)
         if not self.relationship_engine.has_vector(user_id):
             self.relationship_engine.load_from_profile(user_id, profile.__dict__)
@@ -339,7 +418,12 @@ class StateEngine:
         new_score = max(-100.0, min(100.0, old_score + impact_score))
         aligned_score = self.relationship_engine.align_social_score(user_id, new_score)
         rel_vector = self.relationship_engine.export_user_vector(user_id)
-        await self.user_profile_service.update_social_score(user_id, aligned_score, rel_vector)
+        await self.user_profile_service.update_social_score(
+            user_id,
+            aligned_score,
+            rel_vector,
+            touch_activity=touch_activity,
+        )
         logger.info(
             f"[Social] user {profile.name}({user_id}) score {old_score:.1f} -> "
             f"{aligned_score:.1f} ({impact_score:+.1f})"
@@ -499,6 +583,17 @@ class StateEngine:
         if "FriendMessage" in chat_id:
             return
         await self.chat_state_service.mark_energy_consumed(chat_id, amount)
+
+    async def settle_proactive_wakeup(
+        self,
+        chat_id: str,
+        *,
+        amount: float,
+        next_wakeup_timestamp: float,
+    ) -> ChatState:
+        if "FriendMessage" in chat_id:
+            amount = 0.0
+        return await self.chat_state_service.settle_wakeup(chat_id, amount, next_wakeup_timestamp)
 
     async def get_user_profile_summary(self, user_id: str) -> UserProfileSummary:
         profile = await self.get_user_profile(user_id)

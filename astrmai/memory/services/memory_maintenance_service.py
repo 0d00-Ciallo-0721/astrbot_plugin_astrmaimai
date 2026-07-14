@@ -14,6 +14,10 @@ class MemoryMaintenanceService:
         self.config = config
         self.scoring = scoring_from_config(config)
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+        self.scoring = scoring_from_config(config)
+
     async def apply_daily_decay(
         self,
         *,

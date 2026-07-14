@@ -44,6 +44,15 @@ class MemoryTurnPipeline:
         self._running = False
         self._sweep_task: asyncio.Task[Any] | None = None
 
+    def refresh_config(self, config: Any) -> None:
+        self.config = config
+        for component in (self.session_summarizer, self.instant_gate):
+            refresh = getattr(component, "refresh_config", None)
+            if callable(refresh):
+                refresh(config)
+            elif component is not None:
+                component.config = config
+
     async def start(self) -> None:
         if self._running:
             return

@@ -14,6 +14,7 @@ AstrBot 规范:
 """
 import asyncio
 import time
+import uuid
 from typing import List, Optional, Dict
 from astrbot.api import logger
 from ...infrastructure.runtime.lane_manager import LaneKey
@@ -32,7 +33,11 @@ class ExpressionReflector:
         self.config = config
         self._pending_reflections: List[Dict] = []
         self._lock = asyncio.Lock()
+        self._processing_lock = asyncio.Lock()
         self._last_audit_time = 0.0
+
+    def refresh_config(self, config) -> None:
+        self.config = config
 
     def _pattern_service(self):
         return getattr(getattr(self.db, "memory_engine", None), "expression_pattern_service", None)
@@ -53,6 +58,7 @@ class ExpressionReflector:
         """
         async with self._lock:
             self._pending_reflections.append({
+                "reflection_id": uuid.uuid4().hex,
                 "pattern_id": str(pattern_id or ""),
                 "chat_id": str(chat_id or ""),
                 "situation": pattern_situation,
@@ -78,79 +84,109 @@ class ExpressionReflector:
         批量反思: 评估最近使用过的表达效果。
         建议在 ProactiveTask 的心跳循环中周期性调用。
         """
-        async with self._lock:
-            if len(self._pending_reflections) < 3:
-                return
-            batch = self._pending_reflections[:8]
+        async with self._processing_lock:
+            async with self._lock:
+                retry_items = [
+                    item
+                    for item in self._pending_reflections
+                    if "_reflection_score" in item or item.get("_reflection_attempted")
+                ]
+                if retry_items:
+                    batch = retry_items[:8]
+                else:
+                    if len(self._pending_reflections) < 3:
+                        return
+                    batch = self._pending_reflections[:8]
+                for item in batch:
+                    item.setdefault("reflection_id", uuid.uuid4().hex)
 
-        if not batch:
-            return
+            unscored = [item for item in batch if "_reflection_score" not in item]
+            try:
+                if unscored:
+                    scores = await self._score_reflections(group_id, unscored)
+                    if not scores:
+                        logger.warning("[Reflector] empty score payload from LLM; keeping batch for retry")
+                        return
+                    async with self._lock:
+                        for item in unscored:
+                            item["_reflection_attempted"] = True
+                        for score_item in scores:
+                            idx = int(score_item.get("index", 0) or 0) - 1
+                            if 0 <= idx < len(unscored):
+                                try:
+                                    unscored[idx]["_reflection_score"] = float(score_item.get("score", 5))
+                                except (TypeError, ValueError):
+                                    continue
 
-        # 构建批量反思 Prompt
+                acked_ids: set[str] = set()
+                for item in batch:
+                    if "_reflection_score" not in item:
+                        continue
+                    score = float(item["_reflection_score"])
+                    pattern_id = str(item.get("pattern_id") or "")
+                    expression = item["expression"]
+                    situation = item["situation"]
+                    adjusted = True
+                    if score <= 2:
+                        adjusted = await self._adjust_canonical_pattern_weight(
+                            group_id,
+                            situation,
+                            expression,
+                            delta=-0.3,
+                            pattern_id=pattern_id,
+                        )
+                        if adjusted:
+                            logger.info(f"[Reflector] 📉 表达效果不佳 (得分:{score}): 「{expression}」已降权")
+                    elif score >= 9:
+                        adjusted = await self._adjust_canonical_pattern_weight(
+                            group_id,
+                            situation,
+                            expression,
+                            delta=0.15,
+                            pattern_id=pattern_id,
+                        )
+                        if adjusted:
+                            logger.debug(f"[Reflector] 📈 表达效果极佳 (得分:{score}): 「{expression}」已加权")
+                    if adjusted:
+                        acked_ids.add(str(item["reflection_id"]))
+
+                if acked_ids:
+                    async with self._lock:
+                        self._pending_reflections = [
+                            item
+                            for item in self._pending_reflections
+                            if str(item.get("reflection_id") or "") not in acked_ids
+                        ]
+                if len(acked_ids) < len(batch):
+                    logger.warning("[Reflector] partial reflection failure; retrying only unacked items")
+            except Exception as e:
+                logger.debug(f"[Reflector] 批量反思失败: {e}")
+
+    async def _score_reflections(self, group_id: str, batch: List[Dict]) -> List[Dict]:
         items_text = "\n".join(
             f"第{i+1}次: 场景「{item['situation']}」→ 表达「{item['expression']}」→ 实际回复「{item['reply'][:100]}」"
             + (f" → 用户反应「{item['reaction'][:80]}」" if item['reaction'] else "")
             for i, item in enumerate(batch)
         )
-
         prompt = f"""请评估以下几次表达风格的使用效果。对每次使用打分 (0-10分)。
 
 {items_text}
 
 评分标准:
 - 10分: 表达极其自然，完美契合场景
-- 7分: 表达合适，略有生硬  
+- 7分: 表达合适，略有生硬
 - 5分: 一般，可用但不出彩
 - 3分: 不太合适，有些刻意或尴尬
 - 0分: 完全不合适，应该淘汰
 
 返回 JSON 数组: [{{"index": 1, "score": 8, "feedback": "简评"}}]"""
-
-        try:
-            result = await self.gateway.call_data_process_task(
-                prompt,
-                is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=group_id, scope_kind="global"),
-                base_origin="",
-            )
-            scores = self._parse_scores(result)
-            if not scores:
-                logger.warning("[Reflector] empty score payload from LLM; keeping batch for retry")
-                return
-
-            # Ack the batch only after LLM scoring and weight updates both succeed.
-            weight_update_failed = False
-            for score_item in scores:
-                idx = score_item.get("index", 0) - 1
-                score = score_item.get("score", 5)
-
-                if 0 <= idx < len(batch):
-                    pattern_id = str(batch[idx].get("pattern_id") or "")
-                    expression = batch[idx]["expression"]
-                    situation = batch[idx]["situation"]
-
-                    if score <= 2:
-                        # 低分: 降权
-                        adjusted = await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=-0.3, pattern_id=pattern_id)
-                        weight_update_failed = weight_update_failed or not adjusted
-                        if adjusted:
-                            logger.info(f"[Reflector] 📉 表达效果不佳 (得分:{score}): 「{expression}」已降权")
-                    elif score >= 9:
-                        # 高分: 加权
-                        adjusted = await self._adjust_canonical_pattern_weight(group_id, situation, expression, delta=0.15, pattern_id=pattern_id)
-                        weight_update_failed = weight_update_failed or not adjusted
-                        if adjusted:
-                            logger.debug(f"[Reflector] 📈 表达效果极佳 (得分:{score}): 「{expression}」已加权")
-
-            if weight_update_failed:
-                logger.warning("[Reflector] weight update failed after LLM success; keeping batch for retry")
-                return
-
-            async with self._lock:
-                self._pending_reflections = self._pending_reflections[len(batch):]
-
-        except Exception as e:
-            logger.debug(f"[Reflector] 批量反思失败: {e}")
+        result = await self.gateway.call_data_process_task(
+            prompt,
+            is_json=True,
+            lane_key=LaneKey(subsystem="bg", task_family="reflect", scope_id=group_id, scope_kind="global"),
+            base_origin="",
+        )
+        return self._parse_scores(result)
 
     async def auto_audit(self, group_id: str):
         """

@@ -16,13 +16,13 @@ class ProfileGenerator:
         }
 
     def build_template_payload(self, profile, persona_summary: str = "") -> dict[str, str]:
-        old_analysis = getattr(profile, "persona_analysis", "") or "鏆傛棤鏃х敾鍍?"
+        old_analysis = getattr(profile, "persona_analysis", "") or "暂无旧画像"
         old_tags = getattr(profile, "tags", []) or []
-        old_tags_str = ", ".join(old_tags) if old_tags else "鏆傛棤鏍囩"
+        old_tags_str = ", ".join(old_tags) if old_tags else "暂无标签"
         old_memory_points = getattr(profile, "memory_points", []) or []
-        old_memory_text = "\n".join(str(item) for item in old_memory_points) if old_memory_points else "鏆傛棤璁板繂鐐?"
+        old_memory_text = "\n".join(str(item) for item in old_memory_points) if old_memory_points else "暂无记忆点"
         profiling_count = int(getattr(profile, "message_count_for_profiling", 0) or 0)
-        recent_interaction_summary = str(getattr(profile, "recent_interaction_summary", "") or "").strip() or "鏆傛棤鏈€杩戜簰鍔ㄦ憳瑕?"
+        recent_interaction_summary = str(getattr(profile, "recent_interaction_summary", "") or "").strip() or "暂无最近互动摘要"
         return {
             "persona_summary": str(persona_summary or "").strip(),
             "name": str(getattr(profile, "name", "") or "").strip(),

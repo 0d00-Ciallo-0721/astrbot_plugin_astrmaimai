@@ -31,6 +31,7 @@ class PrivateChatManager:
 
     def refresh_config(self, config):
         self.config = config
+        self._init_timeout(config)
 
     def set_host_plugin(self, host_plugin) -> None:
         """Inject host plugin reference for KV storage access."""

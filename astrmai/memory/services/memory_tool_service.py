@@ -17,6 +17,9 @@ class MemoryToolService:
         self.db_service = db_service
         self.config = config
 
+    def refresh_config(self, config: Any) -> None:
+        self.config = config
+
     @staticmethod
     def _already_injected_ids(event) -> list[str]:
         trace = event.get_extra("astrmai_memory_injection_trace", None) if hasattr(event, "get_extra") else None

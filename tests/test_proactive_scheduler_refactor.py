@@ -773,7 +773,7 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         service = wakeup_mod.WakeupService(
             context=context,
             state_engine=state_engine,
-            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda state: asyncio.sleep(0)),
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda chat_id, state: asyncio.sleep(0)),
             call_background_lane=lambda *args, **kwargs: None,
             config=config,
             dispatcher=dispatcher,
@@ -1045,7 +1045,7 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         service = wakeup_mod.WakeupService(
             context=SimpleNamespace(send_message=None),
             state_engine=state_engine,
-            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda target_state: asyncio.sleep(0)),
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda chat_id, target_state: asyncio.sleep(0)),
             call_background_lane=lambda *args, **kwargs: None,
             config=SimpleNamespace(
                 persona=SimpleNamespace(persona_id="global"),
@@ -1128,7 +1128,7 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         service = wakeup_mod.WakeupService(
             context=SimpleNamespace(send_message=None),
             state_engine=state_engine,
-            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda target_state: asyncio.sleep(0)),
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda chat_id, target_state: asyncio.sleep(0)),
             call_background_lane=lambda *args, **kwargs: None,
             config=SimpleNamespace(
                 life=SimpleNamespace(silence_threshold=10, wakeup_min_energy=20, wakeup_cost=7),

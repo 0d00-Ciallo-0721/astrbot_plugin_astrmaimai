@@ -42,6 +42,7 @@ class EventBus:
         self._workers_started = False
         self._background_tasks = set()
         self._worker_tasks: set = set()  # ponytail: worker-only tracking (R8)
+        self._generation = 0
 
     # ==========================
     # 基础 Event 触发机制 (遗留兼容)
@@ -138,7 +139,10 @@ class EventBus:
         
         while True:
             try:
-                topic, data = await self._event_queue.get()
+                generation, topic, data = await self._event_queue.get()
+                if generation != self._generation:
+                    self._event_queue.task_done()
+                    continue
                 if topic not in self.subscribers:
                     self._event_queue.task_done()
                     continue
@@ -213,7 +217,7 @@ class EventBus:
         
         try:
             # 使用 nowait 防止高频事件反向阻塞关键请求链路，溢出时告警
-            self._event_queue.put_nowait((topic, data))
+            self._event_queue.put_nowait((self._generation, topic, data))
         except asyncio.QueueFull:
             self._dropped_count += 1
             from astrbot.api import logger
@@ -231,6 +235,13 @@ class EventBus:
         self._background_tasks.clear()
         self._worker_tasks.clear()
         self._workers_started = False
+        self._generation += 1
+        self._event_queue = asyncio.Queue(maxsize=1000)
+        self.subscribers = {}
+        self.abort_signal.clear()
+        self.response_sent.clear()
+        self.affection_changed.clear()
+        self.knowledge_updated.clear()
     
     def get_dropped_count(self) -> int:
         """Return the number of events dropped due to queue full (R9)."""
