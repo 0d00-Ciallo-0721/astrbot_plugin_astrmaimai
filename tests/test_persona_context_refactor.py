@@ -420,7 +420,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
             summarizer._generate_all_shards_background = _background
             payload = await summarizer.get_summary(
-                original_prompt="new prompt",
+                original_prompt="cached raw persona",
                 persona_id="persona-recovery",
             )
             await started.wait()
@@ -536,7 +536,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
         payload = asyncio.run(
             summarizer.get_summary(
-                original_prompt="fallback raw",
+                original_prompt="cached raw persona",
                 persona_id="",
                 session_id="chat-1",
             )

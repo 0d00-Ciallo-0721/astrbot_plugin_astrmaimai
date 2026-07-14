@@ -26,6 +26,9 @@ class MemoryRetrievalService:
         self.jargon_policy = JargonRetrievalPolicy(store)
         self.expression_pattern_policy = ExpressionPatternRetrievalPolicy(store)
 
+    def refresh_config(self, config) -> None:
+        self.scoring = scoring_from_config(config)
+
     @staticmethod
     def _resolved_session_id(query: MemoryQuery) -> str:
         layer_set = {str(item) for item in query.layers or [] if str(item).strip()}
@@ -324,13 +327,13 @@ class MemoryRetrievalService:
             top_k=query.top_k,
             candidate_pool_limit=candidate_limit,
         )
-        return self._finalize_candidates(query, candidates)
+        return await self._finalize_retrieval(query, candidates)
 
     async def retrieve_deep(self, query: MemoryQuery) -> list[MemoryCandidate]:
         queries = [query.query]
         try:
             queries = await self._rewrite_queries(query)
-            candidate_pool_limit = max(
+            candidate_pool_limit = self._explicit_candidate_limit(query) or max(
                 int(query.top_k or 5) * max(int(self.scoring.deep_temporal_candidate_pool_factor or 4), 1),
                 max(int(self.scoring.deep_temporal_candidate_pool_min or 20), 1),
             )
@@ -349,7 +352,7 @@ class MemoryRetrievalService:
             if guidance:
                 for item in candidates:
                     item.metadata.setdefault("deep_guidance", guidance)
-            return self._finalize_candidates(query, candidates)
+            return await self._finalize_retrieval(query, candidates)
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep retrieval degraded: {exc}")
             candidates = await self._retrieve_queries(
@@ -358,7 +361,22 @@ class MemoryRetrievalService:
                 top_k=query.top_k,
                 candidate_pool_limit=self._candidate_limit(query),
             )
-            return self._finalize_candidates(query, candidates)
+            return await self._finalize_retrieval(query, candidates)
+
+    async def _finalize_retrieval(
+        self,
+        query: MemoryQuery,
+        candidates: list[MemoryCandidate],
+    ) -> list[MemoryCandidate]:
+        selected = self._finalize_candidates(query, candidates)
+        try:
+            finalize_access = getattr(self.store, "finalize_access", None)
+            if finalize_access is not None:
+                await finalize_access(selected, allow_stale=query.allow_stale)
+        except Exception as exc:
+            logger.warning(f"[MemoryRetrievalService] access tracking degraded: {exc}")
+            self._mark_degraded(query, "access_tracking")
+        return selected
 
     async def _retrieve_queries(
         self,
@@ -463,6 +481,7 @@ class MemoryRetrievalService:
             exclude_ids=query.exclude_ids,
             allow_stale=query.allow_stale,
             visibility_mode=visibility_mode,
+            track_access=False,
         )
         hybrid_task = self._hybrid_search(query, visibility_mode)
         canonical_results, hybrid_results = await asyncio.gather(canonical_task, hybrid_task, return_exceptions=True)
@@ -486,7 +505,7 @@ class MemoryRetrievalService:
         try:
             results = await self.engine.search_memories(
                 query.query,
-                top_k=max(int(query.top_k or 5), 1),
+                top_k=self._explicit_candidate_limit(query) or max(int(query.top_k or 5), 1),
                 session_id=self._resolved_session_id(query),
                 persona_id=query.persona_id or None,
             )

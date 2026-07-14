@@ -20,6 +20,9 @@ class HybridRetriever:
         self.rrf = RRFFusion()
         self.config = config
 
+    def refresh_config(self, config) -> None:
+        self.config = config
+
     async def add_memory(self, content: str, metadata: Dict[str, Any]) -> int:
         doc_id = None
         
@@ -80,8 +83,16 @@ class HybridRetriever:
         # ponytail: wall-clock, mixed with DB values — do NOT replace with monotonic
         now = time.time()
         time_decay_rate = getattr(self.config.memory, 'time_decay_rate', 0.01) if self.config else 0.01
+        raw_scores = [max(float(result.score or 0.0), 0.0) for result in results]
+        high = max(raw_scores, default=0.0)
+        if high > 0.0:
+            normalized_scores = [score / high for score in raw_scores]
+        elif results:
+            normalized_scores = [1.0 for _result in results]
+        else:
+            normalized_scores = []
         
-        for r in results:
+        for r, relevance in zip(results, normalized_scores):
             meta = r.metadata
             if isinstance(meta, str):
                 try:
@@ -92,11 +103,12 @@ class HybridRetriever:
             create_time = meta.get("create_time", now)
             importance = meta.get("importance", 0.5)
             
-            # 物理衰减公式: score * importance * e^(-lambda * days)
-            days_old = (now - create_time) / 86400
+            # Keep query relevance dominant while using importance as a bounded modifier.
+            days_old = max(0.0, (now - create_time) / 86400)
             decay = math.exp(-time_decay_rate * days_old)
             
-            r.score = r.score * importance * decay
+            importance_factor = 0.75 + 0.25 * min(max(float(importance or 0.0), 0.0), 1.0)
+            r.score = relevance * importance_factor * decay
             r.metadata = meta
             
         # 重排

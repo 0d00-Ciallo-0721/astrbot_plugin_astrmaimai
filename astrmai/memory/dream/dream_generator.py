@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import random
 from typing import Optional
 
@@ -9,16 +8,17 @@ from astrbot.api import logger
 from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from .fact_contract import parse_dream_fact_log
 
 
 class DreamGenerator:
-    """姊﹀鍙欒堪鐢熸垚鍣?"""
+    """将 Dream maintenance 日志改写为可见梦境叙事。"""
 
     DREAM_STYLES = [
-        "濂囧够鍐掗櫓", "鑽掕癁绂诲", "瀹侀潤骞冲拰", "绉戝够鏈潵", "鍙ゅ吀璇楁剰",
-        "璧涘崥鏈嬪厠", "鐢板洯鐗ф瓕", "鎮枒鎯婃倸", "娓╅Θ娌绘剤", "鍙茶瘲瀹忓ぇ",
-        "纰庣墖鍖栨剰璇嗘祦", "鏃ュ父娴佹按璐?", "绔ヨ瘽鏁呬簨", "姝︿緺姹熸箹", "閮藉競鐖辨儏",
-        "鎭愭€栧摜鐗?", "鍠滃墽鑽掕癁", "鍝插鎬濊鲸", "鏈棩搴熷湡", "榄旀硶瀛﹂櫌", "绁炶瘽浼犺",
+        "奇幻冒险", "荒诞离奇", "宁静平和", "科幻未来", "古典诗意",
+        "赛博朋克", "田园牧歌", "悬疑惊悚", "温馨治愈", "史诗宏大",
+        "碎片化意识流", "日常流水账", "童话故事", "武侠江湖", "都市爱情",
+        "恐怖怪谈", "喜剧荒诞", "哲学思辨", "末日废土", "魔法学院", "神话传说",
     ]
 
     def __init__(self, gateway: GlobalModelGateway, config=None):
@@ -39,6 +39,11 @@ class DreamGenerator:
         lines = [line.strip() for line in str(dream_log or "").splitlines() if line.strip()]
         return "\n".join(lines)
 
+    @classmethod
+    def _normalize_style(cls, style: Optional[str]) -> str:
+        normalized = str(style or "").strip()
+        return normalized if normalized in cls.DREAM_STYLES else random.choice(cls.DREAM_STYLES)
+
     async def generate(
         self,
         dream_log: str,
@@ -50,9 +55,9 @@ class DreamGenerator:
         if not normalized_dream_log.strip():
             return ""
 
-        chosen_style = style if style else random.choice(self.DREAM_STYLES)
+        chosen_style = self._normalize_style(style)
         lane_scope_id, lane_scope_kind = self._resolve_scope(session_id)
-        logger.info(f"[DreamGenerator] 馃寵 鐢熸垚姊﹀鍙欒堪 | 椋庢牸: {chosen_style}")
+        logger.info(f"[DreamGenerator] 生成梦境叙事 | 风格: {chosen_style}")
 
         try:
             if self.prompt_registry is not None:
@@ -100,12 +105,12 @@ class DreamGenerator:
             dream_text = str(result).strip()
             if dream_text:
                 logger.info(
-                    f"[DreamGenerator] 鉁?姊﹀鐢熸垚鎴愬姛 "
-                    f"(椋庢牸:{chosen_style}, 闀垮害:{len(dream_text)}瀛?"
+                    f"[DreamGenerator] 梦境生成成功 "
+                    f"(风格:{chosen_style}, 长度:{len(dream_text)}字)"
                 )
                 return dream_text
         except Exception as e:
-            logger.error(f"[DreamGenerator] 姊﹀鐢熸垚澶辫触: {e}")
+            logger.error(f"[DreamGenerator] 梦境生成失败: {e}")
 
         return self._fallback_dream(normalized_dream_log, chosen_style, persona_name)
 
@@ -154,14 +159,10 @@ class DreamGenerator:
                 elif "suggest_jargon_review" in normalized:
                     tags.append("jargon_review")
                     jargon_suggestions.append(normalized)
-            elif normalized.startswith("[fact]"):
-                payload = normalized.removeprefix("[fact]").strip()
-                try:
-                    item = json.loads(payload)
-                    if isinstance(item, dict):
-                        detected_facts.append(item)
-                except Exception:
-                    continue
+            else:
+                fact = parse_dream_fact_log(normalized)
+                if fact is not None:
+                    detected_facts.append(fact)
         action_count = len(actions)
         summary = (
             f"session={session_id} 的 dream maintenance 完成，共执行 {action_count} 次维护动作。"

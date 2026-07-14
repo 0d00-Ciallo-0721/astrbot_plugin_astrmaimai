@@ -68,6 +68,18 @@ class MemoryV2Store:
         return max(int(candidate_limit), result_limit, 1)
 
     @staticmethod
+    def _normalize_fts_scores(rows: list[tuple]) -> list[float]:
+        raw_scores = [float(row[20] or 0.0) if len(row) > 20 else 0.0 for row in rows]
+        if not raw_scores:
+            return []
+        best = min(raw_scores)
+        worst = max(raw_scores)
+        if worst <= best:
+            return [1.0 for _score in raw_scores]
+        scale = worst - best
+        return [min(max((worst - score) / scale, 0.0), 1.0) for score in raw_scores]
+
+    @staticmethod
     def _normalize_lock_scope(session_id: str) -> str:
         clean = str(session_id or "").strip()
         return clean if clean else "__global__"
@@ -239,6 +251,15 @@ class MemoryV2Store:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS memory_dedup_aliases (
+                    alias_key TEXT PRIMARY KEY,
+                    canonical_memory_id TEXT NOT NULL,
+                    created_at REAL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS memory_v2_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT DEFAULT ''
@@ -278,8 +299,73 @@ class MemoryV2Store:
                 )
                 """
             )
+            await self._ensure_fts_projection(db)
             await db.commit()
         self._initialized = True
+
+    async def _ensure_fts_projection(self, db) -> None:
+        canonical_cursor = await db.execute("SELECT COUNT(*) FROM canonical_memories WHERE status = 'active'")
+        canonical_row = await canonical_cursor.fetchone()
+        projected_cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM canonical_fts fts
+            JOIN canonical_memories cm ON cm.id = fts.memory_id
+            WHERE cm.status = 'active'
+            """
+        )
+        projected_row = await projected_cursor.fetchone()
+        invalid_cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM canonical_fts fts
+            LEFT JOIN canonical_memories cm ON cm.id = fts.memory_id
+            WHERE cm.id IS NULL OR cm.status != 'active'
+            """
+        )
+        invalid_row = await invalid_cursor.fetchone()
+        missing_cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM canonical_memories cm
+            WHERE cm.status = 'active'
+              AND NOT EXISTS (SELECT 1 FROM canonical_fts fts WHERE fts.memory_id = cm.id)
+            """
+        )
+        missing_row = await missing_cursor.fetchone()
+        duplicate_cursor = await db.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT memory_id
+                FROM canonical_fts
+                GROUP BY memory_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        )
+        duplicate_row = await duplicate_cursor.fetchone()
+        canonical_count = int(canonical_row[0] if canonical_row else 0)
+        projected_count = int(projected_row[0] if projected_row else 0)
+        invalid_count = int(invalid_row[0] if invalid_row else 0)
+        missing_count = int(missing_row[0] if missing_row else 0)
+        duplicate_count = int(duplicate_row[0] if duplicate_row else 0)
+        if (
+            canonical_count == projected_count
+            and invalid_count == 0
+            and missing_count == 0
+            and duplicate_count == 0
+        ):
+            return
+        await db.execute("DELETE FROM canonical_fts")
+        await db.execute(
+            """
+            INSERT INTO canonical_fts(memory_id, content, summary, tags)
+            SELECT id, COALESCE(content, ''), COALESCE(summary, ''), COALESCE(tags, '[]')
+            FROM canonical_memories
+            WHERE status = 'active'
+            """
+        )
 
     async def _migrate_schema(self, db) -> None:
         cursor = await db.execute("PRAGMA table_info(canonical_memories)")
@@ -320,9 +406,8 @@ class MemoryV2Store:
         if self._migrated_from_legacy:
             return
         if not self.legacy_db_path or not os.path.isfile(self.legacy_db_path):
-            self._migrated_from_legacy = True
             return
-        if os.path.isfile(self.db_path):
+        if os.path.abspath(self.legacy_db_path) == os.path.abspath(self.db_path):
             self._migrated_from_legacy = True
             return
         try:
@@ -367,8 +452,26 @@ class MemoryV2Store:
                     )
                     """
                 )
+                source_columns_cursor = await tgt_db.execute("PRAGMA legacy_src.table_info(canonical_memories)")
+                source_columns = {str(item[1]) for item in await source_columns_cursor.fetchall()}
+                target_columns = [
+                    "id", "session_id", "sender_id", "persona_id", "source", "kind", "content", "summary",
+                    "tags", "importance", "confidence", "status", "decay_score", "create_time", "update_time",
+                    "last_access_time", "access_count", "superseded_by", "deleted_reason", "metadata", "dedup_key",
+                    "source_ref", "visibility",
+                ]
+                defaults = {
+                    "session_id": "''", "sender_id": "''", "persona_id": "''", "source": "''", "kind": "''",
+                    "content": "''", "summary": "''", "tags": "'[]'", "importance": "0.5",
+                    "confidence": "0.8", "status": "'active'", "decay_score": "1.0", "create_time": "0",
+                    "update_time": "0", "last_access_time": "0", "access_count": "0", "superseded_by": "''",
+                    "deleted_reason": "''", "metadata": "'{}'", "dedup_key": "''", "source_ref": "''",
+                    "visibility": "'auto_and_tool'",
+                }
+                select_columns = [column if column in source_columns else defaults.get(column, "''") for column in target_columns]
                 await tgt_db.execute(
-                    "INSERT OR IGNORE INTO main.canonical_memories SELECT * FROM legacy_src.canonical_memories"
+                    f"INSERT OR IGNORE INTO main.canonical_memories ({', '.join(target_columns)}) "
+                    f"SELECT {', '.join(select_columns)} FROM legacy_src.canonical_memories"
                 )
                 await tgt_db.commit()
                 await tgt_db.execute("DETACH DATABASE legacy_src")
@@ -384,7 +487,6 @@ class MemoryV2Store:
             self._migrated_from_legacy = True
         except Exception as exc:
             logger.warning(f"[MemoryV2] legacy migration skipped: {exc}")
-            self._migrated_from_legacy = True
 
     @staticmethod
     def _now() -> float:
@@ -643,7 +745,119 @@ class MemoryV2Store:
                 params,
             )
             row = await cursor.fetchone()
+            if row is None:
+                alias_status = "" if include_inactive else "AND c.status IN ('active', 'stale', 'review_pending')"
+                cursor = await db.execute(
+                    f"""
+                    SELECT c.id, c.kind, c.source, c.summary, c.content, c.session_id, c.sender_id, c.persona_id,
+                           c.tags, c.importance, c.confidence, c.status, c.create_time,
+                           c.update_time, c.last_access_time, c.metadata, c.visibility, c.access_count,
+                           c.decay_score, c.superseded_by
+                    FROM memory_dedup_aliases AS a
+                    JOIN canonical_memories AS c ON c.id = a.canonical_memory_id
+                    WHERE a.alias_key = ? {alias_status}
+                    LIMIT 1
+                    """,
+                    (clean_key,),
+                )
+                row = await cursor.fetchone()
         return self._row_to_candidate(row) if row else None
+
+    async def resolve_dedup_key(self, dedup_key: str) -> str:
+        await self.initialize()
+        clean_key = str(dedup_key or "").strip()
+        if not clean_key:
+            return ""
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT c.dedup_key
+                FROM memory_dedup_aliases AS a
+                JOIN canonical_memories AS c ON c.id = a.canonical_memory_id
+                WHERE a.alias_key = ? AND c.status IN ('active', 'stale', 'review_pending')
+                LIMIT 1
+                """,
+                (clean_key,),
+            )
+            row = await cursor.fetchone()
+        return str(row[0] or clean_key) if row else clean_key
+
+    async def replace_dedup_identity(
+        self,
+        memory_id: str,
+        *,
+        old_dedup_key: str,
+        new_dedup_key: str,
+        content: str,
+        summary: str,
+        metadata: dict[str, Any],
+        status: str,
+        visibility: str,
+    ) -> int:
+        await self.initialize()
+        old_key = str(old_dedup_key or "").strip()
+        new_key = str(new_dedup_key or "").strip()
+        if not str(memory_id or "").strip() or not new_key:
+            return 0
+        scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        scopes.extend([f"dedup:{old_key}", f"dedup:{new_key}"])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with connect_aiosqlite(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT id FROM canonical_memories
+                    WHERE dedup_key = ? AND id != ?
+                      AND status IN ('active', 'stale', 'review_pending')
+                    LIMIT 1
+                    """,
+                    (new_key, memory_id),
+                )
+                conflict = await cursor.fetchone()
+                if conflict:
+                    conflict_id = str(conflict[0])
+                    await db.execute(
+                        """
+                        UPDATE canonical_memories
+                        SET status = ?, superseded_by = ?, dedup_key = '', update_time = ?
+                        WHERE id = ?
+                        """,
+                        (SUPERSEDED_STATUS, memory_id, self._now(), conflict_id),
+                    )
+                    await self._sync_fts(db, conflict_id, delete_only=True)
+                cursor = await db.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET content = ?, summary = ?, metadata = ?, status = ?, visibility = ?,
+                        dedup_key = ?, update_time = ?, last_access_time = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(content or ""),
+                        str(summary or str(content or "")[:240]),
+                        self._json_dict(metadata),
+                        str(status or ACTIVE_STATUS),
+                        visibility if visibility in {"auto_and_tool", "tool_only", "maintenance_only"} else "auto_and_tool",
+                        new_key,
+                        self._now(),
+                        self._now(),
+                        memory_id,
+                    ),
+                )
+                if old_key and old_key != new_key:
+                    await db.execute(
+                        """
+                        INSERT INTO memory_dedup_aliases(alias_key, canonical_memory_id, created_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(alias_key) DO UPDATE SET
+                            canonical_memory_id = excluded.canonical_memory_id,
+                            created_at = excluded.created_at
+                        """,
+                        (old_key, memory_id, self._now()),
+                    )
+                await db.execute("DELETE FROM memory_dedup_aliases WHERE alias_key = ?", (new_key,))
+                await self._sync_fts(db, memory_id)
+                await db.commit()
+                return cursor.rowcount
 
     async def mark_superseded_by_key(
         self,
@@ -777,6 +991,7 @@ class MemoryV2Store:
         exclude_ids: list[str] | None = None,
         allow_stale: bool = False,
         visibility_mode: str = "",
+        track_access: bool = True,
     ) -> list[MemoryCandidate]:
         await self.initialize()
         query_text = str(query or "").strip()
@@ -833,11 +1048,12 @@ class MemoryV2Store:
                 )
                 rows = await cursor.fetchall()
                 candidates = []
-                for row in rows:
+                normalized_scores = self._normalize_fts_scores(rows)
+                for row, relevance in zip(rows, normalized_scores):
                     candidate = self._row_to_candidate(row)
                     if candidate.id in exclude:
                         continue
-                    candidate.relevance_score = 1.0 / (1.0 + max(0.0, (float(row[20] or 0.0) if len(row) > 20 else 0.0)))
+                    candidate.relevance_score = relevance
                     candidate.metadata = dict(candidate.metadata or {})
                     candidate.metadata["matched_by"] = ["canonical_fts"]
                     candidates.append(candidate)
@@ -878,6 +1094,7 @@ class MemoryV2Store:
 
         candidates.sort(
             key=lambda item: (
+                item.relevance_score,
                 item.relevance_score * DEFAULT_MEMORY_SCORING.search_weight
                 + item.importance * DEFAULT_MEMORY_SCORING.search_importance_weight
                 + item.confidence * DEFAULT_MEMORY_SCORING.search_confidence_weight
@@ -886,25 +1103,32 @@ class MemoryV2Store:
             ),
             reverse=True,
         )
-        selected = candidates[:result_limit]
-        if selected:
-            restore_ids = [
-                item.id
-                for item in selected
-                if allow_stale and item.status == STALE_STATUS and int(getattr(item, "access_count", 0) or 0) > 0
-            ]
-            for memory_id in restore_ids:
-                await self.restore(memory_id, reason="stale_access")
-                if getattr(self, "index_projector", None):
-                    try:
-                        await self.index_projector.project(memory_id)
-                    except Exception:
-                        pass
-            for item in selected:
-                if item.id in restore_ids:
-                    item.status = ACTIVE_STATUS
-            await self.mark_accessed([item.id for item in selected])
+        return_limit = search_limit if candidate_limit is not None else result_limit
+        selected = candidates[:return_limit]
+        if selected and track_access:
+            await self.finalize_access(selected, allow_stale=allow_stale)
         return selected
+
+    async def finalize_access(self, candidates: list[MemoryCandidate], *, allow_stale: bool = False) -> None:
+        selected = [item for item in candidates if str(getattr(item, "id", "") or "").strip()]
+        if not selected:
+            return
+        restore_ids = [
+            item.id
+            for item in selected
+            if allow_stale and item.status == STALE_STATUS and int(getattr(item, "access_count", 0) or 0) > 0
+        ]
+        for memory_id in restore_ids:
+            await self.restore(memory_id, reason="stale_access")
+            if getattr(self, "index_projector", None):
+                try:
+                    await self.index_projector.project(memory_id)
+                except Exception:
+                    pass
+        for item in selected:
+            if item.id in restore_ids:
+                item.status = ACTIVE_STATUS
+        await self.mark_accessed([item.id for item in selected])
 
     async def list_candidates(
         self,
@@ -1628,13 +1852,17 @@ class MemoryV2Store:
             return 0
         await self.initialize()
         imported = 0
+        source_path = str(self.legacy_db_path or self.db_path or "").strip()
+        if not source_path or not os.path.isfile(source_path):
+            await self.record_migration(version, status="failed", detail="legacy documents source unavailable")
+            return 0
         try:
-            async with connect_aiosqlite(self.db_path) as db:
+            async with connect_aiosqlite(source_path) as db:
                 cursor = await db.execute("PRAGMA table_info(documents)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
                 text_col = "page_content" if "page_content" in columns else ("content" if "content" in columns else "text")
                 if text_col not in columns or "metadata" not in columns:
-                    await self.record_migration(version, status="applied", detail="documents table unavailable")
+                    await self.record_migration(version, status="failed", detail="documents table unavailable")
                     return 0
                 cursor = await db.execute(
                     f"SELECT id, {text_col}, metadata FROM documents ORDER BY id DESC LIMIT ?",

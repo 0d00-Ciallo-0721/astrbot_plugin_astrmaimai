@@ -3,6 +3,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -431,6 +432,36 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertEqual(session["buffer"], ["u1", "a1", "u2", "a2"])
         self.assertEqual(session["failures"], 1)
         self.assertGreater(session["cooldown_until"], 0.0)
+
+    def test_memory_turn_pipeline_stop_flushes_below_threshold_buffer(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+        summaries = []
+
+        class _SessionSummarizer:
+            async def summarize_session(self, session_id, chat_history_text, persona_id=None, messages=None):
+                summaries.append((session_id, chat_history_text))
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600))),
+            engine=SimpleNamespace(),
+            session_summarizer=_SessionSummarizer(),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600)),
+        )
+        pipeline._session_history_buffer["short-chat"] = {
+            "buffer": ["用户/旁白：短会话", "Bot：收到"],
+            "last_update": time.time(),
+            "cooldown_until": 0.0,
+            "failures": 0,
+            "last_run_at": 0.0,
+        }
+
+        asyncio.run(pipeline.stop())
+
+        self.assertEqual(summaries, [("short-chat", "用户/旁白：短会话\nBot：收到")])
+        self.assertEqual(pipeline._session_history_buffer["short-chat"]["buffer"], [])
 
     def test_compat_summarizer_still_reexports_chat_history_summarizer(self):
         sys.modules.pop("astrmai.memory.services.summarizer", None)

@@ -460,7 +460,7 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertIs(engine.memory_pipeline.kwargs["observer"], engine.memory_observer)
         self.assertEqual(engine.memory_pipeline.kwargs["event_bus"], "db-events")
 
-    def test_memory_engine_legacy_imports_mark_applied_without_db_service(self):
+    def test_memory_engine_legacy_imports_remain_retryable_without_db_service(self):
         engine = self._memory_engine()
         migrations = []
 
@@ -484,10 +484,7 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         results = asyncio.run(_run_imports())
 
         self.assertEqual(results, [0, 0, 0])
-        self.assertEqual(
-            [item[0] for item in migrations],
-            ["2_memory_event_import", "2_jargon_import", "2_expression_pattern_import"],
-        )
+        self.assertEqual(migrations, [])
         self.assertTrue(all(item[1]["status"] == "applied" for item in migrations))
 
     def test_memory_engine_get_recent_memories_filters_feedback_rows(self):

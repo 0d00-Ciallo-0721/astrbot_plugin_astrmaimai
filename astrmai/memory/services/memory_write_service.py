@@ -22,9 +22,20 @@ class MemoryWriteService:
         r'\[INST\]',
     )
 
-    def __init__(self, store: MemoryV2Store, index_projector=None):
+    def __init__(self, store: MemoryV2Store, index_projector=None, config=None):
         self.store = store
         self.index_projector = index_projector
+        self.config = config
+
+    def refresh_config(self, config) -> None:
+        self.config = config
+
+    def _minimum_confidence(self) -> float:
+        memory_config = getattr(self.config, "memory", None)
+        try:
+            return max(0.0, min(1.0, float(getattr(memory_config, "min_memory_confidence", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
 
     @classmethod
     def _classify_skip_reason(cls, content: str) -> str | None:
@@ -67,6 +78,18 @@ class MemoryWriteService:
                 f"| session_id={str(request.session_id or '')} | content_preview={preview}"
             )
             return ""
+        try:
+            confidence = float(request.confidence if request.confidence is not None else 0.8)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        minimum_confidence = self._minimum_confidence()
+        if minimum_confidence > 0.0 and confidence < minimum_confidence:
+            logger.info(
+                f"[MemoryWriteService] skip write | reason=confidence_below_threshold "
+                f"| confidence={confidence:.3f} | minimum={minimum_confidence:.3f} "
+                f"| kind={str(request.kind or '')} | session_id={str(request.session_id or '')}"
+            )
+            return ""
         dedup_key = str(request.dedup_key or "").strip()
         if not dedup_key:
             digest = hashlib.sha256(
@@ -83,7 +106,7 @@ class MemoryWriteService:
             summary=str(request.summary or ""),
             tags=list(request.tags or []),
             importance=float(request.importance or 0.5),
-            confidence=float(request.confidence or 0.8),
+            confidence=confidence,
             metadata=dict(request.metadata or {}),
             dedup_key=dedup_key,
             source_ref=str(request.source_ref or ""),

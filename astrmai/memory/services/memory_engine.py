@@ -105,6 +105,12 @@ class MemoryEngine:
         self.config = config
         if getattr(self, "injection_service", None) is not None:
             self.injection_service.refresh_config(config)
+        if getattr(self, "retrieval_service", None) is not None:
+            self.retrieval_service.refresh_config(config)
+        if getattr(self, "write_service", None) is not None:
+            self.write_service.refresh_config(config)
+        if getattr(self, "retriever", None) is not None and hasattr(self.retriever, "refresh_config"):
+            self.retriever.refresh_config(config)
         self.embedding_models = self._configured_embedding_models(config)
         if self.embedding_models != old_embedding_models:
             self.faiss_db = None
@@ -195,7 +201,7 @@ class MemoryEngine:
         await self.v2_store.initialize()
         self.index_projector = MemoryIndexProjector(self)
         self.v2_store.index_projector = self.index_projector
-        self.write_service = MemoryWriteService(self.v2_store, self.index_projector)
+        self.write_service = MemoryWriteService(self.v2_store, self.index_projector, self.config)
         self.retrieval_service = MemoryRetrievalService(self.v2_store, engine=self)
         self.expression_pattern_service = ExpressionPatternService(self.v2_store, self.write_service)
         self.injection_service = MemoryInjectionService(self.retrieval_service, config=self.config)
@@ -679,54 +685,69 @@ class MemoryEngine:
             return 0
         db_service = getattr(self, "db_service", None)
         if not db_service or not hasattr(db_service, "get_session"):
-            await self.v2_store.record_migration(version, status="applied", detail="db service unavailable")
+            logger.warning("[MemoryV2] MemoryEvent import deferred: db service unavailable")
             return 0
         imported = 0
+        page_size = max(int(limit or 1000), 1)
         try:
             from ...infrastructure.persistence import MemoryEvent
             from sqlmodel import desc, select
 
-            def _load_events():
+            def _load_events(offset: int):
                 with db_service.get_session() as session:
-                    statement = select(MemoryEvent).order_by(desc(MemoryEvent.created_at)).limit(limit)
+                    statement = (
+                        select(MemoryEvent)
+                        .order_by(desc(MemoryEvent.created_at))
+                        .offset(offset)
+                        .limit(page_size)
+                    )
                     return [MemoryEvent.model_validate(item.model_dump()) for item in session.exec(statement).all()]
 
-            events = await asyncio.to_thread(_load_events)
-            for event in events:
-                content = str(getattr(event, "narrative", "") or "").strip()
-                if not content:
-                    continue
-                tags = []
-                try:
-                    parsed_tags = json.loads(getattr(event, "tags", "") or "[]")
-                    if isinstance(parsed_tags, list):
-                        tags = [str(item) for item in parsed_tags]
-                except Exception:
-                    logger.debug("[MemoryEngine] legacy memory event tags parse failed", exc_info=True)
+            offset = 0
+            while True:
+                events = await asyncio.to_thread(_load_events, offset)
+                for event in events:
+                    content = str(getattr(event, "narrative", "") or "").strip()
+                    if not content:
+                        continue
+                    dedup_key = f"memory_event:{getattr(event, 'event_id', '')}"
+                    existing = await self.v2_store.get_by_dedup_key(dedup_key, include_inactive=True)
+                    if existing is not None:
+                        continue
                     tags = []
-                metadata = {
-                    "legacy_event_id": getattr(event, "event_id", ""),
-                    "emotion": getattr(event, "emotion", ""),
-                    "reflection": getattr(event, "reflection", ""),
-                    "memory_kind": getattr(event, "memory_kind", ""),
-                    "source_layer": getattr(event, "source_layer", ""),
-                }
-                await self.write_service.write(
-                    MemoryWriteRequest(
-                        source="memory_event",
-                        kind=str(getattr(event, "memory_kind", "") or "event"),
-                        session_id=str(getattr(event, "session_id", "") or getattr(event, "date", "") or ""),
-                        content=content,
-                        summary=content[:240],
-                        tags=tags,
-                        importance=max(0.1, min(1.0, float(getattr(event, "importance", 5) or 5) / 10.0)),
-                        confidence=0.75,
-                        metadata=metadata,
-                        dedup_key=f"memory_event:{getattr(event, 'event_id', '')}",
-                        source_ref=f"MemoryEvent:{getattr(event, 'event_id', '')}",
+                    try:
+                        parsed_tags = json.loads(getattr(event, "tags", "") or "[]")
+                        if isinstance(parsed_tags, list):
+                            tags = [str(item) for item in parsed_tags]
+                    except Exception:
+                        logger.debug("[MemoryEngine] legacy memory event tags parse failed", exc_info=True)
+                        tags = []
+                    metadata = {
+                        "legacy_event_id": getattr(event, "event_id", ""),
+                        "emotion": getattr(event, "emotion", ""),
+                        "reflection": getattr(event, "reflection", ""),
+                        "memory_kind": getattr(event, "memory_kind", ""),
+                        "source_layer": getattr(event, "source_layer", ""),
+                    }
+                    memory_id = await self.write_service.write(
+                        MemoryWriteRequest(
+                            source="memory_event",
+                            kind=str(getattr(event, "memory_kind", "") or "event"),
+                            session_id=str(getattr(event, "session_id", "") or getattr(event, "date", "") or ""),
+                            content=content,
+                            summary=content[:240],
+                            tags=tags,
+                            importance=max(0.1, min(1.0, float(getattr(event, "importance", 5) or 5) / 10.0)),
+                            confidence=0.75,
+                            metadata=metadata,
+                            dedup_key=dedup_key,
+                            source_ref=f"MemoryEvent:{getattr(event, 'event_id', '')}",
+                        )
                     )
-                )
-                imported += 1
+                    imported += int(bool(memory_id))
+                offset += len(events)
+                if len(events) < page_size:
+                    break
             await self.v2_store.record_migration(version, status="applied", detail=f"imported={imported}")
         except Exception as exc:
             await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
@@ -739,49 +760,59 @@ class MemoryEngine:
             return 0
         db_service = getattr(self, "db_service", None)
         if not db_service or not hasattr(db_service, "get_session"):
-            await self.v2_store.record_migration(version, status="applied", detail="db service unavailable")
+            logger.warning("[MemoryV2] Jargon import deferred: db service unavailable")
             return 0
         imported = 0
+        page_size = max(int(limit or 1000), 1)
         try:
             from ...infrastructure.persistence import Jargon
             from sqlmodel import desc, select
 
-            def _load_jargons():
+            def _load_jargons(offset: int):
                 with db_service.get_session() as session:
-                    statement = select(Jargon).order_by(desc(Jargon.updated_at)).limit(limit)
+                    statement = select(Jargon).order_by(desc(Jargon.updated_at)).offset(offset).limit(page_size)
                     return [Jargon.model_validate(item.model_dump()) for item in session.exec(statement).all()]
 
-            rows = await asyncio.to_thread(_load_jargons)
-            for item in rows:
-                content = str(getattr(item, "content", "") or "").strip()
-                if not content:
-                    continue
-                meaning = str(getattr(item, "meaning", "") or "").strip()
-                group_id = str(getattr(item, "group_id", "") or "GLOBAL")
-                status = "active" if bool(getattr(item, "is_jargon", False)) and bool(getattr(item, "is_complete", False)) and meaning else "review_pending"
-                await self.write_service.write(
-                    MemoryWriteRequest(
-                        source="legacy_jargon",
-                        kind="jargon",
-                        session_id=group_id,
-                        content=content,
-                        summary=meaning or content,
-                        importance=0.65,
-                        confidence=0.75 if status == "active" else 0.55,
-                        metadata={
-                            "legacy_jargon_id": getattr(item, "id", None),
-                            "raw_content": str(getattr(item, "raw_content", "") or content),
-                            "meaning": meaning,
-                            "count": int(getattr(item, "count", 1) or 1),
-                            "review_status": status,
-                        },
-                        dedup_key=f"jargon:{group_id}:{content.lower()}",
-                        source_ref=f"Jargon:{getattr(item, 'id', '')}",
-                        visibility="auto_and_tool" if status == "active" else "maintenance_only",
-                        status=status,
+            offset = 0
+            while True:
+                rows = await asyncio.to_thread(_load_jargons, offset)
+                for item in rows:
+                    content = str(getattr(item, "content", "") or "").strip()
+                    if not content:
+                        continue
+                    meaning = str(getattr(item, "meaning", "") or "").strip()
+                    group_id = str(getattr(item, "group_id", "") or "GLOBAL")
+                    dedup_key = f"jargon:{group_id}:{content.lower()}"
+                    existing = await self.v2_store.get_by_dedup_key(dedup_key, include_inactive=True)
+                    if existing is not None:
+                        continue
+                    status = "active" if bool(getattr(item, "is_jargon", False)) and bool(getattr(item, "is_complete", False)) and meaning else "review_pending"
+                    memory_id = await self.write_service.write(
+                        MemoryWriteRequest(
+                            source="legacy_jargon",
+                            kind="jargon",
+                            session_id=group_id,
+                            content=content,
+                            summary=meaning or content,
+                            importance=0.65,
+                            confidence=0.75 if status == "active" else 0.55,
+                            metadata={
+                                "legacy_jargon_id": getattr(item, "id", None),
+                                "raw_content": str(getattr(item, "raw_content", "") or content),
+                                "meaning": meaning,
+                                "count": int(getattr(item, "count", 1) or 1),
+                                "review_status": status,
+                            },
+                            dedup_key=dedup_key,
+                            source_ref=f"Jargon:{getattr(item, 'id', '')}",
+                            visibility="auto_and_tool" if status == "active" else "maintenance_only",
+                            status=status,
+                        )
                     )
-                )
-                imported += 1
+                    imported += int(bool(memory_id))
+                offset += len(rows)
+                if len(rows) < page_size:
+                    break
             await self.v2_store.record_migration(version, status="applied", detail=f"imported={imported}")
         except Exception as exc:
             await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
@@ -795,45 +826,62 @@ class MemoryEngine:
         db_service = getattr(self, "db_service", None)
         service = getattr(self, "expression_pattern_service", None)
         if not db_service or not hasattr(db_service, "get_session") or service is None:
-            await self.v2_store.record_migration(version, status="applied", detail="db service unavailable")
+            logger.warning("[MemoryV2] ExpressionPattern import deferred: dependency unavailable")
             return 0
         imported = 0
+        page_size = max(int(limit or 1000), 1)
         try:
             from ...infrastructure.persistence import ExpressionPattern
             from sqlmodel import desc, select
 
-            def _load_patterns():
+            def _load_patterns(offset: int):
                 with db_service.get_session() as session:
-                    statement = select(ExpressionPattern).order_by(desc(ExpressionPattern.last_active_time)).limit(limit)
+                    statement = (
+                        select(ExpressionPattern)
+                        .order_by(desc(ExpressionPattern.last_active_time))
+                        .offset(offset)
+                        .limit(page_size)
+                    )
                     return [ExpressionPattern.model_validate(item.model_dump()) for item in session.exec(statement).all()]
 
-            rows = await asyncio.to_thread(_load_patterns)
-            for item in rows:
-                expression = str(getattr(item, "expression", "") or "").strip()
-                situation = str(getattr(item, "situation", "") or "").strip()
-                if not expression or not situation:
-                    continue
-                await service.write_pattern(
-                    str(getattr(item, "group_id", "") or ""),
-                    {
-                        "expression": expression,
-                        "situation": situation,
-                        "style": str(getattr(item, "style", "") or ""),
-                        "content_samples": json.loads(getattr(item, "content_list", "[]") or "[]"),
-                        "count": int(getattr(item, "count", 1) or 1),
-                        "think_level": int(getattr(item, "think_level", 0) or 0),
-                        "review_status": str(getattr(item, "review_status", "pending") or "pending"),
-                        "review_reason": str(getattr(item, "review_reason", "") or ""),
-                        "review_suggestion": str(getattr(item, "review_suggestion", "") or ""),
-                        "weight": float(getattr(item, "weight", 1.0) or 1.0),
-                        "shared_scope": str(getattr(item, "shared_scope", "") or ""),
-                        "legacy_pattern_id": getattr(item, "id", None),
-                        "source_ref": f"ExpressionPattern:{getattr(item, 'id', '')}",
-                        "summary": expression,
-                    },
-                    source="legacy_expression_pattern",
-                )
-                imported += 1
+            offset = 0
+            while True:
+                rows = await asyncio.to_thread(_load_patterns, offset)
+                for item in rows:
+                    expression = str(getattr(item, "expression", "") or "").strip()
+                    situation = str(getattr(item, "situation", "") or "").strip()
+                    if not expression or not situation:
+                        continue
+                    group_id = str(getattr(item, "group_id", "") or "")
+                    shared_scope = str(getattr(item, "shared_scope", "") or "")
+                    dedup_key = service.build_dedup_key(group_id, situation, expression, shared_scope)
+                    existing = await self.v2_store.get_by_dedup_key(dedup_key, include_inactive=True)
+                    if existing is not None:
+                        continue
+                    memory_id = await service.write_pattern(
+                        group_id,
+                        {
+                            "expression": expression,
+                            "situation": situation,
+                            "style": str(getattr(item, "style", "") or ""),
+                            "content_samples": json.loads(getattr(item, "content_list", "[]") or "[]"),
+                            "count": int(getattr(item, "count", 1) or 1),
+                            "think_level": int(getattr(item, "think_level", 0) or 0),
+                            "review_status": str(getattr(item, "review_status", "pending") or "pending"),
+                            "review_reason": str(getattr(item, "review_reason", "") or ""),
+                            "review_suggestion": str(getattr(item, "review_suggestion", "") or ""),
+                            "weight": float(getattr(item, "weight", 1.0) or 1.0),
+                            "shared_scope": shared_scope,
+                            "legacy_pattern_id": getattr(item, "id", None),
+                            "source_ref": f"ExpressionPattern:{getattr(item, 'id', '')}",
+                            "summary": expression,
+                        },
+                        source="legacy_expression_pattern",
+                    )
+                    imported += int(bool(memory_id))
+                offset += len(rows)
+                if len(rows) < page_size:
+                    break
             await self.v2_store.record_migration(version, status="applied", detail=f"imported={imported}")
         except Exception as exc:
             await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])

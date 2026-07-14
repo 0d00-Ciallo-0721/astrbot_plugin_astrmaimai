@@ -157,7 +157,7 @@ class DecayServiceMigratedTests(unittest.TestCase):
         self.assertAlmostEqual(positive.social_score, 0.0)
         self.assertAlmostEqual(negative.social_score, 0.0)
 
-    def test_memory_decay_failure_is_not_retried_again_on_same_day(self):
+    def test_memory_decay_failure_is_retried_and_success_is_throttled(self):
         class _StateEngine:
             def get_active_states(self):
                 return []
@@ -168,12 +168,18 @@ class DecayServiceMigratedTests(unittest.TestCase):
         class _MemoryEngine:
             def __init__(self):
                 self.calls = 0
+                self.rates = []
 
-            async def apply_daily_decay(self):
+            async def apply_daily_decay(self, decay_rate):
                 self.calls += 1
-                raise RuntimeError("boom")
+                self.rates.append(decay_rate)
+                if self.calls == 1:
+                    raise RuntimeError("boom")
 
-        config = SimpleNamespace(evolution=SimpleNamespace(enable_relationship_engine=False))
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(enable_relationship_engine=False),
+            memory=SimpleNamespace(time_decay_rate=0.03),
+        )
         memory_engine = _MemoryEngine()
         service = DecayService(_StateEngine(), memory_engine, config)
 
@@ -183,7 +189,8 @@ class DecayServiceMigratedTests(unittest.TestCase):
 
         asyncio.run(_run())
 
-        self.assertEqual(memory_engine.calls, 1)
+        self.assertEqual(memory_engine.calls, 2)
+        self.assertEqual(memory_engine.rates, [0.03, 0.03])
 
 
 if __name__ == "__main__":

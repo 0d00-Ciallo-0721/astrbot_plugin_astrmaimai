@@ -230,6 +230,13 @@ class PluginLifecycleManager:
             logger.warning(f"[AstrMai] Expression governance shutdown degraded: {exc}")
 
         try:
+            persona_summarizer = getattr(self.runtime, "persona_summarizer", None)
+            if persona_summarizer and hasattr(persona_summarizer, "stop"):
+                await persona_summarizer.stop()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Persona summarizer shutdown degraded: {exc}")
+
+        try:
             if self.runtime.cron_guard:
                 self.runtime.cron_guard.stop()
         except Exception as exc:

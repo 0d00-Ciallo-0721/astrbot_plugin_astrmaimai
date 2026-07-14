@@ -55,8 +55,9 @@ class MemoryTurnPipeline:
         await self._observe_global("memory_pipeline", "pipeline_started", summary="Memory pipeline started")
 
     async def stop(self) -> None:
-        self._running = False
         self.event_bus.unsubscribe(self.event_bus.TOPIC_MEMORY_TURN_COMMITTED, self.on_turn_committed)
+        await self.flush_pending_sessions()
+        self._running = False
         tasks = [task for task in [self._sweep_task, *self._worker_tasks.values()] if task is not None]
         for task in tasks:
             if not task.done():
@@ -68,6 +69,21 @@ class MemoryTurnPipeline:
         self._background_tasks.clear()
         self._sweep_task = None
         await self._observe_global("memory_pipeline", "pipeline_stopped", level="warning", summary="Memory pipeline stopped")
+
+    async def flush_pending_sessions(self) -> dict[str, dict[str, Any]]:
+        chat_ids = [
+            str(chat_id)
+            for chat_id, session_data in list(self._session_history_buffer.items())
+            if list((session_data or {}).get("buffer", []) or [])
+        ]
+        results: dict[str, dict[str, Any]] = {}
+        for chat_id in chat_ids:
+            try:
+                results[chat_id] = await self.run_maintenance_for_session(chat_id, force=True)
+            except Exception as exc:
+                logger.warning(f"[MemoryTurnPipeline] shutdown flush degraded for {chat_id}: {exc}")
+                results[chat_id] = {"performed": False, "reason": "flush_failed", "error": str(exc)}
+        return results
 
     def build_turn(
         self,
@@ -218,7 +234,7 @@ class MemoryTurnPipeline:
         task = self._worker_tasks.get(str(chat_id or ""))
         return bool(task is not None and not task.done())
 
-    async def run_maintenance_for_session(self, chat_id: str) -> dict[str, Any]:
+    async def run_maintenance_for_session(self, chat_id: str, *, force: bool = False) -> dict[str, Any]:
         threshold = int(getattr(getattr(self.config, "memory", None), "summary_threshold", 30) or 30)
         now = time.time()
         lock = self._get_memory_lock(chat_id)
@@ -232,10 +248,10 @@ class MemoryTurnPipeline:
             last_update = float(session_data.get("last_update", 0.0) or 0.0)
             if not buffer:
                 return {"performed": False, "reason": "no_buffer", "pending_messages": 0}
-            if now < cooldown_until:
+            if now < cooldown_until and not force:
                 return {"performed": False, "reason": "cooldown", "pending_messages": len(buffer), "cooldown_until": cooldown_until}
             force_due = last_update > 0 and (now - last_update) >= self.TURN_FORCE_SUMMARIZE_AFTER_SECONDS
-            if len(buffer) < threshold * 2 and not force_due:
+            if len(buffer) < threshold * 2 and not force_due and not force:
                 await self._observe_chat(
                     chat_id,
                     "memory_pipeline",

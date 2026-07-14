@@ -23,6 +23,7 @@ from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.persistence.database_service import DatabaseService
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.memory_query import MemoryQuery
+from .fact_contract import format_dream_fact_log, normalize_dream_facts
 
 
 class DreamAgent:
@@ -40,7 +41,10 @@ class DreamAgent:
         "delete_memory": "删除噪声或过时记忆，参数: {event_id: str, reason: str}",
         "search_jargon": "读取当前会话相关黑话词条，参数: {query: str='', limit: int=5}",
         "suggest_jargon_review": "提出黑话治理建议（只读，不直接修改词库），参数: {words: [str], reason: str}",
-        "finish_dream": "结束本次整理循环，参数: {summary: str}",
+        "finish_dream": (
+            "结束本次整理循环，参数: {summary: str, detected_facts: [{subject_id: str, entity: str, "
+            "attribute: str, value: str, confidence_score: float, confidence_signal: str, evidence: dict}]}"
+        ),
     }
 
     def __init__(
@@ -126,6 +130,8 @@ class DreamAgent:
             logger.debug(f"[DreamAgent] tool={tool_name} observation={observation[:80]}")
 
             if tool_name == "finish_dream":
+                for fact in normalize_dream_facts(params.get("detected_facts", [])):
+                    dream_log.append(format_dream_fact_log(fact))
                 summary = params.get("summary", "整理完成")
                 dream_log.append(f"[结束] {summary}")
                 break

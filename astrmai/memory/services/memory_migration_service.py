@@ -33,6 +33,9 @@ class MemoryMigrationService:
         self.engine = engine
         self._latest_report: dict[str, Any] = {}
 
+    def _legacy_db_path(self) -> str:
+        return str(getattr(self.store, "legacy_db_path", None) or self.store.db_path)
+
     async def dry_run(self, import_sources: list[str] | None = None) -> dict[str, Any]:
         await self.store.initialize()
         sources = self._sources(import_sources)
@@ -78,6 +81,8 @@ class MemoryMigrationService:
         try:
             if "documents" in sources:
                 report["imported"]["documents"] = await self.store.import_legacy_documents()
+                if not await self.store.migration_applied("2_legacy_documents_import"):
+                    report["errors"].append("legacy documents source traversal did not complete")
             if "persona_cache" in sources:
                 report["imported"]["persona_cache"] = await self.store.import_persona_cache()
             if "memory_events" in sources:
@@ -89,7 +94,12 @@ class MemoryMigrationService:
             if self.index_projector:
                 report["rebuilt_projection"] = await self.index_projector.rebuild_all()
             report["verification"] = await self.verify()
-            await self.store.record_migration("2_final_execute", status="applied", detail=json.dumps(report["imported"], ensure_ascii=False))
+            final_status = "failed" if report["errors"] else "applied"
+            await self.store.record_migration(
+                "2_final_execute",
+                status=final_status,
+                detail=json.dumps(report["imported"], ensure_ascii=False),
+            )
         except Exception as exc:
             report["errors"].append(str(exc))
             await self.store.record_migration("2_final_execute", status="failed", detail=str(exc)[:500])
@@ -173,7 +183,7 @@ class MemoryMigrationService:
     async def _scan_documents(self) -> dict[str, Any]:
         result = {"total": 0, "importable": 0, "duplicates": 0, "skipped": 0, "skip_reasons": {}}
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 cursor = await db.execute("PRAGMA table_info(documents)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
                 text_col = "page_content" if "page_content" in columns else ("content" if "content" in columns else "text")
@@ -204,7 +214,7 @@ class MemoryMigrationService:
     async def _scan_memory_events(self) -> dict[str, Any]:
         result = {"total": 0, "importable": 0, "duplicates": 0, "skipped": 0, "skip_reasons": {}}
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 cursor = await db.execute("PRAGMA table_info(MemoryEvent)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
                 if not columns:
@@ -263,7 +273,7 @@ class MemoryMigrationService:
     async def _scan_jargons(self) -> dict[str, Any]:
         result = {"total": 0, "importable": 0, "duplicates": 0, "skipped": 0, "skip_reasons": {}}
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("PRAGMA table_info(Jargon)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
@@ -291,7 +301,7 @@ class MemoryMigrationService:
     async def _scan_expression_patterns(self) -> dict[str, Any]:
         result = {"total": 0, "importable": 0, "duplicates": 0, "skipped": 0, "skip_reasons": {}}
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("PRAGMA table_info(ExpressionPattern)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
@@ -325,7 +335,7 @@ class MemoryMigrationService:
             return 0
         imported = 0
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("PRAGMA table_info(MemoryEvent)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
@@ -480,7 +490,7 @@ class MemoryMigrationService:
             return 0
         imported = 0
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("PRAGMA table_info(Jargon)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
@@ -537,7 +547,7 @@ class MemoryMigrationService:
             return 0
         imported = 0
         try:
-            async with aiosqlite.connect(self.store.db_path) as db:
+            async with aiosqlite.connect(self._legacy_db_path()) as db:
                 db.row_factory = aiosqlite.Row
                 cursor = await db.execute("PRAGMA table_info(ExpressionPattern)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}

@@ -264,8 +264,13 @@ class ExpressionPatternService:
         expression = str(current.expression or "")
         situation = str(current.situation or "")
         shared_scope = str(current.shared_scope or "")
+        old_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope)
+        replacement_applied = False
         if replacement_expression and apply_replacement:
-            expression = str(replacement_expression or "").strip() or expression
+            replacement = str(replacement_expression or "").strip()
+            if replacement and replacement != expression:
+                expression = replacement
+                replacement_applied = True
         if style is not None:
             metadata["style"] = str(style or "").strip()
         if modified_by is not None:
@@ -295,14 +300,43 @@ class ExpressionPatternService:
         status = self._canonical_status(next_review_status)
         visibility = self._visibility_for_status(status)
         metadata["content_samples"] = self._sample_list(metadata.get("content_samples") or current.content_list)
-        updated = await self.store.update_memory(
-            str(pattern_id),
-            content=expression,
-            summary=str(metadata.get("summary") or expression[:240]),
-            metadata=metadata,
-            status=status,
-            visibility=visibility,
-        )
+        summary = str(metadata.get("summary") or expression[:240])
+        if replacement_applied:
+            new_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope)
+            conflict = await self.store.get_by_dedup_key(new_dedup_key, include_inactive=True)
+            if conflict and str(conflict.id) != str(pattern_id):
+                conflict_metadata = dict(conflict.metadata or {})
+                metadata["content_samples"] = self._sample_list(
+                    [
+                        *self._sample_list(metadata.get("content_samples", [])),
+                        *self._sample_list(conflict_metadata.get("content_samples", [])),
+                    ]
+                )
+                metadata["count"] = int(metadata.get("count") or 0) + int(conflict_metadata.get("count") or 0)
+                metadata["weight"] = max(
+                    self._safe_float(metadata.get("weight"), 1.0),
+                    self._safe_float(conflict_metadata.get("weight"), 1.0),
+                )
+            metadata["summary"] = expression
+            updated = await self.store.replace_dedup_identity(
+                str(pattern_id),
+                old_dedup_key=old_dedup_key,
+                new_dedup_key=new_dedup_key,
+                content=expression,
+                summary=expression,
+                metadata=metadata,
+                status=status,
+                visibility=visibility,
+            )
+        else:
+            updated = await self.store.update_memory(
+                str(pattern_id),
+                content=expression,
+                summary=summary,
+                metadata=metadata,
+                status=status,
+                visibility=visibility,
+            )
         if not updated:
             return None
         return await self.get_pattern(pattern_id)
@@ -337,6 +371,11 @@ class ExpressionPatternService:
         shared_scope = str(payload.get("shared_scope") or group_id or "").strip()
         dedup_key = self.build_dedup_key(group_id, situation, expression, shared_scope)
         existing = await self.store.get_by_dedup_key(dedup_key, include_inactive=True)
+        resolver = getattr(self.store, "resolve_dedup_key", None)
+        resolved_dedup_key = await resolver(dedup_key) if callable(resolver) else dedup_key
+        if existing and resolved_dedup_key != dedup_key:
+            expression = str(existing.content or expression)
+            dedup_key = resolved_dedup_key
         incoming_samples = self._sample_list(payload.get("content_samples", []))
         now = time.time()
         existing_metadata = dict(existing.metadata or {}) if existing else {}

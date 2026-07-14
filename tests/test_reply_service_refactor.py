@@ -148,6 +148,31 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             instant_gate=SimpleNamespace(process_committed_turn=lambda turn: asyncio.sleep(0, result=SimpleNamespace(hit=False, memory_id=""))),
         )
 
+    def test_memory_turn_ingest_passes_real_group_sender_id(self):
+        captured = {}
+
+        class _Pipeline:
+            def build_turn(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(**kwargs, instant_gate_hit=False, instant_memory_id="")
+
+            async def record_turn(self, _turn):
+                return {"performed": False}
+
+        service = self._service()
+        service.memory_engine = SimpleNamespace(
+            memory_pipeline=_Pipeline(),
+            instant_gate=SimpleNamespace(),
+        )
+        event = SimpleNamespace(
+            get_sender_id=lambda: "group-user-42",
+            get_extra=lambda _key, default=None: default,
+        )
+
+        asyncio.run(service._ingest_memory_turn(event, "group-1", "我叫甲", "记住了"))
+
+        self.assertEqual(captured["sender_id"], "group-user-42")
+
     def test_stale_reply_is_still_skipped(self):
         state_engine = FakeStateEngine()
         base_ts = time.time() - 12.0

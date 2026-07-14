@@ -116,6 +116,7 @@ class ReplyPostSendMixin:
                 chat_id=chat_id,
                 user_text=user_text,
                 assistant_text=assistant_text,
+                sender_id=str(event.get_sender_id() or "").strip() if hasattr(event, "get_sender_id") else "",
                 source="reply_service.post_send",
                 is_proactive=bool(event.get_extra("astrmai_is_proactive_event", False)),
                 think_level=self._resolve_memory_turn_think_level(event),

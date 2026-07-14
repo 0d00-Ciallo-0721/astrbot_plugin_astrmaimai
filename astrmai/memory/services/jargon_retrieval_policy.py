@@ -115,8 +115,6 @@ class JargonRetrievalPolicy:
             ranked.append((score, candidate))
         ranked.sort(key=lambda item: item[0], reverse=True)
         selected = [candidate for _, candidate in ranked[: max(int(top_k or 3), 1)]]
-        if selected:
-            await self.store.mark_accessed([item.id for item in selected])
         if trace is not None:
             trace.setdefault("matched_terms", list(terms))
             trace.setdefault("top_k_scores", [

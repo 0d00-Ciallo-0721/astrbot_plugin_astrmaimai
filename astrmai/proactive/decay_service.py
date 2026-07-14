@@ -60,11 +60,14 @@ class DecayService:
             return
         if now - self._last_memory_decay < 86400:
             return
-        self._last_memory_decay = now
+        memory_config = getattr(self.config, "memory", None)
+        decay_rate = float(getattr(memory_config, "time_decay_rate", 0.01) or 0.0)
         try:
-            await self.memory_engine.apply_daily_decay()
+            await self.memory_engine.apply_daily_decay(decay_rate=decay_rate)
         except Exception as exc:
             logger.debug(f"[Life] memory daily decay degraded: {exc}")
+        else:
+            self._last_memory_decay = now
 
 
 __all__ = ["DecayService"]

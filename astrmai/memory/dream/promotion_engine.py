@@ -6,6 +6,7 @@ from typing import Any
 
 from ..contracts.memory_query import MemoryWriteRequest
 from ..services.memory_claim_service import MemoryClaim, MemoryConflictResolver
+from .fact_contract import normalize_dream_facts
 
 
 class MemoryPromotionEngine:
@@ -53,9 +54,7 @@ class MemoryPromotionEngine:
             yield (subject_id, entity, attribute, value), evidence
 
     def _iter_detected_facts(self, maintenance_result: dict[str, Any]):
-        for item in list((maintenance_result or {}).get("detected_facts", []) or []):
-            if not isinstance(item, dict):
-                continue
+        for item in normalize_dream_facts((maintenance_result or {}).get("detected_facts", [])):
             subject_id = str(item.get("subject_id") or item.get("sender_id") or item.get("session_id") or "").strip()
             entity = str(item.get("entity") or "").strip()
             attribute = str(item.get("attribute") or "").strip()

@@ -91,8 +91,6 @@ class ExpressionPatternRetrievalPolicy:
             reverse=True,
         )
         selected = candidates[: max(int(top_k or 5), 1)]
-        if selected:
-            await self.store.mark_accessed([item.id for item in selected])
         return selected
 
 

@@ -9,6 +9,7 @@ from ...infrastructure.context_economy import PromptTemplateId
 from ...infrastructure.persistence.persistence_manager import PersistenceManager
 from ...infrastructure.gateway.model_gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...shared.helpers.plugin_helpers import safe_create_task
 
 class PersonaSummarizer:
     """
@@ -24,6 +25,9 @@ class PersonaSummarizer:
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁
         self.pending_tasks: Dict[str, asyncio.Task] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+        self._cache_generations: Dict[str, int] = {}
+        self._closed = False
         self._lock = asyncio.Lock()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
 
@@ -38,6 +42,63 @@ class PersonaSummarizer:
                 logger.error(f"[PersonaSummarizer] 后台切片任务异常: {exc}", exc_info=exc)
         except asyncio.CancelledError:
             pass
+
+    def _generation_is_current(self, cache_key: str, generation: int) -> bool:
+        return not self._closed and self._cache_generations.get(cache_key, 0) == generation
+
+    def _start_shard_task(self, original_prompt: str, cache_key: str) -> asyncio.Task | None:
+        if self._closed:
+            return None
+        generation = self._cache_generations.setdefault(cache_key, 0)
+        task = safe_create_task(
+            self._generate_all_shards_background(original_prompt, cache_key),
+            name=f"persona-shards:{cache_key}",
+            track_set=self._background_tasks,
+        )
+        setattr(task, "_astrmai_persona_generation", generation)
+        task.add_done_callback(self._handle_background_task_result)
+        self.pending_tasks[cache_key] = task
+        return task
+
+    async def _invalidate_if_prompt_changed(self, cache_key: str, original_prompt: str) -> bool:
+        expected_hash = self._compute_hash(original_prompt)
+        stale_task = None
+        async with self._lock:
+            cached = self.cache.get(cache_key)
+            if not isinstance(cached, dict):
+                return False
+            cached_raw = str(cached.get("raw", "") or "")
+            cached_hash = str(cached.get("raw_hash", "") or "") or self._compute_hash(cached_raw)
+            if cached_hash == expected_hash:
+                if not cached.get("raw_hash"):
+                    cached["raw_hash"] = expected_hash
+                return False
+            self._cache_generations[cache_key] = self._cache_generations.get(cache_key, 0) + 1
+            self.cache.pop(cache_key, None)
+            stale_task = self.pending_tasks.pop(cache_key, None)
+        if stale_task and not stale_task.done():
+            stale_task.cancel()
+            await asyncio.gather(stale_task, return_exceptions=True)
+        memory_engine = getattr(self, "memory_engine", None)
+        if memory_engine and hasattr(memory_engine, "clear_persona_lore"):
+            try:
+                await memory_engine.clear_persona_lore(cache_key)
+            except Exception as exc:
+                logger.warning(f"[PersonaSummarizer] self-lore invalidation degraded [{cache_key}]: {exc}")
+        return True
+
+    async def stop(self) -> None:
+        self._closed = True
+        for cache_key in list(self._cache_generations):
+            self._cache_generations[cache_key] += 1
+        tasks = list({*self._background_tasks, *self.pending_tasks.values()})
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.pending_tasks.clear()
+        self._background_tasks.clear()
 
     def _compute_hash(self, text: str) -> str:
         """计算人设内容的 Hash 值，用于缓存 Key"""
@@ -108,6 +169,8 @@ class PersonaSummarizer:
         )
 
     async def _persist_cache(self) -> None:
+        if self._closed:
+            return
         if hasattr(self.persistence, "save_persona_cache_async"):
             await self.persistence.save_persona_cache_async(self.cache)
         else:
@@ -190,6 +253,20 @@ Rules:
         else:
             cache_key = f"session_{session_id}"
 
+        if self._closed:
+            return {
+                "summary": original_prompt,
+                "first_person_rewrite": original_prompt,
+                "style": "保持原始风格",
+                "shards": {},
+                "is_full_ready": True,
+                "raw": original_prompt,
+                "raw_hash": self._compute_hash(original_prompt),
+                "timestamp": time.time(),
+            }
+
+        await self._invalidate_if_prompt_changed(cache_key, original_prompt)
+
         # ==========================================
         # 🟢 [核心修复] 2. 查缓存与自愈机制 (Fast Path & Self-Healing)
         # ==========================================
@@ -204,9 +281,7 @@ Rules:
                 logger.warning(f"[PersonaSummarizer] ⚠️ 发现 [{cache_key}] 的切片处于中断死锁状态，正在触发自愈机制，重新拉起后台提取任务！")
                 # 从残缺缓存中提取原始长文本，重新拉起后台任务
                 raw_text = cached_data.get("raw", original_prompt)
-                task = asyncio.create_task(self._generate_all_shards_background(raw_text, cache_key))
-                task.add_done_callback(self._handle_background_task_result)
-                self.pending_tasks[cache_key] = task
+                self._start_shard_task(raw_text, cache_key)
 
             if not str(cached_data.get("first_person_rewrite", "") or "").strip():
                 rewritten = await self._build_first_person_rewrite(
@@ -258,6 +333,7 @@ Rules:
                 "timestamp": time.time()
             }
             self.cache[cache_key] = new_cache_data
+            self._cache_generations.setdefault(cache_key, 0)
             
             # 第一次保存到 JSON
             await self._persist_cache()
@@ -281,19 +357,31 @@ Rules:
             # ==========================================
             # 🟢 阶段三：抛出后台任务生成 8 大维度
             # ==========================================
-            task = asyncio.create_task(self._generate_all_shards_background(original_prompt, cache_key))
-            task.add_done_callback(self._handle_background_task_result)
-            self.pending_tasks[cache_key] = task
+            self._start_shard_task(original_prompt, cache_key)
             
             return new_cache_data
 
 # [新增] 核心后台调度器：全维度切片提取引擎
-    async def _generate_all_shards_background(self, original_prompt: str, cache_key: str):
+    async def _generate_all_shards_background(
+        self,
+        original_prompt: str,
+        cache_key: str,
+        generation: int | None = None,
+    ):
         """
         后台静默提取 8 大维度切片任务。
         采用顺序 await 执行以保护 LLM API 并发配额，完成后自动更新挂起状态。
         """
         logger.info(f"[PersonaSummarizer] 🚀 开始后台静默提取 [{cache_key}] 的全维度人格切片...")
+        current_task = asyncio.current_task()
+        task_generation = getattr(current_task, "_astrmai_persona_generation", None)
+        active_generation = (
+            self._cache_generations.get(cache_key, 0)
+            if generation is None and task_generation is None
+            else int(task_generation if generation is None else generation)
+        )
+        if not self._generation_is_current(cache_key, active_generation):
+            return
         
         # ==========================================
         # 🟢 [Phase 8] 触发原典清洗与向量化重铸
@@ -302,6 +390,8 @@ Rules:
             if getattr(self, 'memory_engine', None):
                 logger.info(f"[PersonaSummarizer] 🧹 检测到人设重建，准备清空旧版并重铸 {cache_key} 的潜意识原典...")
                 await self.memory_engine.clear_persona_lore(cache_key)
+                if not self._generation_is_current(cache_key, active_generation):
+                    return
                 await self.memory_engine.add_persona_lore(original_prompt, cache_key)
             else:
                 logger.warning("[PersonaSummarizer] ⚠️ 未能找到 memory_engine (未注入)，跳过原典入库。")
@@ -311,18 +401,24 @@ Rules:
         try:
             shards = {}
             # 顺序调用 8 大维度切片提取 (依赖下方的具体子函数)
-            shards["logic_style"] = await self._summarize_logic_style(original_prompt, cache_key)
-            shards["speech_style"] = await self._summarize_speech_style(original_prompt, cache_key)
-            shards["world_view"] = await self._summarize_world_view(original_prompt, cache_key)
-            shards["timeline"] = await self._summarize_timeline(original_prompt, cache_key)
-            shards["relations"] = await self._summarize_relations(original_prompt, cache_key)
-            shards["skills"] = await self._summarize_skills(original_prompt, cache_key)
-            shards["values"] = await self._summarize_values(original_prompt, cache_key)
-            shards["secrets"] = await self._summarize_secrets(original_prompt, cache_key)
+            shard_builders = (
+                ("logic_style", self._summarize_logic_style),
+                ("speech_style", self._summarize_speech_style),
+                ("world_view", self._summarize_world_view),
+                ("timeline", self._summarize_timeline),
+                ("relations", self._summarize_relations),
+                ("skills", self._summarize_skills),
+                ("values", self._summarize_values),
+                ("secrets", self._summarize_secrets),
+            )
+            for shard_name, builder in shard_builders:
+                if not self._generation_is_current(cache_key, active_generation):
+                    return
+                shards[shard_name] = await builder(original_prompt, cache_key)
 
             # 获取原子锁，安全写回内存并解除失忆状态
             async with self._lock:
-                if cache_key in self.cache:
+                if self._generation_is_current(cache_key, active_generation) and cache_key in self.cache:
                     self.cache[cache_key]["shards"] = shards
                     self.cache[cache_key]["is_full_ready"] = True
                     
@@ -341,7 +437,10 @@ Rules:
             logger.error(f"[PersonaSummarizer] ❌ [{cache_key}] 的切片任务发生严重异常: {e}")
         finally:
             # 无论成功失败，必须从任务挂起池中安全注销自己，防止内存泄漏和僵尸任务
-            self.pending_tasks.pop(cache_key, None)
+            current_task = asyncio.current_task()
+            pending_task = self.pending_tasks.get(cache_key)
+            if pending_task is current_task or not isinstance(pending_task, asyncio.Task):
+                self.pending_tasks.pop(cache_key, None)
 
 # [修改] 替换 call_judge 为 call_persona_task
     async def _summarize_core_identity_with_retry(self, original_prompt: str, cache_key: str, max_retries: int = 3) -> str:

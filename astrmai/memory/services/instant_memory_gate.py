@@ -48,11 +48,10 @@ class InstantMemoryGate:
             return InstantGateResult()
 
         category, extracted = matched
-        content = f"[????|{category}] ????{text}"
         request, payload = await self._build_split_write_request(
             source="instant_gate",
             raw_text=text,
-            extracted_fact=content,
+            extracted_fact=text,
             turn=turn,
             category=category,
         )
