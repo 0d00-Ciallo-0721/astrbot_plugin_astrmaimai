@@ -77,6 +77,32 @@ class DreamAgentGapCoverageTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_count_session_events_uses_session_id_then_legacy_date(self):
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import Session, create_engine
+
+        from astrmai.infrastructure.persistence import MemoryEvent
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        MemoryEvent.__table__.create(engine)
+        with Session(engine) as session:
+            session.add(MemoryEvent(event_id="e1", session_id="chat-1", date="legacy", narrative="one"))
+            session.add(MemoryEvent(event_id="e2", session_id="chat-1", date="legacy", narrative="two"))
+            session.add(MemoryEvent(event_id="e3", session_id="", date="legacy-only", narrative="three"))
+            session.commit()
+
+        db = SimpleNamespace(get_session=lambda: Session(engine))
+        agent = DreamAgent(SimpleNamespace(config=SimpleNamespace()), db)
+
+        self.assertEqual(asyncio.run(agent.count_session_events("chat-1")), 2)
+        self.assertEqual(asyncio.run(agent.count_session_events("legacy-only")), 1)
+        self.assertEqual(asyncio.run(agent.count_session_events("missing")), 0)
+
     def test_run_dream_cycle_executes_tools_until_finish(self):
         async def _run():
             from astrmai.memory.dream.dream_agent import DreamAgent
@@ -104,6 +130,7 @@ class DreamAgentGapCoverageTests(unittest.TestCase):
 
             gateway = _Gateway()
             agent = DreamAgent(gateway, SimpleNamespace())
+            agent.count_session_events = lambda _session_id: asyncio.sleep(0, result=5)
             agent._get_seed_events = lambda session_id: asyncio.sleep(
                 0,
                 result=[
@@ -282,9 +309,27 @@ class DreamAgentGapCoverageTests(unittest.TestCase):
                 raise AssertionError("gateway should not run without seed events")
 
         agent = DreamAgent(_Gateway(), SimpleNamespace())
+        agent.count_session_events = lambda _session_id: asyncio.sleep(0, result=5)
         agent._get_seed_events = lambda _session_id: asyncio.sleep(0, result=[])
 
         self.assertIsNone(asyncio.run(agent.run_dream_cycle("chat-empty")))
+
+    def test_run_dream_cycle_skips_sessions_below_minimum_event_count(self):
+        from astrmai.memory.dream.dream_agent import DreamAgent
+
+        class _Gateway:
+            config = SimpleNamespace()
+
+            async def call_data_process_task(self, **_kwargs):
+                raise AssertionError("gateway should not run below the event threshold")
+
+        agent = DreamAgent(_Gateway(), SimpleNamespace())
+        agent.count_session_events = lambda _session_id: asyncio.sleep(0, result=4)
+        agent._get_seed_events = lambda _session_id: (_ for _ in ()).throw(
+            AssertionError("seed rows should not be loaded below the event threshold")
+        )
+
+        self.assertIsNone(asyncio.run(agent.run_dream_cycle("chat-small")))
 
 
 if __name__ == "__main__":

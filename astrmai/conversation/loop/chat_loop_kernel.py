@@ -1416,6 +1416,9 @@ class ChatLoopKernel:
             return {}
         now_ts = time.time()
         try:
+            if hasattr(scheduler, "describe_session_eligibility_async"):
+                payload = await self._maybe_await(scheduler.describe_session_eligibility_async(chat_id, now_ts))
+                return dict(payload or {})
             if hasattr(scheduler, "describe_session_eligibility"):
                 payload = await self._maybe_await(scheduler.describe_session_eligibility(chat_id, now_ts))
                 return dict(payload or {})

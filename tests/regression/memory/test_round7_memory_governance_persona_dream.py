@@ -283,6 +283,7 @@ class Round7MemoryGovernanceTests(unittest.IsolatedAsyncioTestCase):
                 }
 
         agent = DreamAgent(_Gateway(), SimpleNamespace(), memory_engine=None)
+        agent.count_session_events = lambda _session_id: asyncio.sleep(0, result=5)
         agent._get_seed_events = lambda _session_id: asyncio.sleep(
             0,
             result=[{"event_id": "e1", "narrative": "用户谈到火锅"}],

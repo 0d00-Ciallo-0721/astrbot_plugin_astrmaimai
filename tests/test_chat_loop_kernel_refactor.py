@@ -720,6 +720,32 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.decision.metadata["dream_reason"], "dream_global_cooldown")
         self.assertEqual(result.decision.next_tick_delay, 300.0)
 
+    def test_dream_summary_prefers_async_session_preflight(self):
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _DreamScheduler:
+            async def describe_session_eligibility_async(self, session_id, now_ts):
+                return {
+                    "eligible": False,
+                    "reason": "insufficient_memory_events",
+                    "session_id": session_id,
+                    "throttle_scope": "session",
+                }
+
+            def describe_session_eligibility(self, _session_id, _now_ts):
+                raise AssertionError("sync fallback should not run when async preflight exists")
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(dream_scheduler=_DreamScheduler())
+
+        result = asyncio.run(kernel.tick(chat_id="chat-small", trigger="heartbeat"))
+
+        self.assertEqual(result.decision.action, "NOOP")
+        self.assertEqual(result.decision.metadata["dream_throttle_scope"], "session")
+        self.assertEqual(result.decision.metadata["dream_reason"], "insufficient_memory_events")
+
     def test_select_due_chats_prefers_new_waiting_and_due_over_future_idle(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):

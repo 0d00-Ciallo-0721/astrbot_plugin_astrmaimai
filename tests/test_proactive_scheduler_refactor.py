@@ -697,6 +697,115 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(result["reason"], "dream_global_cooldown")
         self.assertEqual(result["throttle_scope"], "global")
 
+    def test_dream_scheduler_backs_off_sessions_without_enough_events(self):
+        dream_mod = importlib.import_module("astrmai.proactive.dream_scheduler")
+
+        class _DreamAgent:
+            MIN_EVENTS_TO_DREAM = 5
+
+            def __init__(self):
+                self.count_calls = 0
+
+            async def count_session_events(self, _session_id):
+                self.count_calls += 1
+                return 2
+
+            async def run_dream_cycle(self, **_kwargs):
+                raise AssertionError("dream cycle should not start below the event threshold")
+
+        agent = _DreamAgent()
+        scheduler = dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=30,
+                    dream_time_ranges=[],
+                    min_memory_events_to_dream=5,
+                )
+            ),
+            semaphore=asyncio.Semaphore(1),
+        )
+        scheduler.bind_dependencies(agent, object())
+
+        first = asyncio.run(scheduler.run_once_for_session("chat-small"))
+        second = asyncio.run(scheduler.run_once_for_session("chat-small"))
+
+        self.assertEqual(first["reason"], "insufficient_memory_events")
+        self.assertEqual(first["throttle_scope"], "session")
+        self.assertEqual(second["reason"], "dream_session_backoff")
+        self.assertEqual(agent.count_calls, 1)
+
+    def test_dream_scheduler_backs_off_after_empty_dream_result(self):
+        dream_mod = importlib.import_module("astrmai.proactive.dream_scheduler")
+
+        class _DreamAgent:
+            MIN_EVENTS_TO_DREAM = 5
+
+            def __init__(self):
+                self.run_calls = 0
+
+            async def count_session_events(self, _session_id):
+                return 5
+
+            async def run_dream_cycle(self, **_kwargs):
+                self.run_calls += 1
+                return None
+
+        agent = _DreamAgent()
+        scheduler = dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    dream_interval_min=30,
+                    dream_time_ranges=[],
+                    min_memory_events_to_dream=5,
+                )
+            ),
+            semaphore=asyncio.Semaphore(1),
+        )
+        scheduler.bind_dependencies(agent, object())
+
+        first = asyncio.run(scheduler.run_once_for_session("chat-empty"))
+        second = asyncio.run(scheduler.run_once_for_session("chat-empty"))
+
+        self.assertEqual(first["reason"], "no_dream_log")
+        self.assertEqual(second["reason"], "dream_session_backoff")
+        self.assertEqual(agent.run_calls, 1)
+
+    def test_dream_scheduler_restores_cooldowns_after_reload(self):
+        dream_mod = importlib.import_module("astrmai.proactive.dream_scheduler")
+        cache_dir = Path(self.temp_dir.name) / "cache"
+        db_service = SimpleNamespace(persistence=SimpleNamespace(cache_dir=cache_dir))
+        config = SimpleNamespace(life=SimpleNamespace(dream_interval_min=30, dream_time_ranges=[]))
+
+        first = dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=None,
+            config=config,
+            semaphore=asyncio.Semaphore(1),
+        )
+        first.bind_dependencies(object(), object(), db_service=db_service)
+        first._last_dream_time = time.time()
+        first._last_attempt_by_session["chat-1"] = time.time()
+        asyncio.run(first._persist_runtime_state())
+
+        restored = dream_mod.DreamScheduler(
+            context=SimpleNamespace(send_message=None),
+            memory_engine=None,
+            config=config,
+            semaphore=asyncio.Semaphore(1),
+        )
+        restored.bind_dependencies(object(), object(), db_service=db_service)
+
+        self.assertGreater(restored._last_dream_time, 0)
+        self.assertIn("chat-1", restored._last_attempt_by_session)
+        self.assertEqual(
+            restored.describe_session_eligibility("chat-2", time.time())["reason"],
+            "dream_global_cooldown",
+        )
+
     def test_diary_jitter_cancellation_does_not_commit_daily_marker(self):
         task = self.mod.ProactiveTask.__new__(self.mod.ProactiveTask)
         task._last_diary_date = ""

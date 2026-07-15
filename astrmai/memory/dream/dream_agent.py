@@ -66,12 +66,20 @@ class DreamAgent:
             logger.info("[DreamAgent] no eligible memory bucket, skipping this cycle")
             return None
 
-        logger.info(f"[DreamAgent] start dream maintenance for session={session_id}")
-        self._last_session_id = session_id
+        event_count = await self.count_session_events(session_id)
+        if event_count < self.MIN_EVENTS_TO_DREAM:
+            logger.debug(
+                f"[DreamAgent] skip dream maintenance for session={session_id}: "
+                f"events={event_count}, required={self.MIN_EVENTS_TO_DREAM}"
+            )
+            return None
 
         seed_events = await self._get_seed_events(session_id)
         if not seed_events:
             return None
+
+        logger.info(f"[DreamAgent] start dream maintenance for session={session_id}")
+        self._last_session_id = session_id
 
         dream_log: list[str] = []
         iteration = 0
@@ -491,6 +499,33 @@ class DreamAgent:
         except Exception as exc:
             logger.warning(f"[DreamAgent] failed to choose session: {exc}")
         return None
+
+    async def count_session_events(self, session_id: str) -> int:
+        from ...infrastructure.persistence import MemoryEvent
+        from sqlalchemy import func
+        from sqlmodel import select
+
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return 0
+
+        try:
+            def _query() -> int:
+                with self.db.get_session() as session:
+                    count = session.exec(
+                        select(func.count()).select_from(MemoryEvent).where(MemoryEvent.session_id == session_id)
+                    ).one()
+                    if int(count or 0) > 0:
+                        return int(count)
+                    legacy_count = session.exec(
+                        select(func.count()).select_from(MemoryEvent).where(MemoryEvent.date == session_id)
+                    ).one()
+                    return int(legacy_count or 0)
+
+            return await asyncio.to_thread(_query)
+        except Exception as exc:
+            logger.warning(f"[DreamAgent] failed to count seed events: {exc}")
+            return 0
 
     async def _get_seed_events(self, session_id: str) -> List[Dict]:
         try:
