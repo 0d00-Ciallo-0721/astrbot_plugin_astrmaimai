@@ -84,6 +84,22 @@ class ChatRuntimeGenerationTests(unittest.TestCase):
         self.assertEqual(retried["status"], "claimed")
         self.assertEqual(retried["error"], "")
 
+    def test_latest_committed_outbound_can_exclude_current_send(self):
+        coordinator = ChatRuntimeCoordinator()
+
+        async def _run():
+            await coordinator.commit_send("chat-1", "previous", ["msg-1", "msg-2"])
+            await asyncio.sleep(0.001)
+            await coordinator.commit_send("chat-1", "current", ["msg-3"])
+            latest = await coordinator.get_latest_committed_outbound("chat-1")
+            previous = await coordinator.get_latest_committed_outbound(
+                "chat-1",
+                exclude_send_key="current",
+            )
+            return latest, previous
+
+        self.assertEqual(asyncio.run(_run()), (["msg-3"], ["msg-1", "msg-2"]))
+
     def test_empty_send_key_is_not_claimed(self):
         coordinator = ChatRuntimeCoordinator()
 

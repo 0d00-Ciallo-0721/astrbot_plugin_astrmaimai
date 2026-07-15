@@ -78,13 +78,18 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             result = asyncio.run(tool.call(_wrap_event(event), tone="approve"))
 
         self.assertIn("QQ", result)
+        self.assertEqual(api.calls, [])
         self.assertEqual(
-            api.calls,
-            [("set_msg_emoji_like", {"message_id": "msg-1", "emoji_id": self.mod.QQ_MESSAGE_EMOJI_OPTIONS["approve"][0]})],
+            event.get_extra("astrmai_pending_actions")[0]["action"],
+            "message_emoji_like",
         )
         self.assertEqual(
-            event.get_extra("astrmai_tool_execution_trace"),
-            [{"tool_name": "message_emoji_like_action", "status": "success"}],
+            event.get_extra("astrmai_pending_actions")[0]["payload"]["emoji_id"],
+            self.mod.QQ_MESSAGE_EMOJI_OPTIONS["approve"][0],
+        )
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace", []),
+            [],
         )
 
     def test_wait_tool_records_actual_execution(self):
@@ -133,7 +138,64 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         result = asyncio.run(tool.call(_wrap_event(event)))
 
         self.assertIn("群签到", result)
-        self.assertEqual(api.calls, [("set_group_sign", {"group_id": "67890"})])
+        self.assertEqual(api.calls, [])
+        self.assertEqual(event.get_extra("astrmai_pending_actions")[0]["action"], "group_sign")
+        self.assertEqual(event.get_extra("astrmai_pending_actions")[0]["group_id"], "67890")
+
+    def test_custom_face_catalog_query_accepts_wrapped_napcat_data(self):
+        event = _FakeEvent(group_id="12345")
+        api = _FakeApi(result={"data": ["cat_smile"]})
+        event.bot.api = api
+
+        result = asyncio.run(self.mod.CustomFaceCatalogQueryTool().call(_wrap_event(event), count=1))
+
+        self.assertIn("cat_smile", result)
+
+    def test_meme_tool_marks_explicit_send_as_forced(self):
+        event = _FakeEvent(group_id="12345")
+
+        asyncio.run(self.mod.ProactiveMemeTool(emotion_mapping=["happy: 开心"]).call(_wrap_event(event), emotion_tag="happy"))
+
+        self.assertTrue(event.get_extra("astrmai_force_meme"))
+
+    def test_textual_reaction_does_not_create_fake_qq_action(self):
+        event = _FakeEvent(group_id="12345")
+
+        result = asyncio.run(self.mod.MessageReactionTool().call(_wrap_event(event), reaction="赞同"))
+
+        self.assertIn("文字回复", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_withdraw_resolves_latest_bot_message_before_queueing(self):
+        event = _FakeEvent(group_id="12345", self_id="90001")
+        event.bot.api = _FakeApi(
+            result={
+                "data": {
+                    "messages": [
+                        {"message_id": 10, "sender": {"user_id": "user-1"}},
+                        {"message_id": 11, "sender": {"user_id": "90001"}},
+                    ]
+                }
+            }
+        )
+
+        result = asyncio.run(self.mod.RegretAndWithdrawTool().call(_wrap_event(event)))
+
+        self.assertIn("加入待执行动作", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions")[0]["message_id"], "11")
+        self.assertEqual(event.bot.api.calls[0][0], "get_group_msg_history")
+
+    def test_withdraw_does_not_queue_when_history_has_no_bot_message(self):
+        event = _FakeEvent(group_id=None, self_id="90001")
+        event.bot.api = _FakeApi(
+            result={"messages": [{"message_id": 10, "user_id": "user-1"}]}
+        )
+
+        result = asyncio.run(self.mod.RegretAndWithdrawTool().call(_wrap_event(event)))
+
+        self.assertIn("没有找到", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+        self.assertEqual(event.bot.api.calls[0][0], "get_friend_msg_history")
 
     def test_custom_face_catalog_query_returns_preview(self):
         event = _FakeEvent(group_id="12345")

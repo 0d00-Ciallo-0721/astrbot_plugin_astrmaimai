@@ -123,6 +123,7 @@ class ConcurrentExecutor:
             "astrmai_tool_execution_trace",
             "astrmai_pending_actions",
             "astrmai_bypass_mood_analysis",
+            "astrmai_force_meme",
         ):
             value = source_event.get_extra(key, None)
             if value is not None:

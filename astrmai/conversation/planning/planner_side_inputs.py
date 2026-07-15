@@ -63,6 +63,15 @@ class PlannerSideInputMixin:
         "change topic",
         "switch topic",
     }
+    QQ_ACTION_INTENT_KEYWORDS = {
+        "poke": ("戳一下", "戳一戳", "戳戳", "poke"),
+        "at": ("艾特", "帮我@", "@一下"),
+        "qq_reaction": ("消息表情", "表情回应", "加个表情", "给这条消息点赞", "点赞这条消息"),
+        "sign": ("群签到", "群打卡", "签到一下"),
+        "withdraw": ("撤回", "删掉上一条", "撤回上一条"),
+        "meme": ("发个表情包", "发表情包", "来个表情包"),
+        "qq_query": ("查自定义表情", "自定义表情列表", "有哪些自定义表情"),
+    }
     POKE_INTENT_KEYWORDS = {
         "戳一下",
         "戳一戳",
@@ -70,8 +79,9 @@ class PlannerSideInputMixin:
         "poke",
     }
     AT_INTENT_KEYWORDS = {
-        "@",
         "艾特",
+        "帮我@",
+        "@一下",
     }
     CHAT_TOOL_NAMES = {
         "proactive_meme",
@@ -93,6 +103,13 @@ class PlannerSideInputMixin:
         "space_transition_action",
         "regret_and_withdraw_action",
         "meme_resonance_action",
+    }
+    QQ_NATIVE_TOOL_NAMES = {
+        "proactive_poke",
+        "message_emoji_like_action",
+        "group_sign_action",
+        "regret_and_withdraw_action",
+        "custom_face_catalog_query",
     }
     TOOL_NAME_ALIASES = {
         "WaitTool": "wait_and_listen",
@@ -123,9 +140,9 @@ class PlannerSideInputMixin:
         "space_transition_action": {"private"},
         "regret_and_withdraw_action": {"withdraw"},
         "message_reaction_action": {"reaction"},
-        "message_emoji_like_action": {"reaction"},
+        "message_emoji_like_action": {"qq_reaction"},
         "proactive_like_action": {"reaction", "like"},
-        "custom_face_catalog_query": {"query", "meme"},
+        "custom_face_catalog_query": {"qq_query"},
         "group_sign_action": {"sign"},
     }
     MODE_INSTRUCTION_MAX_CHARS = 240
@@ -237,7 +254,28 @@ class PlannerSideInputMixin:
         if not msg:
             return False
         lowered = msg.lower()
-        return any(keyword in msg or keyword in lowered for keyword in self.TOOL_INTENT_KEYWORDS)
+        if any(keyword in msg or keyword in lowered for keyword in self.TOOL_INTENT_KEYWORDS):
+            return True
+        return self._conversation_flag("qq_explicit_intent_override_enabled", True) and bool(
+            self._explicit_qq_action_families(event)
+        )
+
+    def _explicit_qq_action_families(self, event: AstrMessageEvent) -> set[str]:
+        message = str(getattr(event, "message_str", "") or "").strip()
+        if not message:
+            return set()
+        lowered = message.lower()
+        families = {
+            family
+            for family, keywords in self.QQ_ACTION_INTENT_KEYWORDS.items()
+            if any(keyword in message or keyword in lowered for keyword in keywords)
+        }
+        return families
+
+    def _conversation_flag(self, name: str, default: bool) -> bool:
+        config = getattr(self.gateway, "config", None)
+        conversation = getattr(config, "conversation", None)
+        return bool(getattr(conversation, name, default))
 
     def _has_poke_intent(self, message: str) -> bool:
         if not message:
@@ -273,7 +311,7 @@ class PlannerSideInputMixin:
     def _build_full_pfc_tools(self, chat_id: str, user_id, sender_name: str):
         target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
         memory_tool_service = getattr(self.memory_engine, "tool_service", None)
-        return [
+        tools = [
             WaitTool(),
             SelfLoreQueryTool(
                 memory_engine=self.memory_engine,
@@ -301,6 +339,12 @@ class PlannerSideInputMixin:
             CustomFaceCatalogQueryTool(),
             GroupSignTool(),
         ]
+        if not self._conversation_flag("qq_native_tools_enabled", True) or not self._conversation_flag(
+            "qq_deferred_action_commit_enabled",
+            True,
+        ):
+            tools = [tool for tool in tools if self._canonical_tool_name(tool) not in self.QQ_NATIVE_TOOL_NAMES]
+        return tools
 
     def _build_chat_tools(self, event: AstrMessageEvent):
         tools = [
@@ -316,6 +360,11 @@ class PlannerSideInputMixin:
                     ConstructAtEventTool(db_service=self.context_engine.db),
                 ]
             )
+        if not self._conversation_flag("qq_native_tools_enabled", True) or not self._conversation_flag(
+            "qq_deferred_action_commit_enabled",
+            True,
+        ):
+            tools = [tool for tool in tools if self._canonical_tool_name(tool) not in self.QQ_NATIVE_TOOL_NAMES]
         return tools
 
     @classmethod
@@ -346,9 +395,9 @@ class PlannerSideInputMixin:
         if not social_intent:
             return None
         if social_intent == "comfort":
-            return {"reaction", "like"}
+            return {"reaction", "qq_reaction", "like"}
         if social_intent == "tease":
-            families = {"meme", "reaction", "like"}
+            families = {"meme", "reaction", "qq_reaction", "like"}
             if self._has_poke_intent(str(getattr(event, "message_str", "") or "")):
                 families.add("poke")
             if self._has_at_intent(str(getattr(event, "message_str", "") or "")):
@@ -445,6 +494,8 @@ class PlannerSideInputMixin:
         else:
             self._set_disable_rag_injection(ctx, False)
 
+        explicit_qq_families = self._explicit_qq_action_families(event)
+        explicit_override_enabled = self._conversation_flag("qq_explicit_intent_override_enabled", True)
         explicit_tool_intent = self._has_tool_intent(event)
         requested_tier = str(event.get_extra("astrmai_action_tier", "") if hasattr(event, "get_extra") else "").strip().lower()
         social_intent = str(event.get_extra("astrmai_social_intent", "") if hasattr(event, "get_extra") else "").strip().lower()
@@ -486,6 +537,8 @@ class PlannerSideInputMixin:
         intent_families = self._families_for_social_intent(event, social_intent)
         if intent_families is not None:
             allowed_families = (allowed_families & intent_families) if allowed_families else intent_families
+        if explicit_override_enabled and explicit_qq_families:
+            allowed_families.update(explicit_qq_families)
         turn_tools.allowed_families = sorted(allowed_families if allowed_families else (intent_families or set()))
 
         state = None
@@ -593,6 +646,7 @@ class PlannerSideInputMixin:
         else:
             turn_tools.family_filtered_tools = []
 
+        tools_before_modifier = list(tools or [])
         tools = self.action_modifier.modify_tools(
             tools,
             state=state,
@@ -604,6 +658,27 @@ class PlannerSideInputMixin:
             cooldown_tags=event.get_extra("astrmai_agency_cooldown_tags", []) if hasattr(event, "get_extra") else [],
             trace=turn_tools,
         )
+        if explicit_override_enabled and explicit_qq_families:
+            filtered_names = {self._canonical_tool_name(tool) for tool in tools or []}
+            protected_names = {
+                self._canonical_tool_name(tool)
+                for tool in tools_before_modifier
+                if self.TOOL_FAMILIES.get(self._canonical_tool_name(tool), set()) & explicit_qq_families
+            }
+            if protected_names - filtered_names:
+                before_names = [self._canonical_tool_name(tool) for tool in tools or []]
+                tools = [
+                    tool
+                    for tool in tools_before_modifier
+                    if self._canonical_tool_name(tool) in filtered_names | protected_names
+                ]
+                turn_tools.record_step(
+                    "planner.explicit_qq_action_restore",
+                    before_names,
+                    [self._canonical_tool_name(tool) for tool in tools],
+                    "explicit_user_qq_action",
+                    category="social_intent",
+                )
         turn_tools.filtered_tools = [
             self._canonical_tool_name(tool)
             for tool in tools or []

@@ -256,6 +256,28 @@ class ChatRuntimeCoordinator:
                 "committed_at": float(claim.committed_at or 0.0),
             }
 
+    async def get_latest_committed_outbound(
+        self,
+        chat_id: str,
+        *,
+        exclude_send_key: str = "",
+    ) -> List[str]:
+        normalized_chat_id = str(chat_id or "").strip()
+        excluded = str(exclude_send_key or "").strip()
+        async with self._lock:
+            state = self._states.get(normalized_chat_id)
+            if not state:
+                return []
+            candidates = [
+                claim
+                for key, claim in state.send_claims.items()
+                if key != excluded and claim.status == "committed" and claim.outbound_message_ids
+            ]
+            if not candidates:
+                return []
+            latest = max(candidates, key=lambda item: float(item.committed_at or item.claimed_at or 0.0))
+            return latest.outbound_message_ids[:]
+
     def _increment_metric_locked(self, event_name: str, amount: int = 1) -> None:
         key = str(event_name or "unknown")
         self._concurrency_metrics[key] = int(self._concurrency_metrics.get(key, 0) or 0) + max(

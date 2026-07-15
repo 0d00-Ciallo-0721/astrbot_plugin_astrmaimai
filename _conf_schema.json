@@ -231,6 +231,24 @@
         "default": false,
         "hint": "仅在排查并发问题时开启；默认的概要轨迹不会记录用户消息或回复正文。"
       },
+      "qq_native_tools_enabled": {
+        "description": "启用平台原生互动工具",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，机器人可以在合适时使用戳一戳、消息表情回复、群签到和撤回等平台原生动作；关闭后不会向模型提供这些动作。"
+      },
+      "qq_deferred_action_commit_enabled": {
+        "description": "确认回复有效后再执行平台动作",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，平台动作会等到本轮回复通过时序检查并成功发送后再执行，避免旧回复或失败回复误触发动作。"
+      },
+      "qq_explicit_intent_override_enabled": {
+        "description": "优先响应用户明确要求的平台动作",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，用户明确要求戳一戳、群签到或消息表情回复时，不会仅因普通好感度或动作冷却而隐藏对应工具。"
+      },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
         "type": "float",

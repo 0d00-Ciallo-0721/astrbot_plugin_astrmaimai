@@ -576,7 +576,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])
 
         tool_ctx = SimpleNamespace(shared_dict={})
-        query_keyword = next(iter(mixin.TOOL_INTENT_KEYWORDS))
+        query_keyword = "查一下"
         intent_event = _FakeEvent(message=f"{query_keyword} target")
         intent_tools = asyncio.run(
             mixin._build_execution_tools(
@@ -656,7 +656,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         mixin = self._prepare_tool_mixin()
         mixin.state_engine = _FakeStateEngine(energy=0.2)
         ctx = SimpleNamespace(shared_dict={})
-        query_keyword = next(iter(mixin.TOOL_INTENT_KEYWORDS))
+        query_keyword = "查一下"
         event = _FakeEvent(message=f"{query_keyword} target")
         event.set_extra("astrmai_action_tier", "full")
 
@@ -679,7 +679,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(trace.final_tier, "full")
         self.assertNotIn("full_tier", trace.removed_by_energy)
 
-    def test_guarded_chat_intent_adds_guarded_chat_tools_without_full_pfc(self):
+    def test_explicit_qq_intent_injects_only_requested_action_family(self):
         mixin = self._prepare_tool_mixin()
         ctx = SimpleNamespace(shared_dict={})
         poke_keyword = next(iter(mixin.POKE_INTENT_KEYWORDS))
@@ -700,13 +700,13 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         tool_names = _normalized_tool_names(tools)
         self.assertIn("proactive_poke", tool_names)
-        self.assertIn("construct_at_event", tool_names)
+        self.assertNotIn("construct_at_event", tool_names)
         self.assertNotIn("omni_perception_query", tool_names)
         self.assertNotIn("wait_and_listen", tool_names)
-        self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
+        self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
         at_ctx = SimpleNamespace(shared_dict={})
-        at_event = _FakeEvent(message="@target")
+        at_event = _FakeEvent(message="请艾特 target")
         at_tools = asyncio.run(
             mixin._build_execution_tools(
                 "default:GroupMessage:group-1",
@@ -720,8 +720,134 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
         at_tool_names = _normalized_tool_names(at_tools)
-        self.assertIn("proactive_poke", at_tool_names)
+        self.assertNotIn("proactive_poke", at_tool_names)
         self.assertIn("construct_at_event", at_tool_names)
+
+    def test_explicit_poke_is_restored_after_action_modifier_filter(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.action_modifier = SimpleNamespace(modify_tools=lambda tools, **kwargs: [])
+        event = _FakeEvent(message="请戳一戳我", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"proactive_poke"})
+        trace = event.get_extra("astrmai_turn_context").tools
+        self.assertTrue(any(step["stage"] == "planner.explicit_qq_action_restore" for step in trace.filter_steps))
+
+    def test_explicit_group_sign_gets_full_tier_without_unrelated_tools(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="请帮当前群签到", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"group_sign_action"})
+        self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
+
+    def test_plain_bot_mention_does_not_become_explicit_at_command(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="@机器人 你好", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        names = _normalized_tool_names(tools)
+        self.assertNotIn("proactive_poke", names)
+        self.assertNotIn("construct_at_event", names)
+        self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
+
+    def test_qq_flags_restore_safe_no_native_tool_path(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.gateway.config.conversation = SimpleNamespace(
+            qq_native_tools_enabled=True,
+            qq_deferred_action_commit_enabled=False,
+            qq_explicit_intent_override_enabled=True,
+        )
+        event = _FakeEvent(message="请帮当前群签到", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertNotIn("group_sign_action", _normalized_tool_names(tools))
+
+    def test_explicit_message_reaction_only_injects_native_qq_tool(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="给这条消息加个表情", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"message_emoji_like_action"})
+
+    def test_explicit_custom_face_query_does_not_inject_general_memory_query(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="查自定义表情", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"custom_face_catalog_query"})
 
     def test_guarded_chat_intent_does_not_match_unrelated_poke_words(self):
         mixin = self._prepare_tool_mixin()
@@ -750,6 +876,27 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
                     tool_names,
                     {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
                 )
+
+    def test_plain_bot_mention_does_not_open_at_or_poke_tools(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="@2715245266 你好", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=False,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        names = _normalized_tool_names(tools)
+        self.assertNotIn("construct_at_event", names)
+        self.assertNotIn("proactive_poke", names)
 
     def test_core_only_plain_chat_uses_chat_tier_instead_of_full_pfc(self):
         mixin = self._prepare_tool_mixin()
@@ -839,7 +986,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(recall_tools),
-            {"omni_perception_query", "self_lore_query", "custom_face_catalog_query"},
+            {"omni_perception_query", "self_lore_query"},
         )
         recall_turn = recall_event.get_extra("astrmai_turn_context")
         self.assertEqual(recall_turn.tools.allowed_families, ["query"])

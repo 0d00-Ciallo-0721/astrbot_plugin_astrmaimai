@@ -93,6 +93,8 @@ class CognitiveLoop:
         "Valid action: reply|wait|ignore|tool_call. "
         "Valid memory_policy: none|light|deep. "
         "Valid social_intent: answer|comfort|tease|pushback|boundary|observe|join|inquire|recall|redirect. "
+        "Valid action_tier: none|chat|full|sys3. "
+        "Valid allowed_action_families values: wait|query|qq_query|at|poke|meme|resonance|topic|private|withdraw|reaction|qq_reaction|like|sign. "
         "Pushback is allowed only for very obvious direct attacks toward the bot with attack_confidence >= 0.85; "
         "when and only when it is a direct attack toward the bot, include risk_flags item direct_attack_to_bot. "
         "Ordinary disagreement, correction, joking, third-party conflict, distress, or help-seeking must not be pushback. "

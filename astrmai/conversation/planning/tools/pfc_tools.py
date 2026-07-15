@@ -12,6 +12,8 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
 
+from ...contracts.qq_action import PendingQQAction
+
 
 QQ_MESSAGE_EMOJI_OPTIONS: dict[str, list[str]] = {
     "support": ["66", "124"],
@@ -47,12 +49,10 @@ def _append_pending_action(event, action: dict[str, Any]) -> None:
     pending_actions = _get_pending_actions(event)
     pending_actions.append(action)
     _set_pending_actions(event, pending_actions)
-    tool_name = {
-        "reaction": "message_reaction_action",
-        "like": "proactive_like_action",
-    }.get(str(action.get("action") or ""), "")
-    if tool_name:
-        _record_tool_execution(event, tool_name)
+
+
+def _append_qq_action(event, action: PendingQQAction) -> None:
+    _append_pending_action(event, action.to_dict())
 
 
 def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
@@ -72,16 +72,61 @@ def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
     return True
 
 
-def _coerce_action_identifier(value: Any) -> Any:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return int(text) if text.isdigit() else text
-
-
 def _current_message_id(event) -> str:
     message_obj = getattr(event, "message_obj", None)
     return str(getattr(message_obj, "message_id", "") or "").strip()
+
+
+def _history_messages(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        data = payload.get("data", payload)
+        if isinstance(data, dict):
+            payload = data.get("messages", [])
+        else:
+            payload = data
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+async def _resolve_latest_bot_message_id(event) -> str:
+    client = getattr(event, "bot", None)
+    api = getattr(client, "api", None)
+    if api is None:
+        return ""
+    group_id = str(event.get_group_id() or "").strip()
+    sender_id = str(event.get_sender_id() or "").strip()
+    self_id = str(event.get_self_id() or "").strip()
+    try:
+        if group_id:
+            payload = await api.call_action(
+                "get_group_msg_history",
+                group_id=int(group_id) if group_id.isdigit() else group_id,
+                message_seq=0,
+                count=20,
+            )
+        elif sender_id:
+            payload = await api.call_action(
+                "get_friend_msg_history",
+                user_id=int(sender_id) if sender_id.isdigit() else sender_id,
+                message_seq=0,
+                count=20,
+            )
+        else:
+            return ""
+    except Exception as exc:
+        logger.warning(f"[RegretAndWithdrawTool] message history lookup failed: {exc}")
+        return ""
+
+    for message in reversed(_history_messages(payload)):
+        message_sender = message.get("sender")
+        author_id = message.get("user_id")
+        if isinstance(message_sender, dict):
+            author_id = message_sender.get("user_id", author_id)
+        message_id = str(message.get("message_id") or "").strip()
+        if message_id and str(author_id or "").strip() == self_id:
+            return message_id
+    return ""
 
 
 async def _resolve_target(
@@ -349,25 +394,16 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
         if target_id == str(current_event.get_self_id()):
             return "动作取消：不能戳自己。"
 
-        try:
-            client = getattr(current_event, "bot", None)
-            api = getattr(client, "api", None)
-            if api is None:
-                return "动作取消：底层 poke API 不可用。"
-            if group_id:
-                await api.call_action(
-                    "send_poke",
-                    user_id=_coerce_action_identifier(target_id),
-                    group_id=_coerce_action_identifier(group_id),
-                )
-            else:
-                await api.call_action("send_poke", user_id=_coerce_action_identifier(target_id))
-            logger.info(f"[ProactivePokeTool] poked target={target_id} group={group_id}")
-            _record_tool_execution(current_event, self.name)
-            return f"已主动戳了 {display_name}，请继续生成自然的文字回应。"
-        except Exception as exc:
-            logger.error(f"[ProactivePokeTool] execution failed: {exc}")
-            return f"动作执行失败：{exc}"
+        _append_qq_action(
+            current_event,
+            PendingQQAction(
+                action_type="poke",
+                target_id=str(target_id or ""),
+                target_name=display_name,
+                group_id=str(group_id or ""),
+            ),
+        )
+        return f"已将戳一戳 {display_name} 加入待执行动作；不要声称已经成功，继续生成自然的文字回应。"
 
 
 @dataclass
@@ -389,10 +425,6 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        client = getattr(current_event, "bot", None)
-        api = getattr(client, "api", None)
-        if api is None:
-            return "动作取消：底层表情回复 API 不可用。"
         message_id = _current_message_id(current_event)
         if not message_id:
             return "动作取消：当前消息没有可定位的 message_id。"
@@ -407,20 +439,18 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
             selected_tone, selected_pool = random.choice(fallback_items)
         emoji_id = random.choice(selected_pool)
 
-        try:
-            await api.call_action(
-                "set_msg_emoji_like",
-                message_id=_coerce_action_identifier(message_id),
-                emoji_id=str(emoji_id),
-            )
-            logger.info(
-                f"[MessageEmojiLikeTool] liked message={message_id} tone={selected_tone or tone or 'random'} emoji={emoji_id}"
-            )
-            _record_tool_execution(current_event, self.name)
-            return f"已给当前消息加了一个 QQ 表情回复（{selected_tone or tone or 'random'}）。"
-        except Exception as exc:
-            logger.error(f"[MessageEmojiLikeTool] execution failed: {exc}")
-            return f"动作执行失败：{exc}"
+        _append_qq_action(
+            current_event,
+            PendingQQAction(
+                action_type="message_emoji_like",
+                message_id=message_id,
+                payload={
+                    "emoji_id": str(emoji_id),
+                    "tone": selected_tone or tone or "random",
+                },
+            ),
+        )
+        return "已将 QQ 原生消息表情回复加入待执行动作；不要声称已经成功，继续生成最终回复。"
 
 
 @dataclass
@@ -435,18 +465,11 @@ class GroupSignTool(FunctionTool[AstrAgentContext]):
         group_id = str(current_event.get_group_id() or "").strip()
         if not group_id:
             return "动作取消：当前不是群聊，无法执行群签到。"
-        client = getattr(current_event, "bot", None)
-        api = getattr(client, "api", None)
-        if api is None:
-            return "动作取消：底层群签到 API 不可用。"
-        try:
-            await api.call_action("set_group_sign", group_id=str(group_id))
-            logger.info(f"[GroupSignTool] signed group={group_id}")
-            _record_tool_execution(current_event, self.name)
-            return "已完成当前群签到。"
-        except Exception as exc:
-            logger.error(f"[GroupSignTool] execution failed: {exc}")
-            return f"动作执行失败：{exc}"
+        _append_qq_action(
+            current_event,
+            PendingQQAction(action_type="group_sign", group_id=group_id),
+        )
+        return "已将当前群签到加入待执行动作；不要声称已经成功，继续生成最终回复。"
 
 
 @dataclass
@@ -479,7 +502,10 @@ class CustomFaceCatalogQueryTool(FunctionTool[AstrAgentContext]):
             logger.error(f"[CustomFaceCatalogQueryTool] execution failed: {exc}")
             return f"系统提示：查询自定义表情失败：{exc}"
 
-        faces = payload if isinstance(payload, list) else []
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            faces = payload["data"]
+        else:
+            faces = payload if isinstance(payload, list) else []
         normalized = [str(item).strip() for item in faces if str(item or "").strip()]
         if not normalized:
             return "系统提示：当前没有查询到可用的 QQ 自定义表情。"
@@ -515,6 +541,7 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
         if valid_tags and emotion_tag not in valid_tags:
             emotion_tag = "neutral"
         current_event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
+        current_event.set_extra("astrmai_force_meme", True)
         _append_once(
             current_event,
             matcher=lambda item: item.get("action") == "meme",
@@ -609,18 +636,22 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
-        _append_once(
-            current_event,
-            matcher=lambda item: item.get("action") == "withdraw",
-            action={"action": "withdraw"},
-        )
-        return "已记录撤回动作，请继续生成简短自然的补救文本。"
+        message_id = await _resolve_latest_bot_message_id(current_event)
+        if not message_id:
+            return "动作取消：没有找到可撤回的上一条机器人消息。"
+        pending_actions = _get_pending_actions(current_event)
+        if not any(item.get("action") == "withdraw" for item in pending_actions):
+            _append_qq_action(
+                current_event,
+                PendingQQAction(action_type="withdraw", message_id=message_id),
+            )
+        return "已将撤回上一条 AstrMai 回复加入待执行动作；不要声称已经成功，请继续生成简短自然的补救文本。"
 
 
 @dataclass
 class MessageReactionTool(FunctionTool[AstrAgentContext]):
     name: str = "message_reaction_action"
-    description: str = "为当前消息补一个简短互动反应。"
+    description: str = "只调整最终文字回复的互动语气，不执行 QQ 原生消息表情或点赞。"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -632,18 +663,16 @@ class MessageReactionTool(FunctionTool[AstrAgentContext]):
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        current_event = _get_current_event(context)
         reaction = str(kwargs.get("reaction", "") or "").strip()
         if not reaction:
             return "执行失败：reaction 不能为空。"
-        _append_pending_action(current_event, {"action": "reaction", "reaction": reaction})
-        return f"已记录互动反应 {reaction}，请继续生成最终回复。"
+        return f"请在最终文字回复中自然体现“{reaction}”的互动语气，不要声称执行了 QQ 动作。"
 
 
 @dataclass
 class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
     name: str = "proactive_like_action"
-    description: str = "表达明确的点赞、夸奖或正向偏爱。"
+    description: str = "只调整最终文字回复中的夸奖或好感表达，不执行 QQ 资料点赞。"
     db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
@@ -667,15 +696,8 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
             )
             if resolved:
                 target_id, _ = resolved
-        _append_pending_action(
-            current_event,
-            {
-                "action": "like",
-                "target_id": target_id,
-                "target_name": target_name or (current_event.get_sender_name() or ""),
-            },
-        )
-        return "已记录正向偏好动作，请继续生成带一点明确好感的回复。"
+        display_name = target_name or (current_event.get_sender_name() or "对方")
+        return f"请在最终文字回复中自然表达对 {display_name} 的夸奖或好感，不要声称执行了 QQ 点赞。"
 
 
 @dataclass

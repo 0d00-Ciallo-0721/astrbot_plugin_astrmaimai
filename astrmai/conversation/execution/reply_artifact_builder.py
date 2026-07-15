@@ -425,6 +425,8 @@ class ReplyArtifactMixin:
             except Exception:
                 logger.debug("[ReplyService] send claim degraded; preserving legacy send behavior", exc_info=True)
                 send_key = ""
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_reply_send_key", send_key)
 
         outbound_message_ids: list[str] = []
         sent_segment_count = 0
@@ -445,7 +447,7 @@ class ReplyArtifactMixin:
                     chain.chain.append(_plain_component(" "))
                 chain.chain.append(_plain_component(seg))
                 sent_result = await context.send_message(event.unified_msg_origin, chain)
-                if sent_result is not None:
+                if sent_result is not None and not isinstance(sent_result, bool):
                     outbound_message_ids.append(str(sent_result))
                 artifact.sent = True
                 sent_segment_count += 1

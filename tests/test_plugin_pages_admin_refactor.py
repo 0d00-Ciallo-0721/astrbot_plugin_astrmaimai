@@ -60,6 +60,8 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/users/{{user_id}}/slices/{{index}}", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/update", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/restore", paths)
         self.assertNotIn(f"{PLUGIN_API_PREFIX}/persona", paths)
         self.assertFalse(any(path.startswith(f"{PLUGIN_API_PREFIX}/config") for path in paths))
 
@@ -76,6 +78,8 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/{{user_id}}/slices/{{index}}/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>/delete", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/update", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/restore", ("POST",)), mutating)
         self.assertNotIn((f"{PLUGIN_API_PREFIX}/persona/save", ("POST",)), mutating)
 
     def test_registered_plugin_page_handlers_accept_astrbot_path_kwargs(self):
@@ -174,6 +178,11 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn("角色切片", app_js)
         self.assertIn("renderPersonaSlices", app_js)
         self.assertIn("renderShardCards", app_js)
+        self.assertIn("savePersonaSlices", app_js)
+        self.assertIn("restorePersonaFields", app_js)
+        self.assertIn("/persona/slices/update", app_js)
+        self.assertIn("/persona/slices/restore", app_js)
+        self.assertIn("派生人格微调", app_js)
         self.assertIn("角色切片读取失败", app_js)
         self.assertIn("Bridge 初始化中", app_js)
         self.assertIn("Bridge 连接失败", app_js)

@@ -5,6 +5,7 @@ _EXPORTS = {
     "FollowupManager": ".followup_manager",
     "intercept_outbound_error": ".outbound_error_policy",
     "ReplyService": ".reply_service",
+    "QQActionDispatcher": ".qq_action_dispatcher",
     "System2Runner": ".system2_runner",
 }
 

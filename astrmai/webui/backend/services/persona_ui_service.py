@@ -16,6 +16,9 @@ SHARD_LABELS: dict[str, str] = {
     "secrets": "深层秘密",
 }
 
+CORE_EDIT_FIELDS = ("summary", "first_person_rewrite", "style")
+MAX_PERSONA_FIELD_CHARS = 12000
+
 class PersonaUiService:
     def __init__(self, plugin_api: PluginApiAdapter):
         self.plugin_api = plugin_api
@@ -46,6 +49,10 @@ class PersonaUiService:
                 "timestamp": payload.get("timestamp", 0.0),
                 "pending_task": pending_task,
                 "pending_task_keys": pending_tasks,
+                "manual_overrides": dict(payload.get("manual_overrides", {}) or {}),
+                "manual_revision": int(payload.get("manual_revision", 0) or 0),
+                "manual_updated_at": float(payload.get("manual_updated_at", 0.0) or 0.0),
+                "generated_baseline_available": isinstance(payload.get("generated_baseline"), dict),
                 "raw_length": len(raw_text),
                 "self_lore": {
                     "available": self.plugin_api.get_memory_engine() is not None,
@@ -73,6 +80,104 @@ class PersonaUiService:
         updated_cache[target_key] = updated_payload
         await self.plugin_api.write_persona_cache(updated_cache)
         return updated_payload
+
+    @staticmethod
+    def _expected_timestamp(data: dict[str, Any]) -> float | None:
+        value = data.get("expected_timestamp")
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("缓存时间戳格式无效，请重新读取页面") from exc
+
+    @staticmethod
+    def _clean_edit_value(value: Any, label: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{label}必须是文本")
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(f"{label}不能为空")
+        if len(cleaned) > MAX_PERSONA_FIELD_CHARS:
+            raise ValueError(f"{label}不能超过 {MAX_PERSONA_FIELD_CHARS} 个字符")
+        return cleaned
+
+    def _normalize_manual_changes(self, data: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"cache_key", "expected_timestamp", *CORE_EDIT_FIELDS, "shards"}
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            raise ValueError("包含不允许修改的字段：" + ", ".join(unknown))
+        changes: dict[str, Any] = {}
+        labels = {
+            "summary": "核心摘要",
+            "first_person_rewrite": "第一人称自觉",
+            "style": "说话方式",
+        }
+        for field in CORE_EDIT_FIELDS:
+            if field in data:
+                changes[field] = self._clean_edit_value(data[field], labels[field])
+        if "shards" in data:
+            shards = data.get("shards")
+            if not isinstance(shards, dict):
+                raise ValueError("八维切片必须是对象")
+            unknown_shards = sorted(set(shards) - set(SHARD_LABELS))
+            if unknown_shards:
+                raise ValueError("包含未知的切片：" + ", ".join(unknown_shards))
+            changes["shards"] = {
+                name: self._clean_edit_value(value, SHARD_LABELS[name])
+                for name, value in shards.items()
+            }
+        if not changes or (set(changes) == {"shards"} and not changes["shards"]):
+            raise ValueError("没有可保存的人格修改")
+        return changes
+
+    async def update_persona_slices(self, data: dict[str, Any]) -> dict[str, Any]:
+        summarizer = self.plugin_api.get_persona_summarizer()
+        if summarizer is None or not hasattr(summarizer, "apply_manual_overrides"):
+            return {"status": "error", "code": "runtime_unavailable", "message": "人格运行时尚未就绪"}
+        cache = await self.plugin_api.read_persona_cache()
+        persona_id = self._resolve_persona_id(self.plugin_api)
+        cache_key, _ = self._select_cache_payload(cache, persona_id)
+        requested_key = str(data.get("cache_key", "") or cache_key).strip()
+        if requested_key != cache_key:
+            return {"status": "error", "code": "stale_cache_key", "message": "当前人格已经变化，请重新读取页面"}
+        try:
+            await summarizer.apply_manual_overrides(
+                cache_key,
+                self._normalize_manual_changes(dict(data or {})),
+                expected_timestamp=self._expected_timestamp(data),
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return {"status": "error", "code": "persona_update_failed", "message": str(exc)}
+        return await self.get_persona_slices()
+
+    async def restore_persona_slices(self, data: dict[str, Any]) -> dict[str, Any]:
+        summarizer = self.plugin_api.get_persona_summarizer()
+        if summarizer is None or not hasattr(summarizer, "restore_manual_overrides"):
+            return {"status": "error", "code": "runtime_unavailable", "message": "人格运行时尚未就绪"}
+        cache = await self.plugin_api.read_persona_cache()
+        persona_id = self._resolve_persona_id(self.plugin_api)
+        cache_key, _ = self._select_cache_payload(cache, persona_id)
+        requested_key = str(data.get("cache_key", "") or cache_key).strip()
+        if requested_key != cache_key:
+            return {"status": "error", "code": "stale_cache_key", "message": "当前人格已经变化，请重新读取页面"}
+        raw_fields = data.get("fields", [])
+        if raw_fields is not None and not isinstance(raw_fields, list):
+            return {"status": "error", "code": "invalid_fields", "message": "恢复字段必须是列表"}
+        valid_fields = set(CORE_EDIT_FIELDS) | {f"shards.{name}" for name in SHARD_LABELS}
+        fields = [str(item or "").strip() for item in (raw_fields or []) if str(item or "").strip()]
+        unknown = sorted(set(fields) - valid_fields)
+        if unknown:
+            return {"status": "error", "code": "invalid_fields", "message": "包含未知的恢复字段：" + ", ".join(unknown)}
+        try:
+            await summarizer.restore_manual_overrides(
+                cache_key,
+                fields or None,
+                expected_timestamp=self._expected_timestamp(data),
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return {"status": "error", "code": "persona_restore_failed", "message": str(exc)}
+        return await self.get_persona_slices()
 
     def _resolve_persona_id(self, plugin_api: Any) -> str:
         try:

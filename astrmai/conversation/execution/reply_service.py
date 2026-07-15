@@ -41,6 +41,7 @@ from .text_segmenter import TextSegmenter
 from .reply_artifact_builder import ReplyArtifactMixin
 from .reply_freshness import ReplyFreshnessMixin
 from .reply_post_send import ReplyPostSendMixin
+from .qq_action_dispatcher import QQActionDispatcher
 
 
 class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
@@ -52,6 +53,10 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         self.config = config if config else state_engine.config
         self.runtime_coordinator = runtime_coordinator
         self.memory_engine = memory_engine
+        self.qq_action_dispatcher = QQActionDispatcher(
+            config=self.config,
+            runtime_coordinator=runtime_coordinator,
+        )
 
         self.segmentation_threshold = self.config.reply.segment_min_len
         self.no_segment_limit = self.config.reply.no_segment_max_len
@@ -70,6 +75,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             min_length=self.segmentation_threshold,
             max_length=self.no_segment_limit,
         )
+        self.qq_action_dispatcher.refresh_config(config)
 
     async def handle_reply(
         self,
@@ -130,6 +136,14 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 anchor_event=anchor_event,
             )
             return artifact
+        try:
+            await self.qq_action_dispatcher.commit(
+                event,
+                chat_id,
+                send_key=str(event.get_extra("astrmai_reply_send_key", "") or ""),
+            )
+        except Exception as exc:
+            logger.warning(f"[ReplyService] optional QQ action commit degraded: {exc}")
         await self._sync_native_history_mirror(
             event=event,
             chat_id=chat_id,

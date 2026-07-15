@@ -1294,17 +1294,24 @@ function renderReadonlyText(value, empty = "暂无内容") {
 function renderShardCards(persona = {}) {
   const shards = persona.shards || {};
   const labels = persona.shard_labels || {};
+  const overrides = persona.manual_overrides || {};
   const keys = persona.shard_order || Object.keys(labels).concat(Object.keys(shards)).filter((value, index, array) => array.indexOf(value) === index);
   return `
     <div class="persona-shard-grid">
       ${keys.map((key) => {
         const value = shards[key] || "";
         const ready = String(value || "").trim().length > 0;
+        const overrideKey = `shards.${key}`;
+        const manual = Boolean(overrides[overrideKey]);
         return `
           <article class="persona-shard-card ${ready ? "" : "missing"}">
             <div class="field-head">
-              <strong>${escapeHtml(labels[key] || key)}</strong>
-              <code>${escapeHtml(key)}</code>
+              <div><strong>${escapeHtml(labels[key] || key)}</strong> <code>${escapeHtml(key)}</code></div>
+              <div class="row-actions">
+                ${manual ? statusChip("已人工修改", "ok") : statusChip("AI 生成", "muted")}
+                <button class="ghost-button" data-edit-persona-shard="${attr(key)}" type="button">编辑</button>
+                ${manual ? `<button class="ghost-button" data-restore-persona-field="${attr(overrideKey)}" type="button">恢复</button>` : ""}
+              </div>
             </div>
             ${renderReadonlyText(value, "该切片尚未生成")}
           </article>
@@ -1312,6 +1319,83 @@ function renderShardCards(persona = {}) {
       }).join("") || `<div class="empty-state"><p>暂无切片定义</p></div>`}
     </div>
   `;
+}
+
+async function savePersonaSlices(changes) {
+  const persona = state.cache.personaSlices || {};
+  const updated = await api.post("/persona/slices/update", {
+    cache_key: persona.cache_key || "",
+    expected_timestamp: persona.timestamp || 0,
+    ...changes,
+  });
+  state.cache.personaSlices = updated;
+  renderPersonaSlices();
+  toast("派生人格已保存，下一轮聊天生效");
+}
+
+async function restorePersonaFields(fields = []) {
+  const persona = state.cache.personaSlices || {};
+  const confirmed = await confirmAction(
+    fields.length ? "确认将所选内容恢复为最初的 AI 生成版本？" : "确认恢复全部人工修改？",
+  );
+  if (!confirmed) return;
+  const updated = await api.post("/persona/slices/restore", {
+    cache_key: persona.cache_key || "",
+    expected_timestamp: persona.timestamp || 0,
+    fields,
+  });
+  state.cache.personaSlices = updated;
+  renderPersonaSlices();
+  toast("已恢复 AI 生成版本");
+}
+
+function openPersonaCoreEditor(persona) {
+  openFormModal(
+    "微调核心人格与说话方式",
+    [
+      { name: "summary", label: "核心摘要", type: "textarea", rows: 8 },
+      { name: "first_person_rewrite", label: "第一人称自觉", type: "textarea", rows: 8 },
+      { name: "style", label: "说话方式", type: "textarea", rows: 8 },
+    ],
+    persona,
+    async (data) => {
+      try {
+        const changed = {};
+        ["summary", "first_person_rewrite", "style"].forEach((field) => {
+          if (String(data[field] || "").trim() !== String(persona[field] || "").trim()) changed[field] = data[field];
+        });
+        if (!Object.keys(changed).length) {
+          toast("内容没有变化");
+          return;
+        }
+        await savePersonaSlices(changed);
+      } catch (error) {
+        toast(`保存失败：${error.message || error}`);
+        throw error;
+      }
+    },
+  );
+}
+
+function openPersonaShardEditor(persona, key) {
+  const label = persona.shard_labels?.[key] || key;
+  openFormModal(
+    `微调${label}`,
+    [{ name: "value", label: `${label}切片内容`, type: "textarea", rows: 12 }],
+    { value: persona.shards?.[key] || "" },
+    async (data) => {
+      try {
+        if (String(data.value || "").trim() === String(persona.shards?.[key] || "").trim()) {
+          toast("内容没有变化");
+          return;
+        }
+        await savePersonaSlices({ shards: { [key]: data.value } });
+      } catch (error) {
+        toast(`保存失败：${error.message || error}`);
+        throw error;
+      }
+    },
+  );
 }
 
 function renderPersonaSlices() {
@@ -1344,12 +1428,12 @@ function renderPersonaSlices() {
   const ready = Boolean(persona.is_full_ready);
   const pending = Boolean(persona.pending_task);
   content().innerHTML = `
-    ${pageHeader("角色切片诊断 Persona Slices", "只读查看 AstrMai 从 AstrBot 人格中提炼出的摘要、第一人称自觉与 8 类角色切片。", `<button class="ghost-button" data-persona-slices-json type="button">诊断 JSON</button>`)}
-    ${section("管理边界", "插件页只展示 AstrMai 的角色理解结果；基础配置与原始人格请继续使用 AstrBot 原生页面。", `
+    ${pageHeader("角色理解与微调 Persona Slices", "查看并微调 AstrMai 从 AstrBot 人格中提炼出的核心内容与 8 类角色切片。", `<button class="ghost-button" data-persona-slices-json type="button">诊断 JSON</button>${Object.keys(persona.manual_overrides || {}).length ? `<button class="ghost-button" data-restore-persona-all type="button">恢复全部 AI 版本</button>` : ""}`)}
+    ${section("管理边界", "本页只修改 AstrMai 的派生人格缓存，保存后下一轮聊天生效；不会修改 AstrBot 原始人格或 self-lore。", `
       <div class="chip-row">
         ${statusChip("配置：AstrBot 插件配置页", "muted")}
         ${statusChip("原始人格：AstrBot 人格管理", "muted")}
-        ${statusChip("本页：只读诊断", "ok")}
+        ${statusChip("本页：派生人格微调", "ok")}
       </div>
     `)}
     <div class="grid">
@@ -1359,10 +1443,10 @@ function renderPersonaSlices() {
       ${metric("缓存时间", formatTime(persona.timestamp), "persona_cache 时间戳")}
     </div>
     <div class="grid two">
-      ${section("核心摘要 Summary", "用于压缩长人格，降低即时回复 token 成本。", renderReadonlyText(summary))}
-      ${section("第一人称自觉 First Person Rewrite", "ContextEngine 优先使用这段短自述来稳定扮演视角。", renderReadonlyText(firstPerson))}
+      ${section("核心摘要 Summary", `用于压缩长人格，降低即时回复 token 成本。${persona.manual_overrides?.summary ? " 当前为人工版本。" : ""}`, renderReadonlyText(summary), persona.manual_overrides?.summary ? `<button class="ghost-button" data-restore-persona-field="summary" type="button">恢复</button>` : "")}
+      ${section("第一人称自觉 First Person Rewrite", `ContextEngine 优先使用这段短自述来稳定扮演视角。${persona.manual_overrides?.first_person_rewrite ? " 当前为人工版本。" : ""}`, renderReadonlyText(firstPerson), persona.manual_overrides?.first_person_rewrite ? `<button class="ghost-button" data-restore-persona-field="first_person_rewrite" type="button">恢复</button>` : "")}
     </div>
-    ${section("风格指南 Style", "由 PersonaSummarizer 提炼，不直接等同原始人格 prompt。", renderReadonlyText(style))}
+    ${section("风格指南 Style", `每轮用于约束说话方式，不直接等同原始人格 prompt。${persona.manual_overrides?.style ? " 当前为人工版本。" : ""}`, renderReadonlyText(style), `<button class="primary-button" data-edit-persona-core type="button">编辑核心内容与说话方式</button>${persona.manual_overrides?.style ? `<button class="ghost-button" data-restore-persona-field="style" type="button">恢复</button>` : ""}`)}
     ${section("八维角色切片", "CognitiveLoop 可按 retrieve_keys 临时加载这些切片；缺失时不会阻断聊天。", renderShardCards(persona))}
     ${section("自我原典与缓存", "self_lore 是长期记忆中的角色原典索引，本页不展示原文，只展示安全摘要。", `
       <div class="chip-row">
@@ -1373,6 +1457,10 @@ function renderPersonaSlices() {
     `)}
   `;
   $('[data-persona-slices-json]')?.addEventListener("click", () => openModal("Persona Slices Diagnostic", `<pre>${json(state.cache.personaSlices || {})}</pre>`));
+  $('[data-edit-persona-core]')?.addEventListener("click", () => openPersonaCoreEditor(persona));
+  $$('[data-edit-persona-shard]').forEach((button) => button.addEventListener("click", () => openPersonaShardEditor(persona, button.dataset.editPersonaShard)));
+  $$('[data-restore-persona-field]').forEach((button) => button.addEventListener("click", () => restorePersonaFields([button.dataset.restorePersonaField]).catch((error) => toast(`恢复失败：${error.message || error}`))));
+  $('[data-restore-persona-all]')?.addEventListener("click", () => restorePersonaFields().catch((error) => toast(`恢复失败：${error.message || error}`)));
 }
 
 async function loadCurrent() {

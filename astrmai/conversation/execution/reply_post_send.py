@@ -210,6 +210,8 @@ class ReplyPostSendMixin:
         anchor_event: AstrMessageEvent | None,
     ) -> None:
         tag, force_meme_flag = self._resolve_post_send_tag(bypassed_tag)
+        if hasattr(event, "get_extra") and event.get_extra("astrmai_force_meme", False):
+            force_meme_flag = True
         is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
         try:
             await self.state_engine.atomic_update_mood(chat_id, delta=0.0 if not bypassed_tag else (0.1 if tag == "happy" else -0.1 if tag in ["sad", "angry"] else 0.0))

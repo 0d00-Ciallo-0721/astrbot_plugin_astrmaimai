@@ -50,6 +50,9 @@ class _ClaimingRuntimeCoordinator:
     async def mark_send_failed(self, chat_id, send_key, error=""):
         self.commits.append((chat_id, send_key, [f"failed:{error}"]))
 
+    async def get_latest_committed_outbound(self, _chat_id, *, exclude_send_key=""):
+        return ["previous-message"]
+
 
 async def _noop_post_send(*args, **kwargs):
     return None
@@ -268,6 +271,77 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         claim_records = [item for item in trace_log if str(item.get("stage", "")).startswith("reply.")]
         self.assertNotIn("first answer", str(claim_records))
         self.assertNotIn("duplicate answer", str(claim_records))
+
+    def test_qq_action_is_committed_only_after_visible_reply_send(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        coordinator = _ClaimingRuntimeCoordinator()
+        order = []
+
+        async def _send_message(_umo, _chain):
+            order.append("reply")
+            return "reply-message"
+
+        class _Api:
+            async def call_action(self, action, **kwargs):
+                order.append(action)
+                return {"status": "ok"}
+
+        state_engine.gateway.context.send_message = _send_message
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        event.bot = SimpleNamespace(api=_Api())
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=1,
+            ),
+        )
+        event.set_extra("astrmai_pending_actions", [{"action": "group_sign", "group_id": "group-1"}])
+
+        asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
+
+        self.assertEqual(order, ["reply", "set_group_sign"])
+        self.assertEqual(event.get_extra("astrmai_qq_action_results")[0]["status"], "success")
+
+    def test_boolean_context_send_result_is_not_recorded_as_message_id(self):
+        from astrmai.conversation.contracts.turn_identity import TurnIdentity
+
+        state_engine = FakeStateEngine()
+        coordinator = _ClaimingRuntimeCoordinator()
+
+        async def _send_message(_umo, _chain):
+            return True
+
+        state_engine.gateway.context.send_message = _send_message
+        engine = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            runtime_coordinator=coordinator,
+        )
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_turn_identity",
+            TurnIdentity(
+                mode="group",
+                chat_id=event.unified_msg_origin,
+                thread_id=event.unified_msg_origin,
+                generation=1,
+            ),
+        )
+
+        asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
+
+        self.assertEqual(coordinator.commits[0][2], [])
+        self.assertEqual(event.get_extra("astrmai_reply_outbound_message_ids", []), [])
 
     def test_send_claim_flag_off_preserves_legacy_duplicate_send_path(self):
         from astrmai.conversation.contracts.turn_identity import TurnIdentity

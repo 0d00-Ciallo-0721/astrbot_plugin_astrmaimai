@@ -27,6 +27,7 @@ class PersonaSummarizer:
         "values",
         "secrets",
     )
+    MANUAL_CORE_FIELDS = ("summary", "first_person_rewrite", "style")
 
     def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None, memory_engine=None):
         self.persistence = persistence
@@ -43,6 +44,7 @@ class PersonaSummarizer:
         self._verified_core_hashes: Dict[str, str] = {}
         self._closed = False
         self._lock = asyncio.Lock()
+        self._manual_update_lock = asyncio.Lock()
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None)
 
     def refresh_config(self, config) -> None:
@@ -245,6 +247,194 @@ class PersonaSummarizer:
     def _cache_key(self, persona_id: str, session_id: str) -> str:
         normalized = str(persona_id or "").strip()
         return normalized or f"session_{session_id}"
+
+    @classmethod
+    def _manual_generated_snapshot(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        shards = payload.get("shards", {}) if isinstance(payload.get("shards", {}), dict) else {}
+        return {
+            **{field: str(payload.get(field, "") or "") for field in cls.MANUAL_CORE_FIELDS},
+            "shards": {name: str(shards.get(name, "") or "") for name in cls.REQUIRED_SHARDS},
+        }
+
+    def _refresh_manual_readiness(self, payload: Dict[str, Any]) -> bool:
+        core_components = payload.get("core_components", {})
+        if not isinstance(core_components, dict):
+            core_components = {}
+            payload["core_components"] = core_components
+        core_ready = all(
+            core_components.get(field) == "completed" and bool(str(payload.get(field, "") or "").strip())
+            for field in self.MANUAL_CORE_FIELDS
+        )
+        payload["core_ready"] = core_ready
+
+        shards = payload.get("shards", {})
+        shard_status = payload.get("shard_status", {})
+        if not isinstance(shards, dict):
+            shards = {}
+            payload["shards"] = shards
+        if not isinstance(shard_status, dict):
+            shard_status = {}
+            payload["shard_status"] = shard_status
+        shards_ready = bool(payload.get("shards_not_required", False)) or all(
+            shard_status.get(name) == "completed" and bool(str(shards.get(name, "") or "").strip())
+            for name in self.REQUIRED_SHARDS
+        )
+        include_self_lore = bool(
+            getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False)
+        )
+        self_lore_ready = not include_self_lore or bool(payload.get("self_lore_ready", False))
+        payload["is_full_ready"] = bool(core_ready and shards_ready and self_lore_ready)
+        payload["persona_state"] = "full_ready" if payload["is_full_ready"] else ("core_ready" if core_ready else "enriching")
+        return bool(core_ready and not payload["is_full_ready"] and not payload.get("shards_not_required", False))
+
+    async def _cancel_shard_task_for_manual_update(self, cache_key: str) -> None:
+        stale_task = None
+        async with self._lock:
+            core_task = self.pending_core_tasks.get(cache_key)
+            if core_task is not None and not core_task.done():
+                raise RuntimeError("persona core is still being generated")
+            self._cache_generations[cache_key] = self._cache_generations.get(cache_key, 0) + 1
+            stale_task = self.pending_tasks.pop(cache_key, None)
+        if stale_task is not None and not stale_task.done():
+            stale_task.cancel()
+            await asyncio.gather(stale_task, return_exceptions=True)
+
+    @staticmethod
+    def _check_manual_timestamp(payload: Dict[str, Any], expected_timestamp: float | None) -> None:
+        if expected_timestamp is None:
+            return
+        current = float(payload.get("timestamp", 0.0) or 0.0)
+        if abs(current - float(expected_timestamp)) > 1e-6:
+            raise RuntimeError("persona cache changed; reload before saving")
+
+    async def apply_manual_overrides(
+        self,
+        cache_key: str,
+        changes: Dict[str, Any],
+        *,
+        expected_timestamp: float | None = None,
+    ) -> Dict[str, Any]:
+        clean_key = str(cache_key or "").strip()
+        if not clean_key:
+            raise ValueError("persona cache key is required")
+        async with self._manual_update_lock:
+            async with self._lock:
+                payload = self.cache.get(clean_key)
+                if not isinstance(payload, dict):
+                    raise ValueError("persona cache was not found")
+                self._check_manual_timestamp(payload, expected_timestamp)
+            await self._cancel_shard_task_for_manual_update(clean_key)
+
+            resume_enrichment = False
+            original_prompt = ""
+            async with self._lock:
+                payload = self.cache.get(clean_key)
+                if not isinstance(payload, dict):
+                    raise ValueError("persona cache was not found")
+                self._check_manual_timestamp(payload, expected_timestamp)
+                payload.setdefault("generated_baseline", self._manual_generated_snapshot(payload))
+                overrides = payload.get("manual_overrides", {})
+                if not isinstance(overrides, dict):
+                    overrides = {}
+                now = time.time()
+                core_components = payload.setdefault("core_components", {})
+                for field in self.MANUAL_CORE_FIELDS:
+                    if field not in changes:
+                        continue
+                    payload[field] = str(changes[field])
+                    core_components[field] = "completed"
+                    overrides[field] = {"source": "plugin_page", "updated_at": now}
+
+                changed_shards = changes.get("shards", {})
+                shards = payload.setdefault("shards", {})
+                shard_status = payload.setdefault("shard_status", {})
+                for name, value in changed_shards.items():
+                    shards[name] = str(value)
+                    shard_status[name] = "completed"
+                    overrides[f"shards.{name}"] = {"source": "plugin_page", "updated_at": now}
+
+                payload["manual_overrides"] = overrides
+                payload["manual_revision"] = int(payload.get("manual_revision", 0) or 0) + 1
+                payload["manual_updated_at"] = now
+                payload["timestamp"] = now
+                original_prompt = str(payload.get("raw", "") or "")
+                resume_enrichment = self._refresh_manual_readiness(payload)
+                await self._persist_cache(strict=True)
+                result = copy.deepcopy(payload)
+
+            if resume_enrichment and original_prompt and not self._closed:
+                self._start_shard_task(original_prompt, clean_key)
+            return result
+
+    async def restore_manual_overrides(
+        self,
+        cache_key: str,
+        fields: list[str] | None = None,
+        *,
+        expected_timestamp: float | None = None,
+    ) -> Dict[str, Any]:
+        clean_key = str(cache_key or "").strip()
+        if not clean_key:
+            raise ValueError("persona cache key is required")
+        async with self._manual_update_lock:
+            async with self._lock:
+                payload = self.cache.get(clean_key)
+                if not isinstance(payload, dict):
+                    raise ValueError("persona cache was not found")
+                self._check_manual_timestamp(payload, expected_timestamp)
+            await self._cancel_shard_task_for_manual_update(clean_key)
+
+            resume_enrichment = False
+            original_prompt = ""
+            async with self._lock:
+                payload = self.cache.get(clean_key)
+                if isinstance(payload, dict):
+                    self._check_manual_timestamp(payload, expected_timestamp)
+                baseline = payload.get("generated_baseline", {}) if isinstance(payload, dict) else {}
+                overrides = payload.get("manual_overrides", {}) if isinstance(payload, dict) else {}
+                if not isinstance(payload, dict) or not isinstance(baseline, dict) or not isinstance(overrides, dict):
+                    raise ValueError("no generated persona baseline is available")
+                requested = [str(item or "").strip() for item in (fields or list(overrides)) if str(item or "").strip()]
+                if not requested:
+                    raise ValueError("no manual persona fields were selected")
+
+                core_components = payload.setdefault("core_components", {})
+                shards = payload.setdefault("shards", {})
+                shard_status = payload.setdefault("shard_status", {})
+                baseline_shards = baseline.get("shards", {}) if isinstance(baseline.get("shards", {}), dict) else {}
+                for field in requested:
+                    if field in self.MANUAL_CORE_FIELDS and field in baseline:
+                        payload[field] = str(baseline.get(field, "") or "")
+                        core_components[field] = "completed" if str(payload[field]).strip() else "pending"
+                        overrides.pop(field, None)
+                    elif field.startswith("shards."):
+                        name = field.split(".", 1)[1]
+                        if name not in self.REQUIRED_SHARDS:
+                            continue
+                        restored = str(baseline_shards.get(name, "") or "")
+                        if restored:
+                            shards[name] = restored
+                            shard_status[name] = "completed"
+                        else:
+                            shards.pop(name, None)
+                            shard_status.pop(name, None)
+                        overrides.pop(field, None)
+
+                now = time.time()
+                payload["manual_overrides"] = overrides
+                if not overrides:
+                    payload.pop("generated_baseline", None)
+                payload["manual_revision"] = int(payload.get("manual_revision", 0) or 0) + 1
+                payload["manual_updated_at"] = now
+                payload["timestamp"] = now
+                original_prompt = str(payload.get("raw", "") or "")
+                resume_enrichment = self._refresh_manual_readiness(payload)
+                await self._persist_cache(strict=True)
+                result = copy.deepcopy(payload)
+
+            if resume_enrichment and original_prompt and not self._closed:
+                self._start_shard_task(original_prompt, clean_key)
+            return result
 
     def _core_cache_is_ready(self, payload: Dict[str, Any], original_prompt: str) -> bool:
         if not isinstance(payload, dict):
