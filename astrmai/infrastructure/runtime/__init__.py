@@ -2,6 +2,8 @@ from importlib import import_module
 
 _EXPORTS = {
     "ChatRuntimeCoordinator": ".chat_runtime_coordinator",
+    "CrossSessionHandoff": ".cross_session_handoff_store",
+    "CrossSessionHandoffStore": ".cross_session_handoff_store",
     "EventBus": ".event_bus",
     "FailureKind": ".runtime_contracts",
     "HostBridge": ".host_bridge",

@@ -62,15 +62,17 @@ class _FakeMessageChain:
 
 
 class _FakeAstrContext:
-    def __init__(self, *, send_exc=None):
+    def __init__(self, *, send_exc=None, send_result=None):
         self.shared_dict = {}
         self.sent = []
         self.send_exc = send_exc
+        self.send_result = send_result
 
     async def send_message(self, umo, chain):
         if self.send_exc is not None:
             raise self.send_exc
         self.sent.append((umo, chain.text))
+        return self.send_result
 
 
 def _wrap_event(event, astr_ctx=None):
@@ -242,6 +244,86 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             "default:FriendMessage:123",
         )
 
+    def test_space_transition_uses_runtime_handoff_store_without_shared_dict(self):
+        store_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.cross_session_handoff_store"
+        )
+        store = store_mod.CrossSessionHandoffStore()
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+        event.bot.api = _FakeApi(result=[{"user_id": "1481314186", "nickname": "萤"}])
+        astr_ctx = _FakeAstrContext()
+        del astr_ctx.shared_dict
+
+        async def _run():
+            with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+                result = await self.mod.SpaceTransitionTool(
+                    handoff_store=store
+                ).call(
+                    _wrap_event(event, astr_ctx),
+                    target_name="1481314186",
+                    message="和妃爱聊天开不开心？",
+                    context_summary="恸委托我询问萤的聊天感受。",
+                    delivery_mode="relay",
+                )
+            handoff = await store.peek_for_recipient("default", "1481314186")
+            return result, handoff
+
+        result, handoff = asyncio.run(_run())
+
+        self.assertIn("发送成功", result)
+        self.assertIsNotNone(handoff)
+        self.assertEqual(handoff.source_sender_id, "516779421")
+        self.assertEqual(handoff.source_sender_name, "恸")
+        self.assertEqual(handoff.target_id, "1481314186")
+
+    def test_space_transition_treats_false_send_result_as_failure(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+        event.bot.api = _FakeApi(result=[{"user_id": "1481314186", "nickname": "萤"}])
+        astr_ctx = _FakeAstrContext(send_result=False)
+
+        with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+            result = asyncio.run(
+                self.mod.SpaceTransitionTool().call(
+                    _wrap_event(event, astr_ctx),
+                    target_name="1481314186",
+                    message="测试消息",
+                    context_summary="验证发送失败不会被报告为成功。",
+                    delivery_mode="relay",
+                )
+            )
+
+        self.assertIn("发送失败", result)
+        self.assertNotIn("发送成功", result)
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace")[-1]["status"],
+            "failed",
+        )
+
+    def test_space_transition_blocks_stale_turn_before_sending(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+        event.bot.api = _FakeApi(result=[{"user_id": "1481314186", "nickname": "萤"}])
+        astr_ctx = _FakeAstrContext()
+
+        class _Coordinator:
+            async def is_current_turn(self, turn):
+                return False
+
+        with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+            result = asyncio.run(
+                self.mod.SpaceTransitionTool(
+                    runtime_coordinator=_Coordinator()
+                ).call(
+                    _wrap_event(event, astr_ctx),
+                    target_name="1481314186",
+                    message="测试消息",
+                    context_summary="验证过期请求不会产生跨会话副作用。",
+                    delivery_mode="relay",
+                )
+            )
+
+        self.assertIn("请求已经过期", result)
+        self.assertEqual(astr_ctx.sent, [])
+
     def test_space_transition_reports_missing_friend_in_origin_session(self):
         event = _FakeEvent(group_id="777")
         event.bot.api = _FakeApi(result=[{"user_id": "456", "nickname": "Bob"}])
@@ -357,6 +439,61 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("不在当前群聊", result)
         self.assertEqual(api.calls, [])
+
+    def test_proactive_poke_accepts_current_private_sender_name(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+
+        class _DbService:
+            async def resolve_entity_spatio_temporal(self, **kwargs):
+                raise AssertionError("current private sender should not require database resolution")
+
+        tool = self.mod.ProactivePokeTool(db_service=_DbService())
+        result = asyncio.run(tool.call(_wrap_event(event), target_name="恸"))
+
+        self.assertIn("加入待执行动作", result)
+        action = event.get_extra("astrmai_pending_actions")[0]
+        self.assertEqual(action["target_id"], "516779421")
+        self.assertEqual(action["group_id"], "")
+
+    def test_proactive_poke_accepts_current_private_sender_id(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+        tool = self.mod.ProactivePokeTool(db_service=None)
+
+        result = asyncio.run(tool.call(_wrap_event(event), target_name="516779421"))
+
+        self.assertIn("加入待执行动作", result)
+        self.assertEqual(
+            event.get_extra("astrmai_pending_actions")[0]["target_id"],
+            "516779421",
+        )
+
+    def test_proactive_poke_accepts_private_session_scope_from_resolver(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+
+        class _DbService:
+            async def resolve_entity_spatio_temporal(self, **kwargs):
+                return "516779421", event.unified_msg_origin
+
+        tool = self.mod.ProactivePokeTool(db_service=_DbService())
+        result = asyncio.run(tool.call(_wrap_event(event), target_name="当前聊天对象"))
+
+        self.assertIn("加入待执行动作", result)
+        self.assertEqual(
+            event.get_extra("astrmai_pending_actions")[0]["group_id"],
+            "",
+        )
+
+    def test_proactive_poke_defaults_to_current_private_sender(self):
+        event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
+        tool = self.mod.ProactivePokeTool(db_service=None)
+
+        result = asyncio.run(tool.call(_wrap_event(event)))
+
+        self.assertIn("加入待执行动作", result)
+        self.assertEqual(
+            event.get_extra("astrmai_pending_actions")[0]["target_id"],
+            "516779421",
+        )
 
     def test_proactive_poke_rejects_private_arbitrary_numeric_target(self):
         event = _FakeEvent(group_id=None, sender_id="user-1", sender_name="Alice")

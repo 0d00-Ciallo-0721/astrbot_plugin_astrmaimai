@@ -308,12 +308,25 @@ class PluginLifecycleManager:
         self.runtime.set_boot_phase("shutdown.start")
 
         try:
+            coordinator = getattr(self.runtime, "runtime_coordinator", None)
+            shutdown = getattr(coordinator, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    await shutdown()
+                except Exception as exc:
+                    logger.warning(f"[AstrMai] Runtime coordinator shutdown degraded: {exc}")
             await self._terminate_impl()
         finally:
-            # ponytail: clear ChatRuntimeCoordinator states to free memory
             coordinator = getattr(self.runtime, "runtime_coordinator", None)
             if coordinator and hasattr(coordinator, "_states"):
                 coordinator._states.clear()
+            handoff_store = getattr(self.runtime, "cross_session_handoff_store", None)
+            clear_handoffs = getattr(handoff_store, "clear", None)
+            if callable(clear_handoffs):
+                try:
+                    await clear_handoffs()
+                except Exception as exc:
+                    logger.warning(f"[AstrMai] Cross-session handoff cleanup degraded: {exc}")
             self._reset_runtime_status_flags()
             self.runtime.set_boot_phase("shutdown.complete")
 

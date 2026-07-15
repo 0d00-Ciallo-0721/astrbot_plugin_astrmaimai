@@ -129,6 +129,7 @@ class PluginRuntimeContext:
     runtime_coordinator: Any
     host_bridge: Any
     chat_loop_kernel: Any = None
+    cross_session_handoff_store: Any = None
     infrastructure_settings: InfrastructureSettings = field(
         default_factory=InfrastructureSettings
     )
@@ -494,6 +495,7 @@ def export_legacy_attrs(runtime: PluginRuntimeContext) -> dict[str, Any]:
         "config": runtime.config,
         "_background_tasks": runtime.background_tasks,
         "runtime_coordinator": runtime.runtime_coordinator,
+        "cross_session_handoff_store": runtime.cross_session_handoff_store,
         "host_bridge": runtime.host_bridge,
     }
     for name in LEGACY_RUNTIME_ATTRS:

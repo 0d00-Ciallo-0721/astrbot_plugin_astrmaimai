@@ -14,6 +14,8 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
 
+from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoff
+from ....presentation.dto.message_scope import MessageScope
 from ...contracts.qq_action import PendingQQAction
 from ..tool_contracts import record_tool_lifecycle
 
@@ -599,32 +601,46 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
         astr_ctx = context.context.context
+        scope = MessageScope.from_event(current_event)
         target_name = str(kwargs.get("target_name", "") or "").strip()
         target_id: Optional[str] = None
-        group_id = current_event.get_group_id()
+        group_id = scope.group_id
         display_name = target_name or (current_event.get_sender_name() or "当前用户")
 
         if target_name:
-            resolved = await _resolve_target(
-                self.db_service,
-                target_name=target_name,
-                current_event=current_event,
-                astr_ctx=astr_ctx,
-            )
-            if not resolved:
-                return f"动作取消：当前上下文里无法锁定 {target_name}。"
-            target_id, resolved_group_id = resolved
-            current_group_id = str(group_id or "").strip()
+            clean_target = target_name.lstrip("@").strip()
+            current_sender_aliases = {
+                str(scope.sender_id or "").strip().casefold(),
+                str(current_event.get_sender_name() or "").strip().casefold(),
+            }
+            if scope.is_private_chat and clean_target.casefold() in current_sender_aliases:
+                target_id = scope.sender_id
+                resolved_group_id = None
+            else:
+                resolved = await _resolve_target(
+                    self.db_service,
+                    target_name=target_name,
+                    current_event=current_event,
+                    astr_ctx=astr_ctx,
+                )
+                if not resolved:
+                    return f"动作取消：当前上下文里无法锁定 {target_name}。"
+                target_id, resolved_group_id = resolved
+            current_group_id = str(scope.group_id or "").strip()
             resolved_group_id = str(resolved_group_id or "").strip()
-            if current_group_id:
+            if scope.is_group_chat:
                 if resolved_group_id and resolved_group_id != current_group_id:
                     return f"动作取消：{target_name} 不在当前群聊上下文里。"
             else:
-                current_peer_id = str(current_event.get_sender_id() or "").strip()
-                if resolved_group_id or str(target_id or "").strip() != current_peer_id:
+                current_peer_id = str(scope.sender_id or "").strip()
+                valid_private_scopes = {"", str(scope.umo or "").strip()}
+                if (
+                    resolved_group_id not in valid_private_scopes
+                    or str(target_id or "").strip() != current_peer_id
+                ):
                     return f"动作取消：{target_name} 不在当前私聊上下文里。"
         else:
-            target_id = str(current_event.get_sender_id())
+            target_id = scope.sender_id
 
         if target_id == str(current_event.get_self_id()):
             return "动作取消：不能戳自己。"
@@ -856,6 +872,8 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
         "目标必须是机器人好友；发送失败时必须把工具错误如实告诉当前发起会话，不得声称发送成功。"
     )
     db_service: Any = Field(default=None, exclude=True)
+    handoff_store: Any = Field(default=None, exclude=True)
+    runtime_coordinator: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -943,31 +961,90 @@ class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
             _record_tool_execution(current_event, self.name, status="failed")
             return "发送失败：AstrBot 跨会话发送接口不可用，消息未发送。"
 
+        if self.runtime_coordinator is not None:
+            turn = current_event.get_extra("astrmai_turn_identity", None)
+            try:
+                is_current = await self.runtime_coordinator.is_current_turn(turn)
+            except Exception as exc:
+                logger.warning(
+                    "[SpaceTransitionTool] turn freshness check failed: %s",
+                    exc,
+                )
+                is_current = False
+            if not is_current:
+                _record_tool_execution(current_event, self.name, status="failed")
+                return "发送取消：当前请求已经过期或插件正在重载，消息未发送。"
+
         try:
-            await astr_ctx.send_message(target_umo, MessageChain().message(outbound_message))
+            send_result = await astr_ctx.send_message(
+                target_umo,
+                MessageChain().message(outbound_message),
+            )
         except Exception as exc:
             logger.warning(f"[SpaceTransitionTool] cross-session send failed: {exc}")
             _record_tool_execution(current_event, self.name, status="failed")
             return f"发送失败：向 {display_name} 的私聊发送时出错：{exc}。"
+        if send_result is False:
+            logger.warning(
+                "[SpaceTransitionTool] cross-session send returned false target=%s",
+                target_id,
+            )
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"发送失败：AstrBot 未能把消息送入 {display_name} 的私聊，消息未发送。"
 
         sends.append({"target_id": target_id, "target_umo": target_umo, "message": outbound_message})
         current_event.set_extra("astrmai_cross_session_sends", sends[-8:])
-        shared_dict = getattr(astr_ctx, "shared_dict", None)
-        if isinstance(shared_dict, dict):
-            jumps = dict(shared_dict.get("astrmai_space_jumps", {}) or {})
-            jumps[target_id] = {
-                "timestamp": time.time(),
-                "source_umo": source_umo,
-                "group_id": str(current_event.get_group_id() or ""),
-                "source_sender_id": str(current_event.get_sender_id() or ""),
-                "source_sender_name": source_sender_name,
-                "target_id": target_id,
-                "target_name": display_name,
-                "private_message": outbound_message,
-                "context_summary": context_summary,
-                "delivery_mode": delivery_mode,
-            }
-            shared_dict["astrmai_space_jumps"] = jumps
+        if self.handoff_store is not None:
+            try:
+                handoff = CrossSessionHandoff(
+                    platform_id=platform_id,
+                    source_umo=source_umo,
+                    source_sender_id=str(current_event.get_sender_id() or ""),
+                    source_sender_name=source_sender_name,
+                    target_umo=target_umo,
+                    target_id=target_id,
+                    target_name=display_name,
+                    outbound_message=outbound_message,
+                    context_summary=context_summary,
+                    delivery_mode=delivery_mode,
+                )
+                await self.handoff_store.put(handoff)
+                if delivery_mode == "relay":
+                    await self.handoff_store.complete_for_recipient(
+                        platform_id,
+                        str(current_event.get_sender_id() or ""),
+                    )
+                logger.info(
+                    "[SpaceTransitionTool] handoff stored id=%s target=%s",
+                    handoff.handoff_id,
+                    target_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[SpaceTransitionTool] message delivered but handoff storage failed: %s",
+                    exc,
+                )
+        else:
+            shared_dict = getattr(astr_ctx, "shared_dict", None)
+            if isinstance(shared_dict, dict):
+                jumps = dict(shared_dict.get("astrmai_space_jumps", {}) or {})
+                jumps[target_id] = {
+                    "timestamp": time.time(),
+                    "source_umo": source_umo,
+                    "group_id": str(current_event.get_group_id() or ""),
+                    "source_sender_id": str(current_event.get_sender_id() or ""),
+                    "source_sender_name": source_sender_name,
+                    "target_id": target_id,
+                    "target_name": display_name,
+                    "private_message": outbound_message,
+                    "context_summary": context_summary,
+                    "delivery_mode": delivery_mode,
+                }
+                shared_dict["astrmai_space_jumps"] = jumps
+            else:
+                logger.warning(
+                    "[SpaceTransitionTool] message delivered without cross-session handoff store"
+                )
         _record_tool_execution(current_event, self.name)
         confirmation = origin_reply or f"我已经把消息发给 {display_name} 了。"
         return f"发送成功：消息已进入 {display_name} 的私聊会话。请在当前发起会话中自然确认：{confirmation}"

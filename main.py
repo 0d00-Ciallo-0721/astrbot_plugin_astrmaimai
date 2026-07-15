@@ -18,6 +18,7 @@ try:
     from .astrmai.app import PluginFacade, build_runtime_context, export_legacy_attrs
     from .astrmai.presentation.commands import handle_mai_help, handle_work_mode
     from .astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
+    from .astrmai.infrastructure.runtime.handler_binding_compat import repair_plugin_handler_bindings
     from .astrmai.webui.plugin_pages import register_astrmai_admin_pages
 except ImportError:
     if __package__:
@@ -26,6 +27,7 @@ except ImportError:
     from astrmai.app import PluginFacade, build_runtime_context, export_legacy_attrs
     from astrmai.presentation.commands import handle_mai_help, handle_work_mode
     from astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
+    from astrmai.infrastructure.runtime.handler_binding_compat import repair_plugin_handler_bindings
     from astrmai.webui.plugin_pages import register_astrmai_admin_pages
 
 
@@ -99,6 +101,12 @@ class AstrMaiPlugin(Star):
 
     async def initialize(self) -> None:
         """Start the runtime whenever AstrBot activates or hot-reloads the plugin."""
+        repair = repair_plugin_handler_bindings(self, __name__)
+        if repair.nested_binding_count:
+            logger.warning(
+                "[AstrMai] repaired %s nested AstrBot handler binding(s) before startup",
+                repair.nested_binding_count,
+            )
         await self._ensure_runtime_started("plugin_initialize")
 
     async def _ensure_runtime_started(self, source: str) -> None:

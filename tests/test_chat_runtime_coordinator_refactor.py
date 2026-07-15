@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import time
 import unittest
+from types import SimpleNamespace
 
 
 class ChatRuntimeCoordinatorRefactorTests(unittest.TestCase):
@@ -57,6 +58,38 @@ class ChatRuntimeCoordinatorRefactorTests(unittest.TestCase):
         self.assertEqual(snapshot["latest_activity_preview"], "second")
         self.assertEqual(snapshot["latest_activity_thread_signature"], "thread-a")
         self.assertEqual(snapshot["recent_activity_count"], 2)
+
+    def test_shutdown_cancels_active_turns_and_rejects_late_results(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+
+        async def _run():
+            generation = await coordinator.advance_generation("chat-1", "thread-1")
+            turn = SimpleNamespace(
+                chat_id="chat-1",
+                thread_id="thread-1",
+                generation=generation,
+            )
+            started = asyncio.Event()
+
+            async def _worker():
+                started.set()
+                await asyncio.sleep(60)
+
+            task = asyncio.create_task(_worker())
+            self.assertTrue(await coordinator.register_turn_task(turn, task))
+            await started.wait()
+            cancelled_count = await coordinator.shutdown()
+            return cancelled_count, task, await coordinator.is_current_turn(turn)
+
+        cancelled_count, task, is_current = asyncio.run(_run())
+
+        self.assertEqual(cancelled_count, 1)
+        self.assertTrue(task.cancelled())
+        self.assertFalse(is_current)
+        self.assertEqual(coordinator._states, {})
 
 
 if __name__ == "__main__":

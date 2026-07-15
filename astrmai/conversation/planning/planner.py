@@ -64,6 +64,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         prompt_refiner=None,
         sys3_router=None,
         runtime_coordinator=None,
+        cross_session_handoff_store=None,
         cognitive_loop=None,
     ):
         self.gateway = gateway
@@ -76,6 +77,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.sys3_router = sys3_router
         self.context = context
         self.runtime_coordinator = runtime_coordinator
+        self.cross_session_handoff_store = cross_session_handoff_store
         self.agency_runtime = AgencyRuntimeStore()
         self.agency_reflection_bridge = AgencyReflectionBridge(memory_engine)
         self.conversation_continuity = ConversationContinuityStore()

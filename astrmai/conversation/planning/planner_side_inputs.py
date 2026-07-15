@@ -304,9 +304,21 @@ class PlannerSideInputMixin:
             for family, keywords in self.GENERAL_EXPLICIT_TOOL_KEYWORDS.items()
             if any(keyword in message or keyword in lowered for keyword in keywords)
         )
-        if re.search(r"(?:帮我|替我|麻烦你)?给.{1,40}(?:发(?:一条)?消息|说一声|告诉)", message):
+        if self._looks_like_cross_session_relay_request(message):
             families.add("private")
         return families
+
+    @staticmethod
+    def _looks_like_cross_session_relay_request(message: str) -> bool:
+        text = str(message or "").strip()
+        if not text:
+            return False
+        patterns = (
+            r"^(?:(?:帮我|替我|麻烦你|请你|你去|去)[，, ]*)?(?:给|向|跟).{1,40}?(?:发(?:个|一条)?消息|问问|问一下|说一声|说|告诉|转告|带话)",
+            r"^(?:帮我|替我|麻烦你|请你|你去|去)[，, ]*(?:问问|问一下|询问|联系)(?:你(?:的)?好友|好友|朋友|联系人|\d{5,12}|(?!我(?:们|的)?|你).{1,20})",
+            r"^(?:帮我|替我|麻烦你|请你)[，, ]*(?:告诉|转告)(?!我(?:们|的)?|你).{1,30}",
+        )
+        return any(re.search(pattern, text) for pattern in patterns)
 
     def _explicit_qq_action_families(self, event: AstrMessageEvent) -> set[str]:
         message = str(getattr(event, "message_str", "") or "").strip()
@@ -379,7 +391,11 @@ class PlannerSideInputMixin:
             ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
             MemeResonanceTool(),
             TopicHijackTool(),
-            SpaceTransitionTool(db_service=self.context_engine.db),
+            SpaceTransitionTool(
+                db_service=self.context_engine.db,
+                handoff_store=getattr(self, "cross_session_handoff_store", None),
+                runtime_coordinator=getattr(self, "runtime_coordinator", None),
+            ),
             RegretAndWithdrawTool(),
             MessageReactionTool(),
             MessageEmojiLikeTool(),
@@ -404,7 +420,11 @@ class PlannerSideInputMixin:
                 ProactiveLikeTool(db_service=self.context_engine.db),
                 ProactivePokeTool(db_service=self.context_engine.db),
                 ConstructAtEventTool(db_service=self.context_engine.db),
-                SpaceTransitionTool(db_service=self.context_engine.db),
+                SpaceTransitionTool(
+                    db_service=self.context_engine.db,
+                    handoff_store=getattr(self, "cross_session_handoff_store", None),
+                    runtime_coordinator=getattr(self, "runtime_coordinator", None),
+                ),
             ]
         elif self._has_guarded_chat_intent(event):
             tools.extend(
@@ -804,19 +824,47 @@ class PlannerSideInputMixin:
         *,
         prompt_envelope: PromptEnvelope | None,
     ) -> None:
-        if event.get_group_id() or not ctx:
+        if event.get_group_id() or not isinstance(prompt_envelope, PromptEnvelope):
             return
-        shared_dict = getattr(ctx, "shared_dict", {})
-        jumps = shared_dict.get("astrmai_space_jumps", {})
         sender_id = str(user_id)
-        if sender_id not in jumps:
+        source_umo = str(getattr(event, "unified_msg_origin", "") or "")
+        platform_id = source_umo.split(":", 1)[0] if ":" in source_umo else "default"
+        handoff_store = getattr(self, "cross_session_handoff_store", None)
+        handoff_id = ""
+        jumps = None
+        jump_info = None
+        if handoff_store is not None:
+            try:
+                handoff = await handoff_store.peek_for_recipient(platform_id, sender_id)
+            except Exception as exc:
+                logger.warning(f"[Planner] cross-session handoff lookup degraded: {exc}")
+                handoff = None
+            if handoff is not None:
+                handoff_id = str(handoff.handoff_id or "")
+                jump_info = {
+                    "timestamp": handoff.created_at,
+                    "source_umo": handoff.source_umo,
+                    "source_sender_id": handoff.source_sender_id,
+                    "source_sender_name": handoff.source_sender_name,
+                    "target_id": handoff.target_id,
+                    "target_name": handoff.target_name,
+                    "private_message": handoff.outbound_message,
+                    "context_summary": handoff.context_summary,
+                    "delivery_mode": handoff.delivery_mode,
+                }
+        if jump_info is None and ctx is not None:
+            shared_dict = getattr(ctx, "shared_dict", {})
+            jumps = shared_dict.get("astrmai_space_jumps", {})
+            jump_info = jumps.get(sender_id)
+        if jump_info is None:
             return
 
-        jump_info = jumps[sender_id]
+        injected = False
         try:
             if time.time() - float(jump_info.get("timestamp") or 0.0) < 1800:
                 source_group_id = jump_info.get("group_id")
                 source_umo = str(jump_info.get("source_umo") or "").strip()
+                source_sender_id = str(jump_info.get("source_sender_id") or "").strip()
                 source_sender_name = str(jump_info.get("source_sender_name") or "").strip()
                 context_summary = self._truncate_runtime_instruction_text(
                     str(jump_info.get("context_summary") or ""),
@@ -861,7 +909,13 @@ class PlannerSideInputMixin:
                     action_text = "受对方委托传话" if delivery_mode == "relay" else "主动联系当前对方"
                     sys_inject = (
                         f"\n\n我刚才从{source_type}跨会话来到当前私聊，执行的是：{action_text}。\n"
-                        + (f"【发起人】：{source_sender_name}\n" if source_sender_name else "")
+                        + (
+                            f"【发起人】：{source_sender_name}（QQ：{source_sender_id}）\n"
+                            if source_sender_name and source_sender_id
+                            else f"【发起人】：{source_sender_name or source_sender_id}\n"
+                            if source_sender_name or source_sender_id
+                            else ""
+                        )
                         + (f"【跨会话摘要】：{context_summary}\n" if context_summary else "")
                         + f"【已经发给当前对方的消息】：{private_message}\n"
                         "当前发消息给我的人是收件人，不一定是上一会话的发起人。"
@@ -886,9 +940,16 @@ class PlannerSideInputMixin:
                     self.PRIVATE_JUMP_CONTEXT_MAX_CHARS,
                 )
                 self._append_planner_runtime_instruction(prompt_envelope, sys_inject)
+                injected = True
                 logger.info(f"[Planner] 已触发跨会话语境补偿，并注入到 {sender_id} 的私聊思考中。")
         finally:
-            jumps.pop(sender_id, None)
+            if injected and handoff_id and handoff_store is not None:
+                try:
+                    await handoff_store.acknowledge(handoff_id)
+                except Exception as exc:
+                    logger.warning(f"[Planner] cross-session handoff acknowledge degraded: {exc}")
+            elif jumps is not None:
+                jumps.pop(sender_id, None)
         return
 
     def _append_mode_instructions(

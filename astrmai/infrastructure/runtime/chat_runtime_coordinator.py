@@ -50,9 +50,12 @@ class ChatRuntimeCoordinator:
         self._lock = asyncio.Lock()
         self._concurrency_metrics: Dict[str, int] = {}
         self._generation_sequence = 0
+        self._shutdown = False
 
     async def _get_state(self, chat_id: str) -> ChatRuntimeState:
         async with self._lock:
+            if self._shutdown:
+                return ChatRuntimeState()
             if chat_id not in self._states:
                 self._states[chat_id] = ChatRuntimeState()
             return self._states[chat_id]
@@ -63,6 +66,8 @@ class ChatRuntimeCoordinator:
 
     async def try_acquire_executor(self, chat_id: str, max_pending: int = 2) -> Optional[asyncio.Lock]:
         async with self._lock:
+            if self._shutdown:
+                return None
             state = self._states.setdefault(chat_id, ChatRuntimeState())
             if state.executor_pending >= max_pending:
                 return None
@@ -91,6 +96,8 @@ class ChatRuntimeCoordinator:
 
     async def update_wait_targets(self, chat_id: str, targets: List[str], target_name: str = "") -> None:
         async with self._lock:
+            if self._shutdown:
+                return
             state = self._states.setdefault(chat_id, ChatRuntimeState())
             state.wait_targets = list(dict.fromkeys([str(target) for target in targets if str(target)]))
             state.wait_target_name = target_name or ""
@@ -113,6 +120,8 @@ class ChatRuntimeCoordinator:
         normalized_chat_id, normalized_thread_id = self._normalize_thread_key(chat_id, thread_id)
         stale_task: asyncio.Task | None = None
         async with self._lock:
+            if self._shutdown:
+                return 0
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
             if (
                 normalized_thread_id not in state.turn_generations
@@ -142,6 +151,8 @@ class ChatRuntimeCoordinator:
             return True
         previous_task: asyncio.Task | None = None
         async with self._lock:
+            if self._shutdown:
+                return False
             state = self._states.setdefault(chat_id, ChatRuntimeState())
             if int(state.turn_generations.get(thread_id, 0) or 0) != generation:
                 self._increment_metric_locked("stale_turn_rejected")
@@ -173,6 +184,9 @@ class ChatRuntimeCoordinator:
             return int(state.turn_generations.get(normalized_thread_id, 0) or 0)
 
     async def is_current_turn(self, turn: Any) -> bool:
+        async with self._lock:
+            if self._shutdown:
+                return False
         if turn is None:
             return True
         try:
@@ -192,6 +206,8 @@ class ChatRuntimeCoordinator:
         if not normalized_send_key:
             return False
         async with self._lock:
+            if self._shutdown:
+                return False
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
             existing = state.send_claims.get(normalized_send_key)
             if existing is not None and existing.status == "failed":
@@ -217,6 +233,8 @@ class ChatRuntimeCoordinator:
         if not normalized_send_key:
             return
         async with self._lock:
+            if self._shutdown:
+                return
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
             claim = state.send_claims.setdefault(normalized_send_key, SendClaimState())
             claim.status = "committed"
@@ -230,6 +248,8 @@ class ChatRuntimeCoordinator:
         if not normalized_send_key:
             return
         async with self._lock:
+            if self._shutdown:
+                return
             state = self._states.setdefault(normalized_chat_id, ChatRuntimeState())
             claim = state.send_claims.setdefault(normalized_send_key, SendClaimState())
             claim.status = "failed"
@@ -302,6 +322,8 @@ class ChatRuntimeCoordinator:
         thread_signature: str = "",
     ) -> None:
         async with self._lock:
+            if self._shutdown:
+                return
             state = self._states.setdefault(chat_id, ChatRuntimeState())
             if timestamp < state.latest_activity_ts:
                 return
@@ -375,6 +397,25 @@ class ChatRuntimeCoordinator:
             if not task.done():
                 task.cancel()
         return state is not None
+
+    async def shutdown(self) -> int:
+        current_task = asyncio.current_task()
+        async with self._lock:
+            if self._shutdown:
+                return 0
+            self._shutdown = True
+            tasks = [
+                task
+                for state in self._states.values()
+                for task in state.active_turn_tasks.values()
+                if task is not current_task and not task.done()
+            ]
+            self._states.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return len(tasks)
 
     async def prune_inactive(self, max_idle_sec: float = 1800) -> int:
         now = time.time()

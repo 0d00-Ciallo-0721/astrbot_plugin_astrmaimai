@@ -283,6 +283,107 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertIn("不要把三者混为一人", block)
         self.assertEqual(ctx.shared_dict["astrmai_space_jumps"], {})
 
+    def test_private_jump_context_uses_runtime_store_and_keeps_short_continuation(self):
+        store_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.cross_session_handoff_store"
+        )
+        store = store_mod.CrossSessionHandoffStore()
+        self.mixin.cross_session_handoff_store = store
+        event = _FakeEvent(group_id=None)
+        event.unified_msg_origin = "default:FriendMessage:1481314186"
+
+        async def _run():
+            await store.put(
+                store_mod.CrossSessionHandoff(
+                    platform_id="default",
+                    source_umo="default:FriendMessage:516779421",
+                    source_sender_id="516779421",
+                    source_sender_name="恸",
+                    target_umo=event.unified_msg_origin,
+                    target_id="1481314186",
+                    target_name="萤",
+                    outbound_message="恸让我转告你：和妃爱聊天开不开心？",
+                    context_summary="恸委托我询问萤的聊天感受。",
+                    delivery_mode="relay",
+                )
+            )
+            blocks = []
+            for _ in range(3):
+                envelope = self.side_inputs_mod.PromptEnvelope()
+                await self.mixin._apply_private_jump_context(
+                    SimpleNamespace(),
+                    event,
+                    "1481314186",
+                    prompt_envelope=envelope,
+                )
+                blocks.append(envelope.planner_runtime_instruction_block)
+            remaining = await store.peek_for_recipient("default", "1481314186")
+            return blocks, remaining
+
+        blocks, remaining = asyncio.run(_run())
+
+        self.assertIn("【发起人】：恸（QQ：516779421）", blocks[0])
+        self.assertIn("当前发消息给我的人是收件人", blocks[1])
+        self.assertIn("已经发给当前对方的消息", blocks[2])
+        self.assertIsNone(remaining)
+
+    def test_private_jump_context_falls_back_when_runtime_store_is_unavailable(self):
+        class _BrokenStore:
+            async def peek_for_recipient(self, platform_id, target_id):
+                raise RuntimeError("store unavailable")
+
+        self.mixin.cross_session_handoff_store = _BrokenStore()
+        ctx = SimpleNamespace(
+            shared_dict={
+                "astrmai_space_jumps": {
+                    "recipient-1": {
+                        "timestamp": time.time(),
+                        "private_message": "旧兼容桥仍可续接",
+                    }
+                }
+            }
+        )
+        event = _FakeEvent(group_id=None)
+        event.unified_msg_origin = "default:FriendMessage:recipient-1"
+        envelope = self.side_inputs_mod.PromptEnvelope()
+
+        asyncio.run(
+            self.mixin._apply_private_jump_context(
+                ctx,
+                event,
+                "recipient-1",
+                prompt_envelope=envelope,
+            )
+        )
+
+        self.assertIn("旧兼容桥仍可续接", envelope.planner_runtime_instruction_block)
+        self.assertEqual(ctx.shared_dict["astrmai_space_jumps"], {})
+
+    def test_cross_session_relay_intent_covers_natural_commands_without_false_positives(self):
+        positives = [
+            "帮我给1481314186发个消息，问他吃饭了吗",
+            "去问问你好友516779421吃饭了没有",
+            "替我问一下小明明天来不来",
+            "跟萤说一声我晚点到",
+        ]
+        negatives = [
+            "我朋友给我发消息了",
+            "你觉得发消息好吗",
+            "我去问问他",
+            "请你告诉我天气",
+        ]
+
+        for message in positives:
+            with self.subTest(message=message):
+                self.assertTrue(
+                    self.mixin._looks_like_cross_session_relay_request(message)
+                )
+        for message in negatives:
+            with self.subTest(message=message):
+                self.assertFalse(
+                    self.mixin._looks_like_cross_session_relay_request(message)
+                )
+
     def _prepare_tool_mixin(self):
         mixin = self.side_inputs_mod.PlannerSideInputMixin()
         mixin.gateway = SimpleNamespace(
@@ -804,6 +905,33 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(_normalized_tool_names(tools), {"space_transition_action"})
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
+
+    def test_natural_reverse_relay_request_is_required_after_behavior_filter(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.action_modifier = SimpleNamespace(modify_tools=lambda tools, **kwargs: [])
+        event = _FakeEvent(
+            message="去问问你好友516779421吃饭了没有",
+            group_id=None,
+        )
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:1481314186",
+                event,
+                "1481314186",
+                "萤",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"space_transition_action"})
+        self.assertEqual(
+            event.get_extra("astrmai_required_tools"),
+            ["space_transition_action"],
+        )
 
     def test_explicit_poke_is_restored_after_action_modifier_filter(self):
         mixin = self._prepare_tool_mixin()

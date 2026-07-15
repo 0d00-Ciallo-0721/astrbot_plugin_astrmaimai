@@ -22,6 +22,7 @@ from ..infrastructure.gateway.model_gateway import GlobalModelGateway
 from ..infrastructure.persistence.database_service import DatabaseService
 from ..infrastructure.persistence.persistence_manager import PersistenceManager
 from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
+from ..infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoffStore
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
 from ..infrastructure.runtime.event_bus import EventBus
 from ..infrastructure.runtime.host_bridge import HostBridge
@@ -70,6 +71,7 @@ class PluginBootstrap:
             config=self.config,
             runtime_coordinator=ChatRuntimeCoordinator(),
             host_bridge=HostBridge(),
+            cross_session_handoff_store=CrossSessionHandoffStore(),
             infrastructure_settings=build_infrastructure_settings(self.config),
         )
         runtime.set_boot_phase("bootstrap.logging")
@@ -322,6 +324,7 @@ class PluginBootstrap:
             prompt_refiner=prompt_refiner,
             sys3_router=runtime.sys3_router,
             runtime_coordinator=runtime.runtime_coordinator,
+            cross_session_handoff_store=runtime.cross_session_handoff_store,
         )
         system2_runner = System2Runner(runtime)
         self._bind_learning_collaboration(runtime, evolution)
