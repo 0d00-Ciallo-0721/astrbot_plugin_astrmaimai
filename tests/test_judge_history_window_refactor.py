@@ -121,6 +121,19 @@ class _FakeWindowEvent:
 
 
 class JudgeHistoryWindowRefactorTests(unittest.TestCase):
+    def test_judge_does_not_log_full_prompt_probe(self):
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "astrmai"
+            / "conversation"
+            / "decision"
+            / "judge.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("System 1 意图判决探针", source)
+        self.assertNotIn("f\"{prompt}\\n\"", source)
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         _install_astrbot_stubs(self.temp_dir.name)

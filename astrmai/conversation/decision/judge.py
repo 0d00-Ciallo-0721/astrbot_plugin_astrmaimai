@@ -464,15 +464,6 @@ class Judge:
             
             plan = BrainActionPlan()
             try:
-                if getattr(self.config.global_settings, 'debug_mode', True):
-                    logger.info(
-                        f"\n{'='*60}\n"
-                        f"⚡ [System 1 意图判决探针] 目标: {chat_id}\n"
-                        f"{'='*60}\n"
-                        f"{prompt}\n"
-                        f"{'='*60}"
-                    )
-
                 lane_key = LaneKey(subsystem="sys1", task_family="judge", scope_id=chat_id)
                 task_models = getattr(self.config.provider, 'task_models', [])
                 llm_result = await self.gateway.chat_in_lane_result(
