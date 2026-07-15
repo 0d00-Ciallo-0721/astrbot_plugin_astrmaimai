@@ -129,6 +129,26 @@ class SchedulerFixtureRefactorTests(unittest.TestCase):
         self.assertIn("绕开 AstrBot 宿主页 iframe 边界", harness)
         self.assertIn("AstrMai 管理台直开验收页", harness)
 
+    def test_user_profile_page_uses_matched_layout_contracts(self):
+        root = Path(__file__).resolve().parents[1]
+        app_source = (root / "pages" / "admin" / "app.js").read_text(encoding="utf-8")
+        style_source = (root / "pages" / "admin" / "style.css").read_text(encoding="utf-8")
+
+        for class_name in (
+            "users-layout",
+            "users-sidebar",
+            "user-list",
+            "user-card",
+            "profile-summary",
+            "profile-slice-grid",
+        ):
+            self.assertIn(f'class="{class_name}', app_source)
+            self.assertIn(f".{class_name}", style_source)
+        self.assertIn("data-user-search", app_source)
+        self.assertIn("applyUserSearchFilter", app_source)
+        self.assertNotIn('class="list-item', app_source)
+        self.assertNotIn('class="side-list', app_source)
+
 
 if __name__ == "__main__":
     unittest.main()

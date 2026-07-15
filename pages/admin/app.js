@@ -48,6 +48,7 @@ const state = {
   lastApiErrorToastAt: 0,
   selectedReviews: new Set(),
   activeUserId: "",
+  userSearch: "",
   cache: {
     reviews: { pending: [], all: { items: [], total: 0, page: 1, page_size: 20 }, filters: { status: "", group_id: "", keyword: "" } },
     memories: { month: new Date().toISOString().slice(0, 7), events: [], reflections: [], nodes: [], jargon: [] },
@@ -1193,51 +1194,165 @@ async function loadUsers() {
 function renderUsers() {
   const users = state.cache.users || [];
   const active = users.find((item) => String(item.user_id || item.id || "") === String(state.activeUserId)) || users[0] || null;
-  const list = users.map((user) => `
-    <button class="list-item ${String(user.user_id || user.id || "") === String(state.activeUserId) ? "active" : ""}" data-select-user="${attr(user.user_id || user.id || "")}" type="button">
-      <span class="avatar">${escapeHtml(String(user.nickname || user.name || user.user_id || "?").slice(0, 1).toUpperCase())}</span>
-      <span><strong>${escapeHtml(user.nickname || user.name || "Unknown")}</strong><small>${escapeHtml(user.identity || "未定义身份")}</small>${progressBar(user.social_score || 0)}</span>
-    </button>
-  `).join("");
+  const list = users.map((user) => {
+    const userId = String(user.user_id || user.id || "");
+    const displayName = String(user.nickname || user.name || userId || "未命名用户");
+    const identity = String(user.identity || "身份尚未定义");
+    const rawScore = Number(user.social_score || 0);
+    const score = Number.isFinite(rawScore) ? rawScore : 0;
+    const scoreTone = score > 20 ? "positive" : (score < -10 ? "negative" : "neutral");
+    const scorePosition = Math.max(3, Math.min(100, (score + 100) / 2));
+    const searchText = `${displayName} ${identity} ${userId}`.toLocaleLowerCase();
+    return `
+      <button
+        class="user-card ${userId === String(state.activeUserId) ? "active" : ""}"
+        data-select-user="${attr(userId)}"
+        data-user-search-text="${attr(searchText)}"
+        type="button"
+        aria-current="${userId === String(state.activeUserId) ? "true" : "false"}"
+      >
+        <span class="avatar">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</span>
+        <span class="user-card-body">
+          <span class="user-card-heading">
+            <strong title="${attr(displayName)}">${escapeHtml(displayName)}</strong>
+            <span class="user-score ${scoreTone}">${escapeHtml(score)}</span>
+          </span>
+          <small class="user-card-identity">${escapeHtml(identity)}</small>
+          <small class="user-card-id">QQ ${escapeHtml(userId || "-")}</small>
+          <span class="user-relation-meter" aria-label="羁绊权重 ${attr(score)}">
+            <span style="width:${scorePosition}%"></span>
+          </span>
+        </span>
+      </button>
+    `;
+  }).join("");
   content().innerHTML = `
-    ${pageHeader("社交画像枢纽 Users", "查看和调整用户画像、关系切片与长期记忆点。")}
-    <div class="dual-pane">
-      <aside class="side-list">${list || "<p class='muted'>暂无用户</p>"}</aside>
-      <section>${active ? renderUserDetail(active) : "<p class='muted'>请选择用户</p>"}</section>
+    ${pageHeader("用户画像", "管理用户身份、关系权重和长期画像切片。")}
+    <div class="users-layout">
+      <aside class="users-sidebar panel">
+        <div class="users-sidebar-head">
+          <div>
+            <h3>用户列表</h3>
+            <p data-user-visible-count>共 ${users.length} 位</p>
+          </div>
+          <span class="chip muted">${users.length}</span>
+        </div>
+        <label class="user-search-field">
+          <span>搜索用户</span>
+          <input data-user-search type="search" value="${attr(state.userSearch)}" placeholder="昵称、身份或 QQ 号" autocomplete="off">
+        </label>
+        <div class="user-list" role="list">${list || "<div class='empty-state compact'><p>暂无用户画像</p></div>"}</div>
+      </aside>
+      <section class="user-profile-detail">${active ? renderUserDetail(active) : "<div class='empty-state'><h3>请选择用户</h3></div>"}</section>
     </div>
   `;
   $$('[data-select-user]').forEach((button) => button.addEventListener("click", () => {
     state.activeUserId = button.dataset.selectUser;
     renderUsers();
   }));
+  $('[data-user-search]')?.addEventListener("input", (event) => {
+    state.userSearch = event.target.value;
+    applyUserSearchFilter();
+  });
+  applyUserSearchFilter();
   bindUserActions(active);
 }
 
+function applyUserSearchFilter() {
+  const query = String(state.userSearch || "").trim().toLocaleLowerCase();
+  let visible = 0;
+  $$('[data-user-search-text]').forEach((card) => {
+    const matches = !query || String(card.dataset.userSearchText || "").includes(query);
+    card.hidden = !matches;
+    if (matches) visible += 1;
+  });
+  const count = $('[data-user-visible-count]');
+  if (count) count.textContent = query ? `显示 ${visible} / ${state.cache.users.length} 位` : `共 ${state.cache.users.length} 位`;
+}
+
 function renderUserDetail(user) {
+  const userId = String(user.user_id || user.id || "");
+  const displayName = String(user.nickname || user.name || userId || "未命名用户");
+  const identity = String(user.identity || "身份尚未定义");
+  const tags = Array.isArray(user.tags)
+    ? user.tags
+    : String(user.tags || "").split(",").map((item) => item.trim()).filter(Boolean);
+  const score = Number.isFinite(Number(user.social_score)) ? Number(user.social_score) : 0;
   return `
-    ${section("基础画像", "基础字段与原始画像。", `
-      <div class="grid two">
+    <section class="profile-summary">
+      <span class="avatar large">${escapeHtml(displayName.slice(0, 1).toUpperCase())}</span>
+      <div class="profile-summary-main">
+        <span class="profile-kicker">当前画像</span>
+        <h2>${escapeHtml(displayName)}</h2>
+        <p>${escapeHtml(identity)} <span aria-hidden="true">·</span> QQ ${escapeHtml(userId || "-")}</p>
+        <div class="profile-tag-row">
+          ${tags.slice(0, 6).map((tag) => `<span class="chip muted">${escapeHtml(tag)}</span>`).join("") || "<span class='muted'>暂无标签</span>"}
+        </div>
+      </div>
+      <div class="profile-score-card">
+        <span>羁绊权重</span>
+        <strong>${escapeHtml(score)}</strong>
+      </div>
+    </section>
+    <section class="panel user-profile-panel">
+      <div class="section-head">
+        <div>
+          <h3>基础画像</h3>
+          <p>身份字段与画像分析。</p>
+        </div>
+      </div>
+      <div class="user-form-grid">
         ${formField("nickname", "系统称呼", user.nickname || "")}
         ${formField("identity", "底层身份", user.identity || "")}
-        ${formField("social_score", "羁绊权重", user.social_score ?? "")}
+        ${formField("social_score", "羁绊权重", user.social_score ?? "", "number")}
         ${formField("tags", "全局标签", Array.isArray(user.tags) ? user.tags.join(", ") : (user.tags || ""))}
       </div>
-      <label>画像分析概览<textarea data-user-field="persona_analysis">${escapeHtml(user.persona_analysis || "")}</textarea></label>
-      <div class="row-actions">
+      <label class="profile-analysis-field">画像分析概览<textarea data-user-field="persona_analysis" placeholder="暂无画像分析">${escapeHtml(user.persona_analysis || "")}</textarea></label>
+      <div class="profile-form-actions">
         <button class="primary-button" data-save-user type="button">保存基础画像</button>
         <button class="danger-button" data-delete-user type="button">删除用户画像</button>
       </div>
-    `)}
-    ${SLICE_FIELDS.map(([field, label]) => renderSliceSection(user, field, label)).join("")}
+    </section>
+    <section class="profile-slices-section">
+      <div class="profile-slices-head">
+        <div>
+          <h3>画像切片</h3>
+          <p>按维度维护可检索的长期认知点。</p>
+        </div>
+        <span class="chip muted">${SLICE_FIELDS.length} 个维度</span>
+      </div>
+      <div class="profile-slice-grid">
+        ${SLICE_FIELDS.map(([field, label]) => renderSliceSection(user, field, label)).join("")}
+      </div>
+    </section>
   `;
 }
 
 function renderSliceSection(user, field, label) {
   const values = Array.isArray(user[field]) ? user[field] : [];
-  return section(label, field, `
-    <div class="chip-row">${values.map((value, index) => `<span class="chip">${escapeHtml(value)} <button data-delete-slice="${field}:${index}" type="button">×</button></span>`).join(" ") || "<span class='muted'>暂无数据</span>"}</div>
-    <div class="inline-form"><input data-slice-input="${field}" placeholder="新增切片内容"><button class="ghost-button" data-add-slice="${field}" type="button">添加</button></div>
-  `);
+  return `
+    <article class="profile-slice-card">
+      <div class="profile-slice-card-head">
+        <div>
+          <h3>${escapeHtml(label)}</h3>
+          <code>${escapeHtml(field)}</code>
+        </div>
+        <span class="slice-count">${values.length}</span>
+      </div>
+      <div class="profile-chip-list">
+        ${values.map((value, index) => `
+          <span class="profile-chip">
+            <span>${escapeHtml(value)}</span>
+            <button class="chip-remove" data-delete-slice="${field}:${index}" type="button" aria-label="删除${attr(label)}：${attr(value)}">×</button>
+          </span>
+        `).join("") || "<span class='slice-empty'>暂无内容</span>"}
+      </div>
+      <div class="inline-form profile-slice-add">
+        <input data-slice-input="${field}" placeholder="新增${attr(label)}">
+        <button class="ghost-button" data-add-slice="${field}" type="button">添加</button>
+      </div>
+    </article>
+  `;
 }
 
 function bindUserActions(active) {
@@ -1263,6 +1378,11 @@ function bindUserActions(active) {
     await api.post(`/users/${segment(active.user_id || active.id)}/slices`, { type: field, content: input.value.trim() });
     toast("切片已添加");
     loadUsers();
+  }));
+  $$('[data-slice-input]').forEach((input) => input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    $(`[data-add-slice="${cssEscape(input.dataset.sliceInput)}"]`)?.click();
   }));
   $$('[data-delete-slice]').forEach((button) => button.addEventListener("click", async () => {
     const [field, index] = button.dataset.deleteSlice.split(":");
