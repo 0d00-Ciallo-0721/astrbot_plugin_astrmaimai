@@ -13,6 +13,13 @@ from astrbot.api.event import AstrMessageEvent
 from ..contracts.turn_context import ensure_turn_context
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.prompt_envelope import PromptEnvelope
+from .tool_contracts import (
+    AUTONOMOUS_INTERACTION_TOOLS,
+    build_explicit_invocation_plans,
+    filter_tools_for_context,
+    normalize_tool_schemas,
+    publish_invocation_plans,
+)
 from .tools.pfc_tools import (
     CustomFaceCatalogQueryTool,
     ConstructAtEventTool,
@@ -30,6 +37,13 @@ from .tools.pfc_tools import (
     TopicHijackTool,
     WaitTool,
 )
+
+try:
+    from .tools.pfc_tools import prepare_explicit_tool_fallbacks
+except ImportError:  # Compatibility with lightweight host/test tool modules.
+    async def prepare_explicit_tool_fallbacks(*args, **kwargs):
+        del args, kwargs
+        return []
 
 
 class PlannerSideInputMixin:
@@ -71,6 +85,27 @@ class PlannerSideInputMixin:
         "withdraw": ("撤回", "删掉上一条", "撤回上一条"),
         "meme": ("发个表情包", "发表情包", "来个表情包"),
         "qq_query": ("查自定义表情", "自定义表情列表", "有哪些自定义表情"),
+    }
+    GENERAL_EXPLICIT_TOOL_KEYWORDS = {
+        "wait": ("先别回复", "先等等", "等一下再说", "wait a moment"),
+        "query": ("查一下", "搜一下", "帮我看看", "帮我查", "你还记得", "你记得", "do you remember"),
+        "self_lore": ("你的设定", "你的人设", "你的世界观", "你的经历", "你是谁"),
+        "resonance": ("复读这句", "跟着复读", "原样复读"),
+        "topic": ("转移话题", "换个话题", "别聊这个了", "change topic", "switch topic"),
+        "private": (
+            "转到私聊",
+            "私聊说",
+            "去私聊",
+            "发私聊",
+            "发私信",
+            "传话",
+            "转告",
+            "带话",
+            "talk in private",
+            "send a private message",
+        ),
+        "reaction": ("用文字回应", "用语气回应"),
+        "like": ("夸夸我", "表扬我", "夸我一下"),
     }
     POKE_INTENT_KEYWORDS = {
         "戳一下",
@@ -256,9 +291,22 @@ class PlannerSideInputMixin:
         lowered = msg.lower()
         if any(keyword in msg or keyword in lowered for keyword in self.TOOL_INTENT_KEYWORDS):
             return True
-        return self._conversation_flag("qq_explicit_intent_override_enabled", True) and bool(
-            self._explicit_qq_action_families(event)
+        return bool(self._explicit_tool_families(event))
+
+    def _explicit_tool_families(self, event: AstrMessageEvent) -> set[str]:
+        message = str(getattr(event, "message_str", "") or "").strip()
+        if not message:
+            return set()
+        lowered = message.lower()
+        families = self._explicit_qq_action_families(event)
+        families.update(
+            family
+            for family, keywords in self.GENERAL_EXPLICIT_TOOL_KEYWORDS.items()
+            if any(keyword in message or keyword in lowered for keyword in keywords)
         )
+        if re.search(r"(?:帮我|替我|麻烦你)?给.{1,40}(?:发(?:一条)?消息|说一声|告诉)", message):
+            families.add("private")
+        return families
 
     def _explicit_qq_action_families(self, event: AstrMessageEvent) -> set[str]:
         message = str(getattr(event, "message_str", "") or "").strip()
@@ -331,7 +379,7 @@ class PlannerSideInputMixin:
             ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
             MemeResonanceTool(),
             TopicHijackTool(),
-            SpaceTransitionTool(),
+            SpaceTransitionTool(db_service=self.context_engine.db),
             RegretAndWithdrawTool(),
             MessageReactionTool(),
             MessageEmojiLikeTool(),
@@ -347,13 +395,18 @@ class PlannerSideInputMixin:
         return tools
 
     def _build_chat_tools(self, event: AstrMessageEvent):
-        tools = [
-            ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
-            MessageReactionTool(),
-            MessageEmojiLikeTool(),
-            ProactiveLikeTool(db_service=self.context_engine.db),
-        ]
-        if self._has_guarded_chat_intent(event):
+        tools = []
+        if self._conversation_flag("autonomous_chat_tools_enabled", True):
+            tools = [
+                ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
+                MessageReactionTool(),
+                MessageEmojiLikeTool(),
+                ProactiveLikeTool(db_service=self.context_engine.db),
+                ProactivePokeTool(db_service=self.context_engine.db),
+                ConstructAtEventTool(db_service=self.context_engine.db),
+                SpaceTransitionTool(db_service=self.context_engine.db),
+            ]
+        elif self._has_guarded_chat_intent(event):
             tools.extend(
                 [
                     ProactivePokeTool(db_service=self.context_engine.db),
@@ -495,6 +548,7 @@ class PlannerSideInputMixin:
             self._set_disable_rag_injection(ctx, False)
 
         explicit_qq_families = self._explicit_qq_action_families(event)
+        explicit_tool_families = self._explicit_tool_families(event)
         explicit_override_enabled = self._conversation_flag("qq_explicit_intent_override_enabled", True)
         explicit_tool_intent = self._has_tool_intent(event)
         requested_tier = str(event.get_extra("astrmai_action_tier", "") if hasattr(event, "get_extra") else "").strip().lower()
@@ -537,8 +591,12 @@ class PlannerSideInputMixin:
         intent_families = self._families_for_social_intent(event, social_intent)
         if intent_families is not None:
             allowed_families = (allowed_families & intent_families) if allowed_families else intent_families
-        if explicit_override_enabled and explicit_qq_families:
-            allowed_families.update(explicit_qq_families)
+        explicit_filter_families = {
+            "query" if family == "self_lore" else family
+            for family in explicit_tool_families
+        }
+        if explicit_override_enabled and explicit_filter_families:
+            allowed_families.update(explicit_filter_families)
         turn_tools.allowed_families = sorted(allowed_families if allowed_families else (intent_families or set()))
 
         state = None
@@ -617,6 +675,19 @@ class PlannerSideInputMixin:
             self._set_tool_tier(event, "chat")
             tools = self._build_chat_tools(event)
 
+        tools = filter_tools_for_context(
+            tools,
+            is_group=bool(event.get_group_id()),
+            name_resolver=self._canonical_tool_name,
+        )
+
+        if not explicit_tool_intent and not self._conversation_flag("autonomous_chat_tools_enabled", True):
+            tools = [
+                tool
+                for tool in tools
+                if self._canonical_tool_name(tool) not in AUTONOMOUS_INTERACTION_TOOLS
+            ]
+
         built_tool_names = [
             self._canonical_tool_name(tool)
             for tool in tools or []
@@ -658,12 +729,12 @@ class PlannerSideInputMixin:
             cooldown_tags=event.get_extra("astrmai_agency_cooldown_tags", []) if hasattr(event, "get_extra") else [],
             trace=turn_tools,
         )
-        if explicit_override_enabled and explicit_qq_families:
+        if explicit_override_enabled and explicit_filter_families:
             filtered_names = {self._canonical_tool_name(tool) for tool in tools or []}
             protected_names = {
                 self._canonical_tool_name(tool)
                 for tool in tools_before_modifier
-                if self.TOOL_FAMILIES.get(self._canonical_tool_name(tool), set()) & explicit_qq_families
+                if self.TOOL_FAMILIES.get(self._canonical_tool_name(tool), set()) & explicit_filter_families
             }
             if protected_names - filtered_names:
                 before_names = [self._canonical_tool_name(tool) for tool in tools or []]
@@ -676,14 +747,42 @@ class PlannerSideInputMixin:
                     "planner.explicit_qq_action_restore",
                     before_names,
                     [self._canonical_tool_name(tool) for tool in tools],
-                    "explicit_user_qq_action",
+                    "explicit_user_tool_request",
                     category="social_intent",
                 )
+        tools = normalize_tool_schemas(tools)
         turn_tools.filtered_tools = [
             self._canonical_tool_name(tool)
             for tool in tools or []
             if self._canonical_tool_name(tool)
         ]
+        reliable_explicit_enabled = self._conversation_flag("explicit_tool_execution_enabled", True)
+        plans = (
+            build_explicit_invocation_plans(explicit_tool_families, turn_tools.filtered_tools)
+            if reliable_explicit_enabled
+            else []
+        )
+        publish_invocation_plans(event, plans)
+        turn_tools.invocation_mode = "required" if plans else "auto"
+        turn_tools.required_tools = [plan.tool_name for plan in plans if plan.required]
+        turn_tools.invocation_plans = [
+            {
+                "tool_name": plan.tool_name,
+                "family": plan.family,
+                "source": plan.source,
+                "required": plan.required,
+                "deterministic_fallback": plan.deterministic_fallback,
+                "reason": plan.reason,
+            }
+            for plan in plans
+        ]
+        if plans:
+            prepared_tools = await prepare_explicit_tool_fallbacks(
+                event,
+                turn_tools.required_tools,
+                emotion_mapping=self._emotion_mapping_for_meme_tool(),
+            )
+            event.set_extra("astrmai_prepared_required_tools", prepared_tools)
         return tools
 
     @staticmethod
@@ -715,10 +814,17 @@ class PlannerSideInputMixin:
 
         jump_info = jumps[sender_id]
         try:
-            if time.time() - jump_info["timestamp"] < 600:
+            if time.time() - float(jump_info.get("timestamp") or 0.0) < 1800:
                 source_group_id = jump_info.get("group_id")
+                source_umo = str(jump_info.get("source_umo") or "").strip()
+                source_sender_name = str(jump_info.get("source_sender_name") or "").strip()
+                context_summary = self._truncate_runtime_instruction_text(
+                    str(jump_info.get("context_summary") or ""),
+                    self.PRIVATE_JUMP_MAX_PRIVATE_MESSAGE_CHARS,
+                )
+                delivery_mode = str(jump_info.get("delivery_mode") or "").strip().lower()
                 group_context_str = ""
-                if source_group_id:
+                if source_group_id and not context_summary:
                     try:
                         conv_mgr = ctx.conversation_manager
                         uid = f"default:GroupMessage:{source_group_id}"
@@ -747,29 +853,42 @@ class PlannerSideInputMixin:
                         logger.error(f"[Planner] 溯源群聊历史失败: {exc}")
 
                 private_message = self._truncate_runtime_instruction_text(
-                    str(jump_info["private_message"] or ""),
+                    str(jump_info.get("private_message") or ""),
                     self.PRIVATE_JUMP_MAX_PRIVATE_MESSAGE_CHARS,
                 )
-                sys_inject = (
-                    "\n\n刚才我还在群聊"
-                    + (f" (群号:{source_group_id})" if source_group_id else "")
-                    + "里和大家说话，随后又主动私下对 ta 说了一句：\n"
-                    f"【我刚才的悄悄话】：{private_message}\n"
-                )
-                if group_context_str:
-                    sys_inject += f"\n【我切出来前群里的话题回顾】：\n{group_context_str}\n"
-                sys_inject += (
-                    "\n对方现在这句，多半就是接着我刚才那次跨界私聊在回我。"
-                    "我得把群里的前置话题和这句悄悄话一起接住，顺着私下交流的自然感继续聊下去。"
-                )
+                if source_umo or context_summary or delivery_mode:
+                    source_type = "群聊" if source_group_id or ":GroupMessage:" in source_umo else "另一个私聊"
+                    action_text = "受对方委托传话" if delivery_mode == "relay" else "主动联系当前对方"
+                    sys_inject = (
+                        f"\n\n我刚才从{source_type}跨会话来到当前私聊，执行的是：{action_text}。\n"
+                        + (f"【发起人】：{source_sender_name}\n" if source_sender_name else "")
+                        + (f"【跨会话摘要】：{context_summary}\n" if context_summary else "")
+                        + f"【已经发给当前对方的消息】：{private_message}\n"
+                        "当前发消息给我的人是收件人，不一定是上一会话的发起人。"
+                        "回复时必须区分发起人、机器人自己和当前收件人，不要把三者混为一人；"
+                        "同时自然承接已经发送的消息和对方现在的回应。"
+                    )
+                else:
+                    sys_inject = (
+                        "\n\n刚才我还在群聊"
+                        + (f" (群号:{source_group_id})" if source_group_id else "")
+                        + "里和大家说话，随后又主动私下对 ta 说了一句：\n"
+                        f"【我刚才的悄悄话】：{private_message}\n"
+                    )
+                    if group_context_str:
+                        sys_inject += f"\n【我切出来前群里的话题回顾】：\n{group_context_str}\n"
+                    sys_inject += (
+                        "\n对方现在这句，多半就是接着我刚才那次跨界私聊在回我。"
+                        "我得把群里的前置话题和这句悄悄话一起接住，顺着私下交流的自然感继续聊下去。"
+                    )
                 sys_inject = self._truncate_runtime_instruction_text(
                     sys_inject,
                     self.PRIVATE_JUMP_CONTEXT_MAX_CHARS,
                 )
                 self._append_planner_runtime_instruction(prompt_envelope, sys_inject)
-                logger.info(f"[Planner] 已触发跨界语境补偿，成功抓取群聊历史并注入到 {sender_id} 的私聊思考中。")
+                logger.info(f"[Planner] 已触发跨会话语境补偿，并注入到 {sender_id} 的私聊思考中。")
         finally:
-            del jumps[sender_id]
+            jumps.pop(sender_id, None)
         return
 
     def _append_mode_instructions(

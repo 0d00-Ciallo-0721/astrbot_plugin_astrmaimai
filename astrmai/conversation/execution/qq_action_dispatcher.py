@@ -6,6 +6,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..contracts.qq_action import PendingQQAction
+from ..planning.tool_contracts import record_tool_lifecycle
 
 
 class QQActionDispatcher:
@@ -13,6 +14,16 @@ class QQActionDispatcher:
 
     ACTION_TTL_SECONDS = 900.0
     MAX_EXECUTED_KEYS = 1024
+    TOOL_NAMES = {
+        "poke": "proactive_poke",
+        "message_emoji_like": "message_emoji_like_action",
+        "group_sign": "group_sign_action",
+        "withdraw": "regret_and_withdraw_action",
+    }
+
+    @classmethod
+    def _tool_name(cls, action_type: str) -> str:
+        return cls.TOOL_NAMES.get(str(action_type or ""), str(action_type or ""))
 
     def __init__(self, config=None, runtime_coordinator=None):
         self.config = config
@@ -89,19 +100,20 @@ class QQActionDispatcher:
 
     @staticmethod
     def _record_committed_tool(event, action_type: str) -> None:
-        tool_names = {
-            "poke": "proactive_poke",
-            "message_emoji_like": "message_emoji_like_action",
-            "group_sign": "group_sign_action",
-            "withdraw": "regret_and_withdraw_action",
-        }
-        tool_name = tool_names.get(action_type)
+        tool_name = QQActionDispatcher._tool_name(action_type)
         if not tool_name or not hasattr(event, "get_extra") or not hasattr(event, "set_extra"):
             return
         trace = event.get_extra("astrmai_tool_execution_trace", [])
         trace = list(trace) if isinstance(trace, list) else []
         trace.append({"tool_name": tool_name, "status": "success"})
         event.set_extra("astrmai_tool_execution_trace", trace[-32:])
+        record_tool_lifecycle(
+            event,
+            tool_name,
+            "action_committed",
+            source="deferred_dispatcher",
+            status="success",
+        )
 
     async def _commit_one(
         self,
@@ -159,6 +171,14 @@ class QQActionDispatcher:
         if not await self._is_current_turn(event):
             for action in actions:
                 self._append_result(event, action, "skipped", "stale_turn")
+                record_tool_lifecycle(
+                    event,
+                    self._tool_name(action.action_type),
+                    "action_commit",
+                    source="deferred_dispatcher",
+                    status="skipped",
+                    reason="stale_turn",
+                )
             return list(event.get_extra("astrmai_qq_action_results", []) or [])
 
         client = getattr(event, "bot", None)
@@ -166,6 +186,14 @@ class QQActionDispatcher:
         if api is None:
             for action in actions:
                 self._append_result(event, action, "failed", "napcat_api_unavailable")
+                record_tool_lifecycle(
+                    event,
+                    self._tool_name(action.action_type),
+                    "action_commit",
+                    source="deferred_dispatcher",
+                    status="failed",
+                    reason="napcat_api_unavailable",
+                )
             return list(event.get_extra("astrmai_qq_action_results", []) or [])
 
         self._prune_keys()
@@ -177,14 +205,34 @@ class QQActionDispatcher:
             key = action.idempotency_key(turn_key)
             if key in self._executed_keys:
                 self._append_result(event, action, "skipped", "duplicate")
+                record_tool_lifecycle(
+                    event,
+                    self._tool_name(action.action_type),
+                    "action_commit",
+                    source="deferred_dispatcher",
+                    status="skipped",
+                    reason="duplicate",
+                )
                 continue
             try:
                 await self._commit_one(api, event, action, chat_id=chat_id, send_key=send_key)
                 self._executed_keys[key] = time.time()
                 self._append_result(event, action, "success")
+                logger.info(
+                    f"[QQActionDispatcher] committed action={action.action_type} "
+                    f"target={action.target_id or action.group_id or action.message_id or 'current'}"
+                )
             except Exception as exc:
                 logger.warning(f"[QQActionDispatcher] {action.action_type} failed: {exc}")
                 self._append_result(event, action, "failed", str(exc))
+                record_tool_lifecycle(
+                    event,
+                    self._tool_name(action.action_type),
+                    "action_commit",
+                    source="deferred_dispatcher",
+                    status="failed",
+                    reason=str(exc),
+                )
         return list(event.get_extra("astrmai_qq_action_results", []) or [])
 
 

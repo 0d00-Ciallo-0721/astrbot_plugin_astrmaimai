@@ -36,6 +36,7 @@ from ...infrastructure.gateway.output_guard import (
 from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
+from ..planning.tool_contracts import record_tool_lifecycle
 
 
 class ConcurrentExecutor:
@@ -121,6 +122,10 @@ class ConcurrentExecutor:
             "astrmai_request_trace",
             "astrmai_post_hook_system_hash",
             "astrmai_tool_execution_trace",
+            "astrmai_tool_lifecycle_trace",
+            "astrmai_tool_invocation_plans",
+            "astrmai_required_tools",
+            "astrmai_prepared_required_tools",
             "astrmai_pending_actions",
             "astrmai_bypass_mood_analysis",
             "astrmai_force_meme",
@@ -128,6 +133,62 @@ class ConcurrentExecutor:
             value = source_event.get_extra(key, None)
             if value is not None:
                 target_event.set_extra(key, value)
+
+    @staticmethod
+    def _record_required_tool_outcomes(event: AstrMessageEvent) -> list[str]:
+        required = {
+            str(name or "").strip()
+            for name in event.get_extra("astrmai_required_tools", []) or []
+            if str(name or "").strip()
+        }
+        if not required:
+            return []
+        executed = {
+            str(item.get("tool_name") or "").strip()
+            for item in event.get_extra("astrmai_tool_execution_trace", []) or []
+            if isinstance(item, dict) and str(item.get("status", "success")) == "success"
+        }
+        queued = {
+            str(item.get("tool") or "").strip()
+            for item in event.get_extra("astrmai_tool_lifecycle_trace", []) or []
+            if isinstance(item, dict) and str(item.get("phase") or "") == "action_queued"
+        }
+        prepared = {
+            str(name or "").strip()
+            for name in event.get_extra("astrmai_prepared_required_tools", []) or []
+        }
+        satisfied = executed | queued | prepared
+        missing: list[str] = []
+        for tool_name in sorted(required):
+            if tool_name in satisfied:
+                record_tool_lifecycle(
+                    event,
+                    tool_name,
+                    "required_tool_outcome",
+                    status="satisfied",
+                )
+            else:
+                missing.append(tool_name)
+                record_tool_lifecycle(
+                    event,
+                    tool_name,
+                    "required_tool_outcome",
+                    source="model_tool_call",
+                    status="missing",
+                    reason="model_did_not_call_required_tool",
+                )
+        return missing
+
+    @staticmethod
+    def _required_tool_retry_prompt(api_prompt: str, missing_tools: list[str]) -> str:
+        tool_list = "、".join(missing_tools)
+        return (
+            f"{api_prompt}\n\n"
+            "[SYSTEM TOOL ENFORCEMENT]\n"
+            f"用户本轮明确要求的工具尚未执行：{tool_list}。"
+            "你必须先各调用一次当前提供的工具，再依据真实工具结果回答原始请求。"
+            "禁止跳过工具直接声称已查询、已执行或已完成。"
+        )
 
     def _mark_vision_direct_state(
         self,
@@ -704,6 +765,42 @@ class ConcurrentExecutor:
                     raw_user_text=runtime["raw_user_text"],
                 )
                 self._sync_execution_event_trace(execution_event, event)
+                missing_required = self._record_required_tool_outcomes(event)
+                if missing_required:
+                    retry_tools = [
+                        tool
+                        for tool in tools
+                        if str(getattr(tool, "name", "") or "").strip() in set(missing_required)
+                    ]
+                    if retry_tools:
+                        for tool_name in missing_required:
+                            record_tool_lifecycle(
+                                event,
+                                tool_name,
+                                "required_tool_retry",
+                                source="executor_enforcement",
+                                status="started",
+                            )
+                        result = await self.gateway.tool_chat_in_lane_result(
+                            lane_key=runtime["dialog_lane_key"],
+                            base_origin=chat_id,
+                            event=execution_event,
+                            prompt=self._required_tool_retry_prompt(api_prompt, missing_required),
+                            system_prompt=system_prompt,
+                            tools=ToolSet(retry_tools),
+                            models=[provider_id],
+                            max_steps=max(2, runtime["max_steps"]),
+                            timeout=runtime["timeout"],
+                            image_urls=image_urls,
+                            prefix_hash=runtime["prefix_hash"],
+                            raw_user_text=runtime["raw_user_text"],
+                        )
+                        self._sync_execution_event_trace(execution_event, event)
+                        missing_required = self._record_required_tool_outcomes(event)
+                    if missing_required:
+                        raise ValueError(
+                            "required_tool_not_called:" + ",".join(sorted(missing_required))
+                        )
                 reply_text = result.text
                 if not reply_text:
                     raise ValueError("empty tool reply")

@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from typing import Any, Optional
 
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 
 from astrbot.api import logger
+from astrbot.api.event import MessageChain
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
 
 from ...contracts.qq_action import PendingQQAction
+from ..tool_contracts import record_tool_lifecycle
 
 
 QQ_MESSAGE_EMOJI_OPTIONS: dict[str, list[str]] = {
@@ -43,6 +46,13 @@ def _record_tool_execution(event, tool_name: str, *, status: str = "success") ->
     trace = list(trace) if isinstance(trace, list) else []
     trace.append({"tool_name": str(tool_name or ""), "status": str(status or "success")})
     event.set_extra("astrmai_tool_execution_trace", trace[-32:])
+    record_tool_lifecycle(
+        event,
+        tool_name,
+        "tool_completed",
+        source="model_tool_call",
+        status=status,
+    )
 
 
 def _append_pending_action(event, action: dict[str, Any]) -> None:
@@ -51,11 +61,37 @@ def _append_pending_action(event, action: dict[str, Any]) -> None:
     _set_pending_actions(event, pending_actions)
 
 
-def _append_qq_action(event, action: PendingQQAction) -> None:
-    _append_pending_action(event, action.to_dict())
+def _append_qq_action(event, action: PendingQQAction) -> bool:
+    action_data = action.to_dict()
+    added = _append_once(
+        event,
+        matcher=lambda item: (
+            str(item.get("action_type") or item.get("action") or "") == action.action_type
+            and str(item.get("target_id") or "") == action.target_id
+            and str(item.get("group_id") or "") == action.group_id
+            and str(item.get("message_id") or "") == action.message_id
+            and dict(item.get("payload") or {}) == action.payload
+        ),
+        action=action_data,
+        record_execution=False,
+    )
+    if added:
+        tool_name = {
+            "poke": "proactive_poke",
+            "message_emoji_like": "message_emoji_like_action",
+            "group_sign": "group_sign_action",
+            "withdraw": "regret_and_withdraw_action",
+        }.get(action.action_type, action.action_type)
+        record_tool_lifecycle(
+            event,
+            tool_name,
+            "action_queued",
+            status="pending",
+        )
+    return added
 
 
-def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
+def _append_once(event, *, matcher, action: dict[str, Any], record_execution: bool = True) -> bool:
     pending_actions = _get_pending_actions(event)
     if any(matcher(item) for item in pending_actions):
         return False
@@ -67,7 +103,7 @@ def _append_once(event, *, matcher, action: dict[str, Any]) -> bool:
         "terminal_reread": "meme_resonance_action",
         "withdraw": "regret_and_withdraw_action",
     }.get(str(action.get("action") or ""), "")
-    if tool_name:
+    if tool_name and record_execution:
         _record_tool_execution(event, tool_name)
     return True
 
@@ -149,6 +185,196 @@ async def _resolve_target(
     return str(target_id), str(group_id) if group_id is not None else None
 
 
+def _friend_entries(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        payload = payload.get("data", payload)
+        if isinstance(payload, dict):
+            payload = payload.get("friends", payload.get("list", []))
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+async def _resolve_friend_target(
+    event,
+    astr_ctx,
+    db_service: Any,
+    target_name: str,
+) -> tuple[Optional[tuple[str, str]], str]:
+    client = getattr(event, "bot", None)
+    api = getattr(client, "api", None)
+    if api is None:
+        return None, "NapCat 好友接口不可用"
+    try:
+        friends = _friend_entries(await api.call_action("get_friend_list"))
+    except Exception as exc:
+        logger.warning(f"[SpaceTransitionTool] friend list lookup failed: {exc}")
+        return None, f"读取机器人好友列表失败：{exc}"
+    if not friends:
+        return None, "机器人好友列表为空"
+
+    clean_target = str(target_name or "").strip().lstrip("@")
+    candidate_id = clean_target if clean_target.isdigit() else ""
+    matches: list[dict[str, Any]] = []
+    if not candidate_id:
+        lowered = clean_target.casefold()
+        matches = [
+            item
+            for item in friends
+            if lowered
+            in {
+                str(item.get("nickname") or "").strip().casefold(),
+                str(item.get("remark") or "").strip().casefold(),
+            }
+        ]
+    if not candidate_id and not matches:
+        resolved = await _resolve_target(
+            db_service,
+            target_name=clean_target,
+            current_event=event,
+            astr_ctx=astr_ctx,
+        )
+        if resolved:
+            candidate_id = str(resolved[0] or "").strip()
+
+    if candidate_id:
+        matches = [
+            item
+            for item in friends
+            if str(item.get("user_id") or item.get("uin") or "").strip() == candidate_id
+        ]
+    if not matches:
+        return None, f"机器人好友列表中没有找到“{clean_target}”"
+    unique_ids = {
+        str(item.get("user_id") or item.get("uin") or "").strip()
+        for item in matches
+        if str(item.get("user_id") or item.get("uin") or "").strip()
+    }
+    if len(unique_ids) != 1:
+        return None, f"好友“{clean_target}”匹配到多个账号，请改用准确 QQ 号"
+    target_id = next(iter(unique_ids))
+    friend = next(
+        item
+        for item in matches
+        if str(item.get("user_id") or item.get("uin") or "").strip() == target_id
+    )
+    display_name = str(friend.get("remark") or friend.get("nickname") or clean_target or target_id).strip()
+    return (target_id, display_name), ""
+
+
+async def prepare_explicit_tool_fallbacks(
+    event,
+    required_tools: list[str],
+    *,
+    emotion_mapping: Optional[list[str]] = None,
+) -> list[str]:
+    """Queue unambiguous explicit actions without relying on model tool selection."""
+    required = set(required_tools or [])
+    queued: list[str] = []
+    message = str(getattr(event, "message_str", "") or "").strip().lower()
+    group_id = str(event.get_group_id() or "").strip()
+
+    if "proactive_poke" in required:
+        self_targeted = any(
+            marker in message
+            for marker in ("戳一下我", "戳一戳我", "戳戳我", "戳我", "poke me")
+        ) or message.rstrip("。！？!~～ ").endswith(("戳一下", "戳一戳", "戳戳", "poke"))
+        if self_targeted:
+            target_id = str(event.get_sender_id() or "").strip()
+            if target_id and target_id != str(event.get_self_id() or "").strip():
+                if _append_qq_action(
+                    event,
+                    PendingQQAction(
+                        action_type="poke",
+                        target_id=target_id,
+                        target_name=str(event.get_sender_name() or "当前用户"),
+                        group_id=group_id,
+                    ),
+                ):
+                    queued.append("proactive_poke")
+
+    if "message_emoji_like_action" in required:
+        message_id = _current_message_id(event)
+        pools = [item for values in QQ_MESSAGE_EMOJI_OPTIONS.values() for item in values]
+        if message_id and pools:
+            if _append_qq_action(
+                event,
+                PendingQQAction(
+                    action_type="message_emoji_like",
+                    message_id=message_id,
+                    payload={"emoji_id": str(random.choice(pools)), "tone": "explicit"},
+                ),
+            ):
+                queued.append("message_emoji_like_action")
+
+    if "group_sign_action" in required and group_id:
+        if _append_qq_action(
+            event,
+            PendingQQAction(action_type="group_sign", group_id=group_id),
+        ):
+            queued.append("group_sign_action")
+
+    if "regret_and_withdraw_action" in required:
+        message_id = await _resolve_latest_bot_message_id(event)
+        if message_id:
+            if _append_qq_action(
+                event,
+                PendingQQAction(action_type="withdraw", message_id=message_id),
+            ):
+                queued.append("regret_and_withdraw_action")
+
+    if "proactive_meme" in required:
+        tag_hints: list[tuple[str, list[str]]] = []
+        for item in emotion_mapping or []:
+            if not str(item or "").strip():
+                continue
+            tag, _, hints = str(item).partition(":")
+            tag_hints.append(
+                (
+                    tag.strip().lower(),
+                    [
+                        part.strip().lower()
+                        for part in hints.replace("，", ",").replace("、", ",").split(",")
+                        if part.strip()
+                    ],
+                )
+            )
+        valid_tags = [tag for tag, _ in tag_hints if tag]
+        mood_tag = str(event.get_extra("astrmai_mood_tag", "") or "").strip().lower()
+        requested_tag = next(
+            (tag for tag, hints in tag_hints if tag in message or any(hint in message for hint in hints)),
+            "",
+        )
+        emotion_tag = requested_tag or (mood_tag if mood_tag in valid_tags else (
+            "neutral" if "neutral" in valid_tags else (valid_tags[0] if valid_tags else "neutral")
+        ))
+        event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
+        event.set_extra("astrmai_force_meme", True)
+        if _append_once(
+            event,
+            matcher=lambda item: item.get("action") == "meme",
+            action={"action": "meme", "tag": emotion_tag},
+            record_execution=False,
+        ):
+            record_tool_lifecycle(
+                event,
+                "proactive_meme",
+                "action_queued",
+                status="pending",
+            )
+            queued.append("proactive_meme")
+
+    for tool_name in queued:
+        record_tool_lifecycle(
+            event,
+            tool_name,
+            "explicit_fallback_prepared",
+            source="explicit_router",
+            status="queued",
+        )
+    return queued
+
+
 @dataclass
 class WaitTool(FunctionTool[AstrAgentContext]):
     name: str = "wait_and_listen"
@@ -174,11 +400,12 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "要检索的事件、概念或关键词。"},
-                "target_name": {"type": "string", "description": "要检索的人物名称或 ID。"},
+                "query": {"type": "string", "description": "要检索的事件、概念或关键词。", "maxLength": 240},
+                "target_name": {"type": "string", "description": "要检索的人物名称或 ID。", "maxLength": 80},
                 "recall_date": {
                     "type": "string",
                     "description": "要检索的日期，格式 YYYY-MM-DD。",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
                 },
             },
         }
@@ -200,15 +427,21 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
         current_event = _get_current_event(context)
         tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
         if tool_service and hasattr(tool_service, "omni_query"):
-            return await tool_service.omni_query(
-                query=query,
-                target_name=target_name,
-                recall_date=recall_date,
-                chat_id=self.chat_id,
-                current_sender_id=self.current_sender_id,
-                current_sender_name=self.current_sender_name,
-                event=current_event,
-            )
+            try:
+                result = await tool_service.omni_query(
+                    query=query,
+                    target_name=target_name,
+                    recall_date=recall_date,
+                    chat_id=self.chat_id,
+                    current_sender_id=self.current_sender_id,
+                    current_sender_name=self.current_sender_name,
+                    event=current_event,
+                )
+            except Exception:
+                _record_tool_execution(current_event, self.name, status="failed")
+                raise
+            _record_tool_execution(current_event, self.name)
+            return result
 
         async def _fetch_memory():
             return None
@@ -296,7 +529,9 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
         if reflection_result:
             sections.append(f"[反思]\n{reflection_result}")
         if not sections:
+            _record_tool_execution(current_event, self.name)
             return "系统提示：当前没有检索到可用内部资料。"
+        _record_tool_execution(current_event, self.name)
         return "\n\n".join(sections)
 
 
@@ -309,7 +544,7 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "要 @ 的目标用户名或 ID。"}
+                "target_name": {"type": "string", "description": "要 @ 的目标用户名或 ID。", "minLength": 1, "maxLength": 80}
             },
             "required": ["target_name"],
         }
@@ -356,7 +591,7 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "要戳的用户名或 ID，可为空。"}
+                "target_name": {"type": "string", "description": "要戳的用户名或 ID；留空时使用当前发送者。", "maxLength": 80}
             },
         }
     )
@@ -418,6 +653,7 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
                 "tone": {
                     "type": "string",
                     "description": "表情语气，可选 support/approve/laugh/cute，留空则随机。",
+                    "enum": ["support", "approve", "laugh", "cute", ""],
                 }
             },
         }
@@ -480,7 +716,7 @@ class CustomFaceCatalogQueryTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "count": {"type": "integer", "description": "最多返回多少个表情，默认 24。"}
+                "count": {"type": "integer", "description": "最多返回多少个表情，默认 24。", "minimum": 1, "maximum": 96}
             },
         }
     )
@@ -509,6 +745,7 @@ class CustomFaceCatalogQueryTool(FunctionTool[AstrAgentContext]):
         normalized = [str(item).strip() for item in faces if str(item or "").strip()]
         if not normalized:
             return "系统提示：当前没有查询到可用的 QQ 自定义表情。"
+        _record_tool_execution(current_event, self.name)
         preview = "\n".join(f"- {item}" for item in normalized[:count])
         return f"可用的 QQ 自定义表情如下：\n{preview}"
 
@@ -521,6 +758,11 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
     emotion_mapping: list = Field(default_factory=list, exclude=True)
 
     def __post_init__(self) -> None:
+        valid_tags = [
+            str(item).split(":", 1)[0].strip().lower()
+            for item in self.emotion_mapping
+            if str(item or "").strip()
+        ]
         available = "\n".join(f"- {item}" for item in self.emotion_mapping) if self.emotion_mapping else "- neutral: 平静"
         self.description = (
             "选择一个表情包情绪标签，系统会在最终回复后自动按该标签补发表情包。\n"
@@ -529,7 +771,11 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
         self.parameters = {
             "type": "object",
             "properties": {
-                "emotion_tag": {"type": "string", "description": "要使用的情绪标签。"}
+                "emotion_tag": {
+                    "type": "string",
+                    "description": "要使用的情绪标签。",
+                    "enum": valid_tags or ["neutral"],
+                }
             },
             "required": ["emotion_tag"],
         }
@@ -558,7 +804,7 @@ class MemeResonanceTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_message": {"type": "string", "description": "要 1:1 复读的内容。"}
+                "target_message": {"type": "string", "description": "要 1:1 复读的内容。", "minLength": 1, "maxLength": 500}
             },
             "required": ["target_message"],
         }
@@ -585,7 +831,7 @@ class TopicHijackTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "fake_status": {"type": "string", "description": "伪装成当前状态的短句。"}
+                "fake_status": {"type": "string", "description": "用于自然转移话题的当前状态短句。", "minLength": 1, "maxLength": 80}
             },
             "required": ["fake_status"],
         }
@@ -603,29 +849,128 @@ class TopicHijackTool(FunctionTool[AstrAgentContext]):
 @dataclass
 class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
     name: str = "space_transition_action"
-    description: str = "把敏感或更私密的话题转入私聊。"
+    description: str = (
+        "跨越当前会话，向机器人好友列表中的指定 QQ 好友真实发送一条私聊消息。"
+        "可用于你主动判断需要联系某人，也可作为传话人执行用户明确的转告请求。"
+        "relay 模式会自动标明当前发起人的昵称，message 只填写需要转达的正文，不要重复添加来源前缀。"
+        "目标必须是机器人好友；发送失败时必须把工具错误如实告诉当前发起会话，不得声称发送成功。"
+    )
+    db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "private_message": {"type": "string", "description": "准备私发给对方的话。"},
-                "cover_message": {"type": "string", "description": "准备留在当前空间的掩护话。"},
+                "target_name": {
+                    "type": "string",
+                    "description": "接收消息的机器人好友昵称、备注或准确 QQ 号。",
+                    "minLength": 1,
+                    "maxLength": 80,
+                },
+                "message": {
+                    "type": "string",
+                    "description": "要发送到目标好友私聊窗口的正文；relay 模式会自动添加“发起人让我转告你”的来源说明。",
+                    "minLength": 1,
+                    "maxLength": 800,
+                },
+                "context_summary": {
+                    "type": "string",
+                    "description": "供目标会话后续衔接使用的简短摘要，说明消息来源、人物关系和传话目的，不要混淆发起人与接收人。",
+                    "minLength": 1,
+                    "maxLength": 400,
+                },
+                "delivery_mode": {
+                    "type": "string",
+                    "description": "relay 表示受当前用户委托传话；proactive 表示机器人自主联系。",
+                    "enum": ["relay", "proactive"],
+                },
+                "origin_reply": {
+                    "type": "string",
+                    "description": "发送成功后准备在当前发起会话中回复的简短确认语，可留空。",
+                    "maxLength": 200,
+                },
             },
-            "required": ["private_message", "cover_message"],
+            "required": ["target_name", "message", "context_summary", "delivery_mode"],
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        private_message = str(kwargs.get("private_message", "") or "").strip()
-        cover_message = str(kwargs.get("cover_message", "") or "").strip()
-        if not private_message or not cover_message:
-            return "执行失败：private_message 和 cover_message 都不能为空。"
-        _record_tool_execution(_get_current_event(context), self.name)
-        return (
-            "[SYSTEM OVERRIDE] 你已经决定转入私聊。"
-            f"请把群内最终话术写成：{cover_message}。"
-            f"需要私聊的真实内容是：{private_message}。"
+        target_name = str(kwargs.get("target_name", "") or "").strip()
+        private_message = str(kwargs.get("message", kwargs.get("private_message", "")) or "").strip()
+        context_summary = str(kwargs.get("context_summary", "") or "").strip()
+        delivery_mode = str(kwargs.get("delivery_mode", "relay") or "relay").strip().lower()
+        origin_reply = str(kwargs.get("origin_reply", kwargs.get("cover_message", "")) or "").strip()
+        current_event = _get_current_event(context)
+        if not target_name or not private_message or not context_summary:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "发送失败：target_name、message 和 context_summary 都不能为空，消息未发送。"
+        if delivery_mode not in {"relay", "proactive"}:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "发送失败：delivery_mode 只能是 relay 或 proactive，消息未发送。"
+
+        astr_ctx = context.context.context
+        resolved, error = await _resolve_friend_target(
+            current_event,
+            astr_ctx,
+            self.db_service,
+            target_name,
         )
+        if not resolved:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"发送失败：{error}，消息未发送。"
+        target_id, display_name = resolved
+        if target_id == str(current_event.get_self_id() or "").strip():
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "发送失败：不能向机器人自己发送跨会话消息。"
+
+        source_umo = str(getattr(current_event, "unified_msg_origin", "") or "")
+        platform_id = source_umo.split(":", 1)[0] if ":" in source_umo else "default"
+        target_umo = f"{platform_id}:FriendMessage:{target_id}"
+        source_sender_name = str(current_event.get_sender_name() or "当前用户").strip() or "当前用户"
+        outbound_message = private_message
+        if delivery_mode == "relay":
+            outbound_message = f"{source_sender_name}让我转告你：{private_message}"
+
+        sends = current_event.get_extra("astrmai_cross_session_sends", [])
+        sends = list(sends) if isinstance(sends, list) else []
+        if any(
+            str(item.get("target_id") or "") == target_id
+            and str(item.get("message") or "") == outbound_message
+            for item in sends
+            if isinstance(item, dict)
+        ):
+            return f"消息已在本轮发送给 {display_name}，不再重复发送。"
+        if not hasattr(astr_ctx, "send_message"):
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "发送失败：AstrBot 跨会话发送接口不可用，消息未发送。"
+
+        try:
+            await astr_ctx.send_message(target_umo, MessageChain().message(outbound_message))
+        except Exception as exc:
+            logger.warning(f"[SpaceTransitionTool] cross-session send failed: {exc}")
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"发送失败：向 {display_name} 的私聊发送时出错：{exc}。"
+
+        sends.append({"target_id": target_id, "target_umo": target_umo, "message": outbound_message})
+        current_event.set_extra("astrmai_cross_session_sends", sends[-8:])
+        shared_dict = getattr(astr_ctx, "shared_dict", None)
+        if isinstance(shared_dict, dict):
+            jumps = dict(shared_dict.get("astrmai_space_jumps", {}) or {})
+            jumps[target_id] = {
+                "timestamp": time.time(),
+                "source_umo": source_umo,
+                "group_id": str(current_event.get_group_id() or ""),
+                "source_sender_id": str(current_event.get_sender_id() or ""),
+                "source_sender_name": source_sender_name,
+                "target_id": target_id,
+                "target_name": display_name,
+                "private_message": outbound_message,
+                "context_summary": context_summary,
+                "delivery_mode": delivery_mode,
+            }
+            shared_dict["astrmai_space_jumps"] = jumps
+        _record_tool_execution(current_event, self.name)
+        confirmation = origin_reply or f"我已经把消息发给 {display_name} 了。"
+        return f"发送成功：消息已进入 {display_name} 的私聊会话。请在当前发起会话中自然确认：{confirmation}"
 
 
 @dataclass
@@ -656,7 +1001,7 @@ class MessageReactionTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "reaction": {"type": "string", "description": "要执行的互动反应。"}
+                "reaction": {"type": "string", "description": "要在最终文字里体现的互动反应。", "minLength": 1, "maxLength": 80}
             },
             "required": ["reaction"],
         }
@@ -666,6 +1011,7 @@ class MessageReactionTool(FunctionTool[AstrAgentContext]):
         reaction = str(kwargs.get("reaction", "") or "").strip()
         if not reaction:
             return "执行失败：reaction 不能为空。"
+        _record_tool_execution(_get_current_event(context), self.name)
         return f"请在最终文字回复中自然体现“{reaction}”的互动语气，不要声称执行了 QQ 动作。"
 
 
@@ -678,7 +1024,7 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_name": {"type": "string", "description": "要表达好感或点赞的目标，可为空。"}
+                "target_name": {"type": "string", "description": "要在文字中表达好感的目标，可为空。", "maxLength": 80}
             },
         }
     )
@@ -697,6 +1043,7 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
             if resolved:
                 target_id, _ = resolved
         display_name = target_name or (current_event.get_sender_name() or "对方")
+        _record_tool_execution(current_event, self.name)
         return f"请在最终文字回复中自然表达对 {display_name} 的夸奖或好感，不要声称执行了 QQ 点赞。"
 
 
@@ -711,7 +1058,7 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "要查询的自我设定关键词。"}
+                "query": {"type": "string", "description": "要查询的自我设定关键词。", "minLength": 1, "maxLength": 240}
             },
             "required": ["query"],
         }
@@ -723,8 +1070,8 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
             return "执行失败：query 不能为空。"
         if not self.memory_engine and not self.memory_tool_service:
             return "系统提示：当前没有可用的自我设定记忆引擎。"
+        current_event = _get_current_event(context)
         try:
-            current_event = _get_current_event(context)
             tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
             if tool_service and hasattr(tool_service, "self_lore_query"):
                 tool_result = await tool_service.self_lore_query(
@@ -737,7 +1084,9 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
                 result = None
         except Exception as exc:
             logger.debug(f"[SelfLoreQueryTool] recall failed: {exc}")
-            result = None
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "系统提示：自我设定查询暂时失败。"
+        _record_tool_execution(current_event, self.name)
         if not result:
             return "系统提示：当前没有检索到相关自我设定。"
         return str(result)
@@ -754,6 +1103,7 @@ __all__ = [
     "ProactiveLikeTool",
     "ProactiveMemeTool",
     "ProactivePokeTool",
+    "prepare_explicit_tool_fallbacks",
     "RegretAndWithdrawTool",
     "SelfLoreQueryTool",
     "SpaceTransitionTool",

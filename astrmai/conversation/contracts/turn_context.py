@@ -231,6 +231,9 @@ class ToolDecisionTrace:
     requested_tier: str = ""
     final_tier: str = ""
     explicit_tool_intent: bool = False
+    invocation_mode: str = "auto"
+    required_tools: list[str] = field(default_factory=list)
+    invocation_plans: list[dict[str, Any]] = field(default_factory=list)
     social_intent: str = ""
     allowed_families: list[str] = field(default_factory=list)
     initial_tools: list[str] = field(default_factory=list)
@@ -596,6 +599,9 @@ def build_turn_trace_summary(
             "requested_tier": tools.requested_tier,
             "final_tier": tools.final_tier,
             "explicit_tool_intent": bool(tools.explicit_tool_intent),
+            "invocation_mode": tools.invocation_mode,
+            "required_tools": list(tools.required_tools or []),
+            "invocation_plans": list(tools.invocation_plans or []),
             "social_intent": tools.social_intent,
             "allowed_families": list(tools.allowed_families or []),
             "initial_tools": list(tools.initial_tools or []),

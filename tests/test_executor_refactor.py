@@ -128,6 +128,61 @@ class RefactoredExecutorTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_required_tool_outcome_distinguishes_satisfied_and_missing(self):
+        event = _FakeEvent()
+        event.set_extra("astrmai_required_tools", ["proactive_poke", "omni_perception_query"])
+        event.set_extra("astrmai_prepared_required_tools", ["proactive_poke"])
+
+        missing = self.executor_mod.ConcurrentExecutor._record_required_tool_outcomes(event)
+
+        outcomes = [
+            item
+            for item in event.get_extra("astrmai_tool_lifecycle_trace")
+            if item["phase"] == "required_tool_outcome"
+        ]
+        self.assertEqual(
+            {(item["tool"], item["status"]) for item in outcomes},
+            {("proactive_poke", "satisfied"), ("omni_perception_query", "missing")},
+        )
+        self.assertEqual(missing, ["omni_perception_query"])
+
+    def test_tool_mode_retries_once_with_only_missing_required_tools(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            event = kwargs["event"]
+            if calls == 2:
+                event.set_extra(
+                    "astrmai_tool_execution_trace",
+                    [{"tool_name": "omni_perception_query", "status": "success"}],
+                )
+                return "已经根据查询结果回答"
+            return "未调用工具的普通回答"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_required_tools", ["omni_perception_query"])
+        tool = SimpleNamespace(name="omni_perception_query")
+
+        result = asyncio.run(executor.execute(event, "prompt", "system", tools=[tool]))
+
+        self.assertEqual(result, "已经根据查询结果回答")
+        self.assertEqual(calls, 2)
+        retry_call = gateway.calls[1][1]
+        self.assertIn("SYSTEM TOOL ENFORCEMENT", retry_call["prompt"])
+        lifecycle = event.get_extra("astrmai_tool_lifecycle_trace", [])
+        self.assertTrue(any(item["phase"] == "required_tool_retry" for item in lifecycle))
+
     def test_text_mode_runs_on_dialog_lane_and_records_reply(self):
         gateway = _FakeGateway()
         reply_service = _FakeReplyService()

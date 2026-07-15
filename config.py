@@ -168,6 +168,8 @@ class ConversationConfig(BaseModel):
     qq_native_tools_enabled: bool = Field(default=True, repr=False)
     qq_deferred_action_commit_enabled: bool = Field(default=True, repr=False)
     qq_explicit_intent_override_enabled: bool = Field(default=True, repr=False)
+    explicit_tool_execution_enabled: bool = Field(default=True, repr=False)
+    autonomous_chat_tools_enabled: bool = Field(default=True, repr=False)
     hot_zone_ttl_seconds: float = Field(default=30.0, ge=0.0)
     warm_zone_ttl_seconds: float = Field(default=300.0, ge=0.0)
     warm_zone_max_tokens: int = Field(default=1200, ge=1)

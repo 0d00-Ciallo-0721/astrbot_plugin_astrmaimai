@@ -249,6 +249,40 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             self.side_inputs_mod.PlannerSideInputMixin.PRIVATE_JUMP_MAX_HISTORY_MESSAGES,
         )
 
+    def test_private_jump_context_bridges_relay_without_mixing_people(self):
+        ctx = SimpleNamespace(
+            shared_dict={
+                "astrmai_space_jumps": {
+                    "recipient-1": {
+                        "timestamp": time.time(),
+                        "source_umo": "default:FriendMessage:origin-1",
+                        "source_sender_name": "Alice",
+                        "private_message": "Alice让我转告你：明天十点见",
+                        "context_summary": "Alice 在另一个私聊中委托我通知 Bob 见面时间。",
+                        "delivery_mode": "relay",
+                    }
+                }
+            }
+        )
+        envelope = self.side_inputs_mod.PromptEnvelope()
+
+        asyncio.run(
+            self.mixin._apply_private_jump_context(
+                ctx,
+                _FakeEvent(group_id=None),
+                "recipient-1",
+                prompt_envelope=envelope,
+            )
+        )
+
+        block = envelope.planner_runtime_instruction_block
+        self.assertIn("另一个私聊", block)
+        self.assertIn("【发起人】：Alice", block)
+        self.assertIn("【跨会话摘要】", block)
+        self.assertIn("当前发消息给我的人是收件人", block)
+        self.assertIn("不要把三者混为一人", block)
+        self.assertEqual(ctx.shared_dict["astrmai_space_jumps"], {})
+
     def _prepare_tool_mixin(self):
         mixin = self.side_inputs_mod.PlannerSideInputMixin()
         mixin.gateway = SimpleNamespace(
@@ -558,7 +592,14 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertEqual(
             _normalized_tool_names(plain_tools),
-            {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+            {
+                "proactive_meme",
+                "message_reaction_action",
+                "message_emoji_like_action",
+                "proactive_like_action",
+                "proactive_poke",
+                "space_transition_action",
+            },
         )
         self.assertEqual(plain_event.get_extra("astrmai_tool_tier"), "chat")
         plain_turn = plain_event.get_extra("astrmai_turn_context")
@@ -567,12 +608,27 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertFalse(plain_turn.tools.explicit_tool_intent)
         self.assertEqual(
             set(plain_turn.tools.available_tools),
-            {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+            {
+                "proactive_meme",
+                "message_reaction_action",
+                "message_emoji_like_action",
+                "proactive_like_action",
+                "proactive_poke",
+                "space_transition_action",
+            },
         )
         self.assertEqual(
             set(plain_turn.tools.filtered_tools),
-            {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+            {
+                "proactive_meme",
+                "message_reaction_action",
+                "message_emoji_like_action",
+                "proactive_like_action",
+                "proactive_poke",
+                "space_transition_action",
+            },
         )
+        self.assertEqual(plain_event.get_extra("astrmai_required_tools"), [])
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])
 
         tool_ctx = SimpleNamespace(shared_dict={})
@@ -592,10 +648,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertIsNotNone(intent_tools)
         intent_names = _normalized_tool_names(intent_tools)
-        self.assertIn("omni_perception_query", intent_names)
-        self.assertIn("self_lore_query", intent_names)
-        self.assertIn("custom_face_catalog_query", intent_names)
-        self.assertIn("group_sign_action", intent_names)
+        self.assertEqual(intent_names, {"omni_perception_query", "self_lore_query"})
+        self.assertEqual(intent_event.get_extra("astrmai_required_tools"), ["omni_perception_query"])
         self.assertEqual(intent_event.get_extra("astrmai_tool_tier"), "full")
         self.assertEqual(intent_event.get_extra("astrmai_turn_context").tools.final_tier, "full")
         self.assertTrue(intent_event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
@@ -644,7 +698,14 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertEqual(
             _normalized_tool_names(tools),
-            {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+            {
+                "proactive_meme",
+                "message_reaction_action",
+                "message_emoji_like_action",
+                "proactive_like_action",
+                "proactive_poke",
+                "space_transition_action",
+            },
         )
         trace = event.get_extra("astrmai_turn_context").tools
         self.assertEqual(trace.requested_tier, "full")
@@ -706,7 +767,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
         at_ctx = SimpleNamespace(shared_dict={})
-        at_event = _FakeEvent(message="请艾特 target")
+        at_event = _FakeEvent(message="请艾特 target", group_id="group-1")
         at_tools = asyncio.run(
             mixin._build_execution_tools(
                 "default:GroupMessage:group-1",
@@ -722,6 +783,27 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         at_tool_names = _normalized_tool_names(at_tools)
         self.assertNotIn("proactive_poke", at_tool_names)
         self.assertIn("construct_at_event", at_tool_names)
+
+    def test_explicit_relay_request_only_exposes_cross_session_tool(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="帮我给小明发消息告诉他明天十点见", group_id=None)
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"space_transition_action"})
+        self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
+        self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
     def test_explicit_poke_is_restored_after_action_modifier_filter(self):
         mixin = self._prepare_tool_mixin()
@@ -744,6 +826,77 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(_normalized_tool_names(tools), {"proactive_poke"})
         trace = event.get_extra("astrmai_turn_context").tools
         self.assertTrue(any(step["stage"] == "planner.explicit_qq_action_restore" for step in trace.filter_steps))
+        self.assertEqual(trace.invocation_mode, "required")
+        self.assertEqual(trace.required_tools, ["proactive_poke"])
+        self.assertEqual(event.get_extra("astrmai_required_tools"), ["proactive_poke"])
+
+    def test_disabling_autonomous_chat_tools_keeps_explicit_tools_available(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.gateway.config.conversation = SimpleNamespace(
+            qq_native_tools_enabled=True,
+            qq_deferred_action_commit_enabled=True,
+            qq_explicit_intent_override_enabled=True,
+            explicit_tool_execution_enabled=True,
+            autonomous_chat_tools_enabled=False,
+        )
+
+        plain_tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                _FakeEvent(message="你好", group_id="group-1"),
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+        explicit_event = _FakeEvent(message="请戳一戳我", group_id="group-1")
+        explicit_tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                explicit_event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(plain_tools, [])
+        self.assertEqual(_normalized_tool_names(explicit_tools), {"proactive_poke"})
+        self.assertEqual(explicit_event.get_extra("astrmai_required_tools"), ["proactive_poke"])
+
+    def test_disabling_reliable_explicit_execution_restores_optional_legacy_behavior(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.gateway.config.conversation = SimpleNamespace(
+            qq_native_tools_enabled=True,
+            qq_deferred_action_commit_enabled=True,
+            qq_explicit_intent_override_enabled=True,
+            explicit_tool_execution_enabled=False,
+            autonomous_chat_tools_enabled=True,
+        )
+        event = _FakeEvent(message="请戳一戳我", group_id="group-1")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(_normalized_tool_names(tools), {"proactive_poke"})
+        self.assertEqual(event.get_extra("astrmai_required_tools"), [])
+        self.assertEqual(event.get_extra("astrmai_turn_context").tools.invocation_mode, "auto")
 
     def test_explicit_group_sign_gets_full_tier_without_unrelated_tools(self):
         mixin = self._prepare_tool_mixin()
@@ -783,9 +936,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
 
         names = _normalized_tool_names(tools)
-        self.assertNotIn("proactive_poke", names)
-        self.assertNotIn("construct_at_event", names)
+        self.assertIn("proactive_poke", names)
+        self.assertIn("construct_at_event", names)
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
+        self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
     def test_qq_flags_restore_safe_no_native_tool_path(self):
         mixin = self._prepare_tool_mixin()
@@ -870,12 +1024,19 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
                 )
 
                 tool_names = _normalized_tool_names(tools)
-                self.assertNotIn("proactive_poke", tool_names)
-                self.assertNotIn("construct_at_event", tool_names)
                 self.assertEqual(
                     tool_names,
-                    {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+                    {
+                        "proactive_meme",
+                        "message_reaction_action",
+                        "message_emoji_like_action",
+                        "proactive_like_action",
+                        "proactive_poke",
+                        "space_transition_action",
+                    },
                 )
+                self.assertFalse(event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
+                self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
     def test_plain_bot_mention_does_not_open_at_or_poke_tools(self):
         mixin = self._prepare_tool_mixin()
@@ -895,8 +1056,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
 
         names = _normalized_tool_names(tools)
-        self.assertNotIn("construct_at_event", names)
-        self.assertNotIn("proactive_poke", names)
+        self.assertIn("construct_at_event", names)
+        self.assertIn("proactive_poke", names)
+        self.assertFalse(event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
+        self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
     def test_core_only_plain_chat_uses_chat_tier_instead_of_full_pfc(self):
         mixin = self._prepare_tool_mixin()
@@ -918,7 +1081,14 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            {"proactive_meme", "message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+            {
+                "proactive_meme",
+                "message_reaction_action",
+                "message_emoji_like_action",
+                "proactive_like_action",
+                "proactive_poke",
+                "space_transition_action",
+            },
         )
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])

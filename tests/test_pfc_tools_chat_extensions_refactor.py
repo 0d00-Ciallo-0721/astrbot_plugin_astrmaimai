@@ -31,6 +31,7 @@ class _FakeEvent:
         self._extra = {}
         self.message_obj = SimpleNamespace(message_id=message_id)
         self.bot = SimpleNamespace(api=None)
+        self.unified_msg_origin = f"default:{'GroupMessage' if group_id else 'FriendMessage'}:{group_id or sender_id}"
 
     def get_group_id(self):
         return self._group_id
@@ -51,8 +52,34 @@ class _FakeEvent:
         self._extra[key] = value
 
 
-def _wrap_event(event):
-    return SimpleNamespace(context=SimpleNamespace(event=event, context=SimpleNamespace()))
+class _FakeMessageChain:
+    def __init__(self):
+        self.text = ""
+
+    def message(self, text):
+        self.text = str(text)
+        return self
+
+
+class _FakeAstrContext:
+    def __init__(self, *, send_exc=None):
+        self.shared_dict = {}
+        self.sent = []
+        self.send_exc = send_exc
+
+    async def send_message(self, umo, chain):
+        if self.send_exc is not None:
+            raise self.send_exc
+        self.sent.append((umo, chain.text))
+
+
+def _wrap_event(event, astr_ctx=None):
+    return SimpleNamespace(
+        context=SimpleNamespace(
+            event=event,
+            context=astr_ctx or SimpleNamespace(),
+        )
+    )
 
 
 class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
@@ -165,6 +192,113 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("文字回复", result)
         self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_space_transition_relays_to_real_bot_friend_and_records_summary(self):
+        event = _FakeEvent(group_id="777", sender_id="123", sender_name="Alice")
+        event.bot.api = _FakeApi(
+            result={"data": [{"user_id": 456, "nickname": "Bob", "remark": "小明"}]}
+        )
+        astr_ctx = _FakeAstrContext()
+
+        with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+            result = asyncio.run(
+                self.mod.SpaceTransitionTool().call(
+                    _wrap_event(event, astr_ctx),
+                    target_name="小明",
+                    message="明天十点见",
+                    context_summary="Alice 在测试群里委托我通知小明见面时间。",
+                    delivery_mode="relay",
+                )
+            )
+
+        self.assertIn("发送成功", result)
+        self.assertEqual(astr_ctx.sent, [("default:FriendMessage:456", "Alice让我转告你：明天十点见")])
+        jump = astr_ctx.shared_dict["astrmai_space_jumps"]["456"]
+        self.assertEqual(jump["source_umo"], "default:GroupMessage:777")
+        self.assertEqual(jump["source_sender_name"], "Alice")
+        self.assertEqual(jump["delivery_mode"], "relay")
+        self.assertIn("委托", jump["context_summary"])
+
+    def test_space_transition_can_proactively_send_from_private_session(self):
+        event = _FakeEvent(group_id=None, sender_id="123", sender_name="Alice")
+        event.bot.api = _FakeApi(result=[{"user_id": "456", "nickname": "Bob"}])
+        astr_ctx = _FakeAstrContext()
+
+        with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+            result = asyncio.run(
+                self.mod.SpaceTransitionTool().call(
+                    _wrap_event(event, astr_ctx),
+                    target_name="456",
+                    message="突然想问问你今天过得怎么样。",
+                    context_summary="我在和 Alice 私聊时想起 Bob，决定主动问候。",
+                    delivery_mode="proactive",
+                )
+            )
+
+        self.assertIn("发送成功", result)
+        self.assertEqual(astr_ctx.sent[0][1], "突然想问问你今天过得怎么样。")
+        self.assertEqual(
+            astr_ctx.shared_dict["astrmai_space_jumps"]["456"]["source_umo"],
+            "default:FriendMessage:123",
+        )
+
+    def test_space_transition_reports_missing_friend_in_origin_session(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _FakeApi(result=[{"user_id": "456", "nickname": "Bob"}])
+        astr_ctx = _FakeAstrContext()
+
+        result = asyncio.run(
+            self.mod.SpaceTransitionTool().call(
+                _wrap_event(event, astr_ctx),
+                target_name="不存在的人",
+                message="你好",
+                context_summary="测试不存在好友时的错误反馈。",
+                delivery_mode="relay",
+            )
+        )
+
+        self.assertIn("好友列表中没有找到", result)
+        self.assertIn("消息未发送", result)
+        self.assertEqual(astr_ctx.sent, [])
+
+    def test_space_transition_deduplicates_same_send_within_turn(self):
+        event = _FakeEvent(group_id="777", sender_name="Alice")
+        event.bot.api = _FakeApi(result=[{"user_id": "456", "nickname": "Bob"}])
+        astr_ctx = _FakeAstrContext()
+        kwargs = {
+            "target_name": "Bob",
+            "message": "明天见",
+            "context_summary": "Alice 委托我约 Bob 明天见。",
+            "delivery_mode": "relay",
+        }
+
+        with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+            first = asyncio.run(self.mod.SpaceTransitionTool().call(_wrap_event(event, astr_ctx), **kwargs))
+            second = asyncio.run(self.mod.SpaceTransitionTool().call(_wrap_event(event, astr_ctx), **kwargs))
+
+        self.assertIn("发送成功", first)
+        self.assertIn("不再重复发送", second)
+        self.assertEqual(len(astr_ctx.sent), 1)
+
+    def test_space_transition_reports_send_failure_without_fake_success(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _FakeApi(result=[{"user_id": "456", "nickname": "Bob"}])
+        astr_ctx = _FakeAstrContext(send_exc=RuntimeError("network down"))
+
+        with patch.object(self.mod, "MessageChain", _FakeMessageChain):
+            result = asyncio.run(
+                self.mod.SpaceTransitionTool().call(
+                    _wrap_event(event, astr_ctx),
+                    target_name="Bob",
+                    message="你好",
+                    context_summary="测试发送失败反馈。",
+                    delivery_mode="proactive",
+                )
+            )
+
+        self.assertIn("发送失败", result)
+        self.assertIn("network down", result)
+        self.assertNotIn("发送成功", result)
 
     def test_withdraw_resolves_latest_bot_message_before_queueing(self):
         event = _FakeEvent(group_id="12345", self_id="90001")

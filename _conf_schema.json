@@ -249,6 +249,18 @@
         "default": true,
         "hint": "开启后，用户明确要求戳一戳、群签到或消息表情回复时，不会仅因普通好感度或动作冷却而隐藏对应工具。"
       },
+      "explicit_tool_execution_enabled": {
+        "description": "可靠执行用户明确要求的工具",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，系统会识别用户明确提出的戳一戳、撤回、群签到、表情回复、记忆查询等要求；目标明确的动作会提前安全排队，其余工具会被明确要求模型调用。"
+      },
+      "autonomous_chat_tools_enabled": {
+        "description": "允许机器人在普通聊天中主动使用互动工具",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，机器人可以结合语境、情绪、关系和冷却状态，自主使用表情包、消息表情、互动语气或戳一戳等工具丰富聊天；关闭后仍会响应用户明确提出的工具要求。"
+      },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
         "type": "float",

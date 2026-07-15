@@ -43,7 +43,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         "proactive_meme": "发表情包",
         "meme_resonance_action": "复读",
         "topic_hijack_action": "转移话题",
-        "space_transition_action": "转私聊",
+        "space_transition_action": "跨会话私聊消息",
         "regret_and_withdraw_action": "撤回",
         "message_reaction_action": "互动反应",
         "message_emoji_like_action": "消息表情回复",
@@ -460,6 +460,32 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tool_tier = str(event.get_extra("astrmai_tool_tier", "full") or "full")
         tool_names = [str(getattr(tool, "name", "") or "").strip() for tool in tools]
         guidance_lines = list(getattr(prompt_envelope, "guidance_lines", []) or [])
+        if event is not None and hasattr(event, "get_extra"):
+            required_tools = [
+                str(name or "").strip()
+                for name in event.get_extra("astrmai_required_tools", []) or []
+                if str(name or "").strip() in tool_names
+            ]
+            prepared_tools = {
+                str(name or "").strip()
+                for name in event.get_extra("astrmai_prepared_required_tools", []) or []
+            }
+            pending_required = [name for name in required_tools if name not in prepared_tools]
+            if pending_required:
+                labels = [self.TOOL_HINT_LABELS.get(name, name) for name in pending_required]
+                guidance_lines.append(
+                    "用户本轮明确要求执行以下能力："
+                    + "、".join(labels)
+                    + "。这些不是可选建议；必须各调用一次对应工具，并根据工具结果生成最终回复。"
+                )
+            prepared_required = [name for name in required_tools if name in prepared_tools]
+            if prepared_required:
+                labels = [self.TOOL_HINT_LABELS.get(name, name) for name in prepared_required]
+                guidance_lines.append(
+                    "系统已根据用户明确请求准备好以下动作："
+                    + "、".join(labels)
+                    + "。不要重复调用同一动作，也不要声称动作已经成功；请生成自然的配套回复。"
+                )
         if tool_tier == "chat":
             guidance = "如果气氛合适，可以顺手发表情包、轻轻互动或点个赞；这不是必须动作，普通闲聊直接自然回复即可。"
             if any(name in {"proactive_poke", "construct_at_event"} for name in tool_names):

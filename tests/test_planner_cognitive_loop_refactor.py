@@ -830,6 +830,31 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertEqual(guidance_text.count("查询记忆/画像"), 1)
         self.assertIn("本轮可用动作", "\n".join(planner.prompt_refiner.calls[0]["prompt_envelope"].guidance_lines))
 
+    def test_planner_distinguishes_prepared_and_model_required_tools(self):
+        decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="execute explicit tools",
+            memory_policy="light",
+        )
+        planner = self._make_planner(decision)
+
+        async def _fake_build_tools(*args, **kwargs):
+            event = args[1]
+            event.set_extra("astrmai_required_tools", ["proactive_poke", "omni_perception_query"])
+            event.set_extra("astrmai_prepared_required_tools", ["proactive_poke"])
+            return [_NamedTool("proactive_poke"), _NamedTool("omni_perception_query")]
+
+        planner._build_execution_tools = _fake_build_tools
+        event = _FakeEvent(text="戳一下我，再查一下之前的事")
+        _install_focus_extras(event)
+
+        asyncio.run(planner.plan_and_execute(event, [event]))
+
+        guidance = "\n".join(event.get_extra("astrmai_prompt_envelope").guidance_lines)
+        self.assertIn("系统已根据用户明确请求准备好以下动作：戳一戳", guidance)
+        self.assertIn("必须各调用一次对应工具", guidance)
+        self.assertIn("查询记忆/画像", guidance)
+
     def test_planner_injects_chat_tier_tool_guidance(self):
         decision = self.planner_mod.CognitiveDecision(
             action="reply",
