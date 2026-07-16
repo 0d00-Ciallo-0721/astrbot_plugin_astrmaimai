@@ -24,12 +24,19 @@ class _PatternService:
 
 
 class _EvolutionDB:
-    def __init__(self, current_logs):
+    def __init__(self, current_logs, groups=None):
         self.current_logs = list(current_logs)
+        self.groups = list(groups or [])
         self.marked = []
 
     async def get_unprocessed_logs_async(self, group_id, limit=999):
-        return list(self.current_logs)
+        return list(self.current_logs)[:limit]
+
+    async def list_unprocessed_log_groups_async(self, *, min_count=1, limit=20):
+        return [
+            item for item in self.groups
+            if int(item.get("count", 0) or 0) >= int(min_count or 1)
+        ][:limit]
 
     async def mark_logs_processed_async(self, log_ids):
         self.marked.append(list(log_ids))
@@ -245,6 +252,102 @@ class LearningGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(mined_contents, ["current content"])
         self.assertEqual(db.marked, [[1]])
+
+    def test_backlog_mining_processes_eligible_unprocessed_group(self):
+        logs = [SimpleNamespace(id=index, content=f"message {index}") for index in range(1, 6)]
+        db = _EvolutionDB(
+            logs,
+            groups=[
+                {
+                    "group_id": "chat-backlog",
+                    "count": 5,
+                    "oldest_timestamp": 1.0,
+                    "latest_timestamp": 5.0,
+                }
+            ],
+        )
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                enable_expression_mining=True,
+                enable_backlog_mining=True,
+                backlog_min_unprocessed_logs=3,
+                backlog_batch_size=5,
+                backlog_group_limit=1,
+                backlog_scan_interval_sec=60,
+                backlog_failure_cooldown_sec=60,
+                min_mining_context=3,
+                mining_window_sec=60,
+                mining_window_min_messages=10,
+                mining_cooldown_sec=60,
+                mining_trigger=20,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.evolution_mod.EvolutionManager(
+            db,
+            SimpleNamespace(config=config),
+            config=config,
+        )
+        mined = []
+
+        async def _mine(group_id, batch):
+            mined.append((group_id, [item.id for item in batch]))
+            return []
+
+        manager.expression_miner.mine = _mine
+
+        report = asyncio.run(manager.run_backlog_mining_once())
+
+        self.assertEqual(mined, [("chat-backlog", [1, 2, 3, 4, 5])])
+        self.assertEqual(db.marked, [[1, 2, 3, 4, 5]])
+        self.assertEqual(report["processed_groups"][0]["group_id"], "chat-backlog")
+
+    def test_backlog_overview_reports_threshold_and_top_groups(self):
+        db = _EvolutionDB(
+            [],
+            groups=[
+                {
+                    "group_id": "chat-small",
+                    "count": 2,
+                    "oldest_timestamp": 1.0,
+                    "latest_timestamp": 2.0,
+                },
+                {
+                    "group_id": "chat-ready",
+                    "count": 6,
+                    "oldest_timestamp": 1.0,
+                    "latest_timestamp": 6.0,
+                },
+            ],
+        )
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                enable_expression_mining=True,
+                enable_backlog_mining=True,
+                backlog_min_unprocessed_logs=4,
+                backlog_batch_size=10,
+                backlog_group_limit=2,
+                backlog_scan_interval_sec=60,
+                backlog_failure_cooldown_sec=60,
+                min_mining_context=3,
+                mining_window_sec=60,
+                mining_window_min_messages=10,
+                mining_cooldown_sec=60,
+                mining_trigger=20,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.evolution_mod.EvolutionManager(
+            db,
+            SimpleNamespace(config=config),
+            config=config,
+        )
+
+        overview = asyncio.run(manager.backlog_overview())
+
+        self.assertEqual(overview["threshold"], 4)
+        self.assertEqual([item["group_id"] for item in overview["top_unprocessed_groups"]], ["chat-small", "chat-ready"])
+        self.assertEqual([item["group_id"] for item in overview["eligible_groups"]], ["chat-ready"])
 
 
 if __name__ == "__main__":

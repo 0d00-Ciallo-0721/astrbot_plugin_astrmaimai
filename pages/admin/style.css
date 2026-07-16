@@ -26,6 +26,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
+  overflow-y: auto;
 }
 
 button,
@@ -669,16 +670,20 @@ pre {
 .users-layout {
   display: grid;
   grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
-  align-items: start;
+  align-items: stretch;
   gap: 18px;
+  height: calc(100vh - 190px);
+  min-height: 620px;
 }
 
 .users-sidebar {
   position: sticky;
   top: 16px;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 14px;
-  max-height: calc(100vh - 32px);
+  height: 100%;
+  min-height: 0;
   padding: 16px;
   overflow: hidden;
   box-shadow: 0 10px 24px rgba(31, 41, 55, .06);
@@ -711,19 +716,25 @@ pre {
 }
 
 .user-list {
-  display: grid;
-  align-content: start;
-  gap: 8px;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 9px;
   min-height: 0;
-  padding-right: 3px;
+  padding-right: 4px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
 .user-profile-detail {
   display: grid;
+  align-content: start;
   min-width: 0;
+  min-height: 0;
   gap: 16px;
+  padding-right: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .pane-list,
@@ -740,15 +751,15 @@ pre {
 
 .user-card {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-columns: 46px minmax(0, 1fr);
   align-items: center;
-  gap: 11px;
+  gap: 12px;
   width: 100%;
-  min-height: 94px;
-  padding: 12px;
+  min-height: 86px;
+  padding: 11px 12px;
   border: 1px solid transparent;
   border-radius: 8px;
-  background: #f8fafc;
+  background: #f9fbfd;
   color: var(--text);
   text-align: left;
   cursor: pointer;
@@ -773,7 +784,7 @@ pre {
 .user-card.active {
   border-color: var(--brand);
   background: var(--brand-soft);
-  box-shadow: inset 3px 0 0 var(--brand);
+  box-shadow: inset 4px 0 0 var(--brand), 0 8px 18px rgba(59, 130, 160, .1);
 }
 
 .user-card-body,
@@ -785,7 +796,7 @@ pre {
 
 .user-card-heading strong {
   overflow: hidden;
-  font-size: 14px;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -801,7 +812,7 @@ pre {
 }
 
 .user-card-identity {
-  margin-top: 3px;
+  margin-top: 2px;
 }
 
 .user-card-id {
@@ -832,8 +843,8 @@ pre {
 
 .user-relation-meter {
   display: block;
-  height: 5px;
-  margin-top: 8px;
+  height: 4px;
+  margin-top: 7px;
   overflow: hidden;
   border-radius: 999px;
   background: #dfe7ef;
@@ -870,8 +881,8 @@ pre {
   grid-template-columns: 64px minmax(0, 1fr) auto;
   align-items: center;
   gap: 16px;
-  min-height: 116px;
-  padding: 18px;
+  min-height: 108px;
+  padding: 16px 18px;
   border: 1px solid var(--line);
   border-left: 4px solid var(--brand);
   border-radius: 8px;
@@ -885,7 +896,7 @@ pre {
 
 .profile-summary-main h2 {
   overflow-wrap: anywhere;
-  font-size: 22px;
+  font-size: 20px;
 }
 
 .profile-summary-main p {
@@ -930,7 +941,7 @@ pre {
 
 .user-profile-panel {
   display: grid;
-  gap: 15px;
+  gap: 14px;
   box-shadow: none;
 }
 
@@ -945,7 +956,7 @@ pre {
 }
 
 .profile-analysis-field textarea {
-  min-height: 120px;
+  min-height: 104px;
   font-family: inherit;
   line-height: 1.65;
 }
@@ -975,10 +986,10 @@ pre {
 .profile-slice-card {
   display: grid;
   align-content: start;
-  gap: 13px;
+  gap: 12px;
   min-width: 0;
-  min-height: 170px;
-  padding: 15px;
+  min-height: 150px;
+  padding: 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -1209,6 +1220,7 @@ pre {
 @media (max-width: 1080px) {
   .users-layout {
     grid-template-columns: minmax(280px, 310px) minmax(0, 1fr);
+    height: calc(100vh - 190px);
   }
 
   .profile-slice-grid {
@@ -1241,11 +1253,21 @@ pre {
 
   .users-sidebar {
     position: static;
+    height: auto;
     max-height: none;
+  }
+
+  .users-layout {
+    height: auto;
+    min-height: 0;
   }
 
   .user-list {
     max-height: 360px;
+  }
+
+  .user-profile-detail {
+    overflow: visible;
   }
 
   .profile-summary {

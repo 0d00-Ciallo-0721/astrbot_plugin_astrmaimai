@@ -136,6 +136,33 @@ class DatabaseService(
 
         return self._run_with_session(_sync)
 
+    def list_unprocessed_log_groups(self, *, min_count: int = 1, limit: int = 20) -> list[dict[str, Any]]:
+        safe_min_count = max(1, int(min_count or 1))
+        safe_limit = max(1, min(int(limit or 20), 200))
+        with connect_sqlite(self.persistence.db_path) as conn:
+            cursor = conn.execute(
+                """
+                SELECT group_id, COUNT(*) AS count, MIN(timestamp) AS oldest_timestamp, MAX(timestamp) AS latest_timestamp
+                FROM messagelog
+                WHERE processed = 0
+                GROUP BY group_id
+                HAVING COUNT(*) >= ?
+                ORDER BY count DESC, latest_timestamp ASC
+                LIMIT ?
+                """,
+                (safe_min_count, safe_limit),
+            )
+            return [
+                {
+                    "group_id": str(row[0] or ""),
+                    "count": int(row[1] or 0),
+                    "oldest_timestamp": float(row[2] or 0.0),
+                    "latest_timestamp": float(row[3] or 0.0),
+                }
+                for row in cursor.fetchall()
+                if str(row[0] or "")
+            ]
+
     def get_recent_message_logs(
         self,
         group_id: str,
@@ -243,6 +270,13 @@ class DatabaseService(
 
     async def get_unprocessed_logs_async(self, group_id: str, limit: int = 50):
         return await self._run_blocking(self.get_unprocessed_logs, group_id, limit)
+
+    async def list_unprocessed_log_groups_async(self, *, min_count: int = 1, limit: int = 20):
+        return await self._run_blocking(
+            self.list_unprocessed_log_groups,
+            min_count=min_count,
+            limit=limit,
+        )
 
     async def get_recent_message_logs_async(
         self,

@@ -752,6 +752,42 @@
         "type": "int",
         "default": 45,
         "hint": "同一会话两次表达审核之间至少间隔多久，避免短时间连续触发。"
+      },
+      "enable_backlog_mining": {
+        "description": "启用积压消息学习",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，即使群聊没有在短时间内刷屏，系统也会低频扫描未处理消息，积累到足够数量后自动学习表达习惯和黑话。"
+      },
+      "backlog_scan_interval_sec": {
+        "description": "积压学习扫描间隔（秒）",
+        "type": "int",
+        "default": 900,
+        "hint": "后台多久检查一次未处理聊天记录。建议 600 到 1800 秒，太短会增加后台模型调用。"
+      },
+      "backlog_min_unprocessed_logs": {
+        "description": "积压学习最少消息数",
+        "type": "int",
+        "default": 40,
+        "hint": "单个会话累计多少条未处理消息后，才允许进入后台学习。实际会同时参考“学习所需最小上下文量”。"
+      },
+      "backlog_batch_size": {
+        "description": "积压学习单次处理上限",
+        "type": "int",
+        "default": 120,
+        "hint": "单个会话每次后台学习最多处理多少条未处理消息，避免一次处理过多导致模型调用过重。"
+      },
+      "backlog_group_limit": {
+        "description": "每轮最多学习会话数",
+        "type": "int",
+        "default": 2,
+        "hint": "每次后台扫描最多处理几个会话，避免多个群同时积压时后台任务过重。"
+      },
+      "backlog_failure_cooldown_sec": {
+        "description": "积压学习失败冷却（秒）",
+        "type": "int",
+        "default": 1800,
+        "hint": "某个会话后台学习失败后，多久内不再重复尝试，避免数据库锁或模型异常时连续报错。"
       }
     }
   },

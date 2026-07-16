@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Dict, List
+import time
+from typing import Any, Dict, List
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -53,6 +54,9 @@ class EvolutionManager:
         self._lock_mutex = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
         self._mining_tasks: Dict[str, asyncio.Task] = {}
+        self._backlog_task: asyncio.Task | None = None
+        self._backlog_failure_until: dict[str, float] = {}
+        self._last_backlog_report: dict[str, Any] = {}
 
     def refresh_config(self, config):
         self.config = config
@@ -87,6 +91,42 @@ class EvolutionManager:
         )
         if self.jargon_miner.enricher is not None:
             self.jargon_miner.enricher.config = config
+        if not self._backlog_enabled() and self._backlog_task is not None:
+            self._backlog_task.cancel()
+
+    def _evolution_config(self):
+        return getattr(self.config, "evolution", None)
+
+    def _backlog_enabled(self) -> bool:
+        evolution = self._evolution_config()
+        return bool(
+            getattr(evolution, "enable_expression_mining", True)
+            and getattr(evolution, "enable_backlog_mining", True)
+        )
+
+    def _backlog_threshold(self) -> int:
+        evolution = self._evolution_config()
+        return max(
+            int(getattr(evolution, "backlog_min_unprocessed_logs", 40) or 40),
+            int(getattr(evolution, "min_mining_context", 10) or 10),
+            1,
+        )
+
+    def _backlog_batch_size(self) -> int:
+        evolution = self._evolution_config()
+        return max(int(getattr(evolution, "backlog_batch_size", 120) or 120), self._backlog_threshold())
+
+    def _backlog_group_limit(self) -> int:
+        evolution = self._evolution_config()
+        return max(1, int(getattr(evolution, "backlog_group_limit", 2) or 2))
+
+    def _backlog_scan_interval(self) -> int:
+        evolution = self._evolution_config()
+        return max(60, int(getattr(evolution, "backlog_scan_interval_sec", 900) or 900))
+
+    def _backlog_failure_cooldown(self) -> int:
+        evolution = self._evolution_config()
+        return max(60, int(getattr(evolution, "backlog_failure_cooldown_sec", 1800) or 1800))
 
     async def _get_mining_lock(self, group_id: str) -> asyncio.Lock:
         async with self._lock_mutex:
@@ -154,11 +194,61 @@ class EvolutionManager:
             return await self.db.get_unprocessed_logs_async(group_id, limit=limit)
         return self.db.get_unprocessed_logs(group_id, limit=limit)
 
+    async def _list_unprocessed_log_groups(self, *, min_count: int, limit: int) -> list[dict[str, Any]]:
+        if hasattr(self.db, "list_unprocessed_log_groups_async"):
+            return list(await self.db.list_unprocessed_log_groups_async(min_count=min_count, limit=limit) or [])
+        if hasattr(self.db, "list_unprocessed_log_groups"):
+            return list(await asyncio.to_thread(self.db.list_unprocessed_log_groups, min_count=min_count, limit=limit) or [])
+        return []
+
     async def _mark_logs_processed(self, log_ids: List[int]) -> None:
         if hasattr(self.db, "mark_logs_processed_async"):
             await self.db.mark_logs_processed_async(log_ids)
             return
         self.db.mark_logs_processed(log_ids)
+
+    async def backlog_overview(self) -> dict[str, Any]:
+        threshold = self._backlog_threshold()
+        try:
+            groups = await self._list_unprocessed_log_groups(min_count=1, limit=10)
+            degraded = ""
+        except Exception as exc:
+            groups = []
+            degraded = str(exc)
+        eligible = [item for item in groups if int(item.get("count", 0) or 0) >= threshold]
+        return {
+            "enabled": self._backlog_enabled(),
+            "threshold": threshold,
+            "batch_size": self._backlog_batch_size(),
+            "group_limit": self._backlog_group_limit(),
+            "scan_interval_sec": self._backlog_scan_interval(),
+            "failure_cooldown_sec": self._backlog_failure_cooldown(),
+            "top_unprocessed_groups": groups,
+            "eligible_groups": eligible,
+            "last_report": dict(self._last_backlog_report or {}),
+            "worker_running": bool(self._backlog_task is not None and not self._backlog_task.done()),
+            "degraded": bool(degraded),
+            "degraded_reason": degraded,
+        }
+
+    def describe_learning_runtime(self) -> dict[str, Any]:
+        return {
+            "recorder": {
+                "window_seconds": int(getattr(self.recorder, "window_seconds", 0) or 0),
+                "min_messages": int(getattr(self.recorder, "min_messages", 0) or 0),
+                "cooldown_seconds": int(getattr(self.recorder, "cooldown_seconds", 0) or 0),
+            },
+            "backlog": {
+                "enabled": self._backlog_enabled(),
+                "threshold": self._backlog_threshold(),
+                "batch_size": self._backlog_batch_size(),
+                "group_limit": self._backlog_group_limit(),
+                "scan_interval_sec": self._backlog_scan_interval(),
+                "failure_cooldown_sec": self._backlog_failure_cooldown(),
+                "worker_running": bool(self._backlog_task is not None and not self._backlog_task.done()),
+                "last_report": dict(self._last_backlog_report or {}),
+            },
+        }
 
     @staticmethod
     def _field(item, key, default=None):
@@ -407,9 +497,102 @@ class EvolutionManager:
 
     async def _try_trigger_mining(self, group_id: str):
         unprocessed_logs = await self._load_unprocessed_logs(group_id, limit=100)
-        threshold = self.recorder.min_messages
+        evolution = self._evolution_config()
+        threshold = max(int(self.recorder.min_messages or 0), int(getattr(evolution, "min_mining_context", 10) or 10))
         if len(unprocessed_logs) >= threshold:
             await self.process_logs_and_mine(group_id, unprocessed_logs)
+
+    async def run_backlog_mining_once(self) -> dict[str, Any]:
+        if not self._backlog_enabled():
+            report = {
+                "enabled": False,
+                "checked_at": time.time(),
+                "processed_groups": [],
+                "skipped_groups": [],
+                "errors": [],
+            }
+            self._last_backlog_report = report
+            return report
+
+        now = time.time()
+        threshold = self._backlog_threshold()
+        group_limit = self._backlog_group_limit()
+        batch_size = self._backlog_batch_size()
+        groups = await self._list_unprocessed_log_groups(min_count=threshold, limit=group_limit * 3)
+        report: dict[str, Any] = {
+            "enabled": True,
+            "checked_at": now,
+            "threshold": threshold,
+            "batch_size": batch_size,
+            "group_limit": group_limit,
+            "candidate_groups": groups,
+            "processed_groups": [],
+            "skipped_groups": [],
+            "errors": [],
+        }
+
+        processed_count = 0
+        for group in groups:
+            group_id = str(group.get("group_id", "") or "")
+            if not group_id:
+                continue
+            if processed_count >= group_limit:
+                break
+            if self._mining_tasks.get(group_id) is not None and not self._mining_tasks[group_id].done():
+                report["skipped_groups"].append({"group_id": group_id, "reason": "already_mining"})
+                continue
+            failure_until = float(self._backlog_failure_until.get(group_id, 0.0) or 0.0)
+            if failure_until > now:
+                report["skipped_groups"].append(
+                    {"group_id": group_id, "reason": "failure_cooldown", "retry_after": failure_until}
+                )
+                continue
+            logs = await self._load_unprocessed_logs(group_id, limit=batch_size)
+            if len(logs) < threshold:
+                report["skipped_groups"].append(
+                    {"group_id": group_id, "reason": "below_threshold", "count": len(logs)}
+                )
+                continue
+            try:
+                await self.process_logs_and_mine(group_id, logs)
+                processed_count += 1
+                report["processed_groups"].append({"group_id": group_id, "log_count": len(logs)})
+                self._backlog_failure_until.pop(group_id, None)
+            except Exception as exc:
+                self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
+                logger.warning(f"[Evolution-Backlog] mining failed for {group_id}: {exc}")
+                report["errors"].append({"group_id": group_id, "error": str(exc)})
+
+        self._last_backlog_report = report
+        return report
+
+    async def _backlog_mining_loop(self) -> None:
+        try:
+            await asyncio.sleep(30)
+            while True:
+                try:
+                    await self.run_backlog_mining_once()
+                except Exception as exc:
+                    logger.warning(f"[Evolution-Backlog] scan degraded: {exc}")
+                await asyncio.sleep(self._backlog_scan_interval())
+        except asyncio.CancelledError:
+            logger.info("[Evolution-Backlog] backlog mining worker stopped")
+            raise
+
+    async def start_background_tasks(self) -> None:
+        if not self._backlog_enabled():
+            return
+        if self._backlog_task is not None and not self._backlog_task.done():
+            return
+        self._backlog_task = self._fire_background_task(self._backlog_mining_loop())
+
+    async def stop_background_tasks(self) -> None:
+        tasks = [task for task in [self._backlog_task, *self._background_tasks] if task is not None and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._backlog_task = None
 
     async def process_bot_reply(self, chat_id: str, bot_id: str, reply_text: str):
         recorded = await self.bot_reply_recorder.record(chat_id, bot_id, reply_text)

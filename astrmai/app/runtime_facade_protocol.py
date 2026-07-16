@@ -110,6 +110,9 @@ class RuntimeFacadeProtocol(Protocol):
     def get_reflector(self) -> Any:
         ...
 
+    def get_evolution(self) -> Any:
+        ...
+
     def get_runtime_config(self) -> Any:
         ...
 

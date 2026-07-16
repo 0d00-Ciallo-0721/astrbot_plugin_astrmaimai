@@ -8,6 +8,7 @@ import psutil
 from ..adapters.plugin_api import PluginApiAdapter
 from ..paths import default_db_path
 from .dashboard_repository import DashboardRepository
+from .runtime_memory_stats import canonical_kind_review_stats, canonical_memory_stats
 
 
 class DashboardService:
@@ -53,6 +54,24 @@ class DashboardService:
         except Exception as exc:
             counts = {}
             degraded["counts"] = str(exc)
+        try:
+            memory_stats = await canonical_memory_stats(self.plugin_api, self._repo)
+            counts["total_canonical_memories"] = int(memory_stats.get("total", 0) or 0)
+            counts["canonical_memory_stats"] = memory_stats
+            if memory_stats.get("degraded"):
+                degraded["counts.canonical_memory_stats"] = str(memory_stats.get("degraded_reason", "degraded"))
+        except Exception as exc:
+            degraded["counts.canonical_memory_stats"] = str(exc)
+        try:
+            expression_stats = await canonical_kind_review_stats(
+                self.plugin_api,
+                kind="expression_pattern",
+                legacy_expression_repo=self._repo,
+            )
+            counts["pending_reviews"] = int(expression_stats.get("pending", 0) or 0)
+            counts["expression_pattern_stats"] = expression_stats
+        except Exception as exc:
+            degraded["counts.expression_pattern_stats"] = str(exc)
         try:
             diagnostics = await self.plugin_api.get_runtime_diagnostics()
         except Exception as exc:

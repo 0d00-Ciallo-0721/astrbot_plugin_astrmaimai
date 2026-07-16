@@ -247,6 +247,9 @@ class PluginLifecycleManager:
         # Tasks are tracked via track_task() for shutdown; add health probe if
         # silent stall is observed in the field.
         self.runtime.set_boot_phase("lifecycle.background")
+        evolution = getattr(self.runtime, "evolution", None)
+        if evolution is not None and hasattr(evolution, "start_background_tasks"):
+            self.track_task(evolution.start_background_tasks())
         self.track_task(self._memory_gc_task())
         self.track_task(self._db_sync_task())
 
@@ -354,6 +357,13 @@ class PluginLifecycleManager:
             await self.stop_expression_governance_services()
         except Exception as exc:
             logger.warning(f"[AstrMai] Expression governance shutdown degraded: {exc}")
+
+        try:
+            evolution = getattr(self.runtime, "evolution", None)
+            if evolution is not None and hasattr(evolution, "stop_background_tasks"):
+                await evolution.stop_background_tasks()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] Evolution background shutdown degraded: {exc}")
 
         try:
             persona_summarizer = getattr(self.runtime, "persona_summarizer", None)

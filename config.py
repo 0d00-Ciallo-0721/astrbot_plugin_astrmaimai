@@ -110,6 +110,12 @@ class EvolutionConfig(BaseModel):
     jargon_min_count: int = Field(default=2, ge=1, description="黑话进入自动审核前所需的最少证据次数")
     review_runner_interval_sec: int = Field(default=60, ge=30, le=600)
     review_runner_min_interval_sec: int = Field(default=45, ge=15)
+    enable_backlog_mining: bool = Field(default=True, description="启用低频积压消息学习扫描")
+    backlog_scan_interval_sec: int = Field(default=900, ge=60, description="积压学习扫描间隔(秒)")
+    backlog_min_unprocessed_logs: int = Field(default=40, ge=1, description="单个会话触发积压学习的最少未处理消息数")
+    backlog_batch_size: int = Field(default=120, ge=1, description="单次积压学习最多处理的消息数")
+    backlog_group_limit: int = Field(default=2, ge=1, description="每轮积压学习最多处理的会话数")
+    backlog_failure_cooldown_sec: int = Field(default=1800, ge=60, description="积压学习失败后的会话冷却时间(秒)")
 
 
 class LifeConfig(BaseModel):

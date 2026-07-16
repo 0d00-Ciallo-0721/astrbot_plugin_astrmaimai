@@ -526,6 +526,9 @@ class PluginFacade(RuntimeFacadeProtocol):
     def get_reflector(self):
         return getattr(self.runtime, "reflector", None)
 
+    def get_evolution(self):
+        return getattr(self.runtime, "evolution", None)
+
     def get_runtime_config(self):
         return getattr(self.runtime, "config", None)
 

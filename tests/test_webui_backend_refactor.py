@@ -134,6 +134,74 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(snapshot["pending_reviews"], 1)
         self.assertIn("capabilities", snapshot)
 
+    def test_dashboard_service_prefers_runtime_v2_memory_stats(self):
+        service_mod = importlib.import_module(
+            "astrmai.webui.backend.services.dashboard_service"
+        )
+
+        class _Cursor:
+            def __init__(self, value=0, rows=None):
+                self.value = value
+                self.rows = rows or []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def fetchone(self):
+                return (self.value,)
+
+            async def fetchall(self):
+                return list(self.rows)
+
+        class _Db:
+            def execute(self, query):
+                if "user_profiles" in query:
+                    return _Cursor(2)
+                return _Cursor(0)
+
+        class _DbCtx:
+            async def __aenter__(self):
+                return _Db()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _Store:
+            rows = [
+                {"kind": "fact", "status": "active"},
+                {"kind": "expression_pattern", "status": "review_pending"},
+                {"kind": "expression_pattern", "status": "active"},
+            ]
+
+            async def list_canonical(self, **kwargs):
+                kind = kwargs.get("kind", "")
+                status = kwargs.get("status", "")
+                rows = [
+                    row for row in self.rows
+                    if (not kind or row["kind"] == kind) and (not status or row["status"] == status)
+                ]
+                return {"items": [], "total": len(rows)}
+
+        class _PluginApi:
+            def get_v2_store(self):
+                return _Store()
+
+            async def get_runtime_diagnostics(self):
+                return {"status": {"lifecycle_started": True}}
+
+            async def get_capability_overview(self):
+                return {}
+
+        service = service_mod.DashboardService(_PluginApi(), lambda: _DbCtx())
+        snapshot = asyncio.run(service.get_snapshot())
+        self.assertEqual(snapshot["total_canonical_memories"], 3)
+        self.assertEqual(snapshot["pending_reviews"], 1)
+        self.assertEqual(snapshot["canonical_memory_stats"]["source"], "runtime_v2_store")
+        self.assertEqual(snapshot["expression_pattern_stats"]["total"], 2)
+
     def test_runtime_ui_service_reports_unbound_when_no_facade_resolved(self):
         adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
         service_mod = importlib.import_module("astrmai.webui.backend.services.runtimeuiservice")

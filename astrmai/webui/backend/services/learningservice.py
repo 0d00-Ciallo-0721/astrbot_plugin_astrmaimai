@@ -4,6 +4,7 @@ from typing import Any
 from ..adapters.plugin_api import PluginApiAdapter
 from ..db import get_db
 from .dashboard_repository import DashboardRepository
+from .runtime_memory_stats import canonical_kind_review_stats
 
 
 class LearningService:
@@ -11,6 +12,9 @@ class LearningService:
         self.plugin_api = plugin_api
 
     async def learning_status(self) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        diagnostics = evolution.describe_learning_runtime() if evolution and hasattr(evolution, "describe_learning_runtime") else {}
+        backlog = await evolution.backlog_overview() if evolution and hasattr(evolution, "backlog_overview") else {}
         return {
             "status": "ok",
             "data": {
@@ -18,6 +22,10 @@ class LearningService:
                 "dream_agent_bound": self.plugin_api.get_proactive_task() is not None,
                 "reflect_tracker": self.plugin_api.get_reflect_tracker() is not None,
                 "auto_check_task": self.plugin_api.get_auto_check_task() is not None,
+                "expression_patterns": await self._expression_pattern_stats(),
+                "jargons": await canonical_kind_review_stats(self.plugin_api, kind="jargon"),
+                "diagnostics": diagnostics,
+                "backlog": backlog,
             },
             "runtime_bound": self.plugin_api.has_bound_facade(),
         }
@@ -42,13 +50,11 @@ class LearningService:
         return await ChatRuntimeService(self.plugin_api).run_reflect_once(chat_id)
 
     async def _expression_pattern_stats(self) -> dict[str, Any]:
-        total, pending, approved, rejected = await DashboardRepository(get_db).expression_pattern_counts()
-        return {
-            "total": total,
-            "pending": pending,
-            "approved": approved,
-            "rejected": rejected,
-        }
+        return await canonical_kind_review_stats(
+            self.plugin_api,
+            kind="expression_pattern",
+            legacy_expression_repo=DashboardRepository(get_db),
+        )
 
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:

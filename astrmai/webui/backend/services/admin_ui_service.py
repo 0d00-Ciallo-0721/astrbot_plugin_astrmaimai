@@ -50,6 +50,7 @@ class AdminUiService:
         from .learningservice import LearningService
         from .runtimeuiservice import RuntimeUiService
         from .toolsservice import ToolsService
+        from .runtime_memory_stats import canonical_kind_review_stats, canonical_memory_stats
         self._observability = ObservabilityService(plugin_api)
         self._heartflow = HeartflowService(plugin_api)
         self._scheduler = SchedulerService(plugin_api)
@@ -58,6 +59,8 @@ class AdminUiService:
         self._runtime = RuntimeUiService(plugin_api)
         self._context_economy_ui = ContextEconomyUiService(plugin_api)
         self._tools = ToolsService(plugin_api)
+        self._canonical_kind_review_stats = canonical_kind_review_stats
+        self._canonical_memory_stats = canonical_memory_stats
 
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:
@@ -100,20 +103,29 @@ class AdminUiService:
                     return 0
             from ..repositories import CanonicalMemoryRepository
             return await CanonicalMemoryRepository(self.db_factory).count(where=where, params=params)
-        return await DashboardRepository(self.db_factory).count_table(table)
+        try:
+            return await DashboardRepository(self.db_factory).count_table(table)
+        except sqlite3.OperationalError:
+            return 0
 
     async def _expression_pattern_stats(self) -> dict[str, int]:
         from .dashboard_repository import DashboardRepository
         if not self.db_factory:
-            return {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
+            return await self._canonical_kind_review_stats(self.plugin_api, kind="expression_pattern")
         repo = DashboardRepository(self.db_factory)
-        total, pending, approved, rejected = await repo.expression_pattern_counts()
-        return {
-            "total": total,
-            "pending": pending,
-            "approved": approved,
-            "rejected": rejected,
-        }
+        return await self._canonical_kind_review_stats(
+            self.plugin_api,
+            kind="expression_pattern",
+            legacy_expression_repo=repo,
+        )
+
+    async def _jargon_stats(self) -> dict[str, int]:
+        return await self._canonical_kind_review_stats(self.plugin_api, kind="jargon")
+
+    async def _canonical_memory_stats_snapshot(self) -> dict[str, Any]:
+        from .dashboard_repository import DashboardRepository
+        repo = DashboardRepository(self.db_factory) if self.db_factory else None
+        return await self._canonical_memory_stats(self.plugin_api, repo)
 
     async def runtime_status(self) -> dict[str, Any]:
         return await self._runtime.runtime_status()
@@ -347,10 +359,12 @@ class AdminUiService:
         base_health = await self._runtime.runtime_health(await self._expression_pattern_stats())
         data = dict(base_health.get("data", {}) or {})
         expression_stats = await self._expression_pattern_stats()
+        memory_stats = await self._canonical_memory_stats_snapshot()
         data["active_chats"] = int(data.get("active_chat_count", 0) or 0)
         data["pending_reviews"] = expression_stats["pending"]
         data["total_memory_events"] = await self._safe_count("MemoryEvent")
-        data["total_canonical_memories"] = await self._safe_count("canonical_memories")
+        data["total_canonical_memories"] = int(memory_stats.get("total", 0) or 0)
+        data["canonical_memory_stats"] = memory_stats
         data.pop("active_chat_count", None)
         return {
             "status": "ok",
@@ -964,12 +978,21 @@ class AdminUiService:
         }
 
     async def learning_status(self) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        diagnostics = evolution.describe_learning_runtime() if evolution and hasattr(evolution, "describe_learning_runtime") else {}
+        backlog = await evolution.backlog_overview() if evolution and hasattr(evolution, "backlog_overview") else {}
+        expression_stats = await self._expression_pattern_stats()
+        jargon_stats = await self._jargon_stats()
         return {
             "status": "ok",
             "data": {
                 "reflector": self.plugin_api.get_reflector() is not None,
                 "reflect_tracker": self.plugin_api.get_reflect_tracker() is not None,
                 "auto_check_task": self.plugin_api.get_auto_check_task() is not None,
+                "expression_patterns": expression_stats,
+                "jargons": jargon_stats,
+                "diagnostics": diagnostics,
+                "backlog": backlog,
             },
             "runtime_bound": self.plugin_api.has_bound_facade(),
         }

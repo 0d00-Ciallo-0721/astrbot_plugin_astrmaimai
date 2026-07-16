@@ -1,5 +1,6 @@
 const API_PREFIX = "admin";
 const SCHEDULER_POLL_INTERVAL_MS = 5000;
+const DASHBOARD_CACHE_TTL_MS = 10000;
 
 const TABS = [
   { id: "dashboard", label: "Dashboard" },
@@ -46,9 +47,12 @@ const state = {
   schedulerChatId: "",
   schedulerPollTimer: null,
   lastApiErrorToastAt: 0,
+  lastApiErrorKey: "",
   selectedReviews: new Set(),
   activeUserId: "",
   userSearch: "",
+  usersScrollTop: 0,
+  dashboardCache: {},
   cache: {
     reviews: { pending: [], all: { items: [], total: 0, page: 1, page_size: 20 }, filters: { status: "", group_id: "", keyword: "" } },
     memories: { month: new Date().toISOString().slice(0, 7), events: [], reflections: [], nodes: [], jargon: [] },
@@ -199,14 +203,35 @@ function unwrapResponse(result) {
 /** Safe API fetch wrapper — preserves last successful data on error */
 function safeFetch(fetchFn, fallback) {
   return fetchFn().catch((err) => {
-    console.warn("[AstrMai-Admin] API fetch degraded:", err.message || err);
+    const message = err.message || String(err);
+    console.warn("[AstrMai-Admin] API fetch degraded:", message);
     const now = Date.now();
-    if (now - Number(state.lastApiErrorToastAt || 0) > 3000) {
+    if (state.lastApiErrorKey !== message || now - Number(state.lastApiErrorToastAt || 0) > 5000) {
+      state.lastApiErrorKey = message;
       state.lastApiErrorToastAt = now;
-      toast(`数据加载失败：${err.message || err}`);
+      toast(`数据加载失败：${message}`);
     }
     return fallback;
   });
+}
+
+function getDashboardCache(key) {
+  const entry = state.dashboardCache[key];
+  if (!entry || Date.now() - Number(entry.updatedAt || 0) > DASHBOARD_CACHE_TTL_MS) return null;
+  return entry.data;
+}
+
+function setDashboardCache(key, data) {
+  state.dashboardCache[key] = { data, updatedAt: Date.now() };
+  return data;
+}
+
+function clearDashboardCache(key = "") {
+  if (key) {
+    delete state.dashboardCache[key];
+    return;
+  }
+  state.dashboardCache = {};
 }
 
 async function readyBridge(bridge) {
@@ -439,7 +464,19 @@ function openJsonModal(title, value, onSubmit) {
 }
 
 async function loadDashboard() {
-  showLoading("正在读取运行状态大盘...");
+  if (!getDashboardCache(state.dashboardTab)) {
+    const hasDashboardShell = Boolean($("[data-dashboard-tab]"));
+    if (hasDashboardShell) {
+      dashboardShell(`
+        <section class="empty-state">
+          <h2>正在读取运行状态大盘...</h2>
+          <p>请稍候，正在通过 AstrBot Plugin Page bridge 读取插件数据。</p>
+        </section>
+      `);
+    } else {
+      showLoading("正在读取运行状态大盘...");
+    }
+  }
   if (state.dashboardTab === "overview") {
     stopSchedulerPolling();
     return renderDashboardOverview();
@@ -469,19 +506,21 @@ function dashboardShell(body) {
     ${body}
   `;
   $$('[data-dashboard-tab]').forEach((button) => button.addEventListener("click", () => {
+    if (state.dashboardTab === button.dataset.dashboardTab) return;
     state.dashboardTab = button.dataset.dashboardTab;
     loadDashboard();
   }));
 }
 
 async function renderDashboardOverview() {
-  const [snapshot, health, capabilities, models, observabilityOverview] = await Promise.all([
+  const cached = getDashboardCache("overview");
+  const [snapshot, health, capabilities, models, observabilityOverview] = cached || setDashboardCache("overview", await Promise.all([
     safeFetch(() => api.get("/dashboard"), {}),
     safeFetch(() => api.get("/runtime/health"), {}),
     safeFetch(() => api.get("/runtime/capabilities"), {}),
     safeFetch(() => api.get("/runtime/models"), {}),
     safeFetch(() => api.get("/cognition/observability/overview"), {}),
-  ]);
+  ]));
   state.observabilityOverview = observabilityOverview;
   const healthData = health || {};
   const running = Boolean(healthData.running);
@@ -498,7 +537,8 @@ async function renderDashboardOverview() {
     <div class="grid">
       ${metric("总用户数", snapshot.total_users ?? "—")}
       ${metric("待审核项", snapshot.pending_reviews ?? "—")}
-      ${metric("记忆事件", snapshot.total_memory_events ?? "—")}
+      ${metric("长期记忆(v2)", snapshot.total_canonical_memories ?? "—")}
+      ${metric("旧记忆事件", snapshot.total_memory_events ?? "—")}
       ${metric("数据库大小", `${snapshot.db_size_kb ?? 0} KB`)}
     </div>
     <div class="grid two">
@@ -520,14 +560,15 @@ async function renderDashboardOverview() {
 }
 
 async function renderDashboardHeartflow() {
-  const [status, chats, impulses, timeline, digests, intents] = await Promise.all([
+  const cached = getDashboardCache("heartflow");
+  const [status, chats, impulses, timeline, digests, intents] = cached || setDashboardCache("heartflow", await Promise.all([
     safeFetch(() => api.get("/heartflow/status"), {}),
     safeFetch(() => api.get("/heartflow/chats"), { items: [] }),
     safeFetch(() => api.get("/heartflow/impulses?limit=50"), { items: [] }),
     safeFetch(() => api.get("/heartflow/timeline?limit=80"), { items: [] }),
     safeFetch(() => api.get("/heartflow/topic-digests?limit=50"), { items: [] }),
     safeFetch(() => api.get("/proactive/intents?limit=50"), { items: [] }),
-  ]);
+  ]));
   const impulseRows = asItems(impulses).map((item) => `
     <tr>
       <td>${formatTime(item.timestamp)}</td>
@@ -627,6 +668,7 @@ async function renderDashboardHeartflow() {
     if (!await confirmAction("清理这个 chat 的 Heartflow cooldown？")) return;
     await api.post(`/heartflow/chats/${segment(button.dataset.clearHeartflow)}/cooldowns/clear`);
     toast("Heartflow cooldown 已清理");
+    clearDashboardCache("heartflow");
     renderDashboardHeartflow();
   }));
 }
@@ -725,14 +767,15 @@ function renderSchedulerDiagnosticsSection() {
 }
 
 async function renderDashboardCognition() {
-  const [decisions, turns, schedulerStatus, schedulerDueSelection, observabilityOverview, unifiedTimeline] = await Promise.all([
+  const cached = getDashboardCache("cognition");
+  const [decisions, turns, schedulerStatus, schedulerDueSelection, observabilityOverview, unifiedTimeline] = cached || setDashboardCache("cognition", await Promise.all([
     safeFetch(() => api.get("/cognition/recent-decisions?limit=50"), { items: [] }),
     safeFetch(() => api.get("/cognition/recent-turns?limit=50"), { items: [] }),
     safeFetch(() => api.get("/cognition/scheduler/status"), null),
     safeFetch(() => api.get("/cognition/scheduler/due-selection"), null),
     safeFetch(() => api.get("/cognition/observability/overview"), {}),
     safeFetch(() => api.get(observabilityTimelinePath()), { items: [] }),
-  ]);
+  ]));
   state.observabilityOverview = observabilityOverview;
   state.schedulerStatus = schedulerStatus;
   state.schedulerDueSelection = schedulerDueSelection;
@@ -929,11 +972,12 @@ function openTurnTrace(index, source = state.cache.turns) {
 }
 
 async function renderDashboardTools() {
-  const [status, policy, calls] = await Promise.all([
+  const cached = getDashboardCache("tools");
+  const [status, policy, calls] = cached || setDashboardCache("tools", await Promise.all([
     safeFetch(() => api.get("/tools/status"), {}),
     safeFetch(() => api.get("/tools/policy"), {}),
     safeFetch(() => api.get("/tools/recent-calls?limit=50"), { items: [] }),
-  ]);
+  ]));
   const rows = asItems(calls).map((item) => `
     <tr>
       <td>${escapeHtml(item.chat_id || "-")}</td>
@@ -1019,9 +1063,40 @@ async function loadLearning() {
       </td>
     </tr>
   `);
+  const expressionStats = learning.expression_patterns || {};
+  const jargonStats = learning.jargons || {};
+  const backlog = learning.backlog || {};
+  const diagnostics = learning.diagnostics || {};
+  const topBacklogRows = asItems(backlog.top_unprocessed_groups).map((item) => `
+    <tr>
+      <td>${escapeHtml(item.group_id || "-")}</td>
+      <td>${item.count ?? 0}</td>
+      <td>${formatTime(item.oldest_timestamp)}</td>
+      <td>${formatTime(item.latest_timestamp)}</td>
+    </tr>
+  `);
   content().innerHTML = `
     ${pageHeader("主动学习与任务", "监控 AI 的独立思考周期、夜间造梦及反思过滤池。")}
     <div class="feature-grid">${cards}</div>
+    ${section("学习产出", "人物画像、表达习惯和黑话是不同学习通道；表达/黑话默认先进入审核。", `
+      <div class="grid">
+        ${metric("表达习惯", expressionStats.total ?? 0)}
+        ${metric("表达待审核", expressionStats.pending ?? 0)}
+        ${metric("黑话词库", jargonStats.total ?? 0)}
+        ${metric("黑话待审核", jargonStats.pending ?? 0)}
+      </div>
+    `)}
+    ${section("积压学习诊断", "后台会低频扫描未处理消息，满足阈值后自动挖掘表达和黑话。", `
+      <div class="grid">
+        ${metric("积压学习", backlog.enabled ? "开启" : "关闭")}
+        ${metric("触发阈值", backlog.threshold ?? diagnostics.backlog?.threshold ?? "—")}
+        ${metric("每轮会话数", backlog.group_limit ?? diagnostics.backlog?.group_limit ?? "—")}
+        ${metric("Worker", backlog.worker_running ? "运行中" : "未运行")}
+      </div>
+      ${table(["Chat", "未处理消息", "最早", "最新"], topBacklogRows)}
+      <h4>最近一次后台学习</h4>
+      <pre>${json(backlog.last_report || diagnostics.backlog?.last_report || {})}</pre>
+    `)}
     <div class="grid two">
       ${section("主动组件调度 Proactive", "Proactive / Wakeup 状态。", `<pre>${json({ proactive, wakeup })}</pre>`)}
       ${section("表达冷却", "Expression selector cooldowns", `<pre>${json(cooldowns)}</pre>`)}
@@ -1247,6 +1322,7 @@ function renderUsers() {
     </div>
   `;
   $$('[data-select-user]').forEach((button) => button.addEventListener("click", () => {
+    state.usersScrollTop = Number($(".user-list")?.scrollTop || 0);
     state.activeUserId = button.dataset.selectUser;
     renderUsers();
   }));
@@ -1255,6 +1331,8 @@ function renderUsers() {
     applyUserSearchFilter();
   });
   applyUserSearchFilter();
+  const userList = $(".user-list");
+  if (userList) userList.scrollTop = Number(state.usersScrollTop || 0);
   bindUserActions(active);
 }
 
@@ -1605,7 +1683,10 @@ async function loadCurrent() {
 async function init() {
   setBridgeStatus("Bridge 初始化中", "muted");
   renderTabs();
-  $("#refresh-button").addEventListener("click", loadCurrent);
+  $("#refresh-button").addEventListener("click", () => {
+    if (state.current === "dashboard") clearDashboardCache(state.dashboardTab);
+    loadCurrent();
+  });
   window.addEventListener("hashchange", () => {
     const next = normalizeTabId(location.hash.replace("#", "") || "dashboard");
     if (next !== state.current) {

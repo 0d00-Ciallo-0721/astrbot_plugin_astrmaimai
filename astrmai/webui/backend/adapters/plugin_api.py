@@ -220,6 +220,14 @@ class PluginApiAdapter:
     def get_reflector(self) -> Any:
         return self._call_facade("get_reflector")
 
+    def get_evolution(self) -> Any:
+        evolution = self._call_facade("get_evolution")
+        if evolution is not None:
+            return evolution
+        facade = self._current_facade()
+        runtime = getattr(facade, "runtime", None) if facade is not None else None
+        return getattr(runtime, "evolution", None) if runtime is not None else None
+
     def get_runtime_config(self) -> Any:
         return self._call_facade("get_runtime_config")
 
