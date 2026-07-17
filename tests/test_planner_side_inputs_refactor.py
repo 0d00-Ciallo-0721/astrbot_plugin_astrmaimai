@@ -972,6 +972,53 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
+    def test_cross_session_request_missing_message_clarifies_instead_of_required_tool(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="帮我给1481314186发个消息", group_id=None)
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(tools, [])
+        self.assertEqual(event.get_extra("astrmai_required_tools"), [])
+        self.assertTrue(event.get_extra("astrmai_tool_clarification_needed"))
+        self.assertIn("转达什么内容", event.get_extra("astrmai_tool_clarification_prompt"))
+        self.assertIn("private.message", event.get_extra("astrmai_tool_clarification_missing_slots"))
+        self.assertEqual(event.get_extra("astrmai_turn_context").tools.invocation_mode, "clarify")
+
+    def test_cross_session_request_missing_target_clarifies_instead_of_guessing_pronoun(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="帮我问问他吃饭了没有", group_id=None)
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertEqual(tools, [])
+        self.assertEqual(event.get_extra("astrmai_required_tools"), [])
+        self.assertTrue(event.get_extra("astrmai_tool_clarification_needed"))
+        self.assertIn("发给谁", event.get_extra("astrmai_tool_clarification_prompt"))
+        self.assertIn("private.target_name", event.get_extra("astrmai_tool_clarification_missing_slots"))
+
     def test_natural_reverse_relay_request_is_required_after_behavior_filter(self):
         mixin = self._prepare_tool_mixin()
         mixin.action_modifier = SimpleNamespace(modify_tools=lambda tools, **kwargs: [])

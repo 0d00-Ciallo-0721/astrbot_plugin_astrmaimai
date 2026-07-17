@@ -24,6 +24,11 @@ from .tool_disclosure import (
     ToolDisclosurePlanner,
     select_tools_by_names,
 )
+from .tool_intent_resolution import (
+    clarification_resolutions,
+    ready_families,
+    resolve_explicit_tool_intents,
+)
 from .tools.pfc_tools import (
     BotCapabilityLookupTool,
     ContactRouteSuggestTool,
@@ -1050,8 +1055,42 @@ class PlannerSideInputMixin:
             if self._canonical_tool_name(tool)
         ]
         reliable_explicit_enabled = self._conversation_flag("explicit_tool_execution_enabled", True)
+        intent_resolutions = (
+            resolve_explicit_tool_intents(
+                explicit_tool_families,
+                message=str(getattr(event, "message_str", "") or ""),
+                available_tool_names=turn_tools.filtered_tools,
+            )
+            if reliable_explicit_enabled
+            else []
+        )
+        clarification_items = clarification_resolutions(intent_resolutions)
+        if clarification_items:
+            prompt = "；".join(
+                item.clarification_prompt
+                for item in clarification_items
+                if item.clarification_prompt
+            )
+            missing_slots = []
+            for item in clarification_items:
+                missing_slots.extend(f"{item.family}.{slot}" for slot in item.missing_slots)
+            event.set_extra("astrmai_tool_clarification_needed", True)
+            event.set_extra("astrmai_tool_clarification_prompt", prompt)
+            event.set_extra("astrmai_tool_clarification_missing_slots", missing_slots)
+            turn_tools.record_step(
+                "planner.tool_slot_clarification",
+                list(explicit_tool_families),
+                sorted(ready_families(intent_resolutions)),
+                "missing_slots(" + ",".join(missing_slots) + ")",
+                category="tool_slots",
+            )
+        else:
+            event.set_extra("astrmai_tool_clarification_needed", False)
+            event.set_extra("astrmai_tool_clarification_prompt", "")
+            event.set_extra("astrmai_tool_clarification_missing_slots", [])
+        executable_families = ready_families(intent_resolutions) if reliable_explicit_enabled else set()
         plans = (
-            build_explicit_invocation_plans(explicit_tool_families, turn_tools.filtered_tools)
+            build_explicit_invocation_plans(executable_families, turn_tools.filtered_tools)
             if reliable_explicit_enabled
             else []
         )
@@ -1076,6 +1115,10 @@ class PlannerSideInputMixin:
                 emotion_mapping=self._emotion_mapping_for_meme_tool(),
             )
             event.set_extra("astrmai_prepared_required_tools", prepared_tools)
+        elif clarification_items:
+            event.set_extra("astrmai_prepared_required_tools", [])
+            turn_tools.invocation_mode = "clarify"
+            return []
         return tools
 
     @staticmethod

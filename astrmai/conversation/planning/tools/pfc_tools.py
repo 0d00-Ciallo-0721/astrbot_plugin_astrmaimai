@@ -846,7 +846,10 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
 @dataclass
 class ProactivePokeTool(FunctionTool[AstrAgentContext]):
     name: str = "proactive_poke"
-    description: str = "主动戳一戳目标用户。未指定时默认戳当前触发用户。"
+    description: str = (
+        "主动戳一戳目标用户。适合轻互动、调皮回戳、提醒对方看消息、或在群聊中自然拉某人回到话题。"
+        "未指定目标时默认戳当前触发用户；不要在严肃、冲突或信息不明确时滥用。"
+    )
     db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
@@ -913,7 +916,7 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
                 group_id=str(group_id or ""),
             ),
         )
-        return f"已将戳一戳 {display_name} 加入待执行动作；不要声称已经成功，继续生成自然的文字回应。"
+        return f"已将戳一戳 {display_name} 加入待执行动作；不要声称已经成功，继续生成一两句自然、轻快的配套回应。"
 
 
 @dataclass

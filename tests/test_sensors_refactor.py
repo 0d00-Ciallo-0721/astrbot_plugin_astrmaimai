@@ -12,15 +12,19 @@ class _FakeEvent:
     def __init__(self, *, group_id, components, text=""):
         self.message_str = text
         self.unified_msg_origin = f"default:{'GroupMessage' if group_id else 'FriendMessage'}:{group_id or 'user-1'}"
-        self.message_obj = SimpleNamespace(message=components)
+        self.message_obj = SimpleNamespace(message=components, self_id="bot-1")
         self._group_id = group_id
         self._extra = {}
+        self.bot = SimpleNamespace(api=SimpleNamespace(calls=[]))
 
     def get_group_id(self):
         return self._group_id
 
     def get_sender_id(self):
-        return "user-1"
+        return "12345"
+
+    def get_sender_name(self):
+        return "Alice"
 
     def get_self_id(self):
         return "bot-1"
@@ -50,6 +54,8 @@ class RefactoredSensorsTests(unittest.TestCase):
         for name in ("Reply", "Video", "Record", "File"):
             if not hasattr(self.Comp, name):
                 setattr(self.Comp, name, type(name, (), {}))
+        if not hasattr(self.Comp, "Poke"):
+            setattr(self.Comp, "Poke", type("Poke", (), {}))
 
     def tearDown(self):
         try:
@@ -89,6 +95,11 @@ class RefactoredSensorsTests(unittest.TestCase):
         reply = self.Comp.Reply()
         reply.chain = chain
         return reply
+
+    def _poke_component(self, target_id="bot-1"):
+        poke = self.Comp.Poke()
+        poke.target_id = target_id
+        return poke
 
     def test_private_image_bypasses_probability_gate(self):
         filters = self.sensors_mod.PreFilters(self._config(probability=0.0))
@@ -258,6 +269,103 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertEqual(event.get_extra("extracted_image_urls"), [])
         self.assertFalse(event.get_extra("direct_vision_urls"))
         self.assertEqual(event.get_extra("vision_direct_skip_reason"), "not_direct_path")
+
+    def test_poke_event_writes_lightweight_play_context(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        event = _FakeEvent(group_id="456", components=[self._poke_component("bot-1")])
+
+        class _Api:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                return {}
+
+        class _State:
+            def __init__(self):
+                self.affection_calls = []
+                self.relationship_engine = SimpleNamespace(get_social_score=lambda _uid: 42.0)
+
+            async def get_user_profile(self, uid):
+                return SimpleNamespace(name="")
+
+            async def apply_profile_name(self, uid, name, source=""):
+                return None
+
+            async def calculate_and_update_affection(self, **kwargs):
+                self.affection_calls.append(kwargs)
+
+        class _Gate:
+            def __init__(self):
+                self.state_engine = _State()
+                self.processed = []
+
+            async def process_event(self, event):
+                self.processed.append(event)
+
+        api = _Api()
+        event.bot = SimpleNamespace(api=api)
+        gate = _Gate()
+
+        asyncio.run(filters.process_poke_event(event, SimpleNamespace(), gate))
+
+        self.assertTrue(event.get_extra("is_virtual_poke"))
+        self.assertTrue(event.get_extra("astrmai_lightweight_event"))
+        self.assertEqual(event.get_extra("astrmai_interaction_kind"), "poke")
+        self.assertEqual(event.get_extra("astrmai_reply_mode"), "playful_interaction")
+        self.assertEqual(event.get_extra("astrmai_poke_intent"), "affectionate_ping")
+        self.assertIn("亲近", event.get_extra("astrmai_rich_text"))
+        self.assertIn("一两句", event.get_extra("astrmai_poke_reply_hint"))
+        self.assertEqual(api.calls, [("send_poke", {"user_id": 12345, "group_id": 456})])
+        self.assertEqual(len(gate.processed), 1)
+        self.assertEqual(gate.state_engine.affection_calls[0]["event_type"], "normal_chat")
+
+    def test_repeated_poke_switches_to_cooldown_hint_and_meme_flag(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+
+        class _State:
+            relationship_engine = SimpleNamespace(get_social_score=lambda _uid: 0.0)
+
+            async def get_user_profile(self, uid):
+                return SimpleNamespace(name="")
+
+            async def calculate_and_update_affection(self, **kwargs):
+                return None
+
+        class _Gate:
+            state_engine = _State()
+
+            async def process_event(self, event):
+                return None
+
+        async def _run_three():
+            events = []
+            async def _call_action(*args, **kwargs):
+                return {}
+            for _ in range(3):
+                event = _FakeEvent(group_id="456", components=[self._poke_component("bot-1")])
+                event.bot = SimpleNamespace(api=SimpleNamespace(call_action=_call_action))
+                await filters.process_poke_event(event, SimpleNamespace(), _Gate())
+                events.append(event)
+            return events
+
+        events = asyncio.run(_run_three())
+
+        self.assertEqual(events[0].get_extra("astrmai_poke_streak_count"), 1)
+        self.assertEqual(events[1].get_extra("astrmai_poke_streak_count"), 2)
+        self.assertTrue(events[1].get_extra("astrmai_force_meme"))
+        self.assertEqual(events[2].get_extra("astrmai_poke_intent"), "attention_spam")
+        self.assertGreater(events[2].get_extra("astrmai_poke_cooldown_seconds"), 0)
+        self.assertIn("别一直戳", events[2].get_extra("astrmai_poke_reply_hint"))
+
+    def test_extract_social_relations_includes_poke_edge(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        event = _FakeEvent(group_id="456", components=[self._poke_component("67890")])
+
+        relations = filters.extract_social_relations(event, "456")
+
+        self.assertEqual(relations, [("12345", "67890", "poke", 0.2)])
 
 
 if __name__ == "__main__":

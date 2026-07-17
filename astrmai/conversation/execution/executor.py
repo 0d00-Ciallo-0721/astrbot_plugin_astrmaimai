@@ -133,6 +133,9 @@ class ConcurrentExecutor:
             "astrmai_pending_actions",
             "astrmai_bypass_mood_analysis",
             "astrmai_force_meme",
+            "astrmai_tool_clarification_needed",
+            "astrmai_tool_clarification_prompt",
+            "astrmai_tool_clarification_missing_slots",
         ):
             value = source_event.get_extra(key, None)
             if value is not None:
@@ -190,8 +193,56 @@ class ConcurrentExecutor:
             f"{api_prompt}\n\n"
             "[SYSTEM TOOL ENFORCEMENT]\n"
             f"用户本轮明确要求的工具尚未执行：{tool_list}。"
-            "你必须先各调用一次当前提供的工具，再依据真实工具结果回答原始请求。"
-            "禁止跳过工具直接声称已查询、已执行或已完成。"
+            "如果工具参数已经足够，你必须先各调用一次当前提供的工具，再依据真实工具结果回答原始请求。"
+            "如果无法可靠构造工具参数，不要猜测、不要伪造、不要声称已查询或已执行；"
+            "请直接向用户追问缺少的目标、内容或上下文。"
+        )
+
+    @staticmethod
+    def _required_tool_missing_reply(event: AstrMessageEvent, missing_tools: list[str]) -> str:
+        prompt = str(event.get_extra("astrmai_tool_clarification_prompt", "") or "").strip()
+        if prompt:
+            return prompt
+        labels = {
+            "space_transition_action": "跨会话发消息",
+            "construct_at_event": "@某人",
+            "memory_write_correction_tool": "纠正记忆",
+            "unverified_report_record_tool": "记录未确认说法",
+            "persona_fact_check_tool": "核查设定事实",
+            "proactive_meme": "发表情包",
+            "qq_custom_face_send_tool": "发自定义表情",
+            "message_reaction_action": "互动回应",
+        }
+        tool_labels = [labels.get(name, name) for name in missing_tools]
+        if "space_transition_action" in missing_tools:
+            return "我还没能确认要发给谁、具体转达什么，所以没有发送。你把目标和要说的话都告诉我，我再帮你传达。"
+        return "我还没能确认这次要执行的具体信息，所以没有操作。你再补充一下：" + "、".join(tool_labels)
+
+    async def _handle_required_tool_missing(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        bot_id: str,
+        missing_tools: list[str],
+        *,
+        model: str,
+    ) -> Optional[str]:
+        reply_text = self._required_tool_missing_reply(event, missing_tools)
+        event.set_extra("astrmai_execution_status", "tool_clarification_sent")
+        event.set_extra("astrmai_tool_missing_required", list(missing_tools))
+        debug_trace(
+            event,
+            "execution.executor.required_tool_missing",
+            missing_tools=list(missing_tools),
+            reply_preview=preview_text(reply_text, 120),
+        )
+        return await self._finalize_reply(
+            event,
+            chat_id,
+            bot_id,
+            reply_text,
+            trace_mode="tool_clarification",
+            model=model,
         )
 
     def _mark_vision_direct_state(
@@ -898,8 +949,12 @@ class ConcurrentExecutor:
                         self._sync_execution_event_trace(execution_event, event)
                         missing_required = self._record_required_tool_outcomes(event)
                     if missing_required:
-                        raise ValueError(
-                            "required_tool_not_called:" + ",".join(sorted(missing_required))
+                        return await self._handle_required_tool_missing(
+                            event,
+                            chat_id,
+                            runtime["bot_id"],
+                            sorted(missing_required),
+                            model=provider_id,
                         )
                 reply_text = result.text
                 if not reply_text:
@@ -1110,6 +1165,20 @@ class ConcurrentExecutor:
             await self._release_chat_execution_lock(chat_id, using_runtime_coordinator, chat_lock)
     async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str) -> Optional[str]:
         logger.error(f"[{chat_id}] fatal executor fallback triggered")
+        if "required_tool_not_called:" in str(error_detail or ""):
+            missing_text = str(error_detail).split("required_tool_not_called:", 1)[1]
+            missing_tools = [
+                item.strip()
+                for item in missing_text.replace("\n", ",").split(",")
+                if item.strip()
+            ]
+            return await self._handle_required_tool_missing(
+                event,
+                chat_id,
+                str(event.get_self_id()) if hasattr(event, "get_self_id") else "SELF_BOT",
+                missing_tools or ["unknown_tool"],
+                model="fallback",
+            )
         if str(event.get_extra("astrmai_execution_status", "") or "") == "stale_drop":
             debug_trace(
                 event,

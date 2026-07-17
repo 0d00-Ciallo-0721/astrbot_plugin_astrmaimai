@@ -419,6 +419,16 @@ class PlannerPromptContextMixin:
         )
         if is_lightweight_event:
             prompt_envelope.guidance_lines.append("这是轻互动，只回应当前动作，不要接旧话题或复述历史。")
+        if str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower() == "poke":
+            poke_hint = str(focus_event.get_extra("astrmai_poke_reply_hint", "") or "").strip()
+            poke_intent = str(focus_event.get_extra("astrmai_poke_intent", "") or "").strip()
+            poke_streak = int(focus_event.get_extra("astrmai_poke_streak_count", 0) or 0)
+            if poke_hint:
+                prompt_envelope.guidance_lines.append(f"戳一戳互动策略：{poke_hint}")
+            if poke_intent:
+                prompt_envelope.guidance_lines.append(
+                    f"戳一戳语境：intent={poke_intent}, streak={poke_streak}。回复保持短促、鲜活，不要超过两句话。"
+                )
         event.set_extra("astrmai_lightweight_event", is_lightweight_event)
         event.set_extra("astrmai_focus_thread_context", focus_context)
         emit_legacy_prompt_envelope_extras(event, prompt_envelope, use_lane_history=True)

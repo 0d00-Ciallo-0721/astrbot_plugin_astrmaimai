@@ -183,6 +183,59 @@ class RefactoredExecutorTests(unittest.TestCase):
         lifecycle = event.get_extra("astrmai_tool_lifecycle_trace", [])
         self.assertTrue(any(item["phase"] == "required_tool_retry" for item in lifecycle))
 
+    def test_tool_mode_missing_required_tool_sends_clarification_without_alert(self):
+        gateway = _FakeGateway(tool_responses={"model-a": "未调用工具的普通回答"})
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_required_tools", ["space_transition_action"])
+        event.set_extra("astrmai_tool_clarification_prompt", "你想让我发给谁？要转达什么内容？")
+        tool = SimpleNamespace(name="space_transition_action")
+
+        result = asyncio.run(executor.execute(event, "prompt", "system", tools=[tool]))
+
+        self.assertEqual(result, "你想让我发给谁？要转达什么内容？")
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "sent")
+        self.assertEqual(event.get_extra("astrmai_tool_missing_required"), ["space_transition_action"])
+        self.assertEqual(reply_service.calls[-1], ("default:GroupMessage:group-1", result))
+        self.assertEqual(len([call for call in gateway.calls if call[0] == "tool"]), 2)
+
+    def test_fatal_fallback_converts_required_tool_error_to_clarification(self):
+        gateway = _FakeGateway()
+        gateway.config.global_settings = SimpleNamespace(
+            debug_mode=False,
+            enable_error_interception=True,
+            admin_ids=["admin-1"],
+        )
+        reply_service = _FakeReplyService()
+        send_calls = []
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(send_message=lambda *args, **kwargs: send_calls.append((args, kwargs))),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        result = asyncio.run(
+            executor._handle_fatal_fallback(
+                event,
+                event.unified_msg_origin,
+                "required_tool_not_called:space_transition_action",
+            )
+        )
+
+        self.assertIn("没有发送", result)
+        self.assertEqual(event.get_extra("astrmai_tool_missing_required"), ["space_transition_action"])
+        self.assertEqual(send_calls, [])
+
     def test_text_mode_runs_on_dialog_lane_and_records_reply(self):
         gateway = _FakeGateway()
         reply_service = _FakeReplyService()

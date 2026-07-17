@@ -455,7 +455,26 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         return detail
 
     def _append_tool_guidance(self, prompt_envelope, tools, event: AstrMessageEvent | None = None) -> None:
-        if not prompt_envelope or not tools:
+        if not prompt_envelope:
+            return
+        if event is not None and hasattr(event, "get_extra") and event.get_extra("astrmai_tool_clarification_needed", False):
+            prompt = str(event.get_extra("astrmai_tool_clarification_prompt", "") or "").strip()
+            missing_slots = [
+                str(item or "").strip()
+                for item in event.get_extra("astrmai_tool_clarification_missing_slots", []) or []
+                if str(item or "").strip()
+            ]
+            guidance_lines = list(getattr(prompt_envelope, "guidance_lines", []) or [])
+            detail = "用户像是在请求我使用工具或执行动作，但信息还不完整。"
+            if prompt:
+                detail += f"这轮不要声称已经执行，先自然追问：{prompt}"
+            else:
+                detail += "这轮不要声称已经执行，先自然追问缺少的信息。"
+            if missing_slots:
+                detail += " 缺少信息：" + "、".join(missing_slots[:6]) + "。"
+            guidance_lines.append(detail)
+            prompt_envelope.guidance_lines = self._dedupe_guidance_lines(guidance_lines)
+        if not tools:
             return
         tool_tier = "full"
         if event is not None and hasattr(event, "get_extra"):

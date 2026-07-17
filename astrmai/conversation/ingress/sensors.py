@@ -8,6 +8,8 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.core.star.command_management import list_commands
 
+from .poke_play import PokePlaybook
+
 class PreFilters:
     """
     感知与过滤器 (System 1: Fused Version)
@@ -17,6 +19,7 @@ class PreFilters:
         self.config = config
         self.foreign_commands = set()
         self._commands_loaded = False 
+        self._poke_playbook = PokePlaybook()
 
     def refresh_config(self, config):
         self.config = config
@@ -357,6 +360,13 @@ class PreFilters:
                     to_user = getattr(component, 'sender_id', None) 
                     if to_user and to_user != from_user:
                         relations.append((from_user, to_user, "reply", 0.3))
+
+                elif hasattr(Comp, "Poke") and isinstance(component, Comp.Poke):
+                    to_user = getattr(component, 'target_id', getattr(component, 'qq', None))
+                    if to_user and not callable(to_user):
+                        to_user = str(to_user)
+                        if to_user and to_user != from_user:
+                            relations.append((from_user, to_user, "poke", 0.2))
         except Exception as e:
             logger.debug(f"[AstrMai-Sensor] 抽取社交关系失败: {e}")
             
@@ -500,11 +510,46 @@ class PreFilters:
         target_label = f"{target_name}({target_id})" if target_id and target_id not in str(target_name) else target_name
         occurred_at = time.time()
         relative_age_label = "刚刚"
-        
-        virtual_text = f"(Interaction: {actor_label} -> {target_label})"
+
+        state_engine = getattr(attention_gate, "state_engine", None)
+        relationship_engine = getattr(state_engine, "relationship_engine", None)
+        social_score = 0.0
+        if relationship_engine and hasattr(relationship_engine, "get_social_score"):
+            try:
+                social_score = float(relationship_engine.get_social_score(sender_id) or 0.0)
+            except Exception:
+                logger.debug("[AstrMai-Sensor] failed to read relationship score for poke", exc_info=True)
+
+        chat_id = str(getattr(event, "unified_msg_origin", "") or group_id or target_id or sender_id)
+        poke_play = self._poke_playbook.build(
+            chat_id=chat_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            target_id=target_id,
+            target_name=target_name,
+            target_is_bot=target_id == bot_id,
+            social_score=social_score,
+            group_id=group_id,
+            now=occurred_at,
+        )
+
+        if target_id == bot_id and state_engine and hasattr(state_engine, "calculate_and_update_affection"):
+            try:
+                await state_engine.calculate_and_update_affection(
+                    user_id=sender_id,
+                    group_id=chat_id,
+                    mood_tag="happy" if social_score >= -20 else "neutral",
+                    intensity=0.35,
+                    message_text="戳一戳",
+                    event_type="normal_chat",
+                )
+            except Exception:
+                logger.debug("[AstrMai-Sensor] poke affection settlement failed", exc_info=True)
+
+        virtual_text = poke_play.narrative
         logger.info(f"[AstrMai-Sensor] 👉 捕获互动事件: {virtual_text}")
         
-        if target_id == bot_id:
+        if target_id == bot_id and poke_play.should_counter_poke:
             try:
                 client = getattr(event, 'bot', None)
                 if client and hasattr(client, 'api'):
@@ -519,6 +564,9 @@ class PreFilters:
         event.message_str = virtual_text
         event.set_extra("is_virtual_poke", True)
         event.set_extra("astrmai_interaction_kind", "poke")
+        event.set_extra("astrmai_lightweight_event", True)
+        event.set_extra("astrmai_rich_text", virtual_text)
+        event.set_extra("astrmai_reply_mode", "playful_interaction")
         event.set_extra("astrmai_interaction_actor_id", sender_id)
         event.set_extra("astrmai_interaction_actor_name", sender_name)
         event.set_extra("astrmai_interaction_actor_display_name", actor_label)
@@ -528,6 +576,17 @@ class PreFilters:
         event.set_extra("astrmai_interaction_target_is_bot", target_id == bot_id)
         event.set_extra("astrmai_interaction_occurred_at", occurred_at)
         event.set_extra("astrmai_interaction_relative_age_label", relative_age_label)
+        event.set_extra("astrmai_poke_intent", poke_play.intent)
+        event.set_extra("astrmai_poke_intensity", poke_play.intensity)
+        event.set_extra("astrmai_poke_streak_count", poke_play.streak_count)
+        event.set_extra("astrmai_poke_relationship_level", poke_play.relationship_level)
+        event.set_extra("astrmai_poke_reply_hint", poke_play.reply_hint)
+        event.set_extra("astrmai_poke_social_signal", poke_play.social_signal)
+        event.set_extra("astrmai_poke_cooldown_seconds", poke_play.cooldown_seconds)
+        event.set_extra("astrmai_poke_group_focus_hint", poke_play.group_focus_hint)
         event.set_extra("astrmai_bonus_score", 2.0) 
+        if poke_play.should_force_meme:
+            event.set_extra("astrmai_force_meme", True)
+            event.set_extra("astrmai_bypass_mood_analysis", poke_play.meme_tag)
         
         await attention_gate.process_event(event)
