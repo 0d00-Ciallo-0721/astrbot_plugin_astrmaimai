@@ -738,8 +738,15 @@ async def _run_social_score_audit_async() -> dict:
     cold_case = next(item for item in results if item["case_id"] == "cold_distance")
     perfunctory_case = next(item for item in results if item["case_id"] == "perfunctory_brief")
     irritation_case = next(item for item in results if item["case_id"] == "mild_irritation")
+
+    def _expected_published_mood_tag(item: dict) -> str:
+        raw_tag = str(item.get("mood_tag", "") or "").strip().lower()
+        if item["mood_tag_remap_suppressed"] or raw_tag == "neutral":
+            return ""
+        return str(item.get("mood_tag", "") or "")
+
     publish_change_semantics_aligned = all(
-        item["published_mood_tag"] == ("" if item["mood_tag_remap_suppressed"] else item["mood_tag"])
+        item["published_mood_tag"] == _expected_published_mood_tag(item)
         and item["published_event_type"] == item["effective_event_type"]
         for item in results
     )

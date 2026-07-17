@@ -19,6 +19,8 @@ class QQActionDispatcher:
         "message_emoji_like": "message_emoji_like_action",
         "group_sign": "group_sign_action",
         "withdraw": "regret_and_withdraw_action",
+        "custom_face_send": "qq_custom_face_send_tool",
+        "quote_reply": "quote_reply_action",
     }
 
     @classmethod
@@ -115,6 +117,40 @@ class QQActionDispatcher:
             status="success",
         )
 
+    async def _send_qq_message(self, api, action: PendingQQAction, message: list[dict[str, Any]]) -> None:
+        if action.group_id:
+            try:
+                await api.call_action(
+                    "send_msg",
+                    message_type="group",
+                    group_id=self._coerce_identifier(action.group_id),
+                    message=message,
+                )
+                return
+            except Exception:
+                await api.call_action(
+                    "send_group_msg",
+                    group_id=self._coerce_identifier(action.group_id),
+                    message=message,
+                )
+                return
+        target_id = action.target_id
+        if not target_id:
+            raise RuntimeError("缺少目标会话")
+        try:
+            await api.call_action(
+                "send_msg",
+                message_type="private",
+                user_id=self._coerce_identifier(target_id),
+                message=message,
+            )
+        except Exception:
+            await api.call_action(
+                "send_private_msg",
+                user_id=self._coerce_identifier(target_id),
+                message=message,
+            )
+
     async def _commit_one(
         self,
         api,
@@ -154,6 +190,28 @@ class QQActionDispatcher:
             if not message_id:
                 raise RuntimeError("没有可撤回的上一条 AstrMai 回复")
             await api.call_action("delete_msg", message_id=self._coerce_identifier(message_id))
+        elif action_type == "custom_face_send":
+            face = action.payload.get("face")
+            if not isinstance(face, dict) or not face:
+                raise RuntimeError("缺少自定义表情数据")
+            segment_data = dict(face)
+            segment_type = str(action.payload.get("segment_type") or segment_data.pop("type", "") or "mface")
+            await self._send_qq_message(api, action, [{"type": segment_type, "data": segment_data}])
+        elif action_type == "quote_reply":
+            message_id = str(action.message_id or "").strip()
+            text = str(action.payload.get("text") or "").strip()
+            if not message_id:
+                raise RuntimeError("缺少引用消息 ID")
+            if not text:
+                raise RuntimeError("缺少引用回复正文")
+            await self._send_qq_message(
+                api,
+                action,
+                [
+                    {"type": "reply", "data": {"id": self._coerce_identifier(message_id)}},
+                    {"type": "text", "data": {"text": text}},
+                ],
+            )
         else:
             return
         self._record_committed_tool(event, action_type)
@@ -164,7 +222,7 @@ class QQActionDispatcher:
         actions = [
             action
             for action in self._queued_actions(event)
-            if action.action_type in {"poke", "message_emoji_like", "group_sign", "withdraw"}
+            if action.action_type in {"poke", "message_emoji_like", "group_sign", "withdraw", "custom_face_send", "quote_reply"}
         ]
         if not actions:
             return []

@@ -443,6 +443,10 @@ class StateRefactorTests(unittest.TestCase):
             engine.classify_interaction_type("行了，别说了，我知道了。"),
             self.state_mod.RelationshipEvent.IGNORE,
         )
+        self.assertEqual(
+            engine.classify_interaction_type("你可真行啊，又把事情搞砸了，真棒。"),
+            self.state_mod.RelationshipEvent.RUDENESS,
+        )
 
     def test_normal_chat_bias_keeps_tool_intent_above_mixed_affect(self):
         config = SimpleNamespace(

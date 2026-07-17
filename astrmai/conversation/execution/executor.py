@@ -37,6 +37,7 @@ from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureExcept
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
+from ..planning.tool_disclosure import normalize_requested_packages, select_tools_by_packages
 
 
 class ConcurrentExecutor:
@@ -126,6 +127,9 @@ class ConcurrentExecutor:
             "astrmai_tool_invocation_plans",
             "astrmai_required_tools",
             "astrmai_prepared_required_tools",
+            "astrmai_requested_tool_packages",
+            "astrmai_tool_disclosure_expanded_once",
+            "astrmai_disclosure_expanded_packages",
             "astrmai_pending_actions",
             "astrmai_bypass_mood_analysis",
             "astrmai_force_meme",
@@ -431,7 +435,7 @@ class ConcurrentExecutor:
         is_fast_mode = event.get_extra("is_fast_mode", False)
         config_max_steps = getattr(self.config.agent, "max_steps", 5)
         tool_tier = str(event.get_extra("astrmai_tool_tier", "full") or "full")
-        max_steps = 2 if tool_tier == "chat" else max(5, config_max_steps)
+        max_steps = max(5, config_max_steps)
         timeout = 15 if is_fast_mode else self.config.agent.timeout
         prefix_hash = event.get_extra("astrmai_prefix_hash", "")
         prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
@@ -451,6 +455,77 @@ class ConcurrentExecutor:
             "raw_user_text": raw_user_text,
             "dialog_lane_key": dialog_lane_key,
         }
+
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        return str(getattr(tool, "name", "") or "").strip()
+
+    def _expand_tools_for_disclosure_request(
+        self,
+        event: AstrMessageEvent,
+        current_tools: list[Any],
+    ) -> tuple[list[Any], list[str]]:
+        if not hasattr(event, "get_extra") or not hasattr(event, "set_extra"):
+            return current_tools, []
+        if event.get_extra("astrmai_tool_disclosure_expanded_once", False):
+            return current_tools, []
+        conversation = getattr(self.config, "conversation", None)
+        if not bool(getattr(conversation, "tool_disclosure_allow_second_pass", True)):
+            return current_tools, []
+        requested = normalize_requested_packages(event.get_extra("astrmai_requested_tool_packages", []))
+        if not requested:
+            return current_tools, []
+        allowed = set(normalize_requested_packages(event.get_extra("astrmai_disclosure_second_pass_packages", [])))
+        packages = [package for package in requested if package in allowed]
+        if not packages:
+            return current_tools, []
+        hidden_tools = list(getattr(event, "_astrmai_disclosure_hidden_tools", []) or [])
+        if not hidden_tools:
+            return current_tools, []
+        max_extra = max(1, int(getattr(conversation, "tool_disclosure_max_tools_task", 16) or 16))
+        additions = select_tools_by_packages(
+            hidden_tools,
+            packages,
+            name_resolver=self._tool_name,
+            max_tools=max_extra,
+        )
+        if not additions:
+            return current_tools, []
+        existing = {self._tool_name(tool) for tool in current_tools or []}
+        merged = list(current_tools or [])
+        added_names: list[str] = []
+        for tool in additions:
+            name = self._tool_name(tool)
+            if not name or name in existing:
+                continue
+            existing.add(name)
+            merged.append(tool)
+            added_names.append(name)
+        if not added_names:
+            return current_tools, []
+        event.set_extra("astrmai_tool_disclosure_expanded_once", True)
+        event.set_extra("astrmai_disclosure_expanded_packages", packages)
+        turn_context = event.get_extra("astrmai_turn_context", None)
+        tools_state = getattr(turn_context, "tools", None)
+        if tools_state is not None:
+            tools_state.disclosure_expanded_packages = list(packages)
+            tools_state.filtered_tools = [self._tool_name(tool) for tool in merged if self._tool_name(tool)]
+            tools_state.record_step(
+                "executor.tool_disclosure_second_pass",
+                [self._tool_name(tool) for tool in current_tools or []],
+                tools_state.filtered_tools,
+                "requested_packages(" + ",".join(packages) + ")",
+            )
+        for tool_name in added_names:
+            record_tool_lifecycle(
+                event,
+                tool_name,
+                "disclosed_second_pass",
+                source="bot_capability_lookup",
+                status="available",
+                reason="requested_packages(" + ",".join(packages) + ")",
+            )
+        return merged, packages
 
     async def _inject_direct_vision_context(
         self,
@@ -765,6 +840,31 @@ class ConcurrentExecutor:
                     raw_user_text=runtime["raw_user_text"],
                 )
                 self._sync_execution_event_trace(execution_event, event)
+                expanded_tools, expanded_packages = self._expand_tools_for_disclosure_request(event, tools)
+                if expanded_packages:
+                    tools = expanded_tools
+                    tool_set = ToolSet(tools)
+                    result = await self.gateway.tool_chat_in_lane_result(
+                        lane_key=runtime["dialog_lane_key"],
+                        base_origin=chat_id,
+                        event=execution_event,
+                        prompt=(
+                            f"{api_prompt}\n\n"
+                            "[SYSTEM TOOL DISCLOSURE]\n"
+                            "系统已按上一轮工具能力自检追加工具包："
+                            + "、".join(expanded_packages)
+                            + "。请先使用新增工具获取事实，再给出最终回复。"
+                        ),
+                        system_prompt=system_prompt,
+                        tools=tool_set,
+                        models=[provider_id],
+                        max_steps=runtime["max_steps"],
+                        timeout=runtime["timeout"],
+                        image_urls=image_urls,
+                        prefix_hash=runtime["prefix_hash"],
+                        raw_user_text=runtime["raw_user_text"],
+                    )
+                    self._sync_execution_event_trace(execution_event, event)
                 missing_required = self._record_required_tool_outcomes(event)
                 if missing_required:
                     retry_tools = [

@@ -261,6 +261,30 @@
         "default": true,
         "hint": "开启后，机器人可以结合语境、情绪、关系和冷却状态，自主使用表情包、消息表情、互动语气或戳一戳等工具丰富聊天；关闭后仍会响应用户明确提出的工具要求。"
       },
+      "tool_progressive_disclosure_enabled": {
+        "description": "启用工具渐进式披露",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，普通聊天只给模型少量核心工具；遇到图片、好友、跨会话传话、记忆纠正等场景时，再按需开放对应工具包。关闭后回到旧版工具暴露逻辑。"
+      },
+      "tool_disclosure_max_tools_chat": {
+        "description": "普通聊天最多开放工具数",
+        "type": "int",
+        "default": 8,
+        "hint": "普通闲聊时最多给模型看到多少个工具。数值越小越稳、越省上下文；明确任务不受这个上限限制。"
+      },
+      "tool_disclosure_max_tools_task": {
+        "description": "明确任务最多开放工具数",
+        "type": "int",
+        "default": 16,
+        "hint": "当用户明确要求查好友、查图片、跨会话传话、纠正记忆等任务时，最多开放多少个相关工具。"
+      },
+      "tool_disclosure_allow_second_pass": {
+        "description": "允许工具包二次展开",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，模型先用能力查询工具判断缺少哪类只读工具包，系统可安全追加一次身份、关系、图片消息或记忆治理工具包，再让模型继续多步工具调用。"
+      },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
         "type": "float",

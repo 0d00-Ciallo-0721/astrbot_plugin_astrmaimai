@@ -458,7 +458,7 @@ class StateEngine:
             and self.relationship_engine.should_soften_support_event_for_message(message_text, resolved_event_type)
         ):
             resolved_event_type = RelationshipEvent.NORMAL_CHAT
-        effective_mood_tag = mood_tag
+        effective_mood_tag = "" if str(mood_tag or "").strip().lower() == "neutral" else mood_tag
         if (
             event_type is None
             and resolved_event_type == RelationshipEvent.NORMAL_CHAT

@@ -35,6 +35,26 @@ _STUB_TOOL_NAME_ALIASES = {
     "WaitTool": "wait_and_listen",
     "OmniPerceptionTool": "omni_perception_query",
     "SelfLoreQueryTool": "self_lore_query",
+    "QQFriendLookupTool": "qq_friend_lookup",
+    "QQGroupMemberLookupTool": "qq_group_member_lookup",
+    "QQUserIdentityLookupTool": "qq_user_identity_lookup",
+    "QQForwardMessageLookupTool": "qq_forward_message_lookup",
+    "QQGroupPresenceLookupTool": "qq_group_presence_lookup",
+    "QQRecentContactLookupTool": "qq_recent_contact_lookup",
+    "QQMessageArtifactLookupTool": "qq_message_artifact_lookup",
+    "VisionMessageAnalyzeTool": "vision_message_analyze_tool",
+    "CrossSessionReplyLookupTool": "cross_session_reply_lookup",
+    "QQCustomFaceSendTool": "qq_custom_face_send_tool",
+    "QuoteReplyActionTool": "quote_reply_action",
+    "QQMessageRecallLookupTool": "qq_message_recall_lookup",
+    "TopicThreadLookupTool": "topic_thread_lookup",
+    "BotCapabilityLookupTool": "bot_capability_lookup",
+    "MemoryWriteCorrectionTool": "memory_write_correction_tool",
+    "UnverifiedReportRecordTool": "unverified_report_record_tool",
+    "PersonaFactCheckTool": "persona_fact_check_tool",
+    "GroupActivitySnapshotTool": "group_activity_snapshot_tool",
+    "ContactRouteSuggestTool": "contact_route_suggest_tool",
+    "CrossChatMemoryQueryTool": "cross_chat_memory_query",
     "ConstructAtEventTool": "construct_at_event",
     "CustomFaceCatalogQueryTool": "custom_face_catalog_query",
     "GroupSignTool": "group_sign_action",
@@ -52,6 +72,56 @@ _STUB_TOOL_NAME_ALIASES = {
 
 def _normalized_tool_names(tools):
     return {_STUB_TOOL_NAME_ALIASES.get(tool.name, tool.name) for tool in tools}
+
+
+FACT_TOOL_NAMES = {
+    "qq_friend_lookup",
+    "qq_user_identity_lookup",
+    "qq_forward_message_lookup",
+    "qq_group_presence_lookup",
+    "qq_recent_contact_lookup",
+    "qq_message_artifact_lookup",
+    "vision_message_analyze_tool",
+    "cross_session_reply_lookup",
+    "qq_message_recall_lookup",
+    "topic_thread_lookup",
+    "bot_capability_lookup",
+    "memory_write_correction_tool",
+    "unverified_report_record_tool",
+    "persona_fact_check_tool",
+    "contact_route_suggest_tool",
+    "cross_chat_memory_query",
+}
+
+CORE_TOOL_NAMES = {
+    "wait_and_listen",
+    "omni_perception_query",
+    "self_lore_query",
+    "cross_chat_memory_query",
+    "persona_fact_check_tool",
+    "bot_capability_lookup",
+}
+
+LEGACY_CHAT_EXPECTED_TOOL_NAMES = FACT_TOOL_NAMES | {
+    "proactive_meme",
+    "qq_custom_face_send_tool",
+    "message_reaction_action",
+    "message_emoji_like_action",
+    "proactive_like_action",
+    "proactive_poke",
+    "space_transition_action",
+}
+
+CHAT_EXPECTED_TOOL_NAMES = CORE_TOOL_NAMES
+
+CROSS_SESSION_DISCLOSURE_TOOL_NAMES = CORE_TOOL_NAMES | {
+    "qq_friend_lookup",
+    "qq_user_identity_lookup",
+    "qq_recent_contact_lookup",
+    "contact_route_suggest_tool",
+    "space_transition_action",
+    "cross_session_reply_lookup",
+}
 
 
 class _IdentityActionModifier:
@@ -693,44 +763,48 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertEqual(
             _normalized_tool_names(plain_tools),
-            {
-                "proactive_meme",
-                "message_reaction_action",
-                "message_emoji_like_action",
-                "proactive_like_action",
-                "proactive_poke",
-                "space_transition_action",
-            },
+            CHAT_EXPECTED_TOOL_NAMES,
         )
         self.assertEqual(plain_event.get_extra("astrmai_tool_tier"), "chat")
         plain_turn = plain_event.get_extra("astrmai_turn_context")
         self.assertEqual(plain_turn.tools.final_tier, "chat")
         self.assertEqual(plain_turn.tools.requested_tier, "")
         self.assertFalse(plain_turn.tools.explicit_tool_intent)
+        self.assertTrue(plain_turn.tools.disclosure_enabled)
+        self.assertEqual(plain_turn.tools.disclosure_packages, ["core"])
         self.assertEqual(
             set(plain_turn.tools.available_tools),
-            {
-                "proactive_meme",
-                "message_reaction_action",
-                "message_emoji_like_action",
-                "proactive_like_action",
-                "proactive_poke",
-                "space_transition_action",
-            },
+            CHAT_EXPECTED_TOOL_NAMES,
         )
         self.assertEqual(
             set(plain_turn.tools.filtered_tools),
-            {
-                "proactive_meme",
-                "message_reaction_action",
-                "message_emoji_like_action",
-                "proactive_like_action",
-                "proactive_poke",
-                "space_transition_action",
-            },
+            CHAT_EXPECTED_TOOL_NAMES,
         )
         self.assertEqual(plain_event.get_extra("astrmai_required_tools"), [])
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])
+
+        legacy_mixin = self._prepare_tool_mixin()
+        legacy_mixin.gateway.config.conversation = SimpleNamespace(
+            qq_native_tools_enabled=True,
+            qq_deferred_action_commit_enabled=True,
+            qq_explicit_intent_override_enabled=True,
+            explicit_tool_execution_enabled=True,
+            autonomous_chat_tools_enabled=True,
+            tool_progressive_disclosure_enabled=False,
+        )
+        legacy_tools = asyncio.run(
+            legacy_mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                _FakeEvent(message="你好呀"),
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+        self.assertEqual(_normalized_tool_names(legacy_tools), LEGACY_CHAT_EXPECTED_TOOL_NAMES)
 
         tool_ctx = SimpleNamespace(shared_dict={})
         query_keyword = "查一下"
@@ -749,7 +823,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
         self.assertIsNotNone(intent_tools)
         intent_names = _normalized_tool_names(intent_tools)
-        self.assertEqual(intent_names, {"omni_perception_query", "self_lore_query"})
+        self.assertEqual(intent_names, CORE_TOOL_NAMES)
         self.assertEqual(intent_event.get_extra("astrmai_required_tools"), ["omni_perception_query"])
         self.assertEqual(intent_event.get_extra("astrmai_tool_tier"), "full")
         self.assertEqual(intent_event.get_extra("astrmai_turn_context").tools.final_tier, "full")
@@ -799,14 +873,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertEqual(
             _normalized_tool_names(tools),
-            {
-                "proactive_meme",
-                "message_reaction_action",
-                "message_emoji_like_action",
-                "proactive_like_action",
-                "proactive_poke",
-                "space_transition_action",
-            },
+            CHAT_EXPECTED_TOOL_NAMES,
         )
         trace = event.get_extra("astrmai_turn_context").tools
         self.assertEqual(trace.requested_tier, "full")
@@ -863,8 +930,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         tool_names = _normalized_tool_names(tools)
         self.assertIn("proactive_poke", tool_names)
         self.assertNotIn("construct_at_event", tool_names)
-        self.assertNotIn("omni_perception_query", tool_names)
-        self.assertNotIn("wait_and_listen", tool_names)
+        self.assertTrue(CORE_TOOL_NAMES.issubset(tool_names))
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
         at_ctx = SimpleNamespace(shared_dict={})
@@ -902,7 +968,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"space_transition_action"})
+        self.assertEqual(_normalized_tool_names(tools), CROSS_SESSION_DISCLOSURE_TOOL_NAMES)
         self.assertEqual(event.get_extra("astrmai_required_tools"), ["space_transition_action"])
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
@@ -927,10 +993,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"space_transition_action"})
+        self.assertEqual(_normalized_tool_names(tools), {"qq_friend_lookup", "space_transition_action"})
         self.assertEqual(
             event.get_extra("astrmai_required_tools"),
-            ["space_transition_action"],
+            ["qq_friend_lookup", "space_transition_action"],
         )
 
     def test_explicit_poke_is_restored_after_action_modifier_filter(self):
@@ -994,8 +1060,8 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(plain_tools, [])
-        self.assertEqual(_normalized_tool_names(explicit_tools), {"proactive_poke"})
+        self.assertEqual(_normalized_tool_names(plain_tools), CORE_TOOL_NAMES)
+        self.assertEqual(_normalized_tool_names(explicit_tools), CORE_TOOL_NAMES | {"proactive_poke"})
         self.assertEqual(explicit_event.get_extra("astrmai_required_tools"), ["proactive_poke"])
 
     def test_disabling_reliable_explicit_execution_restores_optional_legacy_behavior(self):
@@ -1022,7 +1088,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"proactive_poke"})
+        self.assertEqual(_normalized_tool_names(tools), CORE_TOOL_NAMES | {"proactive_poke"})
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
         self.assertEqual(event.get_extra("astrmai_turn_context").tools.invocation_mode, "auto")
 
@@ -1043,7 +1109,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"group_sign_action"})
+        self.assertEqual(_normalized_tool_names(tools), CORE_TOOL_NAMES | {"group_sign_action"})
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "full")
 
     def test_plain_bot_mention_does_not_become_explicit_at_command(self):
@@ -1064,8 +1130,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
 
         names = _normalized_tool_names(tools)
-        self.assertIn("proactive_poke", names)
-        self.assertIn("construct_at_event", names)
+        self.assertEqual(names, CORE_TOOL_NAMES)
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
@@ -1110,7 +1175,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"message_emoji_like_action"})
+        self.assertEqual(
+            _normalized_tool_names(tools),
+            CORE_TOOL_NAMES | {"message_emoji_like_action"},
+        )
 
     def test_explicit_custom_face_query_does_not_inject_general_memory_query(self):
         mixin = self._prepare_tool_mixin()
@@ -1129,7 +1197,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"custom_face_catalog_query"})
+        self.assertEqual(_normalized_tool_names(tools), CORE_TOOL_NAMES | {"custom_face_catalog_query"})
 
     def test_guarded_chat_intent_does_not_match_unrelated_poke_words(self):
         mixin = self._prepare_tool_mixin()
@@ -1154,14 +1222,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
                 tool_names = _normalized_tool_names(tools)
                 self.assertEqual(
                     tool_names,
-                    {
-                        "proactive_meme",
-                        "message_reaction_action",
-                        "message_emoji_like_action",
-                        "proactive_like_action",
-                        "proactive_poke",
-                        "space_transition_action",
-                    },
+                    CHAT_EXPECTED_TOOL_NAMES,
                 )
                 self.assertFalse(event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
                 self.assertEqual(event.get_extra("astrmai_required_tools"), [])
@@ -1184,8 +1245,9 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         )
 
         names = _normalized_tool_names(tools)
-        self.assertIn("construct_at_event", names)
-        self.assertIn("proactive_poke", names)
+        self.assertFalse(event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
+        self.assertIn("qq_user_identity_lookup", names)
+        self.assertIn("qq_group_member_lookup", names)
         self.assertFalse(event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
         self.assertEqual(event.get_extra("astrmai_required_tools"), [])
 
@@ -1209,14 +1271,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(tools),
-            {
-                "proactive_meme",
-                "message_reaction_action",
-                "message_emoji_like_action",
-                "proactive_like_action",
-                "proactive_poke",
-                "space_transition_action",
-            },
+            CHAT_EXPECTED_TOOL_NAMES,
         )
         self.assertEqual(event.get_extra("astrmai_tool_tier"), "chat")
         self.assertTrue(ctx.shared_dict["disable_rag_injection"])
@@ -1284,12 +1339,11 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             _normalized_tool_names(recall_tools),
-            {"omni_perception_query", "self_lore_query"},
+            CORE_TOOL_NAMES,
         )
         recall_turn = recall_event.get_extra("astrmai_turn_context")
-        self.assertEqual(recall_turn.tools.allowed_families, ["query"])
-        self.assertIn("allowed_families(query)", recall_turn.tools.filter_reasons)
-        self.assertIn("proactive_meme", recall_turn.tools.removed_by_social_intent)
+        self.assertTrue(recall_turn.tools.disclosure_enabled)
+        self.assertIn("core", recall_turn.tools.disclosure_packages)
 
     def test_pushback_intent_does_not_expose_chat_tools_by_default(self):
         mixin = self._prepare_tool_mixin()

@@ -230,6 +230,12 @@ class ProactiveSnapshot:
 class ToolDecisionTrace:
     requested_tier: str = ""
     final_tier: str = ""
+    disclosure_enabled: bool = False
+    disclosure_tier: str = ""
+    disclosure_packages: list[str] = field(default_factory=list)
+    disclosure_reasons: list[str] = field(default_factory=list)
+    disclosure_second_pass_packages: list[str] = field(default_factory=list)
+    disclosure_expanded_packages: list[str] = field(default_factory=list)
     explicit_tool_intent: bool = False
     invocation_mode: str = "auto"
     required_tools: list[str] = field(default_factory=list)
@@ -598,6 +604,12 @@ def build_turn_trace_summary(
         "tools": {
             "requested_tier": tools.requested_tier,
             "final_tier": tools.final_tier,
+            "disclosure_enabled": bool(tools.disclosure_enabled),
+            "disclosure_tier": tools.disclosure_tier,
+            "disclosure_packages": list(tools.disclosure_packages or []),
+            "disclosure_reasons": list(tools.disclosure_reasons or []),
+            "disclosure_second_pass_packages": list(tools.disclosure_second_pass_packages or []),
+            "disclosure_expanded_packages": list(tools.disclosure_expanded_packages or []),
             "explicit_tool_intent": bool(tools.explicit_tool_intent),
             "invocation_mode": tools.invocation_mode,
             "required_tools": list(tools.required_tools or []),

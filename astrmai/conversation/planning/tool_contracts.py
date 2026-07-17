@@ -32,6 +32,26 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "wait_and_listen": ToolCapabilitySpec("wait_and_listen", "wait", "control", explicit_policy="required", autonomous_allowed=True),
     "omni_perception_query": ToolCapabilitySpec("omni_perception_query", "query", "query", explicit_policy="required", autonomous_allowed=True),
     "self_lore_query": ToolCapabilitySpec("self_lore_query", "self_lore", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_friend_lookup": ToolCapabilitySpec("qq_friend_lookup", "friend_fact", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_group_member_lookup": ToolCapabilitySpec("qq_group_member_lookup", "group_member", "query", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
+    "qq_user_identity_lookup": ToolCapabilitySpec("qq_user_identity_lookup", "user_identity", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_forward_message_lookup": ToolCapabilitySpec("qq_forward_message_lookup", "forward_message", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_group_presence_lookup": ToolCapabilitySpec("qq_group_presence_lookup", "group_fact", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_recent_contact_lookup": ToolCapabilitySpec("qq_recent_contact_lookup", "recent_contact", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_message_artifact_lookup": ToolCapabilitySpec("qq_message_artifact_lookup", "message_artifact", "query", explicit_policy="required", autonomous_allowed=True),
+    "vision_message_analyze_tool": ToolCapabilitySpec("vision_message_analyze_tool", "vision_message", "query", explicit_policy="required", autonomous_allowed=True),
+    "cross_session_reply_lookup": ToolCapabilitySpec("cross_session_reply_lookup", "cross_reply", "query", explicit_policy="required", autonomous_allowed=True),
+    "qq_custom_face_send_tool": ToolCapabilitySpec("qq_custom_face_send_tool", "custom_face", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
+    "quote_reply_action": ToolCapabilitySpec("quote_reply_action", "quote_reply", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
+    "qq_message_recall_lookup": ToolCapabilitySpec("qq_message_recall_lookup", "message_recall", "query", explicit_policy="required", autonomous_allowed=True),
+    "topic_thread_lookup": ToolCapabilitySpec("topic_thread_lookup", "topic_thread", "query", explicit_policy="required", autonomous_allowed=True),
+    "bot_capability_lookup": ToolCapabilitySpec("bot_capability_lookup", "capability", "query", explicit_policy="required", autonomous_allowed=True),
+    "memory_write_correction_tool": ToolCapabilitySpec("memory_write_correction_tool", "memory_correction", "memory_write", explicit_policy="required"),
+    "unverified_report_record_tool": ToolCapabilitySpec("unverified_report_record_tool", "unverified_report", "memory_write", explicit_policy="required"),
+    "persona_fact_check_tool": ToolCapabilitySpec("persona_fact_check_tool", "persona_fact", "query", explicit_policy="required", autonomous_allowed=True),
+    "group_activity_snapshot_tool": ToolCapabilitySpec("group_activity_snapshot_tool", "group_activity", "query", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
+    "contact_route_suggest_tool": ToolCapabilitySpec("contact_route_suggest_tool", "route_suggest", "query", explicit_policy="required", autonomous_allowed=True),
+    "cross_chat_memory_query": ToolCapabilitySpec("cross_chat_memory_query", "cross_memory", "query", explicit_policy="required", autonomous_allowed=True),
     "construct_at_event": ToolCapabilitySpec("construct_at_event", "at", "message", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
     "proactive_poke": ToolCapabilitySpec("proactive_poke", "poke", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
     "proactive_meme": ToolCapabilitySpec("proactive_meme", "meme", "message", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
@@ -51,6 +71,26 @@ FAMILY_TO_TOOL: dict[str, str] = {
     "wait": "wait_and_listen",
     "query": "omni_perception_query",
     "self_lore": "self_lore_query",
+    "friend_fact": "qq_friend_lookup",
+    "group_member": "qq_group_member_lookup",
+    "user_identity": "qq_user_identity_lookup",
+    "forward_message": "qq_forward_message_lookup",
+    "group_fact": "qq_group_presence_lookup",
+    "recent_contact": "qq_recent_contact_lookup",
+    "message_artifact": "qq_message_artifact_lookup",
+    "vision_message": "vision_message_analyze_tool",
+    "cross_reply": "cross_session_reply_lookup",
+    "custom_face": "qq_custom_face_send_tool",
+    "quote_reply": "quote_reply_action",
+    "message_recall": "qq_message_recall_lookup",
+    "topic_thread": "topic_thread_lookup",
+    "capability": "bot_capability_lookup",
+    "memory_correction": "memory_write_correction_tool",
+    "unverified_report": "unverified_report_record_tool",
+    "persona_fact": "persona_fact_check_tool",
+    "group_activity": "group_activity_snapshot_tool",
+    "route_suggest": "contact_route_suggest_tool",
+    "cross_memory": "cross_chat_memory_query",
     "at": "construct_at_event",
     "poke": "proactive_poke",
     "meme": "proactive_meme",
@@ -118,8 +158,11 @@ def build_explicit_invocation_plans(
     available_tool_names: Iterable[str],
 ) -> list[ToolInvocationPlan]:
     available = {str(name or "").strip() for name in available_tool_names}
+    requested = {str(item or "").strip() for item in families}
+    ordered_families = [family for family in FAMILY_TO_TOOL if family in requested]
+    ordered_families.extend(family for family in requested if family and family not in FAMILY_TO_TOOL)
     plans: list[ToolInvocationPlan] = []
-    for family in dict.fromkeys(str(item or "").strip() for item in families):
+    for family in ordered_families:
         tool_name = FAMILY_TO_TOOL.get(family)
         spec = TOOL_CAPABILITIES.get(tool_name or "")
         if not spec or tool_name not in available:

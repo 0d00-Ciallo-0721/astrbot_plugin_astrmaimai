@@ -261,7 +261,52 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_execution_status"), "skipped_wait")
         self.assertEqual(reply_service.calls, [])
 
-    def test_chat_tool_tier_limits_runtime_max_steps(self):
+    def test_tool_mode_can_expand_readonly_disclosure_package_once(self):
+        call_count = {"value": 0}
+
+        def _tool_response(kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                kwargs["event"].set_extra("astrmai_requested_tool_packages", ["identity"])
+                return "[TERMINAL_YIELD]: need identity tools"
+            tool_names = [getattr(tool, "name", "") for tool in kwargs["tools"].tools]
+            self.assertIn("qq_friend_lookup", tool_names)
+            self.assertIn("qq_user_identity_lookup", tool_names)
+            self.assertEqual(kwargs["max_steps"], 7)
+            return "[TERMINAL_YIELD]: expanded identity result"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        gateway.config.agent.max_steps = 7
+        gateway.config.conversation = SimpleNamespace(
+            tool_disclosure_allow_second_pass=True,
+            tool_disclosure_max_tools_task=16,
+        )
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_disclosure_second_pass_packages", ["identity"])
+        setattr(
+            event,
+            "_astrmai_disclosure_hidden_tools",
+            [
+                SimpleNamespace(name="qq_friend_lookup"),
+                SimpleNamespace(name="qq_user_identity_lookup"),
+            ],
+        )
+
+        result = asyncio.run(executor.execute(event, "prompt", "system", tools=[SimpleNamespace(name="bot_capability_lookup")]))
+
+        self.assertEqual(result, "expanded identity result")
+        self.assertEqual(call_count["value"], 2)
+        self.assertEqual(event.get_extra("astrmai_disclosure_expanded_packages"), ["identity"])
+
+    def test_chat_tool_tier_uses_configured_multi_tool_max_steps(self):
         gateway = _FakeGateway()
         gateway.config.agent.max_steps = 8
         executor = self.executor_mod.ConcurrentExecutor(
@@ -277,7 +322,7 @@ class RefactoredExecutorTests(unittest.TestCase):
         runtime = executor._execution_runtime_values(event, event.unified_msg_origin)
 
         self.assertEqual(runtime["tool_tier"], "chat")
-        self.assertEqual(runtime["max_steps"], 2)
+        self.assertEqual(runtime["max_steps"], 8)
 
     def test_full_and_sys3_tool_tiers_keep_existing_max_steps_rule(self):
         gateway = _FakeGateway()

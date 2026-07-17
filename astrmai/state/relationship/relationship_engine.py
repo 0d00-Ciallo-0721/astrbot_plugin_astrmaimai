@@ -532,6 +532,11 @@ class RelationshipEngine:
         if any(w in lower for w in rude_words):
             return RelationshipEvent.RUDENESS
 
+        sarcasm_praise_words = {"真行", "真棒", "真厉害"}
+        negative_outcome_words = {"搞砸", "又错", "又坏", "又失败", "又翻车", "真会添乱"}
+        if any(w in lower for w in sarcasm_praise_words) and any(w in lower for w in negative_outcome_words):
+            return RelationshipEvent.RUDENESS
+
         # 冷淡而非 hostile
         if any(w in lower for w in self.COLD_DISMISSIVE_WORDS):
             return RelationshipEvent.IGNORE
@@ -590,7 +595,13 @@ class RelationshipEngine:
         normalized_tag = str(mood_tag or "").strip().lower()
         if self._contains_any(normalized_text, self.TOOL_INTENT_HINT_WORDS):
             return 1.0
-        if normalized_tag in {"sad", "angry"} and self.should_preserve_normal_chat_for_message(normalized_text, normalized_tag):
+        if (
+            normalized_tag in {"sad", "angry"}
+            and self.should_preserve_normal_chat_for_message(normalized_text, normalized_tag)
+        ) or (
+            self._contains_any(normalized_text, self.MIXED_AFFECT_SUPPORT_WORDS)
+            and self._contains_any(normalized_text, self.MIXED_AFFECT_DISTRESS_WORDS)
+        ):
             return 0.8
         return 1.0
 

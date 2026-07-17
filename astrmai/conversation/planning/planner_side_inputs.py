@@ -20,21 +20,45 @@ from .tool_contracts import (
     normalize_tool_schemas,
     publish_invocation_plans,
 )
+from .tool_disclosure import (
+    ToolDisclosurePlanner,
+    select_tools_by_names,
+)
 from .tools.pfc_tools import (
+    BotCapabilityLookupTool,
+    ContactRouteSuggestTool,
+    CrossChatMemoryQueryTool,
+    CrossSessionReplyLookupTool,
     CustomFaceCatalogQueryTool,
     ConstructAtEventTool,
+    GroupActivitySnapshotTool,
     GroupSignTool,
     MemeResonanceTool,
+    MemoryWriteCorrectionTool,
     MessageEmojiLikeTool,
     MessageReactionTool,
     OmniPerceptionTool,
+    PersonaFactCheckTool,
     ProactiveLikeTool,
     ProactiveMemeTool,
     ProactivePokeTool,
+    QQCustomFaceSendTool,
+    QQFriendLookupTool,
+    QQForwardMessageLookupTool,
+    QQGroupMemberLookupTool,
+    QQGroupPresenceLookupTool,
+    QQMessageArtifactLookupTool,
+    QQMessageRecallLookupTool,
+    QQRecentContactLookupTool,
+    QQUserIdentityLookupTool,
+    QuoteReplyActionTool,
     RegretAndWithdrawTool,
     SelfLoreQueryTool,
     SpaceTransitionTool,
     TopicHijackTool,
+    TopicThreadLookupTool,
+    UnverifiedReportRecordTool,
+    VisionMessageAnalyzeTool,
     WaitTool,
 )
 
@@ -65,6 +89,16 @@ class PlannerSideInputMixin:
         "帮我查",
         "你还记得",
         "你记得",
+        "好友",
+        "共同群",
+        "别的群",
+        "哪个群",
+        "最近联系人",
+        "那条消息",
+        "那张图",
+        "图片",
+        "文件",
+        "授权",
         "撤回",
         "转移话题",
         "换个话题",
@@ -82,14 +116,36 @@ class PlannerSideInputMixin:
         "at": ("艾特", "帮我@", "@一下"),
         "qq_reaction": ("消息表情", "表情回应", "加个表情", "给这条消息点赞", "点赞这条消息"),
         "sign": ("群签到", "群打卡", "签到一下"),
-        "withdraw": ("撤回", "删掉上一条", "撤回上一条"),
+        "withdraw": ("撤回", "删掉上一条", "撤回上一条", "withdraw", "delete last reply", "remove last reply"),
         "meme": ("发个表情包", "发表情包", "来个表情包"),
         "qq_query": ("查自定义表情", "自定义表情列表", "有哪些自定义表情"),
+        "custom_face": ("发自定义表情", "自定义表情发一个", "来个自定义表情"),
+        "quote_reply": ("引用回复", "引用那条", "回这条消息"),
     }
     GENERAL_EXPLICIT_TOOL_KEYWORDS = {
         "wait": ("先别回复", "先等等", "等一下再说", "wait a moment"),
         "query": ("查一下", "搜一下", "帮我看看", "帮我查", "你还记得", "你记得", "do you remember"),
         "self_lore": ("你的设定", "你的人设", "你的世界观", "你的经历", "你是谁"),
+        "friend_fact": ("好友", "朋友列表", "联系人", "是不是你好友", "是否为好友"),
+        "group_fact": ("共同群", "别的群", "哪个群", "群里见过", "所在群", "棉花娃娃群"),
+        "recent_contact": ("最近联系人", "刚才谁", "最近联系", "联系过谁", "跨会话"),
+        "message_artifact": ("那条消息", "刚才那条", "那张图", "这张图", "图片", "文件", "转发消息"),
+        "group_member": ("群成员", "群名片", "管理员", "在群里吗", "群里有没有"),
+        "user_identity": ("他是谁", "我是谁", "这个人是谁", "身份", "昵称", "备注"),
+        "forward_message": ("合并转发", "转发消息", "聊天记录", "转发里"),
+        "vision_message": ("看图", "这张图", "表情包什么意思", "图片是什么意思"),
+        "cross_reply": ("对方回了吗", "有没有回复", "他回了什么", "跨会话回复"),
+        "custom_face": ("发自定义表情", "自定义表情发一个", "来个自定义表情"),
+        "quote_reply": ("引用回复", "回这条", "引用那条"),
+        "message_recall": ("上一条消息", "刚才发的", "可撤回", "消息id"),
+        "topic_thread": ("刚才说的", "那个", "这件事", "话题线索"),
+        "capability": ("你能做什么", "你有什么工具", "能不能查", "工具列表"),
+        "memory_correction": ("你记错了", "不是这样", "改成", "纠正记忆"),
+        "unverified_report": ("听说", "据说", "有人说", "未确认", "不确定"),
+        "persona_fact": ("你有没有授权", "你的设定", "官方", "人格事实"),
+        "group_activity": ("群里刚才", "谁在聊天", "群活跃", "最近群消息"),
+        "route_suggest": ("该发哪里", "要不要私聊", "怎么联系", "路由建议"),
+        "cross_memory": ("别的群见过", "跨群记忆", "你的记忆", "你记不记得", "授权", "官方周边"),
         "resonance": ("复读这句", "跟着复读", "原样复读"),
         "topic": ("转移话题", "换个话题", "别聊这个了", "change topic", "switch topic"),
         "private": (
@@ -133,7 +189,9 @@ class PlannerSideInputMixin:
         "omni_perception_query",
         "self_lore_query",
         "custom_face_catalog_query",
+        "qq_custom_face_send_tool",
         "group_sign_action",
+        "quote_reply_action",
         "topic_hijack_action",
         "space_transition_action",
         "regret_and_withdraw_action",
@@ -145,11 +203,33 @@ class PlannerSideInputMixin:
         "group_sign_action",
         "regret_and_withdraw_action",
         "custom_face_catalog_query",
+        "qq_custom_face_send_tool",
+        "quote_reply_action",
     }
     TOOL_NAME_ALIASES = {
         "WaitTool": "wait_and_listen",
         "OmniPerceptionTool": "omni_perception_query",
         "SelfLoreQueryTool": "self_lore_query",
+        "QQFriendLookupTool": "qq_friend_lookup",
+        "QQGroupMemberLookupTool": "qq_group_member_lookup",
+        "QQUserIdentityLookupTool": "qq_user_identity_lookup",
+        "QQForwardMessageLookupTool": "qq_forward_message_lookup",
+        "QQGroupPresenceLookupTool": "qq_group_presence_lookup",
+        "QQRecentContactLookupTool": "qq_recent_contact_lookup",
+        "QQMessageArtifactLookupTool": "qq_message_artifact_lookup",
+        "VisionMessageAnalyzeTool": "vision_message_analyze_tool",
+        "CrossSessionReplyLookupTool": "cross_session_reply_lookup",
+        "QQCustomFaceSendTool": "qq_custom_face_send_tool",
+        "QuoteReplyActionTool": "quote_reply_action",
+        "QQMessageRecallLookupTool": "qq_message_recall_lookup",
+        "TopicThreadLookupTool": "topic_thread_lookup",
+        "BotCapabilityLookupTool": "bot_capability_lookup",
+        "MemoryWriteCorrectionTool": "memory_write_correction_tool",
+        "UnverifiedReportRecordTool": "unverified_report_record_tool",
+        "PersonaFactCheckTool": "persona_fact_check_tool",
+        "GroupActivitySnapshotTool": "group_activity_snapshot_tool",
+        "ContactRouteSuggestTool": "contact_route_suggest_tool",
+        "CrossChatMemoryQueryTool": "cross_chat_memory_query",
         "ConstructAtEventTool": "construct_at_event",
         "ProactivePokeTool": "proactive_poke",
         "ProactiveMemeTool": "proactive_meme",
@@ -167,6 +247,26 @@ class PlannerSideInputMixin:
         "wait_and_listen": {"wait"},
         "omni_perception_query": {"query"},
         "self_lore_query": {"query"},
+        "qq_friend_lookup": {"friend_fact", "query"},
+        "qq_group_member_lookup": {"group_member", "query"},
+        "qq_user_identity_lookup": {"user_identity", "query"},
+        "qq_forward_message_lookup": {"forward_message", "message_artifact", "query"},
+        "qq_group_presence_lookup": {"group_fact", "query"},
+        "qq_recent_contact_lookup": {"recent_contact", "query"},
+        "qq_message_artifact_lookup": {"message_artifact", "query"},
+        "vision_message_analyze_tool": {"vision_message", "message_artifact", "query"},
+        "cross_session_reply_lookup": {"cross_reply", "recent_contact", "query"},
+        "qq_custom_face_send_tool": {"custom_face", "meme"},
+        "quote_reply_action": {"quote_reply"},
+        "qq_message_recall_lookup": {"message_recall", "message_artifact", "query"},
+        "topic_thread_lookup": {"topic_thread", "query"},
+        "bot_capability_lookup": {"capability", "query"},
+        "memory_write_correction_tool": {"memory_correction", "query"},
+        "unverified_report_record_tool": {"unverified_report", "query"},
+        "persona_fact_check_tool": {"persona_fact", "self_lore", "query"},
+        "group_activity_snapshot_tool": {"group_activity", "query"},
+        "contact_route_suggest_tool": {"route_suggest", "query"},
+        "cross_chat_memory_query": {"cross_memory", "query"},
         "construct_at_event": {"at"},
         "proactive_poke": {"poke"},
         "proactive_meme": {"meme"},
@@ -337,6 +437,29 @@ class PlannerSideInputMixin:
         conversation = getattr(config, "conversation", None)
         return bool(getattr(conversation, name, default))
 
+    def _conversation_int(self, name: str, default: int) -> int:
+        config = getattr(self.gateway, "config", None)
+        conversation = getattr(config, "conversation", None)
+        try:
+            return int(getattr(conversation, name, default) or default)
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _event_components(event: AstrMessageEvent) -> list:
+        message_obj = getattr(event, "message_obj", None)
+        components = getattr(message_obj, "message", None)
+        return list(components or []) if isinstance(components, list) else []
+
+    def _event_has_component_hint(self, event: AstrMessageEvent, hints: tuple[str, ...]) -> bool:
+        for component in self._event_components(event):
+            class_name = component.__class__.__name__.lower()
+            type_name = str(getattr(component, "type", "") or "").lower()
+            text = f"{class_name} {type_name}"
+            if any(hint in text for hint in hints):
+                return True
+        return False
+
     def _has_poke_intent(self, message: str) -> bool:
         if not message:
             return False
@@ -378,6 +501,34 @@ class PlannerSideInputMixin:
                 memory_tool_service=memory_tool_service,
                 persona_id=target_persona_id,
             ),
+            QQFriendLookupTool(),
+            QQGroupMemberLookupTool(),
+            QQUserIdentityLookupTool(),
+            QQForwardMessageLookupTool(),
+            QQGroupPresenceLookupTool(),
+            QQRecentContactLookupTool(),
+            QQMessageArtifactLookupTool(),
+            VisionMessageAnalyzeTool(),
+            CrossSessionReplyLookupTool(db_service=self.context_engine.db),
+            QQCustomFaceSendTool(),
+            QuoteReplyActionTool(),
+            QQMessageRecallLookupTool(),
+            TopicThreadLookupTool(),
+            BotCapabilityLookupTool(),
+            MemoryWriteCorrectionTool(memory_engine=self.memory_engine),
+            UnverifiedReportRecordTool(memory_engine=self.memory_engine),
+            PersonaFactCheckTool(
+                memory_engine=self.memory_engine,
+                memory_tool_service=memory_tool_service,
+                persona_id=target_persona_id,
+            ),
+            GroupActivitySnapshotTool(),
+            ContactRouteSuggestTool(db_service=self.context_engine.db),
+            CrossChatMemoryQueryTool(
+                memory_engine=self.memory_engine,
+                memory_tool_service=memory_tool_service,
+                persona_id=target_persona_id,
+            ),
             OmniPerceptionTool(
                 memory_engine=self.memory_engine,
                 memory_tool_service=memory_tool_service,
@@ -413,7 +564,36 @@ class PlannerSideInputMixin:
     def _build_chat_tools(self, event: AstrMessageEvent):
         tools = []
         if self._conversation_flag("autonomous_chat_tools_enabled", True):
+            target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
+            memory_tool_service = getattr(self.memory_engine, "tool_service", None)
             tools = [
+                QQFriendLookupTool(),
+                QQGroupMemberLookupTool(),
+                QQUserIdentityLookupTool(),
+                QQForwardMessageLookupTool(),
+                QQGroupPresenceLookupTool(),
+                QQRecentContactLookupTool(),
+                QQMessageArtifactLookupTool(),
+                VisionMessageAnalyzeTool(),
+                CrossSessionReplyLookupTool(db_service=self.context_engine.db),
+                QQCustomFaceSendTool(),
+                QQMessageRecallLookupTool(),
+                TopicThreadLookupTool(),
+                BotCapabilityLookupTool(),
+                MemoryWriteCorrectionTool(memory_engine=self.memory_engine),
+                UnverifiedReportRecordTool(memory_engine=self.memory_engine),
+                PersonaFactCheckTool(
+                    memory_engine=self.memory_engine,
+                    memory_tool_service=memory_tool_service,
+                    persona_id=target_persona_id,
+                ),
+                GroupActivitySnapshotTool(),
+                ContactRouteSuggestTool(db_service=self.context_engine.db),
+                CrossChatMemoryQueryTool(
+                    memory_engine=self.memory_engine,
+                    memory_tool_service=memory_tool_service,
+                    persona_id=target_persona_id,
+                ),
                 ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
                 MessageReactionTool(),
                 MessageEmojiLikeTool(),
@@ -517,6 +697,11 @@ class PlannerSideInputMixin:
                 self._canonical_tool_name(WaitTool()),
                 self._canonical_tool_name(OmniPerceptionTool(memory_engine=None, memory_tool_service=None, db_service=None, chat_id="", current_sender_id="", current_sender_name="")),
                 self._canonical_tool_name(SelfLoreQueryTool(memory_engine=None, memory_tool_service=None, persona_id="")),
+                self._canonical_tool_name(QQFriendLookupTool()),
+                self._canonical_tool_name(QQGroupPresenceLookupTool()),
+                self._canonical_tool_name(QQRecentContactLookupTool()),
+                self._canonical_tool_name(QQMessageArtifactLookupTool()),
+                self._canonical_tool_name(CrossChatMemoryQueryTool(memory_engine=None, memory_tool_service=None, persona_id="")),
             }
             deduped_sys3_tools: list = []
             for tool in sys3_light_tools:
@@ -541,6 +726,15 @@ class PlannerSideInputMixin:
                     current_sender_name=sender_name,
                 ),
                 SelfLoreQueryTool(
+                    memory_engine=self.memory_engine,
+                    memory_tool_service=memory_tool_service,
+                    persona_id=target_persona_id,
+                ),
+                QQFriendLookupTool(),
+                QQGroupPresenceLookupTool(),
+                QQRecentContactLookupTool(),
+                QQMessageArtifactLookupTool(),
+                CrossChatMemoryQueryTool(
                     memory_engine=self.memory_engine,
                     memory_tool_service=memory_tool_service,
                     persona_id=target_persona_id,
@@ -593,6 +787,12 @@ class PlannerSideInputMixin:
         turn_tools.removed_by_caution = []
         turn_tools.removed_by_social_intent = []
         turn_tools.removed_by_stance = []
+        turn_tools.disclosure_enabled = False
+        turn_tools.disclosure_tier = ""
+        turn_tools.disclosure_packages = []
+        turn_tools.disclosure_reasons = []
+        turn_tools.disclosure_second_pass_packages = []
+        turn_tools.disclosure_expanded_packages = []
         if bool(event.get_extra("astrmai_is_proactive_event", False)):
             if requested_tier in {"full", "sys3"} or explicit_tool_intent:
                 turn_tools.record_step(
@@ -678,9 +878,11 @@ class PlannerSideInputMixin:
                 )
                 requested_tier = "chat"
 
+        progressive_enabled = self._conversation_flag("tool_progressive_disclosure_enabled", True)
         if requested_tier == "none":
             self._set_tool_tier(event, "none")
             tools = []
+            setattr(event, "_astrmai_disclosure_hidden_tools", [])
             turn_tools.record_step(
                 "planner.tier_select",
                 [],
@@ -688,12 +890,83 @@ class PlannerSideInputMixin:
                 "requested_tier_none",
                 category="social_intent" if social_intent in {"pushback", "boundary", "observe"} else "",
             )
+        elif progressive_enabled:
+            self._set_tool_tier(event, "full" if requested_tier == "full" or explicit_tool_intent else "chat")
+            candidate_tools = self._build_full_pfc_tools(chat_id, user_id, sender_name)
+            candidate_tools = filter_tools_for_context(
+                candidate_tools,
+                is_group=bool(event.get_group_id()),
+                name_resolver=self._canonical_tool_name,
+            )
+            if not explicit_tool_intent and not self._conversation_flag("autonomous_chat_tools_enabled", True):
+                candidate_tools = [
+                    tool
+                    for tool in candidate_tools
+                    if self._canonical_tool_name(tool) not in AUTONOMOUS_INTERACTION_TOOLS
+                ]
+            has_image = bool(
+                event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
+                or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+            ) or self._event_has_component_hint(event, ("image",))
+            has_forward = self._event_has_component_hint(event, ("forward", "node"))
+            has_reply = self._event_has_component_hint(event, ("reply",))
+            requested_packages = self._event_string_list(event, "astrmai_requested_tool_packages")
+            disclosure_plan = ToolDisclosurePlanner().plan(
+                message=str(getattr(event, "message_str", "") or ""),
+                requested_tier=requested_tier,
+                explicit_tool_intent=explicit_tool_intent,
+                explicit_tool_families=explicit_tool_families,
+                social_intent=social_intent,
+                has_image=has_image,
+                has_forward=has_forward,
+                has_reply=has_reply,
+                requested_packages=requested_packages,
+                max_chat_tools=max(1, self._conversation_int("tool_disclosure_max_tools_chat", 8)),
+                max_task_tools=max(1, self._conversation_int("tool_disclosure_max_tools_task", 16)),
+            )
+            selected_tool_names = set(disclosure_plan.tool_names)
+            tools = select_tools_by_names(
+                candidate_tools,
+                selected_tool_names,
+                name_resolver=self._canonical_tool_name,
+            )
+            hidden_tools = [
+                tool
+                for tool in candidate_tools
+                if self._canonical_tool_name(tool) not in selected_tool_names
+            ]
+            setattr(event, "_astrmai_disclosure_hidden_tools", hidden_tools)
+            second_pass_packages = (
+                list(disclosure_plan.second_pass_packages)
+                if self._conversation_flag("tool_disclosure_allow_second_pass", True)
+                else []
+            )
+            event.set_extra("astrmai_disclosure_second_pass_packages", second_pass_packages)
+            turn_tools.disclosure_enabled = True
+            turn_tools.disclosure_tier = disclosure_plan.tier
+            turn_tools.disclosure_packages = list(disclosure_plan.packages)
+            turn_tools.disclosure_reasons = list(disclosure_plan.package_reasons)
+            turn_tools.disclosure_second_pass_packages = list(second_pass_packages)
+            disclosure_families: set[str] = set()
+            for tool_name in disclosure_plan.tool_names:
+                disclosure_families.update(self.TOOL_FAMILIES.get(tool_name, set()))
+            if explicit_tool_intent or (not allowed_families and intent_families is None):
+                allowed_families.update(disclosure_families)
+                turn_tools.allowed_families = sorted(allowed_families)
+            turn_tools.record_step(
+                "planner.tool_disclosure",
+                [self._canonical_tool_name(tool) for tool in candidate_tools],
+                [self._canonical_tool_name(tool) for tool in tools],
+                "packages(" + ",".join(disclosure_plan.packages) + ")",
+            )
         elif requested_tier == "full" or explicit_tool_intent:
             self._set_tool_tier(event, "full")
             tools = self._build_full_pfc_tools(chat_id, user_id, sender_name)
+            setattr(event, "_astrmai_disclosure_hidden_tools", [])
         else:
             self._set_tool_tier(event, "chat")
             tools = self._build_chat_tools(event)
+            setattr(event, "_astrmai_disclosure_hidden_tools", [])
 
         tools = filter_tools_for_context(
             tools,

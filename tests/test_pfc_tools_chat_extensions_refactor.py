@@ -22,6 +22,22 @@ class _FakeApi:
         return self.result
 
 
+class _MapApi:
+    def __init__(self, results=None, exc=None):
+        self.calls = []
+        self.results = dict(results or {})
+        self.exc = exc
+
+    async def call_action(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        if self.exc is not None:
+            raise self.exc
+        result = self.results.get(action, self.results.get("*", {}))
+        if callable(result):
+            return result(action, kwargs)
+        return result
+
+
 class _FakeEvent:
     def __init__(self, *, group_id=None, sender_id="user-1", self_id="bot-1", sender_name="Alice", message_id="msg-1"):
         self._group_id = group_id
@@ -179,6 +195,353 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         result = asyncio.run(self.mod.CustomFaceCatalogQueryTool().call(_wrap_event(event), count=1))
 
         self.assertIn("cat_smile", result)
+
+    def test_qq_friend_lookup_matches_friend_remark_without_sending(self):
+        event = _FakeEvent(group_id="12345")
+        event.bot.api = _FakeApi(
+            result={"data": [{"user_id": "1481314186", "nickname": "Ying", "remark": "萤"}]}
+        )
+
+        result = asyncio.run(self.mod.QQFriendLookupTool().call(_wrap_event(event), target="萤"))
+
+        self.assertIn("找到匹配好友", result)
+        self.assertIn("1481314186", result)
+        self.assertEqual(event.bot.api.calls, [("get_friend_list", {})])
+
+    def test_qq_group_presence_lookup_confirms_current_group_shared(self):
+        event = _FakeEvent(group_id="777", sender_id="123")
+        event.bot.api = _FakeApi(result={"data": [{"group_id": "777", "group_name": "测试群"}]})
+
+        result = asyncio.run(self.mod.QQGroupPresenceLookupTool().call(_wrap_event(event), user_id="123"))
+
+        self.assertIn("共同群判断", result)
+        self.assertIn("测试群", result)
+        self.assertEqual(event.bot.api.calls, [("get_group_list", {})])
+
+    def test_qq_recent_contact_lookup_includes_cross_session_sends(self):
+        event = _FakeEvent(group_id="777")
+        event.set_extra(
+            "astrmai_cross_session_sends",
+            [{"target_id": "1481314186", "target_umo": "default:FriendMessage:1481314186", "message": "Alice让我转告你：你好"}],
+        )
+
+        result = asyncio.run(self.mod.QQRecentContactLookupTool().call(_wrap_event(event), count=3))
+
+        self.assertIn("跨会话记录摘要", result)
+        self.assertIn("1481314186", result)
+
+    def test_qq_message_artifact_lookup_describes_current_image_segments(self):
+        event = _FakeEvent(group_id="777", message_id="msg-9")
+        event.message_obj.message = [
+            {"type": "text", "data": {"text": "你看这个"}},
+            {"type": "image", "data": {"file_id": "img-1", "url": "https://example.invalid/a.jpg"}},
+        ]
+
+        result = asyncio.run(self.mod.QQMessageArtifactLookupTool().call(_wrap_event(event)))
+
+        self.assertIn("消息片段数量：2", result)
+        self.assertIn("type=image", result)
+        self.assertIn("file_id=img-1", result)
+
+    def test_cross_chat_memory_query_uses_tool_service_without_current_session_scope(self):
+        event = _FakeEvent(group_id="777")
+
+        class _ToolService:
+            def __init__(self):
+                self.calls = []
+
+            async def search_memory(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(items=[SimpleNamespace()])
+
+            def render_result(self, result):
+                return "记忆命中：妃爱棉花娃娃群仍未确认。"
+
+        service = _ToolService()
+        result = asyncio.run(
+            self.mod.CrossChatMemoryQueryTool(memory_tool_service=service).call(
+                _wrap_event(event),
+                query="妃爱棉花娃娃群",
+                scope="memory",
+            )
+        )
+
+        self.assertIn("跨会话记忆", result)
+        self.assertEqual(service.calls[0]["session_id"], "")
+
+    def test_01_group_member_lookup_matches_card(self):
+        event = _FakeEvent(group_id="777", sender_id="123")
+        event.bot.api = _MapApi(
+            {
+                "get_group_member_list": {
+                    "data": [
+                        {"user_id": "123", "card": "萤", "nickname": "Ying", "role": "member"},
+                    ]
+                }
+            }
+        )
+
+        result = asyncio.run(self.mod.QQGroupMemberLookupTool().call(_wrap_event(event), target="萤"))
+
+        self.assertIn("QQ 123", result)
+        self.assertIn("角色=member", result)
+
+    def test_02_user_identity_lookup_combines_friend_and_group(self):
+        event = _FakeEvent(group_id="777", sender_id="123")
+        event.bot.api = _MapApi(
+            {
+                "get_friend_list": {"data": [{"user_id": "123", "nickname": "Ying", "remark": "萤"}]},
+                "get_group_member_info": {"data": {"user_id": "123", "card": "萤", "role": "admin"}},
+            }
+        )
+
+        result = asyncio.run(self.mod.QQUserIdentityLookupTool().call(_wrap_event(event), target="123"))
+
+        self.assertIn("是机器人好友", result)
+        self.assertIn("群身份", result)
+
+    def test_03_forward_message_lookup_expands_forward_nodes(self):
+        event = _FakeEvent(group_id="777")
+        event.message_obj.message = [{"type": "forward", "data": {"id": "fw-1"}}]
+        event.bot.api = _MapApi(
+            {
+                "get_forward_msg": {
+                    "data": {
+                        "messages": [
+                            {"message_id": "m1", "sender": {"user_id": "1", "nickname": "A"}, "message": "你好"},
+                        ]
+                    }
+                }
+            }
+        )
+
+        result = asyncio.run(self.mod.QQForwardMessageLookupTool().call(_wrap_event(event)))
+
+        self.assertIn("解析到 1 个节点", result)
+        self.assertIn("你好", result)
+
+    def test_04_vision_message_analyze_uses_existing_visual_extra(self):
+        event = _FakeEvent(group_id="777")
+        event.set_extra("astrmai_visual_context", {"type": "emoji", "description": "猫猫在挥手", "emotion_tags": ["开心"]})
+
+        result = asyncio.run(self.mod.VisionMessageAnalyzeTool().call(_wrap_event(event)))
+
+        self.assertIn("猫猫在挥手", result)
+        self.assertIn("emoji", result)
+
+    def test_05_cross_session_reply_lookup_reads_friend_history(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi(
+            {
+                "get_friend_list": {"data": [{"user_id": "1481314186", "nickname": "Ying", "remark": "萤"}]},
+                "get_friend_msg_history": {
+                    "data": {
+                        "messages": [
+                            {"message_id": "m2", "sender": {"user_id": "1481314186", "nickname": "萤"}, "message": "开心呀"},
+                        ]
+                    }
+                },
+            }
+        )
+
+        result = asyncio.run(self.mod.CrossSessionReplyLookupTool().call(_wrap_event(event), target_name="萤"))
+
+        self.assertIn("近期消息", result)
+        self.assertIn("开心呀", result)
+
+    def test_06_custom_face_send_queues_selected_face(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi({"fetch_custom_face": {"data": [{"id": "face-1", "name": "开心猫"}]}})
+
+        result = asyncio.run(self.mod.QQCustomFaceSendTool().call(_wrap_event(event), keyword="开心"))
+
+        self.assertIn("准备发送", result)
+        action = event.get_extra("astrmai_pending_actions")[0]
+        self.assertEqual(action["action"], "custom_face_send")
+        self.assertEqual(action["payload"]["face"]["id"], "face-1")
+
+    def test_07_quote_reply_action_queues_current_message_reply(self):
+        event = _FakeEvent(group_id="777", message_id="m-current")
+
+        result = asyncio.run(self.mod.QuoteReplyActionTool().call(_wrap_event(event), text="收到"))
+
+        self.assertIn("引用消息", result)
+        action = event.get_extra("astrmai_pending_actions")[0]
+        self.assertEqual(action["action"], "quote_reply")
+        self.assertEqual(action["message_id"], "m-current")
+
+    def test_08_message_recall_lookup_filters_bot_messages(self):
+        event = _FakeEvent(group_id="777", self_id="bot-1")
+        event.bot.api = _MapApi(
+            {
+                "get_group_msg_history": {
+                    "data": {
+                        "messages": [
+                            {"message_id": "u1", "sender": {"user_id": "user-1"}, "message": "用户消息"},
+                            {"message_id": "b1", "sender": {"user_id": "bot-1"}, "message": "机器人回复"},
+                        ]
+                    }
+                }
+            }
+        )
+
+        result = asyncio.run(self.mod.QQMessageRecallLookupTool().call(_wrap_event(event), whose="bot"))
+
+        self.assertIn("b1", result)
+        self.assertNotIn("u1", result)
+
+    def test_09_topic_thread_lookup_reads_prompt_envelope(self):
+        event = _FakeEvent(group_id="777")
+        envelope = SimpleNamespace(
+            focus_message_text="刚才在聊棉花娃娃",
+            direct_context_text="萤说买了娃娃",
+            related_context_text="",
+            ambient_background_text="",
+        )
+        event.set_extra("astrmai_prompt_envelope", envelope)
+
+        result = asyncio.run(self.mod.TopicThreadLookupTool().call(_wrap_event(event), topic="娃娃"))
+
+        self.assertIn("棉花娃娃", result)
+        self.assertIn("萤说买了娃娃", result)
+
+    def test_10_bot_capability_lookup_lists_registered_tools(self):
+        event = _FakeEvent(group_id="777")
+
+        result = asyncio.run(self.mod.BotCapabilityLookupTool().call(_wrap_event(event)))
+
+        self.assertIn("qq_group_member_lookup", result)
+        self.assertIn("contact_route_suggest_tool", result)
+
+    def test_11_memory_write_correction_records_feedback(self):
+        event = _FakeEvent(group_id="777")
+
+        class _MemoryEngine:
+            def __init__(self):
+                self.calls = []
+
+            async def record_cognitive_feedback(self, **kwargs):
+                self.calls.append(kwargs)
+
+        engine = _MemoryEngine()
+        result = asyncio.run(
+            self.mod.MemoryWriteCorrectionTool(memory_engine=engine).call(
+                _wrap_event(event),
+                wrong_fact="我叫小红",
+                correct_fact="我叫小明",
+            )
+        )
+
+        self.assertIn("已记录", result)
+        self.assertEqual(engine.calls[0]["source"], "memory_correction_tool")
+        self.assertEqual(event.get_extra("astrmai_memory_correction_reports")[0]["correct_fact"], "我叫小明")
+
+    def test_12_unverified_report_record_marks_claim_uncertain(self):
+        event = _FakeEvent(group_id="777")
+
+        result = asyncio.run(
+            self.mod.UnverifiedReportRecordTool().call(
+                _wrap_event(event),
+                claim="别的群有人卖娃娃",
+                source_hint="群友转述",
+            )
+        )
+
+        self.assertIn("未核实", result)
+        self.assertEqual(event.get_extra("astrmai_unverified_reports")[0]["source_hint"], "群友转述")
+
+    def test_13_persona_fact_check_uses_self_lore_query(self):
+        event = _FakeEvent(group_id="777")
+
+        class _ToolService:
+            async def self_lore_query(self, **kwargs):
+                return SimpleNamespace(items=[SimpleNamespace()])
+
+            def render_result(self, result):
+                return "没有授权棉花娃娃。"
+
+        result = asyncio.run(
+            self.mod.PersonaFactCheckTool(memory_tool_service=_ToolService()).call(
+                _wrap_event(event),
+                claim="妃爱授权棉花娃娃了吗",
+            )
+        )
+
+        self.assertIn("没有授权", result)
+
+    def test_14_group_activity_snapshot_counts_recent_senders(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi(
+            {
+                "get_group_msg_history": {
+                    "data": {
+                        "messages": [
+                            {"message_id": "m1", "sender": {"user_id": "1", "nickname": "A"}, "message": "一"},
+                            {"message_id": "m2", "sender": {"user_id": "1", "nickname": "A"}, "message": "二"},
+                            {"message_id": "m3", "sender": {"user_id": "2", "nickname": "B"}, "message": "三"},
+                        ]
+                    }
+                }
+            }
+        )
+
+        result = asyncio.run(self.mod.GroupActivitySnapshotTool().call(_wrap_event(event), count=3))
+
+        self.assertIn("A(2)", result)
+        self.assertIn("B(1)", result)
+
+    def test_15_contact_route_suggest_prefers_friend_private_send(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi({"get_friend_list": {"data": [{"user_id": "1481314186", "remark": "萤"}]}})
+
+        result = asyncio.run(self.mod.ContactRouteSuggestTool().call(_wrap_event(event), target="萤", intent="传话"))
+
+        self.assertIn("机器人好友", result)
+        self.assertIn("space_transition_action", result)
+
+    def test_dispatcher_commits_custom_face_send_action(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi({"send_msg": {"data": {"message_id": "out-1"}}})
+        event.set_extra(
+            "astrmai_pending_actions",
+            [
+                self.mod.PendingQQAction(
+                    action_type="custom_face_send",
+                    group_id="777",
+                    payload={"face": {"id": "face-1"}},
+                ).to_dict()
+            ],
+        )
+        dispatcher_mod = importlib.import_module("astrmai.conversation.execution.qq_action_dispatcher")
+
+        result = asyncio.run(dispatcher_mod.QQActionDispatcher().commit(event, "chat-1", send_key="send-1"))
+
+        self.assertEqual(result[-1]["status"], "success")
+        self.assertEqual(event.bot.api.calls[0][0], "send_msg")
+        self.assertEqual(event.bot.api.calls[0][1]["message"][0]["type"], "mface")
+
+    def test_dispatcher_commits_quote_reply_action(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi({"send_msg": {"data": {"message_id": "out-2"}}})
+        event.set_extra(
+            "astrmai_pending_actions",
+            [
+                self.mod.PendingQQAction(
+                    action_type="quote_reply",
+                    group_id="777",
+                    message_id="m-current",
+                    payload={"text": "收到"},
+                ).to_dict()
+            ],
+        )
+        dispatcher_mod = importlib.import_module("astrmai.conversation.execution.qq_action_dispatcher")
+
+        result = asyncio.run(dispatcher_mod.QQActionDispatcher().commit(event, "chat-1", send_key="send-2"))
+
+        self.assertEqual(result[-1]["status"], "success")
+        segments = event.bot.api.calls[0][1]["message"]
+        self.assertEqual(segments[0]["type"], "reply")
+        self.assertEqual(segments[1]["data"]["text"], "收到")
 
     def test_meme_tool_marks_explicit_send_as_forced(self):
         event = _FakeEvent(group_id="12345")

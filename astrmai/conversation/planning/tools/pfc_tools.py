@@ -17,7 +17,8 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoff
 from ....presentation.dto.message_scope import MessageScope
 from ...contracts.qq_action import PendingQQAction
-from ..tool_contracts import record_tool_lifecycle
+from ..tool_contracts import TOOL_CAPABILITIES, record_tool_lifecycle
+from ..tool_disclosure import TOOL_PACKAGES, normalize_requested_packages
 
 
 QQ_MESSAGE_EMOJI_OPTIONS: dict[str, list[str]] = {
@@ -83,6 +84,8 @@ def _append_qq_action(event, action: PendingQQAction) -> bool:
             "message_emoji_like": "message_emoji_like_action",
             "group_sign": "group_sign_action",
             "withdraw": "regret_and_withdraw_action",
+            "custom_face_send": "qq_custom_face_send_tool",
+            "quote_reply": "quote_reply_action",
         }.get(action.action_type, action.action_type)
         record_tool_lifecycle(
             event,
@@ -191,10 +194,266 @@ def _friend_entries(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         payload = payload.get("data", payload)
         if isinstance(payload, dict):
-            payload = payload.get("friends", payload.get("list", []))
+            direct = payload.get("friends", payload.get("list", None))
+            if isinstance(direct, list):
+                payload = direct
+            else:
+                categories = payload.get("categories", payload.get("category", []))
+                if isinstance(categories, list):
+                    flattened: list[dict[str, Any]] = []
+                    for category in categories:
+                        if not isinstance(category, dict):
+                            continue
+                        for item in category.get("friends", category.get("list", [])) or []:
+                            if isinstance(item, dict):
+                                flattened.append(item)
+                    payload = flattened
+                else:
+                    payload = []
+    if isinstance(payload, list) and any(isinstance(item, dict) and ("friends" in item or "list" in item) for item in payload):
+        flattened = []
+        for item in payload:
+            if isinstance(item, dict) and ("friends" in item or "list" in item):
+                flattened.extend(entry for entry in item.get("friends", item.get("list", [])) or [] if isinstance(entry, dict))
+            elif isinstance(item, dict):
+                flattened.append(item)
+        payload = flattened
     if not isinstance(payload, list):
         return []
     return [item for item in payload if isinstance(item, dict)]
+
+
+def _payload_data(payload: Any) -> Any:
+    if isinstance(payload, dict) and "data" in payload:
+        return payload.get("data")
+    return payload
+
+
+def _list_entries(payload: Any, *keys: str) -> list[dict[str, Any]]:
+    payload = _payload_data(payload)
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                payload = value
+                break
+        else:
+            payload = []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _entry_id(entry: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = entry.get(key)
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _friend_id(entry: dict[str, Any]) -> str:
+    return _entry_id(entry, "user_id", "uin", "qq", "id")
+
+
+def _friend_name(entry: dict[str, Any]) -> str:
+    return (
+        str(entry.get("remark") or "").strip()
+        or str(entry.get("nickname") or "").strip()
+        or str(entry.get("name") or "").strip()
+        or _friend_id(entry)
+    )
+
+
+def _group_id(entry: dict[str, Any]) -> str:
+    return _entry_id(entry, "group_id", "gid", "id")
+
+
+def _group_name(entry: dict[str, Any]) -> str:
+    return (
+        str(entry.get("group_name") or "").strip()
+        or str(entry.get("group_memo") or "").strip()
+        or str(entry.get("name") or "").strip()
+        or _group_id(entry)
+    )
+
+
+def _match_by_id_or_name(
+    entries: list[dict[str, Any]],
+    target: str,
+    *,
+    id_getter,
+    name_getter,
+) -> list[dict[str, Any]]:
+    clean_target = str(target or "").strip().lstrip("@")
+    if not clean_target:
+        return []
+    if clean_target.isdigit():
+        exact = [entry for entry in entries if id_getter(entry) == clean_target]
+        if exact:
+            return exact
+    lowered = clean_target.casefold()
+    exact_name = [
+        entry
+        for entry in entries
+        if lowered
+        in {
+            str(name_getter(entry) or "").strip().casefold(),
+            str(entry.get("nickname") or "").strip().casefold(),
+            str(entry.get("remark") or "").strip().casefold(),
+            str(entry.get("group_name") or "").strip().casefold(),
+            str(entry.get("name") or "").strip().casefold(),
+        }
+    ]
+    if exact_name:
+        return exact_name
+    return [
+        entry
+        for entry in entries
+        if lowered in str(name_getter(entry) or "").strip().casefold()
+    ]
+
+
+def _truncate_text(text: Any, limit: int = 160) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    if limit <= 3:
+        return cleaned[:limit]
+    return cleaned[: limit - 3].rstrip() + "..."
+
+
+def _segment_type(segment: Any) -> str:
+    if isinstance(segment, dict):
+        return str(segment.get("type") or segment.get("message_type") or "").strip()
+    name = segment.__class__.__name__ if segment is not None else ""
+    return name or "unknown"
+
+
+def _segment_data(segment: Any) -> dict[str, Any]:
+    if isinstance(segment, dict):
+        data = segment.get("data", segment)
+        return dict(data) if isinstance(data, dict) else {}
+    data: dict[str, Any] = {}
+    for key in ("text", "file", "url", "path", "file_id", "file_unique", "name", "summary"):
+        if hasattr(segment, key):
+            value = getattr(segment, key)
+            if value:
+                data[key] = value
+    return data
+
+
+def _message_segments(payload: Any) -> list[Any]:
+    payload = _payload_data(payload)
+    if isinstance(payload, dict):
+        payload = payload.get("message", payload.get("raw_message", payload.get("segments", payload)))
+    if isinstance(payload, str):
+        return [{"type": "text", "data": {"text": payload}}]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _coerce_api_id(value: Any) -> Any:
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() else text
+
+
+def _message_sender_id(message: dict[str, Any]) -> str:
+    sender = message.get("sender")
+    value = message.get("user_id")
+    if isinstance(sender, dict):
+        value = sender.get("user_id", sender.get("uin", value))
+    return str(value or "").strip()
+
+
+def _message_sender_name(message: dict[str, Any]) -> str:
+    sender = message.get("sender")
+    if isinstance(sender, dict):
+        return str(sender.get("card") or sender.get("nickname") or sender.get("name") or "").strip()
+    return ""
+
+
+def _message_text_preview(message: dict[str, Any], limit: int = 120) -> str:
+    texts: list[str] = []
+    for segment in _message_segments(message):
+        if _segment_type(segment).lower() in {"text", "plain"}:
+            text = str(_segment_data(segment).get("text") or "").strip()
+            if text:
+                texts.append(text)
+    if not texts:
+        raw = message.get("raw_message")
+        if isinstance(raw, str):
+            texts.append(raw)
+    return _truncate_text(" ".join(texts), limit)
+
+
+def _format_message_summary(message: dict[str, Any], index: int = 0) -> str:
+    message_id = str(message.get("message_id") or message.get("id") or "").strip()
+    sender_id = _message_sender_id(message)
+    sender_name = _message_sender_name(message)
+    text = _message_text_preview(message, 96)
+    prefix = f"{index}. " if index else ""
+    who = sender_name or sender_id or "unknown"
+    suffix = f" | {text}" if text else ""
+    return f"{prefix}msg={message_id or 'unknown'} sender={who}({sender_id or 'unknown'}){suffix}"
+
+
+def _group_member_id(entry: dict[str, Any]) -> str:
+    return _entry_id(entry, "user_id", "uin", "qq", "id")
+
+
+def _group_member_name(entry: dict[str, Any]) -> str:
+    return (
+        str(entry.get("card") or "").strip()
+        or str(entry.get("nickname") or "").strip()
+        or str(entry.get("name") or "").strip()
+        or _group_member_id(entry)
+    )
+
+
+def _visual_records_from_event(event) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for key in (
+        "astrmai_visual_context",
+        "astrmai_visual_descriptions",
+        "astrmai_image_descriptions",
+        "astrmai_image_context",
+    ):
+        value = event.get_extra(key, None) if hasattr(event, "get_extra") else None
+        items = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+        for item in items:
+            if isinstance(item, dict):
+                records.append(item)
+    return records
+
+
+def _extract_image_candidates(payload: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for segment in _message_segments(payload):
+        seg_type = _segment_type(segment).lower()
+        if seg_type not in {"image", "mface", "face", "emoji"}:
+            continue
+        data = _segment_data(segment)
+        candidates.append(
+            {
+                "type": seg_type,
+                "file": str(data.get("file") or data.get("file_id") or data.get("id") or "").strip(),
+                "url": str(data.get("url") or "").strip(),
+                "path": str(data.get("path") or data.get("file") or "").strip(),
+                "raw": data,
+            }
+        )
+    return candidates
+
+
+def _append_report_extra(event, key: str, report: dict[str, Any], *, max_items: int = 32) -> None:
+    reports = event.get_extra(key, []) if hasattr(event, "get_extra") else []
+    reports = list(reports) if isinstance(reports, list) else []
+    reports.append(report)
+    if hasattr(event, "set_extra"):
+        event.set_extra(key, reports[-max_items:])
 
 
 async def _resolve_friend_target(
@@ -863,6 +1122,1298 @@ class TopicHijackTool(FunctionTool[AstrAgentContext]):
 
 
 @dataclass
+class QQFriendLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_friend_lookup"
+    description: str = (
+        "只读查询机器人自己的 QQ 好友事实。"
+        "当用户问某 QQ/昵称是不是机器人好友，或跨会话传话前需要确认收件人时调用；"
+        "工具查不到时只能回答未知，不能猜测对方身份。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "要查询的 QQ 号、好友备注或昵称；为空时只返回好友数量摘要。",
+                    "maxLength": 80,
+                },
+                "include_preview": {
+                    "type": "boolean",
+                    "description": "是否返回少量好友预览。默认 false；只有用户明确询问好友列表时才设为 true。",
+                },
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
+        api = getattr(getattr(current_event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "好友查询失败：NapCat 好友接口不可用。"
+        target = str(kwargs.get("target", "") or "").strip()
+        include_preview = bool(kwargs.get("include_preview", False))
+        try:
+            payload = await api.call_action("get_friend_list")
+            friends = _friend_entries(payload)
+            if not friends:
+                payload = await api.call_action("get_friends_with_category")
+                friends = _friend_entries(payload)
+        except Exception as exc:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"好友查询失败：读取机器人好友列表时出错：{exc}"
+
+        if target:
+            matches = _match_by_id_or_name(
+                friends,
+                target,
+                id_getter=_friend_id,
+                name_getter=_friend_name,
+            )
+            if not matches:
+                _record_tool_execution(current_event, self.name)
+                return f"好友查询结果：机器人好友列表中没有找到“{target}”。不能声称已经联系到这个人。"
+            lines = []
+            for item in matches[:5]:
+                friend_id = _friend_id(item)
+                display = _friend_name(item)
+                nickname = str(item.get("nickname") or "").strip()
+                remark = str(item.get("remark") or "").strip()
+                extra = f"；昵称={nickname}" if nickname and nickname != display else ""
+                extra += f"；备注={remark}" if remark and remark != display else ""
+                lines.append(f"- QQ {friend_id}: {display}{extra}")
+            if len(matches) > 5:
+                lines.append(f"- 另有 {len(matches) - 5} 个候选，请让用户提供准确 QQ 号。")
+            _record_tool_execution(current_event, self.name)
+            return "好友查询结果：找到匹配好友。\n" + "\n".join(lines)
+
+        _record_tool_execution(current_event, self.name)
+        if include_preview:
+            preview = [f"- QQ {_friend_id(item)}: {_friend_name(item)}" for item in friends[:12]]
+            suffix = f"\n另有 {len(friends) - 12} 位未展示。" if len(friends) > 12 else ""
+            return f"好友查询结果：机器人好友共 {len(friends)} 位。\n" + "\n".join(preview) + suffix
+        return f"好友查询结果：机器人好友共 {len(friends)} 位。需要具体判断时请提供 QQ 号、备注或昵称。"
+
+
+@dataclass
+class QQGroupPresenceLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_group_presence_lookup"
+    description: str = (
+        "只读查询机器人所在群、某群是否匹配、以及指定用户是否与机器人共享群。"
+        "当用户说“我在别的群见过你”“那个群里的你是不是你”时必须先调用本工具查平台事实；"
+        "查不到时只能说无法确认，不能断言冒充、授权或诈骗。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "group_query": {
+                    "type": "string",
+                    "description": "要查询的群号或群名关键词；可为空。",
+                    "maxLength": 80,
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "要判断是否与机器人共享群的 QQ 号；为空时默认当前发言人。",
+                    "maxLength": 32,
+                },
+                "include_preview": {
+                    "type": "boolean",
+                    "description": "是否返回少量群预览。默认 false；只有用户明确询问机器人在哪些群时才设为 true。",
+                },
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
+        api = getattr(getattr(current_event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "群事实查询失败：NapCat 群接口不可用。"
+        include_preview = bool(kwargs.get("include_preview", False))
+        group_query = str(kwargs.get("group_query", "") or "").strip()
+        raw_user_id = str(kwargs.get("user_id", "") or "").strip()
+        user_id = raw_user_id or (
+            str(current_event.get_sender_id() or "").strip()
+            if group_query or not include_preview
+            else ""
+        )
+        try:
+            groups = _list_entries(await api.call_action("get_group_list"), "groups", "list")
+        except Exception as exc:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"群事实查询失败：读取机器人群列表时出错：{exc}"
+
+        matched_groups = (
+            _match_by_id_or_name(groups, group_query, id_getter=_group_id, name_getter=_group_name)
+            if group_query
+            else []
+        )
+        lines: list[str] = [f"机器人当前可见群数量：{len(groups)}。"]
+        if group_query:
+            if matched_groups:
+                lines.append("群匹配结果：")
+                lines.extend(f"- 群 {_group_id(item)}: {_group_name(item)}" for item in matched_groups[:8])
+                if len(matched_groups) > 8:
+                    lines.append(f"- 另有 {len(matched_groups) - 8} 个候选。")
+            else:
+                lines.append(f"群匹配结果：没有找到与“{group_query}”匹配的机器人所在群。")
+        elif include_preview:
+            lines.append("群预览：")
+            lines.extend(f"- 群 {_group_id(item)}: {_group_name(item)}" for item in groups[:10])
+            if len(groups) > 10:
+                lines.append(f"- 另有 {len(groups) - 10} 个群未展示。")
+
+        if user_id:
+            check_groups = matched_groups if matched_groups else groups[:50]
+            shared: list[dict[str, Any]] = []
+            current_group_id = str(current_event.get_group_id() or "").strip()
+            if current_group_id and str(current_event.get_sender_id() or "").strip() == user_id:
+                current_group = next((item for item in groups if _group_id(item) == current_group_id), None)
+                if current_group is None:
+                    current_group = {"group_id": current_group_id, "group_name": "当前群"}
+                shared.append(current_group)
+            for item in check_groups:
+                gid = _group_id(item)
+                if not gid or any(_group_id(existing) == gid for existing in shared):
+                    continue
+                try:
+                    await api.call_action(
+                        "get_group_member_info",
+                        group_id=int(gid) if gid.isdigit() else gid,
+                        user_id=int(user_id) if user_id.isdigit() else user_id,
+                    )
+                except Exception:
+                    continue
+                shared.append(item)
+                if len(shared) >= 8:
+                    break
+            if shared:
+                lines.append(f"共同群判断：QQ {user_id} 与机器人至少共享 {len(shared)} 个可见群：")
+                lines.extend(f"- 群 {_group_id(item)}: {_group_name(item)}" for item in shared[:8])
+            else:
+                checked = len(check_groups)
+                lines.append(f"共同群判断：在已检查的 {checked} 个机器人可见群中，没有确认 QQ {user_id} 与机器人共享群。")
+        _record_tool_execution(current_event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class QQRecentContactLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_recent_contact_lookup"
+    description: str = (
+        "只读查询机器人最近联系人和本轮跨会话发送记录。"
+        "用于回答“刚才谁找你”“你最近有没有联系某人”“跨会话消息发到哪里了”等事实问题。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "要筛选的 QQ、昵称、群名或备注。", "maxLength": 80},
+                "count": {"type": "integer", "description": "最多返回多少条最近联系人，1-20。", "minimum": 1, "maximum": 20},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
+        api = getattr(getattr(current_event, "bot", None), "api", None)
+        target = str(kwargs.get("target", "") or "").strip()
+        try:
+            count = max(1, min(int(kwargs.get("count", 8) or 8), 20))
+        except (TypeError, ValueError):
+            count = 8
+        entries: list[dict[str, Any]] = []
+        api_error = ""
+        if api is not None:
+            try:
+                try:
+                    payload = await api.call_action("get_recent_contact", count=count)
+                except TypeError:
+                    payload = await api.call_action("get_recent_contact")
+                entries = _list_entries(payload, "contacts", "list", "items")
+            except Exception as exc:
+                api_error = str(exc)
+        astr_ctx = context.context.context
+        handoff_lines: list[str] = []
+        sends = current_event.get_extra("astrmai_cross_session_sends", []) if hasattr(current_event, "get_extra") else []
+        for item in list(sends or [])[-5:]:
+            if not isinstance(item, dict):
+                continue
+            handoff_lines.append(
+                f"- 本轮已向 {item.get('target_umo') or item.get('target_id')} 发送：{_truncate_text(item.get('message'), 80)}"
+            )
+        shared_dict = getattr(astr_ctx, "shared_dict", None)
+        if isinstance(shared_dict, dict):
+            jumps = shared_dict.get("astrmai_space_jumps", {})
+            if isinstance(jumps, dict):
+                for target_id, item in list(jumps.items())[-5:]:
+                    if isinstance(item, dict):
+                        handoff_lines.append(
+                            f"- 待衔接跨会话 target={target_id}: {_truncate_text(item.get('context_summary') or item.get('private_message'), 80)}"
+                        )
+
+        if target:
+            lowered = target.casefold()
+            entries = [
+                item
+                for item in entries
+                if lowered
+                in " ".join(
+                    str(item.get(key) or "")
+                    for key in ("user_id", "group_id", "peer_id", "nickname", "remark", "name", "group_name")
+                ).casefold()
+            ]
+        lines: list[str] = []
+        if entries:
+            lines.append(f"最近联系人查询结果：{len(entries)} 条候选。")
+            for item in entries[:count]:
+                contact_id = _entry_id(item, "peer_id", "user_id", "group_id", "uin", "id")
+                name = (
+                    str(item.get("remark") or item.get("nickname") or item.get("group_name") or item.get("name") or contact_id).strip()
+                )
+                contact_type = str(item.get("type") or item.get("chat_type") or item.get("msg_type") or "").strip()
+                lines.append(f"- {contact_type or 'contact'} {contact_id}: {name}")
+        elif api_error:
+            lines.append(f"最近联系人接口暂时不可用：{api_error}")
+        else:
+            lines.append("最近联系人查询结果：没有拿到可用联系人。")
+        if handoff_lines:
+            lines.append("跨会话记录摘要：")
+            lines.extend(handoff_lines)
+        _record_tool_execution(current_event, self.name, status="success" if entries or handoff_lines or not api_error else "failed")
+        return "\n".join(lines)
+
+
+@dataclass
+class QQMessageArtifactLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_message_artifact_lookup"
+    description: str = (
+        "只读查询指定消息、当前消息、图片、表情、文件和转发片段的结构化信息。"
+        "当用户说“刚才那张图/那条消息/那个文件/转发内容”时调用；"
+        "本工具只描述可见消息素材，不直接做视觉识别。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "string",
+                    "description": "要查询的消息 ID；为空时查询当前触发消息。",
+                    "maxLength": 80,
+                },
+                "include_text_preview": {
+                    "type": "boolean",
+                    "description": "是否返回短文本预览。默认 true。",
+                },
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
+        api = getattr(getattr(current_event, "bot", None), "api", None)
+        message_id = str(kwargs.get("message_id", "") or "").strip()
+        include_text_preview = bool(kwargs.get("include_text_preview", True))
+        payload: Any = None
+        if message_id:
+            if api is None:
+                _record_tool_execution(current_event, self.name, status="failed")
+                return "消息素材查询失败：NapCat 消息接口不可用。"
+            try:
+                payload = await api.call_action("get_msg", message_id=int(message_id) if message_id.isdigit() else message_id)
+            except Exception as exc:
+                _record_tool_execution(current_event, self.name, status="failed")
+                return f"消息素材查询失败：读取消息 {message_id} 时出错：{exc}"
+        else:
+            message_obj = getattr(current_event, "message_obj", None)
+            payload = {
+                "message_id": _current_message_id(current_event),
+                "sender": {"user_id": str(current_event.get_sender_id() or ""), "nickname": str(current_event.get_sender_name() or "")},
+                "message": getattr(message_obj, "message", None),
+                "raw_message": getattr(message_obj, "raw_message", None),
+                "time": getattr(message_obj, "timestamp", None),
+            }
+
+        data = _payload_data(payload)
+        if not isinstance(data, dict):
+            data = {"message": data}
+        segments = _message_segments(data)
+        lines = [
+            f"消息 ID：{str(data.get('message_id') or message_id or _current_message_id(current_event) or 'unknown')}",
+        ]
+        sender = data.get("sender")
+        if isinstance(sender, dict):
+            sender_id = str(sender.get("user_id") or sender.get("uin") or "").strip()
+            sender_name = str(sender.get("nickname") or sender.get("card") or sender.get("name") or "").strip()
+            if sender_id or sender_name:
+                lines.append(f"发送者：{sender_name or 'unknown'} ({sender_id or 'unknown'})")
+        if not segments:
+            text = str(data.get("raw_message") or data.get("message") or "").strip()
+            if text:
+                segments = [{"type": "text", "data": {"text": text}}]
+        if not segments:
+            _record_tool_execution(current_event, self.name)
+            return "\n".join(lines + ["消息片段：未发现可解析内容。"])
+
+        lines.append(f"消息片段数量：{len(segments)}")
+        for index, segment in enumerate(segments[:8], start=1):
+            seg_type = _segment_type(segment) or "unknown"
+            data_map = _segment_data(segment)
+            parts = [f"{index}. type={seg_type}"]
+            if include_text_preview and data_map.get("text"):
+                parts.append(f"text={_truncate_text(data_map.get('text'), 100)}")
+            for key in ("file", "name", "url", "path", "file_id", "file_unique", "summary"):
+                value = str(data_map.get(key) or "").strip()
+                if value:
+                    parts.append(f"{key}={_truncate_text(value, 80)}")
+            lines.append("；".join(parts))
+        if len(segments) > 8:
+            lines.append(f"另有 {len(segments) - 8} 个片段未展示。")
+        _record_tool_execution(current_event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class CrossChatMemoryQueryTool(FunctionTool[AstrAgentContext]):
+    name: str = "cross_chat_memory_query"
+    description: str = (
+        "查询 AstrMai 自己跨群、跨私聊、跨会话的内部记忆和自述资料。"
+        "用于确认“我是不是在别的群见过你”“你自己有没有相关记忆/设定/授权记录”；"
+        "查不到时必须回答没有明确记录，不能把未知说成事实。"
+    )
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    memory_tool_service: Optional[Any] = Field(default=None, exclude=True)
+    persona_id: str = Field(default="", exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "要查询的跨会话事实、人物、群名或主题。", "minLength": 1, "maxLength": 240},
+                "scope": {
+                    "type": "string",
+                    "description": "查询范围：memory 查普通跨会话记忆；self_lore 查自我设定；all 同时查两者。",
+                    "enum": ["memory", "self_lore", "all"],
+                },
+                "top_k": {"type": "integer", "description": "最多返回条数，1-8。", "minimum": 1, "maximum": 8},
+            },
+            "required": ["query"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        query = str(kwargs.get("query", "") or "").strip()
+        if not query:
+            return "跨会话记忆查询失败：query 不能为空。"
+        scope = str(kwargs.get("scope", "all") or "all").strip()
+        if scope not in {"memory", "self_lore", "all"}:
+            scope = "all"
+        try:
+            top_k = max(1, min(int(kwargs.get("top_k", 5) or 5), 8))
+        except (TypeError, ValueError):
+            top_k = 5
+        current_event = _get_current_event(context)
+        tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
+        if tool_service is None:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "系统提示：当前没有可用的跨会话记忆查询服务。"
+        sections: list[str] = []
+        try:
+            if scope in {"memory", "all"} and hasattr(tool_service, "search_memory"):
+                result = await tool_service.search_memory(
+                    query=query,
+                    session_id="",
+                    top_k=top_k,
+                    event=current_event,
+                    allow_stale=True,
+                )
+                rendered = tool_service.render_result(result)
+                if rendered and "no usable internal memory" not in rendered.lower():
+                    sections.append("[AstrMai 跨会话记忆]\n" + rendered)
+            if scope in {"self_lore", "all"} and hasattr(tool_service, "self_lore_query"):
+                lore = await tool_service.self_lore_query(
+                    query=query,
+                    persona_id=self.persona_id,
+                    event=current_event,
+                    top_k=min(top_k, 3),
+                    allow_stale=True,
+                )
+                rendered_lore = tool_service.render_result(lore)
+                if rendered_lore and "no usable internal memory" not in rendered_lore.lower():
+                    sections.append("[AstrMai 自我设定]\n" + rendered_lore)
+        except Exception as exc:
+            logger.debug(f"[CrossChatMemoryQueryTool] lookup failed: {exc}")
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "系统提示：跨会话记忆查询暂时失败。"
+        _record_tool_execution(current_event, self.name)
+        if not sections:
+            return "系统提示：AstrMai 没有检索到可确认的跨会话记忆或自我设定。请把这当作未知，不要断言。"
+        return "\n\n".join(sections)
+
+
+@dataclass
+class QQGroupMemberLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_group_member_lookup"
+    description: str = (
+        "只读查询机器人可见群中的成员身份、群名片、昵称、角色和活跃时间。"
+        "当用户问某人在不在当前群/某群、群里怎么称呼、是否管理员时调用；查不到必须说未知。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "QQ 号、群名片或昵称；为空时默认当前发言人。", "maxLength": 80},
+                "group_id": {"type": "string", "description": "群号；为空时使用当前群。", "maxLength": 32},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(event, self.name, status="failed")
+            return "群成员查询失败：NapCat 群接口不可用。"
+        group_id = str(kwargs.get("group_id", "") or event.get_group_id() or "").strip()
+        target = str(kwargs.get("target", "") or event.get_sender_id() or "").strip().lstrip("@")
+        if not group_id:
+            _record_tool_execution(event, self.name, status="failed")
+            return "群成员查询失败：当前不是群聊，也没有提供 group_id。"
+        if not target:
+            _record_tool_execution(event, self.name, status="failed")
+            return "群成员查询失败：target 不能为空。"
+        try:
+            if target.isdigit():
+                payload = await api.call_action(
+                    "get_group_member_info",
+                    group_id=_coerce_api_id(group_id),
+                    user_id=_coerce_api_id(target),
+                    no_cache=False,
+                )
+                entries = [_payload_data(payload)] if isinstance(_payload_data(payload), dict) else []
+            else:
+                payload = await api.call_action("get_group_member_list", group_id=_coerce_api_id(group_id))
+                entries = _match_by_id_or_name(
+                    _list_entries(payload, "members", "list"),
+                    target,
+                    id_getter=_group_member_id,
+                    name_getter=_group_member_name,
+                )
+        except Exception as exc:
+            _record_tool_execution(event, self.name, status="failed")
+            return f"群成员查询失败：读取群 {group_id} 成员信息时出错：{exc}"
+        if not entries:
+            _record_tool_execution(event, self.name)
+            return f"群成员查询结果：没有在群 {group_id} 中确认“{target}”。"
+        lines = [f"群成员查询结果：群 {group_id} 中找到 {len(entries)} 个候选。"]
+        for item in entries[:6]:
+            member_id = _group_member_id(item)
+            name = _group_member_name(item)
+            role = str(item.get("role") or "").strip()
+            title = str(item.get("title") or item.get("special_title") or "").strip()
+            last_sent = str(item.get("last_sent_time") or "").strip()
+            parts = [f"- QQ {member_id or 'unknown'}: {name or 'unknown'}"]
+            if role:
+                parts.append(f"角色={role}")
+            if title:
+                parts.append(f"头衔={title}")
+            if last_sent:
+                parts.append(f"最近发言={last_sent}")
+            lines.append("；".join(parts))
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class QQUserIdentityLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_user_identity_lookup"
+    description: str = (
+        "只读综合查询一个 QQ/昵称在机器人视角下的身份：是否好友、当前群身份、备注、群名片和昵称。"
+        "当模型需要区分不同人、避免把群友/好友搞混时调用。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "QQ 号、好友备注、群名片或昵称；为空时默认当前发言人。", "maxLength": 80},
+                "group_id": {"type": "string", "description": "群号；为空时使用当前群。", "maxLength": 32},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(event, self.name, status="failed")
+            return "用户身份查询失败：NapCat 接口不可用。"
+        target = str(kwargs.get("target", "") or event.get_sender_id() or "").strip().lstrip("@")
+        group_id = str(kwargs.get("group_id", "") or event.get_group_id() or "").strip()
+        lines: list[str] = [f"用户身份查询：target={target or 'current'}。"]
+        try:
+            friends = _friend_entries(await api.call_action("get_friend_list"))
+            friend_matches = _match_by_id_or_name(
+                friends,
+                target,
+                id_getter=_friend_id,
+                name_getter=_friend_name,
+            ) if target else []
+        except Exception as exc:
+            friend_matches = []
+            lines.append(f"好友身份：查询失败：{exc}")
+        if friend_matches:
+            for item in friend_matches[:4]:
+                lines.append(f"好友身份：是机器人好友，QQ {_friend_id(item)}，显示名 {_friend_name(item)}。")
+        elif target:
+            lines.append("好友身份：未在机器人好友列表中确认。")
+
+        if group_id and target:
+            try:
+                if target.isdigit():
+                    payload = await api.call_action(
+                        "get_group_member_info",
+                        group_id=_coerce_api_id(group_id),
+                        user_id=_coerce_api_id(target),
+                        no_cache=False,
+                    )
+                    members = [_payload_data(payload)] if isinstance(_payload_data(payload), dict) else []
+                else:
+                    payload = await api.call_action("get_group_member_list", group_id=_coerce_api_id(group_id))
+                    members = _match_by_id_or_name(
+                        _list_entries(payload, "members", "list"),
+                        target,
+                        id_getter=_group_member_id,
+                        name_getter=_group_member_name,
+                    )
+            except Exception as exc:
+                members = []
+                lines.append(f"群身份：查询群 {group_id} 失败：{exc}")
+            if members:
+                for item in members[:4]:
+                    lines.append(
+                        f"群身份：在群 {group_id} 中，QQ {_group_member_id(item)}，群名片/昵称 {_group_member_name(item)}，"
+                        f"角色 {str(item.get('role') or 'member')}。"
+                    )
+            else:
+                lines.append(f"群身份：未在群 {group_id} 中确认该用户。")
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class QQForwardMessageLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_forward_message_lookup"
+    description: str = (
+        "只读解析当前或指定消息中的合并转发/转发节点。"
+        "用于用户让你看转发消息、截图式聊天记录、或问转发里是谁说了什么。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string", "description": "包含转发的消息 ID；为空时使用当前消息。", "maxLength": 80},
+                "max_nodes": {"type": "integer", "description": "最多展示多少个转发节点，1-20。", "minimum": 1, "maximum": 20},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        message_id = str(kwargs.get("message_id", "") or "").strip()
+        try:
+            max_nodes = max(1, min(int(kwargs.get("max_nodes", 8) or 8), 20))
+        except (TypeError, ValueError):
+            max_nodes = 8
+        payload: Any
+        if message_id:
+            if api is None:
+                _record_tool_execution(event, self.name, status="failed")
+                return "转发消息查询失败：NapCat 消息接口不可用。"
+            try:
+                payload = await api.call_action("get_msg", message_id=_coerce_api_id(message_id))
+            except Exception as exc:
+                _record_tool_execution(event, self.name, status="failed")
+                return f"转发消息查询失败：读取消息 {message_id} 时出错：{exc}"
+        else:
+            payload = {
+                "message_id": _current_message_id(event),
+                "message": getattr(getattr(event, "message_obj", None), "message", None),
+                "raw_message": getattr(getattr(event, "message_obj", None), "raw_message", None),
+            }
+        data = _payload_data(payload)
+        segments = _message_segments(data)
+        forward_ids: list[str] = []
+        inline_nodes: list[dict[str, Any]] = []
+        for segment in segments:
+            seg_type = _segment_type(segment).lower()
+            data_map = _segment_data(segment)
+            if seg_type in {"forward", "node", "json"}:
+                fid = str(data_map.get("id") or data_map.get("forward_id") or data_map.get("resid") or "").strip()
+                if fid:
+                    forward_ids.append(fid)
+                nodes = data_map.get("nodes") or data_map.get("content")
+                if isinstance(nodes, list):
+                    inline_nodes.extend(item for item in nodes if isinstance(item, dict))
+        nodes: list[dict[str, Any]] = list(inline_nodes)
+        if api is not None:
+            for fid in forward_ids[:3]:
+                try:
+                    expanded = await api.call_action("get_forward_msg", message_id=fid)
+                except Exception:
+                    try:
+                        expanded = await api.call_action("get_forward_msg", id=fid)
+                    except Exception:
+                        continue
+                nodes.extend(_history_messages(expanded))
+        if not nodes:
+            _record_tool_execution(event, self.name)
+            return "转发消息查询结果：当前消息中没有解析到可展开的合并转发节点。"
+        lines = [f"转发消息查询结果：解析到 {len(nodes)} 个节点，展示前 {min(len(nodes), max_nodes)} 个。"]
+        for idx, node in enumerate(nodes[:max_nodes], start=1):
+            lines.append(_format_message_summary(node, idx))
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
+    name: str = "vision_message_analyze_tool"
+    description: str = (
+        "查询当前/指定图片消息的视觉转述结果；如果已由 VisualCortex 分析，会返回图片描述、类型和情绪标签。"
+        "用于回答“这张图是什么”“这个表情包什么意思”。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string", "description": "图片消息 ID；为空时使用当前消息。", "maxLength": 80},
+                "image_index": {"type": "integer", "description": "第几张图，从 1 开始。", "minimum": 1, "maximum": 8},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        message_id = str(kwargs.get("message_id", "") or "").strip()
+        try:
+            image_index = max(1, min(int(kwargs.get("image_index", 1) or 1), 8))
+        except (TypeError, ValueError):
+            image_index = 1
+        records = _visual_records_from_event(event)
+        if records:
+            selected = records[min(image_index - 1, len(records) - 1)]
+            desc = str(selected.get("description") or selected.get("summary") or selected.get("text") or "").strip()
+            img_type = str(selected.get("type") or "image").strip()
+            tags = selected.get("emotion_tags") or selected.get("tags") or []
+            _record_tool_execution(event, self.name)
+            return f"视觉转述结果：type={img_type}；tags={tags}；description={_truncate_text(desc, 600)}"
+        payload: Any = None
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if message_id and api is not None:
+            try:
+                payload = await api.call_action("get_msg", message_id=_coerce_api_id(message_id))
+            except Exception as exc:
+                _record_tool_execution(event, self.name, status="failed")
+                return f"视觉转述查询失败：读取图片消息 {message_id} 时出错：{exc}"
+        else:
+            payload = {
+                "message": getattr(getattr(event, "message_obj", None), "message", None),
+                "raw_message": getattr(getattr(event, "message_obj", None), "raw_message", None),
+            }
+        candidates = _extract_image_candidates(_payload_data(payload))
+        if not candidates:
+            _record_tool_execution(event, self.name)
+            return "视觉转述结果：当前没有发现可分析的图片或表情包片段。"
+        image = candidates[min(image_index - 1, len(candidates) - 1)]
+        _record_tool_execution(event, self.name)
+        return (
+            "视觉转述结果：图片分析还没有完成；已看到图片片段。"
+            f"type={image.get('type')} file={_truncate_text(image.get('file'), 120)} url={_truncate_text(image.get('url'), 120)}。"
+            "请不要臆测图片内容，可提示用户稍后再问或根据已完成的视觉转述作答。"
+        )
+
+
+@dataclass
+class CrossSessionReplyLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "cross_session_reply_lookup"
+    description: str = (
+        "只读查询跨会话传话后目标好友/会话的近期回复，用来判断对方有没有回、回了什么。"
+        "不会主动发送消息。"
+    )
+    db_service: Any = Field(default=None, exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target_name": {"type": "string", "description": "目标好友 QQ、备注或昵称；为空时读取本轮最近跨会话目标。", "maxLength": 80},
+                "count": {"type": "integer", "description": "最多读取多少条近期私聊消息，1-20。", "minimum": 1, "maximum": 20},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(event, self.name, status="failed")
+            return "跨会话回复查询失败：NapCat 消息接口不可用。"
+        target_name = str(kwargs.get("target_name", "") or "").strip()
+        if not target_name:
+            sends = event.get_extra("astrmai_cross_session_sends", []) if hasattr(event, "get_extra") else []
+            if isinstance(sends, list) and sends:
+                last = next((item for item in reversed(sends) if isinstance(item, dict)), {})
+                target_name = str(last.get("target_id") or last.get("target_name") or "").strip()
+        if not target_name:
+            _record_tool_execution(event, self.name, status="failed")
+            return "跨会话回复查询失败：没有目标好友。"
+        resolved, reason = await _resolve_friend_target(event, context.context.context, self.db_service, target_name)
+        if not resolved:
+            _record_tool_execution(event, self.name, status="failed")
+            return f"跨会话回复查询失败：{reason}"
+        target_id, display = resolved
+        try:
+            count = max(1, min(int(kwargs.get("count", 8) or 8), 20))
+        except (TypeError, ValueError):
+            count = 8
+        try:
+            payload = await api.call_action(
+                "get_friend_msg_history",
+                user_id=_coerce_api_id(target_id),
+                message_seq=0,
+                count=count,
+            )
+        except Exception as exc:
+            _record_tool_execution(event, self.name, status="failed")
+            return f"跨会话回复查询失败：读取 {display}({target_id}) 的私聊历史出错：{exc}"
+        messages = _history_messages(payload)
+        if not messages:
+            _record_tool_execution(event, self.name)
+            return f"跨会话回复查询结果：没有读取到 {display}({target_id}) 的近期回复。"
+        lines = [f"跨会话回复查询结果：{display}({target_id}) 近期消息 {len(messages)} 条。"]
+        for idx, message in enumerate(messages[-count:], start=1):
+            lines.append(_format_message_summary(message, idx))
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class QQCustomFaceSendTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_custom_face_send_tool"
+    description: str = (
+        "从机器人自定义表情列表中挑选并发送一个自定义表情。"
+        "适合普通聊天中表达调侃、开心、震惊等情绪；如果找不到表情，必须如实说明。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "想匹配的表情关键词、名字或情绪。", "maxLength": 80},
+                "face_id": {"type": "string", "description": "已知的自定义表情 id，可为空。", "maxLength": 120},
+                "reason": {"type": "string", "description": "为什么想发这个表情，给审计日志使用。", "maxLength": 120},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        keyword = str(kwargs.get("keyword", "") or "").strip()
+        face_id = str(kwargs.get("face_id", "") or "").strip()
+        reason = str(kwargs.get("reason", "") or "").strip()
+        face_payload: dict[str, Any] = {"id": face_id} if face_id else {}
+        if api is not None and not face_payload:
+            try:
+                payload = await api.call_action("fetch_custom_face", count=80)
+                entries = _list_entries(payload, "faces", "list", "items")
+                if not entries and isinstance(_payload_data(payload), list):
+                    entries = _list_entries(payload)
+                lowered = keyword.casefold()
+                match = next(
+                    (
+                        item
+                        for item in entries
+                        if not lowered
+                        or lowered
+                        in " ".join(str(item.get(k) or "") for k in ("id", "name", "summary", "key", "emoji_id")).casefold()
+                    ),
+                    None,
+                )
+                if isinstance(match, dict):
+                    face_payload = dict(match)
+            except Exception as exc:
+                logger.debug(f"[QQCustomFaceSendTool] custom face lookup degraded: {exc}")
+        if not face_payload:
+            _record_tool_execution(event, self.name, status="failed")
+            return "自定义表情发送失败：没有匹配到可发送的自定义表情。"
+        group_id = str(event.get_group_id() or "").strip()
+        target_id = str(event.get_sender_id() or "").strip() if not group_id else ""
+        queued = _append_qq_action(
+            event,
+            PendingQQAction(
+                action_type="custom_face_send",
+                target_id=target_id,
+                group_id=group_id,
+                payload={"face": face_payload, "keyword": keyword, "reason": reason},
+            ),
+        )
+        if queued:
+            return "已准备发送自定义表情；如果平台发送失败，会在动作结果里记录失败原因。"
+        return "自定义表情发送已经在本轮排队，无需重复调用。"
+
+
+@dataclass
+class QuoteReplyActionTool(FunctionTool[AstrAgentContext]):
+    name: str = "quote_reply_action"
+    description: str = (
+        "引用某条 QQ 消息并发送一条短回复。"
+        "当用户明确要求“引用那条回复”“回这条消息”时使用；message_id 为空时引用当前消息。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string", "description": "要引用的消息 ID；为空则引用当前消息。", "maxLength": 80},
+                "text": {"type": "string", "description": "引用回复正文，尽量简短。", "maxLength": 240},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        message_id = str(kwargs.get("message_id", "") or _current_message_id(event) or "").strip()
+        text = str(kwargs.get("text", "") or "").strip()
+        if not message_id:
+            _record_tool_execution(event, self.name, status="failed")
+            return "引用回复失败：没有可引用的 message_id。"
+        if not text:
+            _record_tool_execution(event, self.name, status="failed")
+            return "引用回复失败：text 不能为空。"
+        queued = _append_qq_action(
+            event,
+            PendingQQAction(
+                action_type="quote_reply",
+                target_id=str(event.get_sender_id() or "").strip(),
+                group_id=str(event.get_group_id() or "").strip(),
+                message_id=message_id,
+                payload={"text": text},
+            ),
+        )
+        if queued:
+            return f"已准备引用消息 {message_id} 回复。"
+        return f"引用消息 {message_id} 的回复已经在本轮排队。"
+
+
+@dataclass
+class QQMessageRecallLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "qq_message_recall_lookup"
+    description: str = (
+        "只读查询近期可撤回/可引用的消息候选，尤其是机器人刚发过的消息。"
+        "用于撤回、引用、解释上一条回复前先确认 message_id。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "whose": {"type": "string", "description": "bot/current/sender/all，默认 bot。", "enum": ["bot", "current", "sender", "all"]},
+                "count": {"type": "integer", "description": "最多返回多少条，1-20。", "minimum": 1, "maximum": 20},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(event, self.name, status="failed")
+            return "消息候选查询失败：NapCat 消息接口不可用。"
+        whose = str(kwargs.get("whose", "bot") or "bot").strip()
+        if whose not in {"bot", "current", "sender", "all"}:
+            whose = "bot"
+        try:
+            count = max(1, min(int(kwargs.get("count", 8) or 8), 20))
+        except (TypeError, ValueError):
+            count = 8
+        group_id = str(event.get_group_id() or "").strip()
+        sender_id = str(event.get_sender_id() or "").strip()
+        self_id = str(event.get_self_id() or "").strip()
+        try:
+            if group_id:
+                payload = await api.call_action("get_group_msg_history", group_id=_coerce_api_id(group_id), message_seq=0, count=count * 3)
+            else:
+                payload = await api.call_action("get_friend_msg_history", user_id=_coerce_api_id(sender_id), message_seq=0, count=count * 3)
+        except Exception as exc:
+            _record_tool_execution(event, self.name, status="failed")
+            return f"消息候选查询失败：读取历史消息出错：{exc}"
+        messages = _history_messages(payload)
+        if whose == "bot":
+            messages = [item for item in messages if _message_sender_id(item) == self_id]
+        elif whose in {"current", "sender"}:
+            messages = [item for item in messages if _message_sender_id(item) == sender_id]
+        if not messages:
+            _record_tool_execution(event, self.name)
+            return "消息候选查询结果：没有找到符合条件的近期消息。"
+        lines = [f"消息候选查询结果：{len(messages)} 条候选，展示最近 {min(len(messages), count)} 条。"]
+        for idx, message in enumerate(messages[-count:], start=1):
+            lines.append(_format_message_summary(message, idx))
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class TopicThreadLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "topic_thread_lookup"
+    description: str = (
+        "只读查看当前会话的近期话题线索、focus 上下文和消息窗口。"
+        "用于分辨“那个”“刚才说的”“这件事”指的是什么，避免串话题。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "要聚焦的话题关键词，可为空。", "maxLength": 80},
+                "recent_count": {"type": "integer", "description": "返回最近多少条线索，1-12。", "minimum": 1, "maximum": 12},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        topic = str(kwargs.get("topic", "") or "").strip()
+        try:
+            recent_count = max(1, min(int(kwargs.get("recent_count", 6) or 6), 12))
+        except (TypeError, ValueError):
+            recent_count = 6
+        lines: list[str] = []
+        envelope = event.get_extra("astrmai_prompt_envelope", None) if hasattr(event, "get_extra") else None
+        for label, attr in (
+            ("当前焦点", "focus_message_text"),
+            ("直接上下文", "direct_context_text"),
+            ("相关上下文", "related_context_text"),
+            ("环境背景", "ambient_background_text"),
+        ):
+            text = str(getattr(envelope, attr, "") or "").strip()
+            if text:
+                lines.append(f"{label}: {_truncate_text(text, 240)}")
+        for key in ("astrmai_attention_window", "astrmai_recent_messages", "astrmai_window_lines"):
+            value = event.get_extra(key, None) if hasattr(event, "get_extra") else None
+            if isinstance(value, list):
+                for item in value[-recent_count:]:
+                    text = item if isinstance(item, str) else _message_text_preview(item, 160) if isinstance(item, dict) else str(item)
+                    if text and (not topic or topic.casefold() in text.casefold()):
+                        lines.append(f"近期线索: {_truncate_text(text, 180)}")
+        if not lines:
+            lines.append("话题线索查询结果：当前事件没有暴露可用的 focus/thread 上下文。")
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines[: recent_count + 4])
+
+
+@dataclass
+class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "bot_capability_lookup"
+    description: str = (
+        "只读查询本轮模型可用的工具能力、工具族和已过滤/已要求的工具。"
+        "用于模型不知道自己能不能查好友、发私聊、引用回复、发自定义表情时自检。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "needed_package": {
+                    "type": "string",
+                    "description": (
+                        "如果当前工具不够用，可以填写希望系统二次开放的工具包名称；"
+                        "可选：identity、relationship、artifact、memory_governance。"
+                    ),
+                }
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        turn_context = event.get_extra("astrmai_turn_context", None) if hasattr(event, "get_extra") else None
+        tools_state = getattr(turn_context, "tools", None)
+        available = list(getattr(tools_state, "available_tools", []) or [])
+        filtered = list(getattr(tools_state, "filtered_tools", []) or [])
+        required = list(getattr(tools_state, "required_tools", []) or [])
+        package = normalize_requested_packages([kwargs.get("needed_package", "")])
+        if package and hasattr(event, "set_extra"):
+            existing = list(event.get_extra("astrmai_requested_tool_packages", []) or [])
+            merged = []
+            for item in [*existing, *package]:
+                text = str(item or "").strip()
+                if text and text not in merged:
+                    merged.append(text)
+            event.set_extra("astrmai_requested_tool_packages", merged)
+        if not available:
+            available = sorted(TOOL_CAPABILITIES)
+        lines = [
+            f"本轮可用工具数量：{len(available)}。",
+            "可用工具：" + ", ".join(sorted(str(item) for item in available)[:40]),
+            "可请求二次开放的只读工具包：" + ", ".join(
+                name for name in ("identity", "relationship", "artifact", "memory_governance") if name in TOOL_PACKAGES
+            ),
+        ]
+        if package:
+            lines.append("已记录工具包二次开放请求：" + ", ".join(package))
+        if filtered:
+            lines.append("过滤后工具：" + ", ".join(sorted(str(item) for item in filtered)[:40]))
+        if required:
+            lines.append("显式要求工具：" + ", ".join(str(item) for item in required))
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class MemoryWriteCorrectionTool(FunctionTool[AstrAgentContext]):
+    name: str = "memory_write_correction_tool"
+    description: str = (
+        "记录一条用户纠错：哪条记忆/说法不对，正确事实是什么。"
+        "用于用户明确说“你记错了/不是这样/改成……”时。"
+    )
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "wrong_fact": {"type": "string", "description": "需要纠正的错误事实。", "maxLength": 300},
+                "correct_fact": {"type": "string", "description": "用户给出的正确事实。", "maxLength": 300},
+                "reason": {"type": "string", "description": "纠错原因，可为空。", "maxLength": 160},
+            },
+            "required": ["wrong_fact", "correct_fact"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        wrong_fact = str(kwargs.get("wrong_fact", "") or "").strip()
+        correct_fact = str(kwargs.get("correct_fact", "") or "").strip()
+        reason = str(kwargs.get("reason", "") or "").strip()
+        if not wrong_fact or not correct_fact:
+            _record_tool_execution(event, self.name, status="failed")
+            return "记忆纠错记录失败：wrong_fact 和 correct_fact 都不能为空。"
+        report = {
+            "wrong_fact": wrong_fact[:300],
+            "correct_fact": correct_fact[:300],
+            "reason": reason[:160],
+            "sender_id": str(event.get_sender_id() or ""),
+            "session_id": str(getattr(event, "unified_msg_origin", "") or ""),
+            "created_at": time.time(),
+        }
+        _append_report_extra(event, "astrmai_memory_correction_reports", report)
+        status = "success"
+        if self.memory_engine is not None and hasattr(self.memory_engine, "record_cognitive_feedback"):
+            try:
+                await self.memory_engine.record_cognitive_feedback(
+                    session_id=report["session_id"],
+                    source="memory_correction_tool",
+                    summary=f"用户纠正：{wrong_fact} -> {correct_fact}",
+                    guidance=f"以后优先采用正确事实：{correct_fact}。{reason}",
+                    tags=["memory_correction"],
+                    importance=0.72,
+                )
+            except Exception as exc:
+                status = "degraded"
+                logger.debug(f"[MemoryWriteCorrectionTool] feedback write degraded: {exc}")
+        _record_tool_execution(event, self.name, status=status)
+        return "已记录记忆纠错；后续回答应以用户给出的正确事实为准。"
+
+
+@dataclass
+class UnverifiedReportRecordTool(FunctionTool[AstrAgentContext]):
+    name: str = "unverified_report_record_tool"
+    description: str = (
+        "记录一条用户转述但尚未核实的报告。"
+        "例如“别的群有人卖妃爱娃娃”，应标记为未核实，不能当成事实。"
+    )
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "claim": {"type": "string", "description": "用户转述的未核实说法。", "maxLength": 400},
+                "source_hint": {"type": "string", "description": "来源线索，如群名/某人说/截图。", "maxLength": 160},
+            },
+            "required": ["claim"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        claim = str(kwargs.get("claim", "") or "").strip()
+        source_hint = str(kwargs.get("source_hint", "") or "").strip()
+        if not claim:
+            _record_tool_execution(event, self.name, status="failed")
+            return "未核实报告记录失败：claim 不能为空。"
+        report = {
+            "claim": claim[:400],
+            "source_hint": source_hint[:160],
+            "sender_id": str(event.get_sender_id() or ""),
+            "session_id": str(getattr(event, "unified_msg_origin", "") or ""),
+            "created_at": time.time(),
+        }
+        _append_report_extra(event, "astrmai_unverified_reports", report)
+        status = "success"
+        if self.memory_engine is not None and hasattr(self.memory_engine, "record_cognitive_feedback"):
+            try:
+                await self.memory_engine.record_cognitive_feedback(
+                    session_id=report["session_id"],
+                    source="unverified_report_tool",
+                    summary=f"未核实报告：{claim}",
+                    guidance="这是用户转述的未核实信息，回答时必须使用“不确定/需要确认”等措辞，不要断言为事实。",
+                    tags=["unverified_report"],
+                    importance=0.55,
+                )
+            except Exception as exc:
+                status = "degraded"
+                logger.debug(f"[UnverifiedReportRecordTool] feedback write degraded: {exc}")
+        _record_tool_execution(event, self.name, status=status)
+        return "已记录为未核实报告；之后回答时必须保持不确定措辞，不能当成已确认事实。"
+
+
+@dataclass
+class PersonaFactCheckTool(FunctionTool[AstrAgentContext]):
+    name: str = "persona_fact_check_tool"
+    description: str = (
+        "查询 AstrMai 自己的人格/自述/授权类事实，判断用户说法是否有内部依据。"
+        "适合确认“你有没有授权”“你是不是在某群”“你的人设里有没有这件事”。"
+    )
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    memory_tool_service: Optional[Any] = Field(default=None, exclude=True)
+    persona_id: str = Field(default="", exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "claim": {"type": "string", "description": "要核对的说法。", "minLength": 1, "maxLength": 260},
+            },
+            "required": ["claim"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        claim = str(kwargs.get("claim", "") or "").strip()
+        event = _get_current_event(context)
+        if not claim:
+            return "人格事实核对失败：claim 不能为空。"
+        tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
+        if tool_service is None or not hasattr(tool_service, "self_lore_query"):
+            _record_tool_execution(event, self.name, status="failed")
+            return "人格事实核对失败：自我设定查询服务不可用。"
+        try:
+            lore = await tool_service.self_lore_query(query=claim, persona_id=self.persona_id, event=event, top_k=4, allow_stale=True)
+            rendered = tool_service.render_result(lore)
+        except Exception as exc:
+            _record_tool_execution(event, self.name, status="failed")
+            return f"人格事实核对失败：{exc}"
+        _record_tool_execution(event, self.name)
+        if not rendered:
+            return "人格事实核对结果：内部人格/自述资料没有找到可确认依据。回答时应说未知或需要核实。"
+        return "人格事实核对结果：找到相关内部资料，但仍需按资料内容谨慎表达。\n" + str(rendered)
+
+
+@dataclass
+class GroupActivitySnapshotTool(FunctionTool[AstrAgentContext]):
+    name: str = "group_activity_snapshot_tool"
+    description: str = (
+        "只读获取当前群近期活跃快照：谁在说话、最近话题、消息数量。"
+        "用于群聊里判断是否该插话、谁刚刚参与了话题。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "群号；为空时使用当前群。", "maxLength": 32},
+                "count": {"type": "integer", "description": "读取最近多少条，1-50。", "minimum": 1, "maximum": 50},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        group_id = str(kwargs.get("group_id", "") or event.get_group_id() or "").strip()
+        if not group_id:
+            _record_tool_execution(event, self.name, status="failed")
+            return "群活跃快照失败：当前不是群聊，也没有提供 group_id。"
+        if api is None:
+            _record_tool_execution(event, self.name, status="failed")
+            return "群活跃快照失败：NapCat 群消息接口不可用。"
+        try:
+            count = max(1, min(int(kwargs.get("count", 20) or 20), 50))
+        except (TypeError, ValueError):
+            count = 20
+        try:
+            payload = await api.call_action("get_group_msg_history", group_id=_coerce_api_id(group_id), message_seq=0, count=count)
+        except Exception as exc:
+            _record_tool_execution(event, self.name, status="failed")
+            return f"群活跃快照失败：读取群 {group_id} 历史出错：{exc}"
+        messages = _history_messages(payload)
+        if not messages:
+            _record_tool_execution(event, self.name)
+            return f"群活跃快照：群 {group_id} 没有读取到近期消息。"
+        senders: dict[str, int] = {}
+        for msg in messages:
+            key = _message_sender_name(msg) or _message_sender_id(msg) or "unknown"
+            senders[key] = senders.get(key, 0) + 1
+        ranked = sorted(senders.items(), key=lambda item: item[1], reverse=True)[:6]
+        lines = [f"群活跃快照：群 {group_id} 最近 {len(messages)} 条消息。"]
+        lines.append("活跃成员：" + "，".join(f"{name}({num})" for name, num in ranked))
+        lines.append("最近消息：")
+        for idx, msg in enumerate(messages[-6:], start=1):
+            lines.append(_format_message_summary(msg, idx))
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
+class ContactRouteSuggestTool(FunctionTool[AstrAgentContext]):
+    name: str = "contact_route_suggest_tool"
+    description: str = (
+        "只读判断当前请求更适合在当前会话回复、私聊好友、群里 @ 人，还是不能执行。"
+        "跨会话发消息前可先调用，避免把人、群、发送位置搞错。"
+    )
+    db_service: Any = Field(default=None, exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "目标 QQ、好友备注、昵称或群友名称。", "maxLength": 80},
+                "intent": {"type": "string", "description": "想做的事，如传话/询问/提醒/回复当前群。", "maxLength": 120},
+            },
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        target = str(kwargs.get("target", "") or "").strip()
+        intent = str(kwargs.get("intent", "") or "").strip()
+        lines = [f"路由建议：intent={intent or '未说明'}。"]
+        if not target:
+            lines.append("没有目标人：建议直接在当前会话回复，不要跨会话发送。")
+            _record_tool_execution(event, self.name)
+            return "\n".join(lines)
+        resolved, reason = await _resolve_friend_target(event, context.context.context, self.db_service, target)
+        if resolved:
+            target_id, display = resolved
+            lines.append(f"目标是机器人好友：{display}({target_id})。")
+            lines.append("建议：如果用户明确让你传话或联系对方，可调用 space_transition_action；否则先在当前会话确认。")
+        else:
+            group_id = str(event.get_group_id() or "").strip()
+            if group_id:
+                lines.append(f"未确认为机器人好友：{reason}")
+                lines.append("建议：如果目标是当前群友，可用 construct_at_event 或当前群回复；不要声称能私聊对方。")
+            else:
+                lines.append(f"未确认为机器人好友：{reason}")
+                lines.append("建议：无法跨会话发送；请让用户提供准确 QQ 或确认对方是机器人好友。")
+        _record_tool_execution(event, self.name)
+        return "\n".join(lines)
+
+
+@dataclass
 class SpaceTransitionTool(FunctionTool[AstrAgentContext]):
     name: str = "space_transition_action"
     description: str = (
@@ -1170,20 +2721,39 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
 
 
 __all__ = [
+    "BotCapabilityLookupTool",
+    "ContactRouteSuggestTool",
+    "CrossChatMemoryQueryTool",
+    "CrossSessionReplyLookupTool",
     "CustomFaceCatalogQueryTool",
     "ConstructAtEventTool",
     "GroupSignTool",
     "MemeResonanceTool",
+    "MemoryWriteCorrectionTool",
     "MessageEmojiLikeTool",
     "MessageReactionTool",
     "OmniPerceptionTool",
+    "PersonaFactCheckTool",
     "ProactiveLikeTool",
     "ProactiveMemeTool",
     "ProactivePokeTool",
+    "QQCustomFaceSendTool",
+    "QQFriendLookupTool",
+    "QQForwardMessageLookupTool",
+    "QQGroupMemberLookupTool",
+    "QQGroupPresenceLookupTool",
+    "QQMessageArtifactLookupTool",
+    "QQMessageRecallLookupTool",
+    "QQRecentContactLookupTool",
+    "QQUserIdentityLookupTool",
     "prepare_explicit_tool_fallbacks",
+    "QuoteReplyActionTool",
     "RegretAndWithdrawTool",
     "SelfLoreQueryTool",
     "SpaceTransitionTool",
     "TopicHijackTool",
+    "TopicThreadLookupTool",
+    "UnverifiedReportRecordTool",
+    "VisionMessageAnalyzeTool",
     "WaitTool",
 ]

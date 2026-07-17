@@ -705,9 +705,10 @@ async def _run_host_post_send_case(
     effective_base_event = (
         state_mod.RelationshipEvent.NORMAL_CHAT if softened_support_event else resolved_text_event_type
     )
+    suppression_source_tag = host_tag or str(direct_tag or "")
     mood_tag_remap_suppressed = (
         effective_base_event == state_mod.RelationshipEvent.NORMAL_CHAT
-        and state_engine.relationship_engine.should_preserve_normal_chat_for_message(case["text"], host_tag)
+        and state_engine.relationship_engine.should_preserve_normal_chat_for_message(case["text"], suppression_source_tag)
     )
     effective_event_type = (
         effective_base_event
