@@ -7,6 +7,8 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ...multimodal.vision_prompt import normalize_vision_result, render_vision_record
+
 
 class PrivateTurnCoordinator:
     """Private-chat quiet-window plus direct-message pre-decision vision barrier."""
@@ -83,7 +85,7 @@ class PrivateTurnCoordinator:
         event.set_extra("extracted_image_refs", local_paths)
         event.set_extra("direct_vision_urls", local_paths)
         event.set_extra("direct_image_refs", local_paths)
-        descriptions: list[str] = []
+        records: list[dict[str, Any]] = []
         failed_count = len(resolution.failures)
         for image in resolution.images:
             result = None
@@ -103,16 +105,30 @@ class PrivateTurnCoordinator:
                         logger.warning(f"[AstrMai-Vision] vision barrier failed for {chat_id}: {exc}")
                     else:
                         await asyncio.sleep(min(0.5 * (attempt + 1), 1.0))
-            description = str((result or {}).get("description", "") or "").strip()
-            if description:
-                descriptions.append(description)
+            payload, _invalid_reason = normalize_vision_result(result or {})
+            description = str((payload or {}).get("description", "") or "").strip()
+            if payload is not None and description:
+                records.append(
+                    {
+                        "picid": picid,
+                        "source_ref": image.source_ref,
+                        "type": str(payload.get("type") or "image"),
+                        "description": description,
+                        "emotion_tags": list(payload.get("emotion_tags") or []),
+                    }
+                )
             else:
                 failed_count += 1
 
+        descriptions = [str(record.get("description", "") or "") for record in records]
+        event.set_extra("astrmai_vision_records", records)
+        event.set_extra("astrmai_visual_context", records)
+        event.set_extra("astrmai_image_context", records)
+        event.set_extra("astrmai_vision_picids", [record.get("picid") for record in records])
         event.set_extra("astrmai_vision_descriptions", descriptions)
         event.set_extra("astrmai_vision_barrier_complete", True)
         event.set_extra("astrmai_vision_barrier_failed", bool(failed_count))
-        self._append_vision_context(event, descriptions, failed_count)
+        self._append_vision_context(event, records, failed_count)
         await self._mark_vision_executed(event, chat_id)
 
     @staticmethod
@@ -143,16 +159,20 @@ class PrivateTurnCoordinator:
             logger.warning(f"[AstrMai-Vision] vision metadata update degraded for {chat_id}: {exc}")
 
     @staticmethod
-    def _append_vision_context(event: Any, descriptions: list[str], failed_count: int) -> None:
+    def _append_vision_context(event: Any, records: list[dict[str, Any]], failed_count: int) -> None:
         base_text = str(event.get_extra("astrmai_rich_text", getattr(event, "message_str", "")) or "").strip()
         lines = [base_text] if base_text else []
-        lines.extend(f"[图片转述：{description}]" for description in descriptions)
+        lines.extend(line for record in records if (line := render_vision_record(record)))
         if failed_count:
             lines.append(f"[有 {failed_count} 张图片读取失败；禁止猜测其内容。]")
         event.set_extra("astrmai_rich_text", "\n".join(lines).strip())
 
     @classmethod
     def _append_failure_context(cls, event: Any, failed_count: int) -> None:
+        event.set_extra("astrmai_vision_records", [])
+        event.set_extra("astrmai_visual_context", [])
+        event.set_extra("astrmai_image_context", [])
+        event.set_extra("astrmai_vision_picids", [])
         event.set_extra("astrmai_vision_descriptions", [])
         cls._append_vision_context(event, [], failed_count)
 

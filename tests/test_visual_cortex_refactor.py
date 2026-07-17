@@ -116,14 +116,15 @@ class VisualCortexRefactorTests(unittest.TestCase):
         )
 
         self.assertEqual(result["description"], "一张用于测试的普通图片")
+        self.assertEqual(result["emotion_tags"], [])
         combined_prompt = f'{captured["prompt"]}\n{captured["system_prompt"]}'
         for requirement in (
             "普通图片",
             "主体",
             "可见文字",
             "表情包",
-            "也必须先完整描述画面内容",
-            "情绪强度",
+            "聊天反应",
+            "必须返回空数组",
             "表达意图",
             "不得猜测",
             "只输出一个 JSON 对象",
@@ -132,6 +133,20 @@ class VisualCortexRefactorTests(unittest.TestCase):
         self.assertIn('"type"', captured["system_prompt"])
         self.assertIn('"description"', captured["system_prompt"])
         self.assertIn('"emotion_tags"', captured["system_prompt"])
+
+    def test_visual_normalizer_cleans_prefixes_and_keeps_emoji_tags(self):
+        payload, reason = self.visual_mod.normalize_vision_result(
+            {
+                "type": "emoji",
+                "description": "这是一个表情包，熊猫头低着头，文字为“我太难了”。通常用于自我调侃。",
+                "emotion_tags": ["无奈", "无奈", "疲惫", "自嘲", "抱怨", "多余"],
+            }
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(payload["type"], "emoji")
+        self.assertTrue(payload["description"].startswith("熊猫头"))
+        self.assertEqual(payload["emotion_tags"], ["无奈", "疲惫", "自嘲", "抱怨", "多余"])
 
     def test_worker_marks_queue_item_done_when_processing_raises(self):
         async def _run():

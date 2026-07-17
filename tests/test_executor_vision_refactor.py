@@ -157,6 +157,37 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         self.assertNotIn("42", model_prompt)
         self.assertEqual(event.get_extra("vision_direct_outcome"), "success")
 
+    def test_direct_vision_uses_shared_prompt_and_emoji_rendering(self):
+        executor, gateway = self._executor(
+            {"type": "emoji", "description": "熊猫头低着头，文字为“我太难了”。通常用于自我调侃。", "emotion_tags": ["无奈", "自嘲"]}
+        )
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        async def _run():
+            return await executor._inject_direct_vision_context(
+                event,
+                "default:GroupMessage:group-1",
+                "prompt",
+                "system",
+                self._vision_bundle(temp_image.name),
+            )
+
+        try:
+            model_prompt, _system_prompt = asyncio.run(_run())
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertIn("[表情包转述：熊猫头低着头", model_prompt)
+        self.assertIn("传达情绪：无奈、自嘲", model_prompt)
+        self.assertIn("分析当前图片", gateway.calls[0][1]["prompt"])
+        self.assertIn("聊天系统中的视觉转述模块", gateway.calls[0][1]["system_prompt"])
+        self.assertEqual(event.get_extra("vision_direct_outcome"), "success")
+
     def test_no_direct_vision_urls_marks_skip_reason(self):
         executor, _gateway = self._executor({"description": "unused", "emotion_tags": []})
         event = _FakeEvent()

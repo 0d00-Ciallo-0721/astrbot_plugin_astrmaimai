@@ -329,6 +329,26 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("猫猫在挥手", result)
         self.assertIn("emoji", result)
 
+    def test_04b_vision_message_analyze_uses_barrier_records(self):
+        event = _FakeEvent(group_id="777")
+        event.set_extra(
+            "astrmai_vision_records",
+            [
+                {
+                    "type": "emoji",
+                    "description": "熊猫头低着头，文字为“我太难了”。通常用于自我调侃。",
+                    "emotion_tags": ["无奈", "自嘲"],
+                    "picid": "pic-1",
+                }
+            ],
+        )
+
+        result = asyncio.run(self.mod.VisionMessageAnalyzeTool().call(_wrap_event(event)))
+
+        self.assertIn("熊猫头低着头", result)
+        self.assertIn("emoji", result)
+        self.assertIn("无奈", result)
+
     def test_05_cross_session_reply_lookup_reads_friend_history(self):
         event = _FakeEvent(group_id="777")
         event.bot.api = _MapApi(

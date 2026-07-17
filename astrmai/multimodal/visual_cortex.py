@@ -10,6 +10,7 @@ from ..infrastructure.runtime.lane_manager import LaneKey
 from ..shared.helpers.plugin_helpers import safe_create_task
 
 from .image_pipeline import ImagePipeline
+from .vision_prompt import VISION_SYSTEM_PROMPT, VISION_USER_PROMPT, normalize_vision_result
 
 
 class VisualCortex:
@@ -111,38 +112,13 @@ class VisualCortex:
 
         result_dict = await self.gateway.call_vision_task(
             image_data=image_path,
-            prompt=(
-                "请完整分析当前图片，先判断它是普通图片还是表情包，再按照系统要求提取画面信息。"
-                "描述必须以图片中真实可见的内容为依据，供后续对话模型准确理解用户发来的图片。"
-            ),
-            system_prompt=(
-                "你是负责为聊天系统转述图片的视觉分析助手。请仔细观察图片，并先将其分类为普通图片 "
-                "image 或表情包 emoji。\n"
-                "普通图片要求：用自然、完整的中文客观转述画面；说明主要主体及数量、外观特征、动作或互动、"
-                "场景环境、重要物体、位置关系、显著颜色和可能影响理解的细节。图片中存在标题、对话、标牌、"
-                "截图界面或其他可见文字时，应尽可能准确地提取并说明文字内容；无法确认的细节必须明确表示不确定。\n"
-                "表情包要求：description 也必须先完整描述画面内容，包括人物或角色、表情、姿态、动作、道具、"
-                "构图以及全部可见文字；然后结合这些视觉信息解释主要情绪、情绪强度、表达意图和语气，例如赞同、"
-                "拒绝、无奈、抱怨、调侃、讽刺、敷衍、安慰或庆祝，并说明它在聊天中通常想表达的意思。存在多种合理"
-                "解释时应保留不确定性，不要强行断言。\n"
-                "通用约束：不得猜测图片中不可见的身份、关系、事件前因后果或敏感属性；不要向用户提问，不要代替"
-                "聊天机器人回复，不要输出分析过程。emotion_tags 请给出 1 到 5 个简短中文标签，概括主要情绪和"
-                "交流语气。\n"
-                "只输出一个 JSON 对象，不要使用 Markdown 代码块，不要添加 JSON 以外的文字。JSON 键必须严格保持为："
-                '{"type": "image or emoji", "description": "完整中文转述", "emotion_tags": ["标签"]}'
-            ),
+            prompt=VISION_USER_PROMPT,
+            system_prompt=VISION_SYSTEM_PROMPT,
             lane_key=self._build_lane_key(scope_id),
         )
-        if not isinstance(result_dict, dict):
+        payload, _invalid_reason = normalize_vision_result(result_dict)
+        if payload is None:
             return None
-        description = str(result_dict.get("description", "") or "").strip()
-        if not description or description.lower() in {"none", "null"}:
-            return None
-        payload = {
-            "type": str(result_dict.get("type", "image") or "image"),
-            "description": description,
-            "emotion_tags": result_dict.get("emotion_tags", []) if isinstance(result_dict.get("emotion_tags", []), list) else [],
-        }
         if self.db_service is not None:
             await asyncio.to_thread(
                 self._upsert_visual_memory,

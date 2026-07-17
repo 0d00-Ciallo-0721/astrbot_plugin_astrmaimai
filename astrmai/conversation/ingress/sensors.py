@@ -20,9 +20,29 @@ class PreFilters:
         self.foreign_commands = set()
         self._commands_loaded = False 
         self._poke_playbook = PokePlaybook()
+        self._recent_counter_pokes: dict[str, float] = {}
 
     def refresh_config(self, config):
         self.config = config
+
+    def _record_counter_poke_echo(self, chat_id: str, bot_id: str, target_id: str) -> None:
+        now = time.time()
+        key = f"{chat_id}:{bot_id}:{target_id}"
+        self._recent_counter_pokes[key] = now
+        cutoff = now - 12.0
+        for stale_key, seen_at in list(self._recent_counter_pokes.items()):
+            if seen_at < cutoff:
+                self._recent_counter_pokes.pop(stale_key, None)
+
+    def _is_counter_poke_echo(self, chat_id: str, sender_id: str, target_id: str, bot_id: str) -> bool:
+        key = f"{chat_id}:{bot_id}:{target_id}"
+        seen_at = self._recent_counter_pokes.get(key)
+        if not seen_at:
+            return False
+        if time.time() - seen_at > 12.0:
+            self._recent_counter_pokes.pop(key, None)
+            return False
+        return sender_id == bot_id or not sender_id or sender_id == target_id
 
     async def load_foreign_commands(self):
         """公开接口：异步动态加载系统内所有注册指令（D59：替代 hasattr 私有方法访问）"""
@@ -391,17 +411,27 @@ class PreFilters:
                 
         if not bot_id: bot_id = "unknown"
 
-        sender_id = str(event.get_sender_id())
+        event_sender_id = str(event.get_sender_id())
+        sender_id = event_sender_id
         if sender_id == bot_id: return
 
         is_poke = False
         target_id = ""
         group_id = str(event.get_group_id() or "")
+        raw_sender_id = ""
+        actor_confident = False
         
         # 🟢 [深度修复 1] 递归查找 OneBot 底层 payload，突破封装层，解决 target_id 丢失
         def _find_poke_payload(obj, depth=0):
-            if depth > 3: return {}
-            if isinstance(obj, dict) and (obj.get("sub_type") == "poke" or obj.get("notice_type") == "notify"):
+            if depth > 8: return {}
+            if isinstance(obj, dict) and (
+                str(obj.get("sub_type", "")).lower() == "poke"
+                or str(obj.get("notice_type", "")).lower() == "poke"
+                or (
+                    str(obj.get("notice_type", "")).lower() == "notify"
+                    and str(obj.get("sub_type", "")).lower() in {"poke", "戳一戳"}
+                )
+            ):
                 return obj
             if hasattr(obj, "__dict__"):
                 for k, v in obj.__dict__.items():
@@ -411,15 +441,25 @@ class PreFilters:
                 for k, v in obj.items():
                     res = _find_poke_payload(v, depth+1)
                     if res: return res
+            elif isinstance(obj, (list, tuple)):
+                for v in obj:
+                    res = _find_poke_payload(v, depth+1)
+                    if res: return res
             return {}
 
         raw = _find_poke_payload(event)
 
         # 1. 优先通过原生 raw_event 判断
-        if raw and (raw.get("sub_type") == "poke" or raw.get("notice_type") == "notify"):
+        if raw and (
+            str(raw.get("sub_type", "")).lower() == "poke"
+            or str(raw.get("notice_type", "")).lower() in {"poke", "notify"}
+        ):
             if "target_id" in raw or "user_id" in raw:
                 is_poke = True
-                sender_id = str(raw.get("user_id", sender_id))
+                raw_sender_id = str(raw.get("user_id", "") or "")
+                if raw_sender_id and raw_sender_id.isdigit():
+                    sender_id = raw_sender_id
+                    actor_confident = True
                 target_id = str(raw.get("target_id", ""))
                 group_id = str(raw.get("group_id", group_id))
         
@@ -432,6 +472,7 @@ class PreFilters:
                     # 防止提取到 built-in id 函数
                     if not callable(extracted):
                         target_id = str(extracted) if extracted else ""
+                    actor_confident = bool(sender_id and sender_id.isdigit())
                     break
         
         if not is_poke: return
@@ -442,9 +483,12 @@ class PreFilters:
 
         if not target_id or target_id == "0": 
             target_id = bot_id 
+        if self._is_counter_poke_echo(chat_id=str(getattr(event, "unified_msg_origin", "") or group_id), sender_id=sender_id, target_id=target_id, bot_id=bot_id):
+            logger.debug("[AstrMai-Sensor] ignored recent counter-poke echo")
+            return
         
         # 🟢 [深度修复 2] 异步闭包：带【并发安全回写】的数据自愈逻辑
-        sender_name = event.get_sender_name()
+        sender_name = event.get_sender_name() if actor_confident and sender_id == event_sender_id else ""
         
         async def _resolve_name(uid, current_name):
             # 判断当前名是否已经足够真实
@@ -498,7 +542,7 @@ class PreFilters:
                         
             return final_name
 
-        sender_name = await _resolve_name(sender_id, sender_name)
+        sender_name = await _resolve_name(sender_id, sender_name) if actor_confident else "有人"
 
         bot_name = "我"
         if hasattr(self, 'config') and self.config and hasattr(self.config, 'system1'):
@@ -506,7 +550,11 @@ class PreFilters:
                 bot_name = self.config.system1.nicknames[0]
                 
         target_name = bot_name if target_id == bot_id else await _resolve_name(target_id, "")
-        actor_label = f"{sender_name}({sender_id})" if sender_id and sender_id not in str(sender_name) else sender_name
+        actor_label = (
+            f"{sender_name}({sender_id})"
+            if actor_confident and sender_id and sender_id not in str(sender_name)
+            else sender_name
+        )
         target_label = f"{target_name}({target_id})" if target_id and target_id not in str(target_name) else target_name
         occurred_at = time.time()
         relative_age_label = "刚刚"
@@ -514,16 +562,17 @@ class PreFilters:
         state_engine = getattr(attention_gate, "state_engine", None)
         relationship_engine = getattr(state_engine, "relationship_engine", None)
         social_score = 0.0
-        if relationship_engine and hasattr(relationship_engine, "get_social_score"):
+        if actor_confident and relationship_engine and hasattr(relationship_engine, "get_social_score"):
             try:
                 social_score = float(relationship_engine.get_social_score(sender_id) or 0.0)
             except Exception:
                 logger.debug("[AstrMai-Sensor] failed to read relationship score for poke", exc_info=True)
 
         chat_id = str(getattr(event, "unified_msg_origin", "") or group_id or target_id or sender_id)
+        play_sender_id = sender_id if actor_confident else "unknown"
         poke_play = self._poke_playbook.build(
             chat_id=chat_id,
-            sender_id=sender_id,
+            sender_id=play_sender_id,
             sender_name=sender_name,
             target_id=target_id,
             target_name=target_name,
@@ -533,7 +582,7 @@ class PreFilters:
             now=occurred_at,
         )
 
-        if target_id == bot_id and state_engine and hasattr(state_engine, "calculate_and_update_affection"):
+        if actor_confident and target_id == bot_id and state_engine and hasattr(state_engine, "calculate_and_update_affection"):
             try:
                 await state_engine.calculate_and_update_affection(
                     user_id=sender_id,
@@ -549,7 +598,7 @@ class PreFilters:
         virtual_text = poke_play.narrative
         logger.info(f"[AstrMai-Sensor] 👉 捕获互动事件: {virtual_text}")
         
-        if target_id == bot_id and poke_play.should_counter_poke:
+        if actor_confident and target_id == bot_id and poke_play.should_counter_poke:
             try:
                 client = getattr(event, 'bot', None)
                 if client and hasattr(client, 'api'):
@@ -557,6 +606,7 @@ class PreFilters:
                         await client.api.call_action('send_poke', user_id=int(sender_id), group_id=int(group_id))
                     else:
                         await client.api.call_action('send_poke', user_id=int(sender_id))
+                    self._record_counter_poke_echo(str(getattr(event, "unified_msg_origin", "") or group_id), bot_id, sender_id)
                     logger.info(f"[AstrMai-Sensor] 👈 已回戳反击用户: {sender_name}")
             except Exception as e:
                 logger.debug(f"[AstrMai-Sensor] 回戳操作发生异常: {e}")
@@ -567,9 +617,10 @@ class PreFilters:
         event.set_extra("astrmai_lightweight_event", True)
         event.set_extra("astrmai_rich_text", virtual_text)
         event.set_extra("astrmai_reply_mode", "playful_interaction")
-        event.set_extra("astrmai_interaction_actor_id", sender_id)
+        event.set_extra("astrmai_interaction_actor_id", sender_id if actor_confident else "")
         event.set_extra("astrmai_interaction_actor_name", sender_name)
         event.set_extra("astrmai_interaction_actor_display_name", actor_label)
+        event.set_extra("astrmai_interaction_actor_confident", actor_confident)
         event.set_extra("astrmai_interaction_target_id", target_id)
         event.set_extra("astrmai_interaction_target_name", target_name)
         event.set_extra("astrmai_interaction_target_display_name", target_label)

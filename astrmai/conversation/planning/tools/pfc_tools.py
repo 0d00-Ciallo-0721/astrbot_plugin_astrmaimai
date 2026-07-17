@@ -416,16 +416,28 @@ def _group_member_name(entry: dict[str, Any]) -> str:
 def _visual_records_from_event(event) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for key in (
+        "astrmai_vision_records",
+        "astrmai_vision_context",
         "astrmai_visual_context",
         "astrmai_visual_descriptions",
+        "astrmai_vision_descriptions",
         "astrmai_image_descriptions",
         "astrmai_image_context",
     ):
         value = event.get_extra(key, None) if hasattr(event, "get_extra") else None
-        items = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, dict):
+            items = [value]
+        elif isinstance(value, str) and value.strip():
+            items = [{"type": "image", "description": value.strip(), "emotion_tags": []}]
+        else:
+            items = []
         for item in items:
             if isinstance(item, dict):
                 records.append(item)
+            elif isinstance(item, str) and item.strip():
+                records.append({"type": "image", "description": item.strip(), "emotion_tags": []})
     return records
 
 

@@ -27,13 +27,14 @@ except ImportError:  # pragma: no cover
 
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
-from ...infrastructure.gateway.output_guard import (
-    looks_like_provider_failure_text,
-    normalize_guard_text,
-    sanitize_visible_reply_text,
-    validate_visible_output_text,
-)
+from ...infrastructure.gateway.output_guard import validate_visible_output_text
 from ...infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
+from ...multimodal.vision_prompt import (
+    VISION_SYSTEM_PROMPT,
+    VISION_USER_PROMPT,
+    normalize_vision_result,
+    render_vision_record,
+)
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
@@ -343,31 +344,10 @@ class ConcurrentExecutor:
         self,
         result_dict: Any,
     ) -> tuple[Optional[str], list[str], str]:
-        if not isinstance(result_dict, dict) or not result_dict:
-            return None, [], "empty_result"
-
-        raw_desc = result_dict.get("description", "")
-        sanitized_desc = sanitize_visible_reply_text(raw_desc, fallback_text="")
-        sanitized_desc = normalize_guard_text(sanitized_desc)
-        if not sanitized_desc:
-            return None, [], "empty_description"
-        if looks_like_provider_failure_text(raw_desc) or looks_like_provider_failure_text(sanitized_desc):
-            return None, [], "provider_failure_text"
-
-        raw_tags = result_dict.get("emotion_tags", [])
-        tags: list[str] = []
-        if isinstance(raw_tags, list):
-            for item in raw_tags:
-                cleaned = normalize_guard_text(item)
-                if not cleaned or looks_like_provider_failure_text(cleaned):
-                    continue
-                tags.append(cleaned)
-        elif isinstance(raw_tags, str):
-            cleaned = normalize_guard_text(raw_tags)
-            if cleaned and cleaned.lower() not in {"none", "null"} and not looks_like_provider_failure_text(cleaned):
-                tags.append(cleaned)
-
-        return sanitized_desc, tags, ""
+        payload, invalid_reason = normalize_vision_result(result_dict)
+        if payload is None:
+            return None, [], invalid_reason
+        return str(payload["description"]), list(payload["emotion_tags"]), ""
 
     def _classify_execution_failure_kind(self, error_message: Any) -> str:
         if hasattr(error_message, "last_failure_kind"):
@@ -636,23 +616,17 @@ class ConcurrentExecutor:
                 if temp_file_path and os.path.exists(temp_file_path):
                     result_dict = await self.gateway.call_vision_task(
                         image_data=temp_file_path,
-                        prompt="Analyze this image in detail.",
-                        system_prompt=(
-                            'You are an image analysis assistant. Return only JSON with keys '
-                            '"type", "description", and "emotion_tags".'
-                        ),
+                        prompt=VISION_USER_PROMPT,
+                        system_prompt=VISION_SYSTEM_PROMPT,
                         lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=chat_id),
                         base_origin=chat_id,
                     )
-                    desc, tags, invalid_reason = self._normalize_vision_result(result_dict)
-                    if not desc:
+                    payload, invalid_reason = normalize_vision_result(result_dict)
+                    if payload is None:
                         saw_invalid_output = True
                         logger.warning(f"[{chat_id}] vision side-path invalid output: {invalid_reason}")
                         continue
-                    tags_str = ", ".join(tags)
-                    vision_line = f"我刚看到一张图片，画面是：{desc}。"
-                    if tags_str and tags_str.lower() not in {"", "none", "null"}:
-                        vision_line += f" 它给我的感觉是：{tags_str}。"
+                    vision_line = render_vision_record(payload)
                     vision_descriptions.append(vision_line)
             except Exception as exc:
                 saw_exception = True
