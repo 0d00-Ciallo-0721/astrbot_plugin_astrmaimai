@@ -506,6 +506,8 @@ class AstrMaiAdminPageApi:
             status=str(query.get("status", "") or ""),
             group_id=str(query.get("group_id", "") or ""),
             query=str(query.get("query", "") or ""),
+            limit=self._int(query.get("limit"), 200),
+            offset=self._int(query.get("offset"), 0),
         )
 
     async def create_jargon(self, request: Any) -> dict[str, Any]:

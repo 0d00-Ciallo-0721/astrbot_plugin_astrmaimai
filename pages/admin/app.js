@@ -29,8 +29,8 @@ const state = {
   bridge: null,
   current: normalizeTabId(location.hash.replace("#", "") || "dashboard"),
   dashboardTab: "overview",
-  reviewTab: "pending",
-  memoryTab: "events",
+  reviewTab: "jargon_pending",
+  memoryTab: "canonical",
   observabilityOverview: null,
   observabilityTimeline: [],
   observabilityFilters: {
@@ -54,8 +54,22 @@ const state = {
   usersScrollTop: 0,
   dashboardCache: {},
   cache: {
-    reviews: { pending: [], all: { items: [], total: 0, page: 1, page_size: 20 }, filters: { status: "", group_id: "", keyword: "" } },
-    memories: { month: new Date().toISOString().slice(0, 7), events: [], reflections: [], nodes: [], jargon: [] },
+    reviews: {
+      expressionPending: [],
+      expressionAll: { items: [], total: 0, page: 1, page_size: 20 },
+      jargonPending: { items: [], total: 0, limit: 200, offset: 0 },
+      jargonAll: { items: [], total: 0, limit: 200, offset: 0 },
+      filters: { status: "", group_id: "", keyword: "" },
+    },
+    memories: {
+      month: new Date().toISOString().slice(0, 7),
+      canonical: { items: [], total: 0, limit: 100, offset: 0 },
+      canonicalKind: "",
+      events: [],
+      reflections: [],
+      nodes: [],
+      jargon: { items: [], total: 0, limit: 200, offset: 0 },
+    },
     users: [],
     personaSlices: {},
     personaSlicesError: null,
@@ -1142,43 +1156,87 @@ function bindLearningActions() {
 
 async function loadReviews() {
   showLoading("正在读取表达审核...");
-  const reviewState = state.cache.reviews.all;
-  const [pending, all] = await Promise.all([
+  const expressionState = state.cache.reviews.expressionAll;
+  const [expressionPending, expressionAll, jargonPending, jargonAll] = await Promise.all([
     safeFetch(() => api.get("/reviews/pending"), { items: [] }),
-    safeFetch(() => api.get(`/reviews?page=${reviewState.page}&page_size=${reviewState.page_size}`), reviewState),
+    safeFetch(() => api.get(`/reviews?page=${expressionState.page}&page_size=${expressionState.page_size}`), expressionState),
+    safeFetch(() => api.get("/memories/jargon?status=review_pending&limit=200"), { items: [], total: 0 }),
+    safeFetch(() => api.get("/memories/jargon?limit=200"), { items: [], total: 0 }),
   ]);
-  const pendingItems = asItems(pending);
-  const allItems = asItems(all);
-  state.cache.reviews.pending = pendingItems;
-  state.cache.reviews.all = {
-    items: allItems,
-    total: Number(all.total ?? allItems.length),
-    page: Number(all.page ?? reviewState.page),
-    page_size: Number(all.page_size ?? reviewState.page_size),
+  const expressionPendingItems = asItems(expressionPending);
+  const expressionAllItems = asItems(expressionAll);
+  const jargonPendingItems = asItems(jargonPending);
+  const jargonAllItems = asItems(jargonAll);
+  state.cache.reviews.expressionPending = expressionPendingItems;
+  state.cache.reviews.expressionAll = {
+    items: expressionAllItems,
+    total: Number(expressionAll.total ?? expressionAllItems.length),
+    page: Number(expressionAll.page ?? expressionState.page),
+    page_size: Number(expressionAll.page_size ?? expressionState.page_size),
   };
-  const rows = (state.reviewTab === "pending" ? pendingItems : allItems).map((item) => `
-    <tr>
-      <td>${escapeHtml(item.id || item.review_id || "-")}</td>
-      <td>${escapeHtml(item.expression || item.text || item.pattern || item.content || "-")}</td>
-      <td>${escapeHtml(item.status || "pending")}</td>
-      <td>${escapeHtml(item.weight ?? "-")}</td>
-      <td class="row-actions">
-        <button class="primary-button" data-approve-review="${attr(item.id || item.review_id || "")}" type="button">批准</button>
-        <button class="danger-button" data-reject-review="${attr(item.id || item.review_id || "")}" type="button">驳回</button>
-      </td>
-    </tr>
-  `);
+  state.cache.reviews.jargonPending = {
+    items: jargonPendingItems,
+    total: Number(jargonPending.total ?? jargonPendingItems.length),
+    limit: Number(jargonPending.limit ?? 200),
+    offset: Number(jargonPending.offset ?? 0),
+  };
+  state.cache.reviews.jargonAll = {
+    items: jargonAllItems,
+    total: Number(jargonAll.total ?? jargonAllItems.length),
+    limit: Number(jargonAll.limit ?? 200),
+    offset: Number(jargonAll.offset ?? 0),
+  };
+  const reviewMode = state.reviewTab.startsWith("jargon") ? "jargon" : "expression";
+  const activeItems = {
+    expression_pending: expressionPendingItems,
+    expression_all: expressionAllItems,
+    jargon_pending: jargonPendingItems,
+    jargon_all: jargonAllItems,
+  }[state.reviewTab] || [];
+  const rows = activeItems.map((item) => {
+    const id = item.id || item.review_id || "";
+    const contentText = reviewMode === "jargon"
+      ? `${item.content || "-"}${item.meaning ? `\n含义：${item.meaning}` : ""}${item.scene ? `\n场景：${item.scene}` : ""}`
+      : (item.expression || item.text || item.pattern || item.content || "-");
+    return `
+      <tr>
+        <td>${escapeHtml(id || "-")}</td>
+        <td><pre>${escapeHtml(contentText)}</pre></td>
+        <td>${statusChip(item.review_status || item.status || "pending", item.status === "rejected" ? "danger" : "")}</td>
+        <td>${escapeHtml(item.weight ?? item.confidence ?? "-")}</td>
+        <td class="row-actions">
+          <button class="primary-button" data-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">批准</button>
+          <button class="danger-button" data-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">驳回</button>
+        </td>
+      </tr>
+    `;
+  });
+  const totals = `
+    <div class="grid">
+      ${metric("表达待审核", expressionPendingItems.length)}
+      ${metric("表达语料", state.cache.reviews.expressionAll.total)}
+      ${metric("黑话待审核", state.cache.reviews.jargonPending.total)}
+      ${metric("黑话词库", state.cache.reviews.jargonAll.total)}
+    </div>
+  `;
+  const title = state.reviewTab.startsWith("jargon") ? "黑话审核" : "表达习惯审核";
+  const emptyText = state.reviewTab.startsWith("jargon")
+    ? "当前黑话分类暂无数据。若 Dashboard 显示黑话待审核，请确认正在查看“黑话待审”。"
+    : "当前表达习惯暂无数据。黑话审核在同页的“黑话待审/黑话全量”中查看。";
   content().innerHTML = `
-    ${pageHeader("表达语料审核 Reviews", "管理 AI 提取的话术习惯，决定是否加入核心表达网络。")}
+    ${pageHeader("表达与黑话审核 Reviews", "表达习惯和黑话是两条学习通道；Dashboard 的黑话待审核会在本页的黑话队列中展示。")}
+    ${totals}
     ${subTabs(state.reviewTab, [
-      { id: "pending", label: "待审队列" },
-      { id: "all", label: "全量库查阅" },
+      { id: "jargon_pending", label: "黑话待审" },
+      { id: "jargon_all", label: "黑话全量" },
+      { id: "expression_pending", label: "表达待审" },
+      { id: "expression_all", label: "表达全量" },
     ], "review-tab")}
-    ${section(state.reviewTab === "pending" ? "待审队列" : "全量库查阅", "批准、驳回或查看表达语料。", `${table(["ID", "内容", "状态", "权重", "操作"], rows)}${state.reviewTab === "all" ? `
+    ${section(title, "批准、驳回或查看 AI 提取的表达/黑话候选。", `${table(["ID", "内容", "状态", "权重/置信度", "操作"], rows, emptyText)}${state.reviewTab === "expression_all" ? `
       <div class="row-actions">
-        <button class="ghost-button" data-review-page="${state.cache.reviews.all.page - 1}" type="button" ${state.cache.reviews.all.page <= 1 ? "disabled" : ""}>上一页</button>
-        <span>第 ${state.cache.reviews.all.page} / ${Math.max(1, Math.ceil(state.cache.reviews.all.total / state.cache.reviews.all.page_size))} 页，共 ${state.cache.reviews.all.total} 条</span>
-        <button class="ghost-button" data-review-page="${state.cache.reviews.all.page + 1}" type="button" ${state.cache.reviews.all.page * state.cache.reviews.all.page_size >= state.cache.reviews.all.total ? "disabled" : ""}>下一页</button>
+        <button class="ghost-button" data-review-page="${state.cache.reviews.expressionAll.page - 1}" type="button" ${state.cache.reviews.expressionAll.page <= 1 ? "disabled" : ""}>上一页</button>
+        <span>第 ${state.cache.reviews.expressionAll.page} / ${Math.max(1, Math.ceil(state.cache.reviews.expressionAll.total / state.cache.reviews.expressionAll.page_size))} 页，共 ${state.cache.reviews.expressionAll.total} 条</span>
+        <button class="ghost-button" data-review-page="${state.cache.reviews.expressionAll.page + 1}" type="button" ${state.cache.reviews.expressionAll.page * state.cache.reviews.expressionAll.page_size >= state.cache.reviews.expressionAll.total ? "disabled" : ""}>下一页</button>
       </div>` : ""}`)}
   `;
   $$('[data-review-tab]').forEach((button) => button.addEventListener("click", () => {
@@ -1186,7 +1244,7 @@ async function loadReviews() {
     loadReviews();
   }));
   $$('[data-review-page]').forEach((button) => button.addEventListener("click", () => {
-    state.cache.reviews.all.page = Math.max(1, Number(button.dataset.reviewPage || 1));
+    state.cache.reviews.expressionAll.page = Math.max(1, Number(button.dataset.reviewPage || 1));
     loadReviews();
   }));
   bindReviewActions();
@@ -1195,13 +1253,21 @@ async function loadReviews() {
 function bindReviewActions() {
   $$('[data-approve-review]').forEach((button) => button.addEventListener("click", async () => {
     if (!button.dataset.approveReview) return;
-    await api.post(`/reviews/${segment(button.dataset.approveReview)}/submit`, { action: "approve" });
+    if (button.dataset.reviewKind === "jargon") {
+      await api.post(`/memories/jargon/${segment(button.dataset.approveReview)}/approve`);
+    } else {
+      await api.post(`/reviews/${segment(button.dataset.approveReview)}/submit`, { action: "approve" });
+    }
     toast("已批准");
     loadReviews();
   }));
   $$('[data-reject-review]').forEach((button) => button.addEventListener("click", async () => {
     if (!button.dataset.rejectReview) return;
-    await api.post(`/reviews/${segment(button.dataset.rejectReview)}/submit`, { action: "reject" });
+    if (button.dataset.reviewKind === "jargon") {
+      await api.post(`/memories/jargon/${segment(button.dataset.rejectReview)}/reject`);
+    } else {
+      await api.post(`/reviews/${segment(button.dataset.rejectReview)}/submit`, { action: "reject" });
+    }
     toast("已驳回");
     loadReviews();
   }));
@@ -1209,46 +1275,109 @@ function bindReviewActions() {
 
 async function loadMemories() {
   showLoading("正在读取记忆网络...");
-  const [events, reflections, nodes, jargon] = await Promise.all([
+  const memoryState = state.cache.memories.canonical;
+  const kindParam = state.cache.memories.canonicalKind ? `&kind=${segment(state.cache.memories.canonicalKind)}` : "";
+  const [canonical, events, reflections, nodes, jargon] = await Promise.all([
+    safeFetch(() => api.get(`/memories/canonical?limit=${memoryState.limit}&offset=${memoryState.offset}${kindParam}`), memoryState),
     safeFetch(() => api.get("/memories/events"), { items: [] }),
     safeFetch(() => api.get(`/memories/reflections?month=${segment(state.cache.memories.month)}`), { items: [] }),
     safeFetch(() => api.get("/memories/nodes"), { items: [] }),
-    safeFetch(() => api.get("/memories/jargon"), { items: [] }),
+    safeFetch(() => api.get("/memories/jargon?limit=200"), { items: [], total: 0 }),
   ]);
+  state.cache.memories.canonical = {
+    items: asItems(canonical),
+    total: Number(canonical.total ?? asItems(canonical).length),
+    limit: Number(canonical.limit ?? memoryState.limit),
+    offset: Number(canonical.offset ?? memoryState.offset),
+  };
   state.cache.memories.events = asItems(events);
   state.cache.memories.reflections = asItems(reflections);
   state.cache.memories.nodes = asItems(nodes);
-  state.cache.memories.jargon = asItems(jargon);
+  state.cache.memories.jargon = {
+    items: asItems(jargon),
+    total: Number(jargon.total ?? asItems(jargon).length),
+    limit: Number(jargon.limit ?? 200),
+    offset: Number(jargon.offset ?? 0),
+  };
   const tabItems = {
+    canonical: state.cache.memories.canonical.items,
     events: state.cache.memories.events,
     reflections: state.cache.memories.reflections,
     nodes: state.cache.memories.nodes,
-    jargon: state.cache.memories.jargon,
+    jargon: state.cache.memories.jargon.items,
   }[state.memoryTab] || [];
-  const rows = tabItems.map((item) => `
-    <tr>
-      <td>${escapeHtml(item.id || item.date || item.term || "-")}</td>
-      <td><pre>${json(item)}</pre></td>
-      <td class="row-actions"><button class="danger-button" data-memory-delete="${attr(item.id || item.date || "")}" type="button">删除</button></td>
-    </tr>
-  `);
+  const rows = tabItems.map((item) => {
+    const id = item.id || item.date || item.term || "-";
+    const contentText = item.content || item.summary || item.narrative || item.reflection || item.meaning || "-";
+    return `
+      <tr>
+        <td>${escapeHtml(id)}</td>
+        <td>${escapeHtml(item.kind || item.status || item.date || "-")}</td>
+        <td><pre>${escapeHtml(contentText)}</pre></td>
+        <td>${escapeHtml(item.session_id || item.group_id || "-")}</td>
+        <td>${escapeHtml(item.confidence ?? item.importance ?? "-")}</td>
+        <td class="row-actions"><button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button></td>
+      </tr>
+    `;
+  });
+  const kindOptions = [
+    ["", "全部类型"],
+    ["fact", "事实"],
+    ["topic", "话题"],
+    ["feedback", "反馈"],
+    ["memory", "普通记忆"],
+    ["jargon", "黑话"],
+    ["persona_lore", "角色原典"],
+  ].map(([value, label]) => `<option value="${attr(value)}" ${state.cache.memories.canonicalKind === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
+  const canonicalPager = state.memoryTab === "canonical" ? `
+    <div class="row-actions">
+      <label class="inline-label">类型 <select data-memory-kind>${kindOptions}</select></label>
+      <button class="ghost-button" data-memory-page="${state.cache.memories.canonical.offset - state.cache.memories.canonical.limit}" type="button" ${state.cache.memories.canonical.offset <= 0 ? "disabled" : ""}>上一页</button>
+      <span>第 ${Math.floor(state.cache.memories.canonical.offset / state.cache.memories.canonical.limit) + 1} / ${Math.max(1, Math.ceil(state.cache.memories.canonical.total / state.cache.memories.canonical.limit))} 页，共 ${state.cache.memories.canonical.total} 条</span>
+      <button class="ghost-button" data-memory-page="${state.cache.memories.canonical.offset + state.cache.memories.canonical.limit}" type="button" ${state.cache.memories.canonical.offset + state.cache.memories.canonical.limit >= state.cache.memories.canonical.total ? "disabled" : ""}>下一页</button>
+    </div>
+  ` : "";
+  const totals = `
+    <div class="grid">
+      ${metric("Canonical v2", state.cache.memories.canonical.total)}
+      ${metric("黑话", state.cache.memories.jargon.total)}
+      ${metric("旧事件", state.cache.memories.events.length)}
+      ${metric("旧实体", state.cache.memories.nodes.length)}
+    </div>
+  `;
+  const emptyText = state.memoryTab === "canonical"
+    ? "Canonical v2 当前筛选无数据。可切换类型为“全部类型”查看完整长期记忆。"
+    : "当前旧分类暂无数据；长期记忆主体请查看“Canonical 总览”。";
   content().innerHTML = `
-    ${pageHeader("四维记忆网络 Memories", "管理 AI 的记忆碎片、反思日志、实体图谱与黑话字典。")}
+    ${pageHeader("记忆网络 Memories", "以 Canonical v2 长期记忆为主视图；旧事件、反思和实体图谱保留为辅助诊断。")}
+    ${totals}
     ${subTabs(state.memoryTab, [
-      { id: "events", label: "记忆碎片 Events" },
-      { id: "reflections", label: "每日反思 Reflections" },
-      { id: "nodes", label: "实体图谱 Nodes" },
-      { id: "jargon", label: "黑话字典 Jargon" },
+      { id: "canonical", label: "Canonical 总览" },
+      { id: "jargon", label: "黑话字典" },
+      { id: "events", label: "旧事件" },
+      { id: "reflections", label: "每日反思" },
+      { id: "nodes", label: "旧实体图谱" },
     ], "memory-tab")}
-    ${section("记忆数据", "当前子页签数据。", table(["ID", "详情", "操作"], rows))}
+    ${section("记忆数据", state.memoryTab === "canonical" ? "当前展示 canonical_memories v2 数据。" : "当前展示旧版或专题数据。", `${canonicalPager}${table(["ID", "类型/状态", "内容", "会话", "权重", "操作"], rows, emptyText)}`)}
   `;
   $$('[data-memory-tab]').forEach((button) => button.addEventListener("click", () => {
     state.memoryTab = button.dataset.memoryTab;
+    if (state.memoryTab === "canonical") state.cache.memories.canonical.offset = 0;
+    loadMemories();
+  }));
+  $('[data-memory-kind]')?.addEventListener("change", (event) => {
+    state.cache.memories.canonicalKind = event.target.value;
+    state.cache.memories.canonical.offset = 0;
+    loadMemories();
+  });
+  $$('[data-memory-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.memories.canonical.offset = Math.max(0, Number(button.dataset.memoryPage || 0));
     loadMemories();
   }));
   $$('[data-memory-delete]').forEach((button) => button.addEventListener("click", async () => {
     const id = button.dataset.memoryDelete;
     if (!id || !await confirmAction("删除这条记忆记录？", "danger")) return;
+    if (state.memoryTab === "canonical") await api.post(`/memories/canonical/${segment(id)}/delete`);
     if (state.memoryTab === "events") await api.post(`/memories/events/${segment(id)}/delete`);
     if (state.memoryTab === "reflections") await api.post(`/memories/reflections/${segment(id)}/delete`);
     if (state.memoryTab === "nodes") await api.post(`/memories/nodes/${segment(id)}/delete`);

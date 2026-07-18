@@ -194,6 +194,18 @@ class WebUiGapCoverageTests(unittest.TestCase):
         self.assertEqual(result["id"], "mem-event-1")
         self.assertEqual(writes[0].importance, 0.0)
 
+    def test_admin_page_defaults_to_v2_memory_and_jargon_review_views(self):
+        from pathlib import Path
+
+        app_js = Path(__file__).resolve().parents[3] / "pages" / "admin" / "app.js"
+        source = app_js.read_text(encoding="utf-8")
+
+        self.assertIn('reviewTab: "jargon_pending"', source)
+        self.assertIn('memoryTab: "canonical"', source)
+        self.assertIn('api.get("/memories/jargon?status=review_pending&limit=200")', source)
+        self.assertIn('api.get(`/memories/canonical?limit=${memoryState.limit}&offset=${memoryState.offset}${kindParam}`)', source)
+        self.assertIn('{ id: "canonical", label: "Canonical 总览" }', source)
+
 
 if __name__ == "__main__":
     unittest.main()

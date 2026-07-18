@@ -492,13 +492,42 @@ class MemoryUiService:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
-    async def list_jargon(self, *, status: str = "", group_id: str = "", query: str = ""):
+    async def list_jargon(
+        self,
+        *,
+        status: str = "",
+        group_id: str = "",
+        query: str = "",
+        limit: int = 200,
+        offset: int = 0,
+    ):
+        try:
+            page_limit = max(1, min(int(limit or 200), 500))
+        except (TypeError, ValueError):
+            page_limit = 200
+        try:
+            page_offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            page_offset = 0
         engine = self._memory_engine()
         store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "list_canonical"):
-            result = await store.list_canonical(kind="jargon", status=status, session_id=group_id, limit=200)
+            result = await store.list_canonical(
+                kind="jargon",
+                status=status,
+                session_id=group_id,
+                limit=page_limit,
+                offset=page_offset,
+            )
             items = [self._canonical_jargon_view(item) for item in result.get("items", [])]
-            return self._filter_jargon_rows(items, query=query)
+            filtered = self._filter_jargon_rows(items, query=query)
+            return {
+                "items": filtered,
+                "total": int(result.get("total", len(filtered)) or 0),
+                "limit": page_limit,
+                "offset": page_offset,
+                "runtime_bound": True,
+            }
         async with self.db_factory() as db:
             try:
                 where = ["kind = 'jargon'"]
@@ -510,13 +539,25 @@ class MemoryUiService:
                     where.append("session_id = ?")
                     params.append(group_id)
                 async with db.execute(
-                    f"SELECT * FROM canonical_memories WHERE {' AND '.join(where)} ORDER BY update_time DESC LIMIT 200",
+                    f"SELECT COUNT(*) FROM canonical_memories WHERE {' AND '.join(where)}",
                     tuple(params),
+                ) as cursor:
+                    total_row = await cursor.fetchone()
+                async with db.execute(
+                    f"SELECT * FROM canonical_memories WHERE {' AND '.join(where)} ORDER BY update_time DESC LIMIT ? OFFSET ?",
+                    (*params, page_limit, page_offset),
                 ) as cursor:
                     rows = await cursor.fetchall()
                 if rows:
                     items = [self._canonical_jargon_view(self._canonical_row(row)) for row in rows]
-                    return self._filter_jargon_rows(items, query=query)
+                    filtered = self._filter_jargon_rows(items, query=query)
+                    return {
+                        "items": filtered,
+                        "total": int(total_row[0] if total_row else len(filtered)),
+                        "limit": page_limit,
+                        "offset": page_offset,
+                        "runtime_bound": False,
+                    }
             except Exception:
                 pass
             legacy_sql = "SELECT * FROM Jargon"
@@ -524,11 +565,21 @@ class MemoryUiService:
             if group_id:
                 legacy_sql += " WHERE group_id = ?"
                 legacy_params.append(group_id)
-            legacy_sql += " ORDER BY id DESC"
-            async with db.execute(legacy_sql, tuple(legacy_params)) as cursor:
+            count_sql = legacy_sql.replace("SELECT *", "SELECT COUNT(*)", 1)
+            legacy_sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+            async with db.execute(count_sql, tuple(legacy_params)) as cursor:
+                total_row = await cursor.fetchone()
+            async with db.execute(legacy_sql, (*legacy_params, page_limit, page_offset)) as cursor:
                 rows = await cursor.fetchall()
             items = [dict(row) | {"legacy": True, "review_status": "legacy_readonly", "status": "legacy"} for row in rows]
-            return self._filter_jargon_rows(items, query=query)
+            filtered = self._filter_jargon_rows(items, query=query)
+            return {
+                "items": filtered,
+                "total": int(total_row[0] if total_row else len(filtered)),
+                "limit": page_limit,
+                "offset": page_offset,
+                "runtime_bound": False,
+            }
 
     @staticmethod
     def _filter_jargon_rows(items: list[dict], *, query: str = "") -> list[dict]:
