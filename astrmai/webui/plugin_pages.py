@@ -386,6 +386,10 @@ class AstrMaiAdminPageApi:
             body.get("replacement"),
             body.get("weight"),
             body.get("reason"),
+            situation=body.get("situation"),
+            style=body.get("style"),
+            shared_scope=body.get("shared_scope"),
+            review_suggestion=body.get("review_suggestion"),
         )
 
     async def batch_review(self, request: Any) -> dict[str, Any]:
@@ -520,10 +524,10 @@ class AstrMaiAdminPageApi:
         return await self._memory().delete_jargon(str(self._path(request).get("id", "")))
 
     async def approve_jargon(self, request: Any) -> dict[str, Any]:
-        return await self._memory().approve_jargon(str(self._path(request).get("id", "")))
+        return await self._memory().approve_jargon(str(self._path(request).get("id", "")), await self._body(request))
 
     async def reject_jargon(self, request: Any) -> dict[str, Any]:
-        return await self._memory().reject_jargon(str(self._path(request).get("id", "")))
+        return await self._memory().reject_jargon(str(self._path(request).get("id", "")), await self._body(request))
 
     async def users(self, request: Any) -> Any:
         return await self._users().list_users()
@@ -674,6 +678,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/reviews/{id}/submit", api.submit_review, "AstrMai submit review"),
         ("POST", "/reviews/batch", api.batch_review, "AstrMai batch review"),
         ("POST", "/reviews", api.create_review, "AstrMai create review"),
+        ("POST", "/reviews/{id}", api.update_review, "AstrMai update review"),
         ("PUT", "/reviews/{id}", api.update_review, "AstrMai update review"),
         ("POST", "/reviews/{id}/delete", api.delete_review, "AstrMai delete review"),
         ("DELETE", "/reviews/{id}", api.delete_review, "AstrMai delete review"),
@@ -695,6 +700,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/memories/jargon", api.create_jargon, "AstrMai create jargon"),
         ("POST", "/memories/jargon/{id}/approve", api.approve_jargon, "AstrMai approve jargon"),
         ("POST", "/memories/jargon/{id}/reject", api.reject_jargon, "AstrMai reject jargon"),
+        ("POST", "/memories/jargon/{id}", api.update_jargon, "AstrMai update jargon"),
         ("PUT", "/memories/jargon/{id}", api.update_jargon, "AstrMai update jargon"),
         ("POST", "/memories/jargon/{id}/delete", api.delete_jargon, "AstrMai delete jargon"),
         ("DELETE", "/memories/jargon/{id}", api.delete_jargon, "AstrMai delete jargon"),

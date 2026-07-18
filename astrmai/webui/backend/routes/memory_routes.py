@@ -202,12 +202,16 @@ async def create_jargon(data: Dict[str, Any], user: str = Depends(get_current_us
     return await _service().create_jargon(data)
 
 @router.post("/jargon/{id}/approve")
-async def approve_jargon(id: str, user: str = Depends(get_current_user)):
-    return await _service().approve_jargon(id)
+async def approve_jargon(id: str, data: Dict[str, Any] | None = None, user: str = Depends(get_current_user)):
+    return await _service().approve_jargon(id, data or {})
 
 @router.post("/jargon/{id}/reject")
-async def reject_jargon(id: str, user: str = Depends(get_current_user)):
-    return await _service().reject_jargon(id)
+async def reject_jargon(id: str, data: Dict[str, Any] | None = None, user: str = Depends(get_current_user)):
+    return await _service().reject_jargon(id, data or {})
+
+@router.post("/jargon/{id}")
+async def update_jargon_post(id: str, data: Dict[str, Any], user: str = Depends(get_current_user)):
+    return await _service().update_jargon(id, data)
 
 @router.put("/jargon/{id}")
 async def update_jargon(id: str, data: Dict[str, Any], user: str = Depends(get_current_user)):

@@ -477,6 +477,120 @@ function openJsonModal(title, value, onSubmit) {
   });
 }
 
+function splitLines(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function joinLines(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean).join("\n");
+  return String(value || "");
+}
+
+function findReviewItem(kind, id) {
+  const groups = kind === "jargon"
+    ? [state.cache.reviews.jargonPending.items, state.cache.reviews.jargonAll.items, state.cache.memories.jargon.items]
+    : [state.cache.reviews.expressionPending, state.cache.reviews.expressionAll.items];
+  return groups.flat().find((item) => String(item.id || item.review_id || "") === String(id)) || null;
+}
+
+function findMemoryItem(tab, id) {
+  const source = state.cache.memories[tab];
+  const items = Array.isArray(source) ? source : (source?.items || []);
+  return items.find((item) => String(item.id || item.date || item.term || "") === String(id)) || null;
+}
+
+function jargonPayload(data) {
+  return {
+    content: data.content,
+    raw_content: data.raw_content || data.content,
+    meaning: data.meaning,
+    scene: data.scene,
+    examples: splitLines(data.examples),
+    group_id: data.group_id,
+    confidence: data.confidence,
+    importance: data.importance,
+    review_reason: data.review_reason,
+    review_suggestion: data.review_suggestion,
+  };
+}
+
+function expressionPayload(data) {
+  return {
+    situation: data.situation,
+    replacement: data.expression,
+    expression: data.expression,
+    style: data.style,
+    shared_scope: data.shared_scope,
+    weight: data.weight,
+    reason: data.review_reason,
+    review_reason: data.review_reason,
+    review_suggestion: data.review_suggestion,
+  };
+}
+
+function openJargonCalibration(item, action = "save") {
+  const itemId = item.id || item.review_id || item.canonical_id || "";
+  const title = action === "approve" ? "修正黑话并通过" : action === "reject" ? "修正黑话并驳回" : "编辑黑话";
+  const submitText = action === "approve" ? "保存并通过" : action === "reject" ? "保存并驳回" : "保存修改";
+  openFormModal(
+    title,
+    [
+      { name: "content", label: "黑话词", default: item.content || "", type: "text" },
+      { name: "raw_content", label: "原始提取", default: item.raw_content || item.content || "", type: "text" },
+      { name: "meaning", label: "含义解释", default: item.meaning || "", type: "textarea", rows: 4 },
+      { name: "scene", label: "适用场景", default: item.scene || "", type: "textarea", rows: 3 },
+      { name: "examples", label: "例句/证据（每行一条）", default: joinLines(item.examples), type: "textarea", rows: 4 },
+      { name: "group_id", label: "适用会话", default: item.group_id || "GLOBAL", type: "text" },
+      { name: "confidence", label: "置信度", default: item.confidence ?? 0.8, type: "number", cast: "float" },
+      { name: "importance", label: "权重", default: item.importance ?? 0.7, type: "number", cast: "float" },
+      { name: "review_reason", label: "审核备注", default: item.review_reason || "", type: "textarea", rows: 3 },
+      { name: "review_suggestion", label: "修正建议", default: item.review_suggestion || "", type: "textarea", rows: 3 },
+    ],
+    item,
+    async (data) => {
+      const payload = jargonPayload(data);
+      if (action === "approve") await api.post(`/memories/jargon/${segment(itemId)}/approve`, payload);
+      else if (action === "reject") await api.post(`/memories/jargon/${segment(itemId)}/reject`, payload);
+      else await api.post(`/memories/jargon/${segment(itemId)}`, payload);
+      toast(action === "approve" ? "黑话已修正并通过" : action === "reject" ? "黑话已修正并驳回" : "黑话已保存");
+      if (state.current === "memories") await loadMemories();
+      else await loadReviews();
+    },
+    submitText,
+  );
+}
+
+function openExpressionCalibration(item, action = "save") {
+  const itemId = item.id || item.review_id || item.canonical_id || "";
+  const title = action === "approve" ? "修正表达并通过" : action === "reject" ? "修正表达并驳回" : "编辑表达";
+  const submitText = action === "approve" ? "保存并通过" : action === "reject" ? "保存并驳回" : "保存修改";
+  openFormModal(
+    title,
+    [
+      { name: "situation", label: "使用场景", default: item.situation || "", type: "textarea", rows: 3 },
+      { name: "expression", label: "表达文本", default: item.expression || item.content || "", type: "textarea", rows: 4 },
+      { name: "style", label: "风格标签", default: item.style || "", type: "text" },
+      { name: "shared_scope", label: "共享范围", default: item.shared_scope || item.group_id || "GLOBAL", type: "text" },
+      { name: "weight", label: "权重", default: item.weight ?? 1.0, type: "number", cast: "float" },
+      { name: "review_reason", label: "审核备注", default: item.review_reason || "", type: "textarea", rows: 3 },
+      { name: "review_suggestion", label: "修正建议", default: item.review_suggestion || "", type: "textarea", rows: 3 },
+    ],
+    item,
+    async (data) => {
+      const payload = expressionPayload(data);
+      if (action === "approve") await api.post(`/reviews/${segment(itemId)}/submit`, { ...payload, action: "approve" });
+      else if (action === "reject") await api.post(`/reviews/${segment(itemId)}/submit`, { ...payload, action: "reject" });
+      else await api.post(`/reviews/${segment(itemId)}`, payload);
+      toast(action === "approve" ? "表达已修正并通过" : action === "reject" ? "表达已修正并驳回" : "表达已保存");
+      await loadReviews();
+    },
+    submitText,
+  );
+}
+
 async function loadDashboard() {
   if (!getDashboardCache(state.dashboardTab)) {
     const hasDashboardShell = Boolean($("[data-dashboard-tab]"));
@@ -1205,7 +1319,10 @@ async function loadReviews() {
         <td>${statusChip(item.review_status || item.status || "pending", item.status === "rejected" ? "danger" : "")}</td>
         <td>${escapeHtml(item.weight ?? item.confidence ?? "-")}</td>
         <td class="row-actions">
+          <button class="ghost-button" data-edit-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑</button>
+          <button class="primary-button" data-edit-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑通过</button>
           <button class="primary-button" data-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">批准</button>
+          <button class="ghost-button" data-edit-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">备注驳回</button>
           <button class="danger-button" data-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">驳回</button>
         </td>
       </tr>
@@ -1224,7 +1341,7 @@ async function loadReviews() {
     ? "当前黑话分类暂无数据。若 Dashboard 显示黑话待审核，请确认正在查看“黑话待审”。"
     : "当前表达习惯暂无数据。黑话审核在同页的“黑话待审/黑话全量”中查看。";
   content().innerHTML = `
-    ${pageHeader("表达与黑话审核 Reviews", "表达习惯和黑话是两条学习通道；Dashboard 的黑话待审核会在本页的黑话队列中展示。")}
+    ${pageHeader("表达与黑话审核 Reviews", "表达习惯和黑话是两条学习通道；待审队列用于人工校准后通过，全量库查阅用于回看历史表达/黑话。")}
     ${totals}
     ${subTabs(state.reviewTab, [
       { id: "jargon_pending", label: "黑话待审" },
@@ -1251,6 +1368,24 @@ async function loadReviews() {
 }
 
 function bindReviewActions() {
+  $$('[data-edit-review]').forEach((button) => button.addEventListener("click", () => {
+    const item = findReviewItem(button.dataset.reviewKind, button.dataset.editReview);
+    if (!item) return toast("未找到待编辑项");
+    if (button.dataset.reviewKind === "jargon") openJargonCalibration(item, "save");
+    else openExpressionCalibration(item, "save");
+  }));
+  $$('[data-edit-approve-review]').forEach((button) => button.addEventListener("click", () => {
+    const item = findReviewItem(button.dataset.reviewKind, button.dataset.editApproveReview);
+    if (!item) return toast("未找到待编辑项");
+    if (button.dataset.reviewKind === "jargon") openJargonCalibration(item, "approve");
+    else openExpressionCalibration(item, "approve");
+  }));
+  $$('[data-edit-reject-review]').forEach((button) => button.addEventListener("click", () => {
+    const item = findReviewItem(button.dataset.reviewKind, button.dataset.editRejectReview);
+    if (!item) return toast("未找到待编辑项");
+    if (button.dataset.reviewKind === "jargon") openJargonCalibration(item, "reject");
+    else openExpressionCalibration(item, "reject");
+  }));
   $$('[data-approve-review]').forEach((button) => button.addEventListener("click", async () => {
     if (!button.dataset.approveReview) return;
     if (button.dataset.reviewKind === "jargon") {
@@ -1309,6 +1444,9 @@ async function loadMemories() {
   const rows = tabItems.map((item) => {
     const id = item.id || item.date || item.term || "-";
     const contentText = item.content || item.summary || item.narrative || item.reflection || item.meaning || "-";
+    const actions = state.memoryTab === "jargon"
+      ? `<button class="ghost-button" data-memory-jargon-edit="${attr(id)}" type="button">编辑</button><button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button>`
+      : `<button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button>`;
     return `
       <tr>
         <td>${escapeHtml(id)}</td>
@@ -1316,7 +1454,7 @@ async function loadMemories() {
         <td><pre>${escapeHtml(contentText)}</pre></td>
         <td>${escapeHtml(item.session_id || item.group_id || "-")}</td>
         <td>${escapeHtml(item.confidence ?? item.importance ?? "-")}</td>
-        <td class="row-actions"><button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button></td>
+        <td class="row-actions">${actions}</td>
       </tr>
     `;
   });
@@ -1353,10 +1491,10 @@ async function loadMemories() {
     ${totals}
     ${subTabs(state.memoryTab, [
       { id: "canonical", label: "Canonical 总览" },
-      { id: "jargon", label: "黑话字典" },
-      { id: "events", label: "旧事件" },
-      { id: "reflections", label: "每日反思" },
-      { id: "nodes", label: "旧实体图谱" },
+      { id: "jargon", label: "黑话字典 Jargon" },
+      { id: "events", label: "记忆碎片 Events" },
+      { id: "reflections", label: "每日反思 Reflections" },
+      { id: "nodes", label: "实体图谱 Nodes（旧实体图谱）" },
     ], "memory-tab")}
     ${section("记忆数据", state.memoryTab === "canonical" ? "当前展示 canonical_memories v2 数据。" : "当前展示旧版或专题数据。", `${canonicalPager}${table(["ID", "类型/状态", "内容", "会话", "权重", "操作"], rows, emptyText)}`)}
   `;
@@ -1373,6 +1511,11 @@ async function loadMemories() {
   $$('[data-memory-page]').forEach((button) => button.addEventListener("click", () => {
     state.cache.memories.canonical.offset = Math.max(0, Number(button.dataset.memoryPage || 0));
     loadMemories();
+  }));
+  $$('[data-memory-jargon-edit]').forEach((button) => button.addEventListener("click", () => {
+    const item = findMemoryItem("jargon", button.dataset.memoryJargonEdit);
+    if (!item) return toast("未找到黑话记录");
+    openJargonCalibration(item, "save");
   }));
   $$('[data-memory-delete]').forEach((button) => button.addEventListener("click", async () => {
     const id = button.dataset.memoryDelete;

@@ -1703,6 +1703,7 @@ class MemoryV2Store:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
         visibility: str | None = None,
+        session_id: str | None = None,
         dedup_key: str | None = None,
         source_ref: str | None = None,
     ) -> int:
@@ -1735,6 +1736,8 @@ class MemoryV2Store:
             payload["metadata"] = self._json_dict(metadata)
         if visibility is not None and visibility in {"auto_and_tool", "tool_only", "maintenance_only"}:
             payload["visibility"] = visibility
+        if session_id is not None:
+            payload["session_id"] = str(session_id or "GLOBAL")
         if dedup_key is not None:
             payload["dedup_key"] = str(dedup_key or "")
         if source_ref is not None:
@@ -1744,6 +1747,8 @@ class MemoryV2Store:
         columns = list(payload.keys())
         assignments = ", ".join(f"{column} = ?" for column in columns)
         scopes = await self._resolve_session_ids_for_memory_ids([memory_id])
+        if session_id is not None:
+            scopes.append(str(session_id or "GLOBAL"))
         async with await self._acquire_session_scopes(scopes) as _locks:
             async with connect_aiosqlite(self.db_path) as db:
                 cursor = await db.execute(

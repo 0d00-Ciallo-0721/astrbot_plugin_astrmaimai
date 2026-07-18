@@ -28,6 +28,10 @@ class ReviewActionRequest(BaseModel):
     replacement: str | None = None
     weight: float | None = None
     reason: str | None = None
+    situation: str | None = None
+    style: str | None = None
+    shared_scope: str | None = None
+    review_suggestion: str | None = None
 
 
 class BatchReviewRequest(BaseModel):

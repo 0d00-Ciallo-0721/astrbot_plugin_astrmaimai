@@ -197,7 +197,19 @@ class ReviewUiService:
 
     _ACTION_MAP = {"approve": "approved", "reject": "rejected", "revise": "revision_needed", "replace": "replace"}
 
-    async def submit_review(self, review_id: str, action: str, replacement=None, weight=None, reason=None):
+    async def submit_review(
+        self,
+        review_id: str,
+        action: str,
+        replacement=None,
+        weight=None,
+        reason=None,
+        *,
+        situation=None,
+        style=None,
+        shared_scope=None,
+        review_suggestion=None,
+    ):
         mapped = self._ACTION_MAP.get(action)
         if mapped is None:
             return {"status": "error", "message": f"Unknown action: {action!r}"}
@@ -206,9 +218,25 @@ class ReviewUiService:
             decision=mapped,
             reviewer_id="webui",
             replacement_expression=replacement or "",
+            style=style or "",
             reason=reason or "",
             weight_delta=float(weight) - 1.0 if weight is not None else 0.0,
         )
+        extra_update = {
+            key: value
+            for key, value in {
+                "situation": situation,
+                "style": style,
+                "shared_scope": shared_scope,
+                "review_reason": reason,
+                "review_suggestion": review_suggestion,
+            }.items()
+            if value is not None
+        }
+        if result and result.get("id") and extra_update:
+            service = self._pattern_service()
+            if service and hasattr(service, "update_review"):
+                await service.update_review(str(review_id), modified_by="human:webui", **extra_update)
         if result and result.get("id"):
             return {"status": "ok", "data": result}
         service = self._pattern_service()
@@ -217,11 +245,16 @@ class ReviewUiService:
                 str(review_id),
                 replacement_expression=replacement or None,
                 apply_replacement=bool(replacement),
+                situation=situation,
+                shared_scope=shared_scope,
                 review_status=mapped,
                 review_reason=reason or "",
+                review_suggestion=review_suggestion or "",
                 weight_delta=0.0,
                 checked=(mapped == "approved"),
                 rejected=(mapped == "rejected"),
+                modified_by="human:webui",
+                style=style,
             )
             if updated:
                 if weight is not None:
@@ -280,12 +313,21 @@ class ReviewUiService:
         expression = data.get("expression")
         style = data.get("style")
         weight = data.get("weight")
+        situation = data.get("situation")
+        shared_scope = data.get("shared_scope")
+        review_reason = data.get("review_reason")
+        review_suggestion = data.get("review_suggestion")
         service = self._pattern_service()
         if service and hasattr(service, "update_review"):
             await service.update_review(
                 str(review_id),
                 replacement_expression=expression or None,
                 apply_replacement=expression is not None,
+                situation=situation,
+                shared_scope=shared_scope,
+                review_reason=review_reason,
+                review_suggestion=review_suggestion,
+                modified_by="human:webui",
                 style=style,
                 weight_delta=0.0,
             )

@@ -668,6 +668,14 @@ class ConcurrentExecutor:
                         logger.warning(f"[{chat_id}] vision side-path invalid output: {invalid_reason}")
                         continue
                     vision_line = render_vision_record(payload)
+                    if payload.get("type") == "image":
+                        description = str(payload.get("description") or "").strip()
+                        suffix = "" if description.endswith(("。", "！", "？", ".", "!", "?")) else "。"
+                        raw_tags = result_dict.get("emotion_tags") if isinstance(result_dict, dict) else []
+                        tag_items = raw_tags if isinstance(raw_tags, list) else [raw_tags] if isinstance(raw_tags, str) else []
+                        tags = [str(tag).strip() for tag in tag_items if str(tag).strip()]
+                        feeling_line = f"\n它给我的感觉是：{', '.join(tags)}。" if tags else ""
+                        vision_line = f"我刚看到一张图片，画面是：{description}{suffix}{feeling_line}\n{vision_line}"
                     vision_descriptions.append(vision_line)
             except Exception as exc:
                 saw_exception = True

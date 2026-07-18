@@ -10,8 +10,8 @@ class WebUiGapCoverageTests(unittest.TestCase):
         calls = []
 
         class _Reviews:
-            async def submit_review(self, review_id, action, replacement, weight, reason):
-                calls.append(("submit", review_id))
+            async def submit_review(self, review_id, action, replacement, weight, reason, **kwargs):
+                calls.append(("submit", review_id, kwargs.get("situation"), kwargs.get("shared_scope")))
                 return {"status": "ok"}
 
             async def update_review_record(self, review_id, body):
@@ -27,7 +27,7 @@ class WebUiGapCoverageTests(unittest.TestCase):
         request = SimpleNamespace(
             path_params={"id": "mem-review-1"},
             query_params={},
-            json=lambda: {"action": "approve"},
+            json=lambda: {"action": "approve", "situation": "manual situation", "shared_scope": "GLOBAL"},
         )
 
         async def _run():
@@ -40,7 +40,7 @@ class WebUiGapCoverageTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("submit", "mem-review-1"),
+                ("submit", "mem-review-1", "manual situation", "GLOBAL"),
                 ("update", "mem-review-1"),
                 ("delete", "mem-review-1"),
             ],
@@ -138,6 +138,65 @@ class WebUiGapCoverageTests(unittest.TestCase):
         self.assertEqual(result["page_size"], 1)
         self.assertEqual([item["id"] for item in result["items"]], ["review-1"])
 
+    def test_review_submit_forwards_manual_calibration_fields(self):
+        from astrmai.webui.backend.services.review_ui_service import ReviewUiService
+
+        calls = []
+
+        class _PatternService:
+            async def update_review(self, pattern_id, **kwargs):
+                calls.append((pattern_id, kwargs))
+                return SimpleNamespace(
+                    id=pattern_id,
+                    group_id="group-1",
+                    source="webui",
+                    expression=kwargs.get("replacement_expression") or "edited expression",
+                    status="active",
+                    create_time=1.0,
+                    last_active_time=2.0,
+                    metadata={
+                        "situation": kwargs.get("situation"),
+                        "style": kwargs.get("style"),
+                        "shared_scope": kwargs.get("shared_scope"),
+                        "review_reason": kwargs.get("review_reason"),
+                        "review_suggestion": kwargs.get("review_suggestion"),
+                        "weight": 1.2,
+                    },
+                    weight=1.2,
+                )
+
+            async def get_pattern(self, pattern_id):
+                return None
+
+        class _PluginApi:
+            async def submit_review(self, **kwargs):
+                return {"status": "deferred"}
+
+            def get_expression_pattern_service(self):
+                return _PatternService()
+
+        service = ReviewUiService(_PluginApi(), db_factory=None)
+
+        result = asyncio.run(
+            service.submit_review(
+                "expr-1",
+                "approve",
+                replacement="edited expression",
+                weight=1.2,
+                reason="人工修正",
+                situation="撒娇回应",
+                style="轻快",
+                shared_scope="group-1",
+                review_suggestion="已校准",
+            )
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(calls[0][0], "expr-1")
+        self.assertEqual(calls[0][1]["situation"], "撒娇回应")
+        self.assertEqual(calls[0][1]["shared_scope"], "group-1")
+        self.assertEqual(calls[0][1]["review_suggestion"], "已校准")
+
     def test_memory_list_clamps_runtime_pagination(self):
         from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
 
@@ -205,6 +264,10 @@ class WebUiGapCoverageTests(unittest.TestCase):
         self.assertIn('api.get("/memories/jargon?status=review_pending&limit=200")', source)
         self.assertIn('api.get(`/memories/canonical?limit=${memoryState.limit}&offset=${memoryState.offset}${kindParam}`)', source)
         self.assertIn('{ id: "canonical", label: "Canonical 总览" }', source)
+        self.assertIn("openJargonCalibration", source)
+        self.assertIn("openExpressionCalibration", source)
+        self.assertIn("data-edit-approve-review", source)
+        self.assertNotIn("state.activeTab", source)
 
 
 if __name__ == "__main__":

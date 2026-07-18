@@ -255,22 +255,39 @@ class ExpressionPatternService:
         weight_delta: float = 0.0,
         replacement_expression: str | None = None,
         apply_replacement: bool = False,
+        situation: str | None = None,
+        shared_scope: str | None = None,
         style: str | None = None,
     ) -> ExpressionPatternRecord | None:
         current = await self.get_pattern(pattern_id)
         if not current:
             return None
         metadata = dict(current.metadata or {})
+        requested_situation = situation
+        requested_shared_scope = shared_scope
         expression = str(current.expression or "")
         situation = str(current.situation or "")
         shared_scope = str(current.shared_scope or "")
         old_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope)
         replacement_applied = False
+        identity_changed = False
         if replacement_expression and apply_replacement:
             replacement = str(replacement_expression or "").strip()
             if replacement and replacement != expression:
                 expression = replacement
                 replacement_applied = True
+        if requested_situation is not None:
+            next_situation = str(requested_situation or "").strip()
+            if next_situation and next_situation != situation:
+                situation = next_situation
+                metadata["situation"] = situation
+                identity_changed = True
+        if requested_shared_scope is not None:
+            next_shared_scope = str(requested_shared_scope or "").strip()
+            if next_shared_scope and next_shared_scope != shared_scope:
+                shared_scope = next_shared_scope
+                metadata["shared_scope"] = shared_scope
+                identity_changed = True
         if style is not None:
             metadata["style"] = str(style or "").strip()
         if modified_by is not None:
@@ -296,12 +313,32 @@ class ExpressionPatternService:
             metadata["review_status"] = "rejected"
         metadata["last_review_time"] = time.time()
         metadata["weight"] = max(0.0, min(3.0, self._safe_float(metadata.get("weight"), self._safe_float(current.weight, 1.0)) + float(weight_delta or 0.0)))
+        history = metadata.get("manual_revision_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "action": str(review_status or ("replace" if replacement_applied else "update") or "update"),
+                "modified_by": str(modified_by or "human:webui"),
+                "modified_at": metadata["last_review_time"],
+                "changes": {
+                    "expression": expression,
+                    "situation": situation,
+                    "shared_scope": shared_scope,
+                    "style": metadata.get("style", ""),
+                    "review_reason": metadata.get("review_reason", ""),
+                    "review_status": metadata.get("review_status", ""),
+                    "weight": metadata.get("weight", 1.0),
+                },
+            }
+        )
+        metadata["manual_revision_history"] = history[-20:]
         next_review_status = str(metadata.get("review_status") or current.review_status or "pending").strip().lower()
         status = self._canonical_status(next_review_status)
         visibility = self._visibility_for_status(status)
         metadata["content_samples"] = self._sample_list(metadata.get("content_samples") or current.content_list)
         summary = str(metadata.get("summary") or expression[:240])
-        if replacement_applied:
+        if replacement_applied or identity_changed:
             new_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope)
             conflict = await self.store.get_by_dedup_key(new_dedup_key, include_inactive=True)
             if conflict and str(conflict.id) != str(pattern_id):

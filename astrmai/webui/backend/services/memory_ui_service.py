@@ -136,6 +136,15 @@ class MemoryUiService:
     def _existing_values(cls, columns: set[str], values: dict) -> dict:
         return {key: cls._db_value(value) for key, value in values.items() if key in columns and value is not None}
 
+    @staticmethod
+    def _optional_float(value):
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     async def _insert(self, db, table: str, values: dict):
         columns = await self._columns(db, table)
         payload = self._existing_values(columns, values)
@@ -408,6 +417,43 @@ class MemoryUiService:
             "updated_at": float(item.get("updated_at") or item.get("update_time") or 0.0),
             "legacy": False,
         }
+
+    @staticmethod
+    def _append_manual_revision(metadata: dict, *, action: str, changes: dict) -> dict:
+        history = metadata.get("manual_revision_history")
+        if not isinstance(history, list):
+            history = []
+        visible_changes = {
+            key: value
+            for key, value in dict(changes or {}).items()
+            if key
+            in {
+                "content",
+                "raw_content",
+                "meaning",
+                "scene",
+                "examples",
+                "count",
+                "review_reason",
+                "review_suggestion",
+                "confidence",
+                "importance",
+                "status",
+                "group_id",
+            }
+        }
+        history.append(
+            {
+                "action": str(action or "update"),
+                "modified_by": "webui",
+                "modified_at": time.time(),
+                "changes": visible_changes,
+            }
+        )
+        metadata["manual_revision_history"] = history[-20:]
+        metadata["modified_by"] = "webui"
+        metadata["modified_at"] = history[-1]["modified_at"]
+        return metadata
 
     async def migration_report(self) -> dict:
         engine = self._memory_engine()
@@ -881,25 +927,27 @@ class MemoryUiService:
         projector = self.plugin_api.get_index_projector() if self.plugin_api else None
         current = await store.get_canonical(str(jargon_id), include_inactive=True) if store and hasattr(store, "get_canonical") else None
         metadata = dict(getattr(current, "metadata", {}) or {})
-        if not metadata:
-            async with self.db_factory() as db:
-                try:
-                    async with db.execute("SELECT * FROM canonical_memories WHERE id = ?", (jargon_id,)) as cursor:
-                        row = await cursor.fetchone()
-                    if row:
-                        current_row = self._canonical_row(row)
-                        metadata = dict(current_row.get("metadata") or {})
-                        if current is None:
-                            current = type(
-                                "_CurrentJargon",
-                                (),
-                                {
-                                    "summary": current_row.get("summary", ""),
-                                    "metadata": metadata,
-                                },
-                            )()
-                except Exception:
-                    pass
+        if not metadata and self.db_factory is not None:
+            db_context = self.db_factory()
+            if db_context is not None:
+                async with db_context as db:
+                    try:
+                        async with db.execute("SELECT * FROM canonical_memories WHERE id = ?", (jargon_id,)) as cursor:
+                            row = await cursor.fetchone()
+                        if row:
+                            current_row = self._canonical_row(row)
+                            metadata = dict(current_row.get("metadata") or {})
+                            if current is None:
+                                current = type(
+                                    "_CurrentJargon",
+                                    (),
+                                    {
+                                        "summary": current_row.get("summary", ""),
+                                        "metadata": metadata,
+                                    },
+                                )()
+                    except Exception:
+                        pass
         if "meaning" in data:
             metadata["meaning"] = str(data.get("meaning") or "").strip()
         if "raw_content" in data:
@@ -910,11 +958,26 @@ class MemoryUiService:
             metadata["examples"] = list(data.get("examples", []) or [])
         if "count" in data:
             metadata["count"] = int(data.get("count", 1) or 1)
-        next_status = str(data.get("status") or "").strip()
-        if not next_status:
+        current_status = str(getattr(current, "status", "") or "").strip()
+        if not current_status and self.db_factory is not None:
+            db_context = self.db_factory()
+            if db_context is not None:
+                async with db_context as db:
+                    try:
+                        async with db.execute("SELECT status FROM canonical_memories WHERE id = ?", (jargon_id,)) as cursor:
+                            row = await cursor.fetchone()
+                        current_status = str(row[0] if row else "" or "").strip()
+                    except Exception:
+                        current_status = ""
+        explicit_status = str(data.get("status") or "").strip()
+        if explicit_status:
+            next_status = explicit_status
+        elif "is_jargon" in data or "is_complete" in data:
             is_jargon = bool(int(data.get("is_jargon", 1) or 0))
             is_complete = bool(int(data.get("is_complete", 1) or 0))
             next_status = "active" if is_jargon and metadata.get("meaning") and is_complete else "review_pending"
+        else:
+            next_status = current_status or "review_pending"
         if next_status == "active":
             metadata["review_status"] = "approved"
         elif next_status == "rejected":
@@ -925,6 +988,14 @@ class MemoryUiService:
             metadata["review_reason"] = str(data.get("review_reason") or "")
         if "review_suggestion" in data:
             metadata["review_suggestion"] = str(data.get("review_suggestion") or "")
+        group_id = None
+        if "group_id" in data:
+            group_id = str(data.get("group_id") or "GLOBAL").strip() or "GLOBAL"
+        metadata = self._append_manual_revision(
+            metadata,
+            action=str(data.get("manual_action") or ("approve" if next_status == "active" else ("reject" if next_status == "rejected" else "save"))),
+            changes=dict(data or {}) | {"status": next_status},
+        )
         summary = str(metadata.get("meaning") or data.get("summary") or getattr(current, "summary", "") or "").strip()
         content = data.get("content")
         visibility = "auto_and_tool" if next_status == "active" else "maintenance_only"
@@ -933,9 +1004,12 @@ class MemoryUiService:
                 str(jargon_id),
                 content=str(content) if content is not None else None,
                 summary=summary if summary else None,
+                importance=self._optional_float(data.get("importance")),
+                confidence=self._optional_float(data.get("confidence")),
                 status=next_status,
                 metadata=metadata,
                 visibility=visibility,
+                session_id=group_id,
             )
             if changed and projector:
                 if next_status == "active":
@@ -943,20 +1017,25 @@ class MemoryUiService:
                 else:
                     await projector.cleanup_deleted([str(jargon_id)])
             return {"status": "ok"}
+        update_values = {
+            "content": content,
+            "summary": summary or None,
+            "importance": self._optional_float(data.get("importance")),
+            "confidence": self._optional_float(data.get("confidence")),
+            "metadata": metadata,
+            "status": next_status,
+            "visibility": visibility,
+            "update_time": data.get("updated_at", now),
+        }
+        if group_id is not None:
+            update_values["session_id"] = group_id
         async with self.db_factory() as db:
             await self._update(
                 db,
                 "canonical_memories",
                 "id",
                 jargon_id,
-                {
-                    "content": content,
-                    "summary": summary or None,
-                    "metadata": metadata,
-                    "status": next_status,
-                    "visibility": visibility,
-                    "update_time": data.get("updated_at", now),
-                },
+                update_values,
             )
             await db.commit()
         return {"status": "ok"}
@@ -966,11 +1045,15 @@ class MemoryUiService:
         result.update({"legacy": False, "mode": "canonical_soft_delete"})
         return result
 
-    async def approve_jargon(self, jargon_id: str) -> dict[str, str]:
-        return await self.update_jargon(str(jargon_id), {"status": "active"})
+    async def approve_jargon(self, jargon_id: str, data: dict | None = None) -> dict[str, str]:
+        payload = dict(data or {})
+        payload.update({"status": "active", "manual_action": "approve"})
+        return await self.update_jargon(str(jargon_id), payload)
 
-    async def reject_jargon(self, jargon_id: str) -> dict[str, str]:
-        return await self.update_jargon(str(jargon_id), {"status": "rejected"})
+    async def reject_jargon(self, jargon_id: str, data: dict | None = None) -> dict[str, str]:
+        payload = dict(data or {})
+        payload.update({"status": "rejected", "manual_action": "reject"})
+        return await self.update_jargon(str(jargon_id), payload)
 
 
 __all__ = ["MemoryUiService"]

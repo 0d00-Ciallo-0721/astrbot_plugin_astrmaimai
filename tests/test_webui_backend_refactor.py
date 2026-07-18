@@ -690,8 +690,19 @@ class WebuiBackendRefactorTests(unittest.TestCase):
 
                 service = service_mod.MemoryUiService(_db_factory)
                 pending = await service.list_jargon(status="review_pending", group_id="group-1", query="raid")
-                approved = await service.approve_jargon("mem-jargon-1")
-                active = await service.list_jargon(status="active", group_id="group-1", query="bigbird")
+                approved = await service.approve_jargon(
+                    "mem-jargon-1",
+                    {
+                        "content": "big bird",
+                        "meaning": "人工校准后的团本黑话",
+                        "scene": "团本集合",
+                        "examples": ["big bird ready"],
+                        "group_id": "group-2",
+                        "review_reason": "人工确认",
+                        "confidence": 0.95,
+                    },
+                )
+                active = await service.list_jargon(status="active", group_id="group-2", query="团本")
                 rejected = await service.reject_jargon("mem-jargon-1")
                 final_detail = await service.get_canonical("mem-jargon-1")
                 return pending, approved, active, rejected, final_detail
@@ -705,12 +716,18 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(active["total"], 1)
         self.assertEqual(len(active["items"]), 1)
         self.assertEqual(active["items"][0]["status"], "active")
-        self.assertEqual(active["items"][0]["scene"], "raid call")
+        self.assertEqual(active["items"][0]["content"], "big bird")
+        self.assertEqual(active["items"][0]["group_id"], "group-2")
+        self.assertEqual(active["items"][0]["meaning"], "人工校准后的团本黑话")
+        self.assertEqual(active["items"][0]["scene"], "团本集合")
+        self.assertEqual(active["items"][0]["review_reason"], "人工确认")
         self.assertEqual(pending["items"][0]["review_reason"], "needs more evidence")
         self.assertEqual(pending["items"][0]["review_suggestion"], "confirm whether it is boss shorthand")
         self.assertEqual(rejected["status"], "ok")
         self.assertEqual(final_detail["data"]["status"], "rejected")
         self.assertEqual(final_detail["data"]["metadata"]["review_status"], "rejected")
+        self.assertEqual(final_detail["data"]["metadata"]["modified_by"], "webui")
+        self.assertTrue(final_detail["data"]["metadata"]["manual_revision_history"])
 
     def test_memory_route_file_exposes_jargon_review_endpoints(self):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "routes" / "memory_routes.py"
