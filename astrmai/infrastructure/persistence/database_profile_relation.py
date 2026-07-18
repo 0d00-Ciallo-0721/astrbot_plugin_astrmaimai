@@ -28,6 +28,22 @@ class ProfileRelationPersistenceMixin:
                 except Exception:
                     logger.warning("[AstrMai-profile] construction failed", exc_info=True)
                     return None
+        target = str(name).strip().casefold()
+        for profile_data in profiles.values():
+            metadata = profile_data.get("profile_metadata")
+            aliases = metadata.get("verified_aliases", []) if isinstance(metadata, dict) else []
+            if not any(
+                isinstance(item, dict)
+                and bool(item.get("verified"))
+                and str(item.get("value") or "").strip().casefold() == target
+                for item in aliases
+            ):
+                continue
+            try:
+                return UserProfile(**profile_data)
+            except Exception:
+                logger.warning("[AstrMai-profile] construction failed", exc_info=True)
+                return None
         return None
 
     def update_social_relation(

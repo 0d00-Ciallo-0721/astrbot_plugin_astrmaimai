@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from .tool_contracts import FAMILY_TO_TOOL
+from .member_action_intent import detect_member_action_candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +131,9 @@ def _resolve_private(message: str) -> ToolIntentResolution:
 
 def _has_at_target(message: str) -> bool:
     text = _clean(message)
+    candidate = detect_member_action_candidate(text)
+    if candidate and candidate.proposed_purpose == "mention_member" and candidate.target_name:
+        return True
     if QQ_NUMBER_RE.search(text):
         return True
     if "@" in text:

@@ -325,7 +325,18 @@ class ReplyArtifactMixin:
     def _merge_wait_targets(self, event: AstrMessageEvent, pending_actions: Sequence[dict[str, Any]] | None) -> list[str]:
         actions = list(pending_actions or event.get_extra("astrmai_pending_actions", []) or [])
         existing = [str(target) for target in (event.get_extra("astrmai_wait_targets", []) or []) if str(target).strip()]
-        at_targets = [str(action.get("target_id")) for action in actions if action.get("action") == "at" and str(action.get("target_id", "")).strip()]
+        current_group_id = str(event.get_group_id() or "").strip() if hasattr(event, "get_group_id") else ""
+        verified_actions = [
+            action
+            for action in actions
+            if isinstance(action, dict)
+            and action.get("action") == "at"
+            and bool(action.get("verified_current_group"))
+            and bool(current_group_id)
+            and str(action.get("group_id") or "").strip() == current_group_id
+            and str(action.get("target_id", "")).strip()
+        ]
+        at_targets = [str(action.get("target_id")) for action in verified_actions]
         if not at_targets:
             return existing
         merged = existing[:]
@@ -334,8 +345,8 @@ class ReplyArtifactMixin:
                 merged.append(target_id)
         target_names = [
             str(action.get("target_name"))
-            for action in actions
-            if action.get("action") == "at" and action.get("target_name")
+            for action in verified_actions
+            if action.get("target_name")
         ]
         emit_legacy_reply_runtime_extras(
             event,
@@ -343,6 +354,28 @@ class ReplyArtifactMixin:
             wait_target_name=target_names[0] if target_names else "",
         )
         return merged
+
+    @staticmethod
+    def _strip_duplicate_native_at_text(event: AstrMessageEvent, segment: str, at_targets: Sequence[str]) -> str:
+        text = str(segment or "")
+        if not text or not at_targets:
+            return text
+        target_ids = {str(target or "").strip() for target in at_targets if str(target or "").strip()}
+        actions = event.get_extra("astrmai_pending_actions", []) if hasattr(event, "get_extra") else []
+        aliases: list[str] = list(target_ids)
+        for action in actions or []:
+            if not isinstance(action, dict) or str(action.get("action") or "") != "at":
+                continue
+            if str(action.get("target_id") or "").strip() not in target_ids:
+                continue
+            for key in ("target_name", "requested_target_name"):
+                alias = str(action.get(key) or "").strip().lstrip("@＠")
+                if alias and alias not in aliases:
+                    aliases.append(alias)
+        for alias in sorted(aliases, key=len, reverse=True):
+            pattern = rf"(?<![\w\u4e00-\u9fff])[@＠]\s*{re.escape(alias)}(?![\w\u4e00-\u9fff])\s*"
+            text = re.sub(pattern, "", text)
+        return text.strip()
 
     def _segment_send_delay(self, segment: str, profile: str) -> float:
         base_factor = float(getattr(self.config.reply, "typing_speed_factor", 0.1) or 0.0)
@@ -443,13 +476,14 @@ class ReplyArtifactMixin:
                         )
                         break
 
+                    segment_text = self._strip_duplicate_native_at_text(event, seg, at_targets) if index == 0 else seg
                     chain = MessageChain()
                     if index == 0 and at_targets:
                         for target_id in at_targets:
                             uid: Any = int(target_id) if str(target_id).isdigit() else target_id
                             chain.chain.append(_at_component(uid))
                         chain.chain.append(_plain_component(" "))
-                    chain.chain.append(_plain_component(seg))
+                    chain.chain.append(_plain_component(segment_text))
                     sent_result = await context.send_message(event.unified_msg_origin, chain)
                     if sent_result is not None and not isinstance(sent_result, bool):
                         outbound_message_ids.append(str(sent_result))

@@ -1394,6 +1394,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 event.set_extra("astrmai_state_bias", cognitive_decision.state_bias)
                 event.set_extra("astrmai_risk_flags", list(cognitive_decision.risk_flags))
                 event.set_extra("astrmai_attack_confidence", cognitive_decision.attack_confidence)
+                event.set_extra("astrmai_member_action_purpose", cognitive_decision.member_action_purpose)
+                event.set_extra("astrmai_member_action_target", cognitive_decision.member_action_target)
+                event.set_extra("astrmai_member_action_confidence", cognitive_decision.member_action_confidence)
                 turn_context.cognitive.action = cognitive_decision.action
                 turn_context.cognitive.intent = cognitive_decision.intent
                 turn_context.cognitive.memory_policy = cognitive_decision.memory_policy

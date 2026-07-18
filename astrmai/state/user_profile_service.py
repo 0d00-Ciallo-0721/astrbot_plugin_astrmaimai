@@ -306,6 +306,31 @@ class UserProfileService:
                 current = self._clean_text(profile.name)
                 if self._is_placeholder_name(current) or len(cleaned_name) >= len(current):
                     profile.name = cleaned_name
+            if str(user_id).isdigit() and cleaned_name and chat_id:
+                now = time.time()
+                meta = self._profile_metadata(profile)
+                meta["verified_identity"] = {
+                    "platform": "qq",
+                    "user_id": str(user_id),
+                    "verified": True,
+                    "source": "observed_event",
+                    "updated_at": now,
+                }
+                aliases = [item for item in meta.get("verified_aliases", []) if isinstance(item, dict)]
+                aliases = [
+                    item
+                    for item in aliases
+                    if self._clean_text(item.get("value", "")).casefold() != cleaned_name.casefold()
+                ]
+                aliases.append(
+                    {
+                        "value": cleaned_name,
+                        "verified": True,
+                        "source": str(source or "message"),
+                        "last_seen_at": now,
+                    }
+                )
+                meta["verified_aliases"] = aliases[-16:]
             footprint = self._ensure_footprint(profile, chat_id)
             footprint["last_source"] = source
             footprint["last_seen_at"] = time.time()

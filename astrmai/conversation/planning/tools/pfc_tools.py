@@ -413,6 +413,23 @@ def _group_member_name(entry: dict[str, Any]) -> str:
     )
 
 
+def _exact_group_member_matches(entries: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
+    clean_target = str(target or "").strip().lstrip("@").casefold()
+    if not clean_target:
+        return []
+    return [
+        entry
+        for entry in entries
+        if clean_target
+        in {
+            str(entry.get("card") or "").strip().casefold(),
+            str(entry.get("nickname") or "").strip().casefold(),
+            str(entry.get("name") or "").strip().casefold(),
+            _group_member_id(entry).casefold(),
+        }
+    ]
+
+
 def _visual_records_from_event(event) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for key in (
@@ -740,7 +757,21 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
                 social_score = float(getattr(profile, "social_score", 0.0) or 0.0)
                 persona = getattr(profile, "persona_analysis", "") or "暂无稳定侧写。"
                 name = getattr(profile, "name", entity)
-                return f"对象: {name}\n好感度: {social_score:.1f}\n侧写: {persona}"
+                metadata = getattr(profile, "profile_metadata", None)
+                identity = metadata.get("verified_identity", {}) if isinstance(metadata, dict) else {}
+                identity_requested = bool(target_name) or any(
+                    token in query.lower()
+                    for token in ("qq", "是谁", "身份", "艾特", "@", "叫出来", "喊出来", "群成员")
+                )
+                identity_note = ""
+                if identity_requested and isinstance(identity, dict) and bool(identity.get("verified")):
+                    verified_qq = str(identity.get("user_id") or "").strip()
+                    if verified_qq:
+                        identity_note = (
+                            f"\n可信 QQ 身份: {verified_qq}（来自真实 QQ 事件）。"
+                            "\n当前群成员状态: 未验证；执行 @ 前必须通过 NapCat 校验当前群。"
+                        )
+                return f"对象: {name}\n好感度: {social_score:.1f}\n侧写: {persona}{identity_note}"
             except Exception as exc:
                 logger.debug(f"[OmniPerceptionTool] profile lookup failed: {exc}")
                 return None
@@ -811,7 +842,10 @@ class OmniPerceptionTool(FunctionTool[AstrAgentContext]):
 @dataclass
 class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
     name: str = "construct_at_event"
-    description: str = "为最终发送阶段追加 @ 某位群成员的动作。"
+    description: str = (
+        "在当前群中实时确认目标成员，并为最终发送阶段追加原生 @ 动作。"
+        "只能使用当前会话群，历史群记录和记忆中的群号不能作为执行依据。"
+    )
     db_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
@@ -828,17 +862,79 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
         if not target_name:
             return "执行失败：target_name 不能为空。"
         current_event = _get_current_event(context)
+        current_group_id = str(current_event.get_group_id() or "").strip()
+        if not current_group_id:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "动作取消：当前不是群聊，无法执行群成员 @。"
+        api = getattr(getattr(current_event, "bot", None), "api", None)
+        if api is None:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return "动作取消：NapCat 当前群成员接口不可用，无法安全确认 @ 目标。"
+
         astr_ctx = context.context.context
-        resolved = await _resolve_target(
-            self.db_service,
-            target_name=target_name,
-            current_event=current_event,
-            astr_ctx=astr_ctx,
-        )
-        if not resolved:
-            return f"动作取消：当前上下文里无法锁定 {target_name}。"
-        target_id, group_id = resolved
+        clean_target = target_name.lstrip("@").strip()
+        target_id = ""
+        matched_name = ""
+        try:
+            if clean_target.isdigit():
+                payload = await api.call_action(
+                    "get_group_member_info",
+                    group_id=_coerce_api_id(current_group_id),
+                    user_id=_coerce_api_id(clean_target),
+                    no_cache=False,
+                )
+                item = _payload_data(payload)
+                if isinstance(item, dict) and _group_member_id(item) == clean_target:
+                    target_id = clean_target
+                    matched_name = _group_member_name(item)
+            else:
+                payload = await api.call_action(
+                    "get_group_member_list",
+                    group_id=_coerce_api_id(current_group_id),
+                )
+                matches = _exact_group_member_matches(
+                    _list_entries(payload, "members", "list"),
+                    clean_target,
+                )
+                if len(matches) == 1:
+                    target_id = _group_member_id(matches[0])
+                    matched_name = _group_member_name(matches[0])
+                elif len(matches) > 1:
+                    _record_tool_execution(current_event, self.name, status="failed")
+                    return f"动作取消：当前群里有多个“{target_name}”候选，请提供 QQ 号。"
+        except Exception as exc:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"动作取消：读取当前群 {current_group_id} 成员时失败：{exc}"
+
+        if not target_id and not clean_target.isdigit():
+            resolved = await _resolve_target(
+                self.db_service,
+                target_name=target_name,
+                current_event=current_event,
+                astr_ctx=astr_ctx,
+            )
+            candidate_id = str(resolved[0] if resolved else "").strip()
+            if candidate_id.isdigit():
+                try:
+                    payload = await api.call_action(
+                        "get_group_member_info",
+                        group_id=_coerce_api_id(current_group_id),
+                        user_id=_coerce_api_id(candidate_id),
+                        no_cache=False,
+                    )
+                    item = _payload_data(payload)
+                    if isinstance(item, dict) and _group_member_id(item) == candidate_id:
+                        target_id = candidate_id
+                        matched_name = _group_member_name(item)
+                except Exception as exc:
+                    _record_tool_execution(current_event, self.name, status="failed")
+                    return f"动作取消：身份候选 {candidate_id} 未能在当前群完成校验：{exc}"
+
+        if not target_id:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return f"动作取消：没有在当前群 {current_group_id} 中确认“{target_name}”。"
         if target_id == str(current_event.get_self_id()):
+            _record_tool_execution(current_event, self.name, status="failed")
             return "动作取消：不能 @ 自己。"
         added = _append_once(
             current_event,
@@ -846,13 +942,19 @@ class ConstructAtEventTool(FunctionTool[AstrAgentContext]):
             action={
                 "action": "at",
                 "target_id": target_id,
-                "target_name": target_name,
-                "group_id": group_id,
+                "target_name": matched_name or target_name,
+                "requested_target_name": target_name,
+                "group_id": current_group_id,
+                "verified_current_group": True,
             },
         )
+        current_event.set_extra("astrmai_at_action_verified", True)
+        current_event.set_extra("astrmai_at_action_target_id", target_id)
+        current_event.set_extra("astrmai_at_action_group_id", current_group_id)
         if not added:
+            _record_tool_execution(current_event, self.name)
             return f"已存在对 {target_name} 的 @ 动作，无需重复添加。"
-        return f"已将 @{target_name} 加入待发送动作，请继续生成最终回复文本。"
+        return f"已在当前群确认 {matched_name or target_name}（QQ {target_id}），并加入原生 @ 动作。请继续生成最终回复文本。"
 
 
 @dataclass

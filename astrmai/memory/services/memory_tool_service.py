@@ -21,6 +21,31 @@ class MemoryToolService:
         self.config = config
 
     @staticmethod
+    def _identity_lookup_requested(query: str, target_name: str) -> bool:
+        if str(target_name or "").strip():
+            return True
+        text = str(query or "").strip().lower()
+        return any(
+            token in text
+            for token in ("qq", "是谁", "身份", "艾特", "@", "叫出来", "喊出来", "群成员")
+        )
+
+    @staticmethod
+    def _verified_identity_note(profile: Any, *, enabled: bool) -> str:
+        if not enabled:
+            return ""
+        metadata = getattr(profile, "profile_metadata", None)
+        identity = metadata.get("verified_identity", {}) if isinstance(metadata, dict) else {}
+        user_id = str(identity.get("user_id") or "").strip() if isinstance(identity, dict) else ""
+        if not user_id or not bool(identity.get("verified")):
+            return ""
+        return (
+            f"\nVerified QQ identity: {user_id} (observed from a real QQ event)."
+            "\nCurrent-group membership: unverified. This identity is only a candidate; "
+            "before @ or another group action, the current group must be checked through NapCat."
+        )
+
+    @staticmethod
     def _already_injected_ids(event) -> list[str]:
         trace = event.get_extra("astrmai_memory_injection_trace", None) if hasattr(event, "get_extra") else None
         selected = list(getattr(trace, "selected_ids", []) or [])
@@ -165,7 +190,11 @@ class MemoryToolService:
                 social_score = float(getattr(profile, "social_score", 0.0) or 0.0)
                 persona = getattr(profile, "persona_analysis", "") or "No stable profile analysis."
                 name = getattr(profile, "name", entity)
-                return f"Target: {name}\nSocial score: {social_score:.1f}\nProfile: {persona}"
+                identity_note = self._verified_identity_note(
+                    profile,
+                    enabled=self._identity_lookup_requested(query, target_name),
+                )
+                return f"Target: {name}\nSocial score: {social_score:.1f}\nProfile: {persona}{identity_note}"
             except Exception as exc:
                 logger.debug(f"[MemoryToolService] profile lookup failed: {exc}")
                 return None

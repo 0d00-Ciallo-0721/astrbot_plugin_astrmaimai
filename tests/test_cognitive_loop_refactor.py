@@ -146,6 +146,34 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
 
         self.assertIsNone(decision)
 
+    def test_cognitive_loop_semantically_confirms_member_action_without_inventing_identity(self):
+        gateway = _FakeGateway(
+            [
+                {
+                    "action": "reply",
+                    "intent": "call the named member",
+                    "memory_policy": "light",
+                    "reply_need": "reply",
+                    "social_intent": "answer",
+                    "action_tier": "full",
+                    "allowed_action_families": ["at"],
+                    "member_action_purpose": "mention_member",
+                    "member_action_target": "萤",
+                    "member_action_confidence": 0.94,
+                }
+            ]
+        )
+        loop = self.mod.CognitiveLoop(gateway)
+        event = _FakeEvent("帮我把之前和你聊天的萤叫出来")
+
+        decision = asyncio.run(loop.decide(event=event))
+
+        self.assertEqual(decision.member_action_purpose, "mention_member")
+        self.assertEqual(decision.member_action_target, "萤")
+        self.assertAlmostEqual(decision.member_action_confidence, 0.94)
+        self.assertEqual(event.get_extra("astrmai_member_action_candidate")["target_name"], "萤")
+        self.assertIn("never invent a QQ number or group id", gateway.calls[0]["kwargs"]["system_prompt"])
+
     def test_cognitive_loop_should_run_skips_lightweight_fast_legacy_and_trivial_cases(self):
         loop = self.mod.CognitiveLoop(_FakeGateway([]))
 

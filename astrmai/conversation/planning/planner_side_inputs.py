@@ -29,6 +29,7 @@ from .tool_intent_resolution import (
     ready_families,
     resolve_explicit_tool_intents,
 )
+from .member_action_intent import detect_member_action_candidate, normalize_member_action_purpose
 from .tools.pfc_tools import (
     BotCapabilityLookupTool,
     ContactRouteSuggestTool,
@@ -404,6 +405,12 @@ class PlannerSideInputMixin:
             return set()
         lowered = message.lower()
         families = self._explicit_qq_action_families(event)
+        member_families = self._member_action_families(event, message)
+        member_candidate = event.get_extra("astrmai_member_action_candidate", {}) if hasattr(event, "get_extra") else {}
+        member_purpose = str(event.get_extra("astrmai_member_action_effective_purpose", "") or "") if hasattr(event, "get_extra") else ""
+        if member_candidate and member_purpose in {"discuss_member", "unclear"}:
+            families.discard("at")
+        families.update(member_families)
         families.update(
             family
             for family, keywords in self.GENERAL_EXPLICIT_TOOL_KEYWORDS.items()
@@ -412,6 +419,40 @@ class PlannerSideInputMixin:
         if self._looks_like_cross_session_relay_request(message):
             families.add("private")
         return families
+
+    @staticmethod
+    def _member_action_families(event: AstrMessageEvent, message: str) -> set[str]:
+        candidate = detect_member_action_candidate(message)
+        if candidate is None:
+            return set()
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_member_action_candidate", candidate.to_dict())
+
+        confirmed = normalize_member_action_purpose(
+            event.get_extra("astrmai_member_action_purpose", "") if hasattr(event, "get_extra") else ""
+        )
+        if confirmed:
+            purpose = confirmed
+            source = "cognitive_confirmation"
+        elif candidate.strong_explicit:
+            purpose = candidate.proposed_purpose
+            source = "strong_explicit_fallback"
+        elif candidate.proposed_purpose == "lookup_member":
+            purpose = "lookup_member"
+            source = "deterministic_lookup"
+        else:
+            purpose = "unclear"
+            source = "soft_candidate_unconfirmed"
+
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_member_action_effective_purpose", purpose)
+            event.set_extra("astrmai_member_action_effective_target", candidate.target_name)
+            event.set_extra("astrmai_member_action_resolution_source", source)
+        if purpose == "mention_member" and candidate.target_name:
+            return {"at"}
+        if purpose == "lookup_member" and candidate.target_name:
+            return {"group_member"}
+        return set()
 
     @staticmethod
     def _looks_like_cross_session_relay_request(message: str) -> bool:
@@ -474,7 +515,11 @@ class PlannerSideInputMixin:
     def _has_at_intent(self, message: str) -> bool:
         if not message:
             return False
-        return any(keyword in message for keyword in self.AT_INTENT_KEYWORDS)
+        candidate = detect_member_action_candidate(message)
+        return bool(
+            any(keyword in message for keyword in self.AT_INTENT_KEYWORDS)
+            or (candidate and candidate.proposed_purpose == "mention_member")
+        )
 
     def _has_guarded_chat_intent(self, event: AstrMessageEvent) -> bool:
         msg = str(getattr(event, "message_str", "") or "").strip()
@@ -980,6 +1025,11 @@ class PlannerSideInputMixin:
             is_group=bool(event.get_group_id()),
             name_resolver=self._canonical_tool_name,
         )
+
+        member_candidate = event.get_extra("astrmai_member_action_candidate", {}) if hasattr(event, "get_extra") else {}
+        member_purpose = str(event.get_extra("astrmai_member_action_effective_purpose", "") or "") if hasattr(event, "get_extra") else ""
+        if member_candidate and member_purpose in {"discuss_member", "unclear"}:
+            tools = [tool for tool in tools if self._canonical_tool_name(tool) != "construct_at_event"]
 
         if not explicit_tool_intent and not self._conversation_flag("autonomous_chat_tools_enabled", True):
             tools = [

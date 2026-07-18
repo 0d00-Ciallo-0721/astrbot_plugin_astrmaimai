@@ -117,6 +117,41 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(result, "System note: no usable internal data was found.")
         self.assertNotIn("CancelledError", result)
 
+    def test_memory_tool_identity_query_exposes_verified_qq_but_not_historical_group(self):
+        from astrmai.memory.services.memory_tool_service import MemoryToolService
+
+        profile = SimpleNamespace(
+            name="萤",
+            social_score=1.0,
+            persona_analysis="群友",
+            profile_metadata={
+                "verified_identity": {
+                    "platform": "qq",
+                    "user_id": "3650815443",
+                    "verified": True,
+                }
+            },
+        )
+
+        class _Db:
+            def get_profile_by_name(self, name):
+                return profile if name == "萤" else None
+
+        class _Service(MemoryToolService):
+            async def search_memory(self, **kwargs):
+                return SimpleNamespace(items=[])
+
+        result = asyncio.run(
+            _Service(SimpleNamespace(), db_service=_Db()).omni_query(
+                query="",
+                target_name="萤",
+            )
+        )
+
+        self.assertIn("Verified QQ identity: 3650815443", result)
+        self.assertIn("Current-group membership: unverified", result)
+        self.assertNotIn("曾在群", result)
+
     def test_topic_summarizer_sorts_mixed_timestamp_types(self):
         from astrmai.memory.services.topic_summarizer import TopicSummarizer
 

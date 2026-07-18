@@ -74,6 +74,26 @@ class UserProfileServiceMigratedTests(unittest.TestCase):
         self.assertEqual(profile.group_footprints["group-1"]["message_count"], 1)
         self.assertEqual(profile.group_footprints["group-1"]["recent_messages"][-1]["text"], "今天去看电影了")
 
+    def test_observe_real_qq_event_persists_verified_identity_and_alias_without_group_leak(self):
+        service = self.mod.UserProfileService(_FakePersistence())
+
+        async def _run():
+            await service.observe_user_activity(
+                "3650815443",
+                chat_id="ff:GroupMessage:111",
+                sender_name="萤",
+                content="在吗",
+                source="learning_message",
+            )
+            return await service.get_user_profile("3650815443")
+
+        profile = asyncio.run(_run())
+        identity = profile.profile_metadata["verified_identity"]
+        self.assertEqual(identity["user_id"], "3650815443")
+        self.assertTrue(identity["verified"])
+        self.assertNotIn("group_id", identity)
+        self.assertEqual(profile.profile_metadata["verified_aliases"][-1]["value"], "萤")
+
     def test_refresh_profile_from_generation_merges_points_and_respects_manual_locks(self):
         service = self.mod.UserProfileService(_FakePersistence())
         profile = self.mod.UserProfile(

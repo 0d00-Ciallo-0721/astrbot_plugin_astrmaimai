@@ -1081,8 +1081,8 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         event = FakeEvent("user-1", "Alice", "question")
         event.set_extra("astrmai_wait_targets", ["user-1"])
         pending_actions = [
-            {"action": "at", "target_id": "user-2", "target_name": "Bob"},
-            {"action": "at", "target_id": "user-1", "target_name": "Alice"},
+            {"action": "at", "target_id": "user-2", "target_name": "Bob", "group_id": "group-1", "verified_current_group": True},
+            {"action": "at", "target_id": "user-1", "target_name": "Alice", "group_id": "group-1", "verified_current_group": True},
         ]
 
         merged = service._merge_wait_targets(event, pending_actions)
@@ -1090,6 +1090,43 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(merged, ["user-1", "user-2"])
         self.assertEqual(event.get_extra("astrmai_wait_targets"), ["user-1", "user-2"])
         self.assertEqual(event.get_extra("astrmai_wait_target_name"), "Bob")
+
+    def test_native_at_removes_duplicate_text_marker_for_same_target(self):
+        service = self._service()
+        event = FakeEvent("user-1", "Alice", "question")
+        event.set_extra(
+            "astrmai_pending_actions",
+            [
+                {
+                    "action": "at",
+                    "target_id": "3650815443",
+                    "target_name": "萤",
+                    "requested_target_name": "萤",
+                }
+            ],
+        )
+
+        cleaned = service._strip_duplicate_native_at_text(
+            event,
+            "找到啦～ @萤 快出来冒个泡吧！",
+            ["3650815443"],
+        )
+
+        self.assertEqual(cleaned, "找到啦～ 快出来冒个泡吧！")
+
+    def test_merge_wait_targets_ignores_unverified_or_other_group_at_actions(self):
+        service = self._service()
+        event = FakeEvent("user-1", "Alice", "question")
+
+        merged = service._merge_wait_targets(
+            event,
+            [
+                {"action": "at", "target_id": "1", "group_id": "group-1"},
+                {"action": "at", "target_id": "2", "group_id": "other", "verified_current_group": True},
+            ],
+        )
+
+        self.assertEqual(merged, [])
 
 
 if __name__ == "__main__":

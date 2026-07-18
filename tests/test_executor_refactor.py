@@ -103,6 +103,9 @@ class _FakeEvent:
     def get_self_id(self):
         return "bot-1"
 
+    def get_group_id(self):
+        return "group-1"
+
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
 
@@ -145,6 +148,31 @@ class RefactoredExecutorTests(unittest.TestCase):
             {("proactive_poke", "satisfied"), ("omni_perception_query", "missing")},
         )
         self.assertEqual(missing, ["omni_perception_query"])
+
+    def test_construct_at_required_outcome_needs_verified_current_group_action(self):
+        event = _FakeEvent()
+        event.set_extra("astrmai_required_tools", ["construct_at_event"])
+        event.set_extra(
+            "astrmai_tool_execution_trace",
+            [{"tool_name": "construct_at_event", "status": "success"}],
+        )
+
+        missing_without_action = self.executor_mod.ConcurrentExecutor._record_required_tool_outcomes(event)
+        event.set_extra(
+            "astrmai_pending_actions",
+            [
+                {
+                    "action": "at",
+                    "target_id": "3650815443",
+                    "group_id": "group-1",
+                    "verified_current_group": True,
+                }
+            ],
+        )
+        missing_with_action = self.executor_mod.ConcurrentExecutor._record_required_tool_outcomes(event)
+
+        self.assertEqual(missing_without_action, ["construct_at_event"])
+        self.assertEqual(missing_with_action, [])
 
     def test_tool_mode_retries_once_with_only_missing_required_tools(self):
         calls = 0

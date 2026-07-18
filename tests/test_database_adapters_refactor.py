@@ -90,6 +90,42 @@ class DatabaseAdapterRefactorTests(unittest.TestCase):
         self.assertIsNotNone(by_nickname)
         self.assertEqual(by_nickname.name, "Alice")
 
+    def test_profile_repository_resolves_verified_historical_alias(self):
+        with sqlite3.connect(self.manager.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO user_profiles
+                (user_id, name, social_score, last_seen, persona_analysis, group_footprints,
+                 profile_metadata, identity, tags, nickname, nickname_reason, know_times,
+                 is_known, memory_points, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "3650815443",
+                    "NewDisplayName",
+                    1.0,
+                    123.0,
+                    "group member",
+                    "{}",
+                    '{"verified_aliases":[{"value":"萤","verified":true,"source":"message"}]}',
+                    "",
+                    "[]",
+                    "",
+                    "",
+                    1,
+                    1,
+                    "[]",
+                    999.0,
+                ),
+            )
+            conn.commit()
+
+        profile = self.db.profile_repository.get_profile_by_name("萤")
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.user_id, "3650815443")
+        self.assertEqual(profile.name, "NewDisplayName")
+
 
 if __name__ == "__main__":
     unittest.main()

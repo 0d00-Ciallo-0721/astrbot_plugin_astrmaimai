@@ -133,6 +133,9 @@ class ConcurrentExecutor:
             "astrmai_tool_disclosure_expanded_once",
             "astrmai_disclosure_expanded_packages",
             "astrmai_pending_actions",
+            "astrmai_at_action_verified",
+            "astrmai_at_action_target_id",
+            "astrmai_at_action_group_id",
             "astrmai_bypass_mood_analysis",
             "astrmai_force_meme",
             "astrmai_tool_clarification_needed",
@@ -167,9 +170,27 @@ class ConcurrentExecutor:
             for name in event.get_extra("astrmai_prepared_required_tools", []) or []
         }
         satisfied = executed | queued | prepared
+        current_group_id = ""
+        if hasattr(event, "get_group_id"):
+            try:
+                current_group_id = str(event.get_group_id() or "").strip()
+            except Exception:
+                current_group_id = ""
+        verified_at_action = any(
+            isinstance(item, dict)
+            and str(item.get("action") or "") == "at"
+            and bool(item.get("verified_current_group"))
+            and bool(current_group_id)
+            and str(item.get("group_id") or "").strip() == current_group_id
+            and bool(str(item.get("target_id") or "").strip())
+            for item in event.get_extra("astrmai_pending_actions", []) or []
+        )
         missing: list[str] = []
         for tool_name in sorted(required):
-            if tool_name in satisfied:
+            is_satisfied = tool_name in satisfied
+            if tool_name == "construct_at_event":
+                is_satisfied = bool(verified_at_action)
+            if is_satisfied:
                 record_tool_lifecycle(
                     event,
                     tool_name,
@@ -218,6 +239,8 @@ class ConcurrentExecutor:
         tool_labels = [labels.get(name, name) for name in missing_tools]
         if "space_transition_action" in missing_tools:
             return "我还没能确认要发给谁、具体转达什么，所以没有发送。你把目标和要说的话都告诉我，我再帮你传达。"
+        if "construct_at_event" in missing_tools:
+            return "我还没能在当前群确认你要叫的人，所以没有发送假 @。请给我对方当前群昵称或 QQ 号。"
         return "我还没能确认这次要执行的具体信息，所以没有操作。你再补充一下：" + "、".join(tool_labels)
 
     async def _handle_required_tool_missing(

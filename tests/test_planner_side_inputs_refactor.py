@@ -951,6 +951,51 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertNotIn("proactive_poke", at_tool_names)
         self.assertIn("construct_at_event", at_tool_names)
 
+    def test_natural_call_member_request_requires_native_at_tool(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="帮我把之前和你聊天的萤叫出来", group_id="group-1")
+        event.set_extra("astrmai_member_action_purpose", "mention_member")
+        event.set_extra("astrmai_member_action_target", "萤")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertIn("construct_at_event", _normalized_tool_names(tools))
+        self.assertEqual(event.get_extra("astrmai_required_tools"), ["construct_at_event"])
+        self.assertEqual(event.get_extra("astrmai_member_action_effective_target"), "萤")
+        self.assertEqual(event.get_extra("astrmai_member_action_resolution_source"), "cognitive_confirmation")
+
+    def test_member_action_discussion_does_not_expose_native_at_tool(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="为什么要艾特萤出来", group_id="group-1")
+        event.set_extra("astrmai_member_action_purpose", "discuss_member")
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:GroupMessage:group-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        self.assertNotIn("construct_at_event", _normalized_tool_names(tools))
+        self.assertNotIn("construct_at_event", event.get_extra("astrmai_required_tools", []))
+
     def test_explicit_relay_request_only_exposes_cross_session_tool(self):
         mixin = self._prepare_tool_mixin()
         event = _FakeEvent(message="帮我给小明发消息告诉他明天十点见", group_id=None)

@@ -162,17 +162,84 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
     def test_construct_at_event_ignores_dirty_none_target_when_deduping(self):
         event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
         event.set_extra("astrmai_pending_actions", [{"action": "at", "target_id": None}])
+        event.bot.api = _FakeApi(result={"data": [{"user_id": "222", "card": "Bob"}]})
 
         class _DbService:
             async def resolve_entity_spatio_temporal(self, **kwargs):
-                return "user-2", "111"
+                return "222", "999"
 
         tool = self.mod.ConstructAtEventTool(db_service=_DbService())
         asyncio.run(tool.call(_wrap_event(event), target_name="Bob"))
 
         actions = event.get_extra("astrmai_pending_actions")
         self.assertEqual(len(actions), 2)
-        self.assertEqual(actions[-1]["target_id"], "user-2")
+        self.assertEqual(actions[-1]["target_id"], "222")
+        self.assertEqual(actions[-1]["group_id"], "111")
+        self.assertTrue(actions[-1]["verified_current_group"])
+
+    def test_construct_at_event_rejects_historical_identity_not_in_current_group(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.bot.api = _MapApi(
+            results={
+                "get_group_member_list": {"data": []},
+                "get_group_member_info": {"data": None},
+            }
+        )
+
+        class _DbService:
+            async def resolve_entity_spatio_temporal(self, **kwargs):
+                return "3650815443", "552752264"
+
+        result = asyncio.run(
+            self.mod.ConstructAtEventTool(db_service=_DbService()).call(
+                _wrap_event(event),
+                target_name="萤",
+            )
+        )
+
+        self.assertIn("没有在当前群 111 中确认", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_construct_at_event_can_verify_profile_identity_against_current_group(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.bot.api = _MapApi(
+            results={
+                "get_group_member_list": {"data": []},
+                "get_group_member_info": {"data": {"user_id": "3650815443", "card": "萤"}},
+            }
+        )
+
+        class _DbService:
+            async def resolve_entity_spatio_temporal(self, **kwargs):
+                return "3650815443", "552752264"
+
+        result = asyncio.run(
+            self.mod.ConstructAtEventTool(db_service=_DbService()).call(
+                _wrap_event(event),
+                target_name="萤",
+            )
+        )
+
+        action = event.get_extra("astrmai_pending_actions")[0]
+        self.assertIn("当前群确认", result)
+        self.assertEqual(action["target_id"], "3650815443")
+        self.assertEqual(action["group_id"], "111")
+
+    def test_construct_at_event_does_not_use_fuzzy_name_for_side_effect(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.bot.api = _FakeApi(
+            result={"data": [{"user_id": "888", "card": "萤火虫"}]}
+        )
+
+        result = asyncio.run(
+            self.mod.ConstructAtEventTool(db_service=None).call(
+                _wrap_event(event),
+                target_name="萤",
+            )
+        )
+
+        self.assertIn("没有在当前群 111 中确认", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
 
     def test_group_sign_tool_calls_current_group_only(self):
         event = _FakeEvent(group_id="67890")

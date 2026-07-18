@@ -13,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..contracts.turn_context import ensure_turn_context, get_turn_context
+from .member_action_intent import detect_member_action_candidate, normalize_member_action_purpose
 
 
 @dataclass(slots=True)
@@ -32,6 +33,9 @@ class CognitiveDecision:
     state_bias: str = ""
     risk_flags: list[str] = field(default_factory=list)
     attack_confidence: float = 0.0
+    member_action_purpose: str = ""
+    member_action_target: str = ""
+    member_action_confidence: float = 0.0
 
 
 @dataclass(slots=True)
@@ -88,13 +92,17 @@ class CognitiveLoop:
         'Return strict JSON with keys: action, intent, memory_policy, retrieve_keys, '
         "style_policy, forbid_history_continuation, inner_monologue, reply_need, "
         "social_intent, action_tier, allowed_action_families, stance, state_bias, "
-        "risk_flags, attack_confidence, "
+        "risk_flags, attack_confidence, member_action_purpose, member_action_target, "
+        "member_action_confidence, "
         "need_tool, tool_name, tool_query. "
         "Valid action: reply|wait|ignore|tool_call. "
         "Valid memory_policy: none|light|deep. "
         "Valid social_intent: answer|comfort|tease|pushback|boundary|observe|join|inquire|recall|redirect. "
         "Valid action_tier: none|chat|full|sys3. "
         "Valid allowed_action_families values: wait|query|qq_query|at|poke|meme|resonance|topic|private|withdraw|reaction|qq_reaction|like|sign. "
+        "When a Member action candidate is supplied, classify its actual purpose as exactly one of "
+        "mention_member|lookup_member|discuss_member|unclear. Confirm intent only: copy the supplied target text, "
+        "never invent a QQ number or group id. Use mention_member only when the user truly asks the bot to call/@ that person. "
         "Pushback is allowed only for very obvious direct attacks toward the bot with attack_confidence >= 0.85; "
         "when and only when it is a direct attack toward the bot, include risk_flags item direct_attack_to_bot. "
         "Ordinary disagreement, correction, joking, third-party conflict, distress, or help-seeking must not be pushback. "
@@ -110,7 +118,7 @@ class CognitiveLoop:
         'Required keys: action, intent, memory_policy, retrieve_keys, '
         "style_policy, forbid_history_continuation, inner_monologue, reply_need, "
         "social_intent, action_tier, allowed_action_families, stance, state_bias, "
-        "risk_flags, attack_confidence."
+        "risk_flags, attack_confidence, member_action_purpose, member_action_target, member_action_confidence."
     )
 
     def __init__(self, gateway, memory_engine=None, state_engine=None, config=None):
@@ -349,6 +357,10 @@ class CognitiveLoop:
 
     def _build_initial_prompt(self, event: AstrMessageEvent, prompt_envelope: PromptEnvelope | None) -> str:
         current_text = self._current_text(event, prompt_envelope)
+        member_candidate = detect_member_action_candidate(current_text)
+        member_candidate_data = member_candidate.to_dict() if member_candidate is not None else {}
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_member_action_candidate", member_candidate_data)
         focus_message = getattr(prompt_envelope, "focus_message_text", "") if isinstance(prompt_envelope, PromptEnvelope) else ""
         direct_context = getattr(prompt_envelope, "direct_context_text", "") if isinstance(prompt_envelope, PromptEnvelope) else ""
         related_context = getattr(prompt_envelope, "related_context_text", "") if isinstance(prompt_envelope, PromptEnvelope) else ""
@@ -387,6 +399,8 @@ class CognitiveLoop:
         return (
             "Current message:\n"
             f"{self._truncate(safe_current_text, 600)}\n\n"
+            "Member action candidate (rule proposal; semantically confirm purpose only):\n"
+            f"{json.dumps(member_candidate_data, ensure_ascii=False)}\n\n"
             "Focused clue:\n"
             f"{self._truncate(safe_focus_message, 500)}\n\n"
             "Direct context:\n"
@@ -505,6 +519,9 @@ class CognitiveLoop:
         action_tier = self._normalize_action_tier(data.get("action_tier"), action, social_intent)
         if reply_need in {"wait", "ignore"} and action_tier != "none":
             action_tier = "none"
+        member_action_purpose = normalize_member_action_purpose(data.get("member_action_purpose"))
+        member_action_target = str(data.get("member_action_target", "") or "").strip()
+        member_action_confidence = self._normalize_confidence(data.get("member_action_confidence"))
         return CognitiveDecision(
             action=action,
             intent=str(data.get("intent", "") or "").strip(),
@@ -521,6 +538,9 @@ class CognitiveLoop:
             state_bias=str(data.get("state_bias", "") or "").strip(),
             risk_flags=risk_flags,
             attack_confidence=attack_confidence,
+            member_action_purpose=member_action_purpose,
+            member_action_target=member_action_target,
+            member_action_confidence=member_action_confidence,
         )
 
     @staticmethod
