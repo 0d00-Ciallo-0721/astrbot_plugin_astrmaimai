@@ -162,6 +162,19 @@ class ReplyConfig(BaseModel):
     enable_content_safety_filter: bool = Field(default=False, description="启用基础内容安全过滤（NSFW/自残/PII 检测）")
 
 
+class TTSConfig(BaseModel):
+    enabled: bool = Field(default=False, description="启用 TTS 语音回复")
+    plugin_name: str = Field(default="astrbot_plugin_tts_llm", description="提供语音合成能力的 AstrBot 插件目录名或插件名")
+    enable_private: bool = Field(default=True, description="私聊中允许发送 TTS 语音")
+    enable_group: bool = Field(default=False, description="群聊中允许发送 TTS 语音")
+    group_probability: int = Field(default=10, ge=0, le=100, description="群聊中命中语音回复的概率百分比")
+    group_require_direct_trigger: bool = Field(default=True, description="群聊中仅在 @、回复、戳一戳或主动唤醒等明确触发场景尝试 TTS")
+    send_text_with_audio: bool = Field(default=True, description="启用 TTS 时是否仍发送文字回复")
+    min_text_length: int = Field(default=2, ge=1, description="短于该长度的回复不尝试 TTS")
+    max_text_length: int = Field(default=120, ge=1, description="长于该长度的回复不尝试 TTS")
+    silent_on_failure: bool = Field(default=True, description="TTS 失败时只记录日志，不向用户发送错误提示")
+
+
 class ConversationConfig(BaseModel):
     enable_dialogue_store: bool = Field(default=True)
     enable_context_compaction: bool = Field(default=True)
@@ -318,6 +331,7 @@ class AstrMaiConfig(BaseModel):
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     life: LifeConfig = Field(default_factory=LifeConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     infra: InfraConfig = Field(default_factory=InfraConfig)

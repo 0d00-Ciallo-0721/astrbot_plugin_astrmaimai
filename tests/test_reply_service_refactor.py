@@ -84,6 +84,116 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             mood_manager=SimpleNamespace(),
         )
 
+    def _enable_tts(self, service, **overrides):
+        values = {
+            "enabled": True,
+            "plugin_name": "astrbot_plugin_tts_llm",
+            "enable_private": True,
+            "enable_group": False,
+            "group_probability": 10,
+            "group_require_direct_trigger": True,
+            "send_text_with_audio": True,
+            "min_text_length": 2,
+            "max_text_length": 120,
+            "silent_on_failure": True,
+        }
+        values.update(overrides)
+        service.config.tts = SimpleNamespace(**values)
+        service.tts_bridge.refresh_config(service.config)
+        return service.config.tts
+
+    def _install_tts_plugin(self, service, plugin):
+        metadata = SimpleNamespace(
+            root_dir_name="astrbot_plugin_tts_llm",
+            name="astrbot_plugin_tts_llm",
+            star_cls=plugin,
+        )
+        service.state_engine.gateway.context.get_all_stars = lambda: [metadata]
+
+    def test_tts_disabled_preserves_text_only_reply(self):
+        service = self._service()
+        plugin = SimpleNamespace(hiy_tts_from_text=AsyncMock(return_value=["voice"]))
+        self._install_tts_plugin(service, plugin)
+        event = FakeEvent("user-1", "Alice", "hello")
+
+        artifact = asyncio.run(service.handle_reply(event, "你好呀", event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        plugin.hiy_tts_from_text.assert_not_called()
+
+    def test_private_tts_appends_voice_after_text(self):
+        service = self._service()
+        self._enable_tts(service, send_text_with_audio=True)
+        plugin = SimpleNamespace(hiy_tts_from_text=AsyncMock(return_value=["voice"]))
+        self._install_tts_plugin(service, plugin)
+        event = FakeEvent("user-1", "Alice", "hello")
+        event.unified_msg_origin = "default:FriendMessage:user-1"
+
+        artifact = asyncio.run(service.handle_reply(event, "你好呀", event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertTrue(artifact.metadata["tts_sent"])
+        plugin.hiy_tts_from_text.assert_awaited_once_with(event=event, text="你好呀", visible_text="")
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 2)
+        text_chain = service.state_engine.gateway.context.sent[0][1].chain
+        voice_chain = service.state_engine.gateway.context.sent[1][1].chain
+        self.assertEqual(getattr(text_chain[0], "text", ""), "你好呀")
+        self.assertEqual(voice_chain, ["voice"])
+
+    def test_group_tts_requires_direct_trigger(self):
+        service = self._service()
+        self._enable_tts(service, enable_group=True, group_probability=100, group_require_direct_trigger=True)
+        plugin = SimpleNamespace(hiy_tts_from_text=AsyncMock(return_value=["voice"]))
+        self._install_tts_plugin(service, plugin)
+        event = FakeEvent("user-1", "Alice", "hello")
+
+        artifact = asyncio.run(service.handle_reply(event, "你好呀", event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertNotIn("tts_sent", artifact.metadata)
+        plugin.hiy_tts_from_text.assert_not_called()
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+
+    def test_group_tts_direct_trigger_can_send_voice(self):
+        service = self._service()
+        self._enable_tts(service, enable_group=True, group_probability=100, group_require_direct_trigger=True)
+        plugin = SimpleNamespace(hiy_tts_from_text=AsyncMock(return_value=["voice"]))
+        self._install_tts_plugin(service, plugin)
+        event = FakeEvent("user-1", "Alice", "hello")
+        event.set_extra("astrmai_is_direct_call", True)
+
+        artifact = asyncio.run(service.handle_reply(event, "你好呀", event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertTrue(artifact.metadata["tts_sent"])
+        plugin.hiy_tts_from_text.assert_awaited_once()
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 2)
+
+    def test_tts_send_failure_does_not_break_text_reply(self):
+        service = self._service()
+        self._enable_tts(service, send_text_with_audio=True)
+        plugin = SimpleNamespace(hiy_tts_from_text=AsyncMock(return_value=["voice"]))
+        self._install_tts_plugin(service, plugin)
+        event = FakeEvent("user-1", "Alice", "hello")
+        event.unified_msg_origin = "default:FriendMessage:user-1"
+        sent = []
+
+        async def _send_message(_umo, chain):
+            sent.append(chain)
+            if len(sent) == 2:
+                raise RuntimeError("voice transport failed")
+            return None
+
+        service.state_engine.gateway.context.send_message = _send_message
+
+        artifact = asyncio.run(service.handle_reply(event, "你好呀", event.unified_msg_origin))
+
+        self.assertTrue(artifact.sent)
+        self.assertFalse(artifact.metadata["tts_sent"])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(getattr(sent[0].chain[0], "text", ""), "你好呀")
+
     def _build_memory_summarizer(self, *, threshold=2):
         sys.modules.pop("astrmai.memory.services.summarizer", None)
         summarizer_mod = importlib.import_module("astrmai.memory.services.summarizer")

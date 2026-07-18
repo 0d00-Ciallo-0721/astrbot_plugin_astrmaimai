@@ -428,35 +428,66 @@ class ReplyArtifactMixin:
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_reply_send_key", send_key)
 
+        tts_bridge = getattr(self, "tts_bridge", None)
+        try_tts = bool(tts_bridge and tts_bridge.should_try_tts(event, chat_id, artifact))
+        send_text_segments = True if not try_tts else bool(tts_bridge.should_send_text())
         outbound_message_ids: list[str] = []
         sent_segment_count = 0
         try:
-            for index, seg in enumerate(artifact.segments):
-                freshness_state, stale_reason = await self._check_reply_freshness(event, event.unified_msg_origin)
-                if freshness_state == FreshnessState.EXPIRED:
-                    logger.info(
-                        f"[ReplyService] stopped stale segmented reply for {event.unified_msg_origin}: {stale_reason} | segment_index={index}"
-                    )
-                    break
+            if send_text_segments:
+                for index, seg in enumerate(artifact.segments):
+                    freshness_state, stale_reason = await self._check_reply_freshness(event, event.unified_msg_origin)
+                    if freshness_state == FreshnessState.EXPIRED:
+                        logger.info(
+                            f"[ReplyService] stopped stale segmented reply for {event.unified_msg_origin}: {stale_reason} | segment_index={index}"
+                        )
+                        break
 
-                chain = MessageChain()
-                if index == 0 and at_targets:
-                    for target_id in at_targets:
-                        uid: Any = int(target_id) if str(target_id).isdigit() else target_id
-                        chain.chain.append(_at_component(uid))
-                    chain.chain.append(_plain_component(" "))
-                chain.chain.append(_plain_component(seg))
-                sent_result = await context.send_message(event.unified_msg_origin, chain)
+                    chain = MessageChain()
+                    if index == 0 and at_targets:
+                        for target_id in at_targets:
+                            uid: Any = int(target_id) if str(target_id).isdigit() else target_id
+                            chain.chain.append(_at_component(uid))
+                        chain.chain.append(_plain_component(" "))
+                    chain.chain.append(_plain_component(seg))
+                    sent_result = await context.send_message(event.unified_msg_origin, chain)
+                    if sent_result is not None and not isinstance(sent_result, bool):
+                        outbound_message_ids.append(str(sent_result))
+                    artifact.sent = True
+                    sent_segment_count += 1
+                    if not event.get_extra("astrmai_reply_sent", False):
+                        emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
+
+                    if index < len(artifact.segments) - 1:
+                        delay = self._segment_send_delay(seg, str(artifact.metadata.get("delay_profile", "default") or "default"))
+                        await asyncio.sleep(delay)
+            if try_tts:
+                tts_payload = await tts_bridge.build_tts_chain(event, context, artifact)
+                sent_result = None
+                if tts_payload:
+                    chain = MessageChain()
+                    if hasattr(tts_payload, "chain"):
+                        chain.chain.extend(list(getattr(tts_payload, "chain", []) or []))
+                    elif isinstance(tts_payload, (list, tuple)):
+                        chain.chain.extend(tts_payload)
+                    else:
+                        chain.chain.append(tts_payload)
+                    if chain.chain:
+                        try:
+                            sent_result = await context.send_message(event.unified_msg_origin, chain)
+                            artifact.metadata["tts_sent"] = True
+                            artifact.sent = True
+                            if not send_text_segments:
+                                sent_segment_count = len(artifact.segments)
+                                if not event.get_extra("astrmai_reply_sent", False):
+                                    emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
+                        except Exception as exc:
+                            artifact.metadata["tts_sent"] = False
+                            logger.debug(f"[ReplyService] optional TTS send degraded for {chat_id}: {exc}")
+                else:
+                    artifact.metadata["tts_sent"] = False
                 if sent_result is not None and not isinstance(sent_result, bool):
                     outbound_message_ids.append(str(sent_result))
-                artifact.sent = True
-                sent_segment_count += 1
-                if not event.get_extra("astrmai_reply_sent", False):
-                    emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
-
-                if index < len(artifact.segments) - 1:
-                    delay = self._segment_send_delay(seg, str(artifact.metadata.get("delay_profile", "default") or "default"))
-                    await asyncio.sleep(delay)
         except Exception as exc:
             if artifact.sent:
                 artifact.metadata["send_status"] = "partial_sent"

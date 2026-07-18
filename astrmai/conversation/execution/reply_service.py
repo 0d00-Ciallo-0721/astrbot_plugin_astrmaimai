@@ -42,6 +42,7 @@ from .reply_artifact_builder import ReplyArtifactMixin
 from .reply_freshness import ReplyFreshnessMixin
 from .reply_post_send import ReplyPostSendMixin
 from .qq_action_dispatcher import QQActionDispatcher
+from .tts_bridge import TTSBridge
 
 
 class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
@@ -57,6 +58,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             config=self.config,
             runtime_coordinator=runtime_coordinator,
         )
+        self.tts_bridge = TTSBridge(config=self.config)
 
         self.segmentation_threshold = self.config.reply.segment_min_len
         self.no_segment_limit = self.config.reply.no_segment_max_len
@@ -76,6 +78,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             max_length=self.no_segment_limit,
         )
         self.qq_action_dispatcher.refresh_config(config)
+        self.tts_bridge.refresh_config(config)
 
     async def handle_reply(
         self,

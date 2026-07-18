@@ -408,6 +408,72 @@
       }
     }
   },
+  "tts": {
+    "type": "object",
+    "description": "TTS 语音回复",
+    "items": {
+      "enabled": {
+        "description": "启用 TTS 语音回复",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，AstrMai 会尝试调用独立的妃爱 TTS 插件，把部分文字回复额外合成为语音。关闭时完全保持原文字回复逻辑。"
+      },
+      "plugin_name": {
+        "description": "TTS 插件名称",
+        "type": "string",
+        "default": "astrbot_plugin_tts_llm",
+        "hint": "提供语音合成能力的 AstrBot 插件目录名或插件注册名。通常保持默认即可。"
+      },
+      "enable_private": {
+        "description": "私聊启用 TTS",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，私聊回复会在满足长度等条件时尝试附带语音。"
+      },
+      "enable_group": {
+        "description": "群聊启用 TTS",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，群聊在明确触发并命中概率时才会尝试附带语音。建议先保持关闭，灰度观察后再开启。"
+      },
+      "group_probability": {
+        "description": "群聊 TTS 触发概率（%）",
+        "type": "int",
+        "default": 10,
+        "hint": "群聊允许 TTS 后，每次回复命中语音合成的概率。0 表示群聊不发语音，100 表示符合条件时每次都尝试。"
+      },
+      "group_require_direct_trigger": {
+        "description": "群聊仅明确触发时使用 TTS",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，群聊只有在 @、回复机器人、戳一戳、主动唤醒等明确互动场景下才会尝试语音，避免普通插话打扰群聊。"
+      },
+      "send_text_with_audio": {
+        "description": "语音时仍发送文字",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，文字回复照常发送，语音作为额外补充；TTS 失败时用户仍能看到文字。关闭后会尽量只发语音，失败则静默。"
+      },
+      "min_text_length": {
+        "description": "TTS 最短文本长度",
+        "type": "int",
+        "default": 2,
+        "hint": "短于该长度的回复不会合成语音。"
+      },
+      "max_text_length": {
+        "description": "TTS 最长文本长度",
+        "type": "int",
+        "default": 120,
+        "hint": "长于该长度的回复不会合成语音，避免长语音等待过久。"
+      },
+      "silent_on_failure": {
+        "description": "TTS 失败静默处理",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，TTS 插件不可用、模型分析失败或合成失败时，只写日志，不向聊天窗口发送错误提示。"
+      }
+    }
+  },
   "attention": {
     "type": "object",
     "description": "群聊注意力与触发控制",
