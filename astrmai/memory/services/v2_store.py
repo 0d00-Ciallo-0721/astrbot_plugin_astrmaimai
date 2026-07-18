@@ -1192,6 +1192,7 @@ class MemoryV2Store:
         *,
         session_id: str = "",
         persona_id: str = "",
+        source: str = "",
         kind: str = "",
         status: str = "",
         limit: int = 100,
@@ -1209,6 +1210,9 @@ class MemoryV2Store:
         if persona_id:
             where.append("persona_id = ?")
             params.append(persona_id)
+        if source:
+            where.append("source = ?")
+            params.append(source)
         if kind:
             where.append("kind = ?")
             params.append(kind)

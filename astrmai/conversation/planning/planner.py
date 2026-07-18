@@ -90,6 +90,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         # Replace with dict[chat_id, list[dict]] when multi-chat contention is observed.
         self.cognitive_decision_history: list[dict] = []
         self.tool_trace_history: list[dict] = []
+        self.tool_execution_history: list[dict] = []
         self.turn_trace_history: list[dict] = []
         self.follow_up_cooldowns: dict[str, float] = {}
         self.dialogue_store = getattr(getattr(self.context_engine, "db", None), "dialogue_store", None)
@@ -682,6 +683,49 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             turn_context.perception.sender_name = str(event.get_sender_name() or "")
         if not turn_context.perception.text:
             turn_context.perception.text = str(getattr(event, "message_str", "") or "")
+        tool_execution_trace = list(event.get_extra("astrmai_tool_execution_trace", []) or []) if hasattr(event, "get_extra") else []
+        tool_lifecycle_trace = list(event.get_extra("astrmai_tool_lifecycle_trace", []) or []) if hasattr(event, "get_extra") else []
+        execution_items: list[dict] = []
+        for execution in tool_execution_trace:
+            if not isinstance(execution, dict):
+                continue
+            tool_name = str(execution.get("tool_name", "") or "").strip()
+            if not tool_name:
+                continue
+            matching_lifecycle = [
+                dict(entry)
+                for entry in tool_lifecycle_trace
+                if isinstance(entry, dict) and str(entry.get("tool", "") or "") == tool_name
+            ]
+            execution_items.append(
+                {
+                    "created_at": max(
+                        [float(entry.get("at", 0.0) or 0.0) for entry in matching_lifecycle] or [time.time()]
+                    ),
+                    "chat_id": str(chat_id or ""),
+                    "tool_name": tool_name,
+                    "status": str(execution.get("status", "success") or "success"),
+                    "lifecycle": matching_lifecycle[-8:],
+                }
+            )
+        for lifecycle in tool_lifecycle_trace:
+            if not isinstance(lifecycle, dict) or str(lifecycle.get("phase", "") or "") != "action_queued":
+                continue
+            tool_name = str(lifecycle.get("tool", "") or "").strip()
+            if not tool_name or any(item["tool_name"] == tool_name for item in execution_items):
+                continue
+            execution_items.append(
+                {
+                    "created_at": float(lifecycle.get("at", 0.0) or time.time()),
+                    "chat_id": str(chat_id or ""),
+                    "tool_name": tool_name,
+                    "status": "queued",
+                    "lifecycle": [dict(lifecycle)],
+                }
+            )
+        if execution_items:
+            self.tool_execution_history = [*self.tool_execution_history, *execution_items][-500:]
+
         item = build_turn_trace_summary(
             turn_context,
             created_at=time.time(),
@@ -689,6 +733,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_sent=(bool(event.get_extra("astrmai_reply_sent", False)) if hasattr(event, "get_extra") else False) or bool(reply_text),
             reply_preview=str(reply_text or ""),
         )
+        item["tool_execution_trace"] = execution_items
+        item["tool_lifecycle_trace"] = [dict(entry) for entry in tool_lifecycle_trace if isinstance(entry, dict)][-64:]
         self.turn_trace_history = [*self.turn_trace_history, item][-300:]
         if self.turn_trace_store is not None and hasattr(self.turn_trace_store, "append"):
             try:

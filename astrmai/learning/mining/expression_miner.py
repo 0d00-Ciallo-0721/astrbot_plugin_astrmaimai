@@ -25,6 +25,7 @@ class ExpressionMiner:
             min_count=getattr(evolution_config, "expression_min_count", 2)
         )
         self.enricher = ExpressionPatternEnricher(gateway, config=self.config)
+        self.last_report: dict[str, Any] = {}
 
     @staticmethod
     def _normalize_messages(messages: List[MessageLog]) -> list[MessageLog]:
@@ -62,6 +63,15 @@ class ExpressionMiner:
         min_context = getattr(self.config.evolution, "min_mining_context", 10)
         normalized = self._normalize_messages(messages)
         if len(normalized) < min_context:
+            self.last_report = {
+                "group_id": group_id,
+                "input_messages": len(messages or []),
+                "normalized_messages": len(normalized),
+                "min_context": min_context,
+                "candidate_count": 0,
+                "enriched_count": 0,
+                "reason": "insufficient_context",
+            }
             return []
         existing = await self._existing_patterns(group_id)
         candidates = await self.candidate_extractor.extract(
@@ -70,8 +80,27 @@ class ExpressionMiner:
             existing_patterns=existing,
         )
         if not candidates:
+            self.last_report = {
+                "group_id": group_id,
+                "input_messages": len(messages or []),
+                "normalized_messages": len(normalized),
+                "min_context": min_context,
+                "existing_patterns": len(existing),
+                **dict(self.candidate_extractor.last_report or {}),
+                "enriched_count": 0,
+            }
             return []
         enriched = await self.enricher.enrich(group_id, candidates)
+        self.last_report = {
+            "group_id": group_id,
+            "input_messages": len(messages or []),
+            "normalized_messages": len(normalized),
+            "min_context": min_context,
+            "existing_patterns": len(existing),
+            **dict(self.candidate_extractor.last_report or {}),
+            "enriched_count": len(enriched),
+            "reason": "completed" if enriched else "enrichment_empty",
+        }
         logger.info(f"[ExpressionMiner] 表达习惯挖掘完成: {group_id} -> patterns={len(enriched)}")
         return enriched
 

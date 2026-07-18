@@ -139,10 +139,19 @@ class ChatRuntimeService:
         chat_id: str | None = None,
         source: str | None = None,
         limit: int = 30,
+        offset: int = 0,
     ) -> dict[str, Any]:
         engine = self._api.get_memory_engine()
         if not engine:
             return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
+        if hasattr(engine, "list_cognitive_feedback_records"):
+            page = await engine.list_cognitive_feedback_records(
+                session_id=str(chat_id or ""),
+                source=str(source or ""),
+                limit=limit,
+                offset=offset,
+            )
+            return {"status": "ok", **dict(page or {}), "runtime_bound": True}
         signals = []
         source_filter = {source} if source else None
         if chat_id and hasattr(engine, "get_cognitive_feedback"):
@@ -164,6 +173,9 @@ class ChatRuntimeService:
         engine = self._api.get_memory_engine()
         if not engine:
             return {"status": "ok", "changed": False, "runtime_bound": False}
+        if hasattr(engine, "disable_cognitive_feedback_record") and str(feedback_id or "").startswith("mem_"):
+            changed = await engine.disable_cognitive_feedback_record(feedback_id)
+            return {"status": "ok", "changed": bool(changed), "runtime_bound": True, "persisted": True}
         for cached_items in getattr(engine, "_cognitive_feedback_cache", {}).values():
             for signal in cached_items:
                 if self._feedback_id(signal) == feedback_id:

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from astrmai.learning.mining.jargon_miner import JargonMiner
 from astrmai.learning.mining.expression_candidate_extractor import ExpressionCandidateExtractor
+from astrmai.learning.mining.jargon_candidate_extractor import JargonCandidateExtractor
 from astrmai.learning.mining.expression_pattern_enricher import ExpressionPatternEnricher
 from astrmai.learning.mining.social_relation_miner import SocialRelationMiner
 
@@ -63,6 +64,42 @@ class MiningHelpersMigratedTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["expression"], "ship it softly")
         self.assertEqual(result[0]["count"], 2)
+
+    def test_expression_candidate_extractor_finds_repeated_phrase_across_variants(self):
+        extractor = ExpressionCandidateExtractor(min_count=2)
+
+        async def _run():
+            return await extractor.extract(
+                "group-phrase",
+                [
+                    SimpleNamespace(content="唉嘿嘿，今天也见到哥哥啦"),
+                    SimpleNamespace(content="唉嘿嘿～这次可不会被骗了"),
+                    SimpleNamespace(content="今天晚上吃什么"),
+                ],
+            )
+
+        result = asyncio.run(_run())
+        self.assertTrue(any(item["expression"] == "唉嘿嘿" for item in result))
+        phrase = next(item for item in result if item["expression"] == "唉嘿嘿")
+        self.assertEqual(phrase["candidate_type"], "phrase")
+        self.assertEqual(phrase["count"], 2)
+
+    def test_jargon_candidate_extractor_rejects_protocol_commands_and_usernames(self):
+        extractor = JargonCandidateExtractor(min_count=2)
+        messages = [
+            SimpleNamespace(sender_name="萤", content="[At:2715245266] /抽卡 at_type at_tinyid astrbot hiyohiyo"),
+            SimpleNamespace(sender_name="萤", content="<img src='x.jpg'> at_type at_tinyid astrbot hiyohiyo"),
+            SimpleNamespace(sender_name="路人", content="萤今天又说 hiyohiyo"),
+        ]
+
+        result = asyncio.run(extractor.extract("group-1", messages))
+        contents = {item["content"] for item in result}
+
+        self.assertIn("hiyohiyo", contents)
+        self.assertNotIn("at_type", contents)
+        self.assertNotIn("at_tinyid", contents)
+        self.assertNotIn("astrbot", contents)
+        self.assertNotIn("萤", contents)
 
     def test_expression_pattern_enricher_degrades_to_candidate_payload(self):
         class _Gateway:

@@ -858,9 +858,43 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("旧实体图谱", js)
         self.assertIn("黑话字典", js)
         self.assertIn("memory-feedback", js)
-        self.assertIn('api.get("/memory-feedback?limit=50")', js)
+        self.assertIn('api.get(`/memory-feedback?limit=${page.limit}&offset=${page.offset}`)', js)
+        self.assertIn('"/tools/executions?limit=50"', js)
         self.assertIn('api.get("/memory-feedback/sources")', js)
         self.assertIn('api.post(`/memory-feedback/${segment(button.dataset.disableFeedback)}/disable`)', js)
+
+    def test_jargon_cleanup_preview_and_apply_are_non_destructive(self):
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        service = MemoryUiService(db_factory=None)
+
+        async def _list_jargon(**kwargs):
+            if kwargs.get("status") == "review_pending":
+                return {
+                    "items": [
+                        {"id": "j-1", "content": "at_type", "status": "review_pending", "confidence": 0.8},
+                        {"id": "j-2", "content": "hiyohiyo", "status": "review_pending", "meaning": "招呼语", "examples": ["hiyohiyo", "hiyohiyo"]},
+                    ]
+                }
+            return {"items": []}
+
+        rejected = []
+
+        async def _reject(jargon_id, data=None):
+            rejected.append((jargon_id, dict(data or {})))
+            return {"status": "ok"}
+
+        service.list_jargon = _list_jargon
+        service.reject_jargon = _reject
+        preview = asyncio.run(service.jargon_cleanup_preview())
+        result = asyncio.run(service.apply_jargon_cleanup({"action": "reject", "ids": ["j-1"]}))
+
+        self.assertEqual([item["id"] for item in preview["items"]], ["j-1"])
+        self.assertEqual(preview["obvious_count"], 1)
+        self.assertFalse(preview["destructive"])
+        self.assertEqual(result["changed"], ["j-1"])
+        self.assertFalse(result["physical_delete"])
+        self.assertEqual(rejected[0][0], "j-1")
 
     def test_admin_service_exposes_memory_observability_views(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
@@ -2441,6 +2475,60 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 return counts
 
             self.assertEqual(asyncio.run(run()), [0, 0, 0])
+
+    def test_admin_service_separates_tool_disclosure_from_executions(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Planner:
+            tool_trace_history = [{"chat_id": "chat-1", "tool_names": ["proactive_poke"]}]
+            tool_execution_history = [
+                {
+                    "created_at": 20.0,
+                    "chat_id": "chat-1",
+                    "tool_name": "proactive_poke",
+                    "status": "queued",
+                }
+            ]
+
+        class _Runtime:
+            system2_planner = _Planner()
+
+        service = service_mod.AdminUiService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
+        disclosed = asyncio.run(service.recent_tool_traces(chat_id="chat-1"))
+        executed = asyncio.run(service.recent_tool_executions(chat_id="chat-1"))
+
+        self.assertEqual(disclosed["items"][0]["tool_names"], ["proactive_poke"])
+        self.assertEqual(executed["items"][0]["tool_name"], "proactive_poke")
+        self.assertEqual(executed["items"][0]["status"], "queued")
+
+    def test_heartflow_status_explains_scheduler_active_manager_idle(self):
+        service_mod = importlib.import_module("astrmai.webui.backend.services.heartflowservice")
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+
+        class _Manager:
+            @staticmethod
+            def describe_status():
+                return {"enabled": True, "active_chats": 0, "last_tick_time": 0.0}
+
+        class _Kernel:
+            @staticmethod
+            def describe_status_sync():
+                return {"tracked_chats": 5, "last_due_selection_summary": {"selected_count": 1}}
+
+        class _Runtime:
+            proactive_task = SimpleNamespace(heartflow_manager=_Manager())
+            chat_loop_kernel = _Kernel()
+
+        service = service_mod.HeartflowService(
+            adapter_mod.PluginApiAdapter(facade=_RuntimeBackedFacade(_Runtime()))
+        )
+        result = asyncio.run(service.heartflow_status())
+
+        self.assertEqual(result["data"]["operational_state"], "scheduler_active_manager_idle")
+        self.assertEqual(result["data"]["kernel"]["tracked_chats"], 5)
 
 
 if __name__ == "__main__":

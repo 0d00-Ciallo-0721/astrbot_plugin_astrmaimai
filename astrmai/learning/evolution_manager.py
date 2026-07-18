@@ -248,6 +248,10 @@ class EvolutionManager:
                 "worker_running": bool(self._backlog_task is not None and not self._backlog_task.done()),
                 "last_report": dict(self._last_backlog_report or {}),
             },
+            "mining": {
+                "expression": dict(getattr(self.expression_miner, "last_report", {}) or {}),
+                "jargon": dict(getattr(self.jargon_miner, "last_report", {}) or {}),
+            },
         }
 
     @staticmethod

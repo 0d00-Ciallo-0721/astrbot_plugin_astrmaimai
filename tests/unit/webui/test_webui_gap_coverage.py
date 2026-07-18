@@ -261,8 +261,11 @@ class WebUiGapCoverageTests(unittest.TestCase):
 
         self.assertIn('reviewTab: "jargon_pending"', source)
         self.assertIn('memoryTab: "canonical"', source)
-        self.assertIn('api.get("/memories/jargon?status=review_pending&limit=200")', source)
-        self.assertIn('api.get(`/memories/canonical?limit=${memoryState.limit}&offset=${memoryState.offset}${kindParam}`)', source)
+        self.assertIn("const REVIEW_PAGE_SIZE = 25", source)
+        self.assertIn("const MEMORY_PAGE_SIZE = 25", source)
+        self.assertIn('api.get(`/memories/jargon?${statusParam}limit=${target.limit}&offset=${target.offset}${query}`)', source)
+        self.assertIn('api.get(`/memories/canonical?limit=${target.limit}&offset=${target.offset}${kindParam}`)', source)
+        self.assertIn('renderOffsetPager(state.reviewTab === "jargon_pending" ? "jargon-pending" : "jargon-all", activePage)', source)
         self.assertIn('{ id: "canonical", label: "Canonical 总览" }', source)
         self.assertIn("openJargonCalibration", source)
         self.assertIn("openExpressionCalibration", source)

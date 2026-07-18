@@ -573,6 +573,54 @@ class MemoryEngine:
                 break
         return unique
 
+    async def list_cognitive_feedback_records(
+        self,
+        *,
+        session_id: str = "",
+        source: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        page = await self.v2_store.list_canonical(
+            session_id=str(session_id or ""),
+            source=str(source or "").strip().lower(),
+            kind="feedback",
+            limit=max(1, min(int(limit or 50), 300)),
+            offset=max(0, int(offset or 0)),
+            include_inactive=True,
+        )
+        items: list[dict[str, Any]] = []
+        for candidate in list(page.get("items", []) or []):
+            candidate_source = str(candidate.get("source", "unknown") or "unknown").strip().lower()
+            metadata = dict(candidate.get("metadata", {}) or {})
+            items.append(
+                {
+                    "id": str(candidate.get("id", "") or ""),
+                    "chat_id": str(candidate.get("session_id", "") or ""),
+                    "session_id": str(candidate.get("session_id", "") or ""),
+                    "source": candidate_source,
+                    "summary": str(candidate.get("summary", "") or ""),
+                    "guidance": str(metadata.get("guidance", "") or ""),
+                    "tags": list(candidate.get("tags", []) or []),
+                    "timestamp": float(candidate.get("created_at", 0.0) or 0.0),
+                    "importance": float(candidate.get("importance", 0.5) or 0.5),
+                    "status": str(candidate.get("status", "active") or "active"),
+                    "persisted": True,
+                }
+            )
+        return {
+            "items": items,
+            "total": int(page.get("total", len(items)) or 0),
+            "limit": int(page.get("limit", limit) or limit),
+            "offset": int(page.get("offset", offset) or offset),
+        }
+
+    async def disable_cognitive_feedback_record(self, memory_id: str) -> bool:
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return False
+        return bool(await self.maintenance_service.soft_delete(clean_id, reason="webui_feedback_disabled"))
+
     async def clear_persona_lore(self, persona_id: str = None) -> int:
         return await self.maintenance_service.soft_delete_by_filter(
             kind="persona_lore",

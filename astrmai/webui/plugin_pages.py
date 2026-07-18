@@ -174,6 +174,13 @@ class AstrMaiAdminPageApi:
             limit=self._int(query.get("limit"), 50),
         )
 
+    async def recent_tool_executions(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        return await self._admin().recent_tool_executions(
+            chat_id=str(query.get("chat_id", "") or "") or None,
+            limit=self._int(query.get("limit"), 50),
+        )
+
     async def recent_decisions(self, request: Any) -> dict[str, Any]:
         query = self._query(request)
         return await self._admin().recent_decisions(limit=self._int(query.get("limit"), 50))
@@ -344,6 +351,7 @@ class AstrMaiAdminPageApi:
             chat_id=query.get("chat_id"),
             source=query.get("source"),
             limit=self._int(query.get("limit"), 50),
+            offset=self._int(query.get("offset"), 0),
         )
 
     async def memory_feedback_sources(self, request: Any) -> dict[str, Any]:
@@ -517,6 +525,17 @@ class AstrMaiAdminPageApi:
     async def create_jargon(self, request: Any) -> dict[str, Any]:
         return await self._memory().create_jargon(await self._body(request))
 
+    async def jargon_cleanup_preview(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        include_active = str(query.get("include_active", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        return await self._memory().jargon_cleanup_preview(
+            include_active=include_active,
+            limit=self._int(query.get("limit"), 300),
+        )
+
+    async def apply_jargon_cleanup(self, request: Any) -> dict[str, Any]:
+        return await self._memory().apply_jargon_cleanup(await self._body(request))
+
     async def update_jargon(self, request: Any) -> dict[str, Any]:
         return await self._memory().update_jargon(str(self._path(request).get("id", "")), await self._body(request))
 
@@ -633,6 +652,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/tools/status", api.tools_status, "AstrMai tools status"),
         ("GET", "/tools/policy", api.tools_policy, "AstrMai tools policy"),
         ("GET", "/tools/recent-calls", api.recent_tool_calls, "AstrMai recent tool calls"),
+        ("GET", "/tools/executions", api.recent_tool_executions, "AstrMai recent tool executions"),
         ("GET", "/tools/chats/{chat_id}/recent-calls", api.chat_recent_tool_calls, "AstrMai chat tool calls"),
         ("GET", "/cognition/recent-decisions", api.recent_decisions, "AstrMai recent cognition decisions"),
         ("GET", "/cognition/chats/{chat_id}/recent-decisions", api.chat_recent_decisions, "AstrMai chat cognition decisions"),
@@ -664,9 +684,9 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/proactive/diary/status", api.diary_status, "AstrMai diary status"),
         ("POST", "/proactive/diary/run-once", api.run_diary_once, "AstrMai run diary once"),
         ("GET", "/proactive/wakeup/status", api.wakeup_status, "AstrMai wakeup status"),
-        ("GET", "/memory-feedback", api.list_memory_feedback, "AstrMai 璁板繂鍙嶉"),
-        ("GET", "/memory-feedback/sources", api.memory_feedback_sources, "AstrMai 璁板繂鍙嶉鏉ユ簮"),
-        ("POST", "/memory-feedback/{feedback_id}/disable", api.disable_memory_feedback, "AstrMai 绂佺敤璁板繂鍙嶉"),
+        ("GET", "/memory-feedback", api.list_memory_feedback, "AstrMai 记忆反馈"),
+        ("GET", "/memory-feedback/sources", api.memory_feedback_sources, "AstrMai 记忆反馈来源"),
+        ("POST", "/memory-feedback/{feedback_id}/disable", api.disable_memory_feedback, "AstrMai 禁用记忆反馈"),
 
 
         ("GET", "/chats/active", api.active_chats, "AstrMai active chats"),
@@ -697,6 +717,8 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/memories/nodes/{id}/delete", api.delete_node, "AstrMai delete memory node"),
         ("DELETE", "/memories/nodes/{id}", api.delete_node, "AstrMai delete memory node"),
         ("GET", "/memories/jargon", api.list_jargon, "AstrMai jargon list"),
+        ("GET", "/memories/jargon/cleanup/preview", api.jargon_cleanup_preview, "AstrMai jargon cleanup preview"),
+        ("POST", "/memories/jargon/cleanup/apply", api.apply_jargon_cleanup, "AstrMai apply jargon cleanup"),
         ("POST", "/memories/jargon", api.create_jargon, "AstrMai create jargon"),
         ("POST", "/memories/jargon/{id}/approve", api.approve_jargon, "AstrMai approve jargon"),
         ("POST", "/memories/jargon/{id}/reject", api.reject_jargon, "AstrMai reject jargon"),

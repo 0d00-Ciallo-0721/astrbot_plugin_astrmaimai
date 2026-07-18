@@ -4,7 +4,7 @@ from astrbot.api import logger
 
 from .jargon_candidate_extractor import JargonCandidateExtractor
 from .jargon_enricher import JargonEnricher
-from typing import Iterable, List, Sequence
+from typing import Any, Iterable, List, Sequence
 
 
 class JargonMiner:
@@ -18,6 +18,7 @@ class JargonMiner:
             min_count=getattr(getattr(config, "evolution", None), "jargon_min_count", 2)
         )
         self.enricher = JargonEnricher(gateway, config=config) if gateway is not None else None
+        self.last_report: dict[str, Any] = {}
 
     def _normalize_messages(self, messages: Iterable | None) -> List:
         if not messages:
@@ -36,9 +37,18 @@ class JargonMiner:
 
     async def mine(self, group_id: str, messages: Sequence | None):
         if not group_id or self.expression_miner is None:
+            self.last_report = {"group_id": group_id, "candidate_count": 0, "reason": "miner_unavailable"}
             return []
         normalized = self._normalize_messages(messages)
         if len(normalized) < self.min_messages:
+            self.last_report = {
+                "group_id": group_id,
+                "input_messages": len(messages or []),
+                "normalized_messages": len(normalized),
+                "min_messages": self.min_messages,
+                "candidate_count": 0,
+                "reason": "insufficient_context",
+            }
             return []
         existing_terms = set()
         store = getattr(getattr(self.memory_engine, "v2_store", None), "list_candidates", None)
@@ -55,7 +65,30 @@ class JargonMiner:
                 logger.debug(f"[JargonMiner] canonical jargon preload degraded: {exc}")
         candidates = await self.candidate_extractor.extract(group_id, normalized, existing_terms=existing_terms)
         if not candidates:
+            self.last_report = {
+                "group_id": group_id,
+                "normalized_messages": len(normalized),
+                "existing_terms": len(existing_terms),
+                **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
+            }
             return []
         if not self.enricher:
+            self.last_report = {
+                "group_id": group_id,
+                "normalized_messages": len(normalized),
+                "existing_terms": len(existing_terms),
+                **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
+                "enriched_count": len(candidates),
+                "reason": "completed_without_enricher",
+            }
             return candidates
-        return await self.enricher.enrich(group_id, candidates)
+        enriched = await self.enricher.enrich(group_id, candidates)
+        self.last_report = {
+            "group_id": group_id,
+            "normalized_messages": len(normalized),
+            "existing_terms": len(existing_terms),
+            **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
+            "enriched_count": len(enriched),
+            "reason": "completed" if enriched else "enrichment_empty",
+        }
+        return enriched

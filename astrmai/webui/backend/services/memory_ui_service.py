@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
+from ....learning.mining.jargon_candidate_extractor import JargonCandidateExtractor
 from ....memory.contracts.memory_query import MemoryWriteRequest
 
 from ..adapters.plugin_api import PluginApiAdapter
@@ -645,6 +647,85 @@ class MemoryUiService:
             if lowered in haystack:
                 filtered.append(item)
         return filtered
+
+    @staticmethod
+    def _jargon_cleanup_reason(item: dict) -> tuple[str, str]:
+        content = str(item.get("content") or "").strip().lower()
+        reason = JargonCandidateExtractor.noise_reason(content)
+        if reason:
+            return "obvious", reason
+        if re.fullmatch(r"\d+(?:version|版本|v\d+)?", content, flags=re.IGNORECASE):
+            return "obvious", "数字或版本片段"
+        if content in {"方法", "不需要", "财运", "事业运", "桃花运", "点评"}:
+            return "obvious", "普通词汇，不是群体黑话"
+        evidence = list(item.get("examples") or [])
+        meaning = str(item.get("meaning") or "").strip()
+        if not meaning and len(evidence) < 2:
+            return "suspect", "缺少含义和重复语境证据"
+        return "", ""
+
+    async def jargon_cleanup_preview(self, *, include_active: bool = False, limit: int = 300) -> dict[str, object]:
+        statuses = ["review_pending"] + (["active"] if include_active else [])
+        candidates: list[dict] = []
+        for status in statuses:
+            page = await self.list_jargon(status=status, limit=max(1, min(int(limit or 300), 500)), offset=0)
+            for item in list(page.get("items", []) or []):
+                severity, reason = self._jargon_cleanup_reason(item)
+                if not severity:
+                    continue
+                candidates.append(
+                    {
+                        "id": str(item.get("id") or ""),
+                        "content": str(item.get("content") or ""),
+                        "status": str(item.get("status") or ""),
+                        "severity": severity,
+                        "reason": reason,
+                        "confidence": float(item.get("confidence") or 0.0),
+                        "group_id": str(item.get("group_id") or ""),
+                    }
+                )
+        obvious = [item for item in candidates if item["severity"] == "obvious"]
+        return {
+            "status": "ok",
+            "items": candidates,
+            "total": len(candidates),
+            "obvious_count": len(obvious),
+            "suspect_count": len(candidates) - len(obvious),
+            "destructive": False,
+        }
+
+    async def apply_jargon_cleanup(self, data: dict) -> dict[str, object]:
+        action = str(data.get("action") or "reject").strip().lower()
+        ids = [str(item).strip() for item in list(data.get("ids") or []) if str(item).strip()]
+        target_id = str(data.get("target_id") or "").strip()
+        if action not in {"reject", "merge"}:
+            return {"status": "error", "message": "Unsupported cleanup action"}
+        if action == "merge" and not target_id:
+            return {"status": "error", "message": "target_id is required for merge"}
+        changed: list[str] = []
+        failed: list[dict[str, str]] = []
+        for jargon_id in ids[:300]:
+            if action == "merge" and jargon_id == target_id:
+                continue
+            try:
+                if action == "merge":
+                    await self.merge_canonical(jargon_id, target_id)
+                else:
+                    await self.reject_jargon(
+                        jargon_id,
+                        {"review_reason": "WebUI 噪声预检后人工批量驳回", "review_suggestion": "保留审计记录，不参与召回"},
+                    )
+                changed.append(jargon_id)
+            except Exception as exc:
+                failed.append({"id": jargon_id, "error": str(exc)[:300]})
+        return {
+            "status": "ok" if not failed else "partial",
+            "action": action,
+            "changed": changed,
+            "changed_count": len(changed),
+            "failed": failed,
+            "physical_delete": False,
+        }
 
     async def create_event(self, data: dict) -> dict[str, object]:
         now = time.time()

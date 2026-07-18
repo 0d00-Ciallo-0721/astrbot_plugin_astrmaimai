@@ -635,6 +635,28 @@ class AdminUiService:
             "runtime_bound": planner is not None,
         }
 
+    async def recent_tool_executions(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        planner = self.plugin_api.get_planner()
+        items = list(getattr(planner, "tool_execution_history", []) or [])
+        if not items and planner is not None:
+            persistent_store = getattr(planner, "turn_trace_store", None)
+            if persistent_store is not None and hasattr(persistent_store, "recent"):
+                try:
+                    turns = list(await persistent_store.recent(chat_id=chat_id, limit=max(limit * 2, limit)))
+                    for turn in turns:
+                        items.extend(
+                            dict(entry)
+                            for entry in list(dict(turn or {}).get("tool_execution_trace", []) or [])
+                            if isinstance(entry, dict)
+                        )
+                except Exception:
+                    items = []
+        if chat_id:
+            items = [item for item in items if str(item.get("chat_id", "") or "") == chat_id]
+        items.sort(key=lambda item: float(item.get("created_at", 0.0) or 0.0), reverse=True)
+        items = items[: max(1, min(int(limit or 50), 300))]
+        return {"status": "ok", "items": items, "total": len(items), "runtime_bound": planner is not None}
+
     @staticmethod
     def _timeline_item(
         *,
@@ -809,10 +831,24 @@ class AdminUiService:
             ]
         )
 
-    async def list_memory_feedback(self, chat_id: str | None = None, source: str | None = None, limit: int = 50) -> dict[str, Any]:
+    async def list_memory_feedback(
+        self,
+        chat_id: str | None = None,
+        source: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         engine = self.plugin_api.get_memory_engine()
         if not engine:
             return {"status": "ok", "items": [], "total": 0, "runtime_bound": False}
+        if hasattr(engine, "list_cognitive_feedback_records"):
+            page = await engine.list_cognitive_feedback_records(
+                session_id=str(chat_id or ""),
+                source=str(source or ""),
+                limit=limit,
+                offset=offset,
+            )
+            return {"status": "ok", **dict(page or {}), "runtime_bound": True}
         signals = []
         source_filter = {source} if source else None
         if chat_id and hasattr(engine, "get_cognitive_feedback"):
@@ -834,6 +870,9 @@ class AdminUiService:
         engine = self.plugin_api.get_memory_engine()
         if not engine:
             return {"status": "ok", "changed": False, "runtime_bound": False}
+        if hasattr(engine, "disable_cognitive_feedback_record") and str(feedback_id or "").startswith("mem_"):
+            changed = await engine.disable_cognitive_feedback_record(feedback_id)
+            return {"status": "ok", "changed": bool(changed), "runtime_bound": True, "persisted": True}
         for cached_items in getattr(engine, "_cognitive_feedback_cache", {}).values():
             for signal in cached_items:
                 if self._feedback_id(signal) == feedback_id:

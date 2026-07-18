@@ -27,7 +27,33 @@ class HeartflowService:
 
     async def heartflow_status(self) -> dict[str, Any]:
         manager = self._api.get_heartflow_manager()
-        data = manager.describe_status() if manager and hasattr(manager, "describe_status") else {"enabled": False}
+        manager_status = manager.describe_status() if manager and hasattr(manager, "describe_status") else {"enabled": False}
+        kernel = self._api.get_chat_loop_kernel()
+        kernel_status = kernel.describe_status_sync() if kernel and hasattr(kernel, "describe_status_sync") else {}
+        manager_active = int(manager_status.get("active_chats", 0) or 0)
+        kernel_tracked = int(kernel_status.get("tracked_chats", 0) or 0)
+        if manager is None:
+            operational_state = "unavailable"
+            operational_reason = "heartflow_manager_unbound"
+        elif manager_active > 0:
+            operational_state = "active"
+            operational_reason = "heartflow_state_present"
+        elif kernel_tracked > 0:
+            operational_state = "scheduler_active_manager_idle"
+            operational_reason = "tracked_chats_have_not_produced_heartflow_state"
+        else:
+            operational_state = "idle"
+            operational_reason = "no_tracked_chat"
+        data = {
+            **dict(manager_status or {}),
+            "operational_state": operational_state,
+            "operational_reason": operational_reason,
+            "manager": dict(manager_status or {}),
+            "kernel": {
+                "tracked_chats": kernel_tracked,
+                "last_due_selection_summary": dict(kernel_status.get("last_due_selection_summary", {}) or {}),
+            },
+        }
         return {"status": "ok", "data": data, "runtime_bound": manager is not None}
 
     async def heartflow_chats(self) -> dict[str, Any]:

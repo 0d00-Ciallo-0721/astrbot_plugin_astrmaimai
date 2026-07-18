@@ -1,6 +1,10 @@
 const API_PREFIX = "admin";
-const SCHEDULER_POLL_INTERVAL_MS = 5000;
-const DASHBOARD_CACHE_TTL_MS = 10000;
+const ADMIN_BUILD_VERSION = "2026.07.18-r4";
+const SCHEDULER_POLL_INTERVAL_MS = 45000;
+const DASHBOARD_CACHE_TTL_MS = 180000;
+const DATA_CACHE_TTL_MS = 180000;
+const REVIEW_PAGE_SIZE = 25;
+const MEMORY_PAGE_SIZE = 25;
 
 const TABS = [
   { id: "dashboard", label: "Dashboard" },
@@ -29,8 +33,10 @@ const state = {
   bridge: null,
   current: normalizeTabId(location.hash.replace("#", "") || "dashboard"),
   dashboardTab: "overview",
+  learningTab: "overview",
   reviewTab: "jargon_pending",
   memoryTab: "canonical",
+  toolsTab: "executions",
   observabilityOverview: null,
   observabilityTimeline: [],
   observabilityFilters: {
@@ -53,27 +59,30 @@ const state = {
   userSearch: "",
   usersScrollTop: 0,
   dashboardCache: {},
+  dataCache: {},
+  requestGeneration: 0,
   cache: {
     reviews: {
       expressionPending: [],
       expressionAll: { items: [], total: 0, page: 1, page_size: 20 },
-      jargonPending: { items: [], total: 0, limit: 200, offset: 0 },
-      jargonAll: { items: [], total: 0, limit: 200, offset: 0 },
+      jargonPending: { items: [], total: 0, limit: REVIEW_PAGE_SIZE, offset: 0 },
+      jargonAll: { items: [], total: 0, limit: REVIEW_PAGE_SIZE, offset: 0 },
       filters: { status: "", group_id: "", keyword: "" },
     },
     memories: {
       month: new Date().toISOString().slice(0, 7),
-      canonical: { items: [], total: 0, limit: 100, offset: 0 },
+      canonical: { items: [], total: 0, limit: MEMORY_PAGE_SIZE, offset: 0 },
       canonicalKind: "",
       events: [],
       reflections: [],
       nodes: [],
-      jargon: { items: [], total: 0, limit: 200, offset: 0 },
+      jargon: { items: [], total: 0, limit: MEMORY_PAGE_SIZE, offset: 0 },
     },
     users: [],
     personaSlices: {},
     personaSlicesError: null,
     turns: [],
+    learningFeedback: { items: [], total: 0, limit: REVIEW_PAGE_SIZE, offset: 0 },
   },
 };
 
@@ -105,6 +114,65 @@ function cssEscape(value) {
 
 function json(value) {
   return JSON.stringify(value ?? {}, null, 2);
+}
+
+function previewText(value, maxLength = 220) {
+  const normalized = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "—";
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized;
+}
+
+function formatScore(value, digits = 2) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : "—";
+}
+
+function detailsJson(title, value, open = false) {
+  return `<details class="diagnostic-details" ${open ? "open" : ""}><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(json(value))}</pre></details>`;
+}
+
+function currentViewKey() {
+  const suffix = state.current === "dashboard"
+    ? state.dashboardTab
+    : state.current === "learning"
+      ? state.learningTab
+      : state.current === "reviews"
+        ? state.reviewTab
+        : state.current === "memories"
+          ? state.memoryTab
+          : "";
+  return `${state.current}:${suffix}`;
+}
+
+function beginViewRequest() {
+  state.requestGeneration += 1;
+  return { generation: state.requestGeneration, key: currentViewKey() };
+}
+
+function isCurrentView(request) {
+  return request && request.generation === state.requestGeneration && request.key === currentViewKey();
+}
+
+async function cachedFetch(key, fetchFn, fallback, ttlMs = DATA_CACHE_TTL_MS) {
+  const cached = state.dataCache[key];
+  if (cached && Date.now() - Number(cached.updatedAt || 0) <= ttlMs) return cached.data;
+  const data = await safeFetch(fetchFn, cached?.data ?? fallback);
+  state.dataCache[key] = { data, updatedAt: Date.now() };
+  return data;
+}
+
+function clearDataCache(prefix = "") {
+  if (!prefix) {
+    state.dataCache = {};
+    return;
+  }
+  Object.keys(state.dataCache).forEach((key) => {
+    if (key.startsWith(prefix)) delete state.dataCache[key];
+  });
+}
+
+function hasDataCachePrefix(prefix) {
+  return Object.keys(state.dataCache).some((key) => key.startsWith(prefix));
 }
 
 function parseJsonSafe(text, fallback) {
@@ -477,6 +545,21 @@ function openJsonModal(title, value, onSubmit) {
   });
 }
 
+function renderOffsetPager(dataName, page) {
+  const limit = Math.max(1, Number(page?.limit || 20));
+  const offset = Math.max(0, Number(page?.offset || 0));
+  const total = Math.max(0, Number(page?.total || 0));
+  const current = Math.floor(offset / limit) + 1;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  return `
+    <div class="pager">
+      <button class="ghost-button" data-${dataName}-page="${Math.max(0, offset - limit)}" type="button" ${offset <= 0 ? "disabled" : ""}>上一页</button>
+      <span>第 ${current} / ${pages} 页，共 ${total} 条</span>
+      <button class="ghost-button" data-${dataName}-page="${offset + limit}" type="button" ${offset + limit >= total ? "disabled" : ""}>下一页</button>
+    </div>
+  `;
+}
+
 function splitLines(value) {
   return String(value || "")
     .split(/\r?\n/)
@@ -556,6 +639,9 @@ function openJargonCalibration(item, action = "save") {
       else if (action === "reject") await api.post(`/memories/jargon/${segment(itemId)}/reject`, payload);
       else await api.post(`/memories/jargon/${segment(itemId)}`, payload);
       toast(action === "approve" ? "黑话已修正并通过" : action === "reject" ? "黑话已修正并驳回" : "黑话已保存");
+      clearDataCache("reviews:");
+      clearDataCache("memories:");
+      clearDataCache("learning:status");
       if (state.current === "memories") await loadMemories();
       else await loadReviews();
     },
@@ -585,6 +671,8 @@ function openExpressionCalibration(item, action = "save") {
       else if (action === "reject") await api.post(`/reviews/${segment(itemId)}/submit`, { ...payload, action: "reject" });
       else await api.post(`/reviews/${segment(itemId)}`, payload);
       toast(action === "approve" ? "表达已修正并通过" : action === "reject" ? "表达已修正并驳回" : "表达已保存");
+      clearDataCache("reviews:");
+      clearDataCache("learning:status");
       await loadReviews();
     },
     submitText,
@@ -592,7 +680,9 @@ function openExpressionCalibration(item, action = "save") {
 }
 
 async function loadDashboard() {
-  if (!getDashboardCache(state.dashboardTab)) {
+  const hasCachedDashboard = getDashboardCache(state.dashboardTab)
+    || (state.dashboardTab === "tools" && hasDataCachePrefix("tools:"));
+  if (!hasCachedDashboard) {
     const hasDashboardShell = Boolean($("[data-dashboard-tab]"));
     if (hasDashboardShell) {
       dashboardShell(`
@@ -641,6 +731,7 @@ function dashboardShell(body) {
 }
 
 async function renderDashboardOverview() {
+  const request = beginViewRequest();
   const cached = getDashboardCache("overview");
   const [snapshot, health, capabilities, models, observabilityOverview] = cached || setDashboardCache("overview", await Promise.all([
     safeFetch(() => api.get("/dashboard"), {}),
@@ -649,6 +740,7 @@ async function renderDashboardOverview() {
     safeFetch(() => api.get("/runtime/models"), {}),
     safeFetch(() => api.get("/cognition/observability/overview"), {}),
   ]));
+  if (!isCurrentView(request)) return;
   state.observabilityOverview = observabilityOverview;
   const healthData = health || {};
   const running = Boolean(healthData.running);
@@ -670,24 +762,37 @@ async function renderDashboardOverview() {
       ${metric("数据库大小", `${snapshot.db_size_kb ?? 0} KB`)}
     </div>
     <div class="grid two">
-      ${section("能力矩阵", "Capabilities", `<pre>${json(capabilities)}</pre>`)}
-      ${section("模型与健康诊断", "Models / Health", `<pre>${json({ models, health: healthData })}</pre>`)}
+      ${section("能力状态", "只显示关键能力；完整信息按需展开。", `
+        <div class="chip-row">
+          ${statusChip(`Gateway ${capabilities.gateway ? "ready" : "unknown"}`, capabilities.gateway ? "ok" : "muted")}
+          ${statusChip(`Memory ${capabilities.memory ? "ready" : "unknown"}`, capabilities.memory ? "ok" : "muted")}
+          ${statusChip(`Heartflow ${capabilities.heartflow ? "ready" : "unknown"}`, capabilities.heartflow ? "ok" : "muted")}
+        </div>
+        ${detailsJson("查看完整能力矩阵", capabilities)}
+      `)}
+      ${section("模型健康", "当前模型池与降级组件摘要。", `
+        <div class="grid compact-grid">
+          ${metric("降级组件", healthData.degraded_count ?? 0)}
+          ${metric("运行阶段", healthData.boot_phase || "unknown")}
+        </div>
+        ${detailsJson("查看模型与健康诊断", { models, health: healthData })}
+      `)}
     </div>
-    ${section("Observability Overview", "统一观测摘要与最近异常。", `
+    ${section("统一观测", "默认只显示统计摘要，异常详情按需展开。", `
       <div class="grid">
         ${metric("Retained Events", obsSnapshot.retained_events ?? 0)}
         ${metric("Tracked Chats", obsSnapshot.retained_chats ?? 0)}
         ${metric("Warnings", obsSnapshot.recent_warning_count ?? 0)}
         ${metric("Errors", obsSnapshot.recent_error_count ?? 0)}
       </div>
-      <pre>${json(obsSnapshot)}</pre>
-      <h4>Recent Observability Errors</h4>
-      <pre>${json(asItems(obs.recent_errors))}</pre>
+      ${detailsJson("查看观测快照", obsSnapshot)}
+      ${detailsJson(`查看最近异常（${asItems(obs.recent_errors).length}）`, asItems(obs.recent_errors))}
     `)}
   `);
 }
 
 async function renderDashboardHeartflow() {
+  const request = beginViewRequest();
   const cached = getDashboardCache("heartflow");
   const [status, chats, impulses, timeline, digests, intents] = cached || setDashboardCache("heartflow", await Promise.all([
     safeFetch(() => api.get("/heartflow/status"), {}),
@@ -697,6 +802,7 @@ async function renderDashboardHeartflow() {
     safeFetch(() => api.get("/heartflow/topic-digests?limit=50"), { items: [] }),
     safeFetch(() => api.get("/proactive/intents?limit=50"), { items: [] }),
   ]));
+  if (!isCurrentView(request)) return;
   const impulseRows = asItems(impulses).map((item) => `
     <tr>
       <td>${formatTime(item.timestamp)}</td>
@@ -706,7 +812,7 @@ async function renderDashboardHeartflow() {
       <td>${item.requires_synthetic_event ? statusChip("synthetic", "warn") : statusChip("hidden", "")}</td>
       <td>${String(Boolean(item.dispatch_enabled))}</td>
       <td>${String(Boolean(item.synthetic_event_queued))}</td>
-      <td><pre>${json(item.safety_checks || {})}</pre></td>
+      <td><button class="ghost-button" data-json-payload="${attr(json(item.safety_checks || {}))}" type="button">查看</button></td>
     </tr>
   `);
   const timelineRows = asItems(timeline).map((item) => `
@@ -716,7 +822,7 @@ async function renderDashboardHeartflow() {
       <td>${escapeHtml(item.kind || "-")}</td>
       <td>${escapeHtml(item.label || "-")}</td>
       <td>${escapeHtml(item.summary || "-")}</td>
-      <td><pre>${json(item.payload || {})}</pre></td>
+      <td><button class="ghost-button" data-json-payload="${attr(json(item.payload || {}))}" type="button">查看</button></td>
     </tr>
   `);
   const digestRows = asItems(digests).map((item) => `
@@ -771,7 +877,15 @@ async function renderDashboardHeartflow() {
   `;
   });
   dashboardShell(`
-    ${section("心智流状态", "Heartflow manager describe_status()", `<pre>${json(status)}</pre>`)}
+    ${section("心智流状态", "区分调度内核运行与会话管理器空闲，空闲不等于故障。", `
+      <div class="grid">
+        ${metric("运行状态", status.operational_state || status.state || "unknown")}
+        ${metric("状态原因", status.operational_reason || status.reason || "—")}
+        ${metric("活跃会话", status.manager?.active_chats ?? status.active_chats ?? 0)}
+        ${metric("Kernel 跟踪", status.kernel?.tracked_chats ?? 0, "调度跟踪不等于已产生 Heartflow state")}
+      </div>
+      ${detailsJson("查看完整 Heartflow 状态", status)}
+    `)}
     ${section("Heartflow Sessions", "Session / Rhythm / Hidden Action", table(["Chat", "Talk", "Interest", "Silence", "Hidden Action", "Session", "Talk Freq", "Insert", "Reply", "Score", "Topic", "Rhythm", "Cooldowns", "操作"], rows))}
   `);
   content().insertAdjacentHTML("beforeend", section("Impulse Safety", "Heartflow impulse safety decisions: v1 only records candidate state; dispatch_enabled=false means no visible message is sent.", table(["Time", "Chat", "Pulse", "Candidate", "Synthetic", "Dispatch", "Queued", "Safety"], impulseRows)));
@@ -798,6 +912,9 @@ async function renderDashboardHeartflow() {
     toast("Heartflow cooldown 已清理");
     clearDashboardCache("heartflow");
     renderDashboardHeartflow();
+  }));
+  $$('[data-json-payload]').forEach((button) => button.addEventListener("click", () => {
+    openModal("诊断详情", `<pre>${escapeHtml(json(parseJsonSafe(button.dataset.jsonPayload, {})))}</pre>`);
   }));
 }
 
@@ -832,6 +949,7 @@ function startSchedulerPolling() {
     }
     if (state._pollingInFlight) return;  // guard: skip if previous poll still running
     state._pollingInFlight = true;
+    clearDashboardCache("cognition");
     renderDashboardCognition()
       .catch(() => {})
       .finally(() => { state._pollingInFlight = false; });
@@ -867,9 +985,9 @@ function renderSchedulerDiagnosticsSection() {
             ${statusChip(`busy_backpressure: ${state.schedulerStatus?.proactive?.busy_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.proactive?.busy_backpressure_active ? "warn" : "ok")}
             ${statusChip(`maintenance_backpressure: ${state.schedulerStatus?.proactive?.maintenance_backpressure_active ? "on" : "off"}`, state.schedulerStatus?.proactive?.maintenance_backpressure_active ? "warn" : "ok")}
           </div>
-          <pre>${json(state.schedulerStatus?.proactive?.scheduler_batch_plan || {})}</pre>
-          <pre>${json(state.schedulerStatus?.proactive?.quota_skip_counts || {})}</pre>
-          <pre>${json(state.schedulerStatus?.proactive?.poll_mode_transition || {})}</pre>
+          ${detailsJson("批次计划", state.schedulerStatus?.proactive?.scheduler_batch_plan || {})}
+          ${detailsJson("配额跳过统计", state.schedulerStatus?.proactive?.quota_skip_counts || {})}
+          ${detailsJson("轮询模式切换", state.schedulerStatus?.proactive?.poll_mode_transition || {})}
         `)}
         ${section("Chat Loop Drill-down", "", `
           <div class="form-grid single">
@@ -886,8 +1004,8 @@ function renderSchedulerDiagnosticsSection() {
             ${metric("missed_due_passes", chatData.missed_due_passes ?? 0)}
             ${metric("forced_promotion_count", chatData.forced_promotion_count ?? 0)}
           </div>
-          <pre>${json(chatData.scheduler_pending_signals || {})}</pre>
-          <pre>${json(report)}</pre>
+          ${detailsJson("待处理信号", chatData.scheduler_pending_signals || {})}
+          ${detailsJson("Due selection 报告", report)}
         `)}
       </div>
     `,
@@ -895,6 +1013,7 @@ function renderSchedulerDiagnosticsSection() {
 }
 
 async function renderDashboardCognition() {
+  const request = beginViewRequest();
   const cached = getDashboardCache("cognition");
   const [decisions, turns, schedulerStatus, schedulerDueSelection, observabilityOverview, unifiedTimeline] = cached || setDashboardCache("cognition", await Promise.all([
     safeFetch(() => api.get("/cognition/recent-decisions?limit=50"), { items: [] }),
@@ -904,6 +1023,7 @@ async function renderDashboardCognition() {
     safeFetch(() => api.get("/cognition/observability/overview"), {}),
     safeFetch(() => api.get(observabilityTimelinePath()), { items: [] }),
   ]));
+  if (!isCurrentView(request)) return;
   state.observabilityOverview = observabilityOverview;
   state.schedulerStatus = schedulerStatus;
   state.schedulerDueSelection = schedulerDueSelection;
@@ -928,7 +1048,7 @@ async function renderDashboardCognition() {
       <td>${escapeHtml(item.level || "-")}</td>
       <td>${escapeHtml(item.title || "-")}</td>
       <td>${escapeHtml(item.summary || "-")}</td>
-      <td class="row-actions"><button class="ghost-button" data-unified-detail="${index}" type="button">璇︽儏</button></td>
+      <td class="row-actions"><button class="ghost-button" data-unified-detail="${index}" type="button">详情</button></td>
     </tr>
   `);
   const decisionRows = asItems(decisions).map((item) => `
@@ -1100,27 +1220,51 @@ function openTurnTrace(index, source = state.cache.turns) {
 }
 
 async function renderDashboardTools() {
-  const cached = getDashboardCache("tools");
-  const [status, policy, calls] = cached || setDashboardCache("tools", await Promise.all([
+  const request = beginViewRequest();
+  const common = await cachedFetch("tools:common", () => Promise.all([
     safeFetch(() => api.get("/tools/status"), {}),
     safeFetch(() => api.get("/tools/policy"), {}),
-    safeFetch(() => api.get("/tools/recent-calls?limit=50"), { items: [] }),
-  ]));
-  const rows = asItems(calls).map((item) => `
+  ]), [{}, {}]);
+  const [status, policy] = Array.isArray(common) ? common : [{}, {}];
+  const path = state.toolsTab === "executions" ? "/tools/executions?limit=50" : "/tools/recent-calls?limit=50";
+  const calls = await cachedFetch(`tools:${state.toolsTab}`, () => api.get(path), { items: [] }, 60000);
+  if (!isCurrentView(request)) return;
+  const rows = asItems(calls).map((item, index) => `
     <tr>
+      <td>${formatTime(item.created_at || item.timestamp)}</td>
       <td>${escapeHtml(item.chat_id || "-")}</td>
+      <td>${escapeHtml(item.tool_name || item.name || "-")}</td>
       <td>${escapeHtml(item.tool_tier || item.final_tier || "-")}</td>
-      <td>${item.tool_count ?? (Array.isArray(item.filtered_tools) ? item.filtered_tools.length : "-")}</td>
-      <td><pre>${json(item)}</pre></td>
+      <td>${statusChip(item.status || item.lifecycle || "observed", item.status === "failed" ? "danger" : "ok")}</td>
+      <td><button class="ghost-button" data-tool-detail="${index}" type="button">详情</button></td>
     </tr>
   `);
   dashboardShell(`
+    ${subTabs(state.toolsTab, [
+      { id: "executions", label: "真实执行" },
+      { id: "disclosure", label: "策略披露" },
+      { id: "catalog", label: "能力目录" },
+    ], "tools-tab")}
     <div class="grid two">
-      ${section("工具层级", "chat / guarded / full tool tier", `<pre>${json(status)}</pre>`)}
-      ${section("工具策略", "Tool policy rules", `<pre>${json(policy)}</pre>`)}
+      ${section("工具运行摘要", "真实执行与模型可见性分开统计。", `
+        <div class="grid compact-grid">
+          ${metric("记录数", calls.total ?? asItems(calls).length)}
+          ${metric("当前视图", state.toolsTab === "executions" ? "真实执行" : "策略披露")}
+        </div>
+        ${detailsJson("查看工具层级", status)}
+      `)}
+      ${section("工具策略", "按需展开完整策略，不在首页铺开大 JSON。", detailsJson("查看策略详情", policy))}
     </div>
-    ${section("工具链观测 Tools", "最近工具调用轨迹。", table(["Chat", "Tier", "工具数", "详情"], rows))}
+    ${section("工具链观测 Tools", state.toolsTab === "executions" ? "工具实际被调用后的生命周期轨迹。" : "模型可见工具、过滤结果和层级披露，不等同于实际执行。", table(["时间", "Chat", "工具", "Tier", "状态", "操作"], rows, state.toolsTab === "executions" ? "暂无真实工具执行记录。仅有策略披露不代表工具已调用。" : "暂无工具策略披露记录。"))}
   `);
+  $$('[data-tools-tab]').forEach((button) => button.addEventListener("click", () => {
+    if (state.toolsTab === button.dataset.toolsTab) return;
+    state.toolsTab = button.dataset.toolsTab;
+    renderDashboardTools();
+  }));
+  $$('[data-tool-detail]').forEach((button) => button.addEventListener("click", () => {
+    openModal("工具轨迹详情", `<pre>${escapeHtml(json(asItems(calls)[Number(button.dataset.toolDetail)] || {}))}</pre>`);
+  }));
 }
 
 async function openChatTrace(chatId) {
@@ -1138,101 +1282,89 @@ async function openChatTrace(chatId) {
 }
 
 async function loadLearning() {
-  showLoading("正在读取主动学习与任务...");
-  const [proactive, intents, dream, diary, wakeup, learning, feedback, sources, chats, cooldowns] = await Promise.all([
-    safeFetch(() => api.get("/proactive/status"), {}),
-    safeFetch(() => api.get("/proactive/intents?limit=50"), { items: [] }),
-    safeFetch(() => api.get("/proactive/dream/status"), {}),
-    safeFetch(() => api.get("/proactive/diary/status"), {}),
-    safeFetch(() => api.get("/proactive/wakeup/status"), {}),
-    safeFetch(() => api.get("/learning/status"), {}),
-    safeFetch(() => api.get("/memory-feedback?limit=50"), { items: [] }),
-    safeFetch(() => api.get("/memory-feedback/sources"), { items: [] }),
-    safeFetch(() => api.get("/chats/active?max_age_seconds=1800"), { items: [] }),
-    safeFetch(() => api.get("/learning/cooldowns"), {}),
-  ]);
-  const cards = [
-    ["造梦空间", "Dream Agent", dream, "执行造梦序列", "run-dream"],
-    ["日记写作", "Diary Agent", diary, "撰写今日日记", "run-diary"],
-    ["沉淀审核", "Reflect / Learning", learning, "基于会话触发", ""],
-  ].map(([title, subtitle, data, action, key]) => `
-    <article class="feature-card">
-      <div><h3>${title}</h3><p>${subtitle}</p><pre>${json(data)}</pre></div>
-      ${key ? `<button class="primary-button" data-${key} type="button">${action}</button>` : `<span class="chip ok">${action}</span>`}
-    </article>
-  `).join("");
-  const sourceChips = asItems(sources).map((item) => statusChip(`${item.source}: ${item.count}`, "ok")).join(" ");
-  const feedbackRows = asItems(feedback).map((item) => `
-    <tr>
-      <td>${escapeHtml(item.chat_id || "-")}</td>
-      <td>${escapeHtml(item.source || "-")}</td>
-      <td>${escapeHtml(item.summary || "-")}</td>
-      <td>${escapeHtml(item.guidance || "-")}</td>
-      <td><button class="danger-button" data-disable-feedback="${attr(item.id || "")}" type="button">禁用反馈</button></td>
-    </tr>
-  `);
-  const intentRows = asItems(intents).map((item) => `
-    <tr>
-      <td>${formatTime(item.timestamp || item.created_at)}</td>
-      <td>${escapeHtml(item.chat_id || "-")}</td>
-      <td>${escapeHtml(item.source || "-")}</td>
-      <td>${item.reply_sent ? statusChip("sent", "ok") : statusChip(item.blocked_reason || item.status || "queued", item.blocked_reason ? "warn" : "")}</td>
-      <td>${escapeHtml(item.blocked_reason || "-")}</td>
-      <td>${escapeHtml(item.reason || item.guidance || "-")}</td>
-    </tr>
-  `);
-  const chatRows = asItems(chats).map((chatId) => `
-    <tr>
-      <td>${escapeHtml(chatId)}</td>
-      <td class="row-actions">
-        <button class="ghost-button" data-chat-runtime="${attr(chatId)}" type="button">运行态</button>
-        <button class="primary-button" data-run-reflect="${attr(chatId)}" type="button">立即反思</button>
-        <button class="danger-button" data-clear-runtime="${attr(chatId)}" type="button">清理状态</button>
-      </td>
-    </tr>
-  `);
+  const request = beginViewRequest();
+  const cacheKey = `learning:${state.learningTab}`;
+  if (!hasDataCachePrefix(cacheKey)) showLoading("正在读取主动学习与任务...");
+  const learning = await cachedFetch("learning:status", () => api.get("/learning/status"), {});
+  let body = "";
   const expressionStats = learning.expression_patterns || {};
   const jargonStats = learning.jargons || {};
   const backlog = learning.backlog || {};
   const diagnostics = learning.diagnostics || {};
-  const topBacklogRows = asItems(backlog.top_unprocessed_groups).map((item) => `
-    <tr>
-      <td>${escapeHtml(item.group_id || "-")}</td>
-      <td>${item.count ?? 0}</td>
-      <td>${formatTime(item.oldest_timestamp)}</td>
-      <td>${formatTime(item.latest_timestamp)}</td>
-    </tr>
-  `);
+  if (state.learningTab === "overview") {
+    const [proactive, dream, diary, wakeup, cooldowns] = await cachedFetch(cacheKey, () => Promise.all([
+      safeFetch(() => api.get("/proactive/status"), {}),
+      safeFetch(() => api.get("/proactive/dream/status"), {}),
+      safeFetch(() => api.get("/proactive/diary/status"), {}),
+      safeFetch(() => api.get("/proactive/wakeup/status"), {}),
+      safeFetch(() => api.get("/learning/cooldowns"), {}),
+    ]), [{}, {}, {}, {}, {}]);
+    const topBacklogRows = asItems(backlog.top_unprocessed_groups).map((item) => `
+      <tr><td>${escapeHtml(item.group_id || "-")}</td><td>${item.count ?? 0}</td><td>${formatTime(item.oldest_timestamp)}</td><td>${formatTime(item.latest_timestamp)}</td></tr>
+    `);
+    const expressionReport = diagnostics.mining?.expression || diagnostics.expression || {};
+    const jargonReport = diagnostics.mining?.jargon || diagnostics.jargon || {};
+    body = `
+      <div class="grid">
+        ${metric("表达习惯", expressionStats.total ?? 0, `${expressionStats.pending ?? 0} 待审核`)}
+        ${metric("黑话词库", jargonStats.total ?? 0, `${jargonStats.pending ?? 0} 待审核`)}
+        ${metric("积压学习", backlog.enabled ? "开启" : "关闭", `阈值 ${backlog.threshold ?? diagnostics.backlog?.threshold ?? "—"}`)}
+        ${metric("Worker", backlog.worker_running ? "运行中" : "未运行", `每轮 ${backlog.group_limit ?? diagnostics.backlog?.group_limit ?? "—"} 会话`)}
+      </div>
+      ${section("学习漏斗与最近诊断", "明确区分没有输入、噪声过滤、候选不足和成功写入。", `
+        <div class="grid two">
+          <div>${statusChip("表达提取", "ok")}${detailsJson("表达提取诊断", expressionReport, true)}</div>
+          <div>${statusChip("黑话提取", "ok")}${detailsJson("黑话提取诊断", jargonReport, true)}</div>
+        </div>
+        ${table(["Chat", "未处理消息", "最早", "最新"], topBacklogRows, "当前没有达到学习阈值的会话。")}
+        ${detailsJson("后台扫描完整报告", backlog.last_report || diagnostics.backlog?.last_report || {})}
+      `)}
+      <div class="feature-grid">
+        <article class="feature-card"><div><h3>造梦空间</h3><p>${escapeHtml(dream.state || dream.status || "按计划运行")}</p>${detailsJson("诊断", dream)}</div><button class="primary-button" data-run-dream type="button">执行造梦序列</button></article>
+        <article class="feature-card"><div><h3>日记写作</h3><p>${escapeHtml(diary.state || diary.status || "按计划运行")}</p>${detailsJson("诊断", diary)}</div><button class="primary-button" data-run-diary type="button">撰写今日日记</button></article>
+        <article class="feature-card"><div><h3>主动组件调度 Proactive</h3><p>Wakeup 与 Proactive 运行摘要</p>${detailsJson("查看状态", { proactive, wakeup })}</div></article>
+      </div>
+      ${section("表达冷却", "仅在排查表达选择时展开。", detailsJson("查看 cooldown", cooldowns))}
+    `;
+  } else if (state.learningTab === "intents") {
+    const intents = await cachedFetch(cacheKey, () => api.get("/proactive/intents?limit=50"), { items: [] }, 60000);
+    const rows = asItems(intents).map((item) => `<tr><td>${formatTime(item.timestamp || item.created_at)}</td><td>${escapeHtml(item.chat_id || "-")}</td><td>${escapeHtml(item.source || "-")}</td><td>${item.reply_sent ? statusChip("已发送", "ok") : statusChip(item.blocked_reason || item.status || "候选", item.blocked_reason ? "warn" : "")}</td><td>${escapeHtml(item.blocked_reason || "-")}</td><td>${escapeHtml(previewText(item.reason || item.guidance, 160))}</td></tr>`);
+    body = section("主动意图轨迹", "候选经过正常回复判决后的发送或阻断结果。", table(["时间", "Chat", "来源", "状态", "阻断", "摘要"], rows, "暂无主动意图记录；这通常表示当前没有满足条件的主动候选。"));
+  } else if (state.learningTab === "feedback") {
+    const page = state.cache.learningFeedback;
+    const [feedback, sources] = await cachedFetch(`${cacheKey}:${page.offset}`, () => Promise.all([
+      safeFetch(() => api.get(`/memory-feedback?limit=${page.limit}&offset=${page.offset}`), { items: [] }),
+      safeFetch(() => api.get("/memory-feedback/sources"), { items: [] }),
+    ]), [{ items: [] }, { items: [] }]);
+    state.cache.learningFeedback = { items: asItems(feedback), total: Number(feedback.total ?? asItems(feedback).length), limit: page.limit, offset: page.offset };
+    const rows = state.cache.learningFeedback.items.map((item) => `<tr><td>${escapeHtml(item.chat_id || item.session_id || "-")}</td><td>${escapeHtml(item.source || "-")}</td><td>${escapeHtml(previewText(item.summary, 180))}</td><td>${escapeHtml(previewText(item.guidance, 180))}</td><td>${statusChip(item.persisted === false ? "运行态" : "已持久化", item.persisted === false ? "warn" : "ok")}</td><td><button class="danger-button" data-disable-feedback="${attr(item.id || "")}" type="button">禁用</button></td></tr>`);
+    const sourceChips = asItems(sources).map((item) => statusChip(`${item.source}: ${item.count}`, "ok")).join(" ");
+    body = section("记忆反馈", "读取 Canonical feedback 事实源；旧运行态缓存仅作为兼容降级。", `<div class="chip-row">${sourceChips || "<span class='muted'>暂无反馈来源</span>"}</div>${table(["Chat", "来源", "摘要", "指引", "持久化", "操作"], rows, "暂无记忆反馈。")}${renderOffsetPager("learning-feedback", state.cache.learningFeedback)}`);
+  } else {
+    const chats = await cachedFetch(cacheKey, () => api.get("/chats/active?max_age_seconds=1800"), { items: [] }, 60000);
+    const rows = asItems(chats).map((chatId) => `<tr><td>${escapeHtml(chatId)}</td><td class="row-actions"><button class="ghost-button" data-chat-runtime="${attr(chatId)}" type="button">运行态</button><button class="primary-button" data-run-reflect="${attr(chatId)}" type="button">立即反思</button><button class="danger-button" data-clear-runtime="${attr(chatId)}" type="button">清理状态</button></td></tr>`);
+    body = section("活跃会话", "仅显示最近 30 分钟活跃会话，可触发独立反思。", table(["Chat", "操作"], rows, "最近 30 分钟没有活跃会话。"));
+  }
+  if (!isCurrentView(request)) return;
   content().innerHTML = `
     ${pageHeader("主动学习与任务", "监控 AI 的独立思考周期、夜间造梦及反思过滤池。")}
-    <div class="feature-grid">${cards}</div>
-    ${section("学习产出", "人物画像、表达习惯和黑话是不同学习通道；表达/黑话默认先进入审核。", `
-      <div class="grid">
-        ${metric("表达习惯", expressionStats.total ?? 0)}
-        ${metric("表达待审核", expressionStats.pending ?? 0)}
-        ${metric("黑话词库", jargonStats.total ?? 0)}
-        ${metric("黑话待审核", jargonStats.pending ?? 0)}
-      </div>
-    `)}
-    ${section("积压学习诊断", "后台会低频扫描未处理消息，满足阈值后自动挖掘表达和黑话。", `
-      <div class="grid">
-        ${metric("积压学习", backlog.enabled ? "开启" : "关闭")}
-        ${metric("触发阈值", backlog.threshold ?? diagnostics.backlog?.threshold ?? "—")}
-        ${metric("每轮会话数", backlog.group_limit ?? diagnostics.backlog?.group_limit ?? "—")}
-        ${metric("Worker", backlog.worker_running ? "运行中" : "未运行")}
-      </div>
-      ${table(["Chat", "未处理消息", "最早", "最新"], topBacklogRows)}
-      <h4>最近一次后台学习</h4>
-      <pre>${json(backlog.last_report || diagnostics.backlog?.last_report || {})}</pre>
-    `)}
-    <div class="grid two">
-      ${section("主动组件调度 Proactive", "Proactive / Wakeup 状态。", `<pre>${json({ proactive, wakeup })}</pre>`)}
-      ${section("表达冷却", "Expression selector cooldowns", `<pre>${json(cooldowns)}</pre>`)}
-    </div>
-    ${section("主动意图轨迹", "Wakeup / Heartflow 候选经安全裁决后进入主链路的结果。", table(["时间", "Chat", "来源", "状态", "阻断", "预览"], intentRows))}
-    ${section("记忆反馈", "Memory feedback sources 与反馈列表。", `<div class="chip-row">${sourceChips || "<span class='muted'>暂无来源</span>"}</div>${table(["Chat", "来源", "摘要", "指引", "操作"], feedbackRows)}`)}
-    ${section("活跃会话", "可触发独立反思或清理 runtime。", table(["Chat", "操作"], chatRows))}
+    ${subTabs(state.learningTab, [
+      { id: "overview", label: "学习概览" },
+      { id: "intents", label: "主动意图" },
+      { id: "feedback", label: "记忆反馈" },
+      { id: "sessions", label: "活跃会话" },
+    ], "learning-tab")}
+    ${body}
   `;
+  $$('[data-learning-tab]').forEach((button) => button.addEventListener("click", () => {
+    if (state.learningTab === button.dataset.learningTab) return;
+    state.learningTab = button.dataset.learningTab;
+    loadLearning();
+  }));
+  $$('[data-learning-feedback-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.learningFeedback.offset = Math.max(0, Number(button.dataset.learningFeedbackPage || 0));
+    loadLearning();
+  }));
   bindLearningActions();
 }
 
@@ -1250,6 +1382,7 @@ function bindLearningActions() {
     if (!await confirmAction("禁用这条记忆反馈？")) return;
     await api.post(`/memory-feedback/${segment(button.dataset.disableFeedback)}/disable`);
     toast("反馈已禁用");
+    clearDataCache("learning:feedback");
     loadLearning();
   }));
   $$('[data-chat-runtime]').forEach((button) => button.addEventListener("click", async () => {
@@ -1259,54 +1392,46 @@ function bindLearningActions() {
   $$('[data-run-reflect]').forEach((button) => button.addEventListener("click", async () => {
     await api.post("/learning/reflect/run-once", { chat_id: button.dataset.runReflect });
     toast("反思任务已触发");
+    clearDataCache("learning:");
   }));
   $$('[data-clear-runtime]').forEach((button) => button.addEventListener("click", async () => {
     if (!await confirmAction("清理该 chat 的运行态？")) return;
     await api.post(`/chats/${segment(button.dataset.clearRuntime)}/runtime/clear`);
     toast("运行态已清理");
+    clearDataCache("learning:sessions");
     loadLearning();
   }));
 }
 
 async function loadReviews() {
-  showLoading("正在读取表达审核...");
-  const expressionState = state.cache.reviews.expressionAll;
-  const [expressionPending, expressionAll, jargonPending, jargonAll] = await Promise.all([
-    safeFetch(() => api.get("/reviews/pending"), { items: [] }),
-    safeFetch(() => api.get(`/reviews?page=${expressionState.page}&page_size=${expressionState.page_size}`), expressionState),
-    safeFetch(() => api.get("/memories/jargon?status=review_pending&limit=200"), { items: [], total: 0 }),
-    safeFetch(() => api.get("/memories/jargon?limit=200"), { items: [], total: 0 }),
-  ]);
-  const expressionPendingItems = asItems(expressionPending);
-  const expressionAllItems = asItems(expressionAll);
-  const jargonPendingItems = asItems(jargonPending);
-  const jargonAllItems = asItems(jargonAll);
-  state.cache.reviews.expressionPending = expressionPendingItems;
-  state.cache.reviews.expressionAll = {
-    items: expressionAllItems,
-    total: Number(expressionAll.total ?? expressionAllItems.length),
-    page: Number(expressionAll.page ?? expressionState.page),
-    page_size: Number(expressionAll.page_size ?? expressionState.page_size),
-  };
-  state.cache.reviews.jargonPending = {
-    items: jargonPendingItems,
-    total: Number(jargonPending.total ?? jargonPendingItems.length),
-    limit: Number(jargonPending.limit ?? 200),
-    offset: Number(jargonPending.offset ?? 0),
-  };
-  state.cache.reviews.jargonAll = {
-    items: jargonAllItems,
-    total: Number(jargonAll.total ?? jargonAllItems.length),
-    limit: Number(jargonAll.limit ?? 200),
-    offset: Number(jargonAll.offset ?? 0),
-  };
+  const request = beginViewRequest();
+  const tabKey = `reviews:${state.reviewTab}`;
+  if (!hasDataCachePrefix(tabKey)) showLoading("正在读取表达审核...");
+  const learning = await cachedFetch("learning:status", () => api.get("/learning/status"), {});
+  let activePage;
+  if (state.reviewTab === "jargon_pending" || state.reviewTab === "jargon_all") {
+    const target = state.reviewTab === "jargon_pending" ? state.cache.reviews.jargonPending : state.cache.reviews.jargonAll;
+    const statusParam = state.reviewTab === "jargon_pending" ? "status=review_pending&" : "";
+    const query = state.cache.reviews.filters.keyword ? `&query=${segment(state.cache.reviews.filters.keyword)}` : "";
+    activePage = await cachedFetch(`${tabKey}:${target.offset}:${state.cache.reviews.filters.keyword}`, () => api.get(`/memories/jargon?${statusParam}limit=${target.limit}&offset=${target.offset}${query}`), target);
+    const normalized = { items: asItems(activePage), total: Number(activePage.total ?? asItems(activePage).length), limit: target.limit, offset: target.offset };
+    if (state.reviewTab === "jargon_pending") state.cache.reviews.jargonPending = normalized;
+    else state.cache.reviews.jargonAll = normalized;
+    activePage = normalized;
+  } else if (state.reviewTab === "expression_all") {
+    const target = state.cache.reviews.expressionAll;
+    activePage = await cachedFetch(`${tabKey}:${target.page}`, () => api.get(`/reviews?page=${target.page}&page_size=${target.page_size}`), target);
+    state.cache.reviews.expressionAll = { items: asItems(activePage), total: Number(activePage.total ?? asItems(activePage).length), page: Number(activePage.page ?? target.page), page_size: Number(activePage.page_size ?? target.page_size) };
+    activePage = state.cache.reviews.expressionAll;
+  } else {
+    activePage = await cachedFetch(tabKey, () => api.get("/reviews/pending"), { items: [] });
+    state.cache.reviews.expressionPending = asItems(activePage);
+    activePage = { items: state.cache.reviews.expressionPending, total: state.cache.reviews.expressionPending.length };
+  }
+  if (!isCurrentView(request)) return;
   const reviewMode = state.reviewTab.startsWith("jargon") ? "jargon" : "expression";
-  const activeItems = {
-    expression_pending: expressionPendingItems,
-    expression_all: expressionAllItems,
-    jargon_pending: jargonPendingItems,
-    jargon_all: jargonAllItems,
-  }[state.reviewTab] || [];
+  const keyword = String(state.cache.reviews.filters.keyword || "").trim().toLowerCase();
+  const activeItems = asItems(activePage).filter((item) => !keyword || json(item).toLowerCase().includes(keyword));
   const rows = activeItems.map((item) => {
     const id = item.id || item.review_id || "";
     const contentText = reviewMode === "jargon"
@@ -1315,10 +1440,11 @@ async function loadReviews() {
     return `
       <tr>
         <td>${escapeHtml(id || "-")}</td>
-        <td><pre>${escapeHtml(contentText)}</pre></td>
+        <td><div class="content-preview">${escapeHtml(previewText(contentText, 180))}</div></td>
         <td>${statusChip(item.review_status || item.status || "pending", item.status === "rejected" ? "danger" : "")}</td>
-        <td>${escapeHtml(item.weight ?? item.confidence ?? "-")}</td>
+        <td>${formatScore(item.weight ?? item.confidence)}</td>
         <td class="row-actions">
+          <button class="ghost-button" data-review-detail="${attr(id)}" data-review-kind="${reviewMode}" type="button">详情</button>
           <button class="ghost-button" data-edit-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑</button>
           <button class="primary-button" data-edit-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑通过</button>
           <button class="primary-button" data-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">批准</button>
@@ -1328,12 +1454,14 @@ async function loadReviews() {
       </tr>
     `;
   });
+  const expressionStats = learning.expression_patterns || {};
+  const jargonStats = learning.jargons || {};
   const totals = `
     <div class="grid">
-      ${metric("表达待审核", expressionPendingItems.length)}
-      ${metric("表达语料", state.cache.reviews.expressionAll.total)}
-      ${metric("黑话待审核", state.cache.reviews.jargonPending.total)}
-      ${metric("黑话词库", state.cache.reviews.jargonAll.total)}
+      ${metric("表达待审核", expressionStats.pending ?? state.cache.reviews.expressionPending.length)}
+      ${metric("表达语料", expressionStats.total ?? state.cache.reviews.expressionAll.total)}
+      ${metric("黑话待审核", jargonStats.pending ?? state.cache.reviews.jargonPending.total)}
+      ${metric("黑话词库", jargonStats.total ?? state.cache.reviews.jargonAll.total)}
     </div>
   `;
   const title = state.reviewTab.startsWith("jargon") ? "黑话审核" : "表达习惯审核";
@@ -1341,8 +1469,9 @@ async function loadReviews() {
     ? "当前黑话分类暂无数据。若 Dashboard 显示黑话待审核，请确认正在查看“黑话待审”。"
     : "当前表达习惯暂无数据。黑话审核在同页的“黑话待审/黑话全量”中查看。";
   content().innerHTML = `
-    ${pageHeader("表达与黑话审核 Reviews", "表达习惯和黑话是两条学习通道；待审队列用于人工校准后通过，全量库查阅用于回看历史表达/黑话。")}
+    ${pageHeader("表达与黑话审核 Reviews", "待审队列和全量库查阅按当前分类加载；候选可先查看证据，再编辑、通过或驳回。")}
     ${totals}
+    <div class="filter-bar"><label class="inline-label">搜索 <input data-review-search value="${attr(state.cache.reviews.filters.keyword)}" placeholder="词语、含义或场景"></label>${state.reviewTab.startsWith("jargon") ? `<button class="ghost-button" data-jargon-noise-preview type="button">噪声预检</button>` : ""}</div>
     ${subTabs(state.reviewTab, [
       { id: "jargon_pending", label: "黑话待审" },
       { id: "jargon_all", label: "黑话全量" },
@@ -1354,7 +1483,7 @@ async function loadReviews() {
         <button class="ghost-button" data-review-page="${state.cache.reviews.expressionAll.page - 1}" type="button" ${state.cache.reviews.expressionAll.page <= 1 ? "disabled" : ""}>上一页</button>
         <span>第 ${state.cache.reviews.expressionAll.page} / ${Math.max(1, Math.ceil(state.cache.reviews.expressionAll.total / state.cache.reviews.expressionAll.page_size))} 页，共 ${state.cache.reviews.expressionAll.total} 条</span>
         <button class="ghost-button" data-review-page="${state.cache.reviews.expressionAll.page + 1}" type="button" ${state.cache.reviews.expressionAll.page * state.cache.reviews.expressionAll.page_size >= state.cache.reviews.expressionAll.total ? "disabled" : ""}>下一页</button>
-      </div>` : ""}`)}
+      </div>` : state.reviewTab.startsWith("jargon") ? renderOffsetPager(state.reviewTab === "jargon_pending" ? "jargon-pending" : "jargon-all", activePage) : ""}`)}
   `;
   $$('[data-review-tab]').forEach((button) => button.addEventListener("click", () => {
     state.reviewTab = button.dataset.reviewTab;
@@ -1364,7 +1493,58 @@ async function loadReviews() {
     state.cache.reviews.expressionAll.page = Math.max(1, Number(button.dataset.reviewPage || 1));
     loadReviews();
   }));
+  $('[data-review-search]')?.addEventListener("change", (event) => {
+    state.cache.reviews.filters.keyword = event.target.value.trim();
+    state.cache.reviews.jargonPending.offset = 0;
+    state.cache.reviews.jargonAll.offset = 0;
+    clearDataCache("reviews:");
+    loadReviews();
+  });
+  $$('[data-jargon-pending-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.reviews.jargonPending.offset = Math.max(0, Number(button.dataset.jargonPendingPage || 0));
+    loadReviews();
+  }));
+  $$('[data-jargon-all-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.reviews.jargonAll.offset = Math.max(0, Number(button.dataset.jargonAllPage || 0));
+    loadReviews();
+  }));
+  $$('[data-review-detail]').forEach((button) => button.addEventListener("click", () => {
+    const item = findReviewItem(button.dataset.reviewKind, button.dataset.reviewDetail);
+    openModal("候选详情与证据", `<pre>${escapeHtml(json(item || {}))}</pre>`);
+  }));
+  $('[data-jargon-noise-preview]')?.addEventListener("click", openJargonNoisePreview);
   bindReviewActions();
+}
+
+async function openJargonNoisePreview() {
+  const preview = await api.get("/memories/jargon/cleanup/preview?limit=300");
+  const items = asItems(preview);
+  const rows = items.map((item) => `
+    <tr>
+      <td><input type="checkbox" data-noise-id="${attr(item.id)}" ${item.severity === "obvious" ? "checked" : ""}></td>
+      <td>${escapeHtml(item.content || "-")}</td>
+      <td>${statusChip(item.severity === "obvious" ? "明显噪声" : "需复核", item.severity === "obvious" ? "danger" : "warn")}</td>
+      <td>${escapeHtml(item.reason || "-")}</td>
+      <td>${formatScore(item.confidence)}</td>
+    </tr>
+  `);
+  openModal(
+    "黑话噪声预检",
+    `<p class="muted">只做预览。确认后将所选项软驳回并保留审计记录，不会物理删除。</p>${table(["选择", "内容", "判定", "原因", "置信度"], rows, "没有发现明显噪声。")}`,
+    `<button class="ghost-button" data-modal-close type="button">取消</button><button class="danger-button" data-apply-noise-cleanup type="button" ${items.length ? "" : "disabled"}>软驳回所选项</button>`,
+  );
+  $('[data-apply-noise-cleanup]')?.addEventListener("click", async () => {
+    const ids = $$('[data-noise-id]:checked').map((node) => node.dataset.noiseId).filter(Boolean);
+    if (!ids.length) return toast("请先选择要驳回的候选");
+    if (!await confirmAction(`确认软驳回 ${ids.length} 条黑话候选？记录仍会保留。`)) return;
+    await api.post("/memories/jargon/cleanup/apply", { action: "reject", ids });
+    clearDataCache("reviews:");
+    clearDataCache("memories:");
+    clearDataCache("learning:status");
+    closeModal();
+    toast(`已软驳回 ${ids.length} 条候选`);
+    loadReviews();
+  });
 }
 
 function bindReviewActions() {
@@ -1394,6 +1574,8 @@ function bindReviewActions() {
       await api.post(`/reviews/${segment(button.dataset.approveReview)}/submit`, { action: "approve" });
     }
     toast("已批准");
+    clearDataCache("reviews:");
+    clearDataCache("learning:status");
     loadReviews();
   }));
   $$('[data-reject-review]').forEach((button) => button.addEventListener("click", async () => {
@@ -1404,36 +1586,33 @@ function bindReviewActions() {
       await api.post(`/reviews/${segment(button.dataset.rejectReview)}/submit`, { action: "reject" });
     }
     toast("已驳回");
+    clearDataCache("reviews:");
+    clearDataCache("learning:status");
     loadReviews();
   }));
 }
 
 async function loadMemories() {
-  showLoading("正在读取记忆网络...");
-  const memoryState = state.cache.memories.canonical;
-  const kindParam = state.cache.memories.canonicalKind ? `&kind=${segment(state.cache.memories.canonicalKind)}` : "";
-  const [canonical, events, reflections, nodes, jargon] = await Promise.all([
-    safeFetch(() => api.get(`/memories/canonical?limit=${memoryState.limit}&offset=${memoryState.offset}${kindParam}`), memoryState),
-    safeFetch(() => api.get("/memories/events"), { items: [] }),
-    safeFetch(() => api.get(`/memories/reflections?month=${segment(state.cache.memories.month)}`), { items: [] }),
-    safeFetch(() => api.get("/memories/nodes"), { items: [] }),
-    safeFetch(() => api.get("/memories/jargon?limit=200"), { items: [], total: 0 }),
-  ]);
-  state.cache.memories.canonical = {
-    items: asItems(canonical),
-    total: Number(canonical.total ?? asItems(canonical).length),
-    limit: Number(canonical.limit ?? memoryState.limit),
-    offset: Number(canonical.offset ?? memoryState.offset),
-  };
-  state.cache.memories.events = asItems(events);
-  state.cache.memories.reflections = asItems(reflections);
-  state.cache.memories.nodes = asItems(nodes);
-  state.cache.memories.jargon = {
-    items: asItems(jargon),
-    total: Number(jargon.total ?? asItems(jargon).length),
-    limit: Number(jargon.limit ?? 200),
-    offset: Number(jargon.offset ?? 0),
-  };
+  const request = beginViewRequest();
+  const tabKey = `memories:${state.memoryTab}`;
+  if (!hasDataCachePrefix(tabKey)) showLoading("正在读取记忆网络...");
+  if (state.memoryTab === "canonical") {
+    const target = state.cache.memories.canonical;
+    const kindParam = state.cache.memories.canonicalKind ? `&kind=${segment(state.cache.memories.canonicalKind)}` : "";
+    const result = await cachedFetch(`${tabKey}:${target.offset}:${state.cache.memories.canonicalKind}`, () => api.get(`/memories/canonical?limit=${target.limit}&offset=${target.offset}${kindParam}`), target);
+    state.cache.memories.canonical = { items: asItems(result), total: Number(result.total ?? asItems(result).length), limit: target.limit, offset: target.offset };
+  } else if (state.memoryTab === "jargon") {
+    const target = state.cache.memories.jargon;
+    const result = await cachedFetch(`${tabKey}:${target.offset}`, () => api.get(`/memories/jargon?limit=${target.limit}&offset=${target.offset}`), target);
+    state.cache.memories.jargon = { items: asItems(result), total: Number(result.total ?? asItems(result).length), limit: target.limit, offset: target.offset };
+  } else if (state.memoryTab === "events") {
+    state.cache.memories.events = asItems(await cachedFetch(tabKey, () => api.get("/memories/events"), { items: [] }));
+  } else if (state.memoryTab === "reflections") {
+    state.cache.memories.reflections = asItems(await cachedFetch(`${tabKey}:${state.cache.memories.month}`, () => api.get(`/memories/reflections?month=${segment(state.cache.memories.month)}`), { items: [] }));
+  } else {
+    state.cache.memories.nodes = asItems(await cachedFetch(tabKey, () => api.get("/memories/nodes"), { items: [] }));
+  }
+  if (!isCurrentView(request)) return;
   const tabItems = {
     canonical: state.cache.memories.canonical.items,
     events: state.cache.memories.events,
@@ -1441,7 +1620,7 @@ async function loadMemories() {
     nodes: state.cache.memories.nodes,
     jargon: state.cache.memories.jargon.items,
   }[state.memoryTab] || [];
-  const rows = tabItems.map((item) => {
+  const rows = tabItems.map((item, index) => {
     const id = item.id || item.date || item.term || "-";
     const contentText = item.content || item.summary || item.narrative || item.reflection || item.meaning || "-";
     const actions = state.memoryTab === "jargon"
@@ -1451,10 +1630,10 @@ async function loadMemories() {
       <tr>
         <td>${escapeHtml(id)}</td>
         <td>${escapeHtml(item.kind || item.status || item.date || "-")}</td>
-        <td><pre>${escapeHtml(contentText)}</pre></td>
+        <td><div class="content-preview">${escapeHtml(previewText(contentText, 220))}</div></td>
         <td>${escapeHtml(item.session_id || item.group_id || "-")}</td>
         <td>${escapeHtml(item.confidence ?? item.importance ?? "-")}</td>
-        <td class="row-actions">${actions}</td>
+        <td class="row-actions"><button class="ghost-button" data-memory-detail="${index}" type="button">详情</button>${actions}</td>
       </tr>
     `;
   });
@@ -1474,13 +1653,13 @@ async function loadMemories() {
       <span>第 ${Math.floor(state.cache.memories.canonical.offset / state.cache.memories.canonical.limit) + 1} / ${Math.max(1, Math.ceil(state.cache.memories.canonical.total / state.cache.memories.canonical.limit))} 页，共 ${state.cache.memories.canonical.total} 条</span>
       <button class="ghost-button" data-memory-page="${state.cache.memories.canonical.offset + state.cache.memories.canonical.limit}" type="button" ${state.cache.memories.canonical.offset + state.cache.memories.canonical.limit >= state.cache.memories.canonical.total ? "disabled" : ""}>下一页</button>
     </div>
-  ` : "";
+  ` : state.memoryTab === "jargon" ? renderOffsetPager("memory-jargon", state.cache.memories.jargon) : "";
   const totals = `
     <div class="grid">
       ${metric("Canonical v2", state.cache.memories.canonical.total)}
       ${metric("黑话", state.cache.memories.jargon.total)}
-      ${metric("旧事件", state.cache.memories.events.length)}
-      ${metric("旧实体", state.cache.memories.nodes.length)}
+      ${metric("旧事件", state.cache.memories.events.length || "未加载", "兼容诊断源")}
+      ${metric("旧实体", state.cache.memories.nodes.length || "未加载", "旧实体图谱")}
     </div>
   `;
   const emptyText = state.memoryTab === "canonical"
@@ -1512,6 +1691,13 @@ async function loadMemories() {
     state.cache.memories.canonical.offset = Math.max(0, Number(button.dataset.memoryPage || 0));
     loadMemories();
   }));
+  $$('[data-memory-jargon-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.memories.jargon.offset = Math.max(0, Number(button.dataset.memoryJargonPage || 0));
+    loadMemories();
+  }));
+  $$('[data-memory-detail]').forEach((button) => button.addEventListener("click", () => {
+    openModal("记忆详情", `<pre>${escapeHtml(json(tabItems[Number(button.dataset.memoryDetail)] || {}))}</pre>`);
+  }));
   $$('[data-memory-jargon-edit]').forEach((button) => button.addEventListener("click", () => {
     const item = findMemoryItem("jargon", button.dataset.memoryJargonEdit);
     if (!item) return toast("未找到黑话记录");
@@ -1526,13 +1712,16 @@ async function loadMemories() {
     if (state.memoryTab === "nodes") await api.post(`/memories/nodes/${segment(id)}/delete`);
     if (state.memoryTab === "jargon") await api.post(`/memories/jargon/${segment(id)}/delete`);
     toast("记忆记录已删除");
+    clearDataCache("memories:");
     loadMemories();
   }));
 }
 
 async function loadUsers() {
-  showLoading("正在读取用户画像...");
-  const users = await safeFetch(() => api.get("/users"), { items: [] });
+  const request = beginViewRequest();
+  if (!hasDataCachePrefix("users:list")) showLoading("正在读取用户画像...");
+  const users = await cachedFetch("users:list", () => api.get("/users"), { items: [] });
+  if (!isCurrentView(request)) return;
   state.cache.users = asItems(users);
   if (!state.activeUserId && state.cache.users[0]) state.activeUserId = state.cache.users[0].user_id || state.cache.users[0].id || "";
   renderUsers();
@@ -1712,6 +1901,7 @@ function bindUserActions(active) {
     $$('[data-user-field]').forEach((input) => { body[input.dataset.userField] = input.value; });
     await api.post(`/users/${segment(active.user_id || active.id)}`, body);
     toast("用户画像已保存");
+    clearDataCache("users:");
     loadUsers();
   });
   $('[data-delete-user]')?.addEventListener("click", async () => {
@@ -1719,6 +1909,7 @@ function bindUserActions(active) {
     await api.post(`/users/${segment(active.user_id || active.id)}/delete`);
     state.activeUserId = "";
     toast("用户画像已删除");
+    clearDataCache("users:");
     loadUsers();
   });
   $$('[data-add-slice]').forEach((button) => button.addEventListener("click", async () => {
@@ -1727,6 +1918,7 @@ function bindUserActions(active) {
     if (!input?.value?.trim()) return;
     await api.post(`/users/${segment(active.user_id || active.id)}/slices`, { type: field, content: input.value.trim() });
     toast("切片已添加");
+    clearDataCache("users:");
     loadUsers();
   }));
   $$('[data-slice-input]').forEach((input) => input.addEventListener("keydown", (event) => {
@@ -1738,21 +1930,25 @@ function bindUserActions(active) {
     const [field, index] = button.dataset.deleteSlice.split(":");
     await api.post(`/users/${segment(active.user_id || active.id)}/slices/${segment(index)}/delete`, { type: field });
     toast("切片已删除");
+    clearDataCache("users:");
     loadUsers();
   }));
 }
 
 async function loadPersonaSlices() {
-  showLoading("正在读取角色切片诊断...");
+  const request = beginViewRequest();
+  if (!hasDataCachePrefix("persona:slices")) showLoading("正在读取角色切片诊断...");
   state.cache.personaSlicesError = null;
   try {
-    const result = await api.get("/persona/slices");
+    const result = await cachedFetch("persona:slices", () => api.get("/persona/slices"), {});
+    if (!isCurrentView(request)) return;
     state.cache.personaSlices = result;
   } catch (error) {
     state.cache.personaSlices = {};
     state.cache.personaSlicesError = error.message || String(error);
     toast("角色切片读取失败");
   }
+  if (!isCurrentView(request)) return;
   renderPersonaSlices();
 }
 
@@ -1799,6 +1995,7 @@ async function savePersonaSlices(changes) {
     ...changes,
   });
   state.cache.personaSlices = updated;
+  clearDataCache("persona:");
   renderPersonaSlices();
   toast("派生人格已保存，下一轮聊天生效");
 }
@@ -1815,6 +2012,7 @@ async function restorePersonaFields(fields = []) {
     fields,
   });
   state.cache.personaSlices = updated;
+  clearDataCache("persona:");
   renderPersonaSlices();
   toast("已恢复 AI 生成版本");
 }
@@ -1954,9 +2152,18 @@ async function loadCurrent() {
 
 async function init() {
   setBridgeStatus("Bridge 初始化中", "muted");
+  const buildNode = $("#build-version");
+  if (buildNode) buildNode.textContent = `Build ${ADMIN_BUILD_VERSION}`;
   renderTabs();
   $("#refresh-button").addEventListener("click", () => {
-    if (state.current === "dashboard") clearDashboardCache(state.dashboardTab);
+    if (state.current === "dashboard") {
+      clearDashboardCache(state.dashboardTab);
+      if (state.dashboardTab === "tools") clearDataCache("tools:");
+    }
+    clearDataCache(`${state.current}:`);
+    if (state.current === "learning") clearDataCache("learning:");
+    if (state.current === "reviews") clearDataCache("reviews:");
+    if (state.current === "memories") clearDataCache("memories:");
     loadCurrent();
   });
   window.addEventListener("hashchange", () => {

@@ -126,6 +126,38 @@ class ChatRuntimeServiceGapCoverageTests(unittest.TestCase):
         self.assertTrue(disabled["changed"])
         self.assertIs(engine.disabled, signal_a)
 
+    def test_memory_feedback_prefers_persisted_canonical_records(self):
+        from astrmai.webui.backend.services.chatruntimeservice import ChatRuntimeService
+
+        class _Engine:
+            def __init__(self):
+                self.list_call = None
+                self.disabled_id = ""
+
+            async def list_cognitive_feedback_records(self, **kwargs):
+                self.list_call = kwargs
+                return {
+                    "items": [{"id": "mem_feedback_1", "source": "planner", "persisted": True}],
+                    "total": 192,
+                    "limit": kwargs["limit"],
+                    "offset": kwargs["offset"],
+                }
+
+            async def disable_cognitive_feedback_record(self, memory_id):
+                self.disabled_id = memory_id
+                return True
+
+        engine = _Engine()
+        service = ChatRuntimeService(_PluginApi(memory_engine=engine))
+
+        result = asyncio.run(service.list_memory_feedback(source="planner", limit=20, offset=40))
+        disabled = asyncio.run(service.disable_memory_feedback("mem_feedback_1"))
+
+        self.assertEqual(result["total"], 192)
+        self.assertEqual(engine.list_call["offset"], 40)
+        self.assertEqual(engine.disabled_id, "mem_feedback_1")
+        self.assertTrue(disabled["persisted"])
+
 
 if __name__ == "__main__":
     unittest.main()

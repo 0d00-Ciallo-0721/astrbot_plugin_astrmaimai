@@ -2117,6 +2117,11 @@ class ChatLoopKernel:
         poll_mode = str(report.get("poll_mode", "") or "")
         batch_plan = dict(report.get("batch_plan", {}) or {})
         pressure = dict(report.get("batch_pressure", {}) or {})
+        pressure_active = (
+            float(pressure.get("busy_ratio", 0.0) or 0.0) > 0.0
+            or float(pressure.get("maintenance_backlog_ratio", 0.0) or 0.0) > 0.0
+            or int(pressure.get("retry_pressure_count", 0) or 0) > 0
+        )
         common_detail = {
             "poll_mode": poll_mode,
             "batch_plan": batch_plan,
@@ -2130,14 +2135,14 @@ class ChatLoopKernel:
             hub.record(
                 domain="scheduler",
                 kind="heartbeat",
-                level="warning" if pressure else "info",
+                level="warning" if pressure_active else "info",
                 chat_id="",
                 title="Due selection committed",
                 summary=f"selected={len(selected)} skipped={len(skipped)} poll_mode={poll_mode or '-'}",
                 tags={
                     "domain": "scheduler",
                     "kind": "heartbeat",
-                    "level": "warning" if pressure else "info",
+                    "level": "warning" if pressure_active else "info",
                     "phase": "heartbeat",
                     "action": "due_selection_committed",
                     "scheduler_bucket": str(batch_plan.get("selected_bucket", "") or ""),
