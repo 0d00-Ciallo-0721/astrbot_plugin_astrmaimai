@@ -823,6 +823,58 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("不在当前群聊", result)
         self.assertEqual(api.calls, [])
 
+    def test_proactive_poke_peer_poke_requires_explicit_actor_or_target(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.set_extra("astrmai_interaction_kind", "peer_poke")
+        event.set_extra("astrmai_peer_poke_join_allowed", True)
+        event.set_extra("astrmai_interaction_actor_id", "user-1")
+        event.set_extra("astrmai_interaction_actor_name", "Alice")
+        event.set_extra("astrmai_interaction_target_id", "user-2")
+        event.set_extra("astrmai_interaction_target_name", "Bob")
+        tool = self.mod.ProactivePokeTool(db_service=None)
+
+        result = asyncio.run(tool.call(_wrap_event(event)))
+
+        self.assertIn("必须明确选择", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
+    def test_proactive_poke_peer_poke_accepts_named_participant(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.set_extra("astrmai_interaction_kind", "peer_poke")
+        event.set_extra("astrmai_peer_poke_join_allowed", True)
+        event.set_extra("astrmai_interaction_actor_id", "user-1")
+        event.set_extra("astrmai_interaction_actor_name", "Alice")
+        event.set_extra("astrmai_interaction_target_id", "user-2")
+        event.set_extra("astrmai_interaction_target_name", "Bob")
+        tool = self.mod.ProactivePokeTool(db_service=None)
+
+        result = asyncio.run(tool.call(_wrap_event(event), target_name="Bob"))
+
+        self.assertIn("加入待执行动作", result)
+        action = event.get_extra("astrmai_pending_actions")[0]
+        self.assertEqual(action["action"], "poke")
+        self.assertEqual(action["target_id"], "user-2")
+        self.assertEqual(action["group_id"], "111")
+
+    def test_proactive_poke_peer_poke_rejects_unrelated_target(self):
+        event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
+        event.set_extra("astrmai_interaction_kind", "peer_poke")
+        event.set_extra("astrmai_peer_poke_join_allowed", True)
+        event.set_extra("astrmai_interaction_actor_id", "user-1")
+        event.set_extra("astrmai_interaction_actor_name", "Alice")
+        event.set_extra("astrmai_interaction_target_id", "user-2")
+        event.set_extra("astrmai_interaction_target_name", "Bob")
+
+        class _DbService:
+            async def resolve_entity_spatio_temporal(self, **kwargs):
+                return "user-3", "111"
+
+        tool = self.mod.ProactivePokeTool(db_service=_DbService())
+        result = asyncio.run(tool.call(_wrap_event(event), target_name="Carol"))
+
+        self.assertIn("只能戳发起者或被戳者", result)
+        self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
+
     def test_proactive_poke_accepts_current_private_sender_name(self):
         event = _FakeEvent(group_id=None, sender_id="516779421", sender_name="恸")
 

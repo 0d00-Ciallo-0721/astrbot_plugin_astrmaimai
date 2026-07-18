@@ -463,6 +463,36 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertAlmostEqual(focus.get_extra("astrmai_primary_mood_value"), 0.45)
         self.assertEqual(focus.get_extra("astrmai_primary_mood_source"), "attention_pre_judge")
 
+    def test_router_ignores_peer_poke_when_judge_times_out(self):
+        async def _slow_evaluate(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(action="PASS")
+
+        self.gate.config.attention.judge_timeout = 0.001
+        self.gate.judge = SimpleNamespace(evaluate=_slow_evaluate)
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent(
+            "user-1",
+            "Alice",
+            "Alice 戳了 Bob 一下，这是群友之间的轻互动。",
+            extras={"astrmai_interaction_kind": "peer_poke"},
+        )
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "IGNORE")
+        self.assertEqual(decision.reason, "peer_poke_judge_timeout")
+
     def test_process_event_resumes_private_wait_without_consuming_message(self):
         calls = []
 
@@ -909,6 +939,44 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(result, "ENGAGED")
         self.assertEqual(calls, [("default:GroupMessage:group-1", "external plugin reply", "external_result_bridge")])
+
+    def test_proactive_candidate_wait_completes_without_sys2_dispatch(self):
+        completed = []
+        dispatched = []
+
+        async def fake_sys2(event, events):
+            dispatched.append((event, events))
+
+        async def completion(reply_sent, reply_preview):
+            completed.append((reply_sent, reply_preview))
+
+        self.gate.judge = _SequenceJudge(["WAIT"])
+        self.gate.sys2_process = fake_sys2
+        self.gate._compute_debounce_delay = lambda *args, **kwargs: 0.0
+
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            event = _FakeEvent(
+                "astrmai_proactive_candidate",
+                "主动开口候选",
+                "[主动开口候选]\n候选指引：说一句轻松的话",
+                extras={
+                    "astrmai_is_proactive_event": True,
+                    "astrmai_proactive_candidate": True,
+                    "astrmai_proactive_completion_callback": completion,
+                },
+            )
+            session.accumulation_pool = [event]
+            session.is_evaluating = True
+            await self.gate._debounce_and_judge("default:GroupMessage:group-1", session, "bot-1")
+            return event
+
+        event = asyncio.run(_run())
+
+        self.assertEqual(dispatched, [])
+        self.assertEqual(completed, [(False, "")])
+        self.assertTrue(event.get_extra("astrmai_proactive_completed"))
+        self.assertEqual(event.get_extra("judge_action"), "WAIT")
 
     def test_debounce_worker_drain_loop_keeps_late_arrivals(self):
         captured = []

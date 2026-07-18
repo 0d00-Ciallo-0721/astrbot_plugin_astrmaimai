@@ -321,6 +321,62 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertEqual(len(gate.processed), 1)
         self.assertEqual(gate.state_engine.affection_calls[0]["event_type"], "normal_chat")
 
+    def test_peer_poke_enters_observer_context_without_self_poke_semantics(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        event = _FakeEvent(group_id="456", components=[self._poke_component("67890")])
+
+        class _Api:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **kwargs):
+                self.calls.append((action, kwargs))
+                if action == "get_group_member_info" and str(kwargs.get("user_id")) == "67890":
+                    return {"card": "Bob"}
+                return {}
+
+        class _State:
+            def __init__(self):
+                self.affection_calls = []
+                self.relationship_engine = SimpleNamespace(get_social_score=lambda _uid: 42.0)
+
+            async def get_user_profile(self, uid):
+                return SimpleNamespace(name="")
+
+            async def apply_profile_name(self, uid, name, source=""):
+                return None
+
+            async def calculate_and_update_affection(self, **kwargs):
+                self.affection_calls.append(kwargs)
+
+        class _Gate:
+            def __init__(self):
+                self.state_engine = _State()
+                self.processed = []
+
+            async def process_event(self, event):
+                self.processed.append(event)
+
+        api = _Api()
+        event.bot = SimpleNamespace(api=api)
+        gate = _Gate()
+
+        asyncio.run(filters.process_poke_event(event, SimpleNamespace(), gate))
+
+        self.assertFalse(event.get_extra("is_virtual_poke"))
+        self.assertEqual(event.get_extra("astrmai_interaction_kind"), "peer_poke")
+        self.assertEqual(event.get_extra("astrmai_reply_mode"), "peer_interaction_observer")
+        self.assertFalse(event.get_extra("astrmai_interaction_target_is_bot"))
+        self.assertIn("Alice", event.get_extra("astrmai_rich_text"))
+        self.assertIn("Bob", event.get_extra("astrmai_rich_text"))
+        self.assertIn("不是你被戳", event.get_extra("astrmai_poke_reply_hint"))
+        self.assertEqual(event.get_extra("astrmai_peer_poke_allowed_target_ids"), ["12345", "67890"])
+        self.assertEqual(event.get_extra("astrmai_bonus_score"), 0.2)
+        self.assertFalse(event.get_extra("astrmai_force_meme", False))
+        self.assertEqual(gate.state_engine.affection_calls, [])
+        self.assertEqual([call for call in api.calls if call[0] == "send_poke"], [])
+        self.assertEqual(len(gate.processed), 1)
+
     def test_poke_event_uses_deep_raw_user_id_instead_of_event_sender(self):
         filters = self.sensors_mod.PreFilters(self._config())
         event = _FakeEvent(group_id="456", components=[])

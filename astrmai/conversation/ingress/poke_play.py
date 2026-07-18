@@ -84,7 +84,7 @@ class PokePlaybook:
         social_signal = "attention_request" if target_is_bot else "peer_play"
         group_focus_hint = ""
         if group_id and not target_is_bot:
-            group_focus_hint = f"{sender_name} 正在用戳一戳把 {target_name} 拉进当前群聊互动。"
+            group_focus_hint = f"{sender_name} 正在和 {target_name} 进行群友之间的戳一戳互动，机器人只是旁观者。"
 
         return PokePlayContext(
             intent=intent,
@@ -184,7 +184,7 @@ class PokePlaybook:
         cooldown_seconds: float,
     ) -> str:
         if not target_is_bot:
-            return "如果要回应，只轻轻点到这个群友互动，不要替被戳的人做长篇表态。"
+            return "这是群友之间的戳一戳，不是你被戳。默认可以忽略；若语境自然，只能以旁观者轻轻围观或选择戳回发起者/被戳者，禁止说成自己被戳。"
         if cooldown_seconds > 0:
             return "用一两句短回复表达被连续戳到的反应，可以调皮提醒别一直戳。"
         if relationship_level in {"close", "friendly"}:

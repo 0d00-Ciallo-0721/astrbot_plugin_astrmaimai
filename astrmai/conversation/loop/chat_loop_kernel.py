@@ -1209,7 +1209,7 @@ class ChatLoopKernel:
 
         if trigger == "heartbeat":
             proactive_summary = await self._collect_proactive_summary(chat_id, state)
-            if proactive_summary.get("eligible") or proactive_summary.get("candidate_present"):
+            if proactive_summary.get("eligible"):
                 proactive_signal = "wakeup"
 
             heartflow_summary = await self._collect_heartflow_summary(chat_id, latest_activity)
@@ -1548,6 +1548,8 @@ class ChatLoopKernel:
                     proactive_metadata["pending_heartflow"] = True
                     proactive_metadata["pending_heartflow_reason"] = f"heartflow_signal:{snapshot.heartflow_signal}"
                 return self._bridge_decision(snapshot, "PROACTIVE_WAKEUP", "wakeup_signal", metadata=proactive_metadata)
+        elif snapshot.proactive_summary.get("candidate_present") and self._cooldown_active(snapshot, "wakeup"):
+            cooldown_blocks.append("wakeup")
 
         if pending_heartflow and not snapshot.quiet_signal and not self._cooldown_active(snapshot, "heartflow"):
             metadata = {

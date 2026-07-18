@@ -123,7 +123,7 @@ class PlannerPromptContextMixin:
     @staticmethod
     def _is_lightweight_event(message_event: AstrMessageEvent, focus_context: FocusThreadContext) -> bool:
         interaction_kind = str(message_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
-        if message_event.get_extra("is_virtual_poke", False) or interaction_kind in {"poke"}:
+        if message_event.get_extra("is_virtual_poke", False) or interaction_kind in {"poke", "peer_poke"}:
             return True
         text = str(message_event.get_extra("astrmai_rich_text", message_event.message_str) or "").strip()
         if text.startswith("(Interaction:") and text.endswith(")"):
@@ -419,7 +419,8 @@ class PlannerPromptContextMixin:
         )
         if is_lightweight_event:
             prompt_envelope.guidance_lines.append("这是轻互动，只回应当前动作，不要接旧话题或复述历史。")
-        if str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower() == "poke":
+        interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
+        if interaction_kind == "poke":
             poke_hint = str(focus_event.get_extra("astrmai_poke_reply_hint", "") or "").strip()
             poke_intent = str(focus_event.get_extra("astrmai_poke_intent", "") or "").strip()
             poke_streak = int(focus_event.get_extra("astrmai_poke_streak_count", 0) or 0)
@@ -429,6 +430,23 @@ class PlannerPromptContextMixin:
                 prompt_envelope.guidance_lines.append(
                     f"戳一戳语境：intent={poke_intent}, streak={poke_streak}。回复保持短促、鲜活，不要超过两句话。"
                 )
+        elif interaction_kind == "peer_poke":
+            actor = str(focus_event.get_extra("astrmai_interaction_actor_display_name", "") or "").strip()
+            target = str(focus_event.get_extra("astrmai_interaction_target_display_name", "") or "").strip()
+            join_allowed = bool(focus_event.get_extra("astrmai_peer_poke_join_allowed", False))
+            poke_hint = str(focus_event.get_extra("astrmai_poke_reply_hint", "") or "").strip()
+            prompt_envelope.guidance_lines.append(
+                f"群友互戳语境：{actor or '有人'} 戳了 {target or '另一位群友'}。这不是你被戳，你只是旁观者。"
+            )
+            prompt_envelope.guidance_lines.append(
+                "如果回应，只能轻轻围观或吐槽这次群友互动；禁止说“谁戳我/谁戳妃爱/我被戳了”。"
+            )
+            if join_allowed:
+                prompt_envelope.guidance_lines.append("若语境很自然，可以调用戳一戳工具加入互动，但只能戳发起者或被戳者。")
+            else:
+                prompt_envelope.guidance_lines.append("本轮不适合加入互戳，只能选择忽略或短句旁观。")
+            if poke_hint:
+                prompt_envelope.guidance_lines.append(f"群友互戳互动策略：{poke_hint}")
         event.set_extra("astrmai_lightweight_event", is_lightweight_event)
         event.set_extra("astrmai_focus_thread_context", focus_context)
         emit_legacy_prompt_envelope_extras(event, prompt_envelope, use_lane_history=True)

@@ -611,7 +611,9 @@ class PlannerSideInputMixin:
                     runtime_coordinator=getattr(self, "runtime_coordinator", None),
                 ),
             ]
-        elif self._has_guarded_chat_intent(event):
+        elif self._has_guarded_chat_intent(event) or (
+            str(event.get_extra("astrmai_interaction_kind", "") or "").strip().lower() == "peer_poke"
+        ):
             tools.extend(
                 [
                     ProactivePokeTool(db_service=self.context_engine.db),
@@ -1381,7 +1383,7 @@ class PlannerSideInputMixin:
             return False
         return bool(
             event.get_extra("is_virtual_poke", False)
-            or str(event.get_extra("astrmai_interaction_kind", "") or "").lower() == "poke"
+            or str(event.get_extra("astrmai_interaction_kind", "") or "").lower() in {"poke", "peer_poke"}
         )
 
     def _record_follow_up_decision(

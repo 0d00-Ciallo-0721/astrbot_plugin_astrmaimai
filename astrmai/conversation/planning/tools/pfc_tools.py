@@ -880,6 +880,34 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
         target_id: Optional[str] = None
         group_id = scope.group_id
         display_name = target_name or (current_event.get_sender_name() or "当前用户")
+        is_peer_poke = (
+            str(current_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower() == "peer_poke"
+        )
+
+        if is_peer_poke:
+            if not bool(current_event.get_extra("astrmai_peer_poke_join_allowed", False)):
+                return "动作取消：这轮群友互戳不适合继续加入，请只用一句话旁观或忽略。"
+            allowed_pairs = {
+                str(current_event.get_extra("astrmai_interaction_actor_id", "") or "").strip(): str(
+                    current_event.get_extra("astrmai_interaction_actor_name", "") or ""
+                ).strip(),
+                str(current_event.get_extra("astrmai_interaction_target_id", "") or "").strip(): str(
+                    current_event.get_extra("astrmai_interaction_target_name", "") or ""
+                ).strip(),
+            }
+            allowed_pairs = {key: value for key, value in allowed_pairs.items() if key}
+            allowed_names = {name.strip().casefold(): uid for uid, name in allowed_pairs.items() if name}
+            if not target_name:
+                return "动作取消：加入群友互戳时必须明确选择戳发起者或被戳者。"
+            clean_peer_target = target_name.lstrip("@").strip()
+            if clean_peer_target in allowed_pairs:
+                target_id = clean_peer_target
+                display_name = allowed_pairs.get(target_id) or clean_peer_target
+                target_name = display_name
+            elif clean_peer_target.casefold() in allowed_names:
+                target_id = allowed_names[clean_peer_target.casefold()]
+                display_name = allowed_pairs.get(target_id) or clean_peer_target
+                target_name = display_name
 
         if target_name:
             clean_target = target_name.lstrip("@").strip()
@@ -887,7 +915,9 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
                 str(scope.sender_id or "").strip().casefold(),
                 str(current_event.get_sender_name() or "").strip().casefold(),
             }
-            if scope.is_private_chat and clean_target.casefold() in current_sender_aliases:
+            if target_id is not None:
+                resolved_group_id = group_id
+            elif scope.is_private_chat and clean_target.casefold() in current_sender_aliases:
                 target_id = scope.sender_id
                 resolved_group_id = None
             else:
@@ -900,6 +930,9 @@ class ProactivePokeTool(FunctionTool[AstrAgentContext]):
                 if not resolved:
                     return f"动作取消：当前上下文里无法锁定 {target_name}。"
                 target_id, resolved_group_id = resolved
+                if is_peer_poke and target_id not in allowed_pairs:
+                    allowed_display = "、".join(name or uid for uid, name in allowed_pairs.items())
+                    return f"动作取消：群友互戳场景只能戳发起者或被戳者（{allowed_display}）。"
             current_group_id = str(scope.group_id or "").strip()
             resolved_group_id = str(resolved_group_id or "").strip()
             if scope.is_group_chat:

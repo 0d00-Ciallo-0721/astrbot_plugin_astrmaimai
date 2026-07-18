@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable
@@ -106,6 +107,27 @@ class ProactiveDispatcher:
             logger.debug(f"[ProactiveDispatcher] runtime snapshot degraded for {chat_id}: {exc}")
             return {}
 
+    @staticmethod
+    def _proactive_noise_block(snapshot: dict[str, Any], bot_id: str) -> str:
+        preview = str(snapshot.get("latest_activity_preview", "") or "").strip()
+        lowered = preview.lower()
+        try:
+            recent_60s = int(snapshot.get("recent_activity_count_60s", 0) or 0)
+        except (TypeError, ValueError):
+            recent_60s = 0
+        if recent_60s >= 4:
+            return "recent_group_burst"
+        if not preview:
+            return ""
+        if "[](%7b%22version%22" in lowered or "[图片]" in preview or "[image]" in lowered:
+            return "recent_media_or_card"
+        command_like = bool(re.search(r"(^|\s)[/!！.。#＃][^\s]+", preview))
+        at_targets = [item for item in re.findall(r"@[^()\s]+(?:\((\d+)\))?", preview) if item]
+        if command_like and at_targets:
+            if not bot_id or any(str(target) != str(bot_id) for target in at_targets):
+                return "recent_other_bot_command"
+        return ""
+
     async def _safety_check(self, intent: ProactiveMessageIntent, *, now: float) -> tuple[bool, str, dict[str, Any]]:
         rhythm = evaluate_proactive_rhythm(self.config, now=now)
         snapshot = await self._activity_snapshot(intent.chat_id)
@@ -123,6 +145,12 @@ class ProactiveDispatcher:
             executor_pending = int(snapshot.get("executor_pending", 0) or 0)
         except (TypeError, ValueError):
             executor_pending = 1
+        try:
+            recent_activity_count_60s = int(snapshot.get("recent_activity_count_60s", 0) or 0)
+        except (TypeError, ValueError):
+            recent_activity_count_60s = 0
+        bot_id = str(getattr(self.state_engine, "bot_id", "") or "")
+        noise_block = self._proactive_noise_block(snapshot, bot_id) if intent.source == "wakeup" else ""
         energy = await self._state_energy(intent.chat_id)
         min_energy = float(getattr(getattr(self.config, "life", None), "wakeup_min_energy", 0.0) or 0.0)
         talk_willingness = intent.metadata.get("talk_willingness", None)
@@ -151,6 +179,9 @@ class ProactiveDispatcher:
             "proactive_quiet_hours": list(rhythm.quiet_ranges),
             "base_frequency": rhythm.base_frequency,
             "base_frequency_factor": rhythm.base_frequency_factor,
+            "proactive_noise_block": noise_block,
+            "latest_activity_preview": self._preview(snapshot.get("latest_activity_preview", ""), 80),
+            "recent_activity_count_60s": recent_activity_count_60s,
         }
         if not checks["has_attention_gate"]:
             return False, "attention_gate_unavailable", checks
@@ -162,6 +193,8 @@ class ProactiveDispatcher:
             return False, "chat_inactive", checks
         if wait_targets or executor_pending > 0:
             return False, "user_waiting", checks
+        if noise_block:
+            return False, noise_block, checks
         if cooldown_until and now < cooldown_until:
             return False, "cooldown", checks
         if energy is not None and min_energy > 0 and energy < min_energy:
@@ -285,15 +318,22 @@ class ProactiveDispatcher:
                 synthetic_event_queued=decision.synthetic_event_queued,
             )
 
+        candidate_text = (
+            "[主动开口候选]\n"
+            "这不是用户消息，而是后台产生的一次主动加入候选。请先根据当前聊天窗口判断是否自然；"
+            "如果当前语境不适合，请等待或忽略。\n"
+            f"候选指引：{intent.guidance}"
+        )
         event_data = {
-            "message_str": "",
+            "message_str": candidate_text,
             "timestamp": now,
-            "sender_id": str(getattr(self.state_engine, "bot_id", "") or "astrmai"),
-            "sender_name": str(getattr(getattr(self.config, "persona", None), "name", "") or "AstrMai"),
+            "sender_id": "astrmai_proactive_candidate",
+            "sender_name": "主动开口候选",
             "self_id": str(getattr(self.state_engine, "bot_id", "") or "astrmai"),
             "group_id": str(intent.metadata.get("group_id", intent.chat_id) or ""),
             "extra": {
                 "astrmai_is_proactive_event": True,
+                "astrmai_proactive_candidate": True,
                 "astrmai_proactive_source": intent.source,
                 "astrmai_proactive_reason": intent.reason,
                 "astrmai_proactive_guidance": intent.guidance,
@@ -307,7 +347,6 @@ class ProactiveDispatcher:
                 "astrmai_loop_source": "proactive_dispatcher",
                 "astrmai_proactive_dispatch_decision": decision,
                 "astrmai_proactive_completion_callback": _completion,
-                "astrmai_force_engage": True,
             },
         }
         async def _inject_event():

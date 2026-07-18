@@ -21,6 +21,7 @@ class PreFilters:
         self._commands_loaded = False 
         self._poke_playbook = PokePlaybook()
         self._recent_counter_pokes: dict[str, float] = {}
+        self._recent_peer_poke_joins: dict[str, float] = {}
 
     def refresh_config(self, config):
         self.config = config
@@ -43,6 +44,24 @@ class PreFilters:
             self._recent_counter_pokes.pop(key, None)
             return False
         return sender_id == bot_id or not sender_id or sender_id == target_id
+
+    def _peer_poke_join_allowed(self, chat_id: str, sender_id: str, target_id: str) -> bool:
+        key = f"{chat_id}:{sender_id}:{target_id}"
+        seen_at = self._recent_peer_poke_joins.get(key)
+        if not seen_at:
+            return True
+        if time.time() - seen_at > 30.0:
+            self._recent_peer_poke_joins.pop(key, None)
+            return True
+        return False
+
+    def _record_peer_poke_candidate(self, chat_id: str, sender_id: str, target_id: str) -> None:
+        now = time.time()
+        self._recent_peer_poke_joins[f"{chat_id}:{sender_id}:{target_id}"] = now
+        cutoff = now - 90.0
+        for stale_key, seen_at in list(self._recent_peer_poke_joins.items()):
+            if seen_at < cutoff:
+                self._recent_peer_poke_joins.pop(stale_key, None)
 
     async def load_foreign_commands(self):
         """公开接口：异步动态加载系统内所有注册指令（D59：替代 hasattr 私有方法访问）"""
@@ -478,7 +497,7 @@ class PreFilters:
         if not is_poke: return
         if sender_id == bot_id: return
 
-        if target_id and not target_id.isdigit():
+        if target_id and not target_id.isdigit() and target_id != bot_id:
             target_id = ""
 
         if not target_id or target_id == "0": 
@@ -549,7 +568,8 @@ class PreFilters:
             if self.config.system1.nicknames:
                 bot_name = self.config.system1.nicknames[0]
                 
-        target_name = bot_name if target_id == bot_id else await _resolve_name(target_id, "")
+        target_is_bot = target_id == bot_id
+        target_name = bot_name if target_is_bot else await _resolve_name(target_id, "")
         actor_label = (
             f"{sender_name}({sender_id})"
             if actor_confident and sender_id and sender_id not in str(sender_name)
@@ -576,13 +596,13 @@ class PreFilters:
             sender_name=sender_name,
             target_id=target_id,
             target_name=target_name,
-            target_is_bot=target_id == bot_id,
+            target_is_bot=target_is_bot,
             social_score=social_score,
             group_id=group_id,
             now=occurred_at,
         )
 
-        if actor_confident and target_id == bot_id and state_engine and hasattr(state_engine, "calculate_and_update_affection"):
+        if actor_confident and target_is_bot and state_engine and hasattr(state_engine, "calculate_and_update_affection"):
             try:
                 await state_engine.calculate_and_update_affection(
                     user_id=sender_id,
@@ -598,7 +618,7 @@ class PreFilters:
         virtual_text = poke_play.narrative
         logger.info(f"[AstrMai-Sensor] 👉 捕获互动事件: {virtual_text}")
         
-        if actor_confident and target_id == bot_id and poke_play.should_counter_poke:
+        if actor_confident and target_is_bot and poke_play.should_counter_poke:
             try:
                 client = getattr(event, 'bot', None)
                 if client and hasattr(client, 'api'):
@@ -611,12 +631,21 @@ class PreFilters:
             except Exception as e:
                 logger.debug(f"[AstrMai-Sensor] 回戳操作发生异常: {e}")
 
+        peer_join_allowed = True
+        if not target_is_bot:
+            peer_join_allowed = (
+                actor_confident
+                and self._peer_poke_join_allowed(chat_id, sender_id, target_id)
+                and poke_play.cooldown_seconds <= 0
+            )
+            self._record_peer_poke_candidate(chat_id, sender_id, target_id)
+
         event.message_str = virtual_text
-        event.set_extra("is_virtual_poke", True)
-        event.set_extra("astrmai_interaction_kind", "poke")
+        event.set_extra("is_virtual_poke", target_is_bot)
+        event.set_extra("astrmai_interaction_kind", "poke" if target_is_bot else "peer_poke")
         event.set_extra("astrmai_lightweight_event", True)
         event.set_extra("astrmai_rich_text", virtual_text)
-        event.set_extra("astrmai_reply_mode", "playful_interaction")
+        event.set_extra("astrmai_reply_mode", "playful_interaction" if target_is_bot else "peer_interaction_observer")
         event.set_extra("astrmai_interaction_actor_id", sender_id if actor_confident else "")
         event.set_extra("astrmai_interaction_actor_name", sender_name)
         event.set_extra("astrmai_interaction_actor_display_name", actor_label)
@@ -624,7 +653,7 @@ class PreFilters:
         event.set_extra("astrmai_interaction_target_id", target_id)
         event.set_extra("astrmai_interaction_target_name", target_name)
         event.set_extra("astrmai_interaction_target_display_name", target_label)
-        event.set_extra("astrmai_interaction_target_is_bot", target_id == bot_id)
+        event.set_extra("astrmai_interaction_target_is_bot", target_is_bot)
         event.set_extra("astrmai_interaction_occurred_at", occurred_at)
         event.set_extra("astrmai_interaction_relative_age_label", relative_age_label)
         event.set_extra("astrmai_poke_intent", poke_play.intent)
@@ -635,8 +664,17 @@ class PreFilters:
         event.set_extra("astrmai_poke_social_signal", poke_play.social_signal)
         event.set_extra("astrmai_poke_cooldown_seconds", poke_play.cooldown_seconds)
         event.set_extra("astrmai_poke_group_focus_hint", poke_play.group_focus_hint)
-        event.set_extra("astrmai_bonus_score", 2.0) 
-        if poke_play.should_force_meme:
+        event.set_extra("astrmai_peer_poke_join_allowed", peer_join_allowed)
+        event.set_extra(
+            "astrmai_peer_poke_allowed_target_ids",
+            [item for item in (sender_id if actor_confident else "", target_id) if item],
+        )
+        event.set_extra(
+            "astrmai_peer_poke_allowed_target_names",
+            [item for item in (sender_name if actor_confident else "", target_name) if item],
+        )
+        event.set_extra("astrmai_bonus_score", 2.0 if target_is_bot else 0.2)
+        if target_is_bot and poke_play.should_force_meme:
             event.set_extra("astrmai_force_meme", True)
             event.set_extra("astrmai_bypass_mood_analysis", poke_play.meme_tag)
         

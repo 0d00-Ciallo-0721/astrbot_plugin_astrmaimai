@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import hashlib
+import inspect
 import re
 import time
 from types import SimpleNamespace
@@ -572,7 +573,7 @@ class AttentionGate:
             event.set_extra("astrmai_proactive_completed", True)
             try:
                 result = callback(reply_sent, "")
-                if asyncio.iscoroutine(result):
+                if inspect.isawaitable(result):
                     await result
             except Exception as callback_exc:
                 logger.error(f"[AttentionGate] proactive completion callback failed: {callback_exc}")
@@ -739,6 +740,33 @@ class AttentionGate:
         if event.get_extra("astrmai_force_engage", False):
             return await self._engage_immediately(event, chat_id, ["ALL"], fast_mode=False)
         return None
+
+    async def _complete_proactive_candidate(self, event: AstrMessageEvent, *, reason: str) -> None:
+        if not bool(event.get_extra("astrmai_is_proactive_event", False)):
+            return
+        if bool(event.get_extra("astrmai_proactive_completed", False)):
+            return
+        event.set_extra("astrmai_proactive_completed", True)
+        decision = event.get_extra("astrmai_proactive_dispatch_decision", None)
+        if decision is not None:
+            if isinstance(decision, dict):
+                decision["reply_sent"] = False
+                decision["reply_preview"] = ""
+                decision["status"] = "skipped"
+                decision["blocked_reason"] = str(reason or "proactive_candidate_skipped")
+            else:
+                setattr(decision, "reply_sent", False)
+                setattr(decision, "reply_preview", "")
+                setattr(decision, "status", "skipped")
+                setattr(decision, "blocked_reason", str(reason or "proactive_candidate_skipped"))
+        callback = event.get_extra("astrmai_proactive_completion_callback", None)
+        if callable(callback):
+            try:
+                result = callback(False, "")
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.debug(f"[AttentionGate] proactive completion callback degraded: {exc}")
 
     async def _apply_primary_mood_update(self, event: AstrMessageEvent, chat_id: str, msg_str: str) -> None:
         if (
@@ -961,9 +989,11 @@ class AttentionGate:
             return fast_result
 
         if not sensor_checked and not await self._passes_sensor_filters(event, msg_str):
+            await self._complete_proactive_candidate(event, reason="sensor_filtered")
             return "FILTERED"
 
         if self._should_ignore_passive_group_image(is_private, extracted_images, is_strong_wakeup):
+            await self._complete_proactive_candidate(event, reason="passive_group_image")
             return "IGNORED_IMAGE"
 
         if is_private and self.private_chat_manager and not is_strong_wakeup:
@@ -992,14 +1022,22 @@ class AttentionGate:
 
         throttle_result = self._should_skip_by_throttle(msg_str, extracted_images, chat_state, chat_id, is_private, is_strong_wakeup)
         if throttle_result:
+            await self._complete_proactive_candidate(event, reason=str(throttle_result or "throttled").lower())
             return throttle_result
 
         repeater_result = self._handle_repeater_echo(session, is_private, extracted_images, msg_str)
         if repeater_result:
+            await self._complete_proactive_candidate(event, reason=repeater_result)
             return repeater_result
 
-        await self._record_event_activity(chat_id, event, sender_id)
-        if not defer_private_context:
+        is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
+        if is_proactive_event:
+            now = time.time()
+            event.set_extra("astrmai_timestamp", now)
+            ensure_turn_context(event).perception.timestamp = now
+        else:
+            await self._record_event_activity(chat_id, event, sender_id)
+        if not defer_private_context and not is_proactive_event:
             await self._append_dialogue_segment(event)
 
         async with session.lock:
@@ -1133,9 +1171,13 @@ class AttentionGate:
                         judge_action=judge_action,
                     )
                     if judge_action == "WAIT":
+                        if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
+                            await self._complete_proactive_candidate(focus_event, reason="proactive_judge_wait")
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
                     elif judge_action == "IGNORE":
+                        if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
+                            await self._complete_proactive_candidate(focus_event, reason="proactive_judge_ignore")
                         async with session.lock:
                             self._append_attention_window(session, [focus_event])
                     else:

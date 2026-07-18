@@ -43,6 +43,9 @@ class AttentionDecisionRouter:
     ) -> AttentionDecision:
         if is_strong_wakeup or not self.gate.judge or not hasattr(self.gate.judge, "evaluate"):
             return AttentionDecision(action="PASS", raw_action="PASS", reason="skip_judge")
+        interaction_kind = ""
+        if focus_event is not None and hasattr(focus_event, "get_extra"):
+            interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
         if (
             focus_event is not None
             and hasattr(focus_event, "get_extra")
@@ -92,6 +95,8 @@ class AttentionDecisionRouter:
                 )
             except Exception as exc:
                 logger.debug(f"[AttentionGate] Judge degraded: {exc}")
+                if interaction_kind == "peer_poke":
+                    return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="peer_poke_judge_degraded")
                 return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_degraded")
         except asyncio.TimeoutError:
             self._consecutive_timeouts += 1
@@ -99,9 +104,13 @@ class AttentionDecisionRouter:
                 logger.warning(
                     f"[AttentionGate] Judge timeout x{self._consecutive_timeouts} for {chat_id}; passing through"
                 )
+            if interaction_kind == "peer_poke":
+                return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="peer_poke_judge_timeout")
             return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_timeout")
         except Exception as exc:
             logger.debug(f"[AttentionGate] Judge degraded: {exc}")
+            if interaction_kind == "peer_poke":
+                return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="peer_poke_judge_degraded")
             return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_degraded")
 
         raw_action = str(getattr(result, "action", "PASS") or "PASS").upper()

@@ -986,6 +986,9 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
                         trigger,
                         event.get_extra("astrmai_loop_source"),
                         event.get_extra("astrmai_is_proactive_event"),
+                        event.get_extra("astrmai_proactive_candidate"),
+                        event.get_extra("astrmai_force_engage", False),
+                        event.message_str,
                     )
                 )
                 return SimpleNamespace(dispatch_result="BUFFERED")
@@ -1040,7 +1043,59 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
             dispatcher_mod.evaluate_proactive_rhythm = original_eval
 
         self.assertTrue(decision.allowed)
-        self.assertEqual(calls, [("group:10001", "external", "proactive_dispatcher", True)])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:4], ("group:10001", "external", "proactive_dispatcher", True))
+        self.assertTrue(calls[0][4])
+        self.assertFalse(calls[0][5])
+        self.assertIn("主动开口候选", calls[0][6])
+
+    def test_dispatcher_blocks_wakeup_after_other_bot_command_noise(self):
+        dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
+
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                raise AssertionError("noisy other-bot command must not inject proactive event")
+
+        dispatcher = dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={
+                        "latest_activity_ts": time.time(),
+                        "latest_activity_preview": "@丛雨丸(3889060937) /抽卡",
+                        "recent_activity_count_60s": 1,
+                        "wait_targets": [],
+                        "executor_pending": 0,
+                    },
+                )
+            ),
+            state_engine=SimpleNamespace(
+                bot_id="2715245266",
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=[], wakeup_min_energy=0.6),
+                reply=SimpleNamespace(base_frequency=0.7),
+                persona=SimpleNamespace(name="Mai"),
+            ),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="group:10001",
+                    source="wakeup",
+                    reason="silence_threshold_reached",
+                    guidance="say one short line",
+                    metadata={"group_id": "group:10001"},
+                )
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.blocked_reason, "recent_other_bot_command")
+        self.assertEqual(decision.safety_checks["proactive_noise_block"], "recent_other_bot_command")
 
     def test_wakeup_quiet_hours_block_does_not_consume_energy_or_cooldown(self):
         wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
