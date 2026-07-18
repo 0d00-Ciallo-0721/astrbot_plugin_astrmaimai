@@ -121,6 +121,64 @@ class PlannerPromptContextMixin:
         return MessageRenderer.render_event(message_event)
 
     @staticmethod
+    def _is_group_event(message_event: AstrMessageEvent) -> bool:
+        try:
+            if str(message_event.get_group_id() or "").strip():
+                return True
+        except Exception:
+            pass
+        return "GroupMessage" in str(getattr(message_event, "unified_msg_origin", "") or "")
+
+    @staticmethod
+    def _safe_event_sender_id(message_event: AstrMessageEvent) -> str:
+        try:
+            return str(message_event.get_sender_id() or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _safe_event_sender_name(message_event: AstrMessageEvent) -> str:
+        try:
+            return str(message_event.get_sender_name() or "").strip()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _build_current_speaker_block(
+        cls,
+        focus_event: AstrMessageEvent,
+        focus_context: FocusThreadContext,
+        *,
+        is_lightweight_event: bool,
+    ) -> str:
+        sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip() or cls._safe_event_sender_id(focus_event)
+        sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip() or cls._safe_event_sender_name(focus_event)
+        chat_id = str(getattr(focus_event, "unified_msg_origin", "") or "").strip()
+        if not sender_id and not sender_name:
+            return ""
+
+        vision_bundle = getattr(focus_context, "vision_bundle", None)
+        has_image = bool(
+            list(getattr(vision_bundle, "image_urls", []) or [])
+            or list(getattr(vision_bundle, "direct_image_urls", []) or [])
+        )
+        interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
+        message_kind = "interaction" if interaction_kind else "image" if has_image else "text"
+        lines = [
+            "本轮正在回应的对象只看这一位：",
+            f"- QQ: {sender_id or 'unknown'}",
+            f"- 昵称: {sender_name or '群友'}",
+            f"- 会话: {chat_id or 'unknown'}",
+            f"- 消息类型: {message_kind}",
+            "历史里的其他发言人只是背景，不能当作当前用户，也不要把他们的名字、身份或关系套到当前用户身上。",
+        ]
+        if cls._is_group_event(focus_event):
+            lines.append("这是群聊；如果前文出现过其他群友，本轮仍只把眼前这条消息归因给上述 QQ。")
+        if is_lightweight_event or has_image or interaction_kind:
+            lines.append("这是弱文本/图片/互动输入；除非当前图片或当前消息明确给出，不要从旧对话里补出其他人的名字。")
+        return "\n".join(lines)
+
+    @staticmethod
     def _is_lightweight_event(message_event: AstrMessageEvent, focus_context: FocusThreadContext) -> bool:
         interaction_kind = str(message_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
         if message_event.get_extra("is_virtual_poke", False) or interaction_kind in {"poke", "peer_poke"}:
@@ -187,6 +245,7 @@ class PlannerPromptContextMixin:
         warm_zone_has_latest_assistant: bool,
         warm_zone_quote_event_ids: list[str],
         last_assistant_reply: str,
+        current_speaker_block: str,
         near_context_priority: bool,
     ) -> PromptEnvelope:
         return PromptEnvelope(
@@ -202,6 +261,7 @@ class PlannerPromptContextMixin:
             warm_zone_has_latest_assistant=warm_zone_has_latest_assistant,
             warm_zone_quote_event_ids=list(warm_zone_quote_event_ids or []),
             last_assistant_reply=last_assistant_reply,
+            current_speaker_block=current_speaker_block,
             focus_message_text=focus_message_text,
             direct_context_text=direct_context_text,
             related_context_text=related_context_text,
@@ -397,6 +457,11 @@ class PlannerPromptContextMixin:
         )
         if is_lightweight_event:
             near_context_priority = True
+        current_speaker_block = self._build_current_speaker_block(
+            focus_event,
+            focus_context,
+            is_lightweight_event=is_lightweight_event,
+        )
 
         prompt_envelope = self._build_prompt_envelope(
             focus_context=focus_context,
@@ -415,10 +480,13 @@ class PlannerPromptContextMixin:
             warm_zone_has_latest_assistant=warm_zone_has_latest_assistant,
             warm_zone_quote_event_ids=warm_zone_quote_event_ids,
             last_assistant_reply=last_assistant_reply,
+            current_speaker_block=current_speaker_block,
             near_context_priority=near_context_priority,
         )
         if is_lightweight_event:
             prompt_envelope.guidance_lines.append("这是轻互动，只回应当前动作，不要接旧话题或复述历史。")
+        if current_speaker_block and (is_lightweight_event or near_context_priority):
+            prompt_envelope.guidance_lines.append("本轮先遵守当前发言人边界；不要把近期脉络中的其他人名当作当前用户。")
         interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
         if interaction_kind == "poke":
             poke_hint = str(focus_event.get_extra("astrmai_poke_reply_hint", "") or "").strip()

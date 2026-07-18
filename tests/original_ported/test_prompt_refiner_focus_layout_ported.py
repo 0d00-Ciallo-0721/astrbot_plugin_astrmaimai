@@ -84,6 +84,44 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertIn("---补充---\nRelated\nAstrMai: no, that is not allowed", final_prompt)
         self.assertIn("Carol: I am reading too", final_prompt)
 
+    def test_current_speaker_boundary_precedes_focus_message(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=False)),
+            react_retriever=None,
+        )
+        event = _FakeEvent()
+        event._extras["astrmai_prompt_envelope"] = PromptEnvelope(
+            raw_user_text="哥哥: [图片]",
+            recent_transcript="萤: 我没戳你",
+            warm_zone_summary="最近主要是 萤 / Bot 在聊。",
+            warm_zone_quotes="萤: 我没戳你",
+            focus_message_text="哥哥: [图片]",
+            current_speaker_block=(
+                "本轮正在回应的对象只看这一位：\n"
+                "- QQ: 2639044966\n"
+                "- 昵称: 哥哥\n"
+                "历史里的其他发言人只是背景，不能当作当前用户。"
+            ),
+            guidance_lines=["本轮先遵守当前发言人边界；不要把近期脉络中的其他人名当作当前用户。"],
+            near_context_priority=True,
+        )
+
+        async def _run():
+            return await refiner.refine_prompt(
+                event=event,
+                system_prompt="system prompt only",
+                prompt="wrapped prompt",
+                context={"disable_rag_injection": True},
+            )
+
+        _system_prompt, final_prompt = asyncio.run(_run())
+        self.assertIn("---当前发言人边界---", final_prompt)
+        self.assertIn("QQ: 2639044966", final_prompt)
+        self.assertIn("昵称: 哥哥", final_prompt)
+        self.assertLess(final_prompt.index("---当前发言人边界---"), final_prompt.index("---眼前正在对我说的---"))
+        self.assertIn("不要把近期脉络中的其他人名当作当前用户", final_prompt)
+
     def test_transcript_dedup_keeps_semantic_context_sections(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=None,

@@ -785,6 +785,7 @@ class PromptRefiner:
         direct_context_text = prompt_envelope.direct_context_text.strip()
         related_context_text = prompt_envelope.related_context_text.strip()
         background_window_text = prompt_envelope.ambient_background_text.strip()
+        current_speaker_block = str(getattr(prompt_envelope, "current_speaker_block", "") or "").strip()
         focus_reason = prompt_envelope.focus_reason.strip()
         focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
         near_context_priority = bool(prompt_envelope.near_context_priority)
@@ -922,6 +923,8 @@ class PromptRefiner:
                     "如果不自然，可以保持沉默。不要提到系统机制或这段指引。\n"
                     + proactive_guidance[:500]
                 )
+        if current_speaker_block:
+            sections.append(f"---当前发言人边界---\n{PromptEnvelope.sanitize_inline_text(current_speaker_block)}")
         if focus_message_text:
             sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(PromptEnvelope.sanitize_user_input(focus_message_text))}")
         if direct_context_text:

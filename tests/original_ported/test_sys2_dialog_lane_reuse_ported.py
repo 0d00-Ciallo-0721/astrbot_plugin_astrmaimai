@@ -41,14 +41,24 @@ class _FakeReplyEngine:
 
 
 class _FakeEvent:
-    def __init__(self):
-        self.unified_msg_origin = "default:GroupMessage:group-1"
+    def __init__(self, *, group=True):
+        self.unified_msg_origin = "default:GroupMessage:group-1" if group else "default:FriendMessage:user-1"
         self.message_str = "hello"
         self.message_obj = None
-        self._extra = {"astrmai_prefix_hash": "hash-1"}
+        self._group = group
+        self._extra = {
+            "astrmai_prefix_hash": "hash-1",
+            "astrmai_turn_thread_id": "sender:user-1",
+        }
 
     def get_self_id(self):
         return "bot-1"
+
+    def get_group_id(self):
+        return "group-1" if self._group else ""
+
+    def get_sender_id(self):
+        return "user-1"
 
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
@@ -94,7 +104,29 @@ class Sys2DialogLaneReusePortedTests(unittest.TestCase):
         mode, kwargs = gateway.calls[0]
         self.assertEqual(mode, "chat")
         self.assertEqual(kwargs["lane_key"].task_family, "dialog")
-        self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1")
+        self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1@@thread:sender:user-1")
+        self.assertEqual(kwargs["lane_key"].scope_id, "default:GroupMessage:group-1#sender:user-1")
+
+    def test_private_text_mode_keeps_chat_scoped_dialog_lane(self):
+        gateway = _FakeGateway()
+        reply_engine = _FakeReplyEngine()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_engine,
+            evolution_manager=SimpleNamespace(),
+            config=gateway.config,
+        )
+
+        async def _run():
+            return await executor.execute(_FakeEvent(group=False), "prompt", "system")
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result, "lane-text-reply")
+        _mode, kwargs = gateway.calls[0]
+        self.assertEqual(kwargs["base_origin"], "default:FriendMessage:user-1")
+        self.assertEqual(kwargs["lane_key"].scope_id, "default:FriendMessage:user-1")
 
 
 if __name__ == "__main__":

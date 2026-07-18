@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 import time
 from time import monotonic
 from typing import Any, Optional
@@ -461,6 +462,45 @@ class ConcurrentExecutor:
                 self._chat_locks.pop(chat_id, None)
                 self._chat_pending_count.pop(chat_id, None)
 
+    @staticmethod
+    def _is_group_chat_event(event: AstrMessageEvent, chat_id: str) -> bool:
+        try:
+            if str(event.get_group_id() or "").strip():
+                return True
+        except Exception:
+            pass
+        return "GroupMessage" in str(chat_id or "")
+
+    @staticmethod
+    def _sanitize_lane_scope(value: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z_.:-]+", "_", str(value or "").strip())
+        cleaned = cleaned.strip("._:-")
+        return cleaned[:96]
+
+    def _resolve_dialog_lane_identity(self, event: AstrMessageEvent, chat_id: str) -> tuple[LaneKey, str]:
+        if not self._is_group_chat_event(event, chat_id):
+            return LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id), chat_id
+
+        thread_id = str(event.get_extra("astrmai_turn_thread_id", "") or "").strip()
+        if not thread_id:
+            focus_context = event.get_extra("astrmai_focus_thread_context", None)
+            if isinstance(focus_context, FocusThreadContext):
+                thread_id = str(focus_context.thread_signature or "").strip()
+        if not thread_id:
+            try:
+                sender_id = str(event.get_sender_id() or "").strip()
+            except Exception:
+                sender_id = ""
+            if sender_id:
+                thread_id = f"sender:{sender_id}"
+
+        scope_suffix = self._sanitize_lane_scope(thread_id)
+        if not scope_suffix:
+            return LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id), chat_id
+        scoped_origin = f"{chat_id}@@thread:{scope_suffix}"
+        scoped_id = f"{chat_id}#{scope_suffix}"
+        return LaneKey(subsystem="sys2", task_family="dialog", scope_id=scoped_id), scoped_origin
+
     def _execution_runtime_values(self, event: AstrMessageEvent, chat_id: str) -> dict[str, Any]:
         bot_id = str(event.get_self_id()) if hasattr(event, "get_self_id") else "SELF_BOT"
         is_fast_mode = event.get_extra("is_fast_mode", False)
@@ -475,7 +515,7 @@ class ConcurrentExecutor:
             if isinstance(prompt_envelope, PromptEnvelope)
             else event.get_extra("astrmai_raw_user_text", "")
         )
-        dialog_lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id)
+        dialog_lane_key, dialog_base_origin = self._resolve_dialog_lane_identity(event, chat_id)
         return {
             "bot_id": bot_id,
             "is_fast_mode": is_fast_mode,
@@ -485,6 +525,7 @@ class ConcurrentExecutor:
             "prefix_hash": prefix_hash,
             "raw_user_text": raw_user_text,
             "dialog_lane_key": dialog_lane_key,
+            "dialog_base_origin": dialog_base_origin,
         }
 
     @staticmethod
@@ -758,7 +799,7 @@ class ConcurrentExecutor:
                 result = await self.gateway.chat_in_lane_result(
                     event=event,
                     lane_key=runtime["dialog_lane_key"],
-                    base_origin=chat_id,
+                    base_origin=runtime["dialog_base_origin"],
                     prompt=api_prompt,
                     system_prompt=system_prompt,
                     models=[provider_id],
@@ -852,7 +893,7 @@ class ConcurrentExecutor:
             try:
                 result = await self.gateway.tool_chat_in_lane_result(
                     lane_key=runtime["dialog_lane_key"],
-                    base_origin=chat_id,
+                    base_origin=runtime["dialog_base_origin"],
                     event=execution_event,
                     prompt=api_prompt,
                     system_prompt=system_prompt,
@@ -871,7 +912,7 @@ class ConcurrentExecutor:
                     tool_set = ToolSet(tools)
                     result = await self.gateway.tool_chat_in_lane_result(
                         lane_key=runtime["dialog_lane_key"],
-                        base_origin=chat_id,
+                        base_origin=runtime["dialog_base_origin"],
                         event=execution_event,
                         prompt=(
                             f"{api_prompt}\n\n"
@@ -908,7 +949,7 @@ class ConcurrentExecutor:
                             )
                         result = await self.gateway.tool_chat_in_lane_result(
                             lane_key=runtime["dialog_lane_key"],
-                            base_origin=chat_id,
+                            base_origin=runtime["dialog_base_origin"],
                             event=execution_event,
                             prompt=self._required_tool_retry_prompt(api_prompt, missing_required),
                             system_prompt=system_prompt,
