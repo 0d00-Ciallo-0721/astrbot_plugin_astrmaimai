@@ -288,20 +288,95 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertNotIn("group_wait", facade.calls)
         self.assertNotIn("attention", facade.calls)
 
-    def test_framework_command_decision_stops_event(self):
+    def test_framework_command_skips_astrmai_without_stopping_other_plugins(self):
         facade = _Facade()
-        event = _Event(text="/help")
+        event = _Event(text="/合成 欧尼酱")
 
         with patch.object(
             self.entry_mod,
             "check_framework_command",
-            return_value=self.entry_mod.IngressDecision.stop("framework_command"),
+            return_value=SimpleNamespace(
+                should_passthrough=True,
+                reason="framework_command",
+                command_name="合成",
+                owner_module="data.plugins.astrbot_plugin_tts_llm.main",
+                handler_name="cmd_tts",
+                detection_source="activated_handler",
+            ),
         ):
             result = self._collect(facade, event)
 
         self.assertEqual(result, [])
-        self.assertTrue(event.stopped)
+        self.assertFalse(event.stopped)
         self.assertNotIn("scope_access", facade.calls)
+        self.assertNotIn("attention", facade.calls)
+
+    def test_activated_external_command_bypasses_before_astrmai_dedup(self):
+        facade = _Facade()
+        event = _Event(text="合成 欧尼酱")
+        event.set_extra(
+            "activated_handlers",
+            [
+                SimpleNamespace(
+                    enabled=True,
+                    event_filters=[SimpleNamespace(command_name="合成")],
+                    handler_module_path="data.plugins.astrbot_plugin_tts_llm.main",
+                    handler_name="cmd_tts",
+                )
+            ],
+        )
+
+        with patch.object(
+            self.entry_mod,
+            "check_message_dedup",
+            side_effect=AssertionError("AstrMai dedup must not inspect framework commands"),
+        ):
+            result = self._collect(facade, event)
+
+        self.assertEqual(result, [])
+        self.assertFalse(event.stopped)
+        self.assertEqual(facade.calls, [])
+        self.assertIsNone(event.get_extra("astrmai_turn_identity"))
+        self.assertEqual(
+            event.get_extra("astrmai_command_passthrough")["owner_module"],
+            "data.plugins.astrbot_plugin_tts_llm.main",
+        )
+
+    def test_external_command_bypasses_runtime_not_ready_gate(self):
+        facade = _Facade()
+        facade.is_runtime_ready = lambda: False
+        facade.get_runtime_startup_message = lambda: "人格正在初始化"
+        facade.is_framework_command = lambda _message: True
+        event = _Event(text="/未来插件命令 参数", group_id="")
+
+        result = self._collect(facade, event)
+
+        self.assertEqual(result, [])
+        self.assertFalse(event.stopped)
+        self.assertEqual(facade.calls, [])
+        self.assertEqual(
+            event.get_extra("astrmai_command_passthrough")["detection_source"],
+            "runtime_command_registry",
+        )
+
+    def test_command_passthrough_trace_failure_does_not_enter_astrmai(self):
+        facade = _Facade()
+        facade.is_framework_command = lambda _message: True
+        event = _Event(text="/语音 你好")
+        original_set_extra = event.set_extra
+
+        def _set_extra(key, value):
+            if key == "astrmai_command_passthrough":
+                raise RuntimeError("trace backend unavailable")
+            original_set_extra(key, value)
+
+        event.set_extra = _set_extra
+
+        result = self._collect(facade, event)
+
+        self.assertEqual(result, [])
+        self.assertFalse(event.stopped)
+        self.assertEqual(facade.calls, [])
 
     def test_scope_access_exception_is_caught_and_denied(self):
         facade = _Facade()

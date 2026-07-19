@@ -89,6 +89,27 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     scope = MessageScope.from_event(event)
     msg = event.message_str.strip() if event.message_str else ""
+
+    try:
+        command_decision = check_framework_command(facade, msg, event=event)
+    except Exception:
+        logger.exception("[AstrMai] check_framework_command failed")
+        command_decision = None
+    if command_decision is not None and command_decision.should_passthrough:
+        passthrough_metadata = {
+            "reason": command_decision.reason,
+            "command_name": command_decision.command_name,
+            "owner_module": command_decision.owner_module,
+            "handler_name": command_decision.handler_name,
+            "detection_source": command_decision.detection_source,
+        }
+        try:
+            event.set_extra("astrmai_command_passthrough", passthrough_metadata)
+            debug_trace(event, "ingress.command_passthrough", **passthrough_metadata)
+        except Exception:
+            logger.debug("[AstrMai] command passthrough trace degraded", exc_info=True)
+        return
+
     msg_str = build_message_signature_text(event)
     try:
         flag_getter = getattr(facade, "get_conversation_concurrency_flags", None)
@@ -117,14 +138,6 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         debug_trace(event, "ingress.stop", reason="poke_event")
         event.stop_event()
         return
-
-    try:
-        if check_framework_command(facade, msg).should_stop:
-            debug_trace(event, "ingress.stop", reason="framework_command")
-            event.stop_event()
-            return
-    except Exception:
-        logger.exception("[AstrMai] check_framework_command failed")
 
     try:
         if facade.check_message_scope_access(scope).should_stop:
