@@ -6,6 +6,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ...memory.services.cognitive_feedback import render_agency
 from .agency_runtime import AgencyReflection, AgencyRuntimeStore
 
 
@@ -40,9 +41,9 @@ class AgencyReflectionBridge:
         return counter.most_common(1)[0][0]
 
     @classmethod
-    def build_feedback(cls, items: list[AgencyReflection]) -> tuple[str, str, list[str]]:
+    def build_payload(cls, items: list[AgencyReflection]) -> dict[str, Any]:
         if not items:
-            return "", "", []
+            return {}
         intents = Counter(str(item.social_intent or item.reply_need or "answer") for item in items)
         tiers = Counter(str(item.action_tier or "none") for item in items)
         actions = Counter(str(item.action_taken or "none") for item in items)
@@ -56,26 +57,22 @@ class AgencyReflectionBridge:
         repeated_tags = sorted(tag for tag, count in tag_counter.items() if count >= 2)
         tags = sorted(tag_counter.keys())
 
-        summary = (
-            f"Recent agency pattern: {len(items)} turns, main_intent={top_intent}, "
-            f"main_tier={top_tier}, main_action={top_action}."
-        )
-        if tags:
-            summary += " Cooldowns observed: " + ", ".join(tags[:8]) + "."
+        return {
+            "turn_count": len(items),
+            "main_intent": top_intent,
+            "main_tier": top_tier,
+            "main_action": top_action,
+            "cooldown_tags": tags[:8],
+            "repeated_tags": repeated_tags[:6],
+        }
 
-        guidance_parts: list[str] = []
-        if repeated_tags:
-            guidance_parts.append("Avoid repeating recently used actions: " + ", ".join(repeated_tags[:6]) + ".")
-        if tag_counter.get("long_reply", 0):
-            guidance_parts.append("Prefer shorter replies unless the user explicitly asks for detail.")
-        if tag_counter.get("sharp_reply", 0):
-            guidance_parts.append("Do not continue sharp pushback unless there is another very clear direct attack.")
-        if intents.get("wait", 0) + intents.get("ignore", 0) >= 2:
-            guidance_parts.append("The chat recently needed restraint; observe before interrupting.")
-        if not guidance_parts:
-            guidance_parts.append("Keep the next response consistent with the recent agency pattern without repeating it.")
-
-        return summary, " ".join(guidance_parts), tags
+    @classmethod
+    def build_feedback(cls, items: list[AgencyReflection]) -> tuple[str, str, list[str]]:
+        payload = cls.build_payload(items)
+        if not payload:
+            return "", "", []
+        summary, guidance = render_agency(payload)
+        return summary, guidance, list(payload.get("cooldown_tags") or [])
 
     async def maybe_flush(self, runtime: AgencyRuntimeStore, chat_id: str) -> bool:
         if not self.memory_engine or not hasattr(self.memory_engine, "record_cognitive_feedback"):
@@ -83,6 +80,7 @@ class AgencyReflectionBridge:
         if not self.should_flush(runtime, chat_id):
             return False
         items = self._pending_items(runtime, chat_id)
+        payload = self.build_payload(items)
         summary, guidance, tags = self.build_feedback(items)
         if not (summary or guidance):
             return False
@@ -94,6 +92,7 @@ class AgencyReflectionBridge:
                 guidance=guidance,
                 tags=tags,
                 importance=0.55,
+                payload=payload,
             )
         except Exception as exc:
             logger.debug(f"[AgencyReflectionBridge] feedback write degraded: {exc}")

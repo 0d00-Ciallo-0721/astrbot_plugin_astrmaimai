@@ -250,6 +250,7 @@ class MemoryMaintenanceService:
 
         admission = MemoryAdmissionService(self.config)
         suspects: list[dict] = []
+        notices: list[dict] = []
         seen_feedback: set[tuple[str, str]] = set()
         seen_topics: set[tuple[str, str]] = set()
         for item in items:
@@ -281,10 +282,23 @@ class MemoryMaintenanceService:
                     reason = "group_session_used_as_subject"
             elif kind == "feedback":
                 key = (session_id, source)
-                if key in seen_feedback:
+                valid_until = float(metadata.get("valid_until") or 0.0)
+                if valid_until > 0 and valid_until < time.time():
+                    reason = "expired_feedback"
+                elif key in seen_feedback:
                     reason = "superseded_rolling_feedback"
                 else:
                     seen_feedback.add(key)
+                if int(metadata.get("feedback_schema_version") or 1) < 2:
+                    notices.append(
+                        {
+                            "id": memory_id,
+                            "reason": "legacy_unstructured_feedback",
+                            "source": source,
+                            "kind": kind,
+                            "session_id": session_id,
+                        }
+                    )
             elif kind == "topic":
                 normalized = self._normalize_quality_text(str(item.get("summary") or item.get("content") or ""))
                 key = (session_id, normalized)
@@ -312,12 +326,18 @@ class MemoryMaintenanceService:
         reasons: dict[str, int] = {}
         for item in suspects:
             reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        notice_reasons: dict[str, int] = {}
+        for item in notices:
+            notice_reasons[item["reason"]] = notice_reasons.get(item["reason"], 0) + 1
         return {
             "mode": "dry_run",
             "scanned": len(items),
             "suspect_count": len(suspects),
             "reasons": reasons,
             "items": suspects,
+            "notice_count": len(notices),
+            "notice_reasons": notice_reasons,
+            "notice_items": notices,
         }
 
     async def quarantine_quality_suspects(self, *, limit: int = 5000) -> dict:

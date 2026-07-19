@@ -176,6 +176,7 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertEqual(request.visibility, "tool_only")
         self.assertEqual(request.tags, ["joke", "tone"])
         self.assertTrue(request.metadata["cognitive_feedback"])
+        self.assertEqual(request.metadata["feedback_schema_version"], 2)
         self.assertEqual(request.metadata["guidance"], "Prefer direct answers")
         self.assertEqual(request.dedup_key, "feedback:chat-1:agency:rolling")
         self.assertGreater(request.metadata["valid_until"], time.time())
@@ -312,6 +313,134 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
                 chat_id="chat-1",
             )
         )
+
+    def test_memory_engine_localizes_legacy_agency_feedback(self):
+        parsed = self.memory_mod.MemoryEngine._parse_cognitive_feedback_content(
+            "[cognitive_feedback:agency]\n"
+            "summary: Recent agency pattern: 6 turns, main_intent=answer, main_tier=none, "
+            "main_action=reply. Cooldowns observed: long_reply, meme.\n"
+            "guidance: Avoid repeating recently used actions: long_reply. "
+            "Prefer shorter replies unless the user explicitly asks for detail.\n"
+            "tags: long_reply, meme",
+            chat_id="chat-1",
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertIn("近期 6 轮", parsed.summary)
+        self.assertIn("长回复", parsed.summary)
+        self.assertIn("优先简短回应", parsed.guidance)
+        self.assertEqual(parsed.payload["main_intent"], "answer")
+
+    def test_memory_engine_lists_feedback_with_localized_display_fields(self):
+        engine = self._memory_engine()
+        engine._last_feedback_cleanup_ts = time.time()
+
+        class _Store:
+            async def list_canonical(self, **_kwargs):
+                return {
+                    "items": [
+                        {
+                            "id": "mem-feedback",
+                            "source": "agency",
+                            "session_id": "chat-1",
+                            "summary": "Recent agency pattern: 3 turns, main_intent=answer, main_tier=none, main_action=reply.",
+                            "content": "[cognitive_feedback:agency]\nsummary: Recent agency pattern: 3 turns, main_intent=answer, main_tier=none, main_action=reply.",
+                            "tags": [],
+                            "importance": 0.5,
+                            "status": "active",
+                            "created_at": 10.0,
+                            "metadata": {"guidance": "Keep the next response consistent with the recent agency pattern without repeating it."},
+                        }
+                    ],
+                    "total": 1,
+                    "limit": 50,
+                    "offset": 0,
+                }
+
+        engine.v2_store = _Store()
+        result = asyncio.run(engine.list_cognitive_feedback_records())
+
+        self.assertEqual(result["items"][0]["source_label"], "行为节奏")
+        self.assertIn("近期 3 轮", result["items"][0]["summary"])
+        self.assertIn("不要机械重复", result["items"][0]["guidance"])
+        self.assertEqual(result["items"][0]["feedback_schema_version"], 1)
+
+    def test_memory_engine_cleanup_removes_expired_and_superseded_feedback(self):
+        engine = self._memory_engine()
+        now = time.time()
+
+        class _Store:
+            async def list_canonical(self, **_kwargs):
+                return {
+                    "items": [
+                        {"id": "new", "session_id": "chat-1", "source": "agency", "metadata": {"valid_until": now + 100}},
+                        {"id": "old", "session_id": "chat-1", "source": "agency", "metadata": {"valid_until": now + 100}},
+                        {"id": "expired", "session_id": "chat-2", "source": "diary", "metadata": {"valid_until": now - 1}},
+                    ]
+                }
+
+        deleted = []
+
+        class _Maintenance:
+            async def soft_delete(self, memory_id, *, reason=""):
+                deleted.append((memory_id, reason))
+                return 1
+
+        engine.v2_store = _Store()
+        engine.maintenance_service = _Maintenance()
+        changed = asyncio.run(engine._cleanup_cognitive_feedback_records(force=True))
+
+        self.assertEqual(changed, 2)
+        self.assertEqual(
+            deleted,
+            [
+                ("old", "superseded_rolling_feedback"),
+                ("expired", "expired_cognitive_feedback"),
+            ],
+        )
+
+    def test_memory_engine_migrates_legacy_agency_feedback_to_structured_v2(self):
+        engine = self._memory_engine()
+        updated = []
+        migrations = []
+
+        class _Store:
+            async def migration_applied(self, _version):
+                return False
+
+            async def list_canonical(self, **_kwargs):
+                return {
+                    "items": [
+                        {
+                            "id": "legacy-feedback",
+                            "source": "agency",
+                            "session_id": "chat-1",
+                            "summary": "Recent agency pattern: 6 turns, main_intent=answer, main_tier=none, main_action=reply.",
+                            "content": "[cognitive_feedback:agency]\nsummary: Recent agency pattern: 6 turns, main_intent=answer, main_tier=none, main_action=reply.",
+                            "tags": [],
+                            "importance": 0.5,
+                            "metadata": {},
+                        }
+                    ]
+                }
+
+            async def update_memory(self, memory_id, **kwargs):
+                updated.append((memory_id, kwargs))
+                return 1
+
+            async def record_migration(self, version, **kwargs):
+                migrations.append((version, kwargs))
+
+        engine.v2_store = _Store()
+        migrated = asyncio.run(engine.migrate_legacy_cognitive_feedback())
+
+        self.assertEqual(migrated, 1)
+        self.assertEqual(updated[0][0], "legacy-feedback")
+        self.assertIn("近期 6 轮", updated[0][1]["summary"])
+        self.assertEqual(updated[0][1]["metadata"]["feedback_schema_version"], 2)
+        self.assertEqual(updated[0][1]["metadata"]["feedback_payload"]["main_action"], "reply")
+        self.assertEqual(migrations[0][0], "feedback_schema_v2")
+        self.assertEqual(migrations[0][1]["status"], "applied")
 
     def test_memory_engine_store_topic_results_merges_similar_existing_topic(self):
         engine = self._memory_engine()
@@ -558,8 +687,10 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertTrue(flushed)
         self.assertEqual(len(memory.calls), 1)
         self.assertEqual(memory.calls[0]["source"], "agency")
-        self.assertIn("main_intent=tease", memory.calls[0]["summary"])
-        self.assertIn("Avoid repeating", memory.calls[0]["guidance"])
+        self.assertIn("轻松互动", memory.calls[0]["summary"])
+        self.assertIn("避免立即重复", memory.calls[0]["guidance"])
+        self.assertEqual(memory.calls[0]["payload"]["main_intent"], "tease")
+        self.assertEqual(memory.calls[0]["payload"]["turn_count"], 6)
 
     def test_agency_runtime_uses_monotonic_clock_for_record_and_expiry(self):
         runtime = self.runtime_mod.AgencyRuntimeStore()

@@ -886,7 +886,15 @@ class AdminUiService:
         sources: dict[str, dict[str, Any]] = {}
         for item in feedback.get("items", []):
             source = str(item.get("source", "unknown") or "unknown")
-            bucket = sources.setdefault(source, {"source": source, "count": 0, "latest_timestamp": 0.0})
+            bucket = sources.setdefault(
+                source,
+                {
+                    "source": source,
+                    "source_label": str(item.get("source_label") or source),
+                    "count": 0,
+                    "latest_timestamp": 0.0,
+                },
+            )
             bucket["count"] += 1
             bucket["latest_timestamp"] = max(float(bucket["latest_timestamp"]), float(item.get("timestamp", 0.0) or 0.0))
         return {"status": "ok", "items": list(sources.values()), "total": len(sources)}

@@ -24,6 +24,12 @@ from ..retrieval.hybrid_retriever import HybridRetriever
 from ..retrieval.vector_store import VectorRetriever
 from ..contracts.memory_query import MemoryQuery, MemoryWriteRequest
 from .expression_pattern_service import ExpressionPatternService
+from .cognitive_feedback import (
+    FEEDBACK_SCHEMA_VERSION,
+    normalize_payload,
+    render_feedback,
+    source_label,
+)
 from .instant_memory_gate import InstantMemoryGate
 from .memory_index_projector import MemoryIndexProjector
 from .memory_injection_service import MemoryInjectionService
@@ -47,6 +53,7 @@ class CognitiveFeedbackSignal:
     tags: list[str] = field(default_factory=list)
     timestamp: float = 0.0
     importance: float = 0.5
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 class MemoryEngine:
@@ -88,6 +95,7 @@ class MemoryEngine:
         self._learning_event_history = []
         self._cognitive_feedback_cache: dict[str, list[CognitiveFeedbackSignal]] = {}
         self._disabled_cognitive_feedback_keys: dict[str, float] = {}
+        self._last_feedback_cleanup_ts = 0.0
         self.v2_store = MemoryV2Store(self.v2_db_path, data_path=self.data_path, legacy_db_path=self.db_path)
         # Sub-components that depend on self are initialized in initialize()
 
@@ -232,6 +240,8 @@ class MemoryEngine:
         await self.import_legacy_memory_events()
         await self.import_legacy_jargons()
         await self.import_legacy_expression_patterns()
+        await self.migrate_legacy_cognitive_feedback()
+        await self._cleanup_cognitive_feedback_records(force=True)
         self.bm25_retriever = BM25Retriever(self.db_path)
         await self.bm25_retriever.initialize()
         logger.info("[AstrMai] memory skeleton initialized; vector store will be lazy-loaded.")
@@ -366,6 +376,7 @@ class MemoryEngine:
         summary: str,
         guidance: str = "",
         tags: list[str] | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> str:
         lines = [
             cls._feedback_prefix(source),
@@ -376,6 +387,9 @@ class MemoryEngine:
         clean_tags = cls._normalize_feedback_tags(tags)
         if clean_tags:
             lines.append("tags: " + ", ".join(clean_tags))
+        clean_payload = normalize_payload(payload)
+        if clean_payload:
+            lines.append("payload: " + json.dumps(clean_payload, ensure_ascii=False, separators=(",", ":")))
         return "\n".join(lines).strip()
 
     @classmethod
@@ -386,6 +400,7 @@ class MemoryEngine:
         chat_id: str,
         timestamp: float = 0.0,
         importance: float = 0.5,
+        payload: dict[str, Any] | None = None,
     ) -> CognitiveFeedbackSignal | None:
         content = str(text or "").strip()
         if not content.startswith("[cognitive_feedback:"):
@@ -395,6 +410,7 @@ class MemoryEngine:
         summary = ""
         guidance = ""
         tags: list[str] = []
+        parsed_payload = normalize_payload(payload)
         for line in rest:
             if line.startswith("summary:"):
                 summary = line.split(":", 1)[1].strip()
@@ -402,8 +418,20 @@ class MemoryEngine:
                 guidance = line.split(":", 1)[1].strip()
             elif line.startswith("tags:"):
                 tags = cls._normalize_feedback_tags(line.split(":", 1)[1].split(","))
+            elif line.startswith("payload:") and not parsed_payload:
+                try:
+                    parsed_payload = normalize_payload(json.loads(line.split(":", 1)[1].strip()))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    logger.debug("[MemoryEngine] cognitive feedback payload parse failed", exc_info=True)
         if not summary and not guidance:
             return None
+        summary, guidance, _display_tags, parsed_payload = render_feedback(
+            source=source,
+            summary=summary,
+            guidance=guidance,
+            tags=tags,
+            payload=parsed_payload,
+        )
         return CognitiveFeedbackSignal(
             source=source,
             chat_id=chat_id,
@@ -412,6 +440,7 @@ class MemoryEngine:
             tags=tags,
             timestamp=float(timestamp or 0.0),
             importance=float(importance or 0.5),
+            payload=parsed_payload,
         )
 
     def _remember_cognitive_feedback(self, signal: CognitiveFeedbackSignal) -> None:
@@ -446,6 +475,102 @@ class MemoryEngine:
         for k in stale:
             del self._disabled_cognitive_feedback_keys[k]
 
+    async def _cleanup_cognitive_feedback_records(self, *, force: bool = False) -> int:
+        now = time.time()
+        if not force and now - self._last_feedback_cleanup_ts < 3600:
+            return 0
+        self._last_feedback_cleanup_ts = now
+        maintenance = getattr(self, "maintenance_service", None)
+        if maintenance is None:
+            return 0
+        try:
+            page = await self.v2_store.list_canonical(
+                kind="feedback",
+                status="active",
+                limit=500,
+                include_inactive=True,
+            )
+            candidates = list(page.get("items", []) or [])
+            seen: set[tuple[str, str]] = set()
+            delete_reasons: dict[str, str] = {}
+            for candidate in candidates:
+                memory_id = str(candidate.get("id") or "")
+                metadata = dict(candidate.get("metadata") or {})
+                valid_until = float(metadata.get("valid_until") or 0.0)
+                key = (
+                    str(candidate.get("session_id") or ""),
+                    str(candidate.get("source") or "unknown").strip().lower(),
+                )
+                if valid_until > 0 and valid_until < now:
+                    delete_reasons[memory_id] = "expired_cognitive_feedback"
+                elif key in seen:
+                    delete_reasons[memory_id] = "superseded_rolling_feedback"
+                else:
+                    seen.add(key)
+            changed = 0
+            for memory_id, reason in delete_reasons.items():
+                if memory_id:
+                    changed += int(await maintenance.soft_delete(memory_id, reason=reason) or 0)
+            return changed
+        except Exception as exc:
+            logger.warning(f"[MemoryEngine] cognitive feedback cleanup degraded: {exc}")
+            return 0
+
+    async def migrate_legacy_cognitive_feedback(self) -> int:
+        version = "feedback_schema_v2"
+        required = ("migration_applied", "list_canonical", "update_memory", "record_migration")
+        if not all(hasattr(self.v2_store, name) for name in required):
+            return 0
+        if await self.v2_store.migration_applied(version):
+            return 0
+        migrated = 0
+        try:
+            page = await self.v2_store.list_canonical(
+                kind="feedback",
+                status="active",
+                limit=500,
+                include_inactive=True,
+            )
+            for candidate in list(page.get("items", []) or []):
+                metadata = dict(candidate.get("metadata") or {})
+                if int(metadata.get("feedback_schema_version") or 1) >= FEEDBACK_SCHEMA_VERSION:
+                    continue
+                source = str(candidate.get("source") or "unknown").strip().lower() or "unknown"
+                signal = self._parse_cognitive_feedback_content(
+                    str(candidate.get("content") or ""),
+                    chat_id=str(candidate.get("session_id") or ""),
+                    timestamp=float(candidate.get("created_at") or 0.0),
+                    importance=float(candidate.get("importance") or 0.5),
+                )
+                if signal is None:
+                    continue
+                metadata.update(
+                    {
+                        "guidance": signal.guidance,
+                        "feedback_schema_version": FEEDBACK_SCHEMA_VERSION,
+                        "feedback_payload": signal.payload,
+                    }
+                )
+                changed = await self.v2_store.update_memory(
+                    str(candidate.get("id") or ""),
+                    content=self._format_cognitive_feedback_content(
+                        source=source,
+                        summary=signal.summary,
+                        guidance=signal.guidance,
+                        tags=signal.tags,
+                        payload=signal.payload,
+                    ),
+                    summary=signal.summary,
+                    tags=signal.tags,
+                    metadata=metadata,
+                )
+                migrated += int(bool(changed))
+            await self.v2_store.record_migration(version, status="applied", detail=f"migrated={migrated}")
+        except Exception as exc:
+            await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] cognitive feedback migration degraded: {exc}")
+        return migrated
+
     async def record_cognitive_feedback(
         self,
         session_id: str,
@@ -454,7 +579,9 @@ class MemoryEngine:
         guidance: str = "",
         tags: list[str] | None = None,
         importance: float = 0.5,
+        payload: dict[str, Any] | None = None,
     ) -> None:
+        await self._cleanup_cognitive_feedback_records()
         chat_id = str(session_id or "").strip()
         clean_summary = str(summary or "").strip()
         clean_guidance = str(guidance or "").strip()
@@ -462,6 +589,13 @@ class MemoryEngine:
             return
         clean_source = str(source or "unknown").strip().lower() or "unknown"
         clean_tags = self._normalize_feedback_tags(tags)
+        clean_summary, clean_guidance, _display_tags, clean_payload = render_feedback(
+            source=clean_source,
+            summary=clean_summary,
+            guidance=clean_guidance,
+            tags=clean_tags,
+            payload=payload,
+        )
         now = time.time()
         signal = CognitiveFeedbackSignal(
             source=clean_source,
@@ -471,6 +605,7 @@ class MemoryEngine:
             tags=clean_tags,
             timestamp=now,
             importance=float(importance or 0.5),
+            payload=clean_payload,
         )
         self._remember_cognitive_feedback(signal)
         valid_until = now + (72 * 3600)
@@ -484,6 +619,7 @@ class MemoryEngine:
                     summary=signal.summary,
                     guidance=signal.guidance,
                     tags=signal.tags,
+                    payload=signal.payload,
                 ),
                 summary=signal.summary,
                 tags=signal.tags,
@@ -494,6 +630,8 @@ class MemoryEngine:
                     "cognitive_feedback": True,
                     "valid_until": valid_until,
                     "feedback_window": "rolling",
+                    "feedback_schema_version": FEEDBACK_SCHEMA_VERSION,
+                    "feedback_payload": signal.payload,
                 },
                 dedup_key=f"feedback:{chat_id}:{signal.source}:rolling",
                 source_ref=f"cognitive_feedback:{signal.source}",
@@ -543,6 +681,7 @@ class MemoryEngine:
             for text, metadata_raw, create_time_raw in rows:
                 timestamp = float(create_time_raw or 0.0)
                 importance = 0.5
+                metadata: dict[str, Any] = {}
                 try:
                     metadata = json.loads(metadata_raw or "{}") if isinstance(metadata_raw, str) else {}
                     importance = float(metadata.get("importance") or 0.5)
@@ -552,12 +691,15 @@ class MemoryEngine:
                 except Exception:
                     logger.debug("[MemoryEngine] cognitive feedback metadata parse failed", exc_info=True)
                     pass
-                parsed = self._parse_cognitive_feedback_content(
-                    str(text or ""),
-                    chat_id=chat_id,
-                    timestamp=timestamp,
-                    importance=importance,
-                )
+                parse_kwargs: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "timestamp": timestamp,
+                    "importance": importance,
+                }
+                metadata_payload = dict(metadata.get("feedback_payload") or {})
+                if metadata_payload:
+                    parse_kwargs["payload"] = metadata_payload
+                parsed = self._parse_cognitive_feedback_content(str(text or ""), **parse_kwargs)
                 if not parsed:
                     continue
                 if source_filter and parsed.source not in source_filter:
@@ -588,27 +730,57 @@ class MemoryEngine:
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
+        await self._cleanup_cognitive_feedback_records()
         page = await self.v2_store.list_canonical(
             session_id=str(session_id or ""),
             source=str(source or "").strip().lower(),
             kind="feedback",
+            status="active",
             limit=max(1, min(int(limit or 50), 300)),
             offset=max(0, int(offset or 0)),
-            include_inactive=True,
+            include_inactive=False,
         )
         items: list[dict[str, Any]] = []
+        now = time.time()
         for candidate in list(page.get("items", []) or []):
             candidate_source = str(candidate.get("source", "unknown") or "unknown").strip().lower()
             metadata = dict(candidate.get("metadata", {}) or {})
+            signal = self._parse_cognitive_feedback_content(
+                str(candidate.get("content", "") or ""),
+                chat_id=str(candidate.get("session_id", "") or ""),
+                timestamp=float(candidate.get("created_at", 0.0) or 0.0),
+                importance=float(candidate.get("importance", 0.5) or 0.5),
+                payload=dict(metadata.get("feedback_payload") or {}),
+            )
+            raw_summary = str(candidate.get("summary", "") or "")
+            raw_guidance = str(metadata.get("guidance", "") or "")
+            display_summary, display_guidance, display_tags, payload = render_feedback(
+                source=candidate_source,
+                summary=signal.summary if signal else raw_summary,
+                guidance=signal.guidance if signal else raw_guidance,
+                tags=list(candidate.get("tags", []) or []),
+                payload=signal.payload if signal else dict(metadata.get("feedback_payload") or {}),
+            )
+            valid_until = float(metadata.get("valid_until") or 0.0)
+            expiry_state = "长期有效"
+            if valid_until > 0:
+                remaining = valid_until - now
+                expiry_state = "已过期" if remaining <= 0 else ("即将过期" if remaining <= 6 * 3600 else "有效")
             items.append(
                 {
                     "id": str(candidate.get("id", "") or ""),
                     "chat_id": str(candidate.get("session_id", "") or ""),
                     "session_id": str(candidate.get("session_id", "") or ""),
                     "source": candidate_source,
-                    "summary": str(candidate.get("summary", "") or ""),
-                    "guidance": str(metadata.get("guidance", "") or ""),
+                    "source_label": source_label(candidate_source),
+                    "summary": display_summary,
+                    "guidance": display_guidance,
                     "tags": list(candidate.get("tags", []) or []),
+                    "display_tags": display_tags,
+                    "payload": payload,
+                    "feedback_schema_version": int(metadata.get("feedback_schema_version") or 1),
+                    "valid_until": valid_until,
+                    "expiry_state": expiry_state,
                     "timestamp": float(candidate.get("created_at", 0.0) or 0.0),
                     "importance": float(candidate.get("importance", 0.5) or 0.5),
                     "status": str(candidate.get("status", "active") or "active"),
