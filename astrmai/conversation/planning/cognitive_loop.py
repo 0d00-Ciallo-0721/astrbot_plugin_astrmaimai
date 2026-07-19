@@ -130,6 +130,17 @@ class CognitiveLoop:
     def refresh_config(self, config) -> None:
         self.config = config
 
+    def _soft_timeout_seconds(self) -> float:
+        timing = getattr(self.config, "timing", None)
+        try:
+            configured = float(
+                getattr(timing, "cognitive_loop_timeout_sec", self.SOFT_TIMEOUT_SECONDS)
+                or self.SOFT_TIMEOUT_SECONDS
+            )
+        except (TypeError, ValueError):
+            configured = self.SOFT_TIMEOUT_SECONDS
+        return max(0.01, configured)
+
     def _lane_key(self, chat_id: str) -> LaneKey:
         return LaneKey(subsystem="sys2", task_family="cognitive_loop", scope_id=chat_id)
 
@@ -210,7 +221,7 @@ class CognitiveLoop:
             self._write_gate_state(event, gate, ran=True)
             return await asyncio.wait_for(
                 self._decide_inner(event=event, prompt_envelope=prompt_envelope),
-                timeout=self.SOFT_TIMEOUT_SECONDS,
+                timeout=self._soft_timeout_seconds(),
             )
         except asyncio.TimeoutError:
             logger.info(f"[{event.unified_msg_origin}] CognitiveLoop timeout; fallback to planner default flow.")

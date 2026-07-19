@@ -1,11 +1,31 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 
+from astrmai.conversation.execution.reply_freshness import (
+    is_stale_reply_reason,
+    resolve_reply_max_age_seconds,
+)
 from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
 from astrmai.infrastructure.runtime.runtime_contracts import FreshnessState
 
 
 class ReplyFreshnessBudgetTests(unittest.TestCase):
+    def test_auto_reply_budget_scales_past_old_ninety_second_cap(self):
+        config = SimpleNamespace(
+            timing=SimpleNamespace(
+                reply_max_age_sec=0.0,
+                model_request_timeout_sec=240.0,
+                agent_execution_timeout_sec=600,
+            )
+        )
+
+        self.assertEqual(resolve_reply_max_age_seconds(config), 750.0)
+
+    def test_reply_age_exceeded_is_classified_as_stale(self):
+        self.assertTrue(is_stale_reply_reason("reply_age_exceeded:94.6s>90.0s"))
+        self.assertFalse(is_stale_reply_reason("transport failed"))
+
     def test_evaluate_reply_freshness_returns_stale_and_expired(self):
         coordinator = ChatRuntimeCoordinator()
 

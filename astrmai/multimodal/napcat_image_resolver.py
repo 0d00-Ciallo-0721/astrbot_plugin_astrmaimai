@@ -32,9 +32,26 @@ class NapCatImageResolver:
 
     MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
-    def __init__(self, cache_dir: str | Path):
+    def __init__(self, cache_dir: str | Path, config: Any = None):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.config = config
+
+    def refresh_config(self, config: Any) -> None:
+        self.config = config
+
+    def _download_timeout_seconds(self) -> float:
+        timing = getattr(self.config, "timing", None)
+        private_config = getattr(self.config, "private_chat", None)
+        configured = getattr(
+            timing,
+            "image_resolve_timeout_sec",
+            getattr(private_config, "image_resolve_timeout_sec", 15.0),
+        )
+        try:
+            return max(0.1, float(configured))
+        except (TypeError, ValueError):
+            return 15.0
 
     async def resolve_event_images(self, event: Any) -> ImageResolutionBatch:
         references = self._extract_image_references(event)
@@ -183,7 +200,7 @@ class NapCatImageResolver:
 
     def _download_to_cache(self, url: str, index: int) -> str:
         request = urllib.request.Request(url, headers={"User-Agent": "AstrMai/1.0"})
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=self._download_timeout_seconds()) as response:
             payload = response.read(self.MAX_DOWNLOAD_BYTES + 1)
             content_type = str(response.headers.get("Content-Type", "") or "").lower()
         if len(payload) > self.MAX_DOWNLOAD_BYTES:

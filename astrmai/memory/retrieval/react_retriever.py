@@ -30,6 +30,14 @@ class ReActRetriever:
             "found_answer": None,
         }
 
+    def _question_timeout_seconds(self) -> float:
+        timing = getattr(self.config, "timing", None)
+        try:
+            configured = float(getattr(timing, "memory_react_timeout_sec", 15.0) or 15.0)
+        except (TypeError, ValueError):
+            configured = 15.0
+        return max(0.1, configured)
+
     def _retrieval_lane(self, chat_id: str) -> LaneKey:
         return LaneKey(subsystem="sys2", task_family="retrieval", scope_id=chat_id)
 
@@ -140,7 +148,7 @@ class ReActRetriever:
                     lane_key=self._retrieval_lane(chat_id),
                     base_origin=chat_id,
                 ),
-                timeout=15.0,  # ponytail: M13 — prevent indefinite hang on LLM stall
+                timeout=self._question_timeout_seconds(),
             )
             data = self._safe_parse_json(result)
             if data.get("need_search") and data.get("question"):

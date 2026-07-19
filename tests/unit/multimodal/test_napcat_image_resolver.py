@@ -30,6 +30,21 @@ class _Event:
 
 
 class NapCatImageResolverTests(unittest.TestCase):
+    def test_download_timeout_uses_central_timing_and_refreshes(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            resolver = NapCatImageResolver(
+                Path(tmp) / "cache",
+                config=SimpleNamespace(timing=SimpleNamespace(image_resolve_timeout_sec=150.0)),
+            )
+            self.assertEqual(resolver._download_timeout_seconds(), 150.0)
+
+            resolver.refresh_config(
+                SimpleNamespace(timing=SimpleNamespace(image_resolve_timeout_sec=240.0))
+            )
+            self.assertEqual(resolver._download_timeout_seconds(), 240.0)
+
     def test_opaque_onebot_reference_is_resolved_through_get_image(self):
         from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
 

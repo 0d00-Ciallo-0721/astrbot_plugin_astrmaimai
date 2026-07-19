@@ -14,6 +14,18 @@ LEGACY_MEMORY_NAMESPACE_FIELDS = (
     "maintenance_temporal_stale_hot_threshold",
 )
 
+LEGACY_TIMING_NAMESPACE_FIELDS = (
+    ("model_request_timeout_sec", "infra", "api_timeout"),
+    ("reply_max_age_sec", "reply", "stale_reply_max_age_sec"),
+    ("agent_execution_timeout_sec", "agent", "timeout"),
+    ("workmode_execution_timeout_sec", "sys3", "tool_timeout"),
+    ("attention_judge_timeout_sec", "attention", "judge_timeout"),
+    ("private_wait_timeout_sec", "private_chat", "wait_timeout_sec"),
+    ("private_input_settle_sec", "private_chat", "input_settle_sec"),
+    ("image_resolve_timeout_sec", "private_chat", "image_resolve_timeout_sec"),
+    ("image_analysis_timeout_sec", "private_chat", "image_barrier_timeout_sec"),
+)
+
 
 class ProviderConfig(BaseModel):
     fallback_models: List[str] = Field(default=[])
@@ -267,10 +279,28 @@ class Sys3Settings(BaseModel):
 
 class PrivateChatConfig(BaseModel):
     wait_timeout_sec: int = Field(default=300, ge=1, description="单次私聊等待反馈强制休眠阈值(秒)")
-    input_settle_sec: float = Field(default=1.5, ge=0.0, le=10.0, description="私聊连续输入聚合等待时间(秒)")
-    image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=60.0, description="私聊图片文件解析超时时间(秒)")
-    image_barrier_timeout_sec: float = Field(default=45.0, ge=1.0, le=180.0, description="私聊单张图片识别超时时间(秒)")
+    input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0, description="私聊连续输入聚合等待时间(秒)")
+    image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0, description="私聊图片文件解析超时时间(秒)")
+    image_barrier_timeout_sec: float = Field(default=45.0, ge=1.0, le=1200.0, description="私聊单张图片识别超时时间(秒)")
     image_analysis_retries: int = Field(default=2, ge=1, le=5, description="私聊图片识别失败重试次数")
+
+
+class TimingConfig(BaseModel):
+    model_request_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
+    reply_max_age_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
+    agent_execution_timeout_sec: int = Field(default=60, ge=1, le=7200)
+    fast_mode_execution_timeout_sec: int = Field(default=15, ge=1, le=7200)
+    workmode_execution_timeout_sec: int = Field(default=120, ge=1, le=7200)
+    attention_judge_timeout_sec: float = Field(default=3.0, ge=0.1, le=600.0)
+    cognitive_loop_timeout_sec: float = Field(default=2.5, ge=0.1, le=600.0)
+    mood_analysis_timeout_sec: float = Field(default=30.0, ge=1.0, le=600.0)
+    memory_react_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
+    compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
+    embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
+    private_wait_timeout_sec: int = Field(default=300, ge=1, le=7200)
+    private_input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0)
+    image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
+    image_analysis_timeout_sec: float = Field(default=45.0, ge=1.0, le=1200.0)
 
 
 class AstrMaiConfig(BaseModel):
@@ -302,8 +332,39 @@ class AstrMaiConfig(BaseModel):
             normalized["memory"] = memory_values
         return normalized
 
+    @staticmethod
+    def _normalize_legacy_timing_namespace(data: dict) -> dict:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        raw_timing = normalized.get("timing")
+        if raw_timing is None:
+            timing_values = {}
+        elif isinstance(raw_timing, dict):
+            timing_values = dict(raw_timing)
+        else:
+            return normalized
+        for timing_field, section_name, legacy_field in LEGACY_TIMING_NAMESPACE_FIELDS:
+            if timing_field in timing_values:
+                continue
+            section = normalized.get(section_name)
+            if isinstance(section, dict) and legacy_field in section:
+                timing_values[timing_field] = section[legacy_field]
+        if timing_values or "timing" in normalized:
+            normalized["timing"] = timing_values
+        return normalized
+
+    def _sync_legacy_timing_aliases(self) -> None:
+        for timing_field, section_name, legacy_field in LEGACY_TIMING_NAMESPACE_FIELDS:
+            section = getattr(self, section_name, None)
+            if section is not None:
+                setattr(section, legacy_field, getattr(self.timing, timing_field))
+
     def __init__(self, **data):
-        super().__init__(**self._normalize_legacy_memory_namespace(data))
+        normalized = self._normalize_legacy_memory_namespace(data)
+        normalized = self._normalize_legacy_timing_namespace(normalized)
+        super().__init__(**normalized)
+        self._sync_legacy_timing_aliases()
         # ── 互斥配置检测 ──
         if getattr(self.sys3, "enable_work_mode", False) and not self.provider.agent_models:
             from astrbot.api import logger
@@ -341,4 +402,5 @@ class AstrMaiConfig(BaseModel):
     vision: VisionConfig = Field(default_factory=VisionConfig)
     sys3: Sys3Settings = Field(default_factory=Sys3Settings)
     private_chat: PrivateChatConfig = Field(default_factory=PrivateChatConfig)
+    timing: TimingConfig = Field(default_factory=TimingConfig)
 

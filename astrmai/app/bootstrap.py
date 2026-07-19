@@ -345,7 +345,7 @@ class PluginBootstrap:
         vision_cache_dir = Path(getattr(runtime.persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache")) / "vision"
         private_turn_coordinator = PrivateTurnCoordinator(
             config=runtime.config,
-            image_resolver=NapCatImageResolver(vision_cache_dir),
+            image_resolver=NapCatImageResolver(vision_cache_dir, config=runtime.config),
             visual_cortex=runtime.visual_cortex,
             persistence=runtime.persistence,
         )

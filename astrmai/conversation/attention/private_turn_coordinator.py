@@ -21,6 +21,9 @@ class PrivateTurnCoordinator:
 
     def refresh_config(self, config: Any) -> None:
         self.config = config
+        refresh_resolver = getattr(self.image_resolver, "refresh_config", None)
+        if callable(refresh_resolver):
+            refresh_resolver(config)
 
     def _private_config(self) -> Any:
         return getattr(self.config, "private_chat", None)

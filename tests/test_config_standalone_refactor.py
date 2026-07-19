@@ -26,7 +26,42 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.attention.judge_timeout, 3.0)
         self.assertEqual(config.sys3.max_steps, 30)
         self.assertEqual(config.sys3.tool_timeout, 120)
+        self.assertEqual(config.timing.model_request_timeout_sec, 15.0)
+        self.assertEqual(config.timing.fast_mode_execution_timeout_sec, 15)
+        self.assertEqual(config.timing.reply_max_age_sec, 0.0)
         self.assertEqual(config.evolution.jargon_min_count, 2)
+
+    def test_astrmai_config_migrates_legacy_timing_fields_and_syncs_aliases(self):
+        config = AstrMaiConfig(
+            infra={"api_timeout": 240.0},
+            agent={"timeout": 600},
+            attention={"judge_timeout": 120.0},
+            private_chat={"image_resolve_timeout_sec": 150.0},
+        )
+
+        self.assertEqual(config.timing.model_request_timeout_sec, 240.0)
+        self.assertEqual(config.timing.agent_execution_timeout_sec, 600)
+        self.assertEqual(config.timing.attention_judge_timeout_sec, 120.0)
+        self.assertEqual(config.timing.image_resolve_timeout_sec, 150.0)
+        self.assertEqual(config.infra.api_timeout, 240.0)
+        self.assertEqual(config.agent.timeout, 600)
+        self.assertEqual(config.attention.judge_timeout, 120.0)
+        self.assertEqual(config.private_chat.image_resolve_timeout_sec, 150.0)
+
+    def test_central_timing_fields_override_legacy_locations(self):
+        config = AstrMaiConfig(
+            infra={"api_timeout": 30.0},
+            agent={"timeout": 60},
+            timing={
+                "model_request_timeout_sec": 300.0,
+                "agent_execution_timeout_sec": 900,
+                "reply_max_age_sec": 1200.0,
+            },
+        )
+
+        self.assertEqual(config.infra.api_timeout, 300.0)
+        self.assertEqual(config.agent.timeout, 900)
+        self.assertEqual(config.reply.stale_reply_max_age_sec, 1200.0)
 
     def test_astrmai_config_accepts_conversation_and_memory_namespace_fields(self):
         config = AstrMaiConfig(
@@ -104,9 +139,15 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertFalse(memory_items["intent_rerank_enabled"]["default"])
         self.assertFalse(memory_items["adaptive_top_k_enabled"]["default"])
         self.assertFalse(memory_items["memory_retrieval_debug_trace_enabled"]["default"])
-        self.assertEqual(schema["attention"]["items"]["judge_timeout"]["default"], 3.0)
+        timing_items = schema["timing"]["items"]
+        self.assertEqual(timing_items["attention_judge_timeout_sec"]["default"], 3.0)
+        self.assertEqual(timing_items["agent_execution_timeout_sec"]["default"], 60)
+        self.assertEqual(timing_items["fast_mode_execution_timeout_sec"]["default"], 15)
+        self.assertEqual(timing_items["workmode_execution_timeout_sec"]["default"], 120)
+        self.assertEqual(timing_items["image_resolve_timeout_sec"]["maximum"], 600)
+        self.assertNotIn("judge_timeout", schema["attention"]["items"])
         self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)
-        self.assertEqual(schema["sys3"]["items"]["tool_timeout"]["default"], 120)
+        self.assertNotIn("tool_timeout", schema["sys3"]["items"])
         self.assertEqual(schema["life"]["items"]["energy_exhaustion"]["default"], 0.1)
         meme_mapping_hint = schema["reply"]["items"]["emotion_mapping"]["hint"]
         self.assertIn("memes_data/memes/<标签名>/", meme_mapping_hint)

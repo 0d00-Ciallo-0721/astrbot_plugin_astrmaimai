@@ -39,6 +39,14 @@ class MoodManager:
         self.config = config if config else gateway.config
         self.emotion_mapping = self._build_emotion_mapping(self.config)
 
+    def _analysis_timeout_seconds(self) -> float:
+        timing = getattr(self.config, "timing", None)
+        try:
+            configured = float(getattr(timing, "mood_analysis_timeout_sec", 30.0) or 30.0)
+        except (TypeError, ValueError):
+            configured = 30.0
+        return max(0.1, configured)
+
     @staticmethod
     def _build_emotion_mapping(config) -> dict[str, str]:
         mapping = {}
@@ -242,14 +250,14 @@ class MoodManager:
                         is_json=True,
                         use_fallback=False,
                     ),
-                    timeout=30,
+                    timeout=self._analysis_timeout_seconds(),
                 )
                 result = llm_result.parsed_json or self._extract_lane_text_result(llm_result)
             else:
                 try:
                     result = await asyncio.wait_for(
                         self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT),
-                        timeout=30,
+                        timeout=self._analysis_timeout_seconds(),
                     )
                 except TypeError:
                     result = await self.gateway.call_mood_task(prompt, system_prompt=MOOD_SYSTEM_PROMPT)

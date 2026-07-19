@@ -15,13 +15,52 @@ from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy
 
 
+def resolve_reply_max_age_seconds(config) -> float:
+    timing = getattr(config, "timing", None)
+    reply = getattr(config, "reply", None)
+    try:
+        configured = float(
+            getattr(timing, "reply_max_age_sec", getattr(reply, "stale_reply_max_age_sec", 0.0))
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        configured = 0.0
+    if configured > 0.0:
+        return configured
+
+    infra = getattr(config, "infra", None)
+    agent = getattr(config, "agent", None)
+    try:
+        api_timeout = float(
+            getattr(timing, "model_request_timeout_sec", getattr(infra, "api_timeout", 15.0))
+            or 15.0
+        )
+    except (TypeError, ValueError):
+        api_timeout = 15.0
+    try:
+        agent_timeout = float(
+            getattr(timing, "agent_execution_timeout_sec", getattr(agent, "timeout", 60.0))
+            or 60.0
+        )
+    except (TypeError, ValueError):
+        agent_timeout = 60.0
+    return max(30.0, api_timeout * 2.5, agent_timeout * 1.25)
+
+
+def is_stale_reply_reason(reason: str) -> bool:
+    return str(reason or "").startswith(
+        (
+            "reply_age_exceeded:",
+            "superseded_by_newer_activity:",
+            "stale_",
+            "expired",
+        )
+    )
+
+
 class ReplyFreshnessMixin:
     def _reply_max_age_seconds(self) -> float:
-        configured = float(getattr(getattr(self.config, "reply", None), "stale_reply_max_age_sec", 0.0) or 0.0)
-        if configured > 0:
-            return configured
-        api_timeout = float(getattr(getattr(self.config, "infra", None), "api_timeout", 15.0) or 15.0)
-        return max(30.0, min(90.0, api_timeout * 2.5))
+        return resolve_reply_max_age_seconds(self.config)
 
     def _resolve_reply_mode(self, event: AstrMessageEvent) -> ReplyMode:
         prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)

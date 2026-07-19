@@ -9,10 +9,16 @@ class EmbeddingClient:
     标准化的 Embedding 客户端
     支持手动配置优先 + 自动获取兜底的寻找策略。
     """
-    def __init__(self, context: Context, embedding_models: list = None):
+    def __init__(self, context: Context, embedding_models: list = None, config=None):
         self.context = context
         # 使用 embedding_models 列表替代原先的单字符串 provider_id
         self.embedding_models = embedding_models or []
+        timing = getattr(config, "timing", None)
+        try:
+            configured_timeout = getattr(timing, "embedding_timeout_sec", 15.0) or 15.0
+            self._timeout_sec = max(0.1, float(configured_timeout))
+        except (TypeError, ValueError):
+            self._timeout_sec = 15.0
         # 🟢 引入独立的轮询指针状态
         self._cursor = 0
 
@@ -41,12 +47,12 @@ class EmbeddingClient:
                 if hasattr(provider, method_name):
                     method = getattr(provider, method_name)
                     try:
-                        # 尝试批处理格式（15 秒超时防止 embedding provider 卡死）
+                        # 优先尝试批处理格式，并使用统一时间配置防止 provider 卡死。
                         try:
-                            result = await asyncio.wait_for(method([text]), timeout=15.0)
+                            result = await asyncio.wait_for(method([text]), timeout=self._timeout_sec)
                         except (TypeError, ValueError, asyncio.TimeoutError):
                             # 回退单文本格式
-                            result = await asyncio.wait_for(method(text), timeout=15.0)
+                            result = await asyncio.wait_for(method(text), timeout=self._timeout_sec)
 
                         # 结果标准化
                         if result:

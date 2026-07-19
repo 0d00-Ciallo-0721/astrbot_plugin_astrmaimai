@@ -146,6 +146,14 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
 
         self.assertIsNone(decision)
 
+    def test_cognitive_loop_uses_central_timing_timeout(self):
+        gateway = _FakeGateway([{"action": "reply"}])
+        config = SimpleNamespace(timing=SimpleNamespace(cognitive_loop_timeout_sec=123.0))
+
+        loop = self.mod.CognitiveLoop(gateway, config=config)
+
+        self.assertEqual(loop._soft_timeout_seconds(), 123.0)
+
     def test_cognitive_loop_semantically_confirms_member_action_without_inventing_identity(self):
         gateway = _FakeGateway(
             [

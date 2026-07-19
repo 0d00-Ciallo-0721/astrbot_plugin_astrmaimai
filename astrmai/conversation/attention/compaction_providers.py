@@ -41,10 +41,18 @@ class CompactionProviderMixin:
         return prompt_registry.render_template(template_id, {"lines_text": lines_text})
 
     def _compaction_provider_timeout_seconds(self) -> float:
+        config = getattr(self.gateway, "config", None) if self.gateway else None
+        timing = getattr(config, "timing", None)
+        try:
+            configured = float(getattr(timing, "compaction_timeout_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            configured = 0.0
+        if configured > 0.0:
+            return max(0.01, configured)
         gateway_timeout = getattr(self.gateway, "_api_timeout", None) if self.gateway else None
         if callable(gateway_timeout):
             try:
-                return max(0.01, min(60.0, float(gateway_timeout())))
+                return max(0.01, float(gateway_timeout()))
             except (TypeError, ValueError):
                 pass
         settings = getattr(self.gateway, "settings", None) if self.gateway else None
@@ -52,7 +60,7 @@ class CompactionProviderMixin:
             configured = float(getattr(settings, "api_timeout", 60.0) or 60.0)
         except (TypeError, ValueError):
             configured = 60.0
-        return max(0.01, min(60.0, configured))
+        return max(0.01, configured)
 
     def _compaction_provider_capabilities(self, provider_id: str):
         resolver = getattr(self.gateway, "_provider_capabilities", None) if self.gateway else None

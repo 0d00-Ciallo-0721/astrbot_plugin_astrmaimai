@@ -149,6 +149,23 @@ class RefactoredExecutorTests(unittest.TestCase):
         )
         self.assertEqual(missing, ["omni_perception_query"])
 
+    def test_fast_mode_execution_timeout_uses_central_timing(self):
+        gateway = _FakeGateway()
+        gateway.config.timing = SimpleNamespace(fast_mode_execution_timeout_sec=240)
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("is_fast_mode", True)
+
+        runtime_values = executor._execution_runtime_values(event, event.unified_msg_origin)
+
+        self.assertEqual(runtime_values["timeout"], 240)
+
     def test_construct_at_required_outcome_needs_verified_current_group_action(self):
         event = _FakeEvent()
         event.set_extra("astrmai_required_tools", ["construct_at_event"])
@@ -652,6 +669,40 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(event.get_extra("astrmai_execution_status"), "stale_drop")
+        self.assertEqual(evolution.calls, [])
+
+    def test_reply_age_expiry_does_not_retry_the_next_model(self):
+        gateway = _FakeGateway(
+            models=["model-a", "model-b"],
+            chat_responses={"model-a": "first", "model-b": "second"},
+        )
+        evolution = _FakeEvolution()
+
+        class _ExpiredReplyService:
+            async def handle_reply(self, event, text, chat_id):
+                return SimpleNamespace(
+                    sent=False,
+                    blocked_reason="reply_age_exceeded:94.6s>90.0s",
+                    metadata={"send_status": "failed"},
+                )
+
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_ExpiredReplyService(),
+            evolution_manager=evolution,
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+
+        result = asyncio.run(executor.execute(event, "prompt", "system"))
+
+        self.assertIsNone(result)
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "stale_drop")
+        self.assertEqual(
+            [kwargs["models"][0] for mode, kwargs in gateway.calls if mode == "chat"],
+            ["model-a"],
+        )
         self.assertEqual(evolution.calls, [])
 
     def test_send_failure_retries_next_model_and_commits_only_successful_reply(self):

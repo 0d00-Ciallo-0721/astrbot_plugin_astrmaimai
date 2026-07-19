@@ -40,6 +40,7 @@ from ..contracts.focus_context import FocusThreadContext, FreshnessState, Vision
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
 from ..planning.tool_disclosure import normalize_requested_packages, select_tools_by_packages
+from .reply_freshness import is_stale_reply_reason, resolve_reply_max_age_seconds
 
 
 class ConcurrentExecutor:
@@ -437,10 +438,7 @@ class ConcurrentExecutor:
         elif isinstance(prompt_envelope, PromptEnvelope):
             thread_signature = str(prompt_envelope.thread_signature or "")
 
-        max_age_seconds = float(getattr(getattr(self.config, "reply", None), "stale_reply_max_age_sec", 0.0) or 0.0)
-        if max_age_seconds <= 0:
-            api_timeout = float(getattr(getattr(self.config, "infra", None), "api_timeout", 15.0) or 15.0)
-            max_age_seconds = max(30.0, min(90.0, api_timeout * 2.5))
+        max_age_seconds = resolve_reply_max_age_seconds(self.config)
 
         return await self.runtime_coordinator.evaluate_reply_freshness(
             chat_id,
@@ -530,7 +528,9 @@ class ConcurrentExecutor:
         config_max_steps = getattr(self.config.agent, "max_steps", 5)
         tool_tier = str(event.get_extra("astrmai_tool_tier", "full") or "full")
         max_steps = max(5, config_max_steps)
-        timeout = 15 if is_fast_mode else self.config.agent.timeout
+        timing = getattr(self.config, "timing", None)
+        fast_timeout = getattr(timing, "fast_mode_execution_timeout_sec", 15)
+        timeout = max(1, int(fast_timeout or 15)) if is_fast_mode else self.config.agent.timeout
         prefix_hash = event.get_extra("astrmai_prefix_hash", "")
         prompt_envelope = event.get_extra("astrmai_prompt_envelope", None)
         raw_user_text = (
@@ -769,7 +769,7 @@ class ConcurrentExecutor:
             metadata = getattr(artifact, "metadata", {}) or {}
             send_status = str(metadata.get("send_status", "") or "")
             blocked_reason = str(getattr(artifact, "blocked_reason", "") or "")
-            if "stale" in blocked_reason:
+            if is_stale_reply_reason(blocked_reason):
                 event.set_extra("astrmai_execution_status", "stale_drop")
             elif send_status == "duplicate_blocked":
                 event.set_extra("astrmai_execution_status", "duplicate_blocked")

@@ -351,12 +351,6 @@
         "default": 0.2,
         "hint": "控制机器人回完第一句后，是否会再自然补一句。0 表示不会追加，1 表示每次都尝试追加。"
       },
-      "stale_reply_max_age_sec": {
-        "description": "聊天回复的最长有效时长（秒）",
-        "type": "float",
-        "default": 0.0,
-        "hint": "超过这个时间还没发出去的回复，会被当作过期回复处理，避免晚到后突然回错话题。填 0 表示自动根据系统超时设置推导。"
-      },
       "fallback_text": {
         "description": "兜底回复文本",
         "type": "string",
@@ -484,12 +478,6 @@
         "default": 2.0,
         "hint": "短时间内连续出现的消息会先聚合，再统一判断要不要回复。"
       },
-      "judge_timeout": {
-        "description": "快速注意力判断超时（秒）",
-        "type": "float",
-        "default": 3.0,
-        "hint": "轻量注意力判断超过这个时间仍未完成时，会直接放行消息，避免聊天被判断流程卡住。"
-      },
       "bg_pool_size": {
         "description": "后台观察缓存条数",
         "type": "int",
@@ -595,30 +583,6 @@
     "type": "object",
     "description": "私聊连续对话",
     "items": {
-      "wait_timeout_sec": {
-        "description": "私聊等待下一句时长（秒）",
-        "type": "int",
-        "default": 300,
-        "hint": "机器人在私聊里回复后，会在这段时间内保持“等你继续说”的状态。"
-      },
-      "input_settle_sec": {
-        "description": "私聊连续输入等待时间（秒）",
-        "type": "float",
-        "default": 1.5,
-        "hint": "用户连续发送多句话时，机器人会等待这段时间确认输入结束，再合并理解并回复一次。"
-      },
-      "image_resolve_timeout_sec": {
-        "description": "私聊图片读取超时时间（秒）",
-        "type": "float",
-        "default": 15.0,
-        "hint": "从消息平台获取图片文件时最多等待多久。"
-      },
-      "image_barrier_timeout_sec": {
-        "description": "私聊单张图片识别超时时间（秒）",
-        "type": "float",
-        "default": 45.0,
-        "hint": "图片识别完成后才会构建完整上下文并决定是否回复。"
-      },
       "image_analysis_retries": {
         "description": "私聊图片识别重试次数",
         "type": "int",
@@ -1049,6 +1013,133 @@
       }
     }
   },
+  "timing": {
+    "title": "时间与超时设置",
+    "type": "object",
+    "description": "集中管理模型调用、回复有效期、工具执行、记忆、图片和私聊等待时间。慢速模型主要调整这里。",
+    "items": {
+      "model_request_timeout_sec": {
+        "description": "单次模型请求超时（秒）",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 1,
+        "maximum": 3600,
+        "hint": "普通模型请求允许等待的最长时间。响应通常超过 90 秒的模型建议设置为 180 至 300。"
+      },
+      "reply_max_age_sec": {
+        "description": "聊天回复最长有效时间（秒）",
+        "type": "float",
+        "default": 0.0,
+        "minimum": 0,
+        "maximum": 7200,
+        "hint": "模型生成完成后，回复超过该时长会被丢弃。0 表示根据模型和工具超时自动计算，不再限制为 90 秒。"
+      },
+      "agent_execution_timeout_sec": {
+        "description": "聊天工具循环总超时（秒）",
+        "type": "int",
+        "default": 60,
+        "minimum": 1,
+        "maximum": 7200,
+        "hint": "普通聊天使用工具并生成最终回复的总时间预算。慢模型或连续工具调用建议设置为 300 至 900。"
+      },
+      "fast_mode_execution_timeout_sec": {
+        "description": "快速聊天执行超时（秒）",
+        "type": "int",
+        "default": 15,
+        "minimum": 1,
+        "maximum": 7200,
+        "hint": "快速模式生成回复的时间预算。慢模型仍用于快速模式时，请同步提高此值。"
+      },
+      "workmode_execution_timeout_sec": {
+        "description": "工作模式执行总超时（秒）",
+        "type": "int",
+        "default": 120,
+        "minimum": 1,
+        "maximum": 7200,
+        "hint": "工作模式完成多步工具任务的总时间预算。"
+      },
+      "attention_judge_timeout_sec": {
+        "description": "注意力判断超时（秒）",
+        "type": "float",
+        "default": 3.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "超过后会放行消息并继续聊天。使用慢模型时可提高，但群聊每条消息也会等待更久。"
+      },
+      "cognitive_loop_timeout_sec": {
+        "description": "认知决策超时（秒）",
+        "type": "float",
+        "default": 2.5,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "超过后会降级到默认规划流程。慢模型需要提高，否则认知决策不会真正完成。"
+      },
+      "mood_analysis_timeout_sec": {
+        "description": "情绪分析超时（秒）",
+        "type": "float",
+        "default": 30.0,
+        "minimum": 1,
+        "maximum": 600,
+        "hint": "超过后改用本地情绪规则，不会阻断聊天。"
+      },
+      "memory_react_timeout_sec": {
+        "description": "深度记忆判断超时（秒）",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 1,
+        "maximum": 600,
+        "hint": "深度记忆检索生成检索问题的等待时间，超时后退回普通召回。"
+      },
+      "compaction_timeout_sec": {
+        "description": "上下文压缩超时（秒）",
+        "type": "float",
+        "default": 60.0,
+        "minimum": 1,
+        "maximum": 1200,
+        "hint": "长对话摘要压缩允许等待的时间。慢模型建议不低于单次模型请求超时。"
+      },
+      "embedding_timeout_sec": {
+        "description": "向量生成超时（秒）",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 1,
+        "maximum": 600,
+        "hint": "向量模型单次生成向量的等待时间，仅影响向量检索。"
+      },
+      "private_wait_timeout_sec": {
+        "description": "私聊等待下一句时间（秒）",
+        "type": "int",
+        "default": 300,
+        "minimum": 1,
+        "maximum": 7200,
+        "hint": "机器人回复后保持等待用户继续说话状态的时间。"
+      },
+      "private_input_settle_sec": {
+        "description": "私聊连续输入聚合时间（秒）",
+        "type": "float",
+        "default": 1.5,
+        "minimum": 0,
+        "maximum": 30,
+        "hint": "用户连续发送多句话时，等待输入稳定后再合并回复。"
+      },
+      "image_resolve_timeout_sec": {
+        "description": "图片文件读取超时（秒）",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 1,
+        "maximum": 600,
+        "hint": "只负责从消息平台取得图片文件，不是视觉模型生成时间。"
+      },
+      "image_analysis_timeout_sec": {
+        "description": "图片识别等待超时（秒）",
+        "type": "float",
+        "default": 45.0,
+        "minimum": 1,
+        "maximum": 1200,
+        "hint": "视觉模型分析图片并形成转述的等待时间。慢视觉模型建议设置为 180 至 300。"
+      }
+    }
+  },
   "agent": {
     "type": "object",
     "description": "深度推理参数",
@@ -1058,12 +1149,6 @@
         "type": "int",
         "default": 5,
         "hint": "值越大，复杂任务能思考得更深，但速度也可能更慢。"
-      },
-      "timeout": {
-        "description": "单次推理超时（秒）",
-        "type": "int",
-        "default": 60,
-        "hint": "超过这个时间还没完成时，会中止本轮深度推理。"
       }
     }
   },
@@ -1113,12 +1198,6 @@
         "default": 30,
         "hint": "直接进入工作模式后，单次任务最多允许执行多少个工具步骤。数值越大，可完成的任务更复杂，但耗时也可能更长。"
       },
-      "tool_timeout": {
-        "description": "工作模式直接执行超时（秒）",
-        "type": "int",
-        "default": 120,
-        "hint": "直接进入工作模式后，工具执行超过这个时间会中止，避免任务长时间卡住。"
-      },
       "computer_agent_sandbox_enabled": {
         "description": "启用计算机代码执行工具",
         "type": "bool",
@@ -1142,12 +1221,6 @@
         "type": "float",
         "default": 1.5,
         "hint": "每次重试前的等待时间会按这个系数递增。"
-      },
-      "api_timeout": {
-        "description": "单次模型请求超时（秒）",
-        "type": "float",
-        "default": 15.0,
-        "hint": "超过这个时间仍未返回结果，就会中止请求，防止长时间卡住。"
       },
       "max_concurrent_llm_calls": {
         "description": "全局并发请求上限",
