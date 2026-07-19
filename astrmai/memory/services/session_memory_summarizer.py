@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import json
 import re
 import time
@@ -57,17 +58,30 @@ class SessionMemorySummarizer:
                 logger.warning(f"[AstrMai-summarizer] NTP backward jump: cutoff={cutoff_time} > now={now}, clamping")
                 cutoff_time = 0.0
 
+            watermark = await self._get_summary_watermark(session_id)
+
             def fetch_logs_sync():
                 with db.get_session() as session:
-                    statement = select(MessageLog).where(
+                    filters = [
                         MessageLog.group_id == session_id,
                         MessageLog.timestamp >= cutoff_time,
-                    ).order_by(MessageLog.timestamp.asc())
+                    ]
+                    if watermark > 0:
+                        filters.append(MessageLog.id > watermark)
+                    statement = select(MessageLog).where(*filters).order_by(MessageLog.id.asc())
                     results = session.exec(statement).all()
                     return [MessageLog.model_validate(r.model_dump()) for r in results]
 
             logs = await asyncio.to_thread(fetch_logs_sync)
             if not logs:
+                return
+            if len(logs) < max(1, int(self.msg_threshold or 1)):
+                await self._observe(
+                    session_id,
+                    "summarize_deferred",
+                    reason="below_message_threshold",
+                    summary=f"new_messages={len(logs)}, threshold={self.msg_threshold}",
+                )
                 return
 
             history_lines = []
@@ -82,6 +96,8 @@ class SessionMemorySummarizer:
                 history_lines.append(f"[{time_str}] {log.sender_name}: {content}")
                 topic_messages.append(
                     {
+                        "message_id": int(log.id or 0),
+                        "sender_id": str(log.sender_id or ""),
                         "sender": log.sender_name,
                         "content": content,
                         "timestamp": log.timestamp if log.timestamp is not None else float(index),
@@ -90,13 +106,16 @@ class SessionMemorySummarizer:
 
             full_history = "\n".join(history_lines)
             if full_history:
-                await self.summarize_session(session_id, full_history, messages=topic_messages)
+                completed = await self.summarize_session(session_id, full_history, messages=topic_messages)
+                last_log_id = max((int(log.id or 0) for log in logs), default=0)
+                if completed is not False and last_log_id > watermark:
+                    await self._set_summary_watermark(session_id, last_log_id)
         except Exception as exc:
             logger.error(f"[SessionMemorySummarizer] batch history extract failed: {exc}", exc_info=True)
 
     async def summarize_session(self, session_id: str, chat_history_text: str, persona_id: Optional[str] = None, messages: Optional[List[Dict]] = None):
         if not str(chat_history_text or "").strip():
-            return
+            return False
 
         logger.info(f"[SessionMemorySummarizer] summarizing session {session_id}")
         await self._observe(session_id, "summarize_started", summary="session summarize started")
@@ -118,7 +137,7 @@ class SessionMemorySummarizer:
         if not isinstance(memory_data, dict):
             logger.warning(f"[SessionMemorySummarizer] invalid processor result for {session_id}")
             await self._observe(session_id, "memory_processor_invalid", level="warning", reason="memory_processor_invalid")
-            return
+            return False
 
         summary = memory_data.get("summary", "")
         key_facts = memory_data.get("key_facts", [])
@@ -136,10 +155,10 @@ class SessionMemorySummarizer:
             topics = [str(topics)] if topics else []
         if not key_facts and summary == "对话记录":
             await self._observe(session_id, "summarize_skipped", reason="no_effective_facts", summary="processor produced no effective facts")
-            return
+            return True
         if importance < 0.2:
             await self._observe(session_id, "summarize_skipped", reason="low_importance", summary=f"importance={importance:.2f}")
-            return
+            return True
 
         plugin = getattr(self.context, "astrmai_plugin", None) or getattr(self.gateway.context, "astrmai", None)
         if plugin and hasattr(plugin, "db_service"):
@@ -161,13 +180,21 @@ class SessionMemorySummarizer:
             content_lines.append(f"【话题标签】{', '.join(valid_topics)}")
         final_content = "\n".join(content_lines)
 
-        event_id = f"evt_{datetime.datetime.now().strftime('%Y%m%d')}_{uuid4_short()}"
+        topic_messages = messages or self._build_topic_messages(chat_history_text)
+        history_digest = self._history_digest(chat_history_text, topic_messages)
+        event_id = f"evt_summary_{history_digest[:20]}"
+        subject_id = self._default_subject_id(session_id)
+        evidence_message_ids = [
+            int(item.get("message_id") or 0)
+            for item in topic_messages
+            if int(item.get("message_id") or 0) > 0
+        ]
         canonical_id = ""
         if hasattr(self.engine, "write_service"):
             claims = await self.claim_extractor.extract(
                 user_text="\n".join(valid_facts) if valid_facts else str(summary or ""),
                 assistant_text="",
-                subject_id=str(session_id or ""),
+                subject_id=subject_id,
                 turn_id=event_id,
                 context_hint="session_memory_summarizer",
             )
@@ -177,9 +204,18 @@ class SessionMemorySummarizer:
                 "reflection": reflection,
                 "sentiment": sentiment,
                 "canonical_write": True,
+                "history_digest": history_digest,
+                "evidence_message_ids": evidence_message_ids,
+                "speaker_ids": sorted(
+                    {
+                        str(item.get("sender_id") or "").strip()
+                        for item in topic_messages
+                        if str(item.get("sender_id") or "").strip()
+                    }
+                ),
             }
-            kind = "topic" if valid_topics else "fact"
-            dedup_key = f"memory_summary:{session_id}:{event_id}"
+            kind = "memory"
+            dedup_key = f"memory_summary:{session_id}:{history_digest}"
             if decision.metadata:
                 metadata.update(dict(decision.metadata))
             if decision.action == "authority_override" and claims:
@@ -202,16 +238,16 @@ class SessionMemorySummarizer:
                     source="memory_summary",
                     kind=kind,
                     session_id=str(session_id),
-                    sender_id=str(claims[0].subject_id if claims else session_id),
+                    sender_id=str(claims[0].subject_id if claims else subject_id),
                     persona_id=str(persona_id or ""),
                     content=final_content,
                     summary=str(summary or "")[:240],
                     tags=valid_topics,
                     importance=float(importance or 0.5),
-                    confidence=0.8,
+                    confidence=min(0.8, max(0.5, float(importance or 0.5))),
                     metadata=metadata,
                     dedup_key=dedup_key,
-                    source_ref=f"MemoryEvent:{event_id}",
+                    source_ref=f"MessageLogWindow:{history_digest}",
                 )
             )
             await self._observe(
@@ -268,6 +304,55 @@ class SessionMemorySummarizer:
             except Exception as exc:
                 logger.warning(f"[SessionMemorySummarizer] cognitive feedback write degraded: {exc}")
                 await self._observe(session_id, "cognitive_feedback_degraded", level="warning", reason="cognitive_feedback_degraded", summary=str(exc))
+        return True
+
+    @staticmethod
+    def _default_subject_id(session_id: str) -> str:
+        clean = str(session_id or "").strip()
+        marker = ":FriendMessage:"
+        if marker in clean:
+            return clean.rsplit(marker, 1)[-1].strip()
+        return ""
+
+    @staticmethod
+    def _history_digest(chat_history_text: str, messages: List[Dict] | None = None) -> str:
+        parts: list[str] = []
+        for item in messages or []:
+            parts.append(
+                "|".join(
+                    (
+                        str(item.get("message_id") or ""),
+                        str(item.get("sender_id") or ""),
+                        str(item.get("timestamp") or ""),
+                        str(item.get("content") or "").strip(),
+                    )
+                )
+            )
+        payload = "\n".join(parts).strip() or "\n".join(
+            line.strip() for line in str(chat_history_text or "").splitlines() if line.strip()
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _watermark_key(session_id: str) -> str:
+        digest = hashlib.sha256(str(session_id or "").encode("utf-8")).hexdigest()[:24]
+        return f"summary_watermark:{digest}"
+
+    async def _get_summary_watermark(self, session_id: str) -> int:
+        store = getattr(self.engine, "v2_store", None)
+        getter = getattr(store, "get_meta", None)
+        if not callable(getter):
+            return 0
+        try:
+            return max(0, int(await getter(self._watermark_key(session_id), "0") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    async def _set_summary_watermark(self, session_id: str, log_id: int) -> None:
+        store = getattr(self.engine, "v2_store", None)
+        setter = getattr(store, "set_meta", None)
+        if callable(setter):
+            await setter(self._watermark_key(session_id), str(max(0, int(log_id or 0))))
 
     @staticmethod
     def _build_topic_messages(chat_history_text: str) -> List[Dict]:

@@ -212,10 +212,13 @@ class MemoryConfig(BaseModel):
     memory_query_builder_enabled: bool = Field(default=True, repr=False)
     intent_rerank_enabled: bool = Field(default=False, repr=False)
     adaptive_top_k_enabled: bool = Field(default=False, repr=False)
+    memory_rrf_fusion_enabled: bool = Field(default=False, repr=False)
+    memory_mmr_enabled: bool = Field(default=False, repr=False)
     memory_retrieval_debug_trace_enabled: bool = Field(default=False, repr=False)
     enable_react_agent: bool = Field(default=True, description="启用 ReActAgent 多轮记忆检索")
     prune_threshold: float = Field(default=0.2, ge=0.0, le=1.0, description="记忆遗忘被物理剪枝的得分下限")
     min_memory_confidence: float = Field(default=0.3, ge=0.0, le=1.0, description="记忆写入最低置信度，低于此值的记忆不持久化")
+    memory_quality_admission_enabled: bool = Field(default=True, description="启用长期记忆质量准入；不确定事实进入待审隔离区")
 
 
     deep_temporal_alpha: float = Field(default=0.7, ge=0.0, le=1.0)

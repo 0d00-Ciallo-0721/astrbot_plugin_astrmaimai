@@ -434,6 +434,23 @@ class AstrMaiAdminPageApi:
     async def canonical_memory(self, request: Any) -> dict[str, Any]:
         return await self._memory().get_canonical(str(self._path(request).get("memory_id", "")))
 
+    async def update_canonical_memory(self, request: Any) -> dict[str, Any]:
+        return await self._memory().update_canonical(
+            str(self._path(request).get("memory_id", "")),
+            await self._body(request),
+        )
+
+    async def memory_quality_overview(self, request: Any) -> dict[str, Any]:
+        return await self._memory().quality_overview()
+
+    async def memory_quality_audit(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().quality_audit(limit=self._int(body.get("limit"), 5000))
+
+    async def quarantine_memory_quality_suspects(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._memory().quarantine_quality_suspects(limit=self._int(body.get("limit"), 5000))
+
     async def delete_canonical_memory(self, request: Any) -> dict[str, Any]:
         return await self._memory().delete_canonical(str(self._path(request).get("memory_id", "")))
 
@@ -626,6 +643,10 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/heartflow/impulses", api.heartflow_impulses, "AstrMai Heartflow impulse safety decisions"),
         ("GET", "/memories/canonical", api.list_canonical_memories, "AstrMai canonical memories"),
         ("GET", "/memories/canonical/{memory_id}", api.canonical_memory, "AstrMai canonical memory detail"),
+        ("POST", "/memories/canonical/{memory_id}", api.update_canonical_memory, "AstrMai update canonical memory"),
+        ("GET", "/memories/quality/overview", api.memory_quality_overview, "AstrMai memory quality overview"),
+        ("POST", "/memories/quality/audit", api.memory_quality_audit, "AstrMai memory quality dry run"),
+        ("POST", "/memories/quality/quarantine", api.quarantine_memory_quality_suspects, "AstrMai quarantine suspect memories"),
         ("POST", "/memories/canonical/{memory_id}/restore", api.restore_canonical_memory, "AstrMai restore canonical memory"),
         ("POST", "/memories/canonical/{memory_id}/stale", api.stale_canonical_memory, "AstrMai mark canonical memory stale"),
         ("POST", "/memories/canonical/{memory_id}/merge", api.merge_canonical_memory, "AstrMai merge canonical memory"),

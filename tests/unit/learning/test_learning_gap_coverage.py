@@ -299,7 +299,8 @@ class LearningGapCoverageTests(unittest.TestCase):
         report = asyncio.run(manager.run_backlog_mining_once())
 
         self.assertEqual(mined, [("chat-backlog", [1, 2, 3, 4, 5])])
-        self.assertEqual(db.marked, [[1, 2, 3, 4, 5]])
+        self.assertEqual(db.marked, [[1, 2, 3]])
+        self.assertEqual(manager._last_mining_outcomes["chat-backlog"]["retained_overlap"], 2)
         self.assertEqual(report["processed_groups"][0]["group_id"], "chat-backlog")
 
     def test_backlog_overview_reports_threshold_and_top_groups(self):

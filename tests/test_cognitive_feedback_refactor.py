@@ -177,9 +177,24 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertEqual(request.tags, ["joke", "tone"])
         self.assertTrue(request.metadata["cognitive_feedback"])
         self.assertEqual(request.metadata["guidance"], "Prefer direct answers")
-        self.assertTrue(request.dedup_key.startswith("feedback:chat-1:agency:"))
+        self.assertEqual(request.dedup_key, "feedback:chat-1:agency:rolling")
+        self.assertGreater(request.metadata["valid_until"], time.time())
         self.assertIn("[cognitive_feedback:agency]", request.content)
         self.assertEqual(engine._cognitive_feedback_cache["chat-1"][0].summary, "Use fewer repeated jokes")
+
+        asyncio.run(
+            engine.record_cognitive_feedback(
+                session_id="chat-1",
+                source="Agency",
+                summary="Latest feedback replaces the rolling window",
+            )
+        )
+        self.assertEqual(len(engine._cognitive_feedback_cache["chat-1"]), 1)
+        self.assertEqual(
+            engine._cognitive_feedback_cache["chat-1"][0].summary,
+            "Latest feedback replaces the rolling window",
+        )
+        self.assertEqual(captured[0].dedup_key, captured[1].dedup_key)
 
     def test_memory_engine_get_cognitive_feedback_merges_cache_and_db_rows(self):
         cache_engine = self._memory_engine()

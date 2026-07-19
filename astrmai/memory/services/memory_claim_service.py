@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,9 @@ class ResolutionDecision:
 
 
 class MemoryClaimExtractor:
+    _IDENTITY_PATTERN = re.compile(r"(?:我叫|我的名字(?:是|叫))\s*([^\s，。！？?]{1,20})")
+    _PREFERENCE_PATTERN = re.compile(r"我(不喜欢|讨厌|喜欢|最爱|偏好|爱吃|不吃)\s*(.{1,40})")
+
     def __init__(self, gateway=None):
         self.gateway = gateway
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None) if gateway else None
@@ -47,6 +51,39 @@ class MemoryClaimExtractor:
         claims: list[MemoryClaim] = []
         correction = any(hint in lowered for hint in ASCII_CORRECTION_HINTS) or any(hint in text for hint in ZH_CORRECTION_HINTS)
         short_term = any(hint in lowered for hint in ASCII_SHORT_TERM_HINTS) or any(hint in text for hint in ZH_SHORT_TERM_HINTS)
+
+        identity_match = self._IDENTITY_PATTERN.search(text)
+        if identity_match:
+            claims.append(
+                MemoryClaim(
+                    subject_id=subject_id,
+                    entity="identity",
+                    attribute="display_name",
+                    value=identity_match.group(1).strip(),
+                    certainty=0.95,
+                    fact_scope="medium_term",
+                    source_text=text,
+                    evidence_turn_id=turn_id,
+                )
+            )
+        preference_match = self._PREFERENCE_PATTERN.search(text)
+        if preference_match:
+            verb = preference_match.group(1)
+            value = preference_match.group(2).strip(" ，。！？?")
+            if value:
+                claims.append(
+                    MemoryClaim(
+                        subject_id=subject_id,
+                        entity="preference",
+                        attribute="dislike" if verb in {"不喜欢", "讨厌", "不吃"} else "like",
+                        value=value,
+                        polarity="deny" if verb in {"不喜欢", "讨厌", "不吃"} else "affirm",
+                        certainty=0.9,
+                        fact_scope="medium_term",
+                        source_text=text,
+                        evidence_turn_id=turn_id,
+                    )
+                )
 
         if any(keyword in lowered for keyword in SERVER_KEYWORDS) or any(keyword in text for keyword in ZH_SERVER_KEYWORDS):
             match = SERVER_COUNT_PATTERN.search(text) or ZH_SERVER_COUNT_PATTERN.search(text)

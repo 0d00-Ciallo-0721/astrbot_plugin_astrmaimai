@@ -416,6 +416,7 @@ class MemoryEngine:
 
     def _remember_cognitive_feedback(self, signal: CognitiveFeedbackSignal) -> None:
         items = self._cognitive_feedback_cache.setdefault(signal.chat_id, [])
+        items[:] = [item for item in items if item.source != signal.source]
         items.append(signal)
         if len(items) > 32:
             del items[:-32]
@@ -472,6 +473,7 @@ class MemoryEngine:
             importance=float(importance or 0.5),
         )
         self._remember_cognitive_feedback(signal)
+        valid_until = now + (72 * 3600)
         await self.write_service.write(
             MemoryWriteRequest(
                 source=signal.source,
@@ -487,11 +489,13 @@ class MemoryEngine:
                 tags=signal.tags,
                 importance=signal.importance,
                 confidence=0.8,
-                metadata={"guidance": signal.guidance, "cognitive_feedback": True},
-                dedup_key=(
-                    f"feedback:{chat_id}:{signal.source}:"
-                    f"{hashlib.sha256(f'{signal.summary}|{signal.guidance}'.encode()).hexdigest()[:20]}"
-                ),
+                metadata={
+                    "guidance": signal.guidance,
+                    "cognitive_feedback": True,
+                    "valid_until": valid_until,
+                    "feedback_window": "rolling",
+                },
+                dedup_key=f"feedback:{chat_id}:{signal.source}:rolling",
                 source_ref=f"cognitive_feedback:{signal.source}",
                 visibility="tool_only",
             )
@@ -520,7 +524,7 @@ class MemoryEngine:
             signals.append(item)
 
         try:
-            where = ["kind = ?", "session_id = ?"]
+            where = ["kind = ?", "session_id = ?", "status = 'active'"]
             params: list[Any] = ["feedback", chat_id]
             if max_age_seconds is not None:
                 where.append("create_time >= ?")
@@ -542,6 +546,9 @@ class MemoryEngine:
                 try:
                     metadata = json.loads(metadata_raw or "{}") if isinstance(metadata_raw, str) else {}
                     importance = float(metadata.get("importance") or 0.5)
+                    valid_until = float(metadata.get("valid_until") or 0.0)
+                    if valid_until > 0 and valid_until < now:
+                        continue
                 except Exception:
                     logger.debug("[MemoryEngine] cognitive feedback metadata parse failed", exc_info=True)
                     pass
@@ -1000,8 +1007,15 @@ class MemoryEngine:
 
     async def store_topic_results(self, topic_results: list, session_id: str, persona_id: str = None):
         for topic_result in topic_results:
-            summary = topic_result.get("summary", "")
+            summary = str(topic_result.get("summary", "") or "").strip()
             if not summary or summary == "topic too short":
+                continue
+
+            normalized_summary = " ".join(summary.split()).lower()
+            summary_digest = hashlib.sha256(normalized_summary.encode("utf-8")).hexdigest()[:24]
+            topic_dedup_key = f"topic:{session_id}:{summary_digest}"
+            existing_exact = await self.v2_store.get_by_dedup_key(topic_dedup_key, include_inactive=True)
+            if existing_exact is not None:
                 continue
 
             existing_results = await self.retrieval_service.retrieve(
@@ -1032,9 +1046,16 @@ class MemoryEngine:
                             summary=merged_summary[:240],
                             tags=list(existing_doc.tags or []),
                             importance=0.85,
-                            confidence=max(existing_doc.confidence, 0.8),
-                            metadata={"merged_from": [existing_doc.id], "topic_result": dict(topic_result or {})},
-                            dedup_key=f"topic_merged:{session_id}:{hash(merged_summary)}",
+                            confidence=max(existing_doc.confidence, 0.6),
+                            metadata={
+                                "merged_from": [existing_doc.id],
+                                "topic_result": dict(topic_result or {}),
+                                "valid_until": time.time() + (30 * 86400),
+                            },
+                            dedup_key=(
+                                f"topic_merged:{session_id}:"
+                                f"{hashlib.sha256(merged_summary.encode('utf-8')).hexdigest()[:24]}"
+                            ),
                             source_ref="summarizer.topic_merge",
                         )
                     )
@@ -1045,6 +1066,11 @@ class MemoryEngine:
 
             if not merged:
                 importance = float(topic_result.get("importance", 0.4) or 0.4)
+                try:
+                    confidence = float(topic_result.get("confidence", 0.6) or 0.6)
+                except (TypeError, ValueError):
+                    confidence = 0.6
+                confidence = max(0.45, min(0.75, confidence))
                 await self.write_service.write(
                     MemoryWriteRequest(
                         source="topic_summarizer",
@@ -1055,9 +1081,13 @@ class MemoryEngine:
                         summary=str(summary or "")[:240],
                         tags=[str(item) for item in topic_result.get("topic_keywords", []) or []],
                         importance=importance,
-                        confidence=0.8,
-                        metadata={"topic_result": dict(topic_result or {})},
-                        dedup_key=f"topic:{session_id}:{hash(str(summary or ''))}",
+                        confidence=confidence,
+                        metadata={
+                            "topic_result": dict(topic_result or {}),
+                            "valid_until": time.time() + (14 * 86400),
+                            "topic_scope": "session",
+                        },
+                        dedup_key=topic_dedup_key,
                         source_ref="summarizer.topic",
                     )
                 )

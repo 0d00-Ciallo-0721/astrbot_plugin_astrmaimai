@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -57,6 +58,7 @@ class EvolutionManager:
         self._backlog_task: asyncio.Task | None = None
         self._backlog_failure_until: dict[str, float] = {}
         self._last_backlog_report: dict[str, Any] = {}
+        self._last_mining_outcomes: dict[str, dict[str, Any]] = {}
 
     def refresh_config(self, config):
         self.config = config
@@ -251,6 +253,7 @@ class EvolutionManager:
             "mining": {
                 "expression": dict(getattr(self.expression_miner, "last_report", {}) or {}),
                 "jargon": dict(getattr(self.jargon_miner, "last_report", {}) or {}),
+                "last_outcomes": dict(self._last_mining_outcomes),
             },
         }
 
@@ -325,7 +328,7 @@ class EvolutionManager:
             raw_content = str(self._field(jargon, "raw_content", "") or content).strip()
             confidence = float(self._field(jargon, "confidence", 0.0) or 0.0)
             activation_score = float(self._field(jargon, "activation_score", 0.0) or 0.0)
-            is_jargon = bool(self._field(jargon, "is_jargon", True))
+            is_jargon = bool(self._field(jargon, "is_jargon", False))
             scene = str(self._field(jargon, "scene", "") or "").strip()
             examples = [str(item).strip() for item in (self._field(jargon, "examples", []) or []) if str(item).strip()]
             review_status = self._normalize_jargon_review_status(self._field(jargon, "review_status", "review_pending"))
@@ -425,14 +428,52 @@ class EvolutionManager:
                 return
 
             patterns = await self.expression_miner.mine(group_id, logs)
+            expression_report = dict(getattr(self.expression_miner, "last_report", {}) or {})
+            if expression_report.get("reason") == "enrichment_empty" and int(
+                expression_report.get("candidate_count", 0) or 0
+            ) > 0:
+                await self._record_mining_outcome(
+                    group_id,
+                    logs,
+                    status="degraded",
+                    reason="expression_enrichment_failed_closed",
+                )
+                raise RuntimeError("expression enrichment failed closed")
             await self._save_patterns(patterns)
 
             jargon_count = 0
             if getattr(getattr(self.db, "memory_engine", None), "write_service", None):
                 jargons = await self.jargon_miner.mine(group_id, logs)
+                jargon_report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
+                if jargon_report.get("reason") == "enrichment_empty" and int(
+                    jargon_report.get("candidate_count", 0) or 0
+                ) > 0:
+                    await self._record_mining_outcome(
+                        group_id,
+                        logs,
+                        status="degraded",
+                        reason="jargon_enrichment_failed_closed",
+                    )
+                    raise RuntimeError("jargon enrichment failed closed")
                 jargon_count = await self._save_jargons(group_id, jargons)
 
-            await self._mark_logs_processed([self._field(log, "id") for log in logs])
+            evolution = self._evolution_config()
+            min_context = max(1, int(getattr(evolution, "min_mining_context", 10) or 10))
+            overlap = max(2, min(10, min_context // 2)) if len(logs) >= min_context else 0
+            processable = logs[:-overlap] if overlap and len(logs) > overlap else logs
+            processed_ids = [self._field(log, "id") for log in processable if self._field(log, "id") is not None]
+            if processed_ids:
+                await self._mark_logs_processed(processed_ids)
+            await self._record_mining_outcome(
+                group_id,
+                logs,
+                status="completed",
+                reason="candidates_saved" if patterns or jargon_count else "no_candidates_rolling_overlap",
+                pattern_count=len(patterns),
+                jargon_count=jargon_count,
+                processed_count=len(processed_ids),
+                retained_overlap=len(logs) - len(processed_ids),
+            )
             payload = MiningCompletedEvent(
                 group_id=str(group_id),
                 pattern_count=len(patterns),
@@ -441,6 +482,41 @@ class EvolutionManager:
             await self._publish_learning_event("publish_learning_mining_completed", payload)
             if self.event_bus and jargon_count > 0:
                 self.event_bus.trigger_knowledge_update()
+
+    async def _record_mining_outcome(
+        self,
+        group_id: str,
+        logs: List["MessageLog"],
+        *,
+        status: str,
+        reason: str,
+        pattern_count: int = 0,
+        jargon_count: int = 0,
+        processed_count: int = 0,
+        retained_overlap: int = 0,
+    ) -> None:
+        outcome = {
+            "group_id": str(group_id or ""),
+            "status": str(status or "unknown"),
+            "reason": str(reason or ""),
+            "input_count": len(logs or []),
+            "processed_count": int(processed_count or 0),
+            "retained_overlap": int(retained_overlap or 0),
+            "pattern_count": int(pattern_count or 0),
+            "jargon_count": int(jargon_count or 0),
+            "first_log_id": self._field(logs[0], "id") if logs else None,
+            "last_log_id": self._field(logs[-1], "id") if logs else None,
+            "recorded_at": time.time(),
+        }
+        self._last_mining_outcomes[str(group_id or "")] = outcome
+        if len(self._last_mining_outcomes) > 20:
+            self._last_mining_outcomes.pop(next(iter(self._last_mining_outcomes)), None)
+        memory_engine = getattr(self.db, "memory_engine", None)
+        store = getattr(memory_engine, "v2_store", None)
+        setter = getattr(store, "set_meta", None)
+        if callable(setter):
+            key = hashlib.sha256(str(group_id or "").encode("utf-8")).hexdigest()[:24]
+            await setter(f"learning_mining_ledger:{key}", json.dumps(outcome, ensure_ascii=False))
 
     async def analyze_and_get_goal(self, chat_id: str, recent_messages: str) -> str:
         if not recent_messages or not recent_messages.strip():

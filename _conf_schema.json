@@ -685,11 +685,29 @@
         "default": false,
         "hint": "开启后，会根据问题类型和提示词剩余空间，自动调整初步候选数量及最终参与回答的记忆条数；关闭后使用固定条数。"
       },
+      "memory_rrf_fusion_enabled": {
+        "description": "启用多路记忆排名融合",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，会按各检索来源中的名次和来源可靠度融合结果，降低不同分数尺度造成的排序偏差。当前属于灰度功能，建议先小范围观察。"
+      },
+      "memory_mmr_enabled": {
+        "description": "启用记忆多样性排序",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，会在相关性排序后适度降低内容重复的候选，避免最终注入多条近似记忆。当前属于灰度功能。"
+      },
       "memory_retrieval_debug_trace_enabled": {
         "description": "启用详细记忆检索调试轨迹",
         "type": "bool",
         "default": false,
         "hint": "开启后，调试轨迹可能记录完整查询、上下文词和候选详情。日常使用建议关闭，避免日志过多或记录敏感内容。"
+      },
+      "memory_quality_admission_enabled": {
+        "description": "启用长期记忆质量准入",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，疑问句、命令、主体不明或缺少证据的事实不会直接参与自动召回，而会进入待审核隔离区。建议保持开启。"
       },
       "deep_temporal_alpha": {
         "description": "深度召回的时间权重保底系数",

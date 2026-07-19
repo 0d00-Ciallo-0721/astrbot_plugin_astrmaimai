@@ -35,6 +35,17 @@ class JargonCandidateExtractor:
         "jpeg",
         "webp",
         "png",
+        "什么",
+        "不是",
+        "没有",
+        "怎么",
+        "方法",
+        "不需要",
+        "本人照片",
+        "点评",
+        "财运",
+        "事业运",
+        "桃花运",
     }
 
     def __init__(self, *, min_count: int = 2):
@@ -74,6 +85,8 @@ class JargonCandidateExtractor:
             return "发送者昵称"
         if token.isdigit():
             return "纯数字"
+        if re.fullmatch(r"(?:[0-9a-f]{2}){1,4}(?:version)?", token):
+            return "URL 编码或十六进制碎片"
         if "_" in token or token.startswith(("cq", "http", "www")):
             return "协议或字段标识"
         if re.fullmatch(r"\d+(?:px|kb|mb|gb)", token):
@@ -103,6 +116,8 @@ class JargonCandidateExtractor:
     ) -> list[dict[str, Any]]:
         counts: dict[str, int] = defaultdict(int)
         contexts: dict[str, list[str]] = defaultdict(list)
+        context_keys: dict[str, set[str]] = defaultdict(set)
+        sender_keys: dict[str, set[str]] = defaultdict(set)
         existing = {self._normalize_token(item) for item in (existing_terms or set()) if self._normalize_token(item)}
         sender_tokens: set[str] = set()
         for message in messages or []:
@@ -112,21 +127,28 @@ class JargonCandidateExtractor:
                 sender_tokens.update(self._tokens(sender_name))
         accepted_tokens = 0
         skipped_noise = 0
-        for message in messages or []:
+        for message_index, message in enumerate(messages or []):
             content = self._clean_text(getattr(message, "content", ""))
             if not content:
                 continue
-            for token in self._tokens(content):
+            message_key = str(getattr(message, "id", "") or f"row:{message_index}")
+            sender_key = str(getattr(message, "sender_id", "") or getattr(message, "sender_name", "") or "")
+            for token in set(self._tokens(content)):
                 if self._looks_noise(token, sender_tokens) or self._near_duplicate(token, existing):
                     skipped_noise += 1
                     continue
                 accepted_tokens += 1
                 counts[token] += 1
+                context_keys[token].add(message_key)
+                if sender_key:
+                    sender_keys[token].add(sender_key)
                 if len(contexts[token]) < 4:
                     contexts[token].append(content[:160])
         candidates: list[dict[str, Any]] = []
         for token, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             if count < self.min_count:
+                continue
+            if len(context_keys[token]) < self.min_count:
                 continue
             examples = contexts.get(token, [])
             activation = min(1.0, 0.45 + count * 0.15)
@@ -135,6 +157,8 @@ class JargonCandidateExtractor:
                     "content": token,
                     "raw_content": examples[0] if examples else token,
                     "count": count,
+                    "context_count": len(context_keys[token]),
+                    "speaker_count": len(sender_keys[token]),
                     "activation_score": activation,
                     "examples": list(examples),
                     "group_id": group_id,

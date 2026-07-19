@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 
+from ..contracts.memory_query import MemoryWriteRequest
+from .memory_admission_service import MemoryAdmissionService
 from .memory_scoring import compute_hot_score, scoring_from_config
 from .memory_index_projector import MemoryIndexProjector
 from .v2_store import MemoryV2Store
@@ -225,6 +229,140 @@ class MemoryMaintenanceService:
         if ids and self.index_projector:
             await self.index_projector.cleanup_deleted(ids)
         return len(ids)
+
+    async def quality_audit(self, *, limit: int = 5000) -> dict:
+        """Classify legacy pollution without mutating canonical data."""
+        max_items = max(1, min(int(limit or 5000), 20000))
+        items: list[dict] = []
+        offset = 0
+        while len(items) < max_items:
+            page = await self.store.list_canonical(
+                status="active",
+                limit=min(500, max_items - len(items)),
+                offset=offset,
+                include_inactive=True,
+            )
+            batch = list(page.get("items", []) or [])
+            items.extend(batch)
+            offset += len(batch)
+            if not batch or offset >= int(page.get("total", 0) or 0):
+                break
+
+        admission = MemoryAdmissionService(self.config)
+        suspects: list[dict] = []
+        seen_feedback: set[tuple[str, str]] = set()
+        seen_topics: set[tuple[str, str]] = set()
+        for item in items:
+            memory_id = str(item.get("id") or "")
+            source = str(item.get("source") or "").strip().lower()
+            kind = str(item.get("kind") or "").strip().lower()
+            session_id = str(item.get("session_id") or "")
+            sender_id = str(item.get("sender_id") or "")
+            metadata = dict(item.get("metadata") or {})
+            reason = ""
+
+            if kind == "fact" and source in {"instant_gate", "instant_gate_llm", "memory_summary"}:
+                decision = admission.evaluate(
+                    MemoryWriteRequest(
+                        source=source,
+                        kind=kind,
+                        session_id=session_id,
+                        sender_id=sender_id,
+                        content=str(item.get("content") or ""),
+                        summary=str(item.get("summary") or ""),
+                        confidence=float(item.get("confidence") or 0.0),
+                        source_ref=str(item.get("source_ref") or ""),
+                        metadata=metadata,
+                    )
+                )
+                if not decision.accepted:
+                    reason = decision.reason
+                elif ":GroupMessage:" in session_id and sender_id == session_id:
+                    reason = "group_session_used_as_subject"
+            elif kind == "feedback":
+                key = (session_id, source)
+                if key in seen_feedback:
+                    reason = "superseded_rolling_feedback"
+                else:
+                    seen_feedback.add(key)
+            elif kind == "topic":
+                normalized = self._normalize_quality_text(str(item.get("summary") or item.get("content") or ""))
+                key = (session_id, normalized)
+                if not normalized or len(normalized) < 6:
+                    reason = "low_information_topic"
+                elif key in seen_topics:
+                    reason = "duplicate_topic"
+                else:
+                    seen_topics.add(key)
+
+            if reason:
+                suspects.append(
+                    {
+                        "id": memory_id,
+                        "reason": reason,
+                        "source": source,
+                        "kind": kind,
+                        "session_id": session_id,
+                        "summary_digest": hashlib.sha256(
+                            str(item.get("summary") or "").encode("utf-8")
+                        ).hexdigest()[:12],
+                    }
+                )
+
+        reasons: dict[str, int] = {}
+        for item in suspects:
+            reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        return {
+            "mode": "dry_run",
+            "scanned": len(items),
+            "suspect_count": len(suspects),
+            "reasons": reasons,
+            "items": suspects,
+        }
+
+    async def quarantine_quality_suspects(self, *, limit: int = 5000) -> dict:
+        report = await self.quality_audit(limit=limit)
+        changed_ids: list[str] = []
+        failed: list[dict] = []
+        quarantined_at = time.time()
+        for item in list(report.get("items", []) or []):
+            memory_id = str(item.get("id") or "")
+            current = await self.store.get_canonical(memory_id, include_inactive=True)
+            if current is None or current.status != "active":
+                continue
+            metadata = dict(current.metadata or {})
+            metadata["quality_quarantine"] = {
+                "reason": str(item.get("reason") or "quality_audit"),
+                "quarantined_at": quarantined_at,
+                "previous_status": current.status,
+                "previous_visibility": current.visibility,
+            }
+            try:
+                changed = await self.store.update_memory(
+                    memory_id,
+                    status="review_pending",
+                    visibility="maintenance_only",
+                    metadata=metadata,
+                )
+                if changed:
+                    changed_ids.append(memory_id)
+            except Exception as exc:
+                failed.append({"id": memory_id, "error": str(exc)})
+        projection_deleted = 0
+        if changed_ids and self.index_projector:
+            projection_deleted = await self.index_projector.cleanup_deleted(changed_ids)
+        return {
+            **report,
+            "mode": "apply",
+            "changed": len(changed_ids),
+            "changed_ids": changed_ids,
+            "projection_deleted": int(projection_deleted or 0),
+            "failed": failed,
+        }
+
+    @staticmethod
+    def _normalize_quality_text(text: str) -> str:
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(text or "").lower())
 
 
 __all__ = ["MemoryMaintenanceService"]

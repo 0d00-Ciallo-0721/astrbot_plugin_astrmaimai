@@ -71,6 +71,60 @@ class MemoryV2ServiceTests(unittest.TestCase):
         maintenance = self.maintenance_mod.MemoryMaintenanceService(store)
         return store, retrieval, writer, injection, tools, maintenance
 
+    def test_v2_meta_round_trip_supports_persistent_watermarks(self):
+        async def run():
+            store, *_rest = self._services()
+            self.assertEqual(await store.get_meta("summary_watermark:test", "0"), "0")
+            await store.set_meta("summary_watermark:test", 42)
+            self.assertEqual(await store.get_meta("summary_watermark:test", "0"), "42")
+
+        asyncio.run(run())
+
+    def test_quality_audit_quarantines_legacy_question_facts_and_duplicate_feedback(self):
+        async def run():
+            store, _retrieval, _writer, _injection, _tools, maintenance = self._services()
+            bad_fact = await store.upsert(
+                self.contracts.MemoryWriteRequest(
+                    source="instant_gate",
+                    kind="fact",
+                    session_id="ff:GroupMessage:1",
+                    sender_id="ff:GroupMessage:1",
+                    content="你叫什么？",
+                    summary="你叫什么？",
+                    status="active",
+                    dedup_key="legacy:bad-question",
+                )
+            )
+            for index in range(2):
+                await store.upsert(
+                    self.contracts.MemoryWriteRequest(
+                        source="agency",
+                        kind="feedback",
+                        session_id="chat-1",
+                        content=f"[cognitive_feedback:agency]\nsummary: item {index}",
+                        summary=f"item {index}",
+                        status="active",
+                        dedup_key=f"legacy:feedback:{index}",
+                    )
+                )
+
+            preview = await maintenance.quality_audit()
+            self.assertEqual(preview["mode"], "dry_run")
+            self.assertEqual(preview["reasons"]["interrogative_fact"], 1)
+            self.assertEqual(preview["reasons"]["superseded_rolling_feedback"], 1)
+
+            applied = await maintenance.quarantine_quality_suspects()
+            self.assertEqual(applied["changed"], 2)
+            quarantined = await store.get_canonical(bad_fact.memory_id, include_inactive=True)
+            self.assertEqual(quarantined.status, "review_pending")
+            self.assertEqual(quarantined.visibility, "maintenance_only")
+            self.assertEqual(
+                quarantined.metadata["quality_quarantine"]["reason"],
+                "interrogative_fact",
+            )
+
+        asyncio.run(run())
+
     def test_write_service_allows_legal_braced_text(self):
         async def run():
             store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
@@ -864,6 +918,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
             turn = self.contracts.CommittedMemoryTurn(
                 turn_id="turn-1",
                 chat_id="chat-1",
+                sender_id="user-1",
                 user_text="我叫小明",
                 assistant_text="好的",
                 source="test",
@@ -1003,6 +1058,17 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertTrue(payload["fallback_used"])
             self.assertEqual(payload["decision_action"], "legacy_fallback")
             self.assertIn(":zlj:identity:", request.dedup_key)
+            self.assertEqual(request.status, "review_pending")
+            self.assertEqual(request.visibility, "maintenance_only")
+            self.assertFalse(request.metadata["authority_eav"])
+
+            memory_id = await writer.write(request)
+            self.assertTrue(memory_id)
+            stored = await store.get_canonical(memory_id, include_inactive=True)
+            self.assertEqual(stored.status, "review_pending")
+            self.assertEqual(stored.visibility, "maintenance_only")
+            recalled = await store.search("??", session_id="chat-1", top_k=5)
+            self.assertEqual(recalled, [])
 
             other_request, _ = await gate._build_split_write_request(
                 source="instant_gate",
@@ -1020,6 +1086,53 @@ class MemoryV2ServiceTests(unittest.TestCase):
                 category="identity",
             )
             self.assertNotEqual(request.dedup_key, other_request.dedup_key)
+
+        asyncio.run(run())
+
+    def test_write_admission_quarantines_interrogative_and_command_facts(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            for index, content in enumerate(("我是谁？", "帮我叫一下亚托莉"), start=1):
+                memory_id = await writer.write(
+                    self.contracts.MemoryWriteRequest(
+                        source="instant_gate",
+                        kind="fact",
+                        session_id="chat-1",
+                        sender_id="user-1",
+                        content=content,
+                        summary=content,
+                        metadata={"turn_id": f"turn-{index}"},
+                        dedup_key=f"admission:{index}",
+                    )
+                )
+                stored = await store.get_canonical(memory_id, include_inactive=True)
+                self.assertEqual(stored.status, "review_pending")
+                self.assertEqual(stored.visibility, "maintenance_only")
+                self.assertFalse(stored.metadata["admission"]["accepted"])
+
+            rows = await store.search("亚托莉", session_id="chat-1", top_k=5)
+            self.assertEqual(rows, [])
+
+        asyncio.run(run())
+
+    def test_write_admission_keeps_evidenced_statement_active(self):
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="instant_gate",
+                    kind="fact",
+                    session_id="chat-1",
+                    sender_id="user-1",
+                    content="我喜欢吃火锅",
+                    summary="喜欢吃火锅",
+                    metadata={"turn_id": "turn-food"},
+                    dedup_key="admission:food",
+                )
+            )
+            stored = await store.get_canonical(memory_id, include_inactive=True)
+            self.assertEqual(stored.status, "active")
+            self.assertTrue(stored.metadata["admission"]["accepted"])
 
         asyncio.run(run())
 
@@ -1063,13 +1176,12 @@ class MemoryV2ServiceTests(unittest.TestCase):
                 think_level=2,
             )
             result = await gate.run_llm_backfill(turn)
-            rows = await store.list_candidates(session_id="chat-1", kinds=["fact"], limit=10)
             self.assertEqual(gateway.calls, 1)
             self.assertTrue(result.hit)
-            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
-            self.assertEqual(len(llm_rows), 1)
-            self.assertEqual(llm_rows[0].summary, "用户想在周末去植物园散步")
-            self.assertTrue((llm_rows[0].metadata or {}).get("fact_scope"))
+            stored = await store.get_canonical(result.memory_id, include_inactive=True)
+            self.assertEqual(stored.source, "instant_gate_llm")
+            self.assertEqual(stored.status, "review_pending")
+            self.assertEqual(stored.visibility, "maintenance_only")
 
         asyncio.run(run())
 
@@ -1139,12 +1251,12 @@ class MemoryV2ServiceTests(unittest.TestCase):
                 source="test",
                 think_level=3,
             )
-            await high_gate.run_llm_backfill(first_turn)
+            first_result = await high_gate.run_llm_backfill(first_turn)
             self.assertFalse(high_gate.should_run_llm_backfill(second_turn, session_rounds=5, last_check=100.0, now=101.0))
-            rows = await store.list_candidates(session_id="chat-2", kinds=["fact"], limit=10)
             self.assertEqual(high_gateway.calls, 1)
-            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
-            self.assertEqual(len(llm_rows), 1)
+            stored = await store.get_canonical(first_result.memory_id, include_inactive=True)
+            self.assertEqual(stored.source, "instant_gate_llm")
+            self.assertEqual(stored.status, "review_pending")
 
         asyncio.run(run())
 
@@ -1192,9 +1304,9 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertTrue(result.hit)
             self.assertEqual(len(gateway.calls), 1)
             self.assertFalse(gateway.calls[0]["kwargs"].get("system_prompt"))
-            rows = await store.list_candidates(session_id="chat-legacy", kinds=["fact"], limit=10)
-            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
-            self.assertEqual(len(llm_rows), 1)
+            stored = await store.get_canonical(result.memory_id, include_inactive=True)
+            self.assertEqual(stored.source, "instant_gate_llm")
+            self.assertEqual(stored.status, "review_pending")
 
         asyncio.run(run())
 
@@ -1247,9 +1359,9 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
             self.assertTrue(result.hit)
             self.assertEqual(len(gateway.calls), 2)
-            rows = await store.list_candidates(session_id="chat-typeerror", kinds=["fact"], limit=10)
-            llm_rows = [item for item in rows if item.source == "instant_gate_llm"]
-            self.assertEqual(len(llm_rows), 1)
+            stored = await store.get_canonical(result.memory_id, include_inactive=True)
+            self.assertEqual(stored.source, "instant_gate_llm")
+            self.assertEqual(stored.status, "review_pending")
 
         asyncio.run(run())
 

@@ -68,18 +68,21 @@ class JargonEnricher:
         }
         enriched: list[dict[str, Any]] = []
         for index, item in enumerate(candidates, start=1):
+            if index not in by_index:
+                continue
             payload = dict(item)
-            extra = by_index.get(index, {})
+            extra = by_index[index]
             confidence = float(extra.get("confidence") or payload.get("activation_score") or 0.55)
             payload["meaning"] = str(extra.get("meaning") or payload.get("meaning") or "").strip()
             payload["scene"] = str(extra.get("scene") or "").strip()
             payload["confidence"] = max(0.0, min(confidence, 1.0))
-            payload["is_jargon"] = bool(extra.get("is_jargon", True))
+            payload["is_jargon"] = bool(extra.get("is_jargon", False))
             payload["aliases"] = [str(alias).strip() for alias in extra.get("aliases", []) if str(alias).strip()][:5]
             model_examples = [str(example).strip() for example in extra.get("examples", []) if str(example).strip()]
             payload["examples"] = list(dict.fromkeys([*payload.get("examples", []), *model_examples]))[:5]
             payload["review_status"] = self._normalize_review_status(extra.get("review_status") or "")
-            enriched.append(payload)
+            if payload["is_jargon"] and payload["meaning"]:
+                enriched.append(payload)
         return enriched
 
 

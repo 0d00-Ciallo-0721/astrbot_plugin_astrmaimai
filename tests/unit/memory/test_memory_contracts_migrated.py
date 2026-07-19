@@ -109,6 +109,7 @@ class MemoryContractMigratedTests(unittest.TestCase):
         self.assertEqual(captured["session_id"], "chat-1")
         self.assertEqual(len(captured["messages"]), 2)
         self.assertEqual(captured["messages"][0]["sender"], "Alice")
+        self.assertEqual(captured["messages"][0]["sender_id"], "user-1")
         self.assertEqual(captured["messages"][1]["content"], "world")
         self.assertFalse(asyncio.iscoroutine(captured["messages"]))
 
@@ -134,6 +135,68 @@ class MemoryContractMigratedTests(unittest.TestCase):
 
         self.assertEqual(recorded["session_id"], "chat-1")
         self.assertEqual(recorded["messages"], messages)
+
+    def test_group_summary_uses_stable_identity_without_claiming_session_as_sender(self):
+        requests = []
+
+        async def _write(request):
+            requests.append(request)
+            return "memory-1"
+
+        gateway = SimpleNamespace(
+            config=SimpleNamespace(memory=SimpleNamespace(cleanup_interval=60, summary_threshold=2)),
+            context=SimpleNamespace(),
+        )
+        engine = SimpleNamespace(write_service=SimpleNamespace(write=_write))
+        summarizer = self.summarizer_mod.SessionMemorySummarizer(SimpleNamespace(), gateway, engine)
+        summarizer.topic_summarizer = SimpleNamespace(
+            process_history=lambda **_kwargs: asyncio.sleep(0, result=[])
+        )
+        summarizer.processor = SimpleNamespace(
+            process_conversation=lambda *_args, **_kwargs: asyncio.sleep(
+                0,
+                result={
+                    "summary": "Alice discussed a deployment plan",
+                    "key_facts": ["Alice discussed a deployment plan"],
+                    "topics": ["deployment"],
+                    "sentiment": "neutral",
+                    "importance": 0.7,
+                },
+            )
+        )
+        summarizer.claim_extractor = SimpleNamespace(
+            extract=lambda **_kwargs: asyncio.sleep(0, result=[])
+        )
+        messages = [
+            {
+                "message_id": 11,
+                "sender_id": "user-1",
+                "sender": "Alice",
+                "content": "deployment plan",
+                "timestamp": 100.0,
+            }
+        ]
+
+        asyncio.run(
+            summarizer.summarize_session(
+                "ff:GroupMessage:123",
+                "[00:00] Alice: deployment plan",
+                messages=messages,
+            )
+        )
+        asyncio.run(
+            summarizer.summarize_session(
+                "ff:GroupMessage:123",
+                "[00:00] Alice: deployment plan",
+                messages=messages,
+            )
+        )
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].dedup_key, requests[1].dedup_key)
+        self.assertEqual(requests[0].sender_id, "")
+        self.assertEqual(requests[0].kind, "memory")
+        self.assertEqual(requests[0].metadata["evidence_message_ids"], [11])
 
     def test_compat_summarizer_module_still_reexports_chat_history_summarizer(self):
         sys.modules.pop("astrmai.memory.services.summarizer", None)

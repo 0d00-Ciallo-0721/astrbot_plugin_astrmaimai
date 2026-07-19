@@ -292,6 +292,97 @@ class MemoryUiService:
             "runtime_bound": False,
         }
 
+    async def update_canonical(self, memory_id: str, data: dict) -> dict:
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+        if not store or not hasattr(store, "update_memory"):
+            return {"status": "error", "changed": False, "runtime_bound": False, "message": "canonical runtime unavailable"}
+        current = await store.get_canonical(memory_id, include_inactive=True)
+        if current is None:
+            return {"status": "not_found", "changed": False, "runtime_bound": True}
+
+        payload = dict(data or {})
+        updates = {}
+        for key in ("content", "summary", "status", "visibility"):
+            if key in payload:
+                updates[key] = str(payload.get(key) or "").strip()
+        if "status" in updates and updates["status"] not in {"active", "review_pending", "rejected", "stale"}:
+            return {"status": "error", "changed": False, "runtime_bound": True, "message": "invalid status"}
+        if "visibility" in updates and updates["visibility"] not in {
+            "auto_and_tool",
+            "tool_only",
+            "maintenance_only",
+        }:
+            return {"status": "error", "changed": False, "runtime_bound": True, "message": "invalid visibility"}
+        for key in ("importance", "confidence"):
+            if key in payload:
+                try:
+                    updates[key] = min(max(float(payload.get(key)), 0.0), 1.0)
+                except (TypeError, ValueError):
+                    return {"status": "error", "changed": False, "runtime_bound": True, "message": f"invalid {key}"}
+        if "tags" in payload:
+            raw_tags = payload.get("tags")
+            updates["tags"] = (
+                [str(item).strip() for item in raw_tags if str(item).strip()]
+                if isinstance(raw_tags, list)
+                else [item.strip() for item in str(raw_tags or "").split(",") if item.strip()]
+            )
+        if not updates:
+            return {"status": "ok", "changed": False, "runtime_bound": True}
+
+        metadata = self._append_manual_revision(
+            dict(current.metadata or {}),
+            action="canonical_update",
+            changes=updates,
+        )
+        updates["metadata"] = metadata
+        changed = await store.update_memory(memory_id, **updates)
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+        projected = False
+        if changed and projector:
+            if updates.get("status", current.status) == "active" and updates.get("visibility", current.visibility) in {"auto_and_tool", "tool_only"}:
+                projected = bool(await projector.project(memory_id))
+            else:
+                await projector.cleanup_deleted([memory_id])
+                projected = True
+        return {
+            "status": "ok",
+            "changed": bool(changed),
+            "projected": projected,
+            "runtime_bound": True,
+        }
+
+    async def quality_overview(self) -> dict:
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+        if not store or not hasattr(store, "list_canonical"):
+            return {"status": "ok", "runtime_bound": False, "counts": {}, "index": {}}
+        counts = {}
+        for status in ("active", "review_pending", "rejected", "stale", "deleted", "merged"):
+            result = await store.list_canonical(status=status, limit=1, offset=0, include_inactive=True)
+            counts[status] = int(result.get("total", 0) or 0)
+        index_result = await self.index_status()
+        return {
+            "status": "ok",
+            "runtime_bound": True,
+            "counts": counts,
+            "index": dict(index_result.get("data") or {}),
+        }
+
+    async def quality_audit(self, *, limit: int = 5000) -> dict:
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+        if not maintenance or not hasattr(maintenance, "quality_audit"):
+            return {"status": "error", "runtime_bound": False, "message": "quality audit unavailable"}
+        return {"status": "ok", "runtime_bound": True, "data": await maintenance.quality_audit(limit=limit)}
+
+    async def quarantine_quality_suspects(self, *, limit: int = 5000) -> dict:
+        maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
+        if not maintenance or not hasattr(maintenance, "quarantine_quality_suspects"):
+            return {"status": "error", "runtime_bound": False, "message": "quality quarantine unavailable"}
+        return {
+            "status": "ok",
+            "runtime_bound": True,
+            "data": await maintenance.quarantine_quality_suspects(limit=limit),
+        }
+
     async def delete_canonical(self, memory_id: str) -> dict:
         engine = self._memory_engine()
         maintenance = self.plugin_api.get_maintenance_service() if self.plugin_api else None
@@ -441,6 +532,9 @@ class MemoryUiService:
                 "confidence",
                 "importance",
                 "status",
+                "summary",
+                "visibility",
+                "tags",
                 "group_id",
             }
         }

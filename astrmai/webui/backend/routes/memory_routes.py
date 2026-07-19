@@ -37,6 +37,26 @@ async def get_canonical(memory_id: str, user: str = Depends(get_current_user)):
     return await _service().get_canonical(memory_id)
 
 
+@router.post("/canonical/{memory_id}")
+async def update_canonical(memory_id: str, data: Dict[str, Any], user: str = Depends(get_current_user)):
+    return await _service().update_canonical(memory_id, data)
+
+
+@router.get("/quality/overview")
+async def quality_overview(user: str = Depends(get_current_user)):
+    return await _service().quality_overview()
+
+
+@router.post("/quality/audit")
+async def quality_audit(data: Dict[str, Any] | None = None, user: str = Depends(get_current_user)):
+    return await _service().quality_audit(limit=int((data or {}).get("limit") or 5000))
+
+
+@router.post("/quality/quarantine")
+async def quarantine_quality_suspects(data: Dict[str, Any] | None = None, user: str = Depends(get_current_user)):
+    return await _service().quarantine_quality_suspects(limit=int((data or {}).get("limit") or 5000))
+
+
 @router.delete("/canonical/{memory_id}")
 async def delete_canonical(memory_id: str, user: str = Depends(get_current_user)):
     return await _service().delete_canonical(memory_id)

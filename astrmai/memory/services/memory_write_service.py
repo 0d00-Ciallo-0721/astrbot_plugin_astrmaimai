@@ -7,6 +7,7 @@ import re
 from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryWriteRequest
+from .memory_admission_service import MemoryAdmissionService
 from .v2_store import MemoryV2Store
 
 
@@ -26,9 +27,11 @@ class MemoryWriteService:
         self.store = store
         self.index_projector = index_projector
         self.config = config
+        self.admission_service = MemoryAdmissionService(config)
 
     def refresh_config(self, config) -> None:
         self.config = config
+        self.admission_service.refresh_config(config)
 
     def _minimum_confidence(self) -> float:
         memory_config = getattr(self.config, "memory", None)
@@ -78,12 +81,20 @@ class MemoryWriteService:
                 f"| session_id={str(request.session_id or '')} | content_preview={preview}"
             )
             return ""
+        admission = self.admission_service.evaluate(request)
+        metadata = dict(request.metadata or {})
+        metadata["admission"] = {
+            "accepted": admission.accepted,
+            "reason": admission.reason,
+            "original_status": str(request.status or "active"),
+        }
         try:
             confidence = float(request.confidence if request.confidence is not None else 0.8)
         except (TypeError, ValueError):
             confidence = 0.0
+        confidence = admission.confidence
         minimum_confidence = self._minimum_confidence()
-        if minimum_confidence > 0.0 and confidence < minimum_confidence:
+        if admission.status == "active" and minimum_confidence > 0.0 and confidence < minimum_confidence:
             logger.info(
                 f"[MemoryWriteService] skip write | reason=confidence_below_threshold "
                 f"| confidence={confidence:.3f} | minimum={minimum_confidence:.3f} "
@@ -107,11 +118,11 @@ class MemoryWriteService:
             tags=list(request.tags or []),
             importance=float(request.importance or 0.5),
             confidence=confidence,
-            metadata=dict(request.metadata or {}),
+            metadata=metadata,
             dedup_key=dedup_key,
             source_ref=str(request.source_ref or ""),
-            visibility=request.visibility if request.visibility in {"auto_and_tool", "tool_only", "maintenance_only"} else "auto_and_tool",
-            status=str(request.status or "active").strip() or "active",
+            visibility=admission.visibility,
+            status=admission.status,
             created_at=float(request.created_at or 0.0),
         )
         upsert_result = await self.store.upsert(normalized)

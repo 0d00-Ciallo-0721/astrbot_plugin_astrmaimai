@@ -69,8 +69,10 @@ class ExpressionPatternEnricher:
         }
         enriched: list[dict[str, Any]] = []
         for index, item in enumerate(candidates, start=1):
+            if index not in by_index:
+                continue
             payload = dict(item)
-            extra = by_index.get(index, {})
+            extra = by_index[index]
             confidence = float(extra.get("confidence") or payload.get("activation_score") or 0.6)
             payload["expression"] = str(extra.get("expression") or payload.get("expression") or "").strip()
             payload["summary"] = str(extra.get("summary") or payload.get("expression") or "").strip()
@@ -81,7 +83,8 @@ class ExpressionPatternEnricher:
             payload["review_reason"] = str(extra.get("review_reason") or "").strip()
             model_samples = [str(sample).strip() for sample in extra.get("content_samples", []) if str(sample).strip()]
             payload["content_samples"] = list(dict.fromkeys([*(payload.get("content_samples") or []), *model_samples]))[:6]
-            enriched.append(payload)
+            if payload["expression"] and payload["summary"]:
+                enriched.append(payload)
         return enriched
 
 

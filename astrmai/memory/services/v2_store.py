@@ -551,7 +551,7 @@ class MemoryV2Store:
                 if dedup_key and not authority_eav:
                     cursor = await db.execute(
                         """
-                        SELECT id, content, summary, access_count
+                        SELECT id, content, summary, access_count, status
                         FROM canonical_memories
                         WHERE dedup_key = ? AND status IN ('active', 'stale', 'review_pending')
                         LIMIT 1
@@ -561,6 +561,12 @@ class MemoryV2Store:
                     row = await cursor.fetchone()
                     if row:
                         memory_id = str(row[0])
+                        if str(row[4] or "") == ACTIVE_STATUS and status == REVIEW_PENDING_STATUS:
+                            return MemoryUpsertResult(
+                                memory_id=memory_id,
+                                superseded_old_ids=[],
+                                new_record_is_superseded=False,
+                            )
                         merged_content = str(request.content or row[1] or "")
                         merged_summary = str(summary or row[2] or "")[:500]
                         await db.execute(
@@ -1015,6 +1021,12 @@ class MemoryV2Store:
 
         where = ["status IN (" + ",".join("?" for _ in statuses) + ")"]
         params: list[Any] = list(statuses)
+        where.append(
+            "(json_extract(metadata, '$.valid_until') IS NULL "
+            "OR CAST(json_extract(metadata, '$.valid_until') AS REAL) <= 0 "
+            "OR CAST(json_extract(metadata, '$.valid_until') AS REAL) >= ?)"
+        )
+        params.append(self._now())
         where.append("visibility IN (" + ",".join("?" for _ in allowed_visibility) + ")")
         params.extend(sorted(allowed_visibility))
         if session_id == "__self_lore__":
@@ -1854,6 +1866,31 @@ class MemoryV2Store:
             "legacy_counts": legacy_counts,
             "persona_cache_exists": (self.data_path / "persona_cache.json").exists(),
         }
+
+    async def get_meta(self, key: str, default: str = "") -> str:
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            return str(default or "")
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT value FROM memory_v2_meta WHERE key = ? LIMIT 1",
+                (clean_key,),
+            )
+            row = await cursor.fetchone()
+        return str(row[0]) if row and row[0] is not None else str(default or "")
+
+    async def set_meta(self, key: str, value: Any) -> None:
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            raise ValueError("memory meta key must not be empty")
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO memory_v2_meta(key, value) VALUES (?, ?)",
+                (clean_key, str(value if value is not None else "")),
+            )
+            await db.commit()
 
     async def import_legacy_documents(self, *, limit: int = 1000) -> int:
         version = "2_legacy_documents_import"

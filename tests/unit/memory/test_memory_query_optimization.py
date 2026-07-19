@@ -474,6 +474,116 @@ class MemoryQueryOptimizationTests(unittest.TestCase):
 
         self.assertEqual(len(result), 3)
 
+    def test_rrf_fusion_is_opt_in_and_rewards_multi_source_rank(self):
+        from astrmai.memory.contracts.memory_query import MemoryCandidate, MemoryQuery
+        from astrmai.memory.services.memory_retrieval_service import MemoryRetrievalService
+
+        canonical = [
+            MemoryCandidate(
+                id="canonical-only",
+                kind="fact",
+                source="canonical",
+                summary="仅由全文索引命中",
+                content="仅由全文索引命中",
+                relevance_score=0.95,
+                metadata={"matched_by": ["canonical_fts"]},
+            ),
+            MemoryCandidate(
+                id="multi-source",
+                kind="fact",
+                source="canonical",
+                summary="多路共同命中",
+                content="多路共同命中",
+                relevance_score=0.5,
+                metadata={"matched_by": ["canonical_fts"]},
+            ),
+        ]
+        hybrid = [
+            MemoryCandidate(
+                id="multi-source",
+                kind="fact",
+                source="hybrid",
+                summary="多路共同命中",
+                content="多路共同命中",
+                relevance_score=0.7,
+                metadata={"matched_by": ["faiss"]},
+            )
+        ]
+        service = MemoryRetrievalService(_Store())
+
+        legacy = service._fuse_candidates(
+            canonical,
+            hybrid,
+            MemoryQuery(query="共同命中", top_k=2, metadata={}),
+        )
+        rrf = service._fuse_candidates(
+            canonical,
+            hybrid,
+            MemoryQuery(
+                query="共同命中",
+                top_k=2,
+                metadata={"memory_rrf_fusion_enabled": True},
+            ),
+        )
+
+        self.assertEqual(legacy[0].metadata["_fusion_mode"], "weighted")
+        self.assertNotIn("_rrf_score", legacy[0].metadata)
+        self.assertEqual(rrf[0].id, "multi-source")
+        self.assertEqual(rrf[0].metadata["_fusion_mode"], "rrf")
+        self.assertEqual(set(rrf[0].metadata["matched_by"]), {"canonical_fts", "faiss"})
+        self.assertIn("rrf", rrf[0].metadata["_score_breakdown"])
+
+    def test_mmr_is_opt_in_and_promotes_a_diverse_candidate(self):
+        from astrmai.memory.contracts.memory_query import MemoryCandidate, MemoryQuery
+        from astrmai.memory.services.memory_retrieval_service import MemoryRetrievalService
+
+        candidates = [
+            MemoryCandidate(
+                id="hotpot-primary",
+                kind="preference",
+                source="canonical",
+                summary="用户喜欢火锅和麻辣锅",
+                content="用户喜欢火锅和麻辣锅",
+                relevance_score=0.95,
+            ),
+            MemoryCandidate(
+                id="hotpot-repeat",
+                kind="preference",
+                source="canonical",
+                summary="用户常吃麻辣火锅也偏爱火锅",
+                content="用户常吃麻辣火锅也偏爱火锅",
+                relevance_score=0.9,
+            ),
+            MemoryCandidate(
+                id="mango",
+                kind="preference",
+                source="canonical",
+                summary="用户也喜欢芒果甜品",
+                content="用户也喜欢芒果甜品",
+                relevance_score=0.89,
+            ),
+        ]
+        service = MemoryRetrievalService(_Store())
+
+        legacy = service._finalize_candidates(
+            MemoryQuery(query="我喜欢吃什么", top_k=3, metadata={}),
+            candidates,
+        )
+        diversified = service._finalize_candidates(
+            MemoryQuery(
+                query="我喜欢吃什么",
+                top_k=3,
+                metadata={"memory_mmr_enabled": True},
+            ),
+            candidates,
+        )
+
+        self.assertEqual([item.id for item in legacy[:2]], ["hotpot-primary", "hotpot-repeat"])
+        self.assertEqual(diversified[0].id, "hotpot-primary")
+        self.assertEqual(diversified[1].id, "mango")
+        self.assertIn("_mmr_score", diversified[1].metadata)
+        self.assertNotIn("_mmr_score", candidates[2].metadata)
+
     def test_summary_trace_omits_query_and_memory_content(self):
         from astrmai.memory.contracts.memory_query import MemoryCandidate, MemoryQuery
         from astrmai.memory.services.memory_retrieval_service import MemoryRetrievalService
@@ -680,6 +790,8 @@ class MemoryQueryOptimizationTests(unittest.TestCase):
                 "memory_query_builder_enabled": False,
                 "intent_rerank_enabled": True,
                 "adaptive_top_k_enabled": True,
+                "memory_rrf_fusion_enabled": True,
+                "memory_mmr_enabled": True,
             }
         )
 
@@ -688,6 +800,8 @@ class MemoryQueryOptimizationTests(unittest.TestCase):
         self.assertFalse(flags.query_builder)
         self.assertTrue(flags.intent_rerank)
         self.assertTrue(flags.adaptive_top_k)
+        self.assertTrue(flags.rrf_fusion)
+        self.assertTrue(flags.mmr)
 
     def test_flags_can_be_read_from_real_config_model(self):
         from config import AstrMaiConfig
@@ -698,6 +812,8 @@ class MemoryQueryOptimizationTests(unittest.TestCase):
                 "memory_query_builder_enabled": False,
                 "intent_rerank_enabled": True,
                 "adaptive_top_k_enabled": True,
+                "memory_rrf_fusion_enabled": True,
+                "memory_mmr_enabled": True,
                 "memory_retrieval_debug_trace_enabled": True,
             }
         )
@@ -707,6 +823,8 @@ class MemoryQueryOptimizationTests(unittest.TestCase):
         self.assertFalse(flags.query_builder)
         self.assertTrue(flags.intent_rerank)
         self.assertTrue(flags.adaptive_top_k)
+        self.assertTrue(flags.rrf_fusion)
+        self.assertTrue(flags.mmr)
         self.assertTrue(flags.debug_trace)
 
 

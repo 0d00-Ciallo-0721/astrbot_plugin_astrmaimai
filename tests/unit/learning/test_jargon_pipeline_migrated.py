@@ -65,7 +65,7 @@ class JargonPipelineMigratedTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_enricher_degrades_gracefully_when_llm_fails(self):
+    def test_enricher_fails_closed_when_llm_fails(self):
         async def run():
             gateway = _Gateway(error=RuntimeError("llm offline"))
             enricher = self.enricher_mod.JargonEnricher(gateway)
@@ -81,10 +81,7 @@ class JargonPipelineMigratedTests(unittest.TestCase):
                     }
                 ],
             )
-            self.assertEqual(len(enriched), 1)
-            self.assertEqual(enriched[0]["content"], "bigbird")
-            self.assertEqual(enriched[0]["meaning"], "")
-            self.assertGreaterEqual(enriched[0]["confidence"], 0.7)
+            self.assertEqual(enriched, [])
 
         asyncio.run(run())
 

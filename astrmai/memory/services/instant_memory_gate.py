@@ -202,7 +202,7 @@ class InstantMemoryGate:
             content=str(extracted_fact or raw_text or ""),
             summary=str(extracted_fact or raw_text or "")[:240],
             importance=0.85 if source == "instant_gate" else 0.8,
-            confidence=0.9 if source == "instant_gate" else 0.72,
+            confidence=0.45,
             metadata={
                 "source": f"{source}_legacy_fallback",
                 "fact_scope": "medium_term",
@@ -210,10 +210,13 @@ class InstantMemoryGate:
                 "turn_id": str(turn.turn_id or ""),
                 "gate_category": category,
                 "instant_write": True,
-                "authority_eav": True,
+                "authority_eav": False,
+                "admission_reason": "claim_extraction_fallback",
             },
             dedup_key=f"{fallback_prefix}:{subject_id}:{category}:{str(extracted_fact or raw_text or '')[:60]}",
             created_at=float(turn.committed_at or 0.0),
+            visibility="maintenance_only",
+            status="review_pending",
         )
         return request, {
             "claim_count": len(claims or []),

@@ -1,5 +1,5 @@
 const API_PREFIX = "admin";
-const ADMIN_BUILD_VERSION = "2026.07.18-r4";
+const ADMIN_BUILD_VERSION = "2026.07.19-r5";
 const SCHEDULER_POLL_INTERVAL_MS = 45000;
 const DASHBOARD_CACHE_TTL_MS = 180000;
 const DATA_CACHE_TTL_MS = 180000;
@@ -73,6 +73,9 @@ const state = {
       month: new Date().toISOString().slice(0, 7),
       canonical: { items: [], total: 0, limit: MEMORY_PAGE_SIZE, offset: 0 },
       canonicalKind: "",
+      canonicalStatus: "active",
+      qualityOverview: { counts: {}, index: {} },
+      qualityAudit: null,
       events: [],
       reflections: [],
       nodes: [],
@@ -583,6 +586,61 @@ function findMemoryItem(tab, id) {
   const source = state.cache.memories[tab];
   const items = Array.isArray(source) ? source : (source?.items || []);
   return items.find((item) => String(item.id || item.date || item.term || "") === String(id)) || null;
+}
+
+function openCanonicalMemoryEditor(item) {
+  openFormModal(
+    "修正长期记忆",
+    [
+      { name: "content", label: "完整内容", type: "textarea", rows: 8 },
+      { name: "summary", label: "摘要", type: "textarea", rows: 4 },
+      {
+        name: "status",
+        label: "状态",
+        type: "select",
+        options: [
+          { value: "active", label: "启用" },
+          { value: "review_pending", label: "待审核隔离" },
+          { value: "rejected", label: "已驳回" },
+          { value: "stale", label: "已过期" },
+        ],
+      },
+      {
+        name: "visibility",
+        label: "召回范围",
+        type: "select",
+        options: [
+          { value: "auto_and_tool", label: "自动召回与工具均可用" },
+          { value: "tool_only", label: "仅工具查询" },
+          { value: "maintenance_only", label: "仅维护与审核可见" },
+        ],
+      },
+      { name: "confidence", label: "置信度（0-1）", type: "number", cast: "float" },
+      { name: "importance", label: "重要度（0-1）", type: "number", cast: "float" },
+      { name: "tags", label: "标签（逗号分隔）" },
+    ],
+    {
+      content: item.content || "",
+      summary: item.summary || "",
+      status: item.status || "active",
+      visibility: item.visibility || "auto_and_tool",
+      confidence: item.confidence ?? 0.5,
+      importance: item.importance ?? 0.5,
+      tags: Array.isArray(item.tags) ? item.tags.join(",") : "",
+    },
+    async (data) => {
+      const result = await api.post(`/memories/canonical/${segment(item.id)}`, data);
+      if (result?.changed && result?.projected) {
+        toast("长期记忆已修正并同步索引");
+      } else if (result?.changed) {
+        toast("长期记忆已修正；索引将在维护任务中补齐");
+      } else {
+        toast("长期记忆没有变化");
+      }
+      clearDataCache("memories:");
+      await loadMemories();
+    },
+  );
 }
 
 function jargonPayload(data) {
@@ -1599,8 +1657,13 @@ async function loadMemories() {
   if (state.memoryTab === "canonical") {
     const target = state.cache.memories.canonical;
     const kindParam = state.cache.memories.canonicalKind ? `&kind=${segment(state.cache.memories.canonicalKind)}` : "";
-    const result = await cachedFetch(`${tabKey}:${target.offset}:${state.cache.memories.canonicalKind}`, () => api.get(`/memories/canonical?limit=${target.limit}&offset=${target.offset}${kindParam}`), target);
+    const statusParam = state.cache.memories.canonicalStatus ? `&status=${segment(state.cache.memories.canonicalStatus)}` : "";
+    const [result, qualityOverview] = await Promise.all([
+      cachedFetch(`${tabKey}:${target.offset}:${state.cache.memories.canonicalKind}:${state.cache.memories.canonicalStatus}`, () => api.get(`/memories/canonical?limit=${target.limit}&offset=${target.offset}${kindParam}${statusParam}`), target),
+      cachedFetch("memories:quality:overview", () => api.get("/memories/quality/overview"), state.cache.memories.qualityOverview),
+    ]);
     state.cache.memories.canonical = { items: asItems(result), total: Number(result.total ?? asItems(result).length), limit: target.limit, offset: target.offset };
+    state.cache.memories.qualityOverview = qualityOverview || { counts: {}, index: {} };
   } else if (state.memoryTab === "jargon") {
     const target = state.cache.memories.jargon;
     const result = await cachedFetch(`${tabKey}:${target.offset}`, () => api.get(`/memories/jargon?limit=${target.limit}&offset=${target.offset}`), target);
@@ -1625,7 +1688,9 @@ async function loadMemories() {
     const contentText = item.content || item.summary || item.narrative || item.reflection || item.meaning || "-";
     const actions = state.memoryTab === "jargon"
       ? `<button class="ghost-button" data-memory-jargon-edit="${attr(id)}" type="button">编辑</button><button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button>`
-      : `<button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button>`;
+      : state.memoryTab === "canonical"
+        ? `<button class="ghost-button" data-memory-canonical-edit="${attr(id)}" type="button">修正</button>${item.status !== "active" ? `<button class="ghost-button" data-memory-restore="${attr(id)}" type="button">恢复启用</button>` : `<button class="ghost-button" data-memory-stale="${attr(id)}" type="button">标记过期</button>`}<button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button>`
+        : `<button class="danger-button" data-memory-delete="${attr(id)}" type="button">删除</button>`;
     return `
       <tr>
         <td>${escapeHtml(id)}</td>
@@ -1646,8 +1711,18 @@ async function loadMemories() {
     ["jargon", "黑话"],
     ["persona_lore", "角色原典"],
   ].map(([value, label]) => `<option value="${attr(value)}" ${state.cache.memories.canonicalKind === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
+  const statusOptions = [
+    ["active", "启用中"],
+    ["review_pending", "待审核隔离"],
+    ["rejected", "已驳回"],
+    ["stale", "已过期"],
+    ["deleted", "已删除"],
+    ["merged", "已合并"],
+    ["", "全部状态"],
+  ].map(([value, label]) => `<option value="${attr(value)}" ${state.cache.memories.canonicalStatus === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
   const canonicalPager = state.memoryTab === "canonical" ? `
     <div class="row-actions">
+      <label class="inline-label">状态 <select data-memory-status>${statusOptions}</select></label>
       <label class="inline-label">类型 <select data-memory-kind>${kindOptions}</select></label>
       <button class="ghost-button" data-memory-page="${state.cache.memories.canonical.offset - state.cache.memories.canonical.limit}" type="button" ${state.cache.memories.canonical.offset <= 0 ? "disabled" : ""}>上一页</button>
       <span>第 ${Math.floor(state.cache.memories.canonical.offset / state.cache.memories.canonical.limit) + 1} / ${Math.max(1, Math.ceil(state.cache.memories.canonical.total / state.cache.memories.canonical.limit))} 页，共 ${state.cache.memories.canonical.total} 条</span>
@@ -1665,6 +1740,25 @@ async function loadMemories() {
   const emptyText = state.memoryTab === "canonical"
     ? "Canonical v2 当前筛选无数据。可切换类型为“全部类型”查看完整长期记忆。"
     : "当前旧分类暂无数据；长期记忆主体请查看“Canonical 总览”。";
+  const quality = state.cache.memories.qualityOverview || { counts: {}, index: {} };
+  const qualityCounts = quality.counts || {};
+  const indexInfo = quality.index || {};
+  const indexIssueCount = ["missing_projection_ids", "orphan_projection_ids", "inactive_projection_ids", "duplicate_projection_ids"]
+    .reduce((total, key) => total + (Array.isArray(indexInfo[key]) ? indexInfo[key].length : 0), 0);
+  const audit = state.cache.memories.qualityAudit;
+  const auditReasons = audit?.reasons || {};
+  const qualityPanel = state.memoryTab === "canonical" ? section(
+    "长期记忆质量控制",
+    "先执行只读审计确认影响范围，再将疑似污染项移入待审核隔离区；任何操作都不会物理删除长期记忆。",
+    `<div class="grid">
+      ${metric("启用中", qualityCounts.active || 0)}
+      ${metric("待审核隔离", qualityCounts.review_pending || 0)}
+      ${metric("已驳回", qualityCounts.rejected || 0)}
+      ${metric("索引异常", indexIssueCount, "缺失、孤立、失效或重复投影")}
+    </div>
+    ${audit ? `<div class="notice ${Number(audit.suspect_count || 0) ? "warning" : "ok"}">最近审计：扫描 ${Number(audit.scanned || 0)} 条，发现 ${Number(audit.suspect_count || 0)} 条疑似污染。${Object.entries(auditReasons).map(([reason, count]) => `${escapeHtml(reason)} ${Number(count)}`).join(" · ")}</div>` : ""}`,
+    `<button class="ghost-button" data-memory-quality-audit type="button">只读质量审计</button><button class="danger-button" data-memory-quality-quarantine type="button">隔离审计命中项</button><button class="ghost-button" data-memory-index-rebuild type="button">重建召回索引</button>`,
+  ) : "";
   content().innerHTML = `
     ${pageHeader("记忆网络 Memories", "以 Canonical v2 长期记忆为主视图；旧事件、反思和实体图谱保留为辅助诊断。")}
     ${totals}
@@ -1675,6 +1769,7 @@ async function loadMemories() {
       { id: "reflections", label: "每日反思 Reflections" },
       { id: "nodes", label: "实体图谱 Nodes（旧实体图谱）" },
     ], "memory-tab")}
+    ${qualityPanel}
     ${section("记忆数据", state.memoryTab === "canonical" ? "当前展示 canonical_memories v2 数据。" : "当前展示旧版或专题数据。", `${canonicalPager}${table(["ID", "类型/状态", "内容", "会话", "权重", "操作"], rows, emptyText)}`)}
   `;
   $$('[data-memory-tab]').forEach((button) => button.addEventListener("click", () => {
@@ -1684,6 +1779,11 @@ async function loadMemories() {
   }));
   $('[data-memory-kind]')?.addEventListener("change", (event) => {
     state.cache.memories.canonicalKind = event.target.value;
+    state.cache.memories.canonical.offset = 0;
+    loadMemories();
+  });
+  $('[data-memory-status]')?.addEventListener("change", (event) => {
+    state.cache.memories.canonicalStatus = event.target.value;
     state.cache.memories.canonical.offset = 0;
     loadMemories();
   });
@@ -1703,6 +1803,46 @@ async function loadMemories() {
     if (!item) return toast("未找到黑话记录");
     openJargonCalibration(item, "save");
   }));
+  $$('[data-memory-canonical-edit]').forEach((button) => button.addEventListener("click", () => {
+    const item = findMemoryItem("canonical", button.dataset.memoryCanonicalEdit);
+    if (!item) return toast("未找到长期记忆");
+    openCanonicalMemoryEditor(item);
+  }));
+  $$('[data-memory-restore]').forEach((button) => button.addEventListener("click", async () => {
+    await api.post(`/memories/canonical/${segment(button.dataset.memoryRestore)}/restore`);
+    toast("记忆已恢复启用");
+    clearDataCache("memories:");
+    loadMemories();
+  }));
+  $$('[data-memory-stale]').forEach((button) => button.addEventListener("click", async () => {
+    await api.post(`/memories/canonical/${segment(button.dataset.memoryStale)}/stale`);
+    toast("记忆已标记过期");
+    clearDataCache("memories:");
+    loadMemories();
+  }));
+  $('[data-memory-quality-audit]')?.addEventListener("click", async () => {
+    const result = await api.post("/memories/quality/audit", { limit: 5000 });
+    state.cache.memories.qualityAudit = result || {};
+    toast(`质量审计完成：发现 ${Number(state.cache.memories.qualityAudit.suspect_count || 0)} 条`);
+    clearDataCache("memories:canonical");
+    loadMemories();
+  });
+  $('[data-memory-quality-quarantine]')?.addEventListener("click", async () => {
+    if (!await confirmAction("将本次质量审计命中的活动记忆移入待审核隔离区？不会物理删除。", "danger")) return;
+    const result = await api.post("/memories/quality/quarantine", { limit: 5000 });
+    const report = result || {};
+    state.cache.memories.qualityAudit = report;
+    toast(`已隔离 ${Number(report.changed || 0)} 条，索引清理 ${Number(report.projection_deleted || 0)} 条`);
+    clearDataCache("memories:");
+    loadMemories();
+  });
+  $('[data-memory-index-rebuild]')?.addEventListener("click", async () => {
+    if (!await confirmAction("重建全部长期记忆召回索引？期间聊天会自动降级到 Canonical 检索。")) return;
+    const result = await api.post("/memories/index/rebuild", {});
+    toast(`索引重建完成：${Number(result.rebuilt || 0)} 条`);
+    clearDataCache("memories:");
+    loadMemories();
+  });
   $$('[data-memory-delete]').forEach((button) => button.addEventListener("click", async () => {
     const id = button.dataset.memoryDelete;
     if (!id || !await confirmAction("删除这条记忆记录？", "danger")) return;

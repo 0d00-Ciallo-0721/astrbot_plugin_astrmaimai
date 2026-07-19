@@ -61,6 +61,8 @@ class MemoryRetrievalFlags:
     query_builder: bool = True
     intent_rerank: bool = False
     adaptive_top_k: bool = False
+    rrf_fusion: bool = False
+    mmr: bool = False
     debug_trace: bool = False
 
     @classmethod
@@ -69,6 +71,8 @@ class MemoryRetrievalFlags:
             query_builder=read_memory_feature_flag(config, event, "memory_query_builder_enabled", True),
             intent_rerank=read_memory_feature_flag(config, event, "intent_rerank_enabled", False),
             adaptive_top_k=read_memory_feature_flag(config, event, "adaptive_top_k_enabled", False),
+            rrf_fusion=read_memory_feature_flag(config, event, "memory_rrf_fusion_enabled", False),
+            mmr=read_memory_feature_flag(config, event, "memory_mmr_enabled", False),
             debug_trace=read_memory_feature_flag(config, event, "memory_retrieval_debug_trace_enabled", False),
         )
 
@@ -243,6 +247,8 @@ class QueryTraceBuilder:
             "query_builder_enabled": bool(flags.query_builder),
             "intent_rerank_enabled": bool(flags.intent_rerank),
             "adaptive_top_k_enabled": bool(flags.adaptive_top_k),
+            "rrf_fusion_enabled": bool(flags.rrf_fusion),
+            "mmr_enabled": bool(flags.mmr),
             "debug_trace_enabled": bool(flags.debug_trace),
             "primary_intent": result.primary_intent,
             "intents": list(result.intents),
@@ -351,6 +357,8 @@ class MemoryQueryBuilder:
                     "is_low_information": is_low_information,
                     "intent_rerank_enabled": flags.intent_rerank,
                     "adaptive_top_k_enabled": flags.adaptive_top_k,
+                    "memory_rrf_fusion_enabled": flags.rrf_fusion,
+                    "memory_mmr_enabled": flags.mmr,
                     "memory_retrieval_debug_trace_enabled": flags.debug_trace,
                 }
             )

@@ -253,6 +253,87 @@ class WebUiGapCoverageTests(unittest.TestCase):
         self.assertEqual(result["id"], "mem-event-1")
         self.assertEqual(writes[0].importance, 0.0)
 
+    def test_memory_quality_governance_and_manual_repair_use_runtime_services(self):
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        update_calls = []
+        projected = []
+
+        class _Store:
+            async def list_canonical(self, **kwargs):
+                return {"items": [], "total": 3 if kwargs.get("status") == "active" else 1}
+
+            async def get_canonical(self, memory_id, include_inactive=False):
+                return SimpleNamespace(
+                    id=memory_id,
+                    status="review_pending",
+                    visibility="maintenance_only",
+                    metadata={"quality_quarantine": {"reason": "interrogative_fact"}},
+                )
+
+            async def update_memory(self, memory_id, **kwargs):
+                update_calls.append((memory_id, kwargs))
+                return 1
+
+        class _Maintenance:
+            async def quality_audit(self, limit=5000):
+                return {"mode": "dry_run", "scanned": 3, "suspect_count": 1, "items": [{"id": "mem-1"}]}
+
+            async def quarantine_quality_suspects(self, limit=5000):
+                return {"mode": "apply", "changed": 1, "projection_deleted": 1}
+
+        class _Projector:
+            async def check_consistency(self):
+                return {"missing_projection_ids": []}
+
+            async def project(self, memory_id):
+                projected.append(memory_id)
+                return True
+
+            async def cleanup_deleted(self, memory_ids):
+                return len(memory_ids)
+
+        class _PluginApi:
+            def get_memory_engine(self):
+                return object()
+
+            def get_v2_store(self):
+                return _Store()
+
+            def get_maintenance_service(self):
+                return _Maintenance()
+
+            def get_index_projector(self):
+                return _Projector()
+
+        service = MemoryUiService(db_factory=None, plugin_api=_PluginApi())
+
+        async def _run():
+            overview = await service.quality_overview()
+            audit = await service.quality_audit(limit=25)
+            quarantine = await service.quarantine_quality_suspects(limit=25)
+            repaired = await service.update_canonical(
+                "mem-1",
+                {
+                    "content": "用户喜欢火锅",
+                    "summary": "喜欢火锅",
+                    "status": "active",
+                    "visibility": "auto_and_tool",
+                    "confidence": 0.9,
+                },
+            )
+            return overview, audit, quarantine, repaired
+
+        overview, audit, quarantine, repaired = asyncio.run(_run())
+
+        self.assertEqual(overview["counts"]["active"], 3)
+        self.assertEqual(audit["data"]["suspect_count"], 1)
+        self.assertEqual(quarantine["data"]["changed"], 1)
+        self.assertTrue(repaired["projected"])
+        self.assertEqual(projected, ["mem-1"])
+        self.assertEqual(update_calls[0][1]["status"], "active")
+        self.assertIn("manual_revision_history", update_calls[0][1]["metadata"])
+
     def test_admin_page_defaults_to_v2_memory_and_jargon_review_views(self):
         from pathlib import Path
 
@@ -264,9 +345,13 @@ class WebUiGapCoverageTests(unittest.TestCase):
         self.assertIn("const REVIEW_PAGE_SIZE = 25", source)
         self.assertIn("const MEMORY_PAGE_SIZE = 25", source)
         self.assertIn('api.get(`/memories/jargon?${statusParam}limit=${target.limit}&offset=${target.offset}${query}`)', source)
-        self.assertIn('api.get(`/memories/canonical?limit=${target.limit}&offset=${target.offset}${kindParam}`)', source)
+        self.assertIn('api.get(`/memories/canonical?limit=${target.limit}&offset=${target.offset}${kindParam}${statusParam}`)', source)
         self.assertIn('renderOffsetPager(state.reviewTab === "jargon_pending" ? "jargon-pending" : "jargon-all", activePage)', source)
         self.assertIn('{ id: "canonical", label: "Canonical 总览" }', source)
+        self.assertIn('canonicalStatus: "active"', source)
+        self.assertIn('data-memory-quality-audit', source)
+        self.assertIn('data-memory-quality-quarantine', source)
+        self.assertIn('openCanonicalMemoryEditor', source)
         self.assertIn("openJargonCalibration", source)
         self.assertIn("openExpressionCalibration", source)
         self.assertIn("data-edit-approve-review", source)

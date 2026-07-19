@@ -101,7 +101,7 @@ class MiningHelpersMigratedTests(unittest.TestCase):
         self.assertNotIn("astrbot", contents)
         self.assertNotIn("萤", contents)
 
-    def test_expression_pattern_enricher_degrades_to_candidate_payload(self):
+    def test_expression_pattern_enricher_fails_closed_without_model_evidence(self):
         class _Gateway:
             async def call_data_process_task(self, *args, **kwargs):
                 raise RuntimeError("offline")
@@ -123,9 +123,7 @@ class MiningHelpersMigratedTests(unittest.TestCase):
             )
 
         result = asyncio.run(_run())
-        self.assertEqual(result[0]["summary"], "ship it softly")
-        self.assertEqual(result[0]["review_status"], "pending")
-        self.assertAlmostEqual(result[0]["confidence"], 0.72)
+        self.assertEqual(result, [])
 
     def test_jargon_miner_filters_blank_messages_before_delegating(self):
         miner = _FakeExpressionMiner()

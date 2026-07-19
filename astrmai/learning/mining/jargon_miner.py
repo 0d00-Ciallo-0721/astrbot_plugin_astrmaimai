@@ -57,7 +57,7 @@ class JargonMiner:
                 rows = await self.memory_engine.v2_store.list_candidates(
                     session_id=group_id,
                     kinds=["jargon"],
-                    statuses=["active"],
+                    statuses=["active", "review_pending", "rejected", "stale"],
                     limit=200,
                 )
                 existing_terms = {str(item.content or "").strip().lower() for item in rows if str(item.content or "").strip()}

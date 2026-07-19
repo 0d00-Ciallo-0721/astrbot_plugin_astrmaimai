@@ -19,6 +19,16 @@ from ...infrastructure.runtime.lane_manager import LaneKey
 
 
 class MemoryRetrievalService:
+    _RRF_K = 60.0
+    _RRF_SOURCE_WEIGHTS = {
+        "canonical_fts": 1.0,
+        "faiss": 0.9,
+        "legacy_bm25": 0.8,
+        "legacy_hybrid": 0.75,
+        "fallback": 0.65,
+    }
+    _MMR_LAMBDA = 0.75
+
     def __init__(self, store: MemoryV2Store, engine=None, scoring: MemoryScoringConfig | None = None):
         self.store = store
         self.engine = engine
@@ -187,7 +197,8 @@ class MemoryRetrievalService:
             existing_index = next((identities[key] for key in keys if key in identities), None)
             if existing_index is None:
                 normalized = self._normalized_content(candidate)
-                if len(normalized) >= 4:
+                has_cjk = any("\u4e00" <= char <= "\u9fff" for char in normalized)
+                if len(normalized) >= 4 and has_cjk:
                     existing_index = next(
                         (
                             index
@@ -210,6 +221,12 @@ class MemoryRetrievalService:
                     set(self._matched_sources(existing.metadata.get("matched_by")))
                     | set(self._matched_sources(candidate.metadata.get("matched_by")))
                 )
+                for score_key in ("_canon_score", "_hybrid_score", "_rrf_raw_score", "_rrf_score"):
+                    if score_key in candidate.metadata:
+                        existing.metadata[score_key] = max(
+                            float(existing.metadata.get(score_key, 0.0) or 0.0),
+                            float(candidate.metadata.get(score_key, 0.0) or 0.0),
+                        )
             for key in keys:
                 identities[key] = existing_index
         return merged
@@ -280,16 +297,80 @@ class MemoryRetrievalService:
             reranked.append(item)
         return sorted(reranked, key=self._stable_sort_key)
 
+    @classmethod
+    def _rrf_source_weight(cls, candidate: MemoryCandidate, default_source: str) -> float:
+        sources = cls._matched_sources((candidate.metadata or {}).get("matched_by")) or [default_source]
+        return max((cls._RRF_SOURCE_WEIGHTS.get(source, 0.7) for source in sources), default=0.7)
+
+    @classmethod
+    def _candidate_similarity(cls, left: MemoryCandidate, right: MemoryCandidate) -> float:
+        left_text = cls._normalized_content(left)
+        right_text = cls._normalized_content(right)
+        if not left_text or not right_text:
+            return 0.0
+        return SequenceMatcher(None, left_text, right_text).ratio()
+
+    def _mmr_rerank(self, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
+        if len(candidates) <= 1:
+            return [self._clone_candidate(item) for item in candidates]
+
+        working = [self._clone_candidate(item) for item in candidates]
+        raw_scores = [self._get_candidate_sort_score(item) for item in working]
+        low, high = min(raw_scores), max(raw_scores)
+        if all(0.0 <= score <= 1.0 for score in raw_scores):
+            normalized_scores = {id(item): score for item, score in zip(working, raw_scores)}
+        elif high > low:
+            normalized_scores = {
+                id(item): (score - low) / (high - low)
+                for item, score in zip(working, raw_scores)
+            }
+        else:
+            normalized_scores = {id(item): 1.0 for item in working}
+
+        remaining = sorted(working, key=self._stable_sort_key)
+        selected: list[MemoryCandidate] = []
+        while remaining:
+            scored: list[tuple[MemoryCandidate, float, float, float]] = []
+            for item in remaining:
+                relevance = normalized_scores[id(item)]
+                similarity = max(
+                    (self._candidate_similarity(item, chosen) for chosen in selected),
+                    default=0.0,
+                )
+                mmr_score = self._MMR_LAMBDA * relevance - (1.0 - self._MMR_LAMBDA) * similarity
+                scored.append((item, similarity, mmr_score, relevance))
+            best_item, best_similarity, best_mmr_score, _relevance = min(
+                scored,
+                key=lambda row: (-row[2], -row[3], self._stable_sort_key(row[0])),
+            )
+            best_item.metadata["_mmr_score"] = round(best_mmr_score, 6)
+            best_item.metadata["_mmr_penalty"] = round((1.0 - self._MMR_LAMBDA) * best_similarity, 6)
+            breakdown = dict(best_item.metadata.get("_score_breakdown") or {})
+            breakdown["mmr"] = {
+                "score": round(best_mmr_score, 4),
+                "similarity_penalty": round((1.0 - self._MMR_LAMBDA) * best_similarity, 4),
+            }
+            best_item.metadata["_score_breakdown"] = breakdown
+            selected.append(best_item)
+            remaining.remove(best_item)
+        return selected
+
     def _finalize_candidates(self, query: MemoryQuery, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
         rerank_enabled = bool((query.metadata or {}).get("intent_rerank_enabled", False))
-        ranked = list(candidates)
+        ranked = self._deduplicate_candidates(list(candidates))
         if rerank_enabled:
             try:
-                ranked = self._intent_rerank(query, self._deduplicate_candidates(ranked))
+                ranked = self._intent_rerank(query, ranked)
             except Exception as exc:
                 logger.warning(f"[MemoryRetrievalService] intent rerank degraded: {exc}")
                 self._mark_degraded(query, "intent_rerank")
-                ranked = list(candidates)
+                ranked = self._deduplicate_candidates(list(candidates))
+        if bool((query.metadata or {}).get("memory_mmr_enabled", False)):
+            try:
+                ranked = self._mmr_rerank(ranked)
+            except Exception as exc:
+                logger.warning(f"[MemoryRetrievalService] MMR degraded: {exc}")
+                self._mark_degraded(query, "mmr")
         limit = max(int(query.top_k or 5), 1)
         if bool((query.metadata or {}).get("adaptive_top_k_enabled", False)) and ranked:
             high_confidence_count = sum(
@@ -573,20 +654,29 @@ class MemoryRetrievalService:
     ) -> list[MemoryCandidate]:
         excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
         merged: dict[str, MemoryCandidate] = {}
-        for original in canonical or []:
+        rrf_raw_scores: dict[str, float] = {}
+
+        def identity(candidate: MemoryCandidate) -> str:
+            return str((candidate.metadata or {}).get("canonical_id") or candidate.id or "")
+
+        for rank, original in enumerate(canonical or [], start=1):
             c = self._clone_candidate(original)
             if c.id in excluded:
                 continue
+            key = identity(c)
             c.metadata["_canon_score"] = float(c.relevance_score or 0.0)
             c.metadata.setdefault("_hybrid_score", 0.0)
             c.metadata["matched_by"] = self._matched_sources(c.metadata.get("matched_by")) or ["canonical_fts"]
-            merged[c.id] = c
-        for original in hybrid or []:
+            merged[key] = c
+            rrf_raw_scores[key] = rrf_raw_scores.get(key, 0.0) + self._rrf_source_weight(c, "canonical_fts") / (self._RRF_K + rank)
+        for rank, original in enumerate(hybrid or [], start=1):
             h = self._clone_candidate(original)
             if h.id in excluded:
                 continue
-            if h.id in merged:
-                existing = merged[h.id]
+            key = identity(h)
+            rrf_raw_scores[key] = rrf_raw_scores.get(key, 0.0) + self._rrf_source_weight(h, "legacy_hybrid") / (self._RRF_K + rank)
+            if key in merged:
+                existing = merged[key]
                 existing.metadata["_hybrid_score"] = max(
                     float(existing.metadata.get("_hybrid_score", 0.0)),
                     float(h.relevance_score or 0.0),
@@ -603,32 +693,58 @@ class MemoryRetrievalService:
                 h.metadata.setdefault("_canon_score", 0.0)
                 h.metadata["_hybrid_score"] = float(h.relevance_score or 0.0)
                 h.metadata["matched_by"] = self._matched_sources(h.metadata.get("matched_by")) or ["legacy_hybrid"]
-                merged[h.id] = h
+                merged[key] = h
 
+        rrf_enabled = bool((query.metadata or {}).get("memory_rrf_fusion_enabled", False))
+        max_rrf_raw = max(rrf_raw_scores.values(), default=0.0)
         for item in merged.values():
             canon = float(item.metadata.get("_canon_score", 0.0))
             hybrid_score = float(item.metadata.get("_hybrid_score", 0.0))
             conflict_penalty = 0.0
             if (item.metadata or {}).get("corrected_by") or (item.metadata or {}).get("contradicted_by"):
                 conflict_penalty = float(self.scoring.conflict_penalty or 0.0)
-            canon_weighted = canon * self.scoring.canonical_weight
-            hybrid_weighted = hybrid_score * self.scoring.hybrid_weight
             importance_weighted = float(item.importance or 0.0) * self.scoring.importance_weight
             confidence_weighted = float(item.confidence or 0.0) * self.scoring.confidence_weight
+            recency_weighted = float(item.recency_score or 0.0) * self.scoring.recency_weight
             stale_penalty = self.scoring.stale_penalty if item.status == "stale" else 0.0
-            item.relevance_score = (
-                canon_weighted + hybrid_weighted + importance_weighted + confidence_weighted
-                - conflict_penalty - stale_penalty
-            )
-            item.metadata["_score_breakdown"] = {
-                "canonical": round(canon_weighted, 4),
-                "hybrid": round(hybrid_weighted, 4),
-                "importance": round(importance_weighted, 4),
-                "confidence": round(confidence_weighted, 4),
-                "conflict_penalty": round(conflict_penalty, 4),
-                "stale_penalty": round(stale_penalty, 4),
-            }
-        ranked = sorted(merged.values(), key=lambda item: item.relevance_score, reverse=True)
+            if rrf_enabled:
+                key = identity(item)
+                rrf_raw = float(rrf_raw_scores.get(key, 0.0))
+                rrf_normalized = rrf_raw / max_rrf_raw if max_rrf_raw > 0.0 else 0.0
+                rrf_weighted = rrf_normalized * (self.scoring.canonical_weight + self.scoring.hybrid_weight)
+                item.relevance_score = (
+                    rrf_weighted + importance_weighted + confidence_weighted + recency_weighted
+                    - conflict_penalty - stale_penalty
+                )
+                item.metadata["_rrf_raw_score"] = round(rrf_raw, 8)
+                item.metadata["_rrf_score"] = round(rrf_normalized, 6)
+                item.metadata["_fusion_mode"] = "rrf"
+                item.metadata["_score_breakdown"] = {
+                    "rrf": round(rrf_weighted, 4),
+                    "rrf_raw": round(rrf_raw, 8),
+                    "importance": round(importance_weighted, 4),
+                    "confidence": round(confidence_weighted, 4),
+                    "recency": round(recency_weighted, 4),
+                    "conflict_penalty": round(conflict_penalty, 4),
+                    "stale_penalty": round(stale_penalty, 4),
+                }
+            else:
+                canon_weighted = canon * self.scoring.canonical_weight
+                hybrid_weighted = hybrid_score * self.scoring.hybrid_weight
+                item.relevance_score = (
+                    canon_weighted + hybrid_weighted + importance_weighted + confidence_weighted
+                    - conflict_penalty - stale_penalty
+                )
+                item.metadata["_fusion_mode"] = "weighted"
+                item.metadata["_score_breakdown"] = {
+                    "canonical": round(canon_weighted, 4),
+                    "hybrid": round(hybrid_weighted, 4),
+                    "importance": round(importance_weighted, 4),
+                    "confidence": round(confidence_weighted, 4),
+                    "conflict_penalty": round(conflict_penalty, 4),
+                    "stale_penalty": round(stale_penalty, 4),
+                }
+        ranked = sorted(merged.values(), key=self._stable_sort_key)
         return ranked
 
     async def _hydrate_candidate_metadata(self, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
@@ -751,8 +867,18 @@ class MemoryRetrievalService:
         by_id = {item.id: item for item in candidates}
         ranked = [by_id[memory_id] for memory_id in ranked_ids if memory_id in by_id]
         ranked.extend(item for item in candidates if item.id not in set(ranked_ids))
+        original_top = max((float(item.relevance_score or 0.0) for item in candidates), default=0.0)
         for index, item in enumerate(ranked):
-            item.relevance_score = max(item.relevance_score, 1.0 - index * 0.05)
+            base_score = max(0.0, min(1.0, float(item.relevance_score or 0.0)))
+            positional_boost = min(base_score * 0.2, max(0.0, 0.08 - index * 0.01))
+            final_score = min(1.0, base_score + positional_boost)
+            if original_top > 0.0 and base_score < original_top * 0.5:
+                final_score = min(final_score, max(original_top - 1e-6, 0.0))
+            item.metadata = dict(item.metadata or {})
+            item.metadata["_base_relevance_score"] = round(base_score, 6)
+            item.metadata["_deep_rerank_boost"] = round(positional_boost, 6)
+            item.metadata["_final_relevance_score"] = round(final_score, 6)
+            item.relevance_score = final_score
         return ranked
 
     async def _compress_guidance(self, query: MemoryQuery, candidates: list[MemoryCandidate]) -> str:
