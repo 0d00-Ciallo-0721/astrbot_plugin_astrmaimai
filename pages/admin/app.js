@@ -1,5 +1,5 @@
 const API_PREFIX = "admin";
-const ADMIN_BUILD_VERSION = "2026.07.19-r5";
+const ADMIN_BUILD_VERSION = "2026.07.20-r6";
 const SCHEDULER_POLL_INTERVAL_MS = 45000;
 const DASHBOARD_CACHE_TTL_MS = 180000;
 const DATA_CACHE_TTL_MS = 180000;
@@ -1365,7 +1365,7 @@ async function loadLearning() {
     body = `
       <div class="grid">
         ${metric("表达习惯", expressionStats.total ?? 0, `${expressionStats.pending ?? 0} 待审核`)}
-        ${metric("黑话词库", jargonStats.total ?? 0, `${jargonStats.pending ?? 0} 待审核`)}
+        ${metric("黑话词库（已通过）", jargonStats.approved ?? 0, `${jargonStats.pending ?? 0} 待审核`)}
         ${metric("积压学习", backlog.enabled ? "开启" : "关闭", `阈值 ${backlog.threshold ?? diagnostics.backlog?.threshold ?? "—"}`)}
         ${metric("Worker", backlog.worker_running ? "运行中" : "未运行", `每轮 ${backlog.group_limit ?? diagnostics.backlog?.group_limit ?? "—"} 会话`)}
       </div>
@@ -1376,6 +1376,18 @@ async function loadLearning() {
         </div>
         ${table(["Chat", "未处理消息", "最早", "最新"], topBacklogRows, "当前没有达到学习阈值的会话。")}
         ${detailsJson("后台扫描完整报告", backlog.last_report || diagnostics.backlog?.last_report || {})}
+      `)}
+      ${section("表达历史回填", "只重新分析指定会话的历史消息，不重跑黑话，也不会改变消息的已处理状态。建议先预检，再确认写入。", `
+        <div class="form-grid">
+          <label>会话 ID<input id="expression-backfill-chat" type="text" placeholder="例如 ff:GroupMessage:123456"></label>
+          <label>最多读取消息数<input id="expression-backfill-limit" type="number" min="10" max="500" value="120"></label>
+          <label>回看天数<input id="expression-backfill-days" type="number" min="1" max="30" value="7"></label>
+        </div>
+        <div class="row-actions">
+          <button class="ghost-button" data-expression-backfill-dry type="button">预检候选</button>
+          <button class="primary-button" data-expression-backfill-run type="button">确认写入待审库</button>
+        </div>
+        ${detailsJson("最近回填结果", diagnostics.expression_backfill || {})}
       `)}
       <div class="feature-grid">
         <article class="feature-card"><div><h3>造梦空间</h3><p>${escapeHtml(dream.state || dream.status || "按计划运行")}</p>${detailsJson("诊断", dream)}</div><button class="primary-button" data-run-dream type="button">执行造梦序列</button></article>
@@ -1427,6 +1439,23 @@ async function loadLearning() {
 }
 
 function bindLearningActions() {
+  const runExpressionBackfill = async (dryRun) => {
+    const chatId = String($("#expression-backfill-chat")?.value || "").trim();
+    if (!chatId) return toast("请先填写会话 ID");
+    const limit = Math.max(10, Math.min(500, Number($("#expression-backfill-limit")?.value || 120)));
+    const days = Math.max(1, Math.min(30, Number($("#expression-backfill-days")?.value || 7)));
+    if (!dryRun && !await confirmAction("把本次表达候选写入待审库？历史消息状态不会改变。")) return;
+    const result = await api.post("/learning/expression-backfill", {
+      chat_id: chatId,
+      limit,
+      max_age_seconds: days * 86400,
+      dry_run: dryRun,
+    });
+    openModal(dryRun ? "表达回填预检" : "表达回填结果", `<pre>${escapeHtml(json(result))}</pre>`);
+    clearDataCache("learning:");
+  };
+  $('[data-expression-backfill-dry]')?.addEventListener("click", () => runExpressionBackfill(true));
+  $('[data-expression-backfill-run]')?.addEventListener("click", () => runExpressionBackfill(false));
   $('[data-run-dream]')?.addEventListener("click", async () => {
     await api.post("/proactive/dream/run-once");
     toast("Dream 已调度");
@@ -1469,7 +1498,7 @@ async function loadReviews() {
   let activePage;
   if (state.reviewTab === "jargon_pending" || state.reviewTab === "jargon_all") {
     const target = state.reviewTab === "jargon_pending" ? state.cache.reviews.jargonPending : state.cache.reviews.jargonAll;
-    const statusParam = state.reviewTab === "jargon_pending" ? "status=review_pending&" : "";
+    const statusParam = state.reviewTab === "jargon_pending" ? "status=review_pending&" : "status=active&";
     const query = state.cache.reviews.filters.keyword ? `&query=${segment(state.cache.reviews.filters.keyword)}` : "";
     activePage = await cachedFetch(`${tabKey}:${target.offset}:${state.cache.reviews.filters.keyword}`, () => api.get(`/memories/jargon?${statusParam}limit=${target.limit}&offset=${target.offset}${query}`), target);
     const normalized = { items: asItems(activePage), total: Number(activePage.total ?? asItems(activePage).length), limit: target.limit, offset: target.offset };
@@ -1506,8 +1535,8 @@ async function loadReviews() {
           <button class="ghost-button" data-edit-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑</button>
           <button class="primary-button" data-edit-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑通过</button>
           <button class="primary-button" data-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">批准</button>
-          <button class="ghost-button" data-edit-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">备注驳回</button>
-          <button class="danger-button" data-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">驳回</button>
+          ${reviewMode === "jargon" ? "" : `<button class="ghost-button" data-edit-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">备注驳回</button>`}
+          <button class="danger-button" data-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">${reviewMode === "jargon" ? (state.reviewTab === "jargon_all" ? "删除" : "驳回并删除") : "驳回"}</button>
         </td>
       </tr>
     `;
@@ -1519,7 +1548,7 @@ async function loadReviews() {
       ${metric("表达待审核", expressionStats.pending ?? state.cache.reviews.expressionPending.length)}
       ${metric("表达语料", expressionStats.total ?? state.cache.reviews.expressionAll.total)}
       ${metric("黑话待审核", jargonStats.pending ?? state.cache.reviews.jargonPending.total)}
-      ${metric("黑话词库", jargonStats.total ?? state.cache.reviews.jargonAll.total)}
+      ${metric("黑话词库（已通过）", jargonStats.approved ?? state.cache.reviews.jargonAll.total)}
     </div>
   `;
   const title = state.reviewTab.startsWith("jargon") ? "黑话审核" : "表达习惯审核";
@@ -1588,19 +1617,19 @@ async function openJargonNoisePreview() {
   `);
   openModal(
     "黑话噪声预检",
-    `<p class="muted">只做预览。确认后将所选项软驳回并保留审计记录，不会物理删除。</p>${table(["选择", "内容", "判定", "原因", "置信度"], rows, "没有发现明显噪声。")}`,
-    `<button class="ghost-button" data-modal-close type="button">取消</button><button class="danger-button" data-apply-noise-cleanup type="button" ${items.length ? "" : "disabled"}>软驳回所选项</button>`,
+    `<p class="muted">这里只显示预检结果。确认后会物理删除所选黑话及其检索索引，删除后不可在审核页恢复。</p>${table(["选择", "内容", "判定", "原因", "置信度"], rows, "没有发现明显噪声。")}`,
+    `<button class="ghost-button" data-modal-close type="button">取消</button><button class="danger-button" data-apply-noise-cleanup type="button" ${items.length ? "" : "disabled"}>物理删除所选项</button>`,
   );
   $('[data-apply-noise-cleanup]')?.addEventListener("click", async () => {
     const ids = $$('[data-noise-id]:checked').map((node) => node.dataset.noiseId).filter(Boolean);
     if (!ids.length) return toast("请先选择要驳回的候选");
-    if (!await confirmAction(`确认软驳回 ${ids.length} 条黑话候选？记录仍会保留。`)) return;
+    if (!await confirmAction(`确认物理删除 ${ids.length} 条黑话候选？删除后不可恢复。`)) return;
     await api.post("/memories/jargon/cleanup/apply", { action: "reject", ids });
     clearDataCache("reviews:");
     clearDataCache("memories:");
     clearDataCache("learning:status");
     closeModal();
-    toast(`已软驳回 ${ids.length} 条候选`);
+    toast(`已物理删除 ${ids.length} 条候选`);
     loadReviews();
   });
 }
@@ -1639,6 +1668,7 @@ function bindReviewActions() {
   $$('[data-reject-review]').forEach((button) => button.addEventListener("click", async () => {
     if (!button.dataset.rejectReview) return;
     if (button.dataset.reviewKind === "jargon") {
+      if (!await confirmAction(state.reviewTab === "jargon_all" ? "确认删除这条已通过黑话？删除后不可恢复。" : "确认驳回并删除这条黑话？删除后不可恢复。")) return;
       await api.post(`/memories/jargon/${segment(button.dataset.rejectReview)}/reject`);
     } else {
       await api.post(`/reviews/${segment(button.dataset.rejectReview)}/submit`, { action: "reject" });
@@ -1666,7 +1696,7 @@ async function loadMemories() {
     state.cache.memories.qualityOverview = qualityOverview || { counts: {}, index: {} };
   } else if (state.memoryTab === "jargon") {
     const target = state.cache.memories.jargon;
-    const result = await cachedFetch(`${tabKey}:${target.offset}`, () => api.get(`/memories/jargon?limit=${target.limit}&offset=${target.offset}`), target);
+    const result = await cachedFetch(`${tabKey}:${target.offset}`, () => api.get(`/memories/jargon?status=active&limit=${target.limit}&offset=${target.offset}`), target);
     state.cache.memories.jargon = { items: asItems(result), total: Number(result.total ?? asItems(result).length), limit: target.limit, offset: target.offset };
   } else if (state.memoryTab === "events") {
     state.cache.memories.events = asItems(await cachedFetch(tabKey, () => api.get("/memories/events"), { items: [] }));

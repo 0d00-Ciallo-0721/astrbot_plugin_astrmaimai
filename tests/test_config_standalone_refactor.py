@@ -30,6 +30,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.timing.fast_mode_execution_timeout_sec, 15)
         self.assertEqual(config.timing.reply_max_age_sec, 0.0)
         self.assertEqual(config.evolution.jargon_min_count, 2)
+        self.assertEqual(config.evolution.expression_min_count, 2)
 
     def test_astrmai_config_migrates_legacy_timing_fields_and_syncs_aliases(self):
         config = AstrMaiConfig(
@@ -62,6 +63,12 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.infra.api_timeout, 300.0)
         self.assertEqual(config.agent.timeout, 900)
         self.assertEqual(config.reply.stale_reply_max_age_sec, 1200.0)
+
+    def test_workmode_timeout_accepts_long_running_model_budget(self):
+        config = AstrMaiConfig(timing={"workmode_execution_timeout_sec": 9999})
+
+        self.assertEqual(config.timing.workmode_execution_timeout_sec, 9999)
+        self.assertEqual(config.sys3.tool_timeout, 9999)
 
     def test_astrmai_config_accepts_conversation_and_memory_namespace_fields(self):
         config = AstrMaiConfig(
@@ -130,8 +137,10 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertIn("use_native_main_reply_vision", vision_items)
         self.assertIn("native_main_reply_failure_cooldown_sec", vision_items)
         self.assertIn("jargon_min_count", evolution_items)
+        self.assertIn("expression_min_count", evolution_items)
         self.assertEqual(performance_items["summary_threshold"]["default"], 300)
         self.assertEqual(evolution_items["jargon_min_count"]["default"], 2)
+        self.assertEqual(evolution_items["expression_min_count"]["default"], 2)
         self.assertEqual(schema["conversation"]["items"]["compaction_trigger_segments"]["default"], 40)
         self.assertEqual(schema["conversation"]["items"]["compaction_keep_recent_segments"]["default"], 16)
         memory_items = schema["memory"]["items"]
@@ -144,6 +153,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(timing_items["agent_execution_timeout_sec"]["default"], 60)
         self.assertEqual(timing_items["fast_mode_execution_timeout_sec"]["default"], 15)
         self.assertEqual(timing_items["workmode_execution_timeout_sec"]["default"], 120)
+        self.assertEqual(timing_items["workmode_execution_timeout_sec"]["maximum"], 86400)
         self.assertEqual(timing_items["image_resolve_timeout_sec"]["maximum"], 600)
         self.assertNotIn("judge_timeout", schema["attention"]["items"])
         self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)

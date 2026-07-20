@@ -633,7 +633,20 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                             source_ref TEXT,
                             visibility TEXT
                         );
+                        CREATE TABLE Jargon (
+                            id INTEGER PRIMARY KEY,
+                            content TEXT,
+                            group_id TEXT
+                        );
                         """
+                    )
+                    await db.execute(
+                        "INSERT INTO Jargon(id, content, group_id) VALUES (?, ?, ?)",
+                        (7, "bigbird", "group-1"),
+                    )
+                    await db.execute(
+                        "INSERT INTO Jargon(id, content, group_id) VALUES (?, ?, ?)",
+                        (8, "legacy-only", "group-1"),
                     )
                     await db.execute(
                         """
@@ -705,9 +718,13 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 active = await service.list_jargon(status="active", group_id="group-2", query="团本")
                 rejected = await service.reject_jargon("mem-jargon-1")
                 final_detail = await service.get_canonical("mem-jargon-1")
-                return pending, approved, active, rejected, final_detail
+                async with _db_factory() as db:
+                    async with db.execute("SELECT COUNT(*) FROM Jargon WHERE id = 7") as cursor:
+                        legacy_count = int((await cursor.fetchone())[0])
+                remaining = await service.list_jargon(status="active", group_id="group-1")
+                return pending, approved, active, rejected, final_detail, legacy_count, remaining
 
-            pending, approved, active, rejected, final_detail = asyncio.run(_run())
+            pending, approved, active, rejected, final_detail, legacy_count, remaining = asyncio.run(_run())
 
         self.assertEqual(pending["total"], 1)
         self.assertEqual(len(pending["items"]), 1)
@@ -724,10 +741,46 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(pending["items"][0]["review_reason"], "needs more evidence")
         self.assertEqual(pending["items"][0]["review_suggestion"], "confirm whether it is boss shorthand")
         self.assertEqual(rejected["status"], "ok")
-        self.assertEqual(final_detail["data"]["status"], "rejected")
-        self.assertEqual(final_detail["data"]["metadata"]["review_status"], "rejected")
-        self.assertEqual(final_detail["data"]["metadata"]["modified_by"], "webui")
-        self.assertTrue(final_detail["data"]["metadata"]["manual_revision_history"])
+        self.assertTrue(rejected["physical_delete"])
+        self.assertEqual(final_detail["status"], "not_found")
+        self.assertIsNone(final_detail["data"])
+        self.assertEqual(legacy_count, 0)
+        self.assertEqual(remaining["total"], 0)
+
+    def test_runtime_jargon_delete_cleans_projection(self):
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        calls = []
+
+        class _Store:
+            async def get_canonical(self, memory_id, include_inactive=False):
+                return SimpleNamespace(
+                    id=memory_id,
+                    kind="jargon",
+                    content="hiyohiyo",
+                    session_id="chat-1",
+                    metadata={"meaning": "招呼语"},
+                )
+
+            async def hard_delete(self, memory_id, kind=""):
+                calls.append(("delete", memory_id, kind))
+                return 1
+
+        class _Projector:
+            async def cleanup_deleted(self, memory_ids):
+                calls.append(("projector", list(memory_ids)))
+                return 1
+
+        class _PluginApi:
+            def get_v2_store(self):
+                return _Store()
+
+            def get_index_projector(self):
+                return _Projector()
+
+        result = asyncio.run(MemoryUiService(None, _PluginApi()).reject_jargon("mem-jargon-1"))
+        self.assertTrue(result["physical_delete"])
+        self.assertEqual(calls, [("delete", "mem-jargon-1", "jargon"), ("projector", ["mem-jargon-1"])])
 
     def test_memory_route_file_exposes_jargon_review_endpoints(self):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "routes" / "memory_routes.py"
@@ -863,7 +916,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn('api.get("/memory-feedback/sources")', js)
         self.assertIn('api.post(`/memory-feedback/${segment(button.dataset.disableFeedback)}/disable`)', js)
 
-    def test_jargon_cleanup_preview_and_apply_are_non_destructive(self):
+    def test_jargon_cleanup_preview_and_apply_physically_delete_selected_items(self):
         from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
 
         service = MemoryUiService(db_factory=None)
@@ -878,23 +931,23 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 }
             return {"items": []}
 
-        rejected = []
+        deleted = []
 
-        async def _reject(jargon_id, data=None):
-            rejected.append((jargon_id, dict(data or {})))
-            return {"status": "ok"}
+        async def _delete(jargon_id):
+            deleted.append(jargon_id)
+            return {"status": "ok", "physical_delete": True}
 
         service.list_jargon = _list_jargon
-        service.reject_jargon = _reject
+        service.delete_jargon = _delete
         preview = asyncio.run(service.jargon_cleanup_preview())
         result = asyncio.run(service.apply_jargon_cleanup({"action": "reject", "ids": ["j-1"]}))
 
         self.assertEqual([item["id"] for item in preview["items"]], ["j-1"])
         self.assertEqual(preview["obvious_count"], 1)
-        self.assertFalse(preview["destructive"])
+        self.assertTrue(preview["destructive"])
         self.assertEqual(result["changed"], ["j-1"])
-        self.assertFalse(result["physical_delete"])
-        self.assertEqual(rejected[0][0], "j-1")
+        self.assertTrue(result["physical_delete"])
+        self.assertEqual(deleted, ["j-1"])
 
     def test_admin_service_exposes_memory_observability_views(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")

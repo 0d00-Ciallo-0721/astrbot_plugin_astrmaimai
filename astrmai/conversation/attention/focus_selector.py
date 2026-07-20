@@ -47,9 +47,32 @@ def score_focus_candidate(gate, candidate, normalized_events):
     return score, reason
 
 
-def select_focus_event(gate, events, self_id: str, normalized_events=None):
+def select_focus_event(gate, events, self_id: str, normalized_events=None, *, is_private: bool = False):
     if not events:
         return None, [], "empty"
+
+    if normalized_events is None:
+        normalized_events = gate._build_normalized_events(events, self_id)
+    candidates = [candidate for candidate in normalized_events if not candidate.is_self]
+    if is_private:
+        actionable_text = [
+            candidate
+            for candidate in candidates
+            if (
+                not candidate.event.get_extra("astrmai_attention_historical", False)
+                and not candidate.is_image_only
+                and bool(str(getattr(candidate.event, "message_str", "") or "").strip())
+                and str(getattr(candidate.event, "message_str", "") or "").strip().lower()
+                not in {"[图片]", "[image]", "[img]", "图片", "image"}
+            )
+        ]
+        if actionable_text:
+            focus_event = actionable_text[-1].event
+            return (
+                focus_event,
+                [item for item in events if item is not focus_event],
+                "private_latest_actionable_text",
+            )
 
     attention_config = getattr(gate.config, "attention", None)
     if not bool(getattr(attention_config, "focus_thread_enabled", True)):
@@ -66,9 +89,6 @@ def select_focus_event(gate, events, self_id: str, normalized_events=None):
         focus_event = candidates[-1]
         return focus_event, [item for item in events if item is not focus_event], "fallback_last_event"
 
-    if normalized_events is None:
-        normalized_events = gate._build_normalized_events(events, self_id)
-    candidates = [candidate for candidate in normalized_events if not candidate.is_self]
     if not candidates:
         focus_event = events[-1]
         return focus_event, [event for event in events if event is not focus_event], "fallback_last_event"

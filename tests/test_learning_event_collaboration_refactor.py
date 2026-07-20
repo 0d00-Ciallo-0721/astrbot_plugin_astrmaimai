@@ -20,7 +20,13 @@ class _FakeMemoryEngine:
     def __init__(self):
         self.received = []
         self.writes = []
+        self.pattern_writes = []
         self.write_service = SimpleNamespace(write=self._write)
+        self.expression_pattern_service = SimpleNamespace(
+            store=SimpleNamespace(get_by_dedup_key=self._get_pattern),
+            build_dedup_key=self._build_pattern_key,
+            write_pattern=self._write_pattern,
+        )
 
     async def on_learning_bot_reply_recorded(self, payload):
         self.received.append(("bot", payload))
@@ -31,6 +37,18 @@ class _FakeMemoryEngine:
     async def _write(self, request):
         self.writes.append(request)
         return f"mem-{len(self.writes)}"
+
+    @staticmethod
+    async def _get_pattern(_key, include_inactive=True):
+        return None
+
+    @staticmethod
+    def _build_pattern_key(group_id, situation, expression, shared_scope=""):
+        return f"{group_id}:{shared_scope}:{situation}:{expression}"
+
+    async def _write_pattern(self, group_id, payload, source=""):
+        self.pattern_writes.append((group_id, payload, source))
+        return f"pattern-{len(self.pattern_writes)}"
 
 
 class LearningEventCollaborationTests(unittest.TestCase):

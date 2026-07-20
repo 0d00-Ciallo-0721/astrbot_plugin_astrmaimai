@@ -1540,6 +1540,36 @@ class MemoryV2Store:
                 await db.commit()
                 return cursor.rowcount
 
+    async def hard_delete(self, memory_id: str, *, kind: str = "") -> int:
+        """Physically remove one canonical record and its local lookup artifacts."""
+        await self.initialize()
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return 0
+        clean_kind = str(kind or "").strip()
+        scopes = await self._resolve_session_ids_for_memory_ids([clean_id])
+        async with await self._acquire_session_scopes(scopes) as _locks:
+            async with connect_aiosqlite(self.db_path) as db:
+                where = "id = ?"
+                params: tuple[Any, ...] = (clean_id,)
+                if clean_kind:
+                    where += " AND kind = ?"
+                    params = (clean_id, clean_kind)
+                cursor = await db.execute(f"SELECT 1 FROM canonical_memories WHERE {where} LIMIT 1", params)
+                if await cursor.fetchone() is None:
+                    return 0
+                await db.execute("DELETE FROM canonical_fts WHERE memory_id = ?", (clean_id,))
+                await db.execute(
+                    "DELETE FROM memory_dedup_aliases WHERE canonical_memory_id = ?",
+                    (clean_id,),
+                )
+                cursor = await db.execute(
+                    f"DELETE FROM canonical_memories WHERE {where}",
+                    params,
+                )
+                await db.commit()
+                return int(cursor.rowcount or 0)
+
     async def restore(self, memory_id: str, *, reason: str = "manual_restore") -> int:
         await self.initialize()
         now = self._now()

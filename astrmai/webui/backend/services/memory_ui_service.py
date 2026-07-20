@@ -690,16 +690,15 @@ class MemoryUiService:
                     (*params, page_limit, page_offset),
                 ) as cursor:
                     rows = await cursor.fetchall()
-                if rows:
-                    items = [self._canonical_jargon_view(self._canonical_row(row)) for row in rows]
-                    filtered = self._filter_jargon_rows(items, query=query)
-                    return {
-                        "items": filtered,
-                        "total": int(total_row[0] if total_row else len(filtered)),
-                        "limit": page_limit,
-                        "offset": page_offset,
-                        "runtime_bound": False,
-                    }
+                items = [self._canonical_jargon_view(self._canonical_row(row)) for row in rows]
+                filtered = self._filter_jargon_rows(items, query=query)
+                return {
+                    "items": filtered,
+                    "total": int(total_row[0] if total_row else len(filtered)),
+                    "limit": page_limit,
+                    "offset": page_offset,
+                    "runtime_bound": False,
+                }
             except Exception:
                 pass
             legacy_sql = "SELECT * FROM Jargon"
@@ -785,7 +784,7 @@ class MemoryUiService:
             "total": len(candidates),
             "obvious_count": len(obvious),
             "suspect_count": len(candidates) - len(obvious),
-            "destructive": False,
+            "destructive": True,
         }
 
     async def apply_jargon_cleanup(self, data: dict) -> dict[str, object]:
@@ -805,10 +804,7 @@ class MemoryUiService:
                 if action == "merge":
                     await self.merge_canonical(jargon_id, target_id)
                 else:
-                    await self.reject_jargon(
-                        jargon_id,
-                        {"review_reason": "WebUI 噪声预检后人工批量驳回", "review_suggestion": "保留审计记录，不参与召回"},
-                    )
+                    await self.delete_jargon(jargon_id)
                 changed.append(jargon_id)
             except Exception as exc:
                 failed.append({"id": jargon_id, "error": str(exc)[:300]})
@@ -818,7 +814,7 @@ class MemoryUiService:
             "changed": changed,
             "changed_count": len(changed),
             "failed": failed,
-            "physical_delete": False,
+            "physical_delete": action == "reject",
         }
 
     async def create_event(self, data: dict) -> dict[str, object]:
@@ -1215,20 +1211,115 @@ class MemoryUiService:
             await db.commit()
         return {"status": "ok"}
 
-    async def delete_jargon(self, jargon_id: str) -> dict[str, str]:
-        result = await self.delete_canonical(str(jargon_id))
-        result.update({"legacy": False, "mode": "canonical_soft_delete"})
-        return result
+    async def delete_jargon(self, jargon_id: str) -> dict[str, object]:
+        clean_id = str(jargon_id or "").strip()
+        if not clean_id:
+            return {"status": "error", "changed": False, "physical_delete": True}
+
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+        current = None
+        metadata: dict = {}
+        content = ""
+        group_id = ""
+        if store and hasattr(store, "get_canonical"):
+            current = await store.get_canonical(clean_id, include_inactive=True)
+            if current is not None and str(getattr(current, "kind", "") or "") != "jargon":
+                return {"status": "not_found", "changed": False, "physical_delete": True}
+            if current is not None:
+                metadata = dict(getattr(current, "metadata", {}) or {})
+                content = str(getattr(current, "content", "") or "")
+                group_id = str(getattr(current, "session_id", "") or "")
+            changed = (
+                await store.hard_delete(clean_id, kind="jargon")
+                if hasattr(store, "hard_delete")
+                else 0
+            )
+            runtime_bound = True
+        else:
+            changed = 0
+            runtime_bound = False
+            async with self.db_factory() as db:
+                try:
+                    async with db.execute(
+                        "SELECT content, session_id, metadata FROM canonical_memories WHERE id = ? AND kind = 'jargon'",
+                        (clean_id,),
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if row:
+                        content = str(row[0] or "")
+                        group_id = str(row[1] or "")
+                        try:
+                            metadata = json.loads(row[2] or "{}")
+                            if not isinstance(metadata, dict):
+                                metadata = {}
+                        except Exception:
+                            metadata = {}
+                    try:
+                        await db.execute("DELETE FROM canonical_fts WHERE memory_id = ?", (clean_id,))
+                    except Exception:
+                        pass
+                    try:
+                        await db.execute(
+                            "DELETE FROM memory_dedup_aliases WHERE canonical_memory_id = ?",
+                            (clean_id,),
+                        )
+                    except Exception:
+                        pass
+                    cursor = await db.execute(
+                        "DELETE FROM canonical_memories WHERE id = ? AND kind = 'jargon'",
+                        (clean_id,),
+                    )
+                    changed = int(cursor.rowcount or 0)
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+
+        legacy_deleted = 0
+        if changed and self.db_factory is not None:
+            async with self.db_factory() as db:
+                try:
+                    legacy_id = metadata.get("legacy_jargon_id")
+                    if legacy_id is not None:
+                        cursor = await db.execute("DELETE FROM Jargon WHERE id = ?", (legacy_id,))
+                    else:
+                        cursor = await db.execute(
+                            "DELETE FROM Jargon WHERE group_id = ? AND content = ?",
+                            (group_id, content),
+                        )
+                    legacy_deleted = int(cursor.rowcount or 0)
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+
+        projection_deleted = 0
+        projection_cleanup_error = ""
+        if changed and projector and hasattr(projector, "cleanup_deleted"):
+            try:
+                projection_deleted = int(await projector.cleanup_deleted([clean_id]) or 0)
+            except Exception as exc:
+                projection_cleanup_error = str(exc)[:300]
+        return {
+            "status": "ok",
+            "changed": bool(changed),
+            "physical_delete": True,
+            "legacy": False,
+            "legacy_deleted": legacy_deleted,
+            "projection_deleted": projection_deleted,
+            "projection_cleanup_error": projection_cleanup_error,
+            "runtime_bound": runtime_bound,
+            "mode": "canonical_hard_delete",
+        }
 
     async def approve_jargon(self, jargon_id: str, data: dict | None = None) -> dict[str, str]:
         payload = dict(data or {})
         payload.update({"status": "active", "manual_action": "approve"})
         return await self.update_jargon(str(jargon_id), payload)
 
-    async def reject_jargon(self, jargon_id: str, data: dict | None = None) -> dict[str, str]:
-        payload = dict(data or {})
-        payload.update({"status": "rejected", "manual_action": "reject"})
-        return await self.update_jargon(str(jargon_id), payload)
+    async def reject_jargon(self, jargon_id: str, data: dict | None = None) -> dict[str, object]:
+        result = await self.delete_jargon(str(jargon_id))
+        result["action"] = "reject"
+        return result
 
 
 __all__ = ["MemoryUiService"]

@@ -323,6 +323,15 @@ class AstrMaiAdminPageApi:
         body = await self._body(request)
         return await self._admin().run_reflect_once(str(body.get("chat_id") or query.get("chat_id") or ""))
 
+    async def run_expression_backfill(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._admin().run_expression_backfill(
+            str(body.get("chat_id") or ""),
+            limit=self._int(body.get("limit"), 120),
+            max_age_seconds=float(body.get("max_age_seconds") or 604800),
+            dry_run=bool(body.get("dry_run", True)),
+        )
+
     async def proactive_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().proactive_status()
 
@@ -698,6 +707,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/learning/expression-stats", api.expression_stats, "AstrMai expression stats"),
         ("GET", "/learning/cooldowns", api.expression_cooldowns, "AstrMai expression cooldowns"),
         ("POST", "/learning/reflect/run-once", api.run_reflect_once, "AstrMai run reflect once"),
+        ("POST", "/learning/expression-backfill", api.run_expression_backfill, "AstrMai expression history backfill"),
         ("GET", "/proactive/status", api.proactive_status, "AstrMai proactive status"),
         ("GET", "/proactive/intents", api.proactive_intents, "AstrMai proactive intents"),
         ("GET", "/proactive/dream/status", api.dream_status, "AstrMai dream status"),

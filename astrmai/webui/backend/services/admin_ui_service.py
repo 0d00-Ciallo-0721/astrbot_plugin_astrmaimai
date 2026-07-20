@@ -1075,6 +1075,24 @@ class AdminUiService:
             await auto_check.run_once(chat_id)
         return {"status": "ok", "runtime_bound": True}
 
+    async def run_expression_backfill(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 120,
+        max_age_seconds: float = 604800,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        if not evolution or not hasattr(evolution, "run_expression_backfill"):
+            return {"status": "error", "message": "表达学习运行时未绑定"}
+        return await evolution.run_expression_backfill(
+            chat_id,
+            limit=limit,
+            max_age_seconds=max_age_seconds,
+            dry_run=dry_run,
+        )
+
     async def active_chats(self, max_age_seconds: float = 1800) -> dict[str, Any]:
         coordinator = self.plugin_api.get_runtime_coordinator()
         if not coordinator or not hasattr(coordinator, "list_active_chats"):

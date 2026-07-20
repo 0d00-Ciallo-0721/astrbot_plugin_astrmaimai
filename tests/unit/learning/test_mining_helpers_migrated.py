@@ -123,7 +123,10 @@ class MiningHelpersMigratedTests(unittest.TestCase):
             )
 
         result = asyncio.run(_run())
-        self.assertEqual(result, [])
+        self.assertEqual(result.status, "provider_error")
+        self.assertTrue(result.retryable)
+        self.assertFalse(result.terminal)
+        self.assertEqual(result.items, [])
 
     def test_jargon_miner_filters_blank_messages_before_delegating(self):
         miner = _FakeExpressionMiner()

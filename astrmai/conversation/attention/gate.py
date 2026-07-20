@@ -207,8 +207,14 @@ class AttentionGate:
     def _score_focus_candidate(self, candidate, normalized_events):
         return score_focus_candidate(self, candidate, normalized_events)
 
-    def _select_focus_event(self, events, self_id: str, normalized_events=None):
-        return select_focus_event(self, events, self_id, normalized_events=normalized_events)
+    def _select_focus_event(self, events, self_id: str, normalized_events=None, *, is_private: bool = False):
+        return select_focus_event(
+            self,
+            events,
+            self_id,
+            normalized_events=normalized_events,
+            is_private=is_private,
+        )
 
     def _resolve_thread_root(self, focus_candidate, normalized_events):
         return resolve_thread_root(self, focus_candidate, normalized_events)
@@ -545,6 +551,67 @@ class AttentionGate:
         event.set_extra("astrmai_turn_thread_id", thread_id)
         event.set_extra("astrmai_turn_generation", generation)
         event.set_extra("astrmai_turn_created_at", created_at)
+
+    def _bind_private_batch_turn(self, focus_event, batch_events: list[AstrMessageEvent], chat_id: str) -> None:
+        if not batch_events:
+            return
+
+        focus_event.set_extra("is_private_chat", True)
+        focus_event.set_extra("astrmai_turn_mode", "private")
+        latest_timestamp = max(
+            float(event.get_extra("astrmai_timestamp", getattr(event, "timestamp", 0.0)) or 0.0)
+            for event in batch_events
+        )
+        previous_timestamp = float(
+            focus_event.get_extra("astrmai_timestamp", getattr(focus_event, "timestamp", 0.0)) or 0.0
+        )
+        if previous_timestamp != latest_timestamp:
+            focus_event.set_extra("astrmai_focus_original_timestamp", previous_timestamp)
+        focus_event.set_extra("astrmai_timestamp", latest_timestamp)
+        focus_event.set_extra("astrmai_private_batch_latest_ts", latest_timestamp)
+
+        turns = [
+            event.get_extra("astrmai_turn_identity", None)
+            for event in batch_events
+            if event.get_extra("astrmai_turn_identity", None) is not None
+        ]
+        if not turns:
+            return
+        latest_turn = max(
+            turns,
+            key=lambda turn: (int(getattr(turn, "generation", 0) or 0), float(getattr(turn, "created_at", 0.0) or 0.0)),
+        )
+        message_ids: list[str] = []
+        for event in batch_events:
+            turn = event.get_extra("astrmai_turn_identity", None)
+            turn_ids = tuple(getattr(turn, "input_message_ids", ()) or ())
+            candidates = turn_ids or (self._build_message_id(event),)
+            for message_id in candidates:
+                normalized_id = str(message_id or "").strip()
+                if normalized_id and normalized_id not in message_ids:
+                    message_ids.append(normalized_id)
+
+        merged_turn = TurnIdentity(
+            mode="private",
+            chat_id=str(getattr(latest_turn, "chat_id", "") or chat_id),
+            thread_id=str(
+                getattr(latest_turn, "thread_id", "")
+                or build_p0_thread_id("private", chat_id)
+            ),
+            generation=int(getattr(latest_turn, "generation", 0) or 0),
+            sender_id=str(focus_event.get_sender_id() or getattr(latest_turn, "sender_id", "") or ""),
+            input_message_ids=tuple(message_ids),
+            created_at=float(getattr(latest_turn, "created_at", 0.0) or latest_timestamp),
+        )
+        focus_event.set_extra("astrmai_turn_identity", merged_turn)
+        focus_event.set_extra("astrmai_turn_thread_id", merged_turn.thread_id)
+        focus_event.set_extra("astrmai_turn_generation", merged_turn.generation)
+        focus_event.set_extra("astrmai_turn_created_at", merged_turn.created_at)
+        burst_basis = f"{chat_id}|{merged_turn.generation}|{'|'.join(message_ids)}"
+        focus_event.set_extra(
+            "astrmai_private_burst_id",
+            hashlib.sha256(burst_basis.encode("utf-8", errors="ignore")).hexdigest()[:16],
+        )
 
     async def _handle_system2_failure(self, event: AstrMessageEvent, exc: Exception) -> None:
         logger.error(f"[Attention Task Error] {exc}", exc_info=exc)
@@ -940,6 +1007,9 @@ class AttentionGate:
         extracted_images = context["extracted_images"]
         is_private = context["is_private"]
 
+        event.set_extra("is_private_chat", bool(is_private))
+        event.set_extra("astrmai_turn_mode", "private" if is_private else "group")
+
         await self._ensure_turn_identity(event, chat_id, is_private)
 
         debug_trace(event, "attention_ingress", chat_id=chat_id, sender_id=sender_id, preview=preview_text(msg_str, 80))
@@ -1122,15 +1192,30 @@ class AttentionGate:
                 events = await self._format_and_filter_messages(merged_events)
                 if events:
                     normalized = self._build_normalized_events(events, self_id)
-                    focus_event, _, _ = self._select_focus_event(events, self_id, normalized_events=normalized)
+                    focus_event, _, focus_reason = self._select_focus_event(
+                        events,
+                        self_id,
+                        normalized_events=normalized,
+                        is_private=is_private,
+                    )
                     if focus_event is None:
                         focus_event = events[-1]
+                    if is_private:
+                        bind_batch_context = getattr(
+                            self.private_turn_coordinator,
+                            "bind_batch_context",
+                            None,
+                        )
+                        if callable(bind_batch_context):
+                            bind_batch_context(batch_events, focus_event)
+                        self._bind_private_batch_turn(focus_event, batch_events, chat_id)
+                        normalized = self._build_normalized_events(events, self_id)
                     focus_candidate = next((candidate for candidate in normalized if candidate.event is focus_event), None)
                     if focus_candidate is None:
                         focus_candidate = normalized[-1]
                     root_candidate, root_reason = self._resolve_thread_root(focus_candidate, normalized)
                     focus_thread = self._build_focus_thread(focus_candidate, root_candidate, normalized)
-                    focus_thread.focus_reason = focus_thread.focus_reason or "selected_focus_event"
+                    focus_thread.focus_reason = focus_thread.focus_reason or focus_reason or "selected_focus_event"
                     focus_thread.root_reason = focus_thread.root_reason or root_reason
 
                     emit_legacy_focus_thread_extras(focus_event, focus_thread, window_events=events)
@@ -1169,6 +1254,22 @@ class AttentionGate:
                         root_reason=focus_thread.root_reason,
                         focus_preview=preview_text(str(getattr(focus_event, "message_str", "") or ""), 80),
                         judge_action=judge_action,
+                        private_burst_size=len(batch_events) if is_private else 0,
+                        private_generation=(
+                            getattr(focus_event.get_extra("astrmai_turn_identity", None), "generation", 0)
+                            if is_private
+                            else 0
+                        ),
+                        private_vision_count=(
+                            len(focus_event.get_extra("astrmai_vision_records", []) or [])
+                            if is_private
+                            else 0
+                        ),
+                        private_vision_failed=(
+                            bool(focus_event.get_extra("astrmai_vision_barrier_failed", False))
+                            if is_private
+                            else False
+                        ),
                     )
                     if judge_action == "WAIT":
                         if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):

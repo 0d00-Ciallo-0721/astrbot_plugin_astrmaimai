@@ -807,6 +807,12 @@
         "default": 2,
         "hint": "只有重复出现到一定次数的表达，才会进入审核流程。"
       },
+      "expression_min_count": {
+        "description": "表达候选最少证据次数",
+        "type": "int",
+        "default": 2,
+        "hint": "同一表达至少出现多少次，才会送入模型整理。提高此值可减少偶然口语进入待审。"
+      },
       "jargon_min_count": {
         "description": "黑话进入审核的最小证据次数",
         "type": "int",
@@ -1055,8 +1061,8 @@
         "type": "int",
         "default": 120,
         "minimum": 1,
-        "maximum": 7200,
-        "hint": "工作模式完成多步工具任务的总时间预算。"
+        "maximum": 86400,
+        "hint": "工作模式完成多步工具任务的总时间预算，最长可设置为 24 小时。"
       },
       "attention_judge_timeout_sec": {
         "description": "注意力判断超时（秒）",

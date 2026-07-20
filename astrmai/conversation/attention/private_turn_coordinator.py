@@ -50,7 +50,81 @@ class PrivateTurnCoordinator:
         for event in events:
             if bool(event.get_extra("astrmai_vision_barrier_complete", False)):
                 continue
-            await self._prepare_event(event, chat_id)
+            try:
+                await self._prepare_event(event, chat_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[AstrMai-Vision] unexpected private vision failure for {chat_id}: {exc}",
+                    exc_info=True,
+                )
+                event.set_extra("astrmai_vision_barrier_complete", True)
+                event.set_extra("astrmai_vision_barrier_failed", True)
+                self._append_failure_context(event, 1)
+
+    def bind_batch_context(self, events: list[Any], focus_event: Any) -> None:
+        """Attach all visual facts from a private input burst to its final focus event."""
+        image_refs: list[str] = []
+        records: list[dict[str, Any]] = []
+        seen_records: set[str] = set()
+        image_events: list[Any] = []
+        failed_count = 0
+
+        for event in events:
+            direct_refs = list(
+                event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
+                or []
+            )
+            extracted_refs = list(
+                event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+                or []
+            )
+            event_records = list(event.get_extra("astrmai_vision_records", []) or [])
+            if direct_refs or extracted_refs or event_records or event.get_extra("astrmai_vision_barrier_complete", False):
+                image_events.append(event)
+            for ref in [*direct_refs, *extracted_refs]:
+                normalized_ref = str(ref or "").strip()
+                if normalized_ref and normalized_ref not in image_refs:
+                    image_refs.append(normalized_ref)
+            for record in event_records:
+                copied = dict(record or {})
+                record_key = str(
+                    copied.get("picid")
+                    or copied.get("source_ref")
+                    or copied.get("description")
+                    or ""
+                )
+                if not record_key or record_key in seen_records:
+                    continue
+                seen_records.add(record_key)
+                records.append(copied)
+            if bool(event.get_extra("astrmai_vision_barrier_failed", False)):
+                failed_count += 1
+
+        if not image_events:
+            return
+
+        descriptions = [str(record.get("description", "") or "") for record in records]
+        focus_event.set_extra("extracted_image_urls", list(image_refs))
+        focus_event.set_extra("extracted_image_refs", list(image_refs))
+        focus_event.set_extra("direct_vision_urls", list(image_refs))
+        focus_event.set_extra("direct_image_refs", list(image_refs))
+        focus_event.set_extra("astrmai_vision_records", records)
+        focus_event.set_extra("astrmai_visual_context", records)
+        focus_event.set_extra("astrmai_image_context", records)
+        focus_event.set_extra("astrmai_vision_picids", [record.get("picid") for record in records])
+        focus_event.set_extra("astrmai_vision_descriptions", descriptions)
+        focus_event.set_extra(
+            "astrmai_vision_barrier_complete",
+            all(bool(event.get_extra("astrmai_vision_barrier_complete", False)) for event in image_events),
+        )
+        focus_event.set_extra("astrmai_vision_barrier_failed", bool(failed_count))
+        focus_event.set_extra(
+            "astrmai_rich_text",
+            str(getattr(focus_event, "message_str", "") or "").strip(),
+        )
+        self._append_vision_context(focus_event, records, failed_count)
 
     async def prepare_direct_event(self, event: Any, chat_id: str) -> None:
         """Resolve a directly addressed image before group decision/dispatch."""

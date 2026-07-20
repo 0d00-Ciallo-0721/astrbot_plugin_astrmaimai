@@ -52,6 +52,7 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/heartflow/topic-digests", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/proactive/intents", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/learning/status", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/learning/expression-backfill", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/memory-feedback/sources", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/tools/executions", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/memories/jargon/cleanup/preview", paths)
@@ -83,6 +84,7 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/update", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/restore", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/learning/expression-backfill", ("POST",)), mutating)
         self.assertNotIn((f"{PLUGIN_API_PREFIX}/persona/save", ("POST",)), mutating)
 
     def test_registered_plugin_page_handlers_accept_astrbot_path_kwargs(self):
@@ -148,6 +150,9 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn("cachedFetch", app_js)
         self.assertIn("/tools/executions", app_js)
         self.assertIn("/memories/jargon/cleanup/preview", app_js)
+        self.assertIn('status=active&', app_js)
+        self.assertIn("物理删除所选项", app_js)
+        self.assertNotIn("软驳回所选项", app_js)
         self.assertIn('state.current === "dashboard" && state.dashboardTab === "cognition"', app_js)
         self.assertIn("startSchedulerPolling()", app_js)
         self.assertIn("stopSchedulerPolling()", app_js)

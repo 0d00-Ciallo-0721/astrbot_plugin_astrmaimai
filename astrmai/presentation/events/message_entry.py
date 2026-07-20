@@ -89,6 +89,11 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     scope = MessageScope.from_event(event)
     msg = event.message_str.strip() if event.message_str else ""
+    try:
+        event.set_extra("is_private_chat", bool(scope.is_private_chat))
+        event.set_extra("astrmai_turn_mode", "private" if scope.is_private_chat else "group")
+    except Exception:
+        logger.debug("[AstrMai] failed to attach message scope markers", exc_info=True)
 
     try:
         command_decision = check_framework_command(facade, msg, event=event)

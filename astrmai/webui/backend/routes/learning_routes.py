@@ -14,6 +14,13 @@ class ReflectRunOncePayload(BaseModel):
     chat_id: str | None = None
 
 
+class ExpressionBackfillPayload(BaseModel):
+    chat_id: str
+    limit: int = 120
+    max_age_seconds: float = 604800
+    dry_run: bool = True
+
+
 def _service() -> LearningService:
     return LearningService(PluginApiAdapter())
 
@@ -45,4 +52,20 @@ async def run_reflect_once(
     result = await _service().run_reflect_once(str(effective_chat_id))
     if result.get("status") == "error":
         raise HTTPException(status_code=409, detail=result.get("message", "Reflector unavailable"))
+    return result
+
+
+@router.post("/expression-backfill")
+async def run_expression_backfill(
+    payload: Annotated[ExpressionBackfillPayload, Body()],
+    user: str = Depends(get_current_user),
+):
+    result = await _service().run_expression_backfill(
+        payload.chat_id,
+        limit=payload.limit,
+        max_age_seconds=payload.max_age_seconds,
+        dry_run=payload.dry_run,
+    )
+    if result.get("status") == "error":
+        raise HTTPException(status_code=409, detail=result.get("message", "Expression backfill unavailable"))
     return result

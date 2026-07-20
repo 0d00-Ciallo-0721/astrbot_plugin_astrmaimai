@@ -85,6 +85,7 @@ class ExpressionPatternService:
         normalized = str(source or "").strip().lower()
         return normalized in {
             "learning_expression_pattern",
+            "learning_expression_backfill",
             "legacy_expression_write",
         }
 
@@ -450,16 +451,45 @@ class ExpressionPatternService:
         incoming_samples = self._sample_list(payload.get("content_samples", []))
         now = time.time()
         existing_metadata = dict(existing.metadata or {}) if existing else {}
+        incoming_evidence_ids = [
+            str(item)
+            for item in (payload.get("evidence_message_ids") or [])
+            if str(item or "").strip()
+        ]
+        existing_evidence_ids = [
+            str(item)
+            for item in (existing_metadata.get("evidence_message_ids") or [])
+            if str(item or "").strip()
+        ]
+        existing_evidence_set = set(existing_evidence_ids)
+        unseen_evidence_ids = [item for item in incoming_evidence_ids if item not in existing_evidence_set]
+        mining_batch_id = str(payload.get("mining_batch_id") or "").strip()
+        applied_batch_ids = [
+            str(item)
+            for item in (existing_metadata.get("applied_mining_batch_ids") or [])
+            if str(item or "").strip()
+        ]
+        if existing and mining_batch_id and mining_batch_id in applied_batch_ids and not unseen_evidence_ids:
+            return str(existing.id)
         incoming_review_status = self._normalize_incoming_review_status(payload.get("review_status", "pending"), source=source)
         review_status = self._merge_review_status(existing_metadata.get("review_status", ""), incoming_review_status)
         merged_samples = self._sample_list([*self._sample_list(existing_metadata.get("content_samples", [])), *incoming_samples])
-        merged_count = int(existing_metadata.get("count") or 0) + max(int(payload.get("count") or 1), 1)
+        incoming_count = max(int(payload.get("count") or 1), 1)
+        if existing and incoming_evidence_ids:
+            count_increment = len(unseen_evidence_ids)
+        elif existing and mining_batch_id in applied_batch_ids:
+            count_increment = 0
+        else:
+            count_increment = incoming_count
+        merged_count = int(existing_metadata.get("count") or 0) + count_increment
         merged_weight = max(
             0.0,
             min(
                 3.0,
-                self._safe_float(existing_metadata.get("weight"), 0.0)
-                + max(self._safe_float(payload.get("weight"), 1.0), 0.1),
+                max(
+                    self._safe_float(existing_metadata.get("weight"), 0.0),
+                    max(self._safe_float(payload.get("weight"), 1.0), 0.1),
+                ),
             ),
         )
         summary = str(payload.get("summary") or expression).strip()
@@ -481,6 +511,11 @@ class ExpressionPatternService:
             "last_active_time": now,
             "confidence": confidence,
             "summary": summary,
+            "candidate_id": str(payload.get("candidate_id") or existing_metadata.get("candidate_id") or ""),
+            "evidence_message_ids": list(dict.fromkeys([*existing_evidence_ids, *incoming_evidence_ids]))[-256:],
+            "applied_mining_batch_ids": list(
+                dict.fromkeys([*applied_batch_ids, *([mining_batch_id] if mining_batch_id else [])])
+            )[-128:],
         }
         if payload.get("legacy_pattern_id"):
             metadata["legacy_pattern_id"] = payload.get("legacy_pattern_id")

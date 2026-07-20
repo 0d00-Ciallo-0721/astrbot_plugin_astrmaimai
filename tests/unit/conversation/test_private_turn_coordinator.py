@@ -138,6 +138,36 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_vision_records")[0]["type"], "emoji")
         self.assertEqual(event.get_extra("astrmai_vision_records")[0]["emotion_tags"], ["无奈", "自嘲"])
 
+    def test_prepare_batch_fails_open_when_one_event_raises_unexpectedly(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(input_settle_sec=0.0),
+            vision=SimpleNamespace(enable_vision=True),
+        )
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=object(),
+            visual_cortex=None,
+        )
+        first = _Event("第一张")
+        second = _Event("后续文字")
+        calls = []
+
+        async def prepare(event, chat_id):
+            calls.append(event.message_str)
+            if event is first:
+                raise RuntimeError("unexpected vision failure")
+
+        coordinator._prepare_event = prepare
+
+        asyncio.run(coordinator.prepare_batch([first, second], "ff:FriendMessage:user-1"))
+
+        self.assertEqual(calls, ["第一张", "后续文字"])
+        self.assertTrue(first.get_extra("astrmai_vision_barrier_complete"))
+        self.assertTrue(first.get_extra("astrmai_vision_barrier_failed"))
+        self.assertIn("禁止猜测", first.get_extra("astrmai_rich_text"))
+
 
 if __name__ == "__main__":
     unittest.main()

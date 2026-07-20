@@ -80,6 +80,47 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_hard_delete_removes_canonical_fts_and_dedup_aliases(self):
+        async def run():
+            store, *_rest = self._services()
+            result = await store.upsert(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="chat-1",
+                    content="hiyohiyo",
+                    summary="招呼语",
+                    dedup_key="jargon:chat-1:hiyohiyo",
+                    status="active",
+                )
+            )
+            memory_id = result.memory_id
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "INSERT INTO memory_dedup_aliases(alias_key, canonical_memory_id, created_at) VALUES (?, ?, ?)",
+                    ("jargon:chat-1:old-hiyohiyo", memory_id, 1.0),
+                )
+                await db.commit()
+
+            changed = await store.hard_delete(memory_id, kind="jargon")
+            async with aiosqlite.connect(self.db_path) as db:
+                canonical_count = int((await (await db.execute(
+                    "SELECT COUNT(*) FROM canonical_memories WHERE id = ?", (memory_id,)
+                )).fetchone())[0])
+                fts_count = int((await (await db.execute(
+                    "SELECT COUNT(*) FROM canonical_fts WHERE memory_id = ?", (memory_id,)
+                )).fetchone())[0])
+                alias_count = int((await (await db.execute(
+                    "SELECT COUNT(*) FROM memory_dedup_aliases WHERE canonical_memory_id = ?", (memory_id,)
+                )).fetchone())[0])
+
+            self.assertEqual(changed, 1)
+            self.assertEqual(canonical_count, 0)
+            self.assertEqual(fts_count, 0)
+            self.assertEqual(alias_count, 0)
+
+        asyncio.run(run())
+
     def test_quality_audit_quarantines_legacy_question_facts_and_duplicate_feedback(self):
         async def run():
             store, _retrieval, _writer, _injection, _tools, maintenance = self._services()

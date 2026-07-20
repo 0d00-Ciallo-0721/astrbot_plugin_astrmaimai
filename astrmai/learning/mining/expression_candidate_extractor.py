@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from typing import Any
@@ -37,6 +38,27 @@ class ExpressionCandidateExtractor:
     @staticmethod
     def _normalize_text(value: str) -> str:
         return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+    @staticmethod
+    def _message_evidence_id(message: Any, *, fallback_index: int) -> str:
+        raw_id = getattr(message, "id", None)
+        if raw_id is not None and str(raw_id).strip():
+            return str(raw_id)
+        payload = "|".join(
+            (
+                str(getattr(message, "group_id", "") or ""),
+                str(getattr(message, "sender_id", "") or ""),
+                str(getattr(message, "timestamp", "") or ""),
+                str(getattr(message, "content", "") or ""),
+                str(fallback_index),
+            )
+        )
+        return f"synthetic:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
+
+    @staticmethod
+    def _candidate_id(group_id: str, candidate_type: str, normalized_expression: str) -> str:
+        payload = f"{group_id}|{candidate_type}|{normalized_expression}"
+        return f"expr:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
 
     @classmethod
     def _looks_noise(cls, text: str) -> bool:
@@ -121,14 +143,16 @@ class ExpressionCandidateExtractor:
         samples: dict[str, list[str]] = defaultdict(list)
         situations: dict[str, str] = {}
         styles: dict[str, str] = {}
+        evidence_ids: dict[str, list[str]] = defaultdict(list)
         existing = {self._normalize_text(item) for item in (existing_patterns or set()) if self._normalize_text(item)}
         phrase_counts: dict[str, int] = defaultdict(int)
         phrase_samples: dict[str, list[str]] = defaultdict(list)
+        phrase_evidence_ids: dict[str, list[str]] = defaultdict(list)
         accepted_messages = 0
         skipped_noise = 0
         skipped_existing = 0
 
-        for message in messages or []:
+        for message_index, message in enumerate(messages or []):
             content = self._clean_text(getattr(message, "content", ""))
             if self._looks_noise(content):
                 skipped_noise += 1
@@ -138,7 +162,10 @@ class ExpressionCandidateExtractor:
                 skipped_existing += 1
                 continue
             accepted_messages += 1
+            evidence_id = self._message_evidence_id(message, fallback_index=message_index)
             counts[normalized] += 1
+            if evidence_id not in evidence_ids[normalized]:
+                evidence_ids[normalized].append(evidence_id)
             if len(samples[normalized]) < 4:
                 samples[normalized].append(content[:160])
             situations.setdefault(normalized, self._infer_situation(content))
@@ -148,6 +175,8 @@ class ExpressionCandidateExtractor:
                 if self._near_duplicate(normalized_phrase, existing):
                     continue
                 phrase_counts[normalized_phrase] += 1
+                if evidence_id not in phrase_evidence_ids[normalized_phrase]:
+                    phrase_evidence_ids[normalized_phrase].append(evidence_id)
                 if len(phrase_samples[normalized_phrase]) < 4:
                     phrase_samples[normalized_phrase].append(content[:160])
 
@@ -172,6 +201,8 @@ class ExpressionCandidateExtractor:
                     "activation_score": activation_score,
                     "think_level": 1 if len(expression) >= 10 else 0,
                     "candidate_type": "exact",
+                    "candidate_id": self._candidate_id(group_id, "exact", normalized),
+                    "evidence_message_ids": list(evidence_ids.get(normalized, [])),
                 }
             )
             existing.add(normalized)
@@ -201,6 +232,8 @@ class ExpressionCandidateExtractor:
                     "activation_score": min(1.0, 0.35 + count * 0.16),
                     "think_level": 0,
                     "candidate_type": "phrase",
+                    "candidate_id": self._candidate_id(group_id, "phrase", phrase),
+                    "evidence_message_ids": list(phrase_evidence_ids.get(phrase, [])),
                 }
             )
             existing.add(phrase)

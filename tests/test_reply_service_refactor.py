@@ -122,6 +122,23 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
         plugin.hiy_tts_from_text.assert_not_called()
 
+    def test_private_overdue_reply_is_allowed_without_newer_activity(self):
+        service = self._service()
+        event_ts = time.time() - 10.0
+        service.config.reply.stale_reply_max_age_sec = 1.0
+        service.runtime_coordinator = _FakeRuntimeCoordinator((event_ts, "user-1", "Alice", "旧消息"))
+        event = FakeEvent("user-1", "Alice", "问题")
+        event.unified_msg_origin = "default:FriendMessage:user-1"
+        event.set_extra("is_private_chat", True)
+        event.set_extra("astrmai_timestamp", event_ts)
+
+        state, reason = asyncio.run(
+            service._check_reply_freshness(event, event.unified_msg_origin)
+        )
+
+        self.assertEqual(state, self.reply_mod.FreshnessState.FRESH)
+        self.assertEqual(reason, "")
+
     def test_private_tts_appends_voice_after_text(self):
         service = self._service()
         self._enable_tts(service, send_text_with_audio=True)

@@ -20,6 +20,7 @@ from .contracts.learning_events import (
 from .logging.bot_reply_recorder import BotReplyRecorder
 from .logging.message_recorder import MessageRecorder
 from .mining.expression_miner import ExpressionMiner
+from .mining.expression_results import PatternSaveReport
 from .mining.jargon_miner import JargonMiner
 
 
@@ -58,6 +59,7 @@ class EvolutionManager:
         self._backlog_task: asyncio.Task | None = None
         self._backlog_failure_until: dict[str, float] = {}
         self._last_backlog_report: dict[str, Any] = {}
+        self._last_expression_backfill: dict[str, Any] = {}
         self._last_mining_outcomes: dict[str, dict[str, Any]] = {}
 
     def refresh_config(self, config):
@@ -196,6 +198,28 @@ class EvolutionManager:
             return await self.db.get_unprocessed_logs_async(group_id, limit=limit)
         return self.db.get_unprocessed_logs(group_id, limit=limit)
 
+    async def _load_recent_logs(
+        self,
+        group_id: str,
+        *,
+        limit: int,
+        max_age_seconds: float,
+    ):
+        if hasattr(self.db, "get_recent_message_logs_async"):
+            return await self.db.get_recent_message_logs_async(
+                group_id,
+                limit=limit,
+                max_age_seconds=max_age_seconds,
+                include_processed=True,
+            )
+        return await asyncio.to_thread(
+            self.db.get_recent_message_logs,
+            group_id,
+            limit,
+            max_age_seconds,
+            True,
+        )
+
     async def _list_unprocessed_log_groups(self, *, min_count: int, limit: int) -> list[dict[str, Any]]:
         if hasattr(self.db, "list_unprocessed_log_groups_async"):
             return list(await self.db.list_unprocessed_log_groups_async(min_count=min_count, limit=limit) or [])
@@ -250,12 +274,74 @@ class EvolutionManager:
                 "worker_running": bool(self._backlog_task is not None and not self._backlog_task.done()),
                 "last_report": dict(self._last_backlog_report or {}),
             },
+            "expression_backfill": dict(self._last_expression_backfill or {}),
             "mining": {
                 "expression": dict(getattr(self.expression_miner, "last_report", {}) or {}),
                 "jargon": dict(getattr(self.jargon_miner, "last_report", {}) or {}),
                 "last_outcomes": dict(self._last_mining_outcomes),
             },
         }
+
+    async def run_expression_backfill(
+        self,
+        group_id: str,
+        *,
+        limit: int = 120,
+        max_age_seconds: float = 604800,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        group_id = str(group_id or "").strip()
+        if not group_id:
+            return {"status": "error", "message": "chat_id is required"}
+        limit = max(10, min(int(limit or 120), 500))
+        max_age_seconds = max(3600.0, min(float(max_age_seconds or 604800), 2592000.0))
+        group_lock = await self._get_mining_lock(group_id)
+        async with group_lock:
+            logs = list(
+                await self._load_recent_logs(
+                    group_id,
+                    limit=limit,
+                    max_age_seconds=max_age_seconds,
+                )
+                or []
+            )
+            patterns = await self.expression_miner.mine(group_id, logs)
+            expression_report = dict(getattr(self.expression_miner, "last_report", {}) or {})
+            enrichment = expression_report.get("enrichment")
+            terminal = not isinstance(enrichment, dict) or bool(enrichment.get("terminal"))
+            result: dict[str, Any] = {
+                "status": "ok" if terminal else "degraded",
+                "chat_id": group_id,
+                "dry_run": bool(dry_run),
+                "input_count": len(logs),
+                "candidate_count": int(expression_report.get("candidate_count", 0) or 0),
+                "pattern_count": len(patterns),
+                "candidate_ids": [str(item.get("candidate_id") or "") for item in patterns],
+                "expression": expression_report,
+                "processed_flags_changed": False,
+                "checked_at": time.time(),
+            }
+            if not terminal:
+                result["message"] = "表达增强未完成，历史消息保持不变，可稍后重试"
+            elif not dry_run:
+                batch_id = self._mining_batch_id(group_id, logs, prefix="backfill")
+                persistence = await self._save_patterns(
+                    patterns,
+                    mining_batch_id=batch_id,
+                    source="learning_expression_backfill",
+                )
+                result["persistence"] = persistence.to_report()
+                if not persistence.complete:
+                    result["status"] = "degraded"
+                    result["message"] = "部分表达候选未能持久化，可安全重试"
+            self._last_expression_backfill = result
+            memory_engine = getattr(self.db, "memory_engine", None)
+            store = getattr(memory_engine, "v2_store", None)
+            setter = getattr(store, "set_meta", None)
+            if callable(setter):
+                key = hashlib.sha256(group_id.encode("utf-8")).hexdigest()[:24]
+                await setter(f"expression_backfill:{key}", json.dumps(result, ensure_ascii=False))
+            return result
 
     @staticmethod
     def _field(item, key, default=None):
@@ -281,14 +367,39 @@ class EvolutionManager:
             return normalized
         return "review_pending"
 
-    async def _save_patterns(self, patterns) -> None:
+    @classmethod
+    def _mining_batch_id(cls, group_id: str, logs: List["MessageLog"], *, prefix: str = "live") -> str:
+        evidence = [str(cls._field(log, "id", "")) for log in logs if cls._field(log, "id") is not None]
+        payload = f"{prefix}|{group_id}|{'|'.join(evidence)}"
+        return f"{prefix}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+    async def _save_patterns(
+        self,
+        patterns,
+        *,
+        mining_batch_id: str = "",
+        source: str = "learning_expression_pattern",
+    ) -> PatternSaveReport:
+        report = PatternSaveReport(attempted=len(patterns or []))
         memory_engine = getattr(self.db, "memory_engine", None)
         service = getattr(memory_engine, "expression_pattern_service", None) if memory_engine else None
-        if service and hasattr(service, "write_pattern"):
-            for pattern in patterns or []:
-                review_status = self._normalize_pattern_review_status(self._field(pattern, "review_status", "pending"))
-                await service.write_pattern(
-                    str(self._field(pattern, "group_id", "") or ""),
+        if not service or not hasattr(service, "write_pattern"):
+            if report.attempted:
+                report.failed = report.attempted
+                report.failures.append("expression_pattern_service_unavailable")
+            return report
+        for pattern in patterns or []:
+            review_status = self._normalize_pattern_review_status(self._field(pattern, "review_status", "pending"))
+            group_id = str(self._field(pattern, "group_id", "") or "")
+            expression = str(self._field(pattern, "expression", "") or "")
+            situation = str(self._field(pattern, "situation", "") or "")
+            shared_scope = str(self._field(pattern, "shared_scope", "") or group_id)
+            existing = None
+            try:
+                dedup_key = service.build_dedup_key(group_id, situation, expression, shared_scope)
+                existing = await service.store.get_by_dedup_key(dedup_key, include_inactive=True)
+                memory_id = await service.write_pattern(
+                    group_id,
                     {
                         "expression": self._field(pattern, "expression", ""),
                         "situation": self._field(pattern, "situation", ""),
@@ -304,11 +415,25 @@ class EvolutionManager:
                         "summary": self._field(pattern, "summary", self._field(pattern, "expression", "")),
                         "confidence": float(self._field(pattern, "confidence", self._field(pattern, "activation_score", 0.65)) or 0.65),
                         "activation_score": float(self._field(pattern, "activation_score", 0.65) or 0.65),
+                        "candidate_id": self._field(pattern, "candidate_id", ""),
+                        "evidence_message_ids": list(self._field(pattern, "evidence_message_ids", []) or []),
+                        "mining_batch_id": mining_batch_id,
+                        "source_ref": f"{source}:{mining_batch_id}:{self._field(pattern, 'candidate_id', '')}",
                     },
-                    source="learning_expression_pattern",
-            )
-            return
-        return
+                    source=source,
+                )
+                if not memory_id:
+                    raise RuntimeError("write_pattern returned an empty memory id")
+                report.memory_ids.append(str(memory_id))
+                if existing:
+                    report.deduplicated += 1
+                else:
+                    report.saved += 1
+            except Exception as exc:
+                report.failed += 1
+                report.failures.append(f"{self._field(pattern, 'candidate_id', '') or expression[:24]}: {exc}")
+                logger.warning(f"[Evolution-Expression] persistence failed: {exc}")
+        return report
 
     async def _save_jargons(self, group_id: str, jargons) -> int:
         memory_engine = getattr(self.db, "memory_engine", None)
@@ -427,19 +552,38 @@ class EvolutionManager:
             if not logs:
                 return
 
+            batch_id = self._mining_batch_id(group_id, logs)
             patterns = await self.expression_miner.mine(group_id, logs)
             expression_report = dict(getattr(self.expression_miner, "last_report", {}) or {})
-            if expression_report.get("reason") == "enrichment_empty" and int(
+            enrichment_report = expression_report.get("enrichment")
+            enrichment_terminal = True
+            enrichment_retryable = False
+            if isinstance(enrichment_report, dict):
+                enrichment_terminal = bool(enrichment_report.get("terminal"))
+                enrichment_retryable = bool(enrichment_report.get("retryable"))
+            elif expression_report.get("reason") == "enrichment_empty" and int(
                 expression_report.get("candidate_count", 0) or 0
             ) > 0:
+                enrichment_terminal = False
+                enrichment_retryable = True
+
+            pattern_save_report = await self._save_patterns(patterns, mining_batch_id=batch_id)
+            if not enrichment_terminal or not pattern_save_report.complete:
                 await self._record_mining_outcome(
                     group_id,
                     logs,
                     status="degraded",
-                    reason="expression_enrichment_failed_closed",
+                    reason=(
+                        "expression_enrichment_incomplete"
+                        if not enrichment_terminal
+                        else "expression_persistence_incomplete"
+                    ),
+                    pattern_count=pattern_save_report.saved + pattern_save_report.deduplicated,
+                    expression_report=expression_report,
+                    persistence_report=pattern_save_report.to_report(),
+                    retryable=enrichment_retryable or not pattern_save_report.complete,
                 )
-                raise RuntimeError("expression enrichment failed closed")
-            await self._save_patterns(patterns)
+                raise RuntimeError("expression mining did not reach a durable terminal state")
 
             jargon_count = 0
             if getattr(getattr(self.db, "memory_engine", None), "write_service", None):
@@ -469,14 +613,16 @@ class EvolutionManager:
                 logs,
                 status="completed",
                 reason="candidates_saved" if patterns or jargon_count else "no_candidates_rolling_overlap",
-                pattern_count=len(patterns),
+                pattern_count=pattern_save_report.saved + pattern_save_report.deduplicated,
                 jargon_count=jargon_count,
                 processed_count=len(processed_ids),
                 retained_overlap=len(logs) - len(processed_ids),
+                expression_report=expression_report,
+                persistence_report=pattern_save_report.to_report(),
             )
             payload = MiningCompletedEvent(
                 group_id=str(group_id),
-                pattern_count=len(patterns),
+                pattern_count=pattern_save_report.saved + pattern_save_report.deduplicated,
                 jargon_count=jargon_count,
             ).to_payload()
             await self._publish_learning_event("publish_learning_mining_completed", payload)
@@ -494,6 +640,9 @@ class EvolutionManager:
         jargon_count: int = 0,
         processed_count: int = 0,
         retained_overlap: int = 0,
+        expression_report: dict[str, Any] | None = None,
+        persistence_report: dict[str, Any] | None = None,
+        retryable: bool = False,
     ) -> None:
         outcome = {
             "group_id": str(group_id or ""),
@@ -502,11 +651,14 @@ class EvolutionManager:
             "input_count": len(logs or []),
             "processed_count": int(processed_count or 0),
             "retained_overlap": int(retained_overlap or 0),
+            "retryable": bool(retryable),
             "pattern_count": int(pattern_count or 0),
             "jargon_count": int(jargon_count or 0),
             "first_log_id": self._field(logs[0], "id") if logs else None,
             "last_log_id": self._field(logs[-1], "id") if logs else None,
             "recorded_at": time.time(),
+            "expression": dict(expression_report or {}),
+            "persistence": dict(persistence_report or {}),
         }
         self._last_mining_outcomes[str(group_id or "")] = outcome
         if len(self._last_mining_outcomes) > 20:

@@ -49,6 +49,24 @@ class LearningService:
         from .chatruntimeservice import ChatRuntimeService
         return await ChatRuntimeService(self.plugin_api).run_reflect_once(chat_id)
 
+    async def run_expression_backfill(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 120,
+        max_age_seconds: float = 604800,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        if not evolution or not hasattr(evolution, "run_expression_backfill"):
+            return {"status": "error", "message": "表达学习运行时未绑定"}
+        return await evolution.run_expression_backfill(
+            chat_id,
+            limit=limit,
+            max_age_seconds=max_age_seconds,
+            dry_run=dry_run,
+        )
+
     async def _expression_pattern_stats(self) -> dict[str, Any]:
         return await canonical_kind_review_stats(
             self.plugin_api,

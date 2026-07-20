@@ -58,8 +58,15 @@ class _FakeEvent:
 
 
 class _FakePrivateEvent(_FakeEvent):
-    def __init__(self, sender_id, sender_name, text, extras=None, components=None):
-        super().__init__(sender_id, sender_name, text, extras=extras, components=components)
+    def __init__(self, sender_id, sender_name, text, extras=None, components=None, message_id=None):
+        super().__init__(
+            sender_id,
+            sender_name,
+            text,
+            extras=extras,
+            components=components,
+            message_id=message_id,
+        )
         self.unified_msg_origin = f"default:FriendMessage:{sender_id}"
 
     def get_group_id(self):
@@ -623,6 +630,146 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertGreaterEqual(barrier.calls, 2)
         self.assertEqual(captured, [["先看图片", "补充说明"]])
+
+    def test_private_image_then_text_uses_latest_text_with_merged_vision_and_generation(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.conversation.attention.private_turn_coordinator"
+        )
+        turn_mod = importlib.import_module("astrmai.conversation.contracts.turn_identity")
+
+        class _BlockingBarrier(coordinator_mod.PrivateTurnCoordinator):
+            def __init__(self, config):
+                super().__init__(config=config, image_resolver=None, visual_cortex=None)
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.calls = 0
+
+            async def wait_for_input_stability(self, session):
+                return None
+
+            async def prepare_batch(self, events, chat_id):
+                self.calls += 1
+                if self.calls == 1:
+                    self.started.set()
+                    await self.release.wait()
+                for event in events:
+                    if event.get_extra("test_image", False):
+                        event.set_extra("direct_image_refs", ["resolved.jpg"])
+                        event.set_extra("extracted_image_refs", ["resolved.jpg"])
+                        event.set_extra(
+                            "astrmai_vision_records",
+                            [{
+                                "picid": "pic-1",
+                                "source_ref": "resolved.jpg",
+                                "type": "image",
+                                "description": "两个人正在泡温泉",
+                                "emotion_tags": ["放松"],
+                            }],
+                        )
+                        event.set_extra("astrmai_vision_barrier_complete", True)
+                        event.set_extra("astrmai_vision_barrier_failed", False)
+
+        self.gate.config.private_chat = SimpleNamespace(input_settle_sec=0.0)
+        barrier = _BlockingBarrier(self.gate.config)
+        self.gate.private_turn_coordinator = barrier
+        captured = []
+
+        async def fake_sys2(event, events):
+            captured.append((event, list(events), event.get_extra("astrmai_focus_thread_context")))
+
+        self.gate.sys2_process = fake_sys2
+        first = _FakePrivateEvent(
+            "user-1",
+            "Alice",
+            "[图片]",
+            extras={"test_image": True, "direct_image_refs": ["pending.jpg"]},
+            message_id="image-message",
+        )
+        second = _FakePrivateEvent(
+            "user-1",
+            "Alice",
+            "还记得我们一起去泡温泉吗？",
+            message_id="text-message",
+        )
+        first.timestamp = 100.0
+        second.timestamp = 101.0
+        first.set_extra(
+            "astrmai_turn_identity",
+            turn_mod.TurnIdentity(
+                mode="private",
+                chat_id=first.unified_msg_origin,
+                thread_id=f"private:{first.unified_msg_origin}",
+                generation=1,
+                sender_id="user-1",
+                input_message_ids=("image-message",),
+                created_at=100.0,
+            ),
+        )
+        second.set_extra(
+            "astrmai_turn_identity",
+            turn_mod.TurnIdentity(
+                mode="private",
+                chat_id=second.unified_msg_origin,
+                thread_id=f"private:{second.unified_msg_origin}",
+                generation=2,
+                sender_id="user-1",
+                input_message_ids=("text-message",),
+                created_at=101.0,
+            ),
+        )
+
+        async def _run():
+            await self.gate.process_event(first)
+            await barrier.started.wait()
+            await self.gate.process_event(second)
+            barrier.release.set()
+            await asyncio.sleep(0.08)
+
+        asyncio.run(_run())
+
+        self.assertEqual(len(captured), 1)
+        focus_event, thread_events, focus_context = captured[0]
+        self.assertIs(focus_event, second)
+        self.assertIn(first, thread_events)
+        self.assertIn("两个人正在泡温泉", focus_event.get_extra("astrmai_rich_text"))
+        self.assertEqual(focus_event.get_extra("direct_image_refs"), ["resolved.jpg"])
+        self.assertTrue(focus_event.get_extra("is_private_chat"))
+        turn = focus_event.get_extra("astrmai_turn_identity")
+        self.assertEqual(turn.generation, 2)
+        self.assertEqual(turn.input_message_ids, ("image-message", "text-message"))
+        self.assertEqual(
+            focus_context.freshness_budget.created_at,
+            focus_event.get_extra("astrmai_timestamp"),
+        )
+        self.assertEqual(focus_context.vision_bundle.image_urls, ["resolved.jpg"])
+
+    def test_private_focus_prefers_latest_actionable_text_but_group_policy_is_unchanged(self):
+        image = _FakePrivateEvent(
+            "user-1",
+            "Alice",
+            "[图片]",
+            extras={"direct_image_refs": ["image.jpg"]},
+        )
+        text_event = _FakePrivateEvent("user-1", "Alice", "这张图好看吗？")
+        normalized = self.gate._build_normalized_events([image, text_event], "bot-1")
+
+        private_focus, _, private_reason = self.gate._select_focus_event(
+            [image, text_event],
+            "bot-1",
+            normalized_events=normalized,
+            is_private=True,
+        )
+        group_focus, _, group_reason = self.gate._select_focus_event(
+            [image, text_event],
+            "bot-1",
+            normalized_events=normalized,
+            is_private=False,
+        )
+
+        self.assertIs(private_focus, text_event)
+        self.assertEqual(private_reason, "private_latest_actionable_text")
+        self.assertIs(group_focus, image)
+        self.assertEqual(group_reason, "direct_vision_request")
 
     def test_private_system2_runs_are_serial_for_same_chat(self):
         class _ImmediateCoordinator:

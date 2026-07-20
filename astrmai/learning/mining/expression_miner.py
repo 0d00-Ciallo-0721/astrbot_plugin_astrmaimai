@@ -7,6 +7,7 @@ from astrbot.api import logger
 from ...infrastructure.persistence import MessageLog
 from .expression_candidate_extractor import ExpressionCandidateExtractor
 from .expression_pattern_enricher import ExpressionPatternEnricher
+from .expression_results import ExpressionEnrichmentResult
 
 
 class ExpressionMiner:
@@ -26,6 +27,7 @@ class ExpressionMiner:
         )
         self.enricher = ExpressionPatternEnricher(gateway, config=self.config)
         self.last_report: dict[str, Any] = {}
+        self.last_result = ExpressionEnrichmentResult(status="completed", reason="not_run")
 
     @staticmethod
     def _normalize_messages(messages: List[MessageLog]) -> list[MessageLog]:
@@ -63,6 +65,10 @@ class ExpressionMiner:
         min_context = getattr(self.config.evolution, "min_mining_context", 10)
         normalized = self._normalize_messages(messages)
         if len(normalized) < min_context:
+            self.last_result = ExpressionEnrichmentResult(
+                status="completed",
+                reason="insufficient_context",
+            )
             self.last_report = {
                 "group_id": group_id,
                 "input_messages": len(messages or []),
@@ -80,6 +86,10 @@ class ExpressionMiner:
             existing_patterns=existing,
         )
         if not candidates:
+            self.last_result = ExpressionEnrichmentResult(
+                status="completed",
+                reason="no_candidates",
+            )
             self.last_report = {
                 "group_id": group_id,
                 "input_messages": len(messages or []),
@@ -90,7 +100,21 @@ class ExpressionMiner:
                 "enriched_count": 0,
             }
             return []
-        enriched = await self.enricher.enrich(group_id, candidates)
+        enrichment = await self.enricher.enrich(group_id, candidates)
+        if isinstance(enrichment, ExpressionEnrichmentResult):
+            self.last_result = enrichment
+            enriched = list(enrichment.items)
+        else:
+            # Compatibility for tests and third-party wrappers that still return the old list contract.
+            enriched = list(enrichment or [])
+            self.last_result = ExpressionEnrichmentResult(
+                status="completed" if enriched else "all_rejected",
+                items=enriched,
+                input_count=len(candidates),
+                returned_count=len(enriched),
+                rejected_count=max(len(candidates) - len(enriched), 0),
+                reason="legacy_enricher_result",
+            )
         self.last_report = {
             "group_id": group_id,
             "input_messages": len(messages or []),
@@ -99,9 +123,13 @@ class ExpressionMiner:
             "existing_patterns": len(existing),
             **dict(self.candidate_extractor.last_report or {}),
             "enriched_count": len(enriched),
-            "reason": "completed" if enriched else "enrichment_empty",
+            "reason": self.last_result.reason,
+            "enrichment": self.last_result.to_report(),
         }
-        logger.info(f"[ExpressionMiner] 表达习惯挖掘完成: {group_id} -> patterns={len(enriched)}")
+        logger.info(
+            f"[ExpressionMiner] 表达习惯挖掘完成: {group_id} -> "
+            f"status={self.last_result.status}, patterns={len(enriched)}"
+        )
         return enriched
 
     async def mine_bundle(self, group_id: str, messages: List[MessageLog]) -> dict[str, list[Any]]:
