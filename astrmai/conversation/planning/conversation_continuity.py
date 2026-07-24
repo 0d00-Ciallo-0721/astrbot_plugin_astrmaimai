@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from time import monotonic
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 import re
@@ -34,6 +33,7 @@ class ConversationContinuityState:
     last_social_intent: str = ""
     last_action_taken: str = ""
     continuity_weight: str = ""
+    topic_confirmation_requested_at: float = 0.0
     turns: list[ConversationTurnRecord] = field(default_factory=list)
 
 
@@ -46,6 +46,36 @@ class ConversationContinuityStore:
 
     def __init__(self):
         self._states: dict[str, ConversationContinuityState] = {}
+        self._topic_continuity_enabled = True
+        self._topic_active_ttl_seconds = 900.0
+        self._topic_confirm_after_seconds = 1800.0
+        self._topic_confirmation_wait_seconds = 120.0
+        self._topic_summary_max_chars = 300
+
+    def refresh_config(self, config: Any) -> None:
+        """Refresh private-topic timing without changing existing conversation state."""
+        private_config = getattr(config, "private_chat", None)
+        if private_config is None:
+            return
+        self._topic_continuity_enabled = bool(
+            getattr(private_config, "topic_continuity_enabled", True)
+        )
+        self._topic_active_ttl_seconds = max(
+            600.0,
+            float(getattr(private_config, "topic_active_ttl_sec", 900) or 900),
+        )
+        self._topic_confirm_after_seconds = max(
+            1800.0,
+            float(getattr(private_config, "topic_confirm_after_sec", 1800) or 1800),
+        )
+        self._topic_confirmation_wait_seconds = max(
+            30.0,
+            float(getattr(private_config, "topic_confirmation_wait_sec", 120) or 120),
+        )
+        self._topic_summary_max_chars = max(
+            80,
+            int(getattr(private_config, "topic_summary_max_chars", 300) or 300),
+        )
 
     def _state(self, chat_id: str) -> ConversationContinuityState:
         state = self._states.get(chat_id)
@@ -104,9 +134,264 @@ class ConversationContinuityStore:
             return ""
         return "weak" if now - last_update > self.SOFT_DECAY_SECONDS else "strong"
 
+    @staticmethod
+    def _topic_message_text(text: str) -> str:
+        return " ".join(str(text or "").strip().split())
+
+    @classmethod
+    def _is_short_topic_followup(cls, text: str) -> bool:
+        normalized = cls._normalize_topic_text(text)
+        if not normalized:
+            return False
+        if len(normalized) <= 4:
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "然后呢",
+                "接着呢",
+                "后来呢",
+                "后来",
+                "那呢",
+                "这个呢",
+                "那个呢",
+                "还记得吗",
+                "继续吗",
+                "什么意思",
+                "怎么说",
+                "为什么",
+                "咋办",
+                "怎么办",
+            )
+        )
+
+    @classmethod
+    def _is_explicit_topic_switch(cls, text: str) -> bool:
+        normalized = cls._normalize_topic_text(text)
+        return any(
+            marker in normalized
+            for marker in (
+                "换个话题",
+                "换一个话题",
+                "先不说这个",
+                "不聊这个了",
+                "另外问个",
+                "对了问个",
+                "说点别的",
+                "先说别的",
+            )
+        )
+
+    @classmethod
+    def _is_confirmation_yes(cls, text: str) -> bool:
+        normalized = cls._normalize_topic_text(text)
+        return normalized in {
+            "继续",
+            "继续聊",
+            "继续这个",
+            "是",
+            "嗯",
+            "嗯嗯",
+            "对",
+            "好",
+            "好的",
+            "可以",
+            "当然",
+            "记得",
+            "接着说",
+        }
+
+    @classmethod
+    def _is_confirmation_no(cls, text: str) -> bool:
+        normalized = cls._normalize_topic_text(text)
+        return normalized in {
+            "不用",
+            "不要",
+            "不继续",
+            "换话题",
+            "换个话题",
+            "不是",
+            "算了",
+            "先不聊了",
+            "不记得",
+        }
+
+    def _topic_age_seconds(self, state: ConversationContinuityState, now: float) -> float:
+        last_update = float(state.last_goal_update_ts or state.topic_started_at or 0.0)
+        if not last_update:
+            return 0.0
+        return max(0.0, now - last_update)
+
+    def _private_topic_summary(
+        self,
+        state: ConversationContinuityState,
+        *,
+        inherited: bool,
+        age_seconds: float,
+        status: str,
+        current_text: str,
+    ) -> str:
+        topic = self._topic_message_text(state.current_topic)[: self._topic_summary_max_chars]
+        if inherited and topic:
+            return (
+                "私聊话题承接（内部上下文）：\n"
+                f"- 当前话题：{topic}\n"
+                f"- 话题状态：{status}\n"
+                f"- 距离上次实质性交流：约{int(age_seconds)}秒\n"
+                "- 当前消息应优先理解为对该话题的继续追问；不要把其他会话或其他人的内容带入。"
+            )
+        if status == "new":
+            return (
+                "私聊话题状态（内部上下文）：\n"
+                "- 当前消息视为新话题。\n"
+                "- 之前的私聊话题只作背景，不要强行套用到当前回答。"
+            )
+        return ""
+
+    def evaluate_private_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Classify private-topic continuity before System 1/2 dispatch.
+
+        This is intentionally deterministic and side-effect-light: normal topic
+        state is still advanced by Planner after a real reply. The only state
+        written here is the short-lived "waiting for confirmation" marker.
+        """
+        now = time.time() if now is None else float(now)
+        normalized_chat_id = str(chat_id or "")
+        current_text = self._topic_message_text(text)
+        base = {
+            "action": "new",
+            "status": "new",
+            "inherited": False,
+            "requires_confirmation": False,
+            "age_seconds": 0.0,
+            "topic": "",
+            "prompt_summary": "",
+            "confirmation_text": "",
+        }
+        if not self._topic_continuity_enabled:
+            return base
+
+        state = self._states.get(normalized_chat_id)
+        if state is None or not state.current_topic or not state.last_goal_update_ts:
+            return base
+
+        confirmation_at = float(state.topic_confirmation_requested_at or 0.0)
+        if confirmation_at:
+            if now - confirmation_at > self._topic_confirmation_wait_seconds:
+                state.topic_confirmation_requested_at = 0.0
+            elif self._is_confirmation_yes(current_text):
+                state.topic_confirmation_requested_at = 0.0
+                age_seconds = self._topic_age_seconds(state, now)
+                base.update(
+                    action="continue",
+                    status="confirmed",
+                    inherited=True,
+                    age_seconds=age_seconds,
+                    topic=state.current_topic,
+                )
+                base["prompt_summary"] = self._private_topic_summary(
+                    state,
+                    inherited=True,
+                    age_seconds=age_seconds,
+                    status="confirmed",
+                    current_text=current_text,
+                )
+                return base
+            elif self._is_confirmation_no(current_text) or self._is_explicit_topic_switch(current_text):
+                state.topic_confirmation_requested_at = 0.0
+                return base
+            else:
+                base.update(
+                    action="confirm",
+                    status="awaiting_confirmation",
+                    requires_confirmation=True,
+                    age_seconds=self._topic_age_seconds(state, now),
+                    topic=state.current_topic,
+                    confirmation_text=(
+                        f"我们刚才在聊“{self._topic_message_text(state.current_topic)[:120]}”，"
+                        "还要继续这个话题吗？回复“继续”就好，想换话题直接告诉妃爱～"
+                    ),
+                )
+                return base
+
+        age_seconds = self._topic_age_seconds(state, now)
+        explicit_switch = self._is_explicit_topic_switch(current_text)
+        same_topic = self._is_same_topic(
+            state.last_focus_preview or state.current_topic,
+            current_text,
+            threshold=self.TOPIC_SIMILARITY_THRESHOLD
+            if age_seconds <= self._topic_active_ttl_seconds
+            else self.WEAK_TOPIC_SIMILARITY_THRESHOLD,
+        )
+        followup_like = self._is_short_topic_followup(current_text) or any(
+            marker in self._normalize_topic_text(current_text)
+            for marker in ("上面", "刚才", "前面", "那个", "这件事", "还")
+        )
+
+        if (
+            age_seconds > self._topic_confirm_after_seconds
+            and not explicit_switch
+            and (same_topic or followup_like)
+        ):
+            state.topic_confirmation_requested_at = now
+            return {
+                **base,
+                "action": "confirm",
+                "status": "stale_needs_confirmation",
+                "requires_confirmation": True,
+                "age_seconds": age_seconds,
+                "topic": state.current_topic,
+                "confirmation_text": (
+                    f"我们之前在聊“{self._topic_message_text(state.current_topic)[:120]}”，"
+                    "已经隔了一会儿了，还要接着聊吗？回复“继续”就好～"
+                ),
+            }
+
+        if not explicit_switch and (same_topic or followup_like):
+            status = "active" if age_seconds <= self._topic_active_ttl_seconds else "candidate"
+            base.update(
+                action="continue",
+                status=status,
+                inherited=True,
+                age_seconds=age_seconds,
+                topic=state.current_topic,
+            )
+            base["prompt_summary"] = self._private_topic_summary(
+                state,
+                inherited=True,
+                age_seconds=age_seconds,
+                status=status,
+                current_text=current_text,
+            )
+            return base
+
+        return {
+            **base,
+            "status": "new",
+            "age_seconds": age_seconds,
+            "topic": state.current_topic,
+            "prompt_summary": self._private_topic_summary(
+                state,
+                inherited=False,
+                age_seconds=age_seconds,
+                status="new",
+                current_text=current_text,
+            ),
+        }
+
     def _expire_state_if_stale(self, state: ConversationContinuityState, now: float) -> bool:
         last_update = float(state.last_goal_update_ts or 0.0)
-        if not last_update or now - last_update <= self.TURN_TTL_SECONDS:
+        if (
+            not last_update
+            or now - last_update <= self.TURN_TTL_SECONDS
+            or state.topic_confirmation_requested_at
+        ):
             return False
         state.current_topic = ""
         state.current_goal = ""
@@ -118,6 +403,7 @@ class ConversationContinuityStore:
         state.last_social_intent = ""
         state.last_action_taken = ""
         state.continuity_weight = ""
+        state.topic_confirmation_requested_at = 0.0
         state.turns = []
         return True
 
@@ -135,7 +421,7 @@ class ConversationContinuityStore:
         return state.turns
 
     def snapshot(self, chat_id: str, *, now: float | None = None) -> dict[str, Any]:
-        now = monotonic() if now is None else now
+        now = time.time() if now is None else now
         state = self._state(chat_id)
         self.recent(chat_id, now=now)
         return {

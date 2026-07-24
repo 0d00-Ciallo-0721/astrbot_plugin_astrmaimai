@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from typing import Any, Optional
 
@@ -116,6 +117,69 @@ def _append_once(event, *, matcher, action: dict[str, Any], record_execution: bo
 def _current_message_id(event) -> str:
     message_obj = getattr(event, "message_obj", None)
     return str(getattr(message_obj, "message_id", "") or "").strip()
+
+
+def _message_id_binding_error(event, requested_message_id: str) -> str:
+    requested = str(requested_message_id or "").strip()
+    if not requested:
+        return ""
+    current = _current_message_id(event)
+    if current and requested == current:
+        return ""
+
+    identity_ids: set[str] = set()
+    for getter_name in ("get_sender_id", "get_self_id", "get_group_id"):
+        getter = getattr(event, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            value = str(getter() or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            identity_ids.add(value)
+    if hasattr(event, "get_extra"):
+        for key in (
+            "astrmai_interaction_actor_id",
+            "astrmai_interaction_target_id",
+            "astrmai_at_action_target_id",
+        ):
+            value = str(event.get_extra(key, "") or "").strip()
+            if value:
+                identity_ids.add(value)
+        bound_ids = event.get_extra("astrmai_bound_message_ids", []) or []
+        if isinstance(bound_ids, (list, tuple, set)) and requested in {
+            str(item or "").strip() for item in bound_ids
+        }:
+            return ""
+        for key in (
+            "astrmai_reply_message_id",
+            "astrmai_quote_message_id",
+            "astrmai_referenced_message_id",
+        ):
+            if requested == str(event.get_extra(key, "") or "").strip():
+                return ""
+
+    current_text = str(
+        event.get_extra("astrmai_rich_text", getattr(event, "message_str", ""))
+        if hasattr(event, "get_extra")
+        else getattr(event, "message_str", "")
+    ).strip()
+    explicitly_requested = bool(
+        requested
+        and requested in current_text
+        and re.search(r"(?:消息|message|msg|编号|ID|id)", current_text)
+    )
+    if explicitly_requested and requested not in identity_ids:
+        return ""
+
+    reason = "identity_id" if requested in identity_ids else "not_bound_to_current_turn"
+    return (
+        "参数错误[message_id_not_bound]："
+        f"{requested} 未绑定到当前消息（reason={reason}）。"
+        "不要把 QQ 号、群号或模型猜测的数字当作消息 ID；"
+        "分析当前图片/表情包时请留空 message_id 后重新调用。"
+    )
 
 
 def _history_messages(payload: Any) -> list[dict[str, Any]]:
@@ -1551,7 +1615,10 @@ class QQMessageArtifactLookupTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "message_id": {
                     "type": "string",
-                    "description": "要查询的消息 ID；为空时查询当前触发消息。",
+                    "description": (
+                        "要查询的真实消息 ID。查询当前消息、当前图片或当前表情包时必须留空，"
+                        "由运行时自动绑定；禁止填写 QQ 号、群号或自行猜测的数字。"
+                    ),
                     "maxLength": 80,
                 },
                 "include_text_preview": {
@@ -1567,6 +1634,10 @@ class QQMessageArtifactLookupTool(FunctionTool[AstrAgentContext]):
         api = getattr(getattr(current_event, "bot", None), "api", None)
         message_id = str(kwargs.get("message_id", "") or "").strip()
         include_text_preview = bool(kwargs.get("include_text_preview", True))
+        binding_error = _message_id_binding_error(current_event, message_id)
+        if binding_error:
+            _record_tool_execution(current_event, self.name, status="failed")
+            return binding_error
         payload: Any = None
         if message_id:
             if api is None:
@@ -1939,7 +2010,14 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "message_id": {"type": "string", "description": "图片消息 ID；为空时使用当前消息。", "maxLength": 80},
+                "message_id": {
+                    "type": "string",
+                    "description": (
+                        "真实图片消息 ID。分析当前图片/表情包时必须留空，由运行时自动绑定；"
+                        "禁止填写 QQ 号、群号或自行猜测的数字。"
+                    ),
+                    "maxLength": 80,
+                },
                 "image_index": {"type": "integer", "description": "第几张图，从 1 开始。", "minimum": 1, "maximum": 8},
             },
         }
@@ -1960,6 +2038,10 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
             tags = selected.get("emotion_tags") or selected.get("tags") or []
             _record_tool_execution(event, self.name)
             return f"视觉转述结果：type={img_type}；tags={tags}；description={_truncate_text(desc, 600)}"
+        binding_error = _message_id_binding_error(event, message_id)
+        if binding_error:
+            _record_tool_execution(event, self.name, status="failed")
+            return binding_error
         payload: Any = None
         api = getattr(getattr(event, "bot", None), "api", None)
         if message_id and api is not None:

@@ -588,6 +588,44 @@
         "type": "int",
         "default": 2,
         "hint": "视觉模型临时失败时自动重试；全部失败后会明确按图片读取失败处理，不会猜测内容。"
+      },
+      "topic_continuity_enabled": {
+        "description": "启用私聊话题承接",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，私聊会在短时间内承接上一个话题；关闭后恢复旧的连续对话行为。"
+      },
+      "topic_active_ttl_sec": {
+        "description": "私聊话题强承接时间（秒）",
+        "type": "int",
+        "default": 900,
+        "minimum": 600,
+        "maximum": 1200,
+        "hint": "在这段时间内，明确的追问和简短补充会优先接着上一个话题。默认 900 秒，即 15 分钟。"
+      },
+      "topic_confirm_after_sec": {
+        "description": "私聊话题确认阈值（秒）",
+        "type": "int",
+        "default": 1800,
+        "minimum": 1800,
+        "maximum": 7200,
+        "hint": "超过这段时间后，如果新消息看起来仍在接着旧话题，机器人会先询问是否继续。默认 1800 秒，即 30 分钟。"
+      },
+      "topic_confirmation_wait_sec": {
+        "description": "等待话题确认时间（秒）",
+        "type": "int",
+        "default": 120,
+        "minimum": 30,
+        "maximum": 600,
+        "hint": "机器人询问是否继续旧话题后，在这段时间内等待“继续”“换个话题”等确认。默认 120 秒。"
+      },
+      "topic_summary_max_chars": {
+        "description": "话题摘要最大字数",
+        "type": "int",
+        "default": 300,
+        "minimum": 80,
+        "maximum": 1000,
+        "hint": "注入模型上下文的话题摘要最大长度，避免旧话题占用过多提示词空间。"
       }
     }
   },

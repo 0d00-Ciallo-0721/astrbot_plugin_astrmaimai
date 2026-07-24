@@ -310,6 +310,28 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("type=image", result)
         self.assertIn("file_id=img-1", result)
 
+    def test_message_artifact_lookup_rejects_unbound_numeric_id(self):
+        event = _FakeEvent(
+            group_id="777",
+            sender_id="3650815443",
+            sender_name="6",
+            message_id="msg-current",
+        )
+        event.message_obj.message = [{"type": "image", "data": {"file_id": "img-current"}}]
+        event.message_str = "妃妃"
+        event.bot.api = _FakeApi(result={"data": {"message_id": "1481314186"}})
+
+        result = asyncio.run(
+            self.mod.QQMessageArtifactLookupTool().call(
+                _wrap_event(event),
+                message_id="1481314186",
+            )
+        )
+
+        self.assertIn("message_id_not_bound", result)
+        self.assertIn("留空 message_id", result)
+        self.assertEqual(event.bot.api.calls, [])
+
     def test_cross_chat_memory_query_uses_tool_service_without_current_session_scope(self):
         event = _FakeEvent(group_id="777")
 
@@ -415,6 +437,27 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("熊猫头低着头", result)
         self.assertIn("emoji", result)
         self.assertIn("无奈", result)
+
+    def test_04c_vision_message_rejects_qq_number_as_message_id(self):
+        event = _FakeEvent(
+            group_id="777",
+            sender_id="3650815443",
+            sender_name="6",
+            message_id="msg-current",
+        )
+        event.message_obj.message = [{"type": "image", "data": {"file_id": "img-current"}}]
+        event.message_str = "妃妃"
+        event.bot.api = _FakeApi(result={})
+
+        result = asyncio.run(
+            self.mod.VisionMessageAnalyzeTool().call(
+                _wrap_event(event),
+                message_id="1481314186",
+            )
+        )
+
+        self.assertIn("message_id_not_bound", result)
+        self.assertEqual(event.bot.api.calls, [])
 
     def test_05_cross_session_reply_lookup_reads_friend_history(self):
         event = _FakeEvent(group_id="777")

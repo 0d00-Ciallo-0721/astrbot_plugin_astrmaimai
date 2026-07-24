@@ -94,10 +94,12 @@ class _FakeEvolution:
 
 
 class _FakeEvent:
-    def __init__(self):
+    def __init__(self, *, sender_id="", sender_name="", text="hello"):
         self.unified_msg_origin = "default:GroupMessage:group-1"
-        self.message_str = "hello"
+        self.message_str = text
         self.message_obj = None
+        self._sender_id = sender_id
+        self._sender_name = sender_name
         self._extra = {"astrmai_prefix_hash": "hash-1"}
 
     def get_self_id(self):
@@ -105,6 +107,12 @@ class _FakeEvent:
 
     def get_group_id(self):
         return "group-1"
+
+    def get_sender_id(self):
+        return self._sender_id
+
+    def get_sender_name(self):
+        return self._sender_name
 
     def get_extra(self, key, default=None):
         return self._extra.get(key, default)
@@ -165,6 +173,133 @@ class RefactoredExecutorTests(unittest.TestCase):
         runtime_values = executor._execution_runtime_values(event, event.unified_msg_origin)
 
         self.assertEqual(runtime_values["timeout"], 240)
+
+    def test_finalize_reply_repairs_foreign_group_member_direct_address(self):
+        gateway = _FakeGateway()
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(sender_id="3650815443", sender_name="6", text="妃妃")
+        foreign_event = _FakeEvent(sender_id="1481314186", sender_name="萤", text="你话这么多")
+        event.set_extra(
+            "astrmai_focus_thread_context",
+            SimpleNamespace(
+                focus_event=event,
+                root_event=event,
+                core_events=[event],
+                related_events=[],
+                ambient_events=[foreign_event],
+            ),
+        )
+
+        result = asyncio.run(
+            executor._finalize_reply(
+                event,
+                event.unified_msg_origin,
+                "bot-1",
+                "萤哥哥又干什么啦～",
+                trace_mode="chat",
+                model="model-a",
+            )
+        )
+
+        self.assertEqual(result, "你又干什么啦～")
+        self.assertEqual(reply_service.calls[-1][1], "你又干什么啦～")
+        self.assertEqual(event.get_extra("astrmai_actor_guard_action"), "repaired")
+
+    def test_finalize_reply_allows_explicit_third_person_reference(self):
+        gateway = _FakeGateway()
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(
+            sender_id="3650815443",
+            sender_name="6",
+            text="萤哥哥刚才怎么了？",
+        )
+        foreign_event = _FakeEvent(sender_id="1481314186", sender_name="萤", text="你话这么多")
+        event.set_extra(
+            "astrmai_focus_thread_context",
+            SimpleNamespace(
+                focus_event=event,
+                root_event=event,
+                core_events=[event],
+                related_events=[],
+                ambient_events=[foreign_event],
+            ),
+        )
+
+        result = asyncio.run(
+            executor._finalize_reply(
+                event,
+                event.unified_msg_origin,
+                "bot-1",
+                "萤哥哥刚才是在开玩笑吧。",
+                trace_mode="chat",
+                model="model-a",
+            )
+        )
+
+        self.assertEqual(result, "萤哥哥刚才是在开玩笑吧。")
+        self.assertEqual(event.get_extra("astrmai_actor_guard_action"), "allowed_explicit_reference")
+
+    def test_finalize_reply_does_not_rewrite_private_chat_addressing(self):
+        gateway = _FakeGateway()
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(
+            sender_id="3650815443",
+            sender_name="6",
+            text="萤哥哥刚才怎么了？",
+        )
+        event.unified_msg_origin = "default:FriendMessage:3650815443"
+        event.get_group_id = lambda: ""
+        foreign_event = _FakeEvent(
+            sender_id="1481314186",
+            sender_name="萤",
+            text="你话这么多",
+        )
+        event.set_extra(
+            "astrmai_focus_thread_context",
+            SimpleNamespace(
+                focus_event=event,
+                root_event=event,
+                core_events=[event],
+                related_events=[],
+                ambient_events=[foreign_event],
+            ),
+        )
+
+        result = asyncio.run(
+            executor._finalize_reply(
+                event,
+                event.unified_msg_origin,
+                "bot-1",
+                "萤哥哥刚才是在开玩笑吧。",
+                trace_mode="chat",
+                model="model-a",
+            )
+        )
+
+        self.assertEqual(result, "萤哥哥刚才是在开玩笑吧。")
+        self.assertEqual(reply_service.calls[-1][1], "萤哥哥刚才是在开玩笑吧。")
+        self.assertEqual(event.get_extra("astrmai_actor_guard_action"), "not_applicable")
 
     def test_construct_at_required_outcome_needs_verified_current_group_action(self):
         event = _FakeEvent()

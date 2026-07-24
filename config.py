@@ -284,6 +284,11 @@ class PrivateChatConfig(BaseModel):
     image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0, description="私聊图片文件解析超时时间(秒)")
     image_barrier_timeout_sec: float = Field(default=45.0, ge=1.0, le=1200.0, description="私聊单张图片识别超时时间(秒)")
     image_analysis_retries: int = Field(default=2, ge=1, le=5, description="私聊图片识别失败重试次数")
+    topic_continuity_enabled: bool = Field(default=True, description="启用私聊话题承接；关闭后恢复原有连续对话行为")
+    topic_active_ttl_sec: int = Field(default=900, ge=600, le=1200, description="私聊话题保持强承接的时间，默认15分钟")
+    topic_confirm_after_sec: int = Field(default=1800, ge=1800, le=7200, description="私聊超过此时间后，继续旧话题前先向用户确认，默认30分钟")
+    topic_confirmation_wait_sec: int = Field(default=120, ge=30, le=600, description="等待用户确认是否继续旧话题的时间，默认2分钟")
+    topic_summary_max_chars: int = Field(default=300, ge=80, le=1000, description="注入提示词的话题摘要最大字数")
 
 
 class TimingConfig(BaseModel):

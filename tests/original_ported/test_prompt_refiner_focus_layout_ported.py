@@ -122,6 +122,47 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertLess(final_prompt.index("---当前发言人边界---"), final_prompt.index("---眼前正在对我说的---"))
         self.assertIn("不要把近期脉络中的其他人名当作当前用户", final_prompt)
 
+    def test_final_speaker_lock_follows_runtime_guidance(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=False)),
+            react_retriever=None,
+        )
+        event = _FakeEvent()
+        event._extras["astrmai_prompt_envelope"] = PromptEnvelope(
+            raw_user_text="6: 妃妃",
+            focus_message_text="6: 妃妃",
+            current_speaker_block=(
+                "本轮正在回应的对象只看这一位：\n"
+                "- QQ: 3650815443\n"
+                "- 昵称: 6\n"
+                "历史里的其他发言人只是背景，不能当作当前用户。"
+            ),
+            cognitive_drive_block=(
+                "最近我的短期行动残留：\n"
+                "- 上轮姿态=tease，结果=reply；萤哥哥又干什么啦"
+            ),
+            guidance_lines=["自然回应当前消息。"],
+            near_context_priority=True,
+        )
+
+        async def _run():
+            return await refiner.refine_prompt(
+                event=event,
+                system_prompt="system prompt only",
+                prompt="wrapped prompt",
+                context={"disable_rag_injection": True},
+            )
+
+        _system_prompt, final_prompt = asyncio.run(_run())
+
+        self.assertIn("---最终发言人归因锁---", final_prompt)
+        self.assertGreater(
+            final_prompt.index("---最终发言人归因锁---"),
+            final_prompt.index("---内在驱动---"),
+        )
+        self.assertIn("当前唯一对话对象是 6（QQ 3650815443）", final_prompt)
+
     def test_transcript_dedup_keeps_semantic_context_sections(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=None,

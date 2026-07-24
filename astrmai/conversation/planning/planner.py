@@ -81,6 +81,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.agency_runtime = AgencyRuntimeStore()
         self.agency_reflection_bridge = AgencyReflectionBridge(memory_engine)
         self.conversation_continuity = ConversationContinuityStore()
+        self.conversation_continuity.refresh_config(getattr(gateway, "config", None))
         self.heartflow_manager = None
         self.behavior_tuning = BehaviorTuningPolicy()
         self.think_level_policy = ThinkLevelPolicy()
@@ -593,8 +594,17 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             note_parts.append(str(decision.state_bias))
         if tags:
             note_parts.append("本轮触发冷却：" + "、".join(tags))
+        actor_id = ""
+        turn_context = ensure_turn_context(event)
+        actor_id = str(getattr(turn_context.perception, "sender_id", "") or "").strip()
+        if not actor_id and hasattr(event, "get_sender_id"):
+            try:
+                actor_id = str(event.get_sender_id() or "").strip()
+            except Exception:
+                actor_id = ""
         self.agency_runtime.record(
             chat_id=chat_id,
+            actor_id=actor_id,
             reply_need=reply_need,
             social_intent=social_intent,
             action_tier=action_tier,

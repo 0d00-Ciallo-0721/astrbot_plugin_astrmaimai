@@ -40,6 +40,7 @@ from ..contracts.focus_context import FocusThreadContext, FreshnessState, Vision
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
 from ..planning.tool_disclosure import normalize_requested_packages, select_tools_by_packages
+from .group_actor_consistency import GroupActorConsistencyGuard
 from .reply_freshness import is_stale_reply_reason, resolve_reply_max_age_seconds
 
 
@@ -763,6 +764,31 @@ class ConcurrentExecutor:
         return True
 
     async def _finalize_reply(self, event: AstrMessageEvent, chat_id: str, bot_id: str, reply_text: str, *, trace_mode: str, model: str) -> Optional[str]:
+        actor_guard = GroupActorConsistencyGuard.inspect_and_repair(event, reply_text)
+        reply_text = actor_guard.text
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_actor_guard_action", actor_guard.action)
+            event.set_extra("astrmai_actor_guard_reason", actor_guard.reason)
+            event.set_extra("astrmai_actor_guard_current_id", actor_guard.current_actor_id)
+            event.set_extra("astrmai_actor_guard_current_name", actor_guard.current_actor_name)
+            event.set_extra(
+                "astrmai_actor_guard_foreign_names",
+                list(actor_guard.foreign_actor_names),
+            )
+        if actor_guard.action == "repaired":
+            logger.warning(
+                f"[{chat_id}] repaired foreign group addressee "
+                f"current={actor_guard.current_actor_name or actor_guard.current_actor_id} "
+                f"foreign={actor_guard.foreign_actor_names}"
+            )
+        debug_trace(
+            event,
+            "execution.actor_consistency",
+            action=actor_guard.action,
+            reason=actor_guard.reason,
+            current_actor_id=actor_guard.current_actor_id,
+            foreign_actor_names=list(actor_guard.foreign_actor_names),
+        )
         artifact = await self.reply_engine.handle_reply(event, reply_text, chat_id)
         sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
         if not sent:

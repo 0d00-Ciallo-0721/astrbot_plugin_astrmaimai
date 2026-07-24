@@ -19,7 +19,7 @@ class _Event:
 
 
 class _AgencyRuntime:
-    def summary(self, chat_id):
+    def summary(self, chat_id, *, actor_id=""):
         return f"agency summary for {chat_id}"
 
     def cooldown_tags(self, chat_id):
@@ -171,7 +171,7 @@ def test_pre_budget_inputs_run_concurrently_and_write_context(tmp_path):
     loader = module.PlanningInputLoader(planner)
     event = _Event()
 
-    async def _slow_agency(chat_id):
+    async def _slow_agency(chat_id, actor_id=""):
         await asyncio.sleep(0.05)
         return {"reflection_summary": "agency", "cooldown_tags": ["meme"]}
 
@@ -300,3 +300,32 @@ def test_memory_feedback_and_failures_degrade_without_blocking(tmp_path):
     failed_timing = next(item for item in failed_event.get_extra("astrmai_side_input_timings") if item["name"] == "expression_habits")
     assert failed_timing["ok"] is False
     assert "RuntimeError" in failed_timing["error"]
+
+
+def test_private_topic_context_overrides_stale_shared_continuity(tmp_path):
+    module = _load_loader_module(tmp_path)
+    planner = _Planner()
+    loader = module.PlanningInputLoader(planner)
+    event = _Event()
+    event.set_extra("astrmai_private_topic_context", "私聊话题承接：继续讨论泡温泉的安排")
+    event.set_extra("astrmai_private_topic_label", "泡温泉的安排")
+    event.set_extra("astrmai_private_topic_inherited", True)
+
+    loader._apply_continuity(
+        event,
+        {
+            "summary": "旧的共享摘要",
+            "snapshot": {
+                "current_topic": "旧话题",
+                "current_goal": "旧目标",
+                "continuity_weight": "weak",
+                "turn_count": 4,
+            },
+        },
+    )
+
+    turn_context = event.get_extra("astrmai_turn_context")
+    assert turn_context.continuity.conversation_summary == "私聊话题承接：继续讨论泡温泉的安排"
+    assert turn_context.continuity.current_topic == "泡温泉的安排"
+    assert turn_context.continuity.continuity_weight == "strong"
+    assert event.get_extra("astrmai_conversation_continuity_summary") == "私聊话题承接：继续讨论泡温泉的安排"

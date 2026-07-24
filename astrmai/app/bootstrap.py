@@ -367,6 +367,11 @@ class PluginBootstrap:
             private_chat_manager=private_chat_manager,
             private_turn_coordinator=private_turn_coordinator,
             runtime_coordinator=runtime.runtime_coordinator,
+            conversation_continuity=getattr(
+                getattr(runtime, "system2_planner", None),
+                "conversation_continuity",
+                None,
+            ),
         )
         return InteractionServices(
             frequency_controller=frequency_controller,

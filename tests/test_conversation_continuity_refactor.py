@@ -1,3 +1,5 @@
+import astrmai.conversation.planning.conversation_continuity as continuity_module
+
 from astrmai.conversation.planning.conversation_continuity import ConversationContinuityStore
 
 
@@ -249,3 +251,25 @@ def test_conversation_continuity_expires_after_ttl():
     assert snapshot["goal_status"] == "new"
     assert snapshot["turn_count"] == 1
     assert snapshot["current_topic"] == "Alice: fresh topic"
+
+
+def test_conversation_continuity_snapshot_uses_wall_clock_for_default_expiry(monkeypatch):
+    store = ConversationContinuityStore()
+    stale_now = 1000.0 + store.TURN_TTL_SECONDS + 1
+
+    store.record(
+        chat_id="chat-1",
+        focus_preview="Alice: old topic",
+        goal_summary="old goal",
+        social_intent="answer",
+        action_taken="reply",
+        now=1000.0,
+    )
+    monkeypatch.setattr(continuity_module.time, "time", lambda: stale_now)
+
+    snapshot = store.snapshot("chat-1")
+
+    assert snapshot["current_topic"] == ""
+    assert snapshot["current_goal"] == ""
+    assert snapshot["turn_count"] == 0
+    assert snapshot["continuity_weight"] == ""

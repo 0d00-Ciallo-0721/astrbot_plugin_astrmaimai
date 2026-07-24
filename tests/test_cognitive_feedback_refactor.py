@@ -692,6 +692,49 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertEqual(memory.calls[0]["payload"]["main_intent"], "tease")
         self.assertEqual(memory.calls[0]["payload"]["turn_count"], 6)
 
+    def test_agency_reflection_bridge_aggregates_actor_scopes_without_reply_text(self):
+        runtime = self.runtime_mod.AgencyRuntimeStore()
+
+        class _Memory:
+            def __init__(self):
+                self.calls = []
+
+            async def record_cognitive_feedback(self, **kwargs):
+                self.calls.append(kwargs)
+
+        memory = _Memory()
+        bridge = self.bridge_mod.AgencyReflectionBridge(memory)
+        for index in range(6):
+            runtime.record(
+                chat_id="chat-1",
+                actor_id="actor-a" if index % 2 == 0 else "actor-b",
+                reply_need="reply",
+                social_intent="answer",
+                action_tier="chat",
+                action_taken="reply",
+                reply_preview=f"private reply body {index}",
+                note=f"private actor note {index}",
+                cooldown_tags=["long_reply"],
+            )
+
+        self.assertEqual(len(runtime.recent("chat-1", actor_id="actor-a")), 3)
+        self.assertEqual(len(runtime.recent("chat-1", actor_id="actor-b")), 3)
+        self.assertNotIn(
+            "private reply body",
+            runtime.summary("chat-1", actor_id="actor-a"),
+        )
+        self.assertNotIn(
+            "private actor note",
+            runtime.summary("chat-1", actor_id="actor-a"),
+        )
+
+        flushed = asyncio.run(bridge.maybe_flush(runtime, "chat-1"))
+
+        self.assertTrue(flushed)
+        self.assertEqual(len(memory.calls), 1)
+        self.assertEqual(memory.calls[0]["payload"]["turn_count"], 6)
+        self.assertEqual(memory.calls[0]["payload"]["cooldown_tags"], ["long_reply"])
+
     def test_agency_runtime_uses_monotonic_clock_for_record_and_expiry(self):
         runtime = self.runtime_mod.AgencyRuntimeStore()
 

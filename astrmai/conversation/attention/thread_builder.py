@@ -143,6 +143,13 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
     core_limit = int(getattr(attention_config, "focus_thread_core_max_messages", 4) or 4)
     related_limit = int(getattr(attention_config, "focus_thread_related_max_messages", 3) or 3)
     ambient_limit = int(getattr(attention_config, "ambient_background_max_messages", 2) or 2)
+    pending_events = [
+        candidate.event
+        for candidate in normalized_events
+        if bool(candidate.event.get_extra("astrmai_private_pending_context", False))
+    ]
+    if pending_events and bool(focus_candidate.event.get_extra("is_private_chat", False)):
+        core_limit = max(core_limit, len(pending_events) + 1)
 
     def _append_unique(container: list, event, limit: int | None = None):
         if event in container:
@@ -154,6 +161,9 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
     _append_unique(core_events, focus_candidate.event, core_limit)
     if root_candidate and root_candidate.event is not focus_candidate.event:
         _append_unique(core_events, root_candidate.event, core_limit)
+    if pending_events and bool(focus_candidate.event.get_extra("is_private_chat", False)):
+        for pending_event in pending_events:
+            _append_unique(core_events, pending_event, core_limit)
     reply_mode = _infer_reply_mode(focus_candidate, root_candidate, normalized_events)
     social_state = _derive_social_state(reply_mode)
     thread_signature = _build_thread_signature(focus_candidate, root_candidate, reply_mode)

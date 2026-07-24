@@ -77,6 +77,7 @@ class AttentionGate:
         private_turn_coordinator=None,
         runtime_coordinator=None,
         chat_loop_kernel=None,
+        conversation_continuity=None,
     ):
         self.state_engine = state_engine
         self.judge = judge
@@ -90,6 +91,7 @@ class AttentionGate:
         self.private_turn_coordinator = private_turn_coordinator
         self.runtime_coordinator = runtime_coordinator
         self.chat_loop_kernel = chat_loop_kernel
+        self.conversation_continuity = conversation_continuity
         self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
         self._proactive_dispatching: dict[str, bool] = {}
         self._deferred_messages: dict[str, list] = {}  # ponytail: R12 — queue blocked messages
@@ -118,6 +120,10 @@ class AttentionGate:
         self.config = config
         if self.private_turn_coordinator is not None:
             self.private_turn_coordinator.refresh_config(config)
+        if self.conversation_continuity is not None:
+            refresh_continuity = getattr(self.conversation_continuity, "refresh_config", None)
+            if callable(refresh_continuity):
+                refresh_continuity(config)
 
     def get_proactive_lock(self, chat_id: str) -> asyncio.Lock:
         """Return a per-chat lock for proactive injection serialization."""
@@ -155,6 +161,18 @@ class AttentionGate:
         removed = bool(
             await self._cancel_session_workers(chat_id, session=removed_session)
         ) or removed
+        clear_pending = getattr(self.private_turn_coordinator, "clear_pending_batch", None)
+        if callable(clear_pending):
+            removed = bool(clear_pending(chat_id)) or removed
+        clear_continuity = getattr(self.conversation_continuity, "clear", None)
+        if callable(clear_continuity):
+            had_continuity = bool(
+                chat_id in set(self.conversation_continuity.chats())
+                if hasattr(self.conversation_continuity, "chats")
+                else False
+            )
+            clear_continuity(chat_id)
+            removed = had_continuity or removed
         compaction = getattr(self, "context_compaction", None)
         if compaction is not None and hasattr(compaction, "clear_chat_state"):
             try:
@@ -1010,6 +1028,10 @@ class AttentionGate:
         event.set_extra("is_private_chat", bool(is_private))
         event.set_extra("astrmai_turn_mode", "private" if is_private else "group")
 
+        if is_private and self.private_turn_coordinator is not None:
+            note_new_message = getattr(self.private_turn_coordinator, "note_new_message", None)
+            if callable(note_new_message):
+                note_new_message(chat_id)
         await self._ensure_turn_identity(event, chat_id, is_private)
 
         debug_trace(event, "attention_ingress", chat_id=chat_id, sender_id=sender_id, preview=preview_text(msg_str, 80))
@@ -1148,6 +1170,22 @@ class AttentionGate:
         )
         return decision.action
 
+    async def _send_private_topic_confirmation(
+        self,
+        event: AstrMessageEvent,
+        confirmation_text: str,
+    ) -> bool:
+        if not confirmation_text or not hasattr(event, "send") or not hasattr(event, "plain_result"):
+            return False
+        try:
+            await event.send(event.plain_result(confirmation_text))
+            event.set_extra("astrmai_reply_sent", True)
+            event.set_extra("astrmai_topic_confirmation_sent", True)
+            return True
+        except Exception as exc:
+            logger.warning(f"[AttentionGate] private topic confirmation send failed: {exc}")
+            return False
+
     async def _debounce_and_judge(
         self,
         chat_id: str,
@@ -1169,12 +1207,21 @@ class AttentionGate:
 
             if batch_events:
                 if is_private and self.private_turn_coordinator is not None:
+                    merge_pending_batch = getattr(
+                        self.private_turn_coordinator,
+                        "merge_pending_batch",
+                        None,
+                    )
+                    if callable(merge_pending_batch):
+                        batch_events = merge_pending_batch(chat_id, batch_events)
                     await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
                     async with session.lock:
                         if session.accumulation_pool:
                             session.accumulation_pool = batch_events + list(session.accumulation_pool)
                             current_is_strong_wakeup = False
                             continue
+                    mood_event = None
+                    mood_texts: list[str] = []
                     for prepared_event in batch_events:
                         self.perception_builder.build(prepared_event)
                         if not bool(prepared_event.get_extra("astrmai_private_context_recorded", False)):
@@ -1185,9 +1232,17 @@ class AttentionGate:
                                 )
                                 or ""
                             )
-                            await self._apply_primary_mood_update(prepared_event, chat_id, rich_text)
+                            if rich_text.strip():
+                                mood_event = prepared_event
+                                mood_texts.append(rich_text)
                             await self._append_dialogue_segment(prepared_event)
                             prepared_event.set_extra("astrmai_private_context_recorded", True)
+                    if mood_event is not None and mood_texts:
+                        await self._apply_primary_mood_update(
+                            mood_event,
+                            chat_id,
+                            "\n".join(mood_texts),
+                        )
                 merged_events = self._merge_attention_window(session, batch_events)
                 events = await self._format_and_filter_messages(merged_events)
                 if events:
@@ -1229,6 +1284,37 @@ class AttentionGate:
                     turn_context.attention.is_fast_mode = False
                     turn_context.attention.focus_reason = focus_thread.focus_reason
                     turn_context.attention.root_reason = focus_thread.root_reason
+                    topic_confirmation_required = False
+                    if is_private and self.conversation_continuity is not None:
+                        evaluate_topic = getattr(
+                            self.conversation_continuity,
+                            "evaluate_private_message",
+                            None,
+                        )
+                        if callable(evaluate_topic):
+                            topic_decision = evaluate_topic(
+                                chat_id,
+                                str(
+                                    focus_event.get_extra(
+                                        "astrmai_rich_text",
+                                        getattr(focus_event, "message_str", ""),
+                                    )
+                                    or ""
+                                ),
+                            )
+                            focus_event.set_extra("astrmai_private_topic_status", topic_decision.get("status", ""))
+                            focus_event.set_extra("astrmai_private_topic_inherited", bool(topic_decision.get("inherited", False)))
+                            focus_event.set_extra("astrmai_private_topic_age_sec", float(topic_decision.get("age_seconds", 0.0) or 0.0))
+                            focus_event.set_extra("astrmai_private_topic_label", str(topic_decision.get("topic", "") or ""))
+                            prompt_summary = str(topic_decision.get("prompt_summary", "") or "")
+                            if prompt_summary:
+                                focus_event.set_extra("astrmai_private_topic_context", prompt_summary)
+                            topic_confirmation_required = bool(topic_decision.get("requires_confirmation", False))
+                            if topic_confirmation_required:
+                                focus_event.set_extra(
+                                    "astrmai_private_topic_confirmation_text",
+                                    str(topic_decision.get("confirmation_text", "") or ""),
+                                )
                     self._schedule_compaction_task(chat_id, focus_thread)
                     should_skip_judge = bool(
                         focus_candidate.is_direct_wakeup
@@ -1237,13 +1323,16 @@ class AttentionGate:
                         or focus_candidate.has_direct_vision
                         or current_is_strong_wakeup
                     )
-                    judge_action = await self._evaluate_judge_gate(
-                        chat_id,
-                        focus_event,
-                        focus_thread,
-                        events,
-                        is_strong_wakeup=should_skip_judge,
-                    )
+                    if topic_confirmation_required:
+                        judge_action = "TOPIC_CONFIRM"
+                    else:
+                        judge_action = await self._evaluate_judge_gate(
+                            chat_id,
+                            focus_event,
+                            focus_thread,
+                            events,
+                            is_strong_wakeup=should_skip_judge,
+                        )
                     focus_event.set_extra("judge_action", judge_action)
                     turn_context.attention.judge_action = judge_action
                     debug_trace(
@@ -1271,7 +1360,17 @@ class AttentionGate:
                             else False
                         ),
                     )
-                    if judge_action == "WAIT":
+                    if judge_action == "TOPIC_CONFIRM":
+                        async with session.lock:
+                            self._append_attention_window(session, batch_events)
+                        await self._send_private_topic_confirmation(
+                            focus_event,
+                            str(
+                                focus_event.get_extra("astrmai_private_topic_confirmation_text", "")
+                                or "这个话题已经隔了一会儿了，还要继续聊吗？回复“继续”就好～"
+                            ),
+                        )
+                    elif judge_action == "WAIT":
                         if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
                             await self._complete_proactive_candidate(focus_event, reason="proactive_judge_wait")
                         async with session.lock:
@@ -1286,8 +1385,32 @@ class AttentionGate:
                             self._append_attention_window(session, batch_events)
                         if self.sys2_process:
                             if is_private:
+                                begin_pending_batch = getattr(
+                                    self.private_turn_coordinator,
+                                    "begin_pending_batch",
+                                    None,
+                                )
+                                pending_revision = (
+                                    begin_pending_batch(chat_id, batch_events)
+                                    if callable(begin_pending_batch)
+                                    else 0
+                                )
                                 try:
-                                    await self.sys2_process(focus_event, focus_thread.all_thread_events())
+                                    reply_result = await self.sys2_process(
+                                        focus_event,
+                                        focus_thread.all_thread_events(),
+                                    )
+                                    finish_pending_batch = getattr(
+                                        self.private_turn_coordinator,
+                                        "finish_pending_batch",
+                                        None,
+                                    )
+                                    if callable(finish_pending_batch):
+                                        finish_pending_batch(
+                                            chat_id,
+                                            pending_revision,
+                                            bool(reply_result),
+                                        )
                                 except asyncio.CancelledError:
                                     raise
                                 except Exception as exc:

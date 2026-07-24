@@ -133,6 +133,31 @@ class PromptRefiner:
             return ""
         return cls._truncate_soft_background_text("\n\n".join(parts), cls.RUNTIME_GUIDANCE_MAX_CHARS)
 
+    @staticmethod
+    def _render_final_speaker_lock(current_speaker_block: str) -> str:
+        block = str(current_speaker_block or "").strip()
+        if not block:
+            return ""
+        speaker_id = ""
+        speaker_name = ""
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- QQ:"):
+                speaker_id = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("- 昵称:"):
+                speaker_name = stripped.split(":", 1)[1].strip()
+        if not speaker_id and not speaker_name:
+            return ""
+        display_name = speaker_name or "当前发言人"
+        display_id = speaker_id or "unknown"
+        return (
+            "---最终发言人归因锁---\n"
+            f"当前唯一对话对象是 {display_name}（QQ {display_id}）。"
+            "回复中的第二人称、昵称和关系称呼必须指向这一位；"
+            "历史群友只能作为第三方背景。除非当前消息明确提到某位群友，"
+            "不要从历史、记忆、内在驱动或工具参数中补出其他人的名字。"
+        )
+
     def _resolve_soft_background_budget(
         self,
         *,
@@ -975,6 +1000,9 @@ class PromptRefiner:
         )
         if guidance_section:
             sections.append(f"---本轮指引---\n{guidance_section}")
+        final_speaker_lock = self._render_final_speaker_lock(current_speaker_block)
+        if final_speaker_lock:
+            sections.append(final_speaker_lock)
 
         final_prompt = "\n\n".join(section for section in sections if section).strip()
 

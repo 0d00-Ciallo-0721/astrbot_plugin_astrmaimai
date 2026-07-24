@@ -77,6 +77,32 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         elapsed = asyncio.run(run())
         self.assertGreaterEqual(elapsed, 0.04)
 
+    def test_pending_batch_revision_preserves_new_message_during_slow_reply(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(private_chat=SimpleNamespace(input_settle_sec=0.0))
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        first = _Event("第一句")
+        first.message_obj.message_id = "first"
+        second = _Event("第二句")
+        second.message_obj.message_id = "second"
+        chat_id = "ff:FriendMessage:user-1"
+
+        first_revision = coordinator.begin_pending_batch(chat_id, [first])
+        coordinator.note_new_message(chat_id)
+        coordinator.finish_pending_batch(chat_id, first_revision, reply_sent=True)
+
+        merged = coordinator.merge_pending_batch(chat_id, [second])
+
+        self.assertEqual(merged, [first, second])
+        self.assertTrue(first.get_extra("astrmai_private_pending_context"))
+        self.assertIn(chat_id, coordinator._pending_batches)
+
+        second_revision = coordinator.begin_pending_batch(chat_id, merged)
+        coordinator.finish_pending_batch(chat_id, second_revision, reply_sent=True)
+        self.assertNotIn(chat_id, coordinator._pending_batches)
+        self.assertFalse(coordinator.clear_pending_batch(chat_id))
+
     def test_prepare_batch_waits_for_vision_and_builds_rich_context(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 

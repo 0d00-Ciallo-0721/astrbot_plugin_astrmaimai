@@ -573,6 +573,64 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertNotIn("current_goal=", planner.executor.calls[-1]["prompt"])
         self.assertNotIn("goal_status=", planner.executor.calls[-1]["prompt"])
 
+    def test_planner_does_not_feed_another_group_member_agency_reflection(self):
+        first_decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="tease Ying",
+            memory_policy="light",
+            social_intent="tease",
+            action_tier="chat",
+        )
+        planner = self._make_planner(first_decision)
+        first_event = _FakeEvent(sender_id="1481314186", sender_name="萤", text="你话这么多")
+        _install_focus_extras(first_event)
+        asyncio.run(planner.plan_and_execute(first_event, [first_event]))
+
+        second_decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="answer current member",
+            memory_policy="light",
+        )
+        planner.cognitive_loop = _FakeLoop(second_decision)
+        second_event = _FakeEvent(sender_id="3650815443", sender_name="6", text="妃妃")
+        _install_focus_extras(second_event)
+        asyncio.run(planner.plan_and_execute(second_event, [second_event]))
+
+        self.assertEqual(second_event.get_extra("astrmai_agency_reflection_summary", ""), "")
+        self.assertNotIn("萤", planner.executor.calls[-1]["prompt"])
+
+    def test_agency_summary_is_actor_scoped_and_never_contains_reply_body(self):
+        planner = self._make_planner(None)
+        planner.agency_runtime.record(
+            chat_id="default:GroupMessage:group-1",
+            actor_id="1481314186",
+            reply_need="reply",
+            social_intent="tease",
+            action_tier="chat",
+            action_taken="reply",
+            reply_preview="萤哥哥又干什么啦",
+            note="继续叫萤哥哥",
+            cooldown_tags=["long_reply"],
+        )
+
+        ying_summary = planner.agency_runtime.summary(
+            "default:GroupMessage:group-1",
+            actor_id="1481314186",
+        )
+        other_summary = planner.agency_runtime.summary(
+            "default:GroupMessage:group-1",
+            actor_id="3650815443",
+        )
+
+        self.assertIn("tease", ying_summary)
+        self.assertNotIn("萤哥哥", ying_summary)
+        self.assertNotIn("继续叫", ying_summary)
+        self.assertEqual(other_summary, "")
+        self.assertIn(
+            "long_reply",
+            planner.agency_runtime.cooldown_tags("default:GroupMessage:group-1"),
+        )
+
     def test_agency_cooldown_uses_executed_tool_trace_not_available_tools(self):
         planner = self._make_planner(None)
         event = _FakeEvent(text="hello")

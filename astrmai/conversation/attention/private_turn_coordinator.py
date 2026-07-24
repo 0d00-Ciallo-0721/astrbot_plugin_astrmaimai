@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
@@ -10,14 +11,25 @@ from astrbot.api import logger
 from ...multimodal.vision_prompt import normalize_vision_result, render_vision_record
 
 
+@dataclass
+class _PendingPrivateBatch:
+    events: list[Any] = field(default_factory=list)
+    revision: int = 0
+    updated_at: float = field(default_factory=time.time)
+
+
 class PrivateTurnCoordinator:
     """Private-chat quiet-window plus direct-message pre-decision vision barrier."""
+
+    PENDING_MAX_AGE_SECONDS = 900.0
+    PENDING_MAX_EVENTS = 12
 
     def __init__(self, config: Any, image_resolver: Any, visual_cortex: Any, persistence: Any = None):
         self.config = config
         self.image_resolver = image_resolver
         self.visual_cortex = visual_cortex
         self.persistence = persistence
+        self._pending_batches: dict[str, _PendingPrivateBatch] = {}
 
     def refresh_config(self, config: Any) -> None:
         self.config = config
@@ -30,6 +42,88 @@ class PrivateTurnCoordinator:
 
     def settle_seconds(self) -> float:
         return max(0.0, float(getattr(self._private_config(), "input_settle_sec", 1.5) or 0.0))
+
+    @staticmethod
+    def _event_key(event: Any) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        message_id = str(
+            getattr(message_obj, "message_id", None)
+            or getattr(message_obj, "id", None)
+            or getattr(event, "message_id", None)
+            or ""
+        ).strip()
+        if message_id:
+            return f"id:{message_id}"
+        sender_id = ""
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            pass
+        text = str(getattr(event, "message_str", "") or "").strip()
+        timestamp = str(getattr(event, "timestamp", "") or "")
+        return f"fallback:{sender_id}:{timestamp}:{text}"
+
+    @classmethod
+    def _deduplicate_events(cls, events: list[Any]) -> list[Any]:
+        merged: list[Any] = []
+        seen: set[str] = set()
+        for event in events:
+            key = cls._event_key(event)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(event)
+        return merged
+
+    def note_new_message(self, chat_id: str) -> None:
+        """Keep an in-flight private batch alive when a newer message arrives."""
+        pending = self._pending_batches.get(str(chat_id or ""))
+        if pending is not None:
+            pending.revision += 1
+            pending.updated_at = time.time()
+
+    def merge_pending_batch(self, chat_id: str, events: list[Any]) -> list[Any]:
+        """Prepend an unresolved private batch to the next input batch.
+
+        This state is deliberately private-chat-only. It bridges a slow model
+        response or a stale reply decision without changing the group window.
+        """
+        normalized_chat_id = str(chat_id or "")
+        pending = self._pending_batches.get(normalized_chat_id)
+        if pending is None:
+            return list(events)
+        if time.time() - pending.updated_at > self.PENDING_MAX_AGE_SECONDS:
+            self._pending_batches.pop(normalized_chat_id, None)
+            return list(events)
+
+        for event in pending.events:
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_private_pending_context", True)
+        return self._deduplicate_events([*pending.events, *events])[-self.PENDING_MAX_EVENTS :]
+
+    def begin_pending_batch(self, chat_id: str, events: list[Any]) -> int:
+        """Record a private batch until its reply completes successfully."""
+        normalized_chat_id = str(chat_id or "")
+        previous = self._pending_batches.get(normalized_chat_id)
+        revision = (previous.revision if previous is not None else 0) + 1
+        self._pending_batches[normalized_chat_id] = _PendingPrivateBatch(
+            events=self._deduplicate_events(list(events))[-self.PENDING_MAX_EVENTS :],
+            revision=revision,
+            updated_at=time.time(),
+        )
+        return revision
+
+    def finish_pending_batch(self, chat_id: str, revision: int, reply_sent: bool) -> None:
+        """Clear only the exact batch that produced a successful reply."""
+        if not reply_sent:
+            return
+        normalized_chat_id = str(chat_id or "")
+        pending = self._pending_batches.get(normalized_chat_id)
+        if pending is not None and pending.revision == int(revision or 0):
+            self._pending_batches.pop(normalized_chat_id, None)
+
+    def clear_pending_batch(self, chat_id: str) -> bool:
+        return self._pending_batches.pop(str(chat_id or ""), None) is not None
 
     async def wait_for_input_stability(self, session: Any) -> None:
         delay = self.settle_seconds()

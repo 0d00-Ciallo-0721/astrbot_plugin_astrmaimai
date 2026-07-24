@@ -97,7 +97,13 @@ class PlanningInputLoader:
         return self._record_timing(event, item)
 
     async def load_pre_budget(self, event, chat_id: str) -> PreBudgetInputs:
-        agency_task = self._run_timed(event, "agency_snapshot", lambda: self._agency_snapshot(chat_id), {})
+        actor_id = self._current_actor_id(event)
+        agency_task = self._run_timed(
+            event,
+            "agency_snapshot",
+            lambda: self._agency_snapshot(chat_id, actor_id),
+            {},
+        )
         continuity_task = self._run_timed(event, "continuity_snapshot", lambda: self._continuity_snapshot(chat_id), {})
         heartflow_task = self._run_timed(event, "heartflow_snapshot", lambda: self._heartflow_snapshot(chat_id), {})
         agency_item, continuity_item, heartflow_item = await asyncio.gather(
@@ -229,12 +235,30 @@ class PlanningInputLoader:
             self._record_skip(event, "jargon_explanation", f"think_level_{level}")
         return result
 
-    def _agency_snapshot(self, chat_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _current_actor_id(event) -> str:
+        turn_context = ensure_turn_context(event)
+        actor_id = str(getattr(turn_context.perception, "sender_id", "") or "").strip()
+        if actor_id:
+            return actor_id
+        if hasattr(event, "get_extra"):
+            focus_context = event.get_extra("astrmai_focus_thread_context", None)
+            actor_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+            if actor_id:
+                return actor_id
+        if hasattr(event, "get_sender_id"):
+            try:
+                return str(event.get_sender_id() or "").strip()
+            except Exception:
+                return ""
+        return ""
+
+    def _agency_snapshot(self, chat_id: str, actor_id: str = "") -> dict[str, Any]:
         runtime = getattr(self.planner, "agency_runtime", None)
         if not runtime:
             return {}
         return {
-            "reflection_summary": str(runtime.summary(chat_id) or ""),
+            "reflection_summary": str(runtime.summary(chat_id, actor_id=actor_id) or ""),
             "cooldown_tags": sorted(runtime.cooldown_tags(chat_id)),
         }
 
@@ -402,6 +426,26 @@ class PlanningInputLoader:
     def _apply_continuity(self, event, continuity: dict[str, Any]) -> None:
         summary = str(continuity.get("summary", "") or "")
         snapshot = continuity.get("snapshot", {}) or {}
+        private_topic_context = ""
+        private_topic_label = ""
+        private_topic_inherited = False
+        if hasattr(event, "get_extra"):
+            private_topic_context = str(
+                event.get_extra("astrmai_private_topic_context", "") or ""
+            ).strip()
+            private_topic_label = str(
+                event.get_extra("astrmai_private_topic_label", "") or ""
+            ).strip()
+            private_topic_inherited = bool(
+                event.get_extra("astrmai_private_topic_inherited", False)
+            )
+        if private_topic_context:
+            summary = private_topic_context
+            snapshot = dict(snapshot)
+            snapshot["current_topic"] = private_topic_label or str(
+                snapshot.get("current_topic", "") or ""
+            )
+            snapshot["continuity_weight"] = "strong" if private_topic_inherited else ""
         turn_context = ensure_turn_context(event)
         turn_context.continuity.current_topic = str(snapshot.get("current_topic", "") or "")
         turn_context.continuity.current_goal = str(snapshot.get("current_goal", "") or "")
