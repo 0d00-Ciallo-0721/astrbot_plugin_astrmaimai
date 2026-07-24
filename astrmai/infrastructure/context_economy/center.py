@@ -169,6 +169,8 @@ class ContextEconomyCenter:
             cache_affinity_enabled=cache_affinity_enabled,
             freshness_priority=freshness_priority,
             lane_scope_id=lane_scope_id,
+            lane_scope_kind=lane_scope_kind,
+            template_id=request.template_id,
         )
         provider_cache_affinity_class = "cache_priority" if cache_priority else "freshness_priority"
         return WorkloadPolicy(
@@ -344,11 +346,16 @@ class ContextEconomyCenter:
         cache_affinity_enabled: bool,
         freshness_priority: bool,
         lane_scope_id: str,
+        lane_scope_kind: str,
+        template_id: str,
     ) -> str:
         if family in self.GLOBAL_SCOPE_DIAGNOSTIC_FAMILIES and lane_scope_id == "global":
             logger.warning(
-                "[ContextEconomy] cache-priority workload %s fell back to global scope; session affinity may be degraded",
+                "[ContextEconomy] cache-priority workload %s fell back to global scope; "
+                "session affinity may be degraded (scope_kind=%s template=%s)",
                 family.value,
+                lane_scope_kind or "global",
+                template_id or "unknown",
             )
             return "global_scope_fallback"
         if cache_affinity_enabled:

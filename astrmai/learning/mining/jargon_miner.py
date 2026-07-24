@@ -82,13 +82,29 @@ class JargonMiner:
                 "reason": "completed_without_enricher",
             }
             return candidates
-        enriched = await self.enricher.enrich(group_id, candidates)
+        enrichment_result = await self.enricher.enrich(group_id, candidates)
+        if isinstance(enrichment_result, list):
+            enriched = list(enrichment_result)
+            enrichment_report = {
+                "status": "completed",
+                "terminal": True,
+                "retryable": False,
+                "reason": "legacy_enricher_result",
+                "input_count": len(candidates),
+                "accepted_count": len(enriched),
+            }
+            enrichment_reason = "completed"
+        else:
+            enriched = list(enrichment_result.items)
+            enrichment_report = enrichment_result.to_report()
+            enrichment_reason = enrichment_result.reason
         self.last_report = {
             "group_id": group_id,
             "normalized_messages": len(normalized),
             "existing_terms": len(existing_terms),
             **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
             "enriched_count": len(enriched),
-            "reason": "completed" if enriched else "enrichment_empty",
+            "reason": enrichment_reason,
+            "enrichment": enrichment_report,
         }
         return enriched

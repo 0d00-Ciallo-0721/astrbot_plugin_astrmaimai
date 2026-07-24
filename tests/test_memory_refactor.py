@@ -102,6 +102,8 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertEqual(len(gateway.calls), 2)
         self.assertEqual(gateway.calls[0]["lane_key"].scope_id, "chat-42")
         self.assertEqual(gateway.calls[0]["lane_key"].scope_kind, "chat")
+        self.assertEqual(gateway.calls[0]["base_origin"], "chat-42")
+        self.assertEqual(gateway.calls[1]["base_origin"], "chat-42")
 
     def test_memory_turn_pipeline_describes_eligibility_from_buffer(self):
         pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")

@@ -69,7 +69,7 @@ class JargonPipelineMigratedTests(unittest.TestCase):
         async def run():
             gateway = _Gateway(error=RuntimeError("llm offline"))
             enricher = self.enricher_mod.JargonEnricher(gateway)
-            enriched = await enricher.enrich(
+            result = await enricher.enrich(
                 "group-1",
                 [
                     {
@@ -81,7 +81,11 @@ class JargonPipelineMigratedTests(unittest.TestCase):
                     }
                 ],
             )
-            self.assertEqual(enriched, [])
+            self.assertEqual(result.status, "provider_failure")
+            self.assertEqual(result.items, [])
+            self.assertTrue(result.retryable)
+            self.assertFalse(result.terminal)
+            self.assertEqual(result.error_type, "RuntimeError")
 
         asyncio.run(run())
 
@@ -102,7 +106,7 @@ class JargonPipelineMigratedTests(unittest.TestCase):
                 }
             )
             enricher = self.enricher_mod.JargonEnricher(gateway)
-            enriched = await enricher.enrich(
+            result = await enricher.enrich(
                 "group-1",
                 [
                     {
@@ -114,7 +118,80 @@ class JargonPipelineMigratedTests(unittest.TestCase):
                     }
                 ],
             )
-            self.assertEqual(enriched[0]["review_status"], "review_pending")
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.items[0]["review_status"], "review_pending")
+
+        asyncio.run(run())
+
+    def test_enricher_distinguishes_valid_all_rejected_from_failure(self):
+        async def run():
+            gateway = _Gateway(
+                response={
+                    "items": [
+                        {
+                            "index": 1,
+                            "meaning": "",
+                            "scene": "ordinary chat",
+                            "confidence": 0.2,
+                            "is_jargon": False,
+                            "review_status": "rejected",
+                        }
+                    ]
+                }
+            )
+            result = await self.enricher_mod.JargonEnricher(gateway).enrich(
+                "group-1",
+                [{"content": "hello", "raw_content": "hello", "count": 2, "examples": ["hello"]}],
+            )
+
+            self.assertEqual(result.status, "all_rejected")
+            self.assertEqual(result.items, [])
+            self.assertTrue(result.terminal)
+            self.assertFalse(result.retryable)
+            self.assertEqual(result.rejected_count, 1)
+
+        asyncio.run(run())
+
+    def test_enricher_keeps_valid_partial_items_and_reports_missing_indexes(self):
+        async def run():
+            gateway = _Gateway(
+                response={
+                    "items": [
+                        {
+                            "index": 1,
+                            "meaning": "raid boss nickname",
+                            "scene": "raid call",
+                            "confidence": 0.9,
+                            "is_jargon": True,
+                            "review_status": "review_pending",
+                        }
+                    ]
+                }
+            )
+            candidates = [
+                {"content": "bigbird", "raw_content": "bigbird", "count": 3, "examples": ["bigbird"]},
+                {"content": "smallbird", "raw_content": "smallbird", "count": 3, "examples": ["smallbird"]},
+            ]
+            result = await self.enricher_mod.JargonEnricher(gateway).enrich("group-1", candidates)
+
+            self.assertEqual(result.status, "partial")
+            self.assertEqual([item["content"] for item in result.items], ["bigbird"])
+            self.assertEqual(result.missing_indexes, [2])
+            self.assertTrue(result.terminal)
+
+        asyncio.run(run())
+
+    def test_enricher_reports_invalid_json_as_retryable(self):
+        async def run():
+            result = await self.enricher_mod.JargonEnricher(_Gateway(response="{broken")).enrich(
+                "group-1",
+                [{"content": "bigbird", "raw_content": "bigbird", "count": 3, "examples": ["bigbird"]}],
+            )
+
+            self.assertEqual(result.status, "invalid_json")
+            self.assertEqual(result.items, [])
+            self.assertTrue(result.retryable)
+            self.assertFalse(result.terminal)
 
         asyncio.run(run())
 

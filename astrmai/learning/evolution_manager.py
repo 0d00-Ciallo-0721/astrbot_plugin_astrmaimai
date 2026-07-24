@@ -586,17 +586,30 @@ class EvolutionManager:
                 raise RuntimeError("expression mining did not reach a durable terminal state")
 
             jargon_count = 0
+            jargon_report: dict[str, Any] = {}
             if getattr(getattr(self.db, "memory_engine", None), "write_service", None):
                 jargons = await self.jargon_miner.mine(group_id, logs)
                 jargon_report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
-                if jargon_report.get("reason") == "enrichment_empty" and int(
+                jargon_enrichment = jargon_report.get("enrichment")
+                jargon_terminal = True
+                jargon_retryable = False
+                if isinstance(jargon_enrichment, dict):
+                    jargon_terminal = bool(jargon_enrichment.get("terminal"))
+                    jargon_retryable = bool(jargon_enrichment.get("retryable"))
+                elif jargon_report.get("reason") == "enrichment_empty" and int(
                     jargon_report.get("candidate_count", 0) or 0
                 ) > 0:
+                    jargon_terminal = False
+                    jargon_retryable = True
+                if not jargon_terminal:
                     await self._record_mining_outcome(
                         group_id,
                         logs,
                         status="degraded",
                         reason="jargon_enrichment_failed_closed",
+                        expression_report=expression_report,
+                        jargon_report=jargon_report,
+                        retryable=jargon_retryable,
                     )
                     raise RuntimeError("jargon enrichment failed closed")
                 jargon_count = await self._save_jargons(group_id, jargons)
@@ -618,6 +631,7 @@ class EvolutionManager:
                 processed_count=len(processed_ids),
                 retained_overlap=len(logs) - len(processed_ids),
                 expression_report=expression_report,
+                jargon_report=jargon_report,
                 persistence_report=pattern_save_report.to_report(),
             )
             payload = MiningCompletedEvent(
@@ -641,6 +655,7 @@ class EvolutionManager:
         processed_count: int = 0,
         retained_overlap: int = 0,
         expression_report: dict[str, Any] | None = None,
+        jargon_report: dict[str, Any] | None = None,
         persistence_report: dict[str, Any] | None = None,
         retryable: bool = False,
     ) -> None:
@@ -658,6 +673,7 @@ class EvolutionManager:
             "last_log_id": self._field(logs[-1], "id") if logs else None,
             "recorded_at": time.time(),
             "expression": dict(expression_report or {}),
+            "jargon": dict(jargon_report or {}),
             "persistence": dict(persistence_report or {}),
         }
         self._last_mining_outcomes[str(group_id or "")] = outcome

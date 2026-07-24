@@ -59,6 +59,7 @@ class MemoryMaintenanceService:
             "expression_pending_deleted": 0,
             "expression_rejected_deleted": 0,
             "protected_expression_skipped": 0,
+            "index_repair": {"attempted": False, "remaining_pending": 0},
             "errors": [],
             "protected_physical_delete": bool(policy.get("allow_protected_physical_delete", False)),
         }
@@ -187,6 +188,46 @@ class MemoryMaintenanceService:
             report["physically_deleted"] += len(deleted_ids)
         except Exception as exc:
             report["errors"].append(f"expression_pattern_cleanup:{exc}")
+        if self.index_projector:
+            try:
+                consistency = await self.index_projector.check_consistency()
+                consistency_error = str(consistency.get("error") or "").strip()
+                missing = list(consistency.get("missing_projection_ids", []) or [])
+                orphan = list(consistency.get("orphan_projection_ids", []) or [])
+                inactive = list(consistency.get("inactive_projection_ids", []) or [])
+                duplicate = list(consistency.get("duplicate_projection_ids", []) or [])
+                projector_engine = getattr(self.index_projector, "engine", None)
+                retriever_ready = bool(getattr(projector_engine, "retriever", None))
+                has_inconsistency = bool(missing or orphan or inactive or duplicate)
+                can_repair = bool(orphan or inactive or (retriever_ready and (missing or duplicate)))
+                if consistency_error:
+                    report["errors"].append(f"index_projection_check:{consistency_error}")
+                    report["index_repair"] = {
+                        "attempted": False,
+                        "check_failed": True,
+                        "remaining_pending": int(consistency.get("pending_projection_count", 0) or 0),
+                    }
+                elif has_inconsistency and can_repair:
+                    repaired = await self.index_projector.repair_consistency(consistency)
+                    report["index_repair"] = {
+                        "attempted": True,
+                        "missing_before": len(missing),
+                        "orphan_before": len(orphan),
+                        "inactive_before": len(inactive),
+                        "duplicate_before": len(duplicate),
+                        **repaired,
+                    }
+                else:
+                    report["index_repair"] = {
+                        "attempted": False,
+                        "missing_before": len(missing),
+                        "orphan_before": len(orphan),
+                        "inactive_before": len(inactive),
+                        "duplicate_before": len(duplicate),
+                        "remaining_pending": int(consistency.get("pending_projection_count", 0) or 0),
+                    }
+            except Exception as exc:
+                report["errors"].append(f"index_projection_repair:{type(exc).__name__}")
         return report
 
     async def soft_delete(self, memory_id: str, *, reason: str = "") -> int:

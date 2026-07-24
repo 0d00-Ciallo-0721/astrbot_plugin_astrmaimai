@@ -6,6 +6,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.runtime.lane_manager import LaneKey
+from .jargon_results import JargonEnrichmentResult
 
 
 class JargonEnricher:
@@ -26,9 +27,9 @@ class JargonEnricher:
             return normalized
         return "review_pending"
 
-    async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> JargonEnrichmentResult:
         if not candidates:
-            return []
+            return JargonEnrichmentResult(status="completed", reason="no_input")
         prompt_items = []
         for index, item in enumerate(candidates, start=1):
             prompt_items.append(
@@ -56,23 +57,65 @@ class JargonEnricher:
                 base_origin=group_id,
             )
             if isinstance(result, str):
-                result = json.loads(result)
-            rows = result.get("items", []) if isinstance(result, dict) else []
+                try:
+                    result = json.loads(result)
+                except (TypeError, ValueError) as exc:
+                    return self._failed_result(
+                        group_id,
+                        candidates,
+                        status="invalid_json",
+                        reason="response_json_decode_failed",
+                        error_type=type(exc).__name__,
+                    )
         except Exception as exc:
-            logger.debug(f"[JargonEnricher] enrichment degraded: {exc}")
-            rows = []
-        by_index = {
-            int(item.get("index")): item
-            for item in rows
-            if isinstance(item, dict) and str(item.get("index", "")).strip()
-        }
+            return self._failed_result(
+                group_id,
+                candidates,
+                status="provider_failure",
+                reason="gateway_call_failed",
+                error_type=type(exc).__name__,
+            )
+        if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+            return self._failed_result(
+                group_id,
+                candidates,
+                status="invalid_schema",
+                reason="items_array_missing",
+                error_type=type(result).__name__,
+            )
+        rows = result["items"]
+        by_index: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                index = int(row.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= index <= len(candidates) and index not in by_index:
+                by_index[index] = row
+        if not by_index:
+            return self._failed_result(
+                group_id,
+                candidates,
+                status="invalid_schema",
+                reason="no_indexed_items",
+                error_type="MissingCandidateIndex",
+                returned_count=len(rows),
+            )
         enriched: list[dict[str, Any]] = []
+        rejected_count = 0
+        missing_indexes: list[int] = []
         for index, item in enumerate(candidates, start=1):
             if index not in by_index:
+                missing_indexes.append(index)
                 continue
             payload = dict(item)
             extra = by_index[index]
-            confidence = float(extra.get("confidence") or payload.get("activation_score") or 0.55)
+            try:
+                confidence = float(extra.get("confidence") or payload.get("activation_score") or 0.55)
+            except (TypeError, ValueError):
+                confidence = float(payload.get("activation_score") or 0.55)
             payload["meaning"] = str(extra.get("meaning") or payload.get("meaning") or "").strip()
             payload["scene"] = str(extra.get("scene") or "").strip()
             payload["confidence"] = max(0.0, min(confidence, 1.0))
@@ -83,7 +126,58 @@ class JargonEnricher:
             payload["review_status"] = self._normalize_review_status(extra.get("review_status") or "")
             if payload["is_jargon"] and payload["meaning"]:
                 enriched.append(payload)
-        return enriched
+            else:
+                rejected_count += 1
+        if missing_indexes:
+            status = "partial"
+            reason = "partial_response"
+        elif enriched:
+            status = "completed"
+            reason = "enrichment_completed"
+        else:
+            status = "all_rejected"
+            reason = "model_rejected_all_candidates"
+        result_obj = JargonEnrichmentResult(
+            status=status,
+            items=enriched,
+            input_count=len(candidates),
+            returned_count=len(by_index),
+            accepted_count=len(enriched),
+            rejected_count=rejected_count,
+            missing_indexes=missing_indexes,
+            retryable=False,
+            reason=reason,
+        )
+        logger.info(
+            f"[JargonEnricher] group={group_id or 'global'} status={status} "
+            f"input={len(candidates)} returned={len(by_index)} accepted={len(enriched)} "
+            f"rejected={rejected_count} missing={len(missing_indexes)}"
+        )
+        return result_obj
+
+    @staticmethod
+    def _failed_result(
+        group_id: str,
+        candidates: list[dict[str, Any]],
+        *,
+        status: str,
+        reason: str,
+        error_type: str,
+        returned_count: int = 0,
+    ) -> JargonEnrichmentResult:
+        result = JargonEnrichmentResult(
+            status=status,
+            input_count=len(candidates),
+            returned_count=returned_count,
+            retryable=True,
+            reason=reason,
+            error_type=error_type,
+        )
+        logger.warning(
+            f"[JargonEnricher] group={group_id or 'global'} status={status} input={len(candidates)} "
+            f"returned={returned_count} reason={reason} error_type={error_type}"
+        )
+        return result
 
 
 __all__ = ["JargonEnricher"]

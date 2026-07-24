@@ -137,7 +137,12 @@ class MemoryWriteService:
             try:
                 projected = await self.index_projector.project(memory_id=memory_id, request=normalized)
                 if projected is False:
-                    logger.warning(f"[MemoryWrite] index projection pending repair for {memory_id}")
+                    reason_getter = getattr(self.index_projector, "pending_reason", None)
+                    reason = reason_getter(memory_id) if callable(reason_getter) else "unknown"
+                    logger.warning(
+                        f"[MemoryWrite] index projection pending repair memory_id={memory_id} "
+                        f"reason={reason or 'unknown'} repair_scheduled=true"
+                    )
             except Exception as exc:
                 logger.warning(f"[MemoryWrite] index projection failed for {memory_id}: {exc}")
         return memory_id

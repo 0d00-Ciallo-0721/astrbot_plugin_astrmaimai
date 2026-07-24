@@ -1332,6 +1332,83 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertIn(("cancel_group_wait_if_interrupted", "BUFFERED"), facade_calls)
         self.assertIn(("suppress_default_llm_if_engaged", "BUFFERED", False), facade_calls)
 
+    def test_message_entry_passes_group_recall_notice_to_other_plugins(self):
+        calls = []
+
+        async def _unexpected(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("non-chat notice must not enter AstrMai message processing")
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: (_ for _ in ()).throw(
+                AssertionError("command detection must not run for notice events")
+            ),
+            handle_poke=_unexpected,
+            check_message_scope_access=lambda scope: (_ for _ in ()).throw(
+                AssertionError("scope access must not run for notice events")
+            ),
+        )
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            group_id="group-1",
+        )
+        event.raw_event = {
+            "post_type": "notice",
+            "notice_type": "group_recall",
+            "group_id": "group-1",
+            "user_id": "user-1",
+            "message_id": "message-1",
+        }
+
+        async def _run():
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
+
+        self.assertEqual(asyncio.run(_run()), [])
+        self.assertFalse(event.stopped)
+        self.assertEqual(event.get_extra("astrmai_event_route"), "notice_passthrough")
+        self.assertEqual(event.get_extra("astrmai_notice_type"), "group_recall")
+        self.assertEqual(calls, [])
+
+    def test_message_entry_keeps_poke_notice_on_dedicated_path(self):
+        calls = []
+
+        async def _handle_poke(event):
+            from astrmai.presentation.dto.message_scope import IngressDecision
+
+            calls.append("poke")
+            return IngressDecision.stop("poke_event")
+
+        facade = SimpleNamespace(
+            is_framework_command=lambda msg: False,
+            handle_poke=_handle_poke,
+            check_message_scope_access=lambda scope: (_ for _ in ()).throw(
+                AssertionError("poke stop must happen before scope access")
+            ),
+        )
+        event = _FakeEvent(
+            umo="default:GroupMessage:group-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            group_id="group-1",
+        )
+        event.raw_event = {
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "group_id": "group-1",
+            "user_id": "user-1",
+            "target_id": "bot-1",
+        }
+
+        async def _run():
+            return [item async for item in self.message_entry_mod.handle_global_message(facade, event)]
+
+        self.assertEqual(asyncio.run(_run()), [])
+        self.assertTrue(event.stopped)
+        self.assertEqual(calls, ["poke"])
+
     def test_message_entry_anonymous_sender_skips_user_activity_tracking(self):
         facade_calls = []
 

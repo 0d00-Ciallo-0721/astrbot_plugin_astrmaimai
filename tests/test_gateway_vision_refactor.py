@@ -340,7 +340,9 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         lane_key = lane_mod.LaneKey(subsystem="bg", task_family="memory", scope_id="chat-1", scope_kind="chat")
 
         lane_json = asyncio.run(gateway.call_data_process_task("prompt", is_json=True, lane_key=lane_key, base_origin="origin"))
-        elastic_text = asyncio.run(gateway.call_data_process_task("prompt", is_json=False))
+        elastic_text = asyncio.run(
+            gateway.call_data_process_task("prompt", is_json=False, base_origin="default:GroupMessage:group-1")
+        )
         proactive_lane = asyncio.run(gateway.call_proactive_task("prompt", lane_key=lane_key))
         proactive_elastic = asyncio.run(gateway.call_proactive_task("prompt"))
 
@@ -352,6 +354,8 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertTrue(gateway.lane_calls[0]["is_json"])
         self.assertFalse(gateway.lane_calls[1]["is_json"])
         self.assertEqual(len(gateway.elastic_calls), 2)
+        self.assertEqual(gateway.context_economy.requests[0]["scope_id"], "default:GroupMessage:group-1")
+        self.assertEqual(gateway.context_economy.requests[0]["scope_kind"], "chat")
 
     def test_persona_task_dispatches_json_and_text_modes(self):
         task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")

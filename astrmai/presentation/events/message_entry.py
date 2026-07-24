@@ -45,6 +45,53 @@ def _resolve_message_id(event) -> str:
     return ""
 
 
+def _find_notice_payload(value, *, depth: int = 0, seen: set[int] | None = None) -> dict:
+    if value is None or depth > 8:
+        return {}
+    seen = seen if seen is not None else set()
+    object_id = id(value)
+    if object_id in seen:
+        return {}
+    seen.add(object_id)
+    if isinstance(value, dict):
+        post_type = str(value.get("post_type") or "").strip().lower()
+        notice_type = str(value.get("notice_type") or "").strip().lower()
+        if post_type == "notice" or notice_type:
+            return value
+        children = value.values()
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        raw = getattr(value, "raw_event", None)
+        if raw is not None:
+            found = _find_notice_payload(raw, depth=depth + 1, seen=seen)
+            if found:
+                return found
+        message_obj = getattr(value, "message_obj", None)
+        if message_obj is not None and message_obj is not value:
+            found = _find_notice_payload(message_obj, depth=depth + 1, seen=seen)
+            if found:
+                return found
+        data = getattr(value, "__dict__", None)
+        children = data.values() if isinstance(data, dict) else ()
+    for child in children:
+        found = _find_notice_payload(child, depth=depth + 1, seen=seen)
+        if found:
+            return found
+    return {}
+
+
+def _classify_event_route(event) -> tuple[str, dict]:
+    payload = _find_notice_payload(event)
+    if not payload:
+        return "message", {}
+    notice_type = str(payload.get("notice_type") or "").strip().lower()
+    sub_type = str(payload.get("sub_type") or "").strip().lower()
+    if notice_type == "poke" or sub_type in {"poke", "戳一戳"}:
+        return "poke_notice", payload
+    return "notice_passthrough", payload
+
+
 async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: MessageScope) -> None:
     prepare_turn = getattr(facade, "prepare_conversation_turn", None)
     if callable(prepare_turn):
@@ -87,6 +134,24 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
 
 
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
+    event_route, notice_payload = _classify_event_route(event)
+    if event_route == "notice_passthrough":
+        notice_type = str(notice_payload.get("notice_type") or "unknown").strip().lower()
+        sub_type = str(notice_payload.get("sub_type") or "").strip().lower()
+        try:
+            event.set_extra("astrmai_event_route", event_route)
+            event.set_extra("astrmai_notice_type", notice_type)
+            event.set_extra("astrmai_non_conversational", True)
+            debug_trace(
+                event,
+                "ingress.notice_passthrough",
+                notice_type=notice_type,
+                sub_type=sub_type,
+            )
+        except Exception:
+            logger.debug("[AstrMai] notice passthrough trace degraded", exc_info=True)
+        return
+
     scope = MessageScope.from_event(event)
     msg = event.message_str.strip() if event.message_str else ""
     try:

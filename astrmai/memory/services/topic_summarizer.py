@@ -357,7 +357,7 @@ class TopicSummarizer:
                 system_prompt=system_prompt,
                 is_json=True,
                 lane_key=lane_key,
-                base_origin="",
+                base_origin=session_id,
                 template_envelope=envelope,
             )
             summaries = self._parse_summaries(result, len(segments))

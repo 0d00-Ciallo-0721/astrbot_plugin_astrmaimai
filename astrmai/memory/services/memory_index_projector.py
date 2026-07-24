@@ -13,19 +13,40 @@ class MemoryIndexProjector:
     def __init__(self, engine):
         self.engine = engine
         self._pending_projection_ids: set[str] = set()
+        self._pending_projection_reasons: dict[str, str] = {}
+
+    def _mark_pending(self, memory_id: str, reason: str) -> None:
+        if not memory_id:
+            return
+        self._pending_projection_ids.add(memory_id)
+        self._pending_projection_reasons[memory_id] = str(reason or "unknown")
+
+    def _clear_pending(self, memory_id: str) -> None:
+        self._pending_projection_ids.discard(memory_id)
+        self._pending_projection_reasons.pop(memory_id, None)
+
+    def pending_reason(self, memory_id: str) -> str:
+        return str(self._pending_projection_reasons.get(str(memory_id or ""), "") or "")
 
     def _documents_db_path(self) -> str | None:
         return getattr(self.engine, "db_path", None)
 
     async def project(self, memory_id: str, request: MemoryWriteRequest | None = None) -> bool:
-        if not memory_id or not getattr(self.engine, "retriever", None):
+        if not memory_id:
+            return False
+        if not getattr(self.engine, "retriever", None):
+            self._mark_pending(memory_id, "retriever_not_ready")
+            logger.info(
+                f"[MemoryIndexProjector] projection deferred memory_id={memory_id} "
+                "reason=retriever_not_ready repair_scheduled=true"
+            )
             return False
         try:
             if request is None:
                 candidate = await self.engine.v2_store.get_by_id(memory_id, allow_stale=False)
                 if not candidate:
                     await self.delete_projection(memory_id)
-                    self._pending_projection_ids.discard(memory_id)
+                    self._clear_pending(memory_id)
                     return True
                 request = MemoryWriteRequest(
                     source=candidate.source,
@@ -55,11 +76,15 @@ class MemoryIndexProjector:
             )
             metadata.update(dict(request.metadata or {}))
             await self.engine.retriever.add_memory(request.content, metadata)
-            self._pending_projection_ids.discard(memory_id)
+            self._clear_pending(memory_id)
             return True
         except Exception as exc:
-            self._pending_projection_ids.add(memory_id)
-            logger.warning(f"[MemoryIndexProjector] projection degraded: {exc}")
+            reason = f"projection_error:{type(exc).__name__}"
+            self._mark_pending(memory_id, reason)
+            logger.warning(
+                f"[MemoryIndexProjector] projection degraded memory_id={memory_id} "
+                f"reason={reason} repair_scheduled=true"
+            )
             return False
 
     async def delete_projection(self, memory_id: str) -> int:
@@ -83,6 +108,7 @@ class MemoryIndexProjector:
                     db_path=self._documents_db_path(),
                 )
                 await self._delete_fts_rows(doc_ids)
+                self._clear_pending(memory_id)
             except Exception as exc:
                 logger.warning(f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc}")
         return deleted
@@ -115,6 +141,8 @@ class MemoryIndexProjector:
             "duplicate_projection_ids": [],
             "projection_count": 0,
             "canonical_projectable_count": 0,
+            "pending_projection_count": len(self._pending_projection_ids),
+            "pending_projection_reasons": dict(self._pending_projection_reasons),
         }
         try:
             projectable = await self.engine.v2_store.list_projectable()
@@ -151,6 +179,8 @@ class MemoryIndexProjector:
             "deleted_orphan": 0,
             "deleted_inactive": 0,
             "deduplicated": 0,
+            "remaining_pending": len(self._pending_projection_ids),
+            "remaining_pending_reasons": dict(self._pending_projection_reasons),
         }
         for memory_id in report.get("missing_projection_ids", []) or []:
             if await self.project(str(memory_id)):
@@ -162,6 +192,8 @@ class MemoryIndexProjector:
         for memory_id in report.get("duplicate_projection_ids", []) or []:
             if await self.project(str(memory_id)):
                 repaired["deduplicated"] += 1
+        repaired["remaining_pending"] = len(self._pending_projection_ids)
+        repaired["remaining_pending_reasons"] = dict(self._pending_projection_reasons)
         return repaired
 
     async def _clear_projected_documents(self, *, session_id: str = "") -> int:
@@ -209,7 +241,7 @@ class MemoryIndexProjector:
             )
         except Exception as exc:
             logger.warning(f"[MemoryIndexProjector] consistency scan degraded: {exc}")
-            return []
+            raise
         result: list[tuple[int, str]] = []
         for row in rows:
             try:

@@ -909,6 +909,214 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_projection_without_retriever_is_pending_and_repairable(self):
+        class _Retriever:
+            def __init__(self):
+                self.added = []
+
+            async def add_memory(self, content, metadata):
+                self.added.append((content, metadata))
+                return len(self.added)
+
+        class _FakeEngine:
+            def __init__(self, store):
+                self.v2_store = store
+                self.retriever = None
+
+            def _build_memory_metadata(self, **kwargs):
+                return dict(kwargs)
+
+            async def _run_documents_query(self, query, params=(), *, db_path=None):
+                return []
+
+            async def _execute_documents_write(self, query, params=(), *, db_path=None):
+                return 0
+
+        async def run():
+            store, _retrieval, writer, _injection, _tools, _maintenance = self._services()
+            memory_id = await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content="Alice delayed projection memory.",
+                )
+            )
+            engine = _FakeEngine(store)
+            projector = self.projector_mod.MemoryIndexProjector(engine)
+
+            self.assertFalse(await projector.project(memory_id))
+            self.assertEqual(projector.pending_reason(memory_id), "retriever_not_ready")
+            report = await projector.check_consistency()
+            self.assertIn(memory_id, report["missing_projection_ids"])
+            self.assertEqual(report["pending_projection_reasons"][memory_id], "retriever_not_ready")
+
+            engine.retriever = _Retriever()
+            repaired = await projector.repair_consistency(report)
+
+            self.assertEqual(repaired["rebuilt_missing"], 1)
+            self.assertEqual(repaired["remaining_pending"], 0)
+            self.assertEqual(projector.pending_reason(memory_id), "")
+            self.assertEqual(engine.retriever.added[0][1]["canonical_id"], memory_id)
+
+        asyncio.run(run())
+
+    def test_maintenance_cycle_repairs_pending_projection_when_retriever_is_ready(self):
+        class _Projector:
+            def __init__(self):
+                self.engine = SimpleNamespace(retriever=object())
+                self.repair_calls = []
+
+            async def check_consistency(self):
+                return {
+                    "missing_projection_ids": ["mem-1"],
+                    "pending_projection_count": 1,
+                }
+
+            async def repair_consistency(self, report):
+                self.repair_calls.append(report)
+                return {
+                    "rebuilt_missing": 1,
+                    "deleted_orphan": 0,
+                    "deleted_inactive": 0,
+                    "deduplicated": 0,
+                    "remaining_pending": 0,
+                    "remaining_pending_reasons": {},
+                }
+
+            async def cleanup_deleted(self, memory_ids):
+                return 0
+
+        async def run():
+            store, *_rest = self._services()
+            projector = _Projector()
+            maintenance = self.maintenance_mod.MemoryMaintenanceService(store, projector)
+
+            report = await maintenance.run_once(
+                policy={"decay_rate": 0.0, "min_score": 0.0, "stale_grace_seconds": 365 * 86400}
+            )
+
+            self.assertTrue(report["index_repair"]["attempted"])
+            self.assertEqual(report["index_repair"]["rebuilt_missing"], 1)
+            self.assertEqual(report["index_repair"]["remaining_pending"], 0)
+            self.assertEqual(len(projector.repair_calls), 1)
+
+        asyncio.run(run())
+
+    def test_maintenance_cycle_repairs_non_missing_index_inconsistencies(self):
+        class _Projector:
+            def __init__(self):
+                self.engine = SimpleNamespace(retriever=object())
+                self.repair_calls = []
+
+            async def check_consistency(self):
+                return {
+                    "missing_projection_ids": [],
+                    "orphan_projection_ids": ["mem-orphan"],
+                    "inactive_projection_ids": [],
+                    "duplicate_projection_ids": [],
+                    "pending_projection_count": 0,
+                }
+
+            async def repair_consistency(self, report):
+                self.repair_calls.append(report)
+                return {
+                    "rebuilt_missing": 0,
+                    "deleted_orphan": 1,
+                    "deleted_inactive": 0,
+                    "deduplicated": 0,
+                    "remaining_pending": 0,
+                    "remaining_pending_reasons": {},
+                }
+
+            async def cleanup_deleted(self, memory_ids):
+                return 0
+
+        async def run():
+            store, *_rest = self._services()
+            projector = _Projector()
+            maintenance = self.maintenance_mod.MemoryMaintenanceService(store, projector)
+
+            report = await maintenance.run_once(
+                policy={"decay_rate": 0.0, "min_score": 0.0, "stale_grace_seconds": 365 * 86400}
+            )
+
+            self.assertTrue(report["index_repair"]["attempted"])
+            self.assertEqual(report["index_repair"]["deleted_orphan"], 1)
+            self.assertEqual(len(projector.repair_calls), 1)
+
+        asyncio.run(run())
+
+    def test_maintenance_cycle_surfaces_index_consistency_check_error(self):
+        class _Projector:
+            def __init__(self):
+                self.engine = SimpleNamespace(retriever=object())
+
+            async def check_consistency(self):
+                return {
+                    "missing_projection_ids": [],
+                    "error": "documents database unavailable",
+                }
+
+            async def cleanup_deleted(self, memory_ids):
+                return 0
+
+        async def run():
+            store, *_rest = self._services()
+            maintenance = self.maintenance_mod.MemoryMaintenanceService(store, _Projector())
+
+            report = await maintenance.run_once(
+                policy={"decay_rate": 0.0, "min_score": 0.0, "stale_grace_seconds": 365 * 86400}
+            )
+
+            self.assertFalse(report["index_repair"]["attempted"])
+            self.assertIn("index_projection_check:documents database unavailable", report["errors"])
+
+        asyncio.run(run())
+
+    def test_projection_cleanup_clears_pending_state(self):
+        class _FakeEngine:
+            retriever = None
+
+            async def _run_documents_query(self, query, params=(), *, db_path=None):
+                return []
+
+            async def _execute_documents_write(self, query, params=(), *, db_path=None):
+                return 0
+
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector(_FakeEngine())
+
+            self.assertFalse(await projector.project("mem-pending"))
+            self.assertEqual(projector.pending_reason("mem-pending"), "retriever_not_ready")
+
+            await projector.cleanup_deleted(["mem-pending"])
+
+            self.assertEqual(projector.pending_reason("mem-pending"), "")
+
+        asyncio.run(run())
+
+    def test_consistency_scan_reports_projection_query_failure_without_mass_repair(self):
+        class _Store:
+            async def list_projectable(self):
+                return [SimpleNamespace(id="mem-1")]
+
+        class _FakeEngine:
+            v2_store = _Store()
+
+            async def _run_documents_query(self, query, params=(), *, db_path=None):
+                raise RuntimeError("documents database unavailable")
+
+        async def run():
+            projector = self.projector_mod.MemoryIndexProjector(_FakeEngine())
+
+            report = await projector.check_consistency()
+
+            self.assertIn("documents database unavailable", report["error"])
+            self.assertEqual(report["missing_projection_ids"], [])
+
+        asyncio.run(run())
+
     def test_hybrid_projection_fallback_must_pass_canonical_status_check(self):
         class _Result:
             content = "Alice deleted projected memory."

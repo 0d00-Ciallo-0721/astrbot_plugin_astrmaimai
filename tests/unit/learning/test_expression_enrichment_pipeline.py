@@ -281,6 +281,81 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(db.marked, [])
         self.assertTrue(manager._last_mining_outcomes["chat-1"]["retryable"])
 
+    def test_jargon_all_rejected_is_terminal_and_consumes_logs(self):
+        logs = [SimpleNamespace(id=1, content="ordinary phrase", sender_name="user")]
+        db = _BackfillDB(logs)
+        db.memory_engine = SimpleNamespace(write_service=SimpleNamespace())
+        config = AstrMaiConfig(evolution={"min_mining_context": 1})
+        manager = EvolutionManager(db, SimpleNamespace(config=config), config=config)
+
+        async def _mine_expressions(group_id, messages):
+            manager.expression_miner.last_report = {
+                "candidate_count": 0,
+                "enrichment": {"terminal": True, "retryable": False, "status": "completed"},
+            }
+            return []
+
+        async def _mine_jargons(group_id, messages):
+            manager.jargon_miner.last_report = {
+                "candidate_count": 1,
+                "reason": "model_rejected_all_candidates",
+                "enrichment": {
+                    "terminal": True,
+                    "retryable": False,
+                    "status": "all_rejected",
+                    "rejected_count": 1,
+                },
+            }
+            return []
+
+        manager.expression_miner.mine = _mine_expressions
+        manager.jargon_miner.mine = _mine_jargons
+
+        asyncio.run(manager.process_logs_and_mine("chat-1", logs))
+
+        self.assertEqual(db.marked, [[1]])
+        outcome = manager._last_mining_outcomes["chat-1"]
+        self.assertEqual(outcome["status"], "completed")
+        self.assertEqual(outcome["jargon"]["enrichment"]["status"], "all_rejected")
+
+    def test_jargon_provider_failure_does_not_consume_logs(self):
+        logs = [SimpleNamespace(id=1, content="candidate phrase", sender_name="user")]
+        db = _BackfillDB(logs)
+        db.memory_engine = SimpleNamespace(write_service=SimpleNamespace())
+        config = AstrMaiConfig(evolution={"min_mining_context": 1})
+        manager = EvolutionManager(db, SimpleNamespace(config=config), config=config)
+
+        async def _mine_expressions(group_id, messages):
+            manager.expression_miner.last_report = {
+                "candidate_count": 0,
+                "enrichment": {"terminal": True, "retryable": False, "status": "completed"},
+            }
+            return []
+
+        async def _mine_jargons(group_id, messages):
+            manager.jargon_miner.last_report = {
+                "candidate_count": 1,
+                "reason": "gateway_call_failed",
+                "enrichment": {
+                    "terminal": False,
+                    "retryable": True,
+                    "status": "provider_failure",
+                    "error_type": "RuntimeError",
+                },
+            }
+            return []
+
+        manager.expression_miner.mine = _mine_expressions
+        manager.jargon_miner.mine = _mine_jargons
+
+        with self.assertRaisesRegex(RuntimeError, "jargon enrichment failed closed"):
+            asyncio.run(manager.process_logs_and_mine("chat-1", logs))
+
+        self.assertEqual(db.marked, [])
+        outcome = manager._last_mining_outcomes["chat-1"]
+        self.assertTrue(outcome["retryable"])
+        self.assertEqual(outcome["jargon"]["enrichment"]["status"], "provider_failure")
+
     def test_empty_persistence_result_does_not_consume_logs(self):
         class _PatternStore:
             async def get_by_dedup_key(self, key, include_inactive=True):

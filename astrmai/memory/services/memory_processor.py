@@ -91,7 +91,7 @@ JSON 格式要求：
                 system_prompt=summary_system_prompt,
                 is_json=True,
                 lane_key=lane_key,
-                base_origin="",
+                base_origin=session_id,
                 template_envelope=summary_envelope,
             )
             
@@ -121,7 +121,7 @@ JSON 格式要求：
                     system_prompt=node_system_prompt,
                     is_json=True,
                     lane_key=lane_key,
-                    base_origin="",
+                    base_origin=session_id,
                     template_envelope=node_envelope,
                 )
                 

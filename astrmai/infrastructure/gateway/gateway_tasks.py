@@ -260,6 +260,7 @@ class GatewayTaskMixin:
         persona_id: str = "",
         workload_family: Optional[WorkloadFamily] = None,
         template_envelope: Optional[PromptEnvelope] = None,
+        allow_global_scope: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         task_models = self._task_models()
         resolved_family = workload_family or self.context_economy.infer_workload_family(
@@ -282,6 +283,15 @@ class GatewayTaskMixin:
                 template_envelope=template_envelope,
             )
             return result.parsed_json if is_json else result.text
+        normalized_origin = str(base_origin or "").strip()
+        scope_id = normalized_origin or "global"
+        scope_kind = "chat" if normalized_origin and normalized_origin != "global" else "global"
+        if scope_id == "global" and not allow_global_scope:
+            template_id = template_envelope.template_id if template_envelope else ""
+            logger.warning(
+                f"[Gateway] data process task using implicit global scope "
+                f"family={resolved_family.value} template={template_id or 'unknown'}"
+            )
         result = await self._elastic_call_result(
             "task",
             prompt,
@@ -299,8 +309,8 @@ class GatewayTaskMixin:
                     prefix_hash=prefix_hash,
                     persona_id=persona_id,
                     is_json=is_json,
-                    scope_id="global",
-                    scope_kind="global",
+                    scope_id=scope_id,
+                    scope_kind=scope_kind,
                     template_id=template_envelope.template_id if template_envelope else "",
                     template_version=template_envelope.template_version if template_envelope else "v1",
                     schema_id=template_envelope.schema_id if template_envelope else "",
