@@ -10,6 +10,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
+from ...infrastructure.runtime.turn_call_ledger import record_context_block_stats
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
 from .agency_feedback_bridge import AgencyReflectionBridge
 from .agency_runtime import AgencyRuntimeStore
@@ -743,6 +744,22 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_sent=(bool(event.get_extra("astrmai_reply_sent", False)) if hasattr(event, "get_extra") else False) or bool(reply_text),
             reply_preview=str(reply_text or ""),
         )
+        if hasattr(event, "get_extra"):
+            call_ledger = event.get_extra("astrmai_llm_call_ledger", [])
+            context_block_stats = event.get_extra("astrmai_context_block_stats", [])
+            reply_stats = event.get_extra("astrmai_reply_stats", {})
+            item["llm_call_ledger"] = [
+                dict(entry)
+                for entry in list(call_ledger or [])[-128:]
+                if isinstance(entry, dict)
+            ]
+            item["context_block_stats"] = [
+                dict(entry)
+                for entry in list(context_block_stats or [])[-16:]
+                if isinstance(entry, dict)
+            ]
+            if isinstance(reply_stats, dict):
+                item["reply_stats"] = dict(reply_stats)
         item["tool_execution_trace"] = execution_items
         item["tool_lifecycle_trace"] = [dict(entry) for entry in tool_lifecycle_trace if isinstance(entry, dict)][-64:]
         self.turn_trace_history = [*self.turn_trace_history, item][-300:]
@@ -1245,6 +1262,36 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             style_variant=style_variant,
             proactive_recall=proactive_recall,
         )
+        if prompt_envelope is not None:
+            record_context_block_stats(
+                event,
+                stage="planner.final_prompt",
+                blocks={
+                    "system_prompt": final_system_prompt,
+                    "final_prompt": final_prompt,
+                    "raw_user_text": getattr(prompt_envelope, "raw_user_text", ""),
+                    "focus_message": getattr(prompt_envelope, "focus_message_text", ""),
+                    "direct_context": getattr(prompt_envelope, "direct_context_text", ""),
+                    "related_context": getattr(prompt_envelope, "related_context_text", ""),
+                    "recent_transcript": getattr(prompt_envelope, "recent_transcript", ""),
+                    "warm_zone_transcript": getattr(prompt_envelope, "warm_zone_transcript", ""),
+                    "last_assistant_reply": getattr(prompt_envelope, "last_assistant_reply", ""),
+                    "state": getattr(prompt_envelope, "state_block", ""),
+                    "memory": getattr(prompt_envelope, "memory_block", ""),
+                    "background_memory": getattr(prompt_envelope, "background_memory_block", ""),
+                    "cognitive_drive": getattr(prompt_envelope, "cognitive_drive_block", ""),
+                    "soft_background": getattr(prompt_envelope, "soft_background_block", ""),
+                    "situational_context": getattr(prompt_envelope, "situational_context_block", ""),
+                    "planner_runtime_instruction": getattr(prompt_envelope, "planner_runtime_instruction_block", ""),
+                    "guidance": "\n".join(getattr(prompt_envelope, "guidance_lines", []) or []),
+                },
+                total_chars=len(final_system_prompt or "") + len(final_prompt or ""),
+                metadata={
+                    "think_level": int(think_level or 0),
+                    "is_tool_call_mode": bool(is_tool_call_mode),
+                    "is_fast_mode": bool(is_fast_mode),
+                },
+            )
         turn_context = ensure_turn_context(event)
         turn_context.continuity.system_prompt_length = len(final_system_prompt or "")
         turn_context.continuity.prompt_length = len(final_prompt or "")

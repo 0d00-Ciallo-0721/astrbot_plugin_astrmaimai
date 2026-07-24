@@ -8,6 +8,7 @@ from ..context_economy import PromptEnvelope, WorkloadFamily, WorkloadPolicy
 from ..runtime.lane_manager import LaneKey
 from ..runtime.runtime_contracts import LLMCallResult
 from ..runtime.trace_runtime import append_trace_stage, preview_text
+from ..runtime.turn_call_ledger import begin_llm_call, finish_llm_call
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
@@ -310,18 +311,50 @@ class GatewayLaneMixin:
         effective_lane_key = workload_policy.lane_key or lane_key
 
         if not self.lane_manager:
-            return await self._elastic_call_result(
-                pool_name=lane_key.task_family,
+            call_id = begin_llm_call(
+                event,
+                stage="gateway.chat",
+                family=workload_policy.family.value,
+                pool=lane_key.task_family,
                 prompt=prompt,
                 system_prompt=system_prompt,
-                models=models,
-                is_json=is_json,
-                retry_penalty=retry_penalty,
-                image_urls=image_urls,
-                use_fallback=use_fallback,
-                workload_policy=workload_policy,
-                result_validator=result_validator,
+                metadata={"lane_enabled": False, "model_count": len(models or [])},
             )
+            try:
+                result = await self._elastic_call_result(
+                    pool_name=lane_key.task_family,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    models=models,
+                    is_json=is_json,
+                    retry_penalty=retry_penalty,
+                    image_urls=image_urls,
+                    use_fallback=use_fallback,
+                    workload_policy=workload_policy,
+                    result_validator=result_validator,
+                )
+            except Exception as exc:
+                finish_llm_call(
+                    event,
+                    call_id,
+                    status="error",
+                    error=exc,
+                    error_kind=getattr(exc, "failure_kind", ""),
+                    attempts=len(models or []),
+                )
+                raise
+            finish_llm_call(
+                event,
+                call_id,
+                status="success" if result.ok else "error",
+                model=result.model_id,
+                provider=result.provider_family,
+                output=result.text or result.raw_completion,
+                error_kind=getattr(result.error_kind, "value", result.error_kind),
+                error=result.error_message,
+                attempts=len(models or []),
+            )
+            return result
 
         if not models:
             raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
@@ -345,26 +378,64 @@ class GatewayLaneMixin:
             provider_session_enabled=bool(workload_policy.use_provider_session),
             provider_cache_hint_enabled=bool(workload_policy.use_cache_hint),
         )
-        result = await self._elastic_call_result(
-            pool_name=lane_key.task_family,
+        call_id = begin_llm_call(
+            event,
+            stage="gateway.chat",
+            family=workload_policy.family.value,
+            pool=lane_key.task_family,
             prompt=prompt,
             system_prompt=system_prompt,
-            models=models,
-            is_json=is_json,
+            contexts=history,
+            metadata={
+                "lane_enabled": True,
+                "history_count": len(history or []),
+                "model_count": len(models or []),
+            },
+        )
+        try:
+            result = await self._elastic_call_result(
+                pool_name=lane_key.task_family,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                models=models,
+                is_json=is_json,
                 retry_penalty=retry_penalty,
                 image_urls=image_urls,
                 use_fallback=use_fallback,
                 contexts=history,
-            debug_meta=self._lane_debug_meta(
-                effective_lane_key,
-                conversation_id,
-                workload_policy.effective_prefix_hash,
-                seed_trace.as_dict(),
-            ),
-            request_kwargs_factory=self._lane_request_kwargs(lane_umo, workload_policy),
-            workload_policy=workload_policy,
-            record_economy=False,
-            result_validator=result_validator,
+                debug_meta=self._lane_debug_meta(
+                    effective_lane_key,
+                    conversation_id,
+                    workload_policy.effective_prefix_hash,
+                    seed_trace.as_dict(),
+                ),
+                request_kwargs_factory=self._lane_request_kwargs(lane_umo, workload_policy),
+                workload_policy=workload_policy,
+                record_economy=False,
+                result_validator=result_validator,
+            )
+        except Exception as exc:
+            finish_llm_call(
+                event,
+                call_id,
+                status="error",
+                error=exc,
+                error_kind=getattr(exc, "failure_kind", ""),
+                attempts=len(models or []),
+                metadata={"history_count": len(history or [])},
+            )
+            raise
+        finish_llm_call(
+            event,
+            call_id,
+            status="success" if result.ok else "error",
+            model=result.model_id,
+            provider=result.provider_family,
+            output=result.text or result.raw_completion,
+            error_kind=getattr(result.error_kind, "value", result.error_kind),
+            error=result.error_message,
+            attempts=len(models or []),
+            metadata={"history_count": len(history or [])},
         )
         if not result.model_id:
             # 防御性回退：_elastic_call_result 成功路径必定设置 model_id；
@@ -478,22 +549,55 @@ class GatewayLaneMixin:
         template_envelope: Optional[PromptEnvelope] = None,
     ) -> LLMCallResult:
         async with self._global_semaphore:
-            return await self._tool_chat_in_lane_result_unlimited(
-                lane_key=lane_key,
-                base_origin=base_origin,
-                event=event,
+            call_id = begin_llm_call(
+                event,
+                stage="gateway.tool",
+                pool=lane_key.task_family,
                 prompt=prompt,
                 system_prompt=system_prompt,
                 tools=tools,
-                models=models,
                 max_steps=max_steps,
-                timeout=timeout,
-                image_urls=image_urls,
-                prefix_hash=prefix_hash,
-                persona_id=persona_id,
-                raw_user_text=raw_user_text,
-                template_envelope=template_envelope,
+                metadata={"model_count": len(models or []), "timeout_sec": int(timeout or 0)},
             )
+            try:
+                result = await self._tool_chat_in_lane_result_unlimited(
+                    lane_key=lane_key,
+                    base_origin=base_origin,
+                    event=event,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    models=models,
+                    max_steps=max_steps,
+                    timeout=timeout,
+                    image_urls=image_urls,
+                    prefix_hash=prefix_hash,
+                    persona_id=persona_id,
+                    raw_user_text=raw_user_text,
+                    template_envelope=template_envelope,
+                )
+            except Exception as exc:
+                finish_llm_call(
+                    event,
+                    call_id,
+                    status="error",
+                    error=exc,
+                    error_kind=getattr(exc, "failure_kind", ""),
+                    attempts=len(models or []),
+                )
+                raise
+            finish_llm_call(
+                event,
+                call_id,
+                status="success" if result.ok else "error",
+                model=result.model_id,
+                provider=result.provider_family,
+                output=result.text or result.raw_completion,
+                error_kind=getattr(result.error_kind, "value", result.error_kind),
+                error=result.error_message,
+                attempts=len(models or []),
+            )
+            return result
 
     # ponytail: ~200 lines duplicated from _elastic_call_result. Refactor when
     # tool_chat diverges significantly or test coverage of both paths is sufficient.
