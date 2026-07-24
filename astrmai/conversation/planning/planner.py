@@ -10,7 +10,11 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
-from ...infrastructure.runtime.turn_call_ledger import record_context_block_stats
+from ...infrastructure.runtime.turn_call_ledger import (
+    observe_stage,
+    record_context_block_stats,
+    turn_telemetry_snapshot,
+)
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
 from .agency_feedback_bridge import AgencyReflectionBridge
 from .agency_runtime import AgencyRuntimeStore
@@ -744,7 +748,32 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_sent=(bool(event.get_extra("astrmai_reply_sent", False)) if hasattr(event, "get_extra") else False) or bool(reply_text),
             reply_preview=str(reply_text or ""),
         )
-        if hasattr(event, "get_extra"):
+        telemetry = turn_telemetry_snapshot(event)
+        if telemetry:
+            item.update(
+                {
+                    "trace_schema_version": telemetry["trace_schema_version"],
+                    "instrumentation_version": telemetry["instrumentation_version"],
+                    "turn_id": telemetry["turn_id"],
+                    "thread_id": telemetry["thread_id"],
+                    "generation": telemetry["generation"],
+                    "message_id_hash": telemetry["message_id_hash"],
+                    "turn_started_at": telemetry["started_at"],
+                    "turn_total_elapsed_ms": telemetry["total_elapsed_ms"],
+                    "llm_call_ledger": telemetry["llm_call_ledger"],
+                    "context_block_stats": telemetry["context_block_stats"],
+                    "stage_ledger": telemetry["stage_ledger"],
+                    "reply_stats": telemetry["reply_stats"],
+                }
+            )
+            item["actual_reply_chars"] = int(
+                telemetry["reply_stats"].get(
+                    "actual_reply_chars",
+                    telemetry["reply_stats"].get("total_chars", 0),
+                )
+                or 0
+            )
+        elif hasattr(event, "get_extra"):
             call_ledger = event.get_extra("astrmai_llm_call_ledger", [])
             context_block_stats = event.get_extra("astrmai_context_block_stats", [])
             reply_stats = event.get_extra("astrmai_reply_stats", {})
@@ -760,9 +789,65 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             ]
             if isinstance(reply_stats, dict):
                 item["reply_stats"] = dict(reply_stats)
+                item["actual_reply_chars"] = int(
+                    reply_stats.get("actual_reply_chars", reply_stats.get("total_chars", 0)) or 0
+                )
+        if hasattr(event, "get_extra"):
+            memory_funnel = event.get_extra("astrmai_memory_funnel", {})
+            if isinstance(memory_funnel, dict):
+                item["memory_funnel"] = dict(memory_funnel)
+        item["decision_observation"] = {
+            "status": str(status or ""),
+            "skip_reason": str(status or "").removeprefix("skipped_") if str(status or "").startswith("skipped_") else "",
+            "judge_action": str(turn_context.attention.judge_action or ""),
+            "cognitive_action": str(turn_context.cognitive.action or ""),
+            "focus_reason": str(turn_context.attention.focus_reason or ""),
+            "root_reason": str(turn_context.attention.root_reason or ""),
+            "is_private": bool(turn_context.perception.is_private),
+            "is_direct_wakeup": bool(turn_context.perception.is_direct_wakeup),
+            "is_at_bot": bool(turn_context.perception.is_at_bot),
+            "is_reply_to_bot": bool(turn_context.perception.is_reply_to_bot),
+        }
         item["tool_execution_trace"] = execution_items
         item["tool_lifecycle_trace"] = [dict(entry) for entry in tool_lifecycle_trace if isinstance(entry, dict)][-64:]
         self.turn_trace_history = [*self.turn_trace_history, item][-300:]
+        if (
+            hasattr(event, "get_extra")
+            and hasattr(event, "set_extra")
+            and not bool(event.get_extra("astrmai_turn_ledger_summary_logged", False))
+        ):
+            event.set_extra("astrmai_turn_ledger_summary_logged", True)
+            calls = list(item.get("llm_call_ledger") or [])
+            stages = list(item.get("stage_ledger") or [])
+            slowest = max(
+                (
+                    (str(entry.get("stage", "") or ""), float(entry.get("elapsed_ms", 0.0) or 0.0))
+                    for entry in [*calls, *stages]
+                    if isinstance(entry, dict)
+                ),
+                key=lambda pair: pair[1],
+                default=("", 0.0),
+            )
+            context_stats = list(item.get("context_block_stats") or [])
+            context_chars = max(
+                (
+                    int(entry.get("total_chars", 0) or 0)
+                    for entry in context_stats
+                    if isinstance(entry, dict)
+                ),
+                default=0,
+            )
+            memory_funnel = dict(item.get("memory_funnel") or {})
+            logger.info(
+                "[TurnLedger] "
+                f"turn={item.get('turn_id', '')} chat={chat_id} status={status} "
+                f"elapsed_ms={float(item.get('turn_total_elapsed_ms', 0.0) or 0.0):.1f} "
+                f"llm_calls={len(calls)} judge_calls={sum(1 for call in calls if isinstance(call, dict) and call.get('stage') == 'attention.judge')} "
+                f"slowest={slowest[0] or 'none'}:{slowest[1]:.1f}ms "
+                f"context_chars={context_chars} "
+                f"memory={int(memory_funnel.get('candidate_count', 0) or 0)}/{int(memory_funnel.get('selected_count', 0) or 0)} "
+                f"reply_chars={int(item.get('actual_reply_chars', 0) or 0)}"
+            )
         if self.turn_trace_store is not None and hasattr(self.turn_trace_store, "append"):
             try:
                 await self.turn_trace_store.append(item)
@@ -1218,20 +1303,27 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             if str(part or "").strip()
         )
         planner_reasoning = side_inputs.get("planner_reasoning", "")
-        system_prompt, style_variant, proactive_recall = await self.context_engine.build_prompt(
-            chat_id=chat_id,
-            event_messages=planning_context["context_events"],
-            prompt_envelope=prompt_envelope,
-            retrieve_keys=retrieve_keys,
-            situational_style_cues=side_inputs.get("situational_style_cues", ""),
-            sys1_thought=sys1_thought,
-            goals_context=goals_context,
-            stable_expression_habits=side_inputs.get("stable_expression_habits", ""),
-            planner_reasoning=planner_reasoning,
-            stable_jargon_explanation=side_inputs.get("stable_jargon_explanation", ""),
-            near_context_priority=near_context_priority,
-            agency_context=agency_context,
-        )
+        with observe_stage(
+            event,
+            "planner.context_build",
+            metadata={"context_event_count": len(planning_context["context_events"] or [])},
+        ) as context_stage:
+            system_prompt, style_variant, proactive_recall = await self.context_engine.build_prompt(
+                chat_id=chat_id,
+                event_messages=planning_context["context_events"],
+                prompt_envelope=prompt_envelope,
+                retrieve_keys=retrieve_keys,
+                situational_style_cues=side_inputs.get("situational_style_cues", ""),
+                sys1_thought=sys1_thought,
+                goals_context=goals_context,
+                stable_expression_habits=side_inputs.get("stable_expression_habits", ""),
+                planner_reasoning=planner_reasoning,
+                stable_jargon_explanation=side_inputs.get("stable_jargon_explanation", ""),
+                near_context_priority=near_context_priority,
+                agency_context=agency_context,
+            )
+            context_stage["system_chars"] = len(system_prompt or "")
+            context_stage["proactive_recall_chars"] = len(proactive_recall or "")
         if think_level <= 0:
             proactive_recall = ""
         event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
@@ -1254,14 +1346,17 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         )
 
         prefix_status = self.context_engine.get_last_prefix_status(chat_id) if hasattr(self.context_engine, "get_last_prefix_status") else {}
-        final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
-            event=event,
-            system_prompt=system_prompt,
-            context=ctx,
-            prompt_envelope=prompt_envelope,
-            style_variant=style_variant,
-            proactive_recall=proactive_recall,
-        )
+        with observe_stage(event, "planner.prompt_refine") as refine_stage:
+            final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
+                event=event,
+                system_prompt=system_prompt,
+                context=ctx,
+                prompt_envelope=prompt_envelope,
+                style_variant=style_variant,
+                proactive_recall=proactive_recall,
+            )
+            refine_stage["system_chars"] = len(final_system_prompt or "")
+            refine_stage["prompt_chars"] = len(final_prompt or "")
         if prompt_envelope is not None:
             record_context_block_stats(
                 event,
@@ -1290,6 +1385,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "think_level": int(think_level or 0),
                     "is_tool_call_mode": bool(is_tool_call_mode),
                     "is_fast_mode": bool(is_fast_mode),
+                    "context_dedup_removed_lines": int(
+                        (event.get_extra("astrmai_context_dedup_stats", {}) or {}).get("removed_lines", 0) or 0
+                    ),
+                    "context_dedup_observe_only": bool(
+                        (event.get_extra("astrmai_context_dedup_stats", {}) or {}).get("observe_only", False)
+                    ),
                 },
             )
         turn_context = ensure_turn_context(event)

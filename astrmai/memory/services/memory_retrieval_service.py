@@ -792,32 +792,67 @@ class MemoryRetrievalService:
             return []
         gateway = getattr(self.engine, "gateway", None) if self.engine else None
         if not gateway or not hasattr(gateway, "call_data_process_task"):
+            self._record_query_rewrite_trace(query, status="gateway_unavailable", elapsed_ms=0.0, rewrite_count=0)
             return [base_query]
+        timing = getattr(getattr(self.engine, "config", None), "timing", None)
+        timeout_sec = max(0.5, float(getattr(timing, "query_rewrite_timeout_sec", 8.0) or 8.0))
         prompt = (
             "Rewrite the user memory search request into at most 3 short search queries. "
             "Return JSON only: {\"queries\": [\"...\"]}.\n"
             f"Request: {base_query}"
         )
+        started = time.perf_counter()
+        status = "success"
         try:
             response = await gateway.call_data_process_task(
                 prompt=prompt,
                 is_json=True,
                 lane_key=LaneKey(subsystem="bg", task_family="query_rewrite", scope_id="global", scope_kind="global"),
+                timeout_override=timeout_sec,
+                max_retries_override=0,
+                max_models_override=1,
+                use_fallback=False,
             )
             if isinstance(response, str):
                 response = json.loads(response)
             queries = response.get("queries", []) if isinstance(response, dict) else []
             cleaned = [str(item).strip() for item in queries if str(item).strip()]
+            if not cleaned:
+                status = "empty"
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep query rewrite degraded: {exc}")
             cleaned = []
+            status = "timeout" if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in str(exc).lower() else "error"
         result = [base_query]
         for item in cleaned:
             if item not in result:
                 result.append(item)
             if len(result) >= 3:
                 break
+        self._record_query_rewrite_trace(
+            query,
+            status=status,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            rewrite_count=max(0, len(result) - 1),
+        )
         return result
+
+    @staticmethod
+    def _record_query_rewrite_trace(
+        query: MemoryQuery,
+        *,
+        status: str,
+        elapsed_ms: float,
+        rewrite_count: int,
+    ) -> None:
+        metadata = dict(query.metadata or {})
+        metadata["query_rewrite_trace"] = {
+            "status": str(status or "unknown"),
+            "elapsed_ms": round(max(0.0, float(elapsed_ms or 0.0)), 2),
+            "rewrite_count": max(0, int(rewrite_count or 0)),
+            "original_query_fallback": str(status or "") != "success",
+        }
+        query.metadata = metadata
 
     async def _call_deep_json(self, prompt: str) -> dict:
         gateway = getattr(self.engine, "gateway", None) if self.engine else None

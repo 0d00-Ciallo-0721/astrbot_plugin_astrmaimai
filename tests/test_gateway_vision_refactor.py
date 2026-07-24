@@ -52,6 +52,17 @@ class _ConversationManager:
         self.conversations[conversation_id] = _Conversation(history)
 
 
+class _LedgerEvent:
+    def __init__(self):
+        self.extras = {}
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+
 class GatewayVisionRefactorTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -298,6 +309,69 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         )
         self.assertTrue(all(call[1]["is_json"] for call in gateway.elastic_calls))
 
+    def test_direct_judge_call_records_stage_and_exact_model_attempt(self):
+        ledger_mod = importlib.import_module("astrmai.infrastructure.runtime.turn_call_ledger")
+        context = _VisionContext(['{"action": "REPLY"}'])
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[], task_models=["task-a"]),
+            ),
+        )
+        event = _LedgerEvent()
+
+        with ledger_mod.turn_telemetry_scope(event):
+            result = asyncio.run(gateway.call_judge_task("judge prompt", system_prompt="judge system"))
+            snapshot = ledger_mod.turn_telemetry_snapshot(event)
+
+        self.assertEqual(result["action"], "REPLY")
+        self.assertEqual(len(snapshot["llm_call_ledger"]), 1)
+        call = snapshot["llm_call_ledger"][0]
+        self.assertEqual(call["stage"], "attention.judge")
+        self.assertEqual(call["status"], "success")
+        self.assertEqual(call["attempts"], 1)
+        self.assertEqual(call["model_attempts"][0]["model"], "task-a")
+        self.assertGreaterEqual(call["model_attempts"][0]["elapsed_ms"], 0)
+
+    def test_direct_vision_call_records_invalid_then_success_attempts(self):
+        ledger_mod = importlib.import_module("astrmai.infrastructure.runtime.turn_call_ledger")
+        context = _VisionContext(
+            [
+                '{"description": "", "emotion_tags": []}',
+                '{"description": "valid image", "emotion_tags": ["calm"]}',
+            ]
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(
+            context,
+            SimpleNamespace(
+                infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+                provider=SimpleNamespace(fallback_models=[], vision_models=["vision-a", "vision-b"]),
+            ),
+        )
+        event = _LedgerEvent()
+
+        with ledger_mod.turn_telemetry_scope(event):
+            result = asyncio.run(
+                gateway.call_vision_task(
+                    image_data="image.png",
+                    prompt="Analyze",
+                    system_prompt="Return JSON",
+                )
+            )
+            snapshot = ledger_mod.turn_telemetry_snapshot(event)
+
+        self.assertEqual(result["description"], "valid image")
+        calls = snapshot["llm_call_ledger"]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call["stage"] == "multimodal.vision" for call in calls))
+        self.assertEqual([call["status"] for call in calls], ["error", "success"])
+        self.assertEqual([call["attempts"] for call in calls], [1, 1])
+        self.assertEqual(
+            [call["model_attempts"][0]["status"] for call in calls],
+            ["invalid_output", "success"],
+        )
+
     def test_data_process_and_proactive_tasks_dispatch_to_lane_or_elastic(self):
         task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
         context_mod = importlib.import_module("astrmai.infrastructure.context_economy")
@@ -354,6 +428,7 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertTrue(gateway.lane_calls[0]["is_json"])
         self.assertFalse(gateway.lane_calls[1]["is_json"])
         self.assertEqual(len(gateway.elastic_calls), 2)
+        self.assertFalse(gateway.elastic_calls[1][1]["ledger_critical_path"])
         self.assertEqual(gateway.context_economy.requests[0]["scope_id"], "default:GroupMessage:group-1")
         self.assertEqual(gateway.context_economy.requests[0]["scope_kind"], "chat")
 
@@ -393,6 +468,7 @@ class GatewayVisionRefactorTests(unittest.TestCase):
         self.assertEqual(text_result, "persona text")
         self.assertEqual(gateway.context_economy.requests[0]["family"], context_mod.WorkloadFamily.PERSONA_SUMMARY)
         self.assertEqual(gateway.context_economy.requests[0]["persona_id"], "persona-1")
+        self.assertTrue(all(not call[1]["ledger_critical_path"] for call in gateway.elastic_calls))
 
     def test_normalize_vision_failure_reason_handles_empty_and_valid_payloads(self):
         task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")

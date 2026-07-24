@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -10,6 +11,11 @@ from ...infrastructure.context_economy.models import WorkloadTrace
 from ...infrastructure.gateway.output_guard import looks_like_provider_failure_text
 from ...infrastructure.gateway.provider_capabilities import resolve_provider_capabilities
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.turn_call_ledger import (
+    begin_llm_call,
+    finish_llm_call,
+    record_llm_attempt,
+)
 
 
 class CompactionProviderMixin:
@@ -189,19 +195,33 @@ class CompactionProviderMixin:
             schema_id = "bullet_summary"
             stable_prefix_text = system_prompt
             dynamic_payload_text = prompt
-        for provider_id in provider_candidates:
-            request_kwargs, trace_payload = self._compaction_provider_kwargs(
-                chat_id,
-                provider_id,
-                system_prompt,
-                prompt,
-                template_id,
-                template_version,
-                schema_id,
-                stable_prefix_text,
-                dynamic_payload_text,
-            )
+        ledger_call_id = begin_llm_call(
+            None,
+            stage="attention.compaction.v1",
+            family=WorkloadFamily.COMPACTION_SUMMARY.value,
+            pool="compaction",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            contexts=lines,
+            metadata={"provider_count": len(provider_candidates)},
+        )
+        last_error_kind = ""
+        for attempt_index, provider_id in enumerate(provider_candidates):
+            attempt_started = time.perf_counter()
+            request_kwargs: dict[str, Any] = {}
+            trace_payload: dict[str, Any] = {}
             try:
+                request_kwargs, trace_payload = self._compaction_provider_kwargs(
+                    chat_id,
+                    provider_id,
+                    system_prompt,
+                    prompt,
+                    template_id,
+                    template_version,
+                    schema_id,
+                    stable_prefix_text,
+                    dynamic_payload_text,
+                )
                 response = await asyncio.wait_for(
                     context.llm_generate(
                         chat_provider_id=provider_id,
@@ -212,6 +232,17 @@ class CompactionProviderMixin:
                     timeout=self._compaction_provider_timeout_seconds(),
                 )
             except Exception as exc:
+                last_error_kind = exc.__class__.__name__
+                record_llm_attempt(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="timeout" if isinstance(exc, asyncio.TimeoutError) else "error",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    error_kind=last_error_kind,
+                    fallback=attempt_index > 0,
+                    retry_index=attempt_index,
+                )
                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
                 request_kwargs.pop("session_id", None)
                 # 失效损坏的 remote session，防止下次复用（D6）
@@ -226,13 +257,57 @@ class CompactionProviderMixin:
                 continue
             content = getattr(response, "completion_text", response)
             if looks_like_provider_failure_text(str(content or "")):
+                last_error_kind = "provider_failure_text"
+                record_llm_attempt(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="invalid_output",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    error_kind=last_error_kind,
+                    fallback=attempt_index > 0,
+                    retry_index=attempt_index,
+                )
                 logger.warning(f"[{chat_id}] compaction provider {provider_id} returned failure text")
                 continue
             clipped = self._clip_summary(str(content or "").strip())
             if clipped:
+                record_llm_attempt(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="success",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    fallback=attempt_index > 0,
+                    retry_index=attempt_index,
+                )
+                finish_llm_call(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    output=clipped,
+                )
                 if getattr(self.gateway, "context_economy", None):
                     self.gateway.context_economy.record_trace(WorkloadTrace(**trace_payload))
                 return clipped
+            last_error_kind = "empty_output"
+            record_llm_attempt(
+                None,
+                ledger_call_id,
+                model=provider_id,
+                status="invalid_output",
+                elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                error_kind=last_error_kind,
+                fallback=attempt_index > 0,
+                retry_index=attempt_index,
+            )
+        finish_llm_call(
+            None,
+            ledger_call_id,
+            status="error",
+            error_kind=last_error_kind or "empty_output",
+            error=last_error_kind or "empty_output",
+        )
         return ""
 
     async def _build_summary_with_provider_v2(self, chat_id: str, drained_segments) -> str:
@@ -273,19 +348,33 @@ class CompactionProviderMixin:
             schema_id = "section_summary"
             stable_prefix_text = system_prompt
             dynamic_payload_text = prompt
-        for provider_id in provider_candidates:
-            request_kwargs, trace_payload = self._compaction_provider_kwargs(
-                chat_id,
-                provider_id,
-                system_prompt,
-                prompt,
-                template_id,
-                template_version,
-                schema_id,
-                stable_prefix_text,
-                dynamic_payload_text,
-            )
+        ledger_call_id = begin_llm_call(
+            None,
+            stage="attention.compaction.v2",
+            family=WorkloadFamily.COMPACTION_SUMMARY.value,
+            pool="compaction",
+            prompt=prompt,
+            system_prompt=system_prompt,
+            contexts=lines,
+            metadata={"provider_count": len(provider_candidates)},
+        )
+        last_error_kind = ""
+        for attempt_index, provider_id in enumerate(provider_candidates):
+            attempt_started = time.perf_counter()
+            request_kwargs: dict[str, Any] = {}
+            trace_payload: dict[str, Any] = {}
             try:
+                request_kwargs, trace_payload = self._compaction_provider_kwargs(
+                    chat_id,
+                    provider_id,
+                    system_prompt,
+                    prompt,
+                    template_id,
+                    template_version,
+                    schema_id,
+                    stable_prefix_text,
+                    dynamic_payload_text,
+                )
                 response = await asyncio.wait_for(
                     context.llm_generate(
                         chat_provider_id=provider_id,
@@ -296,6 +385,17 @@ class CompactionProviderMixin:
                     timeout=self._compaction_provider_timeout_seconds(),
                 )
             except Exception as exc:
+                last_error_kind = exc.__class__.__name__
+                record_llm_attempt(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="timeout" if isinstance(exc, asyncio.TimeoutError) else "error",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    error_kind=last_error_kind,
+                    fallback=attempt_index > 0,
+                    retry_index=attempt_index,
+                )
                 logger.debug(f"[{chat_id}] compaction provider {provider_id} failed: {exc}")
                 request_kwargs.pop("session_id", None)
                 # 失效损坏的 remote session，防止下次复用（D6）
@@ -311,12 +411,56 @@ class CompactionProviderMixin:
             content = getattr(response, "completion_text", response)
             rendered = str(content or "").strip()
             if looks_like_provider_failure_text(rendered):
+                last_error_kind = "provider_failure_text"
+                record_llm_attempt(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="invalid_output",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    error_kind=last_error_kind,
+                    fallback=attempt_index > 0,
+                    retry_index=attempt_index,
+                )
                 logger.warning(f"[{chat_id}] compaction provider {provider_id} returned failure text")
                 continue
             if rendered:
+                record_llm_attempt(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="success",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    fallback=attempt_index > 0,
+                    retry_index=attempt_index,
+                )
+                finish_llm_call(
+                    None,
+                    ledger_call_id,
+                    model=provider_id,
+                    output=rendered,
+                )
                 if getattr(self.gateway, "context_economy", None):
                     self.gateway.context_economy.record_trace(WorkloadTrace(**trace_payload))
                 return rendered
+            last_error_kind = "empty_output"
+            record_llm_attempt(
+                None,
+                ledger_call_id,
+                model=provider_id,
+                status="invalid_output",
+                elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                error_kind=last_error_kind,
+                fallback=attempt_index > 0,
+                retry_index=attempt_index,
+            )
+        finish_llm_call(
+            None,
+            ledger_call_id,
+            status="error",
+            error_kind=last_error_kind or "empty_output",
+            error=last_error_kind or "empty_output",
+        )
         return ""
 
 

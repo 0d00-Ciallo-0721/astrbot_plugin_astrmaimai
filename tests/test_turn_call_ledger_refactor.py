@@ -1,11 +1,17 @@
+import asyncio
+
 from astrmai.infrastructure.runtime.turn_call_ledger import (
     CALL_LEDGER_KEY,
     CONTEXT_BLOCK_STATS_KEY,
     REPLY_STATS_KEY,
+    STAGE_LEDGER_KEY,
     begin_llm_call,
     finish_llm_call,
+    observe_stage,
     record_context_block_stats,
     record_reply_stats,
+    turn_telemetry_scope,
+    turn_telemetry_snapshot,
 )
 
 
@@ -70,6 +76,25 @@ def test_context_block_stats_keep_hashes_and_lengths_only():
     assert payload["metadata"]["think_level"] == 2
 
 
+def test_context_block_stats_identify_exact_duplicate_blocks():
+    event = _Event()
+
+    record_context_block_stats(
+        event,
+        stage="planner.final_prompt",
+        blocks={
+            "focus": "同一段上下文",
+            "recent": "同一段上下文",
+            "memory": "另一段内容",
+        },
+    )
+
+    payload = event.get_extra(CONTEXT_BLOCK_STATS_KEY)[0]
+    assert payload["duplicate_block_count"] == 1
+    assert payload["blocks"]["recent"]["duplicate_of"] == "focus"
+    assert payload["duplicate_pairs"] == [{"block": "recent", "duplicate_of": "focus"}]
+
+
 def test_reply_stats_support_multiple_segments_and_sent_count():
     event = _Event()
 
@@ -87,7 +112,144 @@ def test_reply_stats_support_multiple_segments_and_sent_count():
         "segment_count": 3,
         "segment_lengths": [4, 5, 6],
         "total_chars": 15,
+        "actual_reply_chars": 15,
         "strategy": "smart",
         "send_status": "sent",
         "sent_segment_count": 3,
     }
+
+
+def test_eventless_call_is_attached_to_active_turn_scope():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        call_id = begin_llm_call(
+            None,
+            stage="attention.judge",
+            family="judge",
+            pool="task",
+            prompt="不应进入账本的原文",
+        )
+        finish_llm_call(None, call_id, model="judge-a", output="reply")
+
+    entries = event.get_extra(CALL_LEDGER_KEY)
+    assert len(entries) == 1
+    assert entries[0]["stage"] == "attention.judge"
+    assert entries[0]["model"] == "judge-a"
+    assert "不应进入账本的原文" not in str(entries[0])
+
+
+def test_turn_scopes_are_isolated_across_concurrent_tasks():
+    first = _Event()
+    second = _Event()
+
+    async def record(event, stage):
+        with turn_telemetry_scope(event):
+            await asyncio.sleep(0)
+            call_id = begin_llm_call(None, stage=stage, prompt=stage)
+            await asyncio.sleep(0)
+            finish_llm_call(None, call_id, model=f"{stage}-model")
+
+    async def run_both():
+        await asyncio.gather(record(first, "first"), record(second, "second"))
+
+    asyncio.run(run_both())
+
+    assert [item["stage"] for item in first.get_extra(CALL_LEDGER_KEY)] == ["first"]
+    assert [item["stage"] for item in second.get_extra(CALL_LEDGER_KEY)] == ["second"]
+
+
+def test_stage_ledger_records_status_without_raw_error():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        with observe_stage(None, "memory.retrieve") as span:
+            span["candidate_count"] = 12
+            span["selected_count"] = 3
+
+    entry = event.get_extra(STAGE_LEDGER_KEY)[0]
+    assert entry["stage"] == "memory.retrieve"
+    assert entry["status"] == "success"
+    assert entry["elapsed_ms"] >= 0
+    assert entry["metadata"]["candidate_count"] == 12
+    assert entry["metadata"]["selected_count"] == 3
+
+
+def test_snapshot_is_versioned_and_contains_no_prompt_text():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        call_id = begin_llm_call(None, stage="dialog", prompt="隐私问题")
+        finish_llm_call(None, call_id, output="隐私回答")
+        snapshot = turn_telemetry_snapshot()
+
+    assert snapshot["trace_schema_version"] == 2
+    assert snapshot["instrumentation_version"]
+    assert snapshot["turn_id"] == snapshot["trace_id"]
+    assert snapshot["total_elapsed_ms"] >= 0
+    assert "隐私问题" not in str(snapshot)
+    assert "隐私回答" not in str(snapshot)
+
+
+def test_snapshot_is_detached_from_later_ledger_mutation():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        call_id = begin_llm_call(None, stage="dialog")
+        snapshot = turn_telemetry_snapshot()
+        finish_llm_call(None, call_id, model="late-model")
+
+    assert snapshot["llm_call_ledger"][0]["status"] == "pending"
+    assert "model" not in snapshot["llm_call_ledger"][0]
+    assert event.get_extra(CALL_LEDGER_KEY)[0]["status"] == "success"
+    assert event.get_extra(CALL_LEDGER_KEY)[0]["model"] == "late-model"
+
+
+def test_reply_stats_include_privacy_safe_freshness_metrics():
+    event = _Event()
+    event.set_extra("astrmai_reply_freshness_state", "expired")
+    event.set_extra("astrmai_reply_stale_reason", "superseded_by_newer_activity:某用户:消息正文")
+    event.set_extra("astrmai_reply_age_sec", 95.4)
+    event.set_extra("astrmai_reply_max_age_sec", 90.0)
+
+    record_reply_stats(
+        event,
+        segment_count=1,
+        segment_lengths=[8],
+        total_chars=8,
+    )
+
+    payload = event.get_extra(REPLY_STATS_KEY)
+    assert payload["freshness_state"] == "expired"
+    assert payload["stale_reason"] == "superseded_by_newer_activity"
+    assert payload["reply_age_sec"] == 95.4
+    assert payload["reply_max_age_sec"] == 90.0
+    assert "某用户" not in str(payload)
+    assert "消息正文" not in str(payload)
+
+
+def test_reply_stats_include_short_reply_policy_without_message_content():
+    event = _Event()
+
+    record_reply_stats(
+        event,
+        segment_count=1,
+        segment_lengths=[12],
+        total_chars=12,
+        metadata={
+            "reply_shape_mode": "micro",
+            "reply_shape_reason": "known_micro_utterance",
+            "humanlike_short_reply_applied": True,
+            "humanlike_short_reply_constraints": "capped_sentence_count",
+            "humanlike_short_reply_before_len": 42,
+            "humanlike_short_reply_after_len": 12,
+            "visible_text": "不应写入账本的回复正文",
+        },
+    )
+
+    payload = event.get_extra(REPLY_STATS_KEY)
+    assert payload["reply_shape_mode"] == "micro"
+    assert payload["humanlike_short_reply_applied"] is True
+    assert payload["humanlike_short_reply_before_len"] == 42
+    assert "visible_text" not in payload
+    assert "不应写入账本" not in str(payload)

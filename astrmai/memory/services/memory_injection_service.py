@@ -12,6 +12,7 @@ from astrbot.api import logger
 
 from ..contracts.memory_query import MemoryInjectionBundle, MemoryInjectionTrace
 from ..contracts.retrieval_trace import RetrievalTrace
+from ...infrastructure.runtime.turn_call_ledger import begin_stage, finish_stage
 from .memory_context_builder import MemoryContextBuilder
 from .memory_query_builder import MemoryQueryBuilder
 from .memory_retrieval_service import MemoryRetrievalService
@@ -166,6 +167,20 @@ class MemoryInjectionService:
         policy = self._memory_policy_for_event(event)
         trace = MemoryInjectionTrace(trace_id=f"memtrace_{uuid.uuid4().hex[:12]}", policy=policy)
         decision = MemoryInjectionDecision(policy=policy, retrieve_keys=list(retrieve_keys))
+        stage_id = begin_stage(
+            event,
+            "memory.injection",
+            metadata={
+                "policy": policy,
+                "retrieve_key_count": len(retrieve_keys),
+                "fast_mode": bool(is_fast_mode),
+                "rag_disabled": bool(disable_rag),
+            },
+        )
+
+        def remember_funnel(payload: dict) -> None:
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_memory_funnel", dict(payload))
 
         def skipped(reason: str) -> MemoryInjectionBundle:
             trace.skip_reason = reason
@@ -177,6 +192,26 @@ class MemoryInjectionService:
             ensure_turn_context(event).memory = decision
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_memory_injection_trace", trace)
+            funnel = {
+                "status": "skipped",
+                "policy": trace.policy,
+                "skip_reason": reason,
+                "candidate_count": 0,
+                "selected_count": 0,
+                "rendered_chars": 0,
+            }
+            remember_funnel(funnel)
+            finish_stage(
+                event,
+                stage_id,
+                status="skipped",
+                reason=reason,
+                metadata={
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "rendered_chars": 0,
+                },
+            )
             return MemoryInjectionBundle(trace=trace, skip_reason=reason)
 
         if hasattr(event, "get_extra") and event.get_extra("astrmai_lightweight_event", False):
@@ -200,32 +235,69 @@ class MemoryInjectionService:
 
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
         persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")
-        query = self.query_builder.build(
-            event=event,
-            raw_query=current_query,
-            prompt_envelope=prompt_envelope,
-            session_id=chat_id,
-            persona_id=persona_id,
-            sender_id=str(event.get_sender_id() or "") if hasattr(event, "get_sender_id") else "",
-            top_k=int(getattr(getattr(self.config, "memory", None), "recall_top_k", 5) or 5),
-            policy=policy,
-            think_level=think_level,
-            retrieve_keys=list(retrieve_keys),
-            allow_stale=policy == "deep" or (think_level is not None and think_level >= 3),
-            metadata={"visibility_mode": "auto"},
-        )
-        candidates = await self.retrieval_service.retrieve(query)
+        try:
+            query = self.query_builder.build(
+                event=event,
+                raw_query=current_query,
+                prompt_envelope=prompt_envelope,
+                session_id=chat_id,
+                persona_id=persona_id,
+                sender_id=str(event.get_sender_id() or "") if hasattr(event, "get_sender_id") else "",
+                top_k=int(getattr(getattr(self.config, "memory", None), "recall_top_k", 5) or 5),
+                policy=policy,
+                think_level=think_level,
+                retrieve_keys=list(retrieve_keys),
+                allow_stale=policy == "deep" or (think_level is not None and think_level >= 3),
+                metadata={"visibility_mode": "auto"},
+            )
+            candidates = await self.retrieval_service.retrieve(query)
+        except Exception as exc:
+            remember_funnel(
+                {
+                    "status": "error",
+                    "policy": policy,
+                    "error_kind": exc.__class__.__name__,
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                }
+            )
+            finish_stage(
+                event,
+                stage_id,
+                status="error",
+                reason=exc.__class__.__name__,
+            )
+            raise
         trace.candidate_count = len(candidates)
         if not candidates:
             return skipped("no_result")
 
-        selected = self.context_builder.select(candidates, max_items=query.top_k)
+        try:
+            selected = self.context_builder.select(candidates, max_items=query.top_k)
+            rendered, guidance = self.context_builder.render_prompt_block(selected, max_items=query.top_k)
+        except Exception as exc:
+            remember_funnel(
+                {
+                    "status": "error",
+                    "policy": policy,
+                    "error_kind": exc.__class__.__name__,
+                    "candidate_count": len(candidates),
+                    "selected_count": 0,
+                }
+            )
+            finish_stage(
+                event,
+                stage_id,
+                status="error",
+                reason=exc.__class__.__name__,
+                metadata={"candidate_count": len(candidates)},
+            )
+            raise
         trace.injected = True
         trace.source = "memory_v2"
         trace.layers = list(dict.fromkeys(item.kind for item in selected if item.kind))
         trace.selected_count = len(selected)
         trace.selected_ids = [item.id for item in selected]
-        rendered, guidance = self.context_builder.render_prompt_block(selected, max_items=query.top_k)
         debug_trace_enabled = bool(query.metadata.get("memory_retrieval_debug_trace_enabled", False))
         trace.summary_preview = self._preview(rendered) if debug_trace_enabled else ""
         decision.source = trace.source
@@ -237,6 +309,46 @@ class MemoryInjectionService:
         ensure_turn_context(event).memory = decision
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_memory_injection_trace", trace)
+        trace_payload = dict((query.metadata or {}).get("_trace", {}) or {})
+        retrieval_payload = dict(trace_payload.get("retrieval") or {})
+        search_steps = [
+            step for step in list(trace_payload.get("search_steps") or [])
+            if isinstance(step, dict)
+        ]
+        matched_by = sorted(
+            {
+                str(source)
+                for item in selected
+                for source in list((getattr(item, "metadata", {}) or {}).get("matched_by") or [])
+                if str(source).strip()
+            }
+        )
+        funnel = {
+            "status": "injected",
+            "policy": policy,
+            "candidate_limit": int((query.metadata or {}).get("candidate_limit", 0) or 0),
+            "injection_top_k": int(query.top_k or 0),
+            "search_step_count": len(search_steps),
+            "candidate_count": int(retrieval_payload.get("candidate_count", len(candidates)) or 0),
+            "selected_count": len(selected),
+            "rendered_chars": len(rendered or ""),
+            "matched_source_count": len(matched_by),
+            "degraded_component_count": len(list(trace_payload.get("degraded_components") or [])),
+        }
+        remember_funnel(funnel)
+        finish_stage(
+            event,
+            stage_id,
+            metadata={
+                "candidate_limit": funnel["candidate_limit"],
+                "injection_top_k": funnel["injection_top_k"],
+                "candidate_count": funnel["candidate_count"],
+                "selected_count": funnel["selected_count"],
+                "rendered_chars": funnel["rendered_chars"],
+                "matched_source_count": funnel["matched_source_count"],
+                "degraded_component_count": funnel["degraded_component_count"],
+            },
+        )
         await self._persist_trace(event=event, query=query, trace=trace, selected=selected)
         return MemoryInjectionBundle(
             rendered_prompt_block=rendered,

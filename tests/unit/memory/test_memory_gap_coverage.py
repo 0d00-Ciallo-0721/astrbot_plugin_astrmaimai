@@ -200,6 +200,17 @@ class MemoryGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(bundle.skip_reason, "think_level_1_no_memory_intent")
         self.assertEqual(event.get_extra("astrmai_memory_injection_trace").skip_reason, "think_level_1_no_memory_intent")
+        self.assertEqual(
+            event.get_extra("astrmai_memory_funnel"),
+            {
+                "status": "skipped",
+                "policy": "light",
+                "skip_reason": "think_level_1_no_memory_intent",
+                "candidate_count": 0,
+                "selected_count": 0,
+                "rendered_chars": 0,
+            },
+        )
         turn_context = event.get_extra("astrmai_turn_context")
         self.assertEqual(turn_context.memory.skip_reason, "think_level_1_no_memory_intent")
 

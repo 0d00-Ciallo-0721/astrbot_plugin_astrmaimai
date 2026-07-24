@@ -6,6 +6,7 @@ from astrbot.api import logger
 
 from ..context_economy import WorkloadPolicy
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
+from ..runtime.turn_call_ledger import begin_llm_call, finish_llm_call, record_llm_attempt
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
@@ -175,6 +176,13 @@ class GatewayCallMixin:
         workload_policy: Optional[WorkloadPolicy] = None,
         record_economy: bool = True,
         result_validator: Optional[Callable[[Any], tuple[bool, str]]] = None,
+        ledger_call_id: str = "",
+        ledger_stage: str = "",
+        ledger_family: str = "",
+        ledger_critical_path: bool = True,
+        timeout_override: Optional[float] = None,
+        max_retries_override: Optional[int] = None,
+        max_models_override: Optional[int] = None,
     ) -> LLMCallResult:
         async with self._global_semaphore:
             primary_models, attempt_queue = self._build_attempt_queue(
@@ -188,7 +196,34 @@ class GatewayCallMixin:
                 primary_models,
                 attempt_queue,
             )
+            if max_models_override is not None:
+                attempt_queue = attempt_queue[: max(1, int(max_models_override))]
+            owns_ledger_call = not bool(ledger_call_id)
+            if owns_ledger_call:
+                ledger_call_id = begin_llm_call(
+                    None,
+                    stage=ledger_stage or f"gateway.{pool_name}",
+                    critical_path=ledger_critical_path,
+                    family=ledger_family
+                    or str(getattr(getattr(workload_policy, "family", None), "value", "") or ""),
+                    pool=pool_name,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    contexts=contexts,
+                    metadata={
+                        "lane_enabled": bool(contexts),
+                        "model_count": len(models or []),
+                    },
+                )
             if not attempt_queue:
+                if owns_ledger_call:
+                    finish_llm_call(
+                        None,
+                        ledger_call_id,
+                        status="error",
+                        error_kind=FailureKind.UNKNOWN.value,
+                        error="empty_model_pool",
+                    )
                 self._raise_cascade_failure(
                     pool_name=pool_name,
                     error_message=f"未配置可用模型池: {pool_name}",
@@ -197,8 +232,16 @@ class GatewayCallMixin:
                     failure_reason="empty_model_pool",
                 )
 
-            timeout_limit = self._api_timeout()
-            max_retries = self._max_retries()
+            timeout_limit = (
+                max(0.1, float(timeout_override))
+                if timeout_override is not None
+                else self._api_timeout()
+            )
+            max_retries = (
+                max(0, int(max_retries_override))
+                if max_retries_override is not None
+                else self._max_retries()
+            )
             backoff_factor = self._backoff_factor()
             attempted_models: List[str] = []
             last_result = self._build_failure_result(
@@ -210,6 +253,7 @@ class GatewayCallMixin:
                 attempted_models.append(model_id)
                 report_pool = pool_name if model_id in primary_models else "fallback"
                 for attempt in range(max_retries + 1):
+                    attempt_started = time.perf_counter()
                     raw_completion_text = ""
                     try:
                         llm_kwargs = self._build_request_kwargs(
@@ -239,6 +283,16 @@ class GatewayCallMixin:
                             raw_completion="",
                         )
                         is_fatal = False  # ponytail: asyncio timeout → retry, not fatal
+                        record_llm_attempt(
+                            None,
+                            ledger_call_id,
+                            model=model_id,
+                            status="timeout",
+                            elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                            error_kind=last_result.error_kind.value,
+                            fallback=model_id not in primary_models,
+                            retry_index=attempt,
+                        )
                         self.router.report_failure(report_pool, model_id, is_fatal=False)
                         logger.warning(f"[Gateway] model {model_id} timeout ({attempt+1}/{max_retries+1}): {last_error}")
                         if attempt < max_retries:
@@ -253,6 +307,16 @@ class GatewayCallMixin:
                             raw_completion="",
                         )
                         is_fatal = self._is_fatal_failure(last_error, error=exc)
+                        record_llm_attempt(
+                            None,
+                            ledger_call_id,
+                            model=model_id,
+                            status="fatal" if is_fatal else "error",
+                            elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                            error_kind=last_result.error_kind.value,
+                            fallback=model_id not in primary_models,
+                            retry_index=attempt,
+                        )
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
                         self._open_model_cooldown(report_pool, model_id, last_error)
                         if is_fatal:
@@ -304,6 +368,23 @@ class GatewayCallMixin:
                                 fallback_used=bool(model_id not in primary_models),
                                 provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
                             )
+                            record_llm_attempt(
+                                None,
+                                ledger_call_id,
+                                model=model_id,
+                                status="success",
+                                elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                                fallback=model_id not in primary_models,
+                                retry_index=attempt,
+                            )
+                            if owns_ledger_call:
+                                finish_llm_call(
+                                    None,
+                                    ledger_call_id,
+                                    model=model_id,
+                                    provider=str(log_meta.get("provider", "") or ""),
+                                    output=content,
+                                )
                             return self._build_success_result(
                                 text=str(content).strip(),
                                 parsed_json=parsed_json,
@@ -335,6 +416,23 @@ class GatewayCallMixin:
                             fallback_used=bool(model_id not in primary_models),
                             provider_session_id=str(llm_kwargs.get("session_id", "") or ""),
                         )
+                        record_llm_attempt(
+                            None,
+                            ledger_call_id,
+                            model=model_id,
+                            status="success",
+                            elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                            fallback=model_id not in primary_models,
+                            retry_index=attempt,
+                        )
+                        if owns_ledger_call:
+                            finish_llm_call(
+                                None,
+                                ledger_call_id,
+                                model=model_id,
+                                provider=str(log_meta.get("provider", "") or ""),
+                                output=safe_text,
+                            )
                         return self._build_success_result(
                             text=safe_text.strip(),
                             model_id=model_id,
@@ -352,6 +450,16 @@ class GatewayCallMixin:
                             raw_completion=raw_completion_text,
                         )
                         is_fatal = self._is_fatal_failure(last_error, error=exc)
+                        record_llm_attempt(
+                            None,
+                            ledger_call_id,
+                            model=model_id,
+                            status="fatal" if is_fatal else "invalid_output",
+                            elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                            error_kind=last_result.error_kind.value,
+                            fallback=model_id not in primary_models,
+                            retry_index=attempt,
+                        )
                         self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
                         self._open_model_cooldown(report_pool, model_id, f"{last_error} {raw_completion_text}")
                         if is_fatal:
@@ -363,6 +471,15 @@ class GatewayCallMixin:
                         if attempt < max_retries:
                             await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
 
+            if owns_ledger_call:
+                finish_llm_call(
+                    None,
+                    ledger_call_id,
+                    status="error",
+                    model=last_result.model_id,
+                    error_kind=last_result.error_kind.value,
+                    error=last_result.error_message,
+                )
             self._raise_cascade_failure(
                 pool_name=pool_name,
                 error_message=f"所有模型均失败: {last_result.error_message}",

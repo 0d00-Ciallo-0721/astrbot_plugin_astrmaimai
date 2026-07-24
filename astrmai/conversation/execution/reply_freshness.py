@@ -59,6 +59,22 @@ def is_stale_reply_reason(reason: str) -> bool:
 
 
 class ReplyFreshnessMixin:
+    @staticmethod
+    def _record_freshness_observation(
+        event: AstrMessageEvent,
+        state: FreshnessState,
+        reason: str,
+        *,
+        reply_age: float = 0.0,
+        max_age: float = 0.0,
+    ) -> tuple[FreshnessState, str]:
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_reply_freshness_state", state.value)
+            event.set_extra("astrmai_reply_stale_reason", str(reason or "").split(":", 1)[0])
+            event.set_extra("astrmai_reply_age_sec", round(max(0.0, float(reply_age or 0.0)), 1))
+            event.set_extra("astrmai_reply_max_age_sec", round(max(0.0, float(max_age or 0.0)), 1))
+        return state, reason
+
     def _reply_max_age_seconds(self) -> float:
         return resolve_reply_max_age_seconds(self.config)
 
@@ -118,13 +134,17 @@ class ReplyFreshnessMixin:
                     )
                     if hasattr(self.runtime_coordinator, "record_concurrency_event"):
                         await self.runtime_coordinator.record_concurrency_event("stale_generation")
-                    return FreshnessState.EXPIRED, "stale_generation"
+                    return self._record_freshness_observation(
+                        event,
+                        FreshnessState.EXPIRED,
+                        "stale_generation",
+                    )
             except Exception:
                 logger.debug("[ReplyService] turn generation freshness check degraded", exc_info=True)
 
         event_ts = float(event.get_extra("astrmai_timestamp", 0.0) or 0.0)
         if event_ts <= 0:
-            return FreshnessState.FRESH, ""
+            return self._record_freshness_observation(event, FreshnessState.FRESH, "")
 
         reply_age = max(0.0, time.time() - event_ts)  # ponytail: NTP guard
         max_age = self._reply_max_age_seconds()
@@ -134,18 +154,48 @@ class ReplyFreshnessMixin:
                     f"[ReplyService] allowing overdue direct reply for {chat_id}: "
                     f"{reply_age:.1f}s>{max_age:.1f}s without newer activity"
                 )
-                return FreshnessState.FRESH, ""
-            return FreshnessState.EXPIRED, f"reply_age_exceeded:{reply_age:.1f}s>{max_age:.1f}s"
+                return self._record_freshness_observation(
+                    event,
+                    FreshnessState.FRESH,
+                    "",
+                    reply_age=reply_age,
+                    max_age=max_age,
+                )
+            return self._record_freshness_observation(
+                event,
+                FreshnessState.EXPIRED,
+                f"reply_age_exceeded:{reply_age:.1f}s>{max_age:.1f}s",
+                reply_age=reply_age,
+                max_age=max_age,
+            )
 
         if not self.runtime_coordinator:
-            return FreshnessState.FRESH, ""
+            return self._record_freshness_observation(
+                event,
+                FreshnessState.FRESH,
+                "",
+                reply_age=reply_age,
+                max_age=max_age,
+            )
 
         if not hasattr(self.runtime_coordinator, "evaluate_reply_freshness"):
             latest_ts, latest_sender_id, latest_sender_name, latest_preview = await self.runtime_coordinator.get_latest_activity(chat_id)
             if latest_ts and latest_ts > event_ts:
                 actor = latest_sender_name or latest_sender_id or "unknown"
-                return FreshnessState.EXPIRED, f"superseded_by_newer_activity:{actor}:{preview_text(latest_preview, 60)}"
-            return FreshnessState.FRESH, ""
+                return self._record_freshness_observation(
+                    event,
+                    FreshnessState.EXPIRED,
+                    f"superseded_by_newer_activity:{actor}:{preview_text(latest_preview, 60)}",
+                    reply_age=reply_age,
+                    max_age=max_age,
+                )
+            return self._record_freshness_observation(
+                event,
+                FreshnessState.FRESH,
+                "",
+                reply_age=reply_age,
+                max_age=max_age,
+            )
 
         thread_signature = str(event.get_extra("astrmai_thread_signature", "") or "")
         freshness_state, stale_reason = await self.runtime_coordinator.evaluate_reply_freshness(
@@ -158,7 +208,13 @@ class ReplyFreshnessMixin:
             latest_ts, latest_sender_id, latest_sender_name, latest_preview = await self.runtime_coordinator.get_latest_activity(chat_id)
             actor = latest_sender_name or latest_sender_id or "unknown"
             stale_reason = f"superseded_by_newer_activity:{actor}:{preview_text(latest_preview, 60)}"
-        return freshness_state, stale_reason
+        return self._record_freshness_observation(
+            event,
+            freshness_state,
+            stale_reason,
+            reply_age=reply_age,
+            max_age=max_age,
+        )
 
     def _build_outbound_policy(self, reply_mode: ReplyMode, freshness_state: FreshnessState, stale_reason: str) -> OutboundPolicy:
         if freshness_state == FreshnessState.EXPIRED:

@@ -35,6 +35,7 @@ from ..concurrency.controls import (
 from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
 from ..contracts.turn_identity import build_turn_send_key
+from ..reply_shape_policy import resolve_reply_shape_policy, should_apply_micro_reply_postprocess
 
 
 def _component_instance(cls: Any, value: Any, attr_name: str, **kwargs: Any):
@@ -196,6 +197,69 @@ class ReplyArtifactMixin:
             "stance_char_cap": char_cap,
         }
 
+    def _apply_humanlike_short_reply_constraints(
+        self,
+        text: str,
+        *,
+        event: AstrMessageEvent | None,
+        reply_mode: ReplyMode,
+        is_proactive: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        if event is None:
+            return text, {}
+        reply_config = getattr(self.config, "reply", None)
+        policy = event.get_extra("astrmai_reply_shape_policy", None) if hasattr(event, "get_extra") else None
+        if not isinstance(policy, dict):
+            policy = resolve_reply_shape_policy(
+                event,
+                str(getattr(event, "message_str", "") or ""),
+                reply_config,
+            )
+        if not should_apply_micro_reply_postprocess(
+            event,
+            policy,
+            reply_mode=reply_mode,
+            is_proactive=is_proactive,
+        ):
+            return text, {
+                "reply_shape_mode": str(policy.get("mode", "default") or "default"),
+                "reply_shape_reason": str(policy.get("reason", "") or ""),
+                "humanlike_short_reply_applied": False,
+            }
+
+        original = str(text or "").strip()
+        sentences = self._reply_sentence_chunks(original)
+        max_sentences = max(1, int(policy.get("max_sentences", 2) or 2))
+        max_chars = max(20, int(policy.get("max_chars", 80) or 80))
+        allow_followup_question = bool(policy.get("allow_followup_question", False))
+        reasons: list[str] = []
+
+        if not allow_followup_question and len(sentences) > 1 and self._looks_like_extension_question(sentences[-1]):
+            sentences = sentences[:-1]
+            reasons.append("trimmed_trailing_question")
+        if len(sentences) > max_sentences:
+            sentences = sentences[:max_sentences]
+            reasons.append("capped_sentence_count")
+
+        separator = "" if any(token in original for token in ("。", "！", "？")) else " "
+        constrained = separator.join(sentences).strip() if sentences else original
+        trimmed = self._trim_text_with_cap(constrained, max_chars)
+        if trimmed != constrained:
+            reasons.append("capped_character_count")
+        constrained = re.sub(r"([!！~～])\1+", r"\1", trimmed)
+        constrained = re.sub(r"\s{2,}", " ", constrained).strip() or original
+
+        return constrained, {
+            "reply_shape_mode": "micro",
+            "reply_shape_reason": str(policy.get("reason", "") or ""),
+            "humanlike_short_reply_applied": constrained != original,
+            "humanlike_short_reply_constraints": ",".join(reasons) or "within_limits",
+            "humanlike_short_reply_before_len": len(original),
+            "humanlike_short_reply_after_len": len(constrained),
+            "humanlike_short_reply_sentence_cap": max_sentences,
+            "humanlike_short_reply_char_cap": max_chars,
+        }
+
     def _single_segment(self, text: str) -> List[str]:
         cleaned = re.sub(r"^\n+|\n+$", "", text.strip())
         return [cleaned] if cleaned else []
@@ -275,6 +339,14 @@ class ReplyArtifactMixin:
         if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE and policy.late_rewrite_allowed:
             clean_text = self._rewrite_late_reply(reply_mode, clean_text)
         clean_text, stance_metadata = self._apply_stance_first_reply_constraints(clean_text, event=event)
+        effective_is_proactive = bool(is_proactive or getattr(self, "_current_reply_is_proactive", False))
+        clean_text, reply_shape_metadata = self._apply_humanlike_short_reply_constraints(
+            clean_text,
+            event=event,
+            reply_mode=reply_mode,
+            is_proactive=effective_is_proactive,
+        )
+        force_segment = "\n\n" in clean_text
         if not clean_text:
             return VisibleReplyArtifact(
                 visible_text="",
@@ -284,7 +356,7 @@ class ReplyArtifactMixin:
                 metadata={"reply_mode": reply_mode.value, "freshness_state": freshness_state.value},
             )
 
-        is_proactive = bool(is_proactive or getattr(self, "_current_reply_is_proactive", False))
+        is_proactive = effective_is_proactive
         raw_segments, segment_reason = self._segment_reply_content(
             clean_text,
             reply_mode,
@@ -292,6 +364,9 @@ class ReplyArtifactMixin:
             is_proactive=is_proactive,
             force_segment=force_segment,
         )
+        if reply_shape_metadata.get("reply_shape_mode") == "micro":
+            raw_segments = self._single_segment(self._join_segments_for_single_send(raw_segments))
+            segment_reason = "humanlike_short_single"
         segments = [
             segment
             for segment in raw_segments
@@ -319,6 +394,7 @@ class ReplyArtifactMixin:
                 "segment_reason": segment_reason,
                 "delay_profile": "proactive" if is_proactive else policy.send_delay_profile,
                 **stance_metadata,
+                **reply_shape_metadata,
             },
         )
 

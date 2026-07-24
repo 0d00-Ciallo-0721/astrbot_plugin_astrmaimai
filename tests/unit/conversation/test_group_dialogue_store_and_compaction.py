@@ -10,6 +10,18 @@ from astrmai.conversation.contracts.focus_context import FocusThreadContext
 from astrmai.infrastructure.context_economy import ContextEconomyCenter
 from astrmai.infrastructure.context_economy.models import WorkloadTrace
 from astrmai.infrastructure.runtime.lane_manager import LaneManager
+from astrmai.infrastructure.runtime.turn_call_ledger import turn_telemetry_scope
+
+
+class _TelemetryEvent:
+    def __init__(self):
+        self.extras = {}
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
 
 
 class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
@@ -468,10 +480,21 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
             )
             engine._compaction_provider_timeout_seconds = lambda: 0.01
             segment = SimpleNamespace(speaker_name="Alice", speaker_id="u1", content="hello", is_bot=False)
+            event = _TelemetryEvent()
 
-            summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
+            with turn_telemetry_scope(event):
+                summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
 
             self.assertEqual(summary, "[topics]\n- recovered summary")
+            calls = event.get_extra("astrmai_llm_call_ledger", [])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["stage"], "attention.compaction.v2")
+            self.assertEqual(calls[0]["status"], "success")
+            self.assertEqual(
+                [attempt["status"] for attempt in calls[0]["model_attempts"]],
+                ["timeout", "success"],
+            )
+            self.assertNotIn("prompt", calls[0])
 
         asyncio.run(run())
 
@@ -489,10 +512,56 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
                 gateway=SimpleNamespace(context=FakeContext()),
             )
             segment = SimpleNamespace(speaker_name="Alice", speaker_id="u1", content="hello", is_bot=False)
+            event = _TelemetryEvent()
 
-            summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
+            with turn_telemetry_scope(event):
+                summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
 
             self.assertEqual(summary, "")
+            calls = event.get_extra("astrmai_llm_call_ledger", [])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["status"], "error")
+            self.assertEqual(calls[0]["model_attempts"][0]["status"], "invalid_output")
+            self.assertEqual(calls[0]["error_kind"], "provider_failure_text")
+
+        asyncio.run(run())
+
+    def test_compaction_provider_kwargs_failure_is_recorded_and_falls_back(self):
+        class FakeContext:
+            async def get_current_chat_provider_id(self, _chat_id):
+                return "provider-ok"
+
+            async def llm_generate(self, chat_provider_id, **_kwargs):
+                return SimpleNamespace(completion_text=f"summary from {chat_provider_id}")
+
+        async def run():
+            engine = ContextCompactionEngine(
+                GroupDialogueStore(),
+                provider_id="provider-bad",
+                gateway=SimpleNamespace(context=FakeContext()),
+            )
+            original = engine._compaction_provider_kwargs
+
+            def build_kwargs(chat_id, provider_id, *args):
+                if provider_id == "provider-bad":
+                    raise RuntimeError("request build failed")
+                return original(chat_id, provider_id, *args)
+
+            engine._compaction_provider_kwargs = build_kwargs
+            segment = SimpleNamespace(speaker_name="Alice", speaker_id="u1", content="hello", is_bot=False)
+            event = _TelemetryEvent()
+
+            with turn_telemetry_scope(event):
+                summary = await engine._build_summary_with_provider_v2("chat-1", [segment])
+
+            self.assertEqual(summary, "summary from provider-ok")
+            calls = event.get_extra("astrmai_llm_call_ledger", [])
+            self.assertEqual(calls[0]["status"], "success")
+            self.assertEqual(
+                [attempt["status"] for attempt in calls[0]["model_attempts"]],
+                ["error", "success"],
+            )
+            self.assertEqual(calls[0]["model_attempts"][0]["error_kind"], "RuntimeError")
 
         asyncio.run(run())
 

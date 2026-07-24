@@ -13,6 +13,10 @@ from ...conversation.contracts.turn_identity import TurnIdentity, build_p0_threa
 from ...conversation.ingress.command_guard import check_framework_command
 from ...conversation.ingress.dedupe import build_message_signature_text, check_message_dedup
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
+from ...infrastructure.runtime.turn_call_ledger import (
+    bind_turn_telemetry_identity,
+    observe_stage,
+)
 from ...presentation.dto.message_scope import IngressDecision, MessageScope
 from ...shared.helpers.plugin_helpers import is_direct_call_event
 
@@ -97,6 +101,7 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
     if callable(prepare_turn):
         try:
             await prepare_turn(event, scope)
+            bind_turn_telemetry_identity(event)
             return
         except Exception:
             logger.debug("[AstrMai] facade prepare_conversation_turn degraded", exc_info=True)
@@ -130,6 +135,7 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
     event.set_extra("astrmai_turn_thread_id", thread_id)
     event.set_extra("astrmai_turn_generation", generation)
     event.set_extra("astrmai_turn_created_at", created_at)
+    bind_turn_telemetry_identity(event)
     debug_trace(event, "ingress.turn_bound", chat_id=scope.chat_id, thread_id=thread_id, generation=generation, mode=mode)
 
 
@@ -294,7 +300,8 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         logger.exception("[AstrMai] is_direct_call_event failed")
         is_direct_call = False
     try:
-        status = await facade.record_and_dispatch_attention(event, scope)
+        with observe_stage(event, "attention.dispatch"):
+            status = await facade.record_and_dispatch_attention(event, scope)
     except Exception:
         logger.exception("[AstrMai] record_and_dispatch_attention failed")
         status = "error"

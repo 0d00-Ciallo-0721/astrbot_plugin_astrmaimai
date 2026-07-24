@@ -60,6 +60,7 @@ class PromptEnvelope:
     last_assistant_reply: str = ""
     current_speaker_block: str = ""
     focus_message_text: str = ""
+    focus_message_identity: str = ""
     direct_context_text: str = ""
     related_context_text: str = ""
     ambient_background_text: str = ""

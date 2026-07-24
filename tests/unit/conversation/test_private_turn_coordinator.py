@@ -103,6 +103,41 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertNotIn(chat_id, coordinator._pending_batches)
         self.assertFalse(coordinator.clear_pending_batch(chat_id))
 
+    def test_bind_batch_context_merges_distinct_messages_in_order(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(turn_merge_enabled=True),
+            vision=SimpleNamespace(enable_vision=True),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        events = [_Event("额妃爱你注意力强吗？"), _Event("就是如果一个话题开启"), _Event("会一直聊下去吗？")]
+        for index, event in enumerate(events):
+            event.message_obj.message_id = f"m{index}"
+
+        coordinator.bind_batch_context(events, events[-1])
+
+        self.assertEqual(
+            events[-1].get_extra("astrmai_private_batch_text"),
+            "额妃爱你注意力强吗？\n就是如果一个话题开启\n会一直聊下去吗？",
+        )
+        self.assertEqual(events[-1].get_extra("astrmai_private_batch_message_ids"), ["m0", "m1", "m2"])
+        self.assertEqual(events[-1].get_extra("astrmai_private_batch_message_count"), 3)
+        self.assertTrue(events[-1].get_extra("astrmai_private_batch_merged"))
+
+    def test_turn_merge_flag_restores_single_event_legacy_behavior(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(private_chat=SimpleNamespace(turn_merge_enabled=False))
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        first = _Event("第一句")
+        second = _Event("第二句")
+
+        self.assertEqual(coordinator.merge_pending_batch("ff:FriendMessage:user-1", [second]), [second])
+        self.assertEqual(coordinator.begin_pending_batch("ff:FriendMessage:user-1", [first]), 0)
+        coordinator.bind_batch_context([first, second], second)
+        self.assertIsNone(second.get_extra("astrmai_private_batch_text"))
+
     def test_prepare_batch_waits_for_vision_and_builds_rich_context(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 
@@ -135,6 +170,38 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_visual_context")[0]["description"], "一只白猫坐在窗边")
         self.assertEqual(len(persistence.added), 1)
         self.assertEqual(persistence.marked, [("ff:FriendMessage:user-1", "user-1")])
+
+    def test_batch_image_description_is_appended_once_after_text_merge(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                turn_merge_enabled=True,
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=1,
+            ),
+            vision=SimpleNamespace(enable_vision=True),
+        )
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_Resolver(),
+            visual_cortex=_VisualCortex(),
+            persistence=_Persistence(),
+        )
+        first = _Event("还记得我们一起去泡温泉吗？")
+        first.message_obj.message_id = "m-image"
+        second = _Event("妃爱？")
+        second.message_obj.message_id = "m-nudge"
+
+        asyncio.run(coordinator.prepare_batch([first], "ff:FriendMessage:user-1"))
+        second.set_extra("astrmai_vision_barrier_complete", True)
+        coordinator.bind_batch_context([first, second], second)
+
+        rich_text = second.get_extra("astrmai_rich_text")
+        self.assertIn("还记得我们一起去泡温泉吗？\n妃爱？", rich_text)
+        self.assertEqual(rich_text.count("一只白猫坐在窗边"), 1)
 
     def test_prepare_batch_formats_emoji_context_with_tags(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator

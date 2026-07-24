@@ -43,6 +43,9 @@ class PrivateTurnCoordinator:
     def settle_seconds(self) -> float:
         return max(0.0, float(getattr(self._private_config(), "input_settle_sec", 1.5) or 0.0))
 
+    def turn_merge_enabled(self) -> bool:
+        return bool(getattr(self._private_config(), "turn_merge_enabled", True))
+
     @staticmethod
     def _event_key(event: Any) -> str:
         message_obj = getattr(event, "message_obj", None)
@@ -77,6 +80,8 @@ class PrivateTurnCoordinator:
 
     def note_new_message(self, chat_id: str) -> None:
         """Keep an in-flight private batch alive when a newer message arrives."""
+        if not self.turn_merge_enabled():
+            return
         pending = self._pending_batches.get(str(chat_id or ""))
         if pending is not None:
             pending.revision += 1
@@ -89,6 +94,8 @@ class PrivateTurnCoordinator:
         response or a stale reply decision without changing the group window.
         """
         normalized_chat_id = str(chat_id or "")
+        if not self.turn_merge_enabled():
+            return list(events)
         pending = self._pending_batches.get(normalized_chat_id)
         if pending is None:
             return list(events)
@@ -103,6 +110,8 @@ class PrivateTurnCoordinator:
 
     def begin_pending_batch(self, chat_id: str, events: list[Any]) -> int:
         """Record a private batch until its reply completes successfully."""
+        if not self.turn_merge_enabled():
+            return 0
         normalized_chat_id = str(chat_id or "")
         previous = self._pending_batches.get(normalized_chat_id)
         revision = (previous.revision if previous is not None else 0) + 1
@@ -159,6 +168,8 @@ class PrivateTurnCoordinator:
 
     def bind_batch_context(self, events: list[Any], focus_event: Any) -> None:
         """Attach all visual facts from a private input burst to its final focus event."""
+        if self.turn_merge_enabled():
+            self._bind_batch_text_context(events, focus_event)
         image_refs: list[str] = []
         records: list[dict[str, Any]] = []
         seen_records: set[str] = set()
@@ -214,11 +225,36 @@ class PrivateTurnCoordinator:
             all(bool(event.get_extra("astrmai_vision_barrier_complete", False)) for event in image_events),
         )
         focus_event.set_extra("astrmai_vision_barrier_failed", bool(failed_count))
-        focus_event.set_extra(
-            "astrmai_rich_text",
-            str(getattr(focus_event, "message_str", "") or "").strip(),
-        )
+        if not str(focus_event.get_extra("astrmai_rich_text", "") or "").strip():
+            focus_event.set_extra(
+                "astrmai_rich_text",
+                str(getattr(focus_event, "message_str", "") or "").strip(),
+            )
         self._append_vision_context(focus_event, records, failed_count)
+
+    @classmethod
+    def _bind_batch_text_context(cls, events: list[Any], focus_event: Any) -> None:
+        lines: list[str] = []
+        message_ids: list[str] = []
+        seen_keys: set[str] = set()
+        for event in cls._deduplicate_events(list(events))[-cls.PENDING_MAX_EVENTS :]:
+            event_key = cls._event_key(event)
+            if event_key in seen_keys:
+                continue
+            seen_keys.add(event_key)
+            text = str(getattr(event, "message_str", "") or "").strip()
+            if text:
+                lines.append(text)
+            if event_key.startswith("id:"):
+                message_ids.append(event_key[3:])
+        if not lines:
+            return
+        merged_text = "\n".join(lines).strip()
+        focus_event.set_extra("astrmai_rich_text", merged_text)
+        focus_event.set_extra("astrmai_private_batch_text", merged_text)
+        focus_event.set_extra("astrmai_private_batch_message_ids", message_ids)
+        focus_event.set_extra("astrmai_private_batch_message_count", len(seen_keys))
+        focus_event.set_extra("astrmai_private_batch_merged", len(seen_keys) > 1)
 
     async def prepare_direct_event(self, event: Any, chat_id: str) -> None:
         """Resolve a directly addressed image before group decision/dispatch."""

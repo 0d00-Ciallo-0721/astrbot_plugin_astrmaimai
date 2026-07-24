@@ -197,6 +197,77 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertIn("Dave: separate transcript line", transcript_block)
         self.assertIn("---前因---\nCarol: longer duplicated clue", final_prompt)
 
+    def test_source_aware_dedup_removes_current_speaker_only(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(
+                memory=SimpleNamespace(enable_react_agent=False),
+                conversation=SimpleNamespace(
+                    context_dedup_enabled=True,
+                    context_dedup_observe_only=False,
+                ),
+            ),
+            react_retriever=None,
+        )
+        event = _FakeEvent()
+        event._extras["astrmai_prompt_envelope"] = PromptEnvelope(
+            raw_user_text="妃妃",
+            focus_message_text="妃妃",
+            focus_message_identity="6: 妃妃",
+            recent_transcript="6: 妃妃\n萤: 妃妃\nBot: 在这里哦",
+            recent_transcript_source="lane",
+        )
+
+        async def _run():
+            return await refiner.refine_prompt(
+                event=event,
+                system_prompt="system prompt only",
+                prompt="wrapped prompt",
+                context={"disable_rag_injection": True},
+            )
+
+        _system_prompt, final_prompt = asyncio.run(_run())
+        transcript_block = final_prompt.split("---对话记录（来源：lane）---\n", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("6: 妃妃", transcript_block)
+        self.assertIn("萤: 妃妃", transcript_block)
+        self.assertEqual(event.get_extra("astrmai_context_dedup_stats")["removed_lines"], 1)
+        self.assertNotIn("6: 妃妃", event.get_extra("astrmai_prompt_envelope").recent_transcript)
+
+    def test_context_dedup_observe_only_keeps_prompt_unchanged(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(
+                memory=SimpleNamespace(enable_react_agent=False),
+                conversation=SimpleNamespace(
+                    context_dedup_enabled=True,
+                    context_dedup_observe_only=True,
+                ),
+            ),
+            react_retriever=None,
+        )
+        event = _FakeEvent()
+        event._extras["astrmai_prompt_envelope"] = PromptEnvelope(
+            raw_user_text="妃妃",
+            focus_message_text="妃妃",
+            focus_message_identity="6: 妃妃",
+            recent_transcript="6: 妃妃\nBot: 在这里哦",
+            recent_transcript_source="lane",
+        )
+
+        async def _run():
+            return await refiner.refine_prompt(
+                event=event,
+                system_prompt="system prompt only",
+                prompt="wrapped prompt",
+                context={"disable_rag_injection": True},
+            )
+
+        _system_prompt, final_prompt = asyncio.run(_run())
+        self.assertIn("6: 妃妃", final_prompt)
+        stats = event.get_extra("astrmai_context_dedup_stats")
+        self.assertTrue(stats["observe_only"])
+        self.assertEqual(stats["removed_lines"], 1)
+
     def test_refiner_places_cognitive_drive_in_user_prompt(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=None,

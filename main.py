@@ -19,6 +19,7 @@ try:
     from .astrmai.presentation.commands import handle_mai_help, handle_work_mode
     from .astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
     from .astrmai.infrastructure.runtime.handler_binding_compat import repair_plugin_handler_bindings
+    from .astrmai.infrastructure.runtime.turn_call_ledger import turn_telemetry_scope
     from .astrmai.webui.plugin_pages import register_astrmai_admin_pages
 except ImportError:
     if __package__:
@@ -28,6 +29,7 @@ except ImportError:
     from astrmai.presentation.commands import handle_mai_help, handle_work_mode
     from astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
     from astrmai.infrastructure.runtime.handler_binding_compat import repair_plugin_handler_bindings
+    from astrmai.infrastructure.runtime.turn_call_ledger import turn_telemetry_scope
     from astrmai.webui.plugin_pages import register_astrmai_admin_pages
 
 
@@ -219,8 +221,9 @@ class AstrMaiPlugin(Star):
     async def on_global_message(self, event: AstrMessageEvent, *args, **kwargs):
         if event.get_extra("heartflow_is_command"):
             return
-        async for result in self.facade.on_global_message(event):
-            yield result
+        with turn_telemetry_scope(event):
+            async for result in self.facade.on_global_message(event):
+                yield result
 
     @filter.on_decorating_result(priority=90)
     async def intercept_and_notify_errors(self, event: AstrMessageEvent):

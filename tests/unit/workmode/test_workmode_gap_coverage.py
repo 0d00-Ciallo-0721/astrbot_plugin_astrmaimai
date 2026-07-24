@@ -25,6 +25,18 @@ class _CronDb:
         self.deactivated.append(job_id)
 
 
+class _TelemetryEvent:
+    def __init__(self, unified_msg_origin):
+        self.unified_msg_origin = unified_msg_origin
+        self.extras = {}
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+
 class WorkmodeGapCoverageTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -82,16 +94,28 @@ class WorkmodeGapCoverageTests(unittest.TestCase):
             get_current_chat_provider_id=_provider_id,
             tool_loop_agent=_tool_loop_agent,
         )
+        event = _TelemetryEvent("chat-1")
         wrapper = SimpleNamespace(
             context=SimpleNamespace(
                 context=host_context,
-                event=SimpleNamespace(unified_msg_origin="chat-1"),
+                event=event,
             )
         )
 
-        result = asyncio.run(agent.call(wrapper, query="create reminder"))
+        from astrmai.infrastructure.runtime.turn_call_ledger import turn_telemetry_scope
+
+        async def _run():
+            with turn_telemetry_scope(event):
+                return await agent.call(wrapper, query="create reminder")
+
+        result = asyncio.run(_run())
 
         self.assertEqual(result, "cron task handled")
+        calls = event.get_extra("astrmai_llm_call_ledger", [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["stage"], "workmode.subagent.transfer_to_cron")
+        self.assertEqual(calls[0]["status"], "success")
+        self.assertEqual(calls[0]["model_attempts"][0]["model"], "provider-1")
         self.assertEqual([item.job_id for item in db.saved], ["job-valid", "job-invalid"])
         self.assertEqual(
             db.saved[0].run_at,

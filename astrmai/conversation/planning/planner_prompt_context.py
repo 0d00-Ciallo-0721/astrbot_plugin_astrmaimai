@@ -10,6 +10,7 @@ from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import preview_text
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyMode
 from ..contracts.prompt_envelope import PromptEnvelope
+from ..reply_shape_policy import resolve_reply_shape_policy, set_reply_shape_policy
 from .message_renderer import MessageRenderer
 
 
@@ -247,6 +248,7 @@ class PlannerPromptContextMixin:
         last_assistant_reply: str,
         current_speaker_block: str,
         near_context_priority: bool,
+        focus_message_identity: str = "",
     ) -> PromptEnvelope:
         return PromptEnvelope(
             raw_user_text=focus_message_text,
@@ -263,6 +265,7 @@ class PlannerPromptContextMixin:
             last_assistant_reply=last_assistant_reply,
             current_speaker_block=current_speaker_block,
             focus_message_text=focus_message_text,
+            focus_message_identity=focus_message_identity,
             direct_context_text=direct_context_text,
             related_context_text=related_context_text,
             ambient_background_text=ambient_background_text,
@@ -482,7 +485,28 @@ class PlannerPromptContextMixin:
             last_assistant_reply=last_assistant_reply,
             current_speaker_block=current_speaker_block,
             near_context_priority=near_context_priority,
+            focus_message_identity=self._render_event_line(focus_event),
         )
+        reply_shape_source_text = str(
+            focus_event.get_extra("astrmai_rich_text", focus_event.message_str) or ""
+        ).strip()
+        reply_shape_policy = resolve_reply_shape_policy(
+            focus_event,
+            reply_shape_source_text,
+            getattr(self.gateway.config, "reply", None),
+        )
+        set_reply_shape_policy(focus_event, reply_shape_policy)
+        if focus_event is not event:
+            set_reply_shape_policy(event, reply_shape_policy)
+        if reply_shape_policy.get("mode") == "micro":
+            max_chars = int(reply_shape_policy.get("max_chars", 80) or 80)
+            max_sentences = int(reply_shape_policy.get("max_sentences", 2) or 2)
+            prompt_envelope.guidance_lines.append(
+                f"本轮是低信息量口语：用自然即时口吻回复，不超过 {max_sentences} 句、约 {max_chars} 字；"
+                "最多一个简短动作描写，不续写新场景，不重复称呼。"
+            )
+            if not bool(reply_shape_policy.get("allow_followup_question", False)):
+                prompt_envelope.guidance_lines.append("当前消息不是问题，不要为了延续对话而主动追加新问题。")
         if is_lightweight_event:
             prompt_envelope.guidance_lines.append("这是轻互动，只回应当前动作，不要接旧话题或复述历史。")
         if current_speaker_block and (is_lightweight_event or near_context_priority):

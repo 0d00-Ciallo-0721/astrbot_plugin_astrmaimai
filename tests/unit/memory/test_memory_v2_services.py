@@ -505,6 +505,11 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertTrue(bundle.rendered_prompt_block)
             injected_ids = event.get_extra("astrmai_memory_injection_trace").selected_ids
             self.assertTrue(injected_ids)
+            funnel = event.get_extra("astrmai_memory_funnel")
+            self.assertEqual(funnel["status"], "injected")
+            self.assertGreaterEqual(funnel["candidate_count"], len(injected_ids))
+            self.assertEqual(funnel["selected_count"], len(injected_ids))
+            self.assertGreater(funnel["rendered_chars"], 0)
 
             result = await tools.search_memory(query="Alice", session_id="chat-1", event=event)
             self.assertEqual(result.already_injected_ids, injected_ids)
@@ -853,6 +858,38 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(len(engine.retriever.added), 3)
             self.assertTrue(all(item[1]["canonical_id"] == memory_id for item in engine.retriever.added))
             self.assertGreaterEqual(len(engine.deleted), 3)
+
+        asyncio.run(run())
+
+    def test_injection_render_failure_closes_stage_and_records_error_funnel(self):
+        async def run():
+            _store, _retrieval, writer, injection, _tools, _maintenance = self._services()
+            await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="event",
+                    session_id="chat-1",
+                    content="Alice likes blue notebooks.",
+                    dedup_key="event:notebook:render-error",
+                )
+            )
+            event = _FakeEvent("remember Alice")
+            event.set_extra("astrmai_think_level", 2)
+
+            with patch.object(
+                injection.context_builder,
+                "render_prompt_block",
+                side_effect=RuntimeError("render failed"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await injection.build_bundle(event=event, prompt="Alice")
+
+            funnel = event.get_extra("astrmai_memory_funnel")
+            self.assertEqual(funnel["status"], "error")
+            self.assertGreater(funnel["candidate_count"], 0)
+            stage = event.get_extra("astrmai_stage_ledger")[-1]
+            self.assertEqual(stage["stage"], "memory.injection")
+            self.assertEqual(stage["status"], "error")
 
         asyncio.run(run())
 

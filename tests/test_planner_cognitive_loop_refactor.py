@@ -965,6 +965,24 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         envelope = event.get_extra("astrmai_prompt_envelope")
         self.assertNotIn("本轮可用动作", "\n".join(envelope.guidance_lines))
 
+    def test_planner_marks_low_information_utterance_for_short_natural_reply(self):
+        decision = self.planner_mod.CognitiveDecision(
+            action="reply",
+            intent="brief social reaction",
+            memory_policy="light",
+        )
+        planner = self._make_planner(decision)
+        event = _FakeEvent(text="哼哼哼")
+        _install_focus_extras(event)
+
+        asyncio.run(planner.plan_and_execute(event, [event]))
+
+        policy = event.get_extra("astrmai_reply_shape_policy")
+        guidance = "\n".join(event.get_extra("astrmai_prompt_envelope").guidance_lines)
+        self.assertEqual(policy["mode"], "micro")
+        self.assertIn("低信息量口语", guidance)
+        self.assertIn("不要为了延续对话而主动追加新问题", guidance)
+
 
 if __name__ == "__main__":
     unittest.main()

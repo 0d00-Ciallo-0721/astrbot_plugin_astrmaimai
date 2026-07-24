@@ -160,6 +160,8 @@ class GatewayTaskMixin:
                     use_fallback=False,
                     workload_policy=workload_policy,
                     result_validator=self._normalize_vision_failure_reason,
+                    ledger_stage="multimodal.vision",
+                    ledger_family=workload_family.value,
                 )
                 parsed = result.parsed_json or {}
                 is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
@@ -217,6 +219,8 @@ class GatewayTaskMixin:
             self._task_models(),
             is_json=True,
             workload_policy=workload_policy,
+            ledger_stage="attention.judge",
+            ledger_family=WorkloadFamily.JUDGE.value,
         )
         return result.parsed_json or {}
 
@@ -246,6 +250,8 @@ class GatewayTaskMixin:
             self._task_models(),
             is_json=True,
             workload_policy=workload_policy,
+            ledger_stage="attention.mood",
+            ledger_family=WorkloadFamily.MOOD.value,
         )
         return result.parsed_json or {}
 
@@ -261,6 +267,10 @@ class GatewayTaskMixin:
         workload_family: Optional[WorkloadFamily] = None,
         template_envelope: Optional[PromptEnvelope] = None,
         allow_global_scope: bool = False,
+        timeout_override: Optional[float] = None,
+        max_retries_override: Optional[int] = None,
+        max_models_override: Optional[int] = None,
+        use_fallback: bool = True,
     ) -> Union[str, Dict[str, Any]]:
         task_models = self._task_models()
         resolved_family = workload_family or self.context_economy.infer_workload_family(
@@ -277,10 +287,13 @@ class GatewayTaskMixin:
                 models=task_models,
                 is_json=is_json,
                 retry_penalty=0.5,
-                use_fallback=True,
+                use_fallback=use_fallback,
                 prefix_hash=prefix_hash,
                 persona_id=persona_id,
                 template_envelope=template_envelope,
+                timeout_override=timeout_override,
+                max_retries_override=max_retries_override,
+                max_models_override=max_models_override,
             )
             return result.parsed_json if is_json else result.text
         normalized_origin = str(base_origin or "").strip()
@@ -319,6 +332,12 @@ class GatewayTaskMixin:
                     template_envelope=template_envelope,
                 )
             ),
+            ledger_stage=f"data.{resolved_family.value}",
+            ledger_family=resolved_family.value,
+            timeout_override=timeout_override,
+            max_retries_override=max_retries_override,
+            max_models_override=max_models_override,
+            use_fallback=use_fallback,
         )
         return result.parsed_json if is_json else result.text
 
@@ -381,6 +400,9 @@ class GatewayTaskMixin:
                     template_envelope=template_envelope,
                 )
             ),
+            ledger_stage=f"proactive.{resolved_family.value}",
+            ledger_family=resolved_family.value,
+            ledger_critical_path=False,
         )
         return result.text
 
@@ -438,6 +460,9 @@ class GatewayTaskMixin:
                     template_envelope=template_envelope,
                 )
             ),
+            ledger_stage=f"persona.{workload_family.value}",
+            ledger_family=workload_family.value,
+            ledger_critical_path=False,
         )
         return result.parsed_json if is_json else result.text
 

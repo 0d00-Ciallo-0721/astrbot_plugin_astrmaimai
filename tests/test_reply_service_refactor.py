@@ -121,6 +121,12 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertTrue(artifact.sent)
         self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
         plugin.hiy_tts_from_text.assert_not_called()
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(
+            [stage["stage"] for stage in stages],
+            ["reply.prepare", "reply.send"],
+        )
+        self.assertTrue(all(stage["status"] == "success" for stage in stages))
 
     def test_private_overdue_reply_is_allowed_without_newer_activity(self):
         service = self._service()
@@ -581,6 +587,58 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertEqual(artifact.segments, ["短句不会拆分"])
         self.assertEqual(artifact.metadata["segment_reason"], "below_segment_min")
+
+    def test_micro_utterance_reply_is_capped_and_sent_as_one_bubble(self):
+        service = self._service(min_len=8, max_len=120)
+        service.config.reply.humanlike_short_reply_enabled = True
+        service.config.reply.short_reply_max_chars = 80
+        service.config.reply.short_reply_max_sentences = 2
+        service.config.reply.short_reply_allow_followup_question = False
+        event = FakeEvent("user-1", "Alice", "哼哼哼")
+        text = "哼什么呀！妃爱才没有闹。你是不是又在笑我？"
+
+        artifact = service._build_visible_reply_artifact(text, event=event)
+
+        self.assertEqual(len(artifact.segments), 1)
+        self.assertEqual(artifact.metadata["segment_reason"], "humanlike_short_single")
+        self.assertTrue(artifact.metadata["humanlike_short_reply_applied"])
+        self.assertNotIn("你是不是又在笑我", artifact.visible_text)
+
+    def test_micro_reply_constraint_does_not_touch_tool_result(self):
+        service = self._service(min_len=8, max_len=120)
+        event = FakeEvent("user-1", "Alice", "行")
+        event.set_extra(
+            "astrmai_reply_shape_policy",
+            {
+                "enabled": True,
+                "mode": "micro",
+                "reason": "known_micro_utterance",
+                "max_chars": 40,
+                "max_sentences": 1,
+                "allow_followup_question": False,
+            },
+        )
+        event.set_extra("astrmai_tool_execution_trace", [{"tool": "lookup", "status": "success"}])
+        text = "工具已经查到第一条结果。第二条结果也需要完整保留。"
+
+        artifact = service._build_visible_reply_artifact(text, event=event)
+
+        self.assertIn("第二条结果也需要完整保留", artifact.visible_text)
+        self.assertFalse(artifact.metadata["humanlike_short_reply_applied"])
+
+    def test_micro_reply_constraint_is_disabled_for_emotional_support(self):
+        service = self._service(min_len=8, max_len=120)
+        event = FakeEvent("user-1", "Alice", "累困")
+        text = "累了就先休息一下。妃爱会在这里陪着你。等缓过来再慢慢说也可以。"
+
+        artifact = service._build_visible_reply_artifact(
+            text,
+            event=event,
+            reply_mode=self.reply_mod.ReplyMode.EMOTIONAL_SUPPORT,
+        )
+
+        self.assertIn("等缓过来再慢慢说也可以", artifact.visible_text)
+        self.assertFalse(artifact.metadata["humanlike_short_reply_applied"])
 
     def test_forced_paragraph_boundary_can_split_below_single_limit(self):
         service = self._service(max_len=200)

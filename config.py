@@ -159,6 +159,10 @@ class ReplyConfig(BaseModel):
     stale_reply_max_age_sec: float = Field(default=0.0, ge=0.0, description="允许聊天回复保留时效性的最长秒数；0 表示自动按系统超时推导")
     segment_min_len: int = Field(default=15, ge=1, description="允许拆成多条发送前，单条内容至少要达到的长度")
     no_segment_max_len: int = Field(default=120, ge=1, description="允许智能分段的长度上限；达到或超过此长度时整条发送，双换行除外")
+    humanlike_short_reply_enabled: bool = Field(default=True, description="对低信息量口语启用简短拟人回复约束")
+    short_reply_max_chars: int = Field(default=80, ge=20, le=240, description="低信息量口语回复的最大字符数")
+    short_reply_max_sentences: int = Field(default=2, ge=1, le=4, description="低信息量口语回复的最大句数")
+    short_reply_allow_followup_question: bool = Field(default=False, description="低信息量口语回复是否允许主动追加问题")
     meme_probability: int = Field(default=60, ge=0, le=100, description="在适合的场景下附带表情包的概率百分比")
     emotion_mapping: List[str] = Field(
         default=[
@@ -192,6 +196,8 @@ class ConversationConfig(BaseModel):
     enable_dialogue_store: bool = Field(default=True)
     enable_context_compaction: bool = Field(default=True)
     enable_prefix_caching: bool = Field(default=True)
+    context_dedup_enabled: bool = Field(default=True, description="启用提示词上下文来源感知去重")
+    context_dedup_observe_only: bool = Field(default=False, description="仅统计上下文重复，不实际删减")
     conversation_generation_enabled: bool = Field(default=True, repr=False)
     reply_send_claim_enabled: bool = Field(default=True, repr=False)
     group_thread_wait_enabled: bool = Field(default=True, repr=False)
@@ -279,6 +285,7 @@ class Sys3Settings(BaseModel):
 
 
 class PrivateChatConfig(BaseModel):
+    turn_merge_enabled: bool = Field(default=True, description="启用私聊连续输入合并，避免只回复最后一句")
     wait_timeout_sec: int = Field(default=300, ge=1, description="单次私聊等待反馈强制休眠阈值(秒)")
     input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0, description="私聊连续输入聚合等待时间(秒)")
     image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0, description="私聊图片文件解析超时时间(秒)")
@@ -301,6 +308,7 @@ class TimingConfig(BaseModel):
     cognitive_loop_timeout_sec: float = Field(default=2.5, ge=0.1, le=600.0)
     mood_analysis_timeout_sec: float = Field(default=30.0, ge=1.0, le=600.0)
     memory_react_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
+    query_rewrite_timeout_sec: float = Field(default=8.0, ge=0.5, le=60.0)
     compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
     embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
     private_wait_timeout_sec: int = Field(default=300, ge=1, le=7200)

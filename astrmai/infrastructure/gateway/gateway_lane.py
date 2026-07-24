@@ -8,7 +8,7 @@ from ..context_economy import PromptEnvelope, WorkloadFamily, WorkloadPolicy
 from ..runtime.lane_manager import LaneKey
 from ..runtime.runtime_contracts import LLMCallResult
 from ..runtime.trace_runtime import append_trace_stage, preview_text
-from ..runtime.turn_call_ledger import begin_llm_call, finish_llm_call
+from ..runtime.turn_call_ledger import begin_llm_call, finish_llm_call, record_llm_attempt
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
@@ -286,6 +286,9 @@ class GatewayLaneMixin:
         template_envelope: Optional[PromptEnvelope] = None,
         event: Any = None,
         result_validator: Optional[Callable[[Any], tuple[bool, str]]] = None,
+        timeout_override: Optional[float] = None,
+        max_retries_override: Optional[int] = None,
+        max_models_override: Optional[int] = None,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -332,6 +335,10 @@ class GatewayLaneMixin:
                     use_fallback=use_fallback,
                     workload_policy=workload_policy,
                     result_validator=result_validator,
+                    ledger_call_id=call_id,
+                    timeout_override=timeout_override,
+                    max_retries_override=max_retries_override,
+                    max_models_override=max_models_override,
                 )
             except Exception as exc:
                 finish_llm_call(
@@ -340,7 +347,6 @@ class GatewayLaneMixin:
                     status="error",
                     error=exc,
                     error_kind=getattr(exc, "failure_kind", ""),
-                    attempts=len(models or []),
                 )
                 raise
             finish_llm_call(
@@ -352,7 +358,6 @@ class GatewayLaneMixin:
                 output=result.text or result.raw_completion,
                 error_kind=getattr(result.error_kind, "value", result.error_kind),
                 error=result.error_message,
-                attempts=len(models or []),
             )
             return result
 
@@ -413,6 +418,10 @@ class GatewayLaneMixin:
                 workload_policy=workload_policy,
                 record_economy=False,
                 result_validator=result_validator,
+                ledger_call_id=call_id,
+                timeout_override=timeout_override,
+                max_retries_override=max_retries_override,
+                max_models_override=max_models_override,
             )
         except Exception as exc:
             finish_llm_call(
@@ -421,7 +430,6 @@ class GatewayLaneMixin:
                 status="error",
                 error=exc,
                 error_kind=getattr(exc, "failure_kind", ""),
-                attempts=len(models or []),
                 metadata={"history_count": len(history or [])},
             )
             raise
@@ -434,7 +442,6 @@ class GatewayLaneMixin:
             output=result.text or result.raw_completion,
             error_kind=getattr(result.error_kind, "value", result.error_kind),
             error=result.error_message,
-            attempts=len(models or []),
             metadata={"history_count": len(history or [])},
         )
         if not result.model_id:
@@ -552,6 +559,7 @@ class GatewayLaneMixin:
             call_id = begin_llm_call(
                 event,
                 stage="gateway.tool",
+                family=self._lane_workload_family(lane_key, tool_mode=True).value,
                 pool=lane_key.task_family,
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -575,6 +583,7 @@ class GatewayLaneMixin:
                     persona_id=persona_id,
                     raw_user_text=raw_user_text,
                     template_envelope=template_envelope,
+                    ledger_call_id=call_id,
                 )
             except Exception as exc:
                 finish_llm_call(
@@ -583,7 +592,6 @@ class GatewayLaneMixin:
                     status="error",
                     error=exc,
                     error_kind=getattr(exc, "failure_kind", ""),
-                    attempts=len(models or []),
                 )
                 raise
             finish_llm_call(
@@ -595,7 +603,6 @@ class GatewayLaneMixin:
                 output=result.text or result.raw_completion,
                 error_kind=getattr(result.error_kind, "value", result.error_kind),
                 error=result.error_message,
-                attempts=len(models or []),
             )
             return result
 
@@ -617,6 +624,7 @@ class GatewayLaneMixin:
         persona_id: str = "",
         raw_user_text: str = "",
         template_envelope: Optional[PromptEnvelope] = None,
+        ledger_call_id: str = "",
     ) -> LLMCallResult:
         if not self.lane_manager:
             raise LLMCascadeFailureException("lane manager is required for tool_chat_in_lane")
@@ -692,6 +700,7 @@ class GatewayLaneMixin:
             tool_kwargs = self._lane_request_kwargs(lane_umo, workload_policy)(model_id)
             side_effect_count_before = self._tool_side_effect_count(event)
             last_raw_completion = ""
+            attempt_started = asyncio.get_running_loop().time()
             try:
                 response = await asyncio.wait_for(
                     self.context.tool_loop_agent(
@@ -735,7 +744,13 @@ class GatewayLaneMixin:
                         usage=usage,
                     )
                     try:
-                        self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                        self._log_usage(
+                            report_pool,
+                            model_id,
+                            usage,
+                            _tool_log_meta,
+                            latency_ms=(asyncio.get_running_loop().time() - attempt_started) * 1000,
+                        )
                     except Exception as exc:
                         logger.warning(f"[Gateway] tool usage logging degraded after successful call: {exc}")
                     provider_session_id = str(tool_kwargs.get("session_id", "") or "")
@@ -796,6 +811,15 @@ class GatewayLaneMixin:
                         protocol_type="terminal_yield" if "[TERMINAL_YIELD]:" in stripped_reply else "wait_signal",
                         debug_log_prefix=f"trace={trace_id} tool-" if (trace_id := getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")) else "tool-",
                     )
+                    record_llm_attempt(
+                        event,
+                        ledger_call_id,
+                        model=model_id,
+                        status="success",
+                        elapsed_ms=(asyncio.get_running_loop().time() - attempt_started) * 1000,
+                        fallback=model_id not in primary_models,
+                        retry_index=attempt,
+                    )
                     return result
                 safe_text, failure_kind = validate_visible_output_text(
                     reply_text,
@@ -827,7 +851,13 @@ class GatewayLaneMixin:
                     usage=usage,
                 )
                 try:
-                    self._log_usage(report_pool, model_id, usage, _tool_log_meta)
+                    self._log_usage(
+                        report_pool,
+                        model_id,
+                        usage,
+                        _tool_log_meta,
+                        latency_ms=(asyncio.get_running_loop().time() - attempt_started) * 1000,
+                    )
                 except Exception as exc:
                     logger.warning(f"[Gateway] tool usage logging degraded after successful call: {exc}")
                 provider_session_id = str(tool_kwargs.get("session_id", "") or "")
@@ -886,6 +916,15 @@ class GatewayLaneMixin:
                     lane_umo=lane_umo,
                     debug_log_prefix=f"trace={trace_id} tool-" if (trace_id := getattr(event, "get_extra", lambda *_args, **_kwargs: "")("astrmai_trace_id", "")) else "tool-",
                 )
+                record_llm_attempt(
+                    event,
+                    ledger_call_id,
+                    model=model_id,
+                    status="success",
+                    elapsed_ms=(asyncio.get_running_loop().time() - attempt_started) * 1000,
+                    fallback=model_id not in primary_models,
+                    retry_index=attempt,
+                )
                 return result
             except Exception as exc:
                 last_error = str(exc)
@@ -897,6 +936,16 @@ class GatewayLaneMixin:
                     blocked_models.add(model_id)
                 has_later_model = any(candidate not in blocked_models for candidate in attempt_queue)
                 will_retry_or_switch = bool(retry_same_model or (not side_effect_recorded and has_later_model))
+                record_llm_attempt(
+                    event,
+                    ledger_call_id,
+                    model=model_id,
+                    status="fatal" if is_fatal else "error",
+                    elapsed_ms=(asyncio.get_running_loop().time() - attempt_started) * 1000,
+                    error_kind=last_failure_kind.value,
+                    fallback=model_id not in primary_models,
+                    retry_index=attempt,
+                )
                 self.router.report_failure(report_pool, model_id, is_fatal=is_fatal)
                 cooldown_meta = self._open_model_cooldown(report_pool, model_id, f"{last_error} {last_raw_completion}")
                 append_trace_stage(

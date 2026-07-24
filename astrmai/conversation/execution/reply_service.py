@@ -31,7 +31,7 @@ from ...infrastructure.compat.legacy_compat import emit_legacy_reply_runtime_ext
 from ...infrastructure.gateway.output_guard import is_sendable_segment, sanitize_visible_reply_text
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
-from ...infrastructure.runtime.turn_call_ledger import record_reply_stats
+from ...infrastructure.runtime.turn_call_ledger import observe_stage, record_reply_stats
 from ...multimodal import MEMES_DIR, send_meme
 from ...state.relationship.affection_router import AffectionRouter
 from ..contracts.focus_context import FreshnessState, ReplyMode
@@ -95,16 +95,20 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         if not raw_text:
             return VisibleReplyArtifact("", [], "", blocked_reason="empty_reply")
 
-        reply_mode = self._resolve_reply_mode(event)
-        freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
-        artifact = self._build_visible_reply_artifact(
-            raw_text,
-            event=event,
-            reply_mode=reply_mode,
-            freshness_state=freshness_state,
-            stale_reason=stale_reason,
-            is_proactive=bool(event.get_extra("astrmai_is_proactive_event", False)),
-        )
+        with observe_stage(event, "reply.prepare") as prepare_stage:
+            reply_mode = self._resolve_reply_mode(event)
+            freshness_state, stale_reason = await self._check_reply_freshness(event, chat_id)
+            artifact = self._build_visible_reply_artifact(
+                raw_text,
+                event=event,
+                reply_mode=reply_mode,
+                freshness_state=freshness_state,
+                stale_reason=stale_reason,
+                is_proactive=bool(event.get_extra("astrmai_is_proactive_event", False)),
+            )
+            prepare_stage["reply_chars"] = len(artifact.visible_text or "")
+            prepare_stage["segment_count"] = len(artifact.segments or [])
+            prepare_stage["blocked"] = bool(artifact.blocked)
         record_reply_stats(
             event,
             segment_count=len(artifact.segments or []),
@@ -112,6 +116,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             total_chars=len(artifact.visible_text or ""),
             strategy=str(artifact.metadata.get("segment_strategy", "") or ""),
             send_status=str(artifact.metadata.get("send_status", "") or ""),
+            metadata=artifact.metadata,
         )
         if artifact.blocked:
             logger.debug(f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} reply blocked: {artifact.blocked_reason}")
@@ -138,7 +143,15 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         rich_text = event.get_extra("astrmai_rich_text", event.message_str)
         formatted_user_text = f"{sender_name}: {rich_text}"
         at_targets = self._merge_wait_targets(event, pending_actions)
-        if not await self._send_segments(event, chat_id, artifact, at_targets):
+        with observe_stage(
+            event,
+            "reply.send",
+            metadata={"planned_segment_count": len(artifact.segments or [])},
+        ) as send_stage:
+            sent = await self._send_segments(event, chat_id, artifact, at_targets)
+            send_stage["sent"] = bool(sent)
+            send_stage["sent_segment_count"] = int(artifact.metadata.get("sent_segment_count", 0) or 0)
+        if not sent:
             record_reply_stats(
                 event,
                 segment_count=len(artifact.segments or []),
@@ -147,6 +160,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 strategy=str(artifact.metadata.get("segment_strategy", "") or ""),
                 send_status=str(artifact.metadata.get("send_status", "failed") or "failed"),
                 sent_segment_count=int(artifact.metadata.get("sent_segment_count", 0) or 0),
+                metadata=artifact.metadata,
             )
             artifact.blocked_reason = artifact.blocked_reason or "send_failed"
             artifact.metadata.setdefault("send_status", "failed")
@@ -165,6 +179,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             strategy=str(artifact.metadata.get("segment_strategy", "") or ""),
             send_status=str(artifact.metadata.get("send_status", "sent") or "sent"),
             sent_segment_count=int(artifact.metadata.get("sent_segment_count", len(artifact.segments or [])) or 0),
+            metadata=artifact.metadata,
         )
         try:
             await self.qq_action_dispatcher.commit(

@@ -580,24 +580,53 @@ class PromptRefiner:
         higher_priority_texts: list[str],
         *,
         min_dedup_length: int = 6,
+        always_dedup_texts: list[str] | None = None,
     ) -> str:
         if not transcript:
             return ""
         high_priority_keys: set[str] = set()
+        always_dedup_keys: set[str] = set()
         for text in higher_priority_texts:
             for line in str(text or "").splitlines():
                 key = cls._normalize_dedup_key(line)
                 if key and len(key) > min_dedup_length:
                     high_priority_keys.add(key)
-        if not high_priority_keys:
+        for text in list(always_dedup_texts or []):
+            for line in str(text or "").splitlines():
+                key = cls._normalize_dedup_key(line)
+                if key:
+                    always_dedup_keys.add(key)
+        if not high_priority_keys and not always_dedup_keys:
             return transcript
 
         kept_lines: list[str] = []
         for line in transcript.splitlines():
             key = cls._normalize_dedup_key(line)
-            if not key or len(key) <= min_dedup_length or key not in high_priority_keys:
+            should_remove = key in always_dedup_keys or (
+                len(key) > min_dedup_length and key in high_priority_keys
+            )
+            if not key or not should_remove:
                 kept_lines.append(line)
         return "\n".join(kept_lines).strip()
+
+    @classmethod
+    def _deduplicate_transcript_with_stats(
+        cls,
+        transcript: str,
+        higher_priority_texts: list[str],
+        *,
+        min_dedup_length: int = 6,
+        always_dedup_texts: list[str] | None = None,
+    ) -> tuple[str, int]:
+        rendered = cls._deduplicate_transcript(
+            transcript,
+            higher_priority_texts,
+            min_dedup_length=min_dedup_length,
+            always_dedup_texts=always_dedup_texts,
+        )
+        before_lines = [line for line in str(transcript or "").splitlines() if line.strip()]
+        after_lines = [line for line in rendered.splitlines() if line.strip()]
+        return rendered, max(0, len(before_lines) - len(after_lines))
 
     async def _decide_memory_injection(
         self,
@@ -807,6 +836,7 @@ class PromptRefiner:
             warm_context_for_dedup = warm_zone_transcript
         raw_user_text = (prompt_envelope.raw_user_text or prompt).strip()
         focus_message_text = (prompt_envelope.focus_message_text or raw_user_text or prompt).strip()
+        focus_message_identity = str(getattr(prompt_envelope, "focus_message_identity", "") or "").strip()
         direct_context_text = prompt_envelope.direct_context_text.strip()
         related_context_text = prompt_envelope.related_context_text.strip()
         background_window_text = prompt_envelope.ambient_background_text.strip()
@@ -867,7 +897,7 @@ class PromptRefiner:
             background_lines = [line for line in background_window_text.splitlines() if line.strip()]
             background_window_text = "\n".join(background_lines[-1:])
 
-        recent_transcript = self._deduplicate_transcript(
+        legacy_recent_transcript = self._deduplicate_transcript(
             recent_transcript,
             [
                 warm_context_for_dedup,
@@ -878,16 +908,49 @@ class PromptRefiner:
             ],
             min_dedup_length=6,
         )
-        warm_zone_transcript = self._deduplicate_transcript(
+        legacy_warm_zone_transcript = self._deduplicate_transcript(
             warm_zone_transcript,
-            [focus_message_text, direct_context_text, related_context_text, background_window_text, recent_transcript],
+            [focus_message_text, direct_context_text, related_context_text, background_window_text, legacy_recent_transcript],
             min_dedup_length=6,
         )
+        conversation_config = getattr(self.config, "conversation", None)
+        context_dedup_enabled = bool(getattr(conversation_config, "context_dedup_enabled", True))
+        context_dedup_observe_only = bool(getattr(conversation_config, "context_dedup_observe_only", False))
+        dedup_recent = legacy_recent_transcript
+        dedup_warm = legacy_warm_zone_transcript
+        recent_removed_lines = 0
+        warm_removed_lines = 0
+        if context_dedup_enabled:
+            dedup_recent, recent_removed_lines = self._deduplicate_transcript_with_stats(
+                recent_transcript,
+                [
+                    warm_context_for_dedup,
+                    focus_message_text,
+                    direct_context_text,
+                    related_context_text,
+                    background_window_text,
+                ],
+                min_dedup_length=6,
+                always_dedup_texts=[focus_message_identity],
+            )
+            dedup_warm, warm_removed_lines = self._deduplicate_transcript_with_stats(
+                warm_zone_transcript,
+                [focus_message_text, direct_context_text, related_context_text, background_window_text, dedup_recent],
+                min_dedup_length=6,
+                always_dedup_texts=[focus_message_identity],
+            )
+        if not context_dedup_observe_only:
+            recent_transcript = dedup_recent
+            warm_zone_transcript = dedup_warm
+        else:
+            recent_transcript = legacy_recent_transcript
+            warm_zone_transcript = legacy_warm_zone_transcript
         warm_text, warm_meta = self._render_warm_context_for_budget(prompt_envelope)
         warm_text = self._deduplicate_transcript(
             warm_text,
             [focus_message_text, direct_context_text, related_context_text, background_window_text, recent_transcript],
             min_dedup_length=6,
+            always_dedup_texts=[focus_message_identity] if context_dedup_enabled and not context_dedup_observe_only else None,
         )
         memory_text, memory_meta = self._render_memory_block_for_budget(
             proactive_recall=effective_proactive_recall,
@@ -928,6 +991,24 @@ class PromptRefiner:
         prompt_envelope.warm_context_rendered_chars = int(flex_budget_meta.get("warm_rendered_chars", 0) or 0)
         prompt_envelope.recent_context_rendered_chars = int(flex_budget_meta.get("recent_rendered_chars", 0) or 0)
         prompt_envelope.memory_context_rendered_chars = int(flex_budget_meta.get("memory_rendered_chars", 0) or 0)
+        prompt_envelope.recent_transcript = recent_transcript
+        prompt_envelope.warm_zone_transcript = warm_zone_transcript
+        context_dedup_stats = {
+            "enabled": context_dedup_enabled,
+            "observe_only": context_dedup_observe_only,
+            "recent_removed_lines": recent_removed_lines,
+            "warm_removed_lines": warm_removed_lines,
+            "removed_lines": recent_removed_lines + warm_removed_lines,
+            "recent_chars": len(recent_transcript),
+            "warm_chars": len(warm_zone_transcript),
+        }
+        set_extra = getattr(event, "set_extra", None)
+        if callable(set_extra):
+            set_extra("astrmai_context_dedup_stats", context_dedup_stats)
+        else:
+            extras = getattr(event, "_extras", None)
+            if isinstance(extras, dict):
+                extras["astrmai_context_dedup_stats"] = context_dedup_stats
 
         final_system_prompt = await self._resolve_visual_memory(system_prompt)
 

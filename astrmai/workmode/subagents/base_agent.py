@@ -5,6 +5,8 @@ AstrMai SubAgent 抽象基类
 2. 统一工具可用性健康检查与优雅退回（Edge Case 闭环）
 3. 拉起独立 tool_loop_agent 循环并返回结果
 """
+import time
+
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 # ponytail: these are internal AstrBot APIs — may break on major version upgrades.
@@ -13,6 +15,12 @@ from astrbot.core.agent.tool import FunctionTool, ToolExecResult, ToolSet
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.api import logger
+
+from ...infrastructure.runtime.turn_call_ledger import (
+    begin_llm_call,
+    finish_llm_call,
+    record_llm_attempt,
+)
 
 
 @dataclass
@@ -107,16 +115,60 @@ class AstrMaiBaseSubAgent(FunctionTool[AstrAgentContext]):
                 provider_id = await ctx.get_current_chat_provider_id(event.unified_msg_origin)
             except Exception as exc:
                 raise RuntimeError(f"[Sys3/{self.name}] 无法获取 Provider ID: {exc}") from exc
-            llm_resp = await ctx.tool_loop_agent(
-                event=event,
-                chat_provider_id=provider_id,
+            ledger_call_id = begin_llm_call(
+                event,
+                stage=f"workmode.subagent.{self.name}",
+                family="sys3",
+                pool="workmode",
                 prompt=query,
                 system_prompt=system_prompt,
-                tools=ToolSet(active_tools),
+                tools=active_tools,
                 max_steps=self.get_max_steps(),
-                tool_call_timeout=self.get_timeout(),
+                metadata={"gateway_available": False},
             )
+            attempt_started = time.perf_counter()
+            try:
+                llm_resp = await ctx.tool_loop_agent(
+                    event=event,
+                    chat_provider_id=provider_id,
+                    prompt=query,
+                    system_prompt=system_prompt,
+                    tools=ToolSet(active_tools),
+                    max_steps=self.get_max_steps(),
+                    tool_call_timeout=self.get_timeout(),
+                )
+            except Exception as exc:
+                record_llm_attempt(
+                    event,
+                    ledger_call_id,
+                    model=provider_id,
+                    status="error",
+                    elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+                    error_kind=exc.__class__.__name__,
+                )
+                finish_llm_call(
+                    event,
+                    ledger_call_id,
+                    status="error",
+                    model=provider_id,
+                    error_kind=exc.__class__.__name__,
+                    error=exc.__class__.__name__,
+                )
+                raise
             result = getattr(llm_resp, "completion_text", None) or "任务已执行完毕，但无文字输出。"
+            record_llm_attempt(
+                event,
+                ledger_call_id,
+                model=provider_id,
+                status="success",
+                elapsed_ms=(time.perf_counter() - attempt_started) * 1000,
+            )
+            finish_llm_call(
+                event,
+                ledger_call_id,
+                model=provider_id,
+                output=result,
+            )
             logger.info(f"[Sys3/{self.name}] 任务完成 (raw provider)，结果长度: {len(result)} 字")
             return result
         except Exception as exc:
