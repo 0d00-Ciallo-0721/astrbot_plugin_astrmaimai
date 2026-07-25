@@ -35,6 +35,11 @@ class TurnTelemetryContext:
     generation: int = 0
     message_id_hash: str = ""
     started_at: float = field(default_factory=time.time)
+    started_monotonic: float = field(default_factory=time.monotonic)
+    deadline_monotonic: float = 0.0
+    total_budget_sec: float = 0.0
+    main_reply_reserve_sec: float = 0.0
+    finalized_at: float = 0.0
     sequence: int = 0
     calls: list[dict[str, Any]] = field(default_factory=list)
     context_blocks: list[dict[str, Any]] = field(default_factory=list)
@@ -127,6 +132,86 @@ def bind_turn_telemetry_identity(event: Any) -> TurnTelemetryContext:
     return context
 
 
+def configure_turn_budget(
+    event: Any,
+    *,
+    total_budget_sec: float,
+    main_reply_reserve_sec: float,
+) -> TurnTelemetryContext:
+    context = ensure_turn_telemetry(event)
+    total = max(1.0, float(total_budget_sec or 0.0))
+    reserve = max(0.0, min(float(main_reply_reserve_sec or 0.0), total))
+    elapsed_wall = max(0.0, time.time() - float(context.started_at or time.time()))
+    remaining = max(0.0, total - elapsed_wall)
+    context.total_budget_sec = total
+    context.main_reply_reserve_sec = reserve
+    context.deadline_monotonic = time.monotonic() + remaining
+    return context
+
+
+def remaining_turn_budget(
+    event: Any = None,
+    *,
+    reserve_for_reply: bool = False,
+) -> float | None:
+    context = current_turn_telemetry(event)
+    if context is None or context.deadline_monotonic <= 0.0:
+        return None
+    reserve = context.main_reply_reserve_sec if reserve_for_reply else 0.0
+    return max(0.0, context.deadline_monotonic - time.monotonic() - reserve)
+
+
+def clamp_timeout_to_turn_budget(
+    event: Any,
+    requested_timeout_sec: float,
+    *,
+    reserve_for_reply: bool = False,
+) -> float:
+    requested = max(0.0, float(requested_timeout_sec or 0.0))
+    remaining = remaining_turn_budget(event, reserve_for_reply=reserve_for_reply)
+    if remaining is None:
+        return requested
+    return max(0.0, min(requested, remaining))
+
+
+def finalize_turn_telemetry(event: Any = None, *, outcome: str = "") -> dict[str, int]:
+    context = current_turn_telemetry(event)
+    if context is None:
+        return {"calls": 0, "stages": 0}
+    now = time.time()
+    finalized_calls = 0
+    finalized_stages = 0
+    for entry in context.calls:
+        if str(entry.get("status", "")) != "pending":
+            continue
+        started_at = float(entry.get("started_at", now) or now)
+        entry.update(
+            {
+                "status": "abandoned",
+                "finished_at": now,
+                "elapsed_ms": round(max(0.0, now - started_at) * 1000, 1),
+                "error_kind": "turn_finalized",
+                "error_hash": _text_hash(outcome),
+            }
+        )
+        finalized_calls += 1
+    for entry in context.stages:
+        if str(entry.get("status", "")) != "pending":
+            continue
+        started_at = float(entry.get("started_at", now) or now)
+        entry.update(
+            {
+                "status": "abandoned",
+                "finished_at": now,
+                "elapsed_ms": round(max(0.0, now - started_at) * 1000, 1),
+                "reason": "turn_finalized",
+            }
+        )
+        finalized_stages += 1
+    context.finalized_at = now
+    return {"calls": finalized_calls, "stages": finalized_stages}
+
+
 def current_turn_telemetry(event: Any = None) -> TurnTelemetryContext | None:
     if event is not None:
         existing = _event_extra(event, TELEMETRY_CONTEXT_KEY)
@@ -152,6 +237,7 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
     if context is None:
         return {}
     captured_at = time.time()
+    remaining = remaining_turn_budget(event)
     return {
         "trace_schema_version": TRACE_SCHEMA_VERSION,
         "instrumentation_version": INSTRUMENTATION_VERSION,
@@ -165,6 +251,12 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         "started_at": context.started_at,
         "captured_at": captured_at,
         "total_elapsed_ms": round(max(0.0, captured_at - context.started_at) * 1000, 1),
+        "budget": {
+            "total_budget_sec": context.total_budget_sec,
+            "main_reply_reserve_sec": context.main_reply_reserve_sec,
+            "remaining_ms": round(max(0.0, float(remaining or 0.0)) * 1000, 1),
+            "exhausted": remaining is not None and remaining <= 0.0,
+        },
         "llm_call_ledger": copy.deepcopy(context.calls[-_MAX_ENTRIES:]),
         "context_block_stats": copy.deepcopy(context.context_blocks[-16:]),
         "stage_ledger": copy.deepcopy(context.stages[-_MAX_ENTRIES:]),
@@ -559,10 +651,13 @@ def record_reply_stats(
     if event is not None and hasattr(event, "get_extra"):
         freshness_state = str(event.get_extra("astrmai_reply_freshness_state", "") or "")
         stale_reason = str(event.get_extra("astrmai_reply_stale_reason", "") or "")
+        stale_category = str(event.get_extra("astrmai_reply_stale_category", "") or "")
         if freshness_state:
             payload["freshness_state"] = freshness_state
         if stale_reason:
             payload["stale_reason"] = stale_reason.split(":", 1)[0]
+        if stale_category:
+            payload["stale_category"] = stale_category
         for key in ("astrmai_reply_age_sec", "astrmai_reply_max_age_sec"):
             value = event.get_extra(key, None)
             if isinstance(value, (int, float)):
@@ -585,14 +680,18 @@ __all__ = [
     "begin_stage",
     "begin_llm_call",
     "bind_turn_telemetry_identity",
+    "clamp_timeout_to_turn_budget",
+    "configure_turn_budget",
     "current_turn_telemetry",
     "ensure_turn_telemetry",
+    "finalize_turn_telemetry",
     "finish_stage",
     "finish_llm_call",
     "observe_stage",
     "record_llm_attempt",
     "record_context_block_stats",
     "record_reply_stats",
+    "remaining_turn_budget",
     "turn_telemetry_scope",
     "turn_telemetry_snapshot",
 ]

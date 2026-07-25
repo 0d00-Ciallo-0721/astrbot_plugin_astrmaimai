@@ -46,13 +46,31 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
                     {"stage": "reply.send", "status": "success", "elapsed_ms": 30},
                 ],
                 "context_block_stats": [
-                    {"total_chars": 5000, "duplicate_block_count": 2},
+                    {
+                        "stage": "planner.final_prompt_sources",
+                        "total_chars": 5000,
+                        "duplicate_block_count": 2,
+                        "metadata": {"scope": "source"},
+                    },
+                    {
+                        "stage": "planner.final_prompt_transmitted",
+                        "total_chars": 3200,
+                        "duplicate_block_count": 0,
+                        "metadata": {"scope": "transmitted"},
+                    },
                 ],
+                "decision_observation": {
+                    "wait_reason": "group_ambient_short_wait",
+                    "stale_category": "newer_activity_same_thread",
+                    "judge_outcome": "reply",
+                },
+                "budget": {"remaining_ms": 120000, "exhausted": False},
                 "memory_funnel": {
                     "status": "injected",
                     "candidate_count": 10,
                     "selected_count": 3,
                     "rendered_chars": 500,
+                    "query_rewrite_trace": {"status": "success"},
                 },
             }
         ]
@@ -63,7 +81,57 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["llm"]["judge_calls_per_turn_p95"] == 1
     assert report["llm"]["path_counts"] == {"critical": 1}
     assert report["context"]["duplicate_block_count"] == 2
+    assert report["context"]["by_scope"]["source"]["duplicate_block_count"] == 2
+    assert report["context"]["by_scope"]["transmitted"]["chars_p50"] == 3200
+    assert report["decision"]["wait_reasons"] == {"group_ambient_short_wait": 1}
+    assert report["decision"]["stale_categories"] == {"newer_activity_same_thread": 1}
+    assert report["decision"]["judge_outcomes"] == {"reply": 1}
+    assert report["budget"]["exhausted_count"] == 0
+    assert report["query_rewrite"]["status_counts"] == {"success": 1}
     assert report["memory"]["selection_rate"] == 0.3
+
+
+def test_analyze_traces_counts_abandoned_calls_budget_and_attempt_failures():
+    report = analyze_traces(
+        [
+            {
+                "turn_id": "turn-2",
+                "chat_id": "chat-2",
+                "status": "skipped_wait",
+                "llm_call_ledger": [
+                    {
+                        "stage": "memory.query_rewrite",
+                        "status": "abandoned",
+                        "model_attempts": [
+                            {"status": "error", "error_kind": "provider_failure"},
+                            {"status": "cooldown_skipped", "error_kind": "provider_cooldown"},
+                        ],
+                    }
+                ],
+                "decision_observation": {
+                    "wait_reason": "cognitive_wait",
+                    "judge_timeout": True,
+                },
+                "budget": {"remaining_ms": 0, "exhausted": True},
+                "memory_funnel": {
+                    "query_rewrite_trace": {"fallback_reason": "timeout"},
+                },
+            }
+        ]
+    )
+
+    assert report["llm"]["status_counts"] == {"abandoned": 1}
+    assert report["llm"]["model_attempt_status_counts"] == {
+        "error": 1,
+        "cooldown_skipped": 1,
+    }
+    assert report["llm"]["model_attempt_error_counts"] == {
+        "provider_failure": 1,
+        "provider_cooldown": 1,
+    }
+    assert report["decision"]["judge_outcomes"] == {"timeout": 1}
+    assert report["budget"]["exhausted_count"] == 1
+    assert report["query_rewrite"]["status_counts"] == {"timeout": 1}
 
 
 def test_analyzer_never_renders_trace_content():

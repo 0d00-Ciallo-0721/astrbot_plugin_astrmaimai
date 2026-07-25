@@ -177,8 +177,13 @@ class MemoryInjectionService:
                 "rag_disabled": bool(disable_rag),
             },
         )
+        query = None
 
         def remember_funnel(payload: dict) -> None:
+            query_metadata = dict(getattr(query, "metadata", {}) or {})
+            rewrite_trace = query_metadata.get("query_rewrite_trace")
+            if isinstance(rewrite_trace, dict):
+                payload = {**payload, "query_rewrite_trace": dict(rewrite_trace)}
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_memory_funnel", dict(payload))
 

@@ -6,7 +6,12 @@ from astrbot.api import logger
 
 from ..context_economy import WorkloadPolicy
 from ..runtime.runtime_contracts import FailureKind, LLMCallResult
-from ..runtime.turn_call_ledger import begin_llm_call, finish_llm_call, record_llm_attempt
+from ..runtime.turn_call_ledger import (
+    begin_llm_call,
+    clamp_timeout_to_turn_budget,
+    finish_llm_call,
+    record_llm_attempt,
+)
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
@@ -183,6 +188,8 @@ class GatewayCallMixin:
         timeout_override: Optional[float] = None,
         max_retries_override: Optional[int] = None,
         max_models_override: Optional[int] = None,
+        allow_cooldown_override: bool = True,
+        reserve_for_reply: bool = False,
     ) -> LLMCallResult:
         async with self._global_semaphore:
             primary_models, attempt_queue = self._build_attempt_queue(
@@ -191,11 +198,23 @@ class GatewayCallMixin:
                 use_fallback,
                 workload_policy=workload_policy,
             )
-            attempt_queue, skipped_cooldown_models, cooldown_overridden = self._filter_cooldown_attempt_queue(
-                pool_name,
-                primary_models,
-                attempt_queue,
-            )
+            if allow_cooldown_override:
+                attempt_queue, skipped_cooldown_models, cooldown_overridden = (
+                    self._filter_cooldown_attempt_queue(
+                        pool_name,
+                        primary_models,
+                        attempt_queue,
+                    )
+                )
+            else:
+                attempt_queue, skipped_cooldown_models, cooldown_overridden = (
+                    self._filter_cooldown_attempt_queue(
+                        pool_name,
+                        primary_models,
+                        attempt_queue,
+                        allow_override=False,
+                    )
+                )
             if max_models_override is not None:
                 attempt_queue = attempt_queue[: max(1, int(max_models_override))]
             owns_ledger_call = not bool(ledger_call_id)
@@ -216,20 +235,25 @@ class GatewayCallMixin:
                     },
                 )
             if not attempt_queue:
+                failure_reason = "all_models_cooling" if skipped_cooldown_models else "empty_model_pool"
                 if owns_ledger_call:
                     finish_llm_call(
                         None,
                         ledger_call_id,
                         status="error",
                         error_kind=FailureKind.UNKNOWN.value,
-                        error="empty_model_pool",
+                        error=failure_reason,
                     )
                 self._raise_cascade_failure(
                     pool_name=pool_name,
-                    error_message=f"未配置可用模型池: {pool_name}",
+                    error_message=(
+                        f"all_models_cooling: {pool_name}; skipped_cooldown_models={skipped_cooldown_models}"
+                        if skipped_cooldown_models
+                        else f"未配置可用模型池: {pool_name}"
+                    ),
                     last_failure_kind=FailureKind.UNKNOWN.value,
                     attempted_models=[],
-                    failure_reason="empty_model_pool",
+                    failure_reason=failure_reason,
                 )
 
             timeout_limit = (
@@ -256,6 +280,13 @@ class GatewayCallMixin:
                     attempt_started = time.perf_counter()
                     raw_completion_text = ""
                     try:
+                        effective_timeout = clamp_timeout_to_turn_budget(
+                            None,
+                            timeout_limit,
+                            reserve_for_reply=reserve_for_reply,
+                        )
+                        if effective_timeout <= 0.0:
+                            raise asyncio.TimeoutError("turn_deadline_exhausted")
                         llm_kwargs = self._build_request_kwargs(
                             model_id=model_id,
                             system_prompt=system_prompt,
@@ -271,7 +302,7 @@ class GatewayCallMixin:
                                 contexts=list(contexts or []),
                                 **llm_kwargs,
                             ),
-                            timeout=timeout_limit,
+                            timeout=effective_timeout,
                         )
                     except asyncio.TimeoutError as exc:
                         # ponytail: timeout is not fatal — should retry, not raise into outer except (R8)
@@ -296,7 +327,15 @@ class GatewayCallMixin:
                         self.router.report_failure(report_pool, model_id, is_fatal=False)
                         logger.warning(f"[Gateway] model {model_id} timeout ({attempt+1}/{max_retries+1}): {last_error}")
                         if attempt < max_retries:
-                            await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
+                            backoff = (backoff_factor + retry_penalty) ** attempt
+                            remaining = clamp_timeout_to_turn_budget(
+                                None,
+                                backoff,
+                                reserve_for_reply=reserve_for_reply,
+                            )
+                            if remaining <= 0.0:
+                                break
+                            await asyncio.sleep(remaining)
                         continue
                     except Exception as exc:
                         last_error = str(exc)
@@ -326,7 +365,15 @@ class GatewayCallMixin:
                             f"[Gateway] model {model_id} failed ({attempt + 1}/{max_retries + 1}): {last_error}"
                         )
                         if attempt < max_retries:
-                            await asyncio.sleep((backoff_factor + retry_penalty) ** attempt)
+                            backoff = (backoff_factor + retry_penalty) ** attempt
+                            remaining = clamp_timeout_to_turn_budget(
+                                None,
+                                backoff,
+                                reserve_for_reply=reserve_for_reply,
+                            )
+                            if remaining <= 0.0:
+                                break
+                            await asyncio.sleep(remaining)
                         continue
 
                     raw_completion_text = ""  # ponytail: init before try to avoid NameError in nested except

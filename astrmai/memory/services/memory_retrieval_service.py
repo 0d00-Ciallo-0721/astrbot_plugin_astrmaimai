@@ -16,6 +16,7 @@ from .expression_pattern_retrieval_policy import ExpressionPatternRetrievalPolic
 from .jargon_retrieval_policy import JargonRetrievalPolicy
 from .v2_store import MemoryV2Store
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 
 
 class MemoryRetrievalService:
@@ -795,7 +796,22 @@ class MemoryRetrievalService:
             self._record_query_rewrite_trace(query, status="gateway_unavailable", elapsed_ms=0.0, rewrite_count=0)
             return [base_query]
         timing = getattr(getattr(self.engine, "config", None), "timing", None)
-        timeout_sec = max(0.5, float(getattr(timing, "query_rewrite_timeout_sec", 8.0) or 8.0))
+        configured_timeout_sec = max(0.01, float(getattr(timing, "query_rewrite_timeout_sec", 8.0) or 8.0))
+        timeout_sec = clamp_timeout_to_turn_budget(
+            None,
+            configured_timeout_sec,
+            reserve_for_reply=True,
+        )
+        if timeout_sec <= 0.0:
+            self._record_query_rewrite_trace(
+                query,
+                status="budget_exhausted",
+                elapsed_ms=0.0,
+                rewrite_count=0,
+                configured_timeout_sec=configured_timeout_sec,
+                effective_timeout_sec=0.0,
+            )
+            return [base_query]
         prompt = (
             "Rewrite the user memory search request into at most 3 short search queries. "
             "Return JSON only: {\"queries\": [\"...\"]}.\n"
@@ -803,16 +819,33 @@ class MemoryRetrievalService:
         )
         started = time.perf_counter()
         status = "success"
+        cancellation_requested = False
         try:
-            response = await gateway.call_data_process_task(
-                prompt=prompt,
-                is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="query_rewrite", scope_id="global", scope_kind="global"),
-                timeout_override=timeout_sec,
-                max_retries_override=0,
-                max_models_override=1,
-                use_fallback=False,
+            task = asyncio.create_task(
+                gateway.call_data_process_task(
+                    prompt=prompt,
+                    is_json=True,
+                    lane_key=LaneKey(
+                        subsystem="bg",
+                        task_family="query_rewrite",
+                        scope_id="global",
+                        scope_kind="global",
+                    ),
+                    timeout_override=timeout_sec,
+                    max_retries_override=0,
+                    max_models_override=1,
+                    use_fallback=False,
+                    allow_cooldown_override=False,
+                    reserve_for_reply=True,
+                )
             )
+            done, _ = await asyncio.wait({task}, timeout=timeout_sec)
+            if task not in done:
+                cancellation_requested = True
+                task.cancel()
+                task.add_done_callback(self._consume_background_task)
+                raise asyncio.TimeoutError("query rewrite hard deadline exceeded")
+            response = task.result()
             if isinstance(response, str):
                 response = json.loads(response)
             queries = response.get("queries", []) if isinstance(response, dict) else []
@@ -834,8 +867,18 @@ class MemoryRetrievalService:
             status=status,
             elapsed_ms=(time.perf_counter() - started) * 1000,
             rewrite_count=max(0, len(result) - 1),
+            configured_timeout_sec=configured_timeout_sec,
+            effective_timeout_sec=timeout_sec,
+            cancellation_requested=cancellation_requested,
         )
         return result
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
 
     @staticmethod
     def _record_query_rewrite_trace(
@@ -844,6 +887,9 @@ class MemoryRetrievalService:
         status: str,
         elapsed_ms: float,
         rewrite_count: int,
+        configured_timeout_sec: float = 0.0,
+        effective_timeout_sec: float = 0.0,
+        cancellation_requested: bool = False,
     ) -> None:
         metadata = dict(query.metadata or {})
         metadata["query_rewrite_trace"] = {
@@ -851,6 +897,9 @@ class MemoryRetrievalService:
             "elapsed_ms": round(max(0.0, float(elapsed_ms or 0.0)), 2),
             "rewrite_count": max(0, int(rewrite_count or 0)),
             "original_query_fallback": str(status or "") != "success",
+            "configured_timeout_sec": round(max(0.0, float(configured_timeout_sec or 0.0)), 3),
+            "effective_timeout_sec": round(max(0.0, float(effective_timeout_sec or 0.0)), 3),
+            "cancellation_requested": bool(cancellation_requested),
         }
         query.metadata = metadata
 

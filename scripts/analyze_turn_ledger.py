@@ -88,9 +88,14 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     chat_counts: Counter[str] = Counter()
     instrumentation_counts: Counter[str] = Counter()
     skip_reason_counts: Counter[str] = Counter()
+    wait_reason_counts: Counter[str] = Counter()
+    stale_category_counts: Counter[str] = Counter()
+    judge_outcome_counts: Counter[str] = Counter()
     llm_stage_counts: Counter[str] = Counter()
     llm_status_counts: Counter[str] = Counter()
     llm_path_counts: Counter[str] = Counter()
+    model_attempt_status_counts: Counter[str] = Counter()
+    model_attempt_error_counts: Counter[str] = Counter()
     llm_stage_latencies: defaultdict[str, list[float]] = defaultdict(list)
     stage_status_counts: Counter[str] = Counter()
     stage_latencies: defaultdict[str, list[float]] = defaultdict(list)
@@ -100,7 +105,11 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     llm_calls_per_turn: list[float] = []
     attempt_counts: list[float] = []
     context_totals: list[float] = []
-    duplicate_blocks = 0
+    context_scope_totals: defaultdict[str, list[float]] = defaultdict(list)
+    context_scope_duplicates: Counter[str] = Counter()
+    budget_exhausted_count = 0
+    budget_remaining_ms: list[float] = []
+    query_rewrite_status_counts: Counter[str] = Counter()
     memory_candidates = 0
     memory_selected = 0
     memory_rendered_chars = 0
@@ -118,6 +127,17 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             skip_reason = status
         if skip_reason:
             skip_reason_counts[skip_reason] += 1
+        wait_reason = str(decision.get("wait_reason", "") or "")
+        if wait_reason:
+            wait_reason_counts[wait_reason] += 1
+        stale_category = str(decision.get("stale_category", "") or "")
+        if stale_category:
+            stale_category_counts[stale_category] += 1
+        judge_outcome = str(decision.get("judge_outcome", "") or "")
+        if judge_outcome:
+            judge_outcome_counts[judge_outcome] += 1
+        if decision.get("judge_timeout") and judge_outcome != "timeout":
+            judge_outcome_counts["timeout"] += 1
 
         calls = _safe_list(trace.get("llm_call_ledger"))
         llm_calls_per_turn.append(float(len(calls)))
@@ -131,6 +151,12 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             llm_stage_latencies[stage].append(_number(call.get("elapsed_ms")))
             attempts = _safe_list(call.get("model_attempts"))
             attempt_counts.append(float(len(attempts) or int(_number(call.get("attempts")))))
+            for attempt in attempts:
+                attempt_status = str(attempt.get("status", "") or "unknown")
+                model_attempt_status_counts[attempt_status] += 1
+                error_kind = str(attempt.get("error_kind", "") or "")
+                if error_kind:
+                    model_attempt_error_counts[error_kind] += 1
             if stage == "attention.judge" or "judge" in stage:
                 judge_count += 1
         judge_calls_per_turn.append(float(judge_count))
@@ -147,10 +173,39 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
         contexts = _safe_list(trace.get("context_block_stats"))
         for context in contexts:
-            context_totals.append(_number(context.get("total_chars")))
-            duplicate_blocks += int(_number(context.get("duplicate_block_count")))
+            total_chars = _number(context.get("total_chars"))
+            context_totals.append(total_chars)
+            metadata = _safe_dict(context.get("metadata"))
+            scope = str(metadata.get("scope", "") or "")
+            if not scope:
+                stage_name = str(context.get("stage", "") or "")
+                scope = "transmitted" if stage_name.endswith("_transmitted") else "source"
+            context_scope_totals[scope].append(total_chars)
+            context_scope_duplicates[scope] += int(_number(context.get("duplicate_block_count")))
         if not contexts:
             missing["context_block_stats"] += 1
+
+        budget = _safe_dict(trace.get("budget"))
+        if budget:
+            budget_remaining_ms.append(_number(budget.get("remaining_ms")))
+            if bool(budget.get("exhausted")):
+                budget_exhausted_count += 1
+        else:
+            missing["budget"] += 1
+
+        memory = _safe_dict(trace.get("memory_funnel"))
+        rewrite_trace = _safe_dict(
+            memory.get("query_rewrite_trace")
+            or memory.get("rewrite_trace")
+            or trace.get("query_rewrite_trace")
+        )
+        if rewrite_trace:
+            rewrite_status = str(
+                rewrite_trace.get("status")
+                or rewrite_trace.get("fallback_reason")
+                or "observed"
+            )
+            query_rewrite_status_counts[rewrite_status] += 1
 
         reply = _safe_dict(trace.get("reply_stats"))
         actual_reply_chars = reply.get("actual_reply_chars", reply.get("total_chars"))
@@ -159,7 +214,6 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
         elif trace.get("reply_sent"):
             missing["reply_stats"] += 1
 
-        memory = _safe_dict(trace.get("memory_funnel"))
         if memory:
             memory_status_counts[str(memory.get("status", "") or "unknown")] += 1
             memory_candidates += int(_number(memory.get("candidate_count")))
@@ -185,6 +239,8 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "stage_counts": dict(llm_stage_counts.most_common()),
             "status_counts": dict(llm_status_counts.most_common()),
             "path_counts": dict(llm_path_counts.most_common()),
+            "model_attempt_status_counts": dict(model_attempt_status_counts.most_common()),
+            "model_attempt_error_counts": dict(model_attempt_error_counts.most_common()),
             "calls_per_turn_p50": _percentile(llm_calls_per_turn, 0.50),
             "calls_per_turn_p95": _percentile(llm_calls_per_turn, 0.95),
             "judge_calls_per_turn_p50": _percentile(judge_calls_per_turn, 0.50),
@@ -222,7 +278,30 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "samples": len(context_totals),
             "chars_p50": _percentile(context_totals, 0.50),
             "chars_p95": _percentile(context_totals, 0.95),
-            "duplicate_block_count": duplicate_blocks,
+            "by_scope": {
+                scope: {
+                    "samples": len(values),
+                    "chars_p50": _percentile(values, 0.50),
+                    "chars_p95": _percentile(values, 0.95),
+                    "duplicate_block_count": int(context_scope_duplicates[scope]),
+                }
+                for scope, values in sorted(context_scope_totals.items())
+            },
+            "duplicate_block_count": sum(context_scope_duplicates.values()),
+        },
+        "decision": {
+            "wait_reasons": dict(wait_reason_counts.most_common(20)),
+            "stale_categories": dict(stale_category_counts.most_common(20)),
+            "judge_outcomes": dict(judge_outcome_counts.most_common(20)),
+        },
+        "budget": {
+            "samples": len(budget_remaining_ms),
+            "exhausted_count": budget_exhausted_count,
+            "remaining_ms_p50": _percentile(budget_remaining_ms, 0.50),
+            "remaining_ms_p05": _percentile(budget_remaining_ms, 0.05),
+        },
+        "query_rewrite": {
+            "status_counts": dict(query_rewrite_status_counts.most_common()),
         },
         "memory": {
             "status_counts": dict(memory_status_counts.most_common()),
@@ -240,6 +319,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     reply = _safe_dict(report.get("reply"))
     context = _safe_dict(report.get("context"))
     memory = _safe_dict(report.get("memory"))
+    decision = _safe_dict(report.get("decision"))
+    budget = _safe_dict(report.get("budget"))
+    rewrite = _safe_dict(report.get("query_rewrite"))
     lines = [
         "# AstrMai Turn Ledger Analysis",
         "",
@@ -249,6 +331,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Reply chars P50/P95/max: {reply.get('chars_p50', 0)} / {reply.get('chars_p95', 0)} / {reply.get('chars_max', 0)}",
         f"- Context chars P50/P95: {context.get('chars_p50', 0)} / {context.get('chars_p95', 0)}",
         f"- Duplicate context blocks: {int(context.get('duplicate_block_count', 0) or 0)}",
+        f"- Turn budget exhausted: {int(budget.get('exhausted_count', 0) or 0)}",
         f"- Memory candidates/selected: {int(memory.get('candidate_count', 0) or 0)} / {int(memory.get('selected_count', 0) or 0)}",
         "",
         "## Status",
@@ -261,6 +344,21 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## Skip Reasons"])
     for key, value in _safe_dict(report.get("skip_reasons")).items():
         lines.append(f"- `{key}`: {value}")
+    lines.extend(["", "## Decision Diagnostics"])
+    for label, values in (
+        ("wait", _safe_dict(decision.get("wait_reasons"))),
+        ("stale", _safe_dict(decision.get("stale_categories"))),
+        ("judge", _safe_dict(decision.get("judge_outcomes"))),
+    ):
+        for key, value in values.items():
+            lines.append(f"- `{label}:{key}`: {value}")
+    lines.extend(["", "## Query Rewrite"])
+    rewrite_counts = _safe_dict(rewrite.get("status_counts"))
+    if rewrite_counts:
+        for key, value in rewrite_counts.items():
+            lines.append(f"- `{key}`: {value}")
+    else:
+        lines.append("- No observed rewrite traces")
     lines.extend(["", "## Coverage Gaps"])
     missing = _safe_dict(report.get("missing_fields"))
     if missing:

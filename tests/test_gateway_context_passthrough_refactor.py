@@ -674,6 +674,59 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
             ["model-a", "model-b"],
         )
 
+    def test_noncritical_call_does_not_override_when_all_models_are_cooled(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                rate_limit_model_cooldown_sec=120,
+                quota_model_cooldown_sec=1800,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        gateway._open_model_cooldown("task", "code2/model-a", "Error code: 429 rate limit")
+        gateway._open_model_cooldown("task", "code3/model-b", "Error code: 429 rate limit")
+
+        async def _run():
+            return await gateway._elastic_call_result(
+                pool_name="task",
+                prompt="judge",
+                system_prompt="",
+                models=["code2/model-a", "code3/model-b"],
+                use_fallback=False,
+                allow_cooldown_override=False,
+            )
+
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(_run())
+
+        self.assertIn("all_models_cooling", str(caught.exception))
+        self.assertEqual(fake_context.calls, [])
+
+    def test_provider_cooldown_applies_across_model_ids_from_same_provider(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(
+                max_concurrent_llm_calls=2,
+                llm_retries=0,
+                backoff_factor=1.5,
+                api_timeout=10,
+                rate_limit_model_cooldown_sec=120,
+                quota_model_cooldown_sec=1800,
+            ),
+            provider=SimpleNamespace(fallback_models=[]),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+
+        gateway._open_model_cooldown("task", "code2/model-a", "Error code: 429 rate limit")
+
+        self.assertTrue(gateway._is_model_cooldown("dialog", "code2/model-b"))
+        self.assertFalse(gateway._is_model_cooldown("dialog", "code3/model-b"))
+
     def test_get_agent_models_filters_runtime_cooldown_for_executor_entrypoint(self):
         fake_context = _FakeContext()
         config = SimpleNamespace(

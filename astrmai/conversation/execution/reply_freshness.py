@@ -60,6 +60,23 @@ def is_stale_reply_reason(reason: str) -> bool:
 
 class ReplyFreshnessMixin:
     @staticmethod
+    def _freshness_category(state: FreshnessState, reason: str) -> str:
+        normalized = str(reason or "")
+        if normalized == "stale_generation":
+            return "generation_superseded"
+        if normalized.startswith("reply_age_exceeded"):
+            return "age_expired"
+        if normalized.startswith("superseded_by_newer_activity_same_thread"):
+            return "newer_activity_same_thread"
+        if normalized.startswith("superseded_by_newer_activity_unknown_thread"):
+            return "newer_activity_unknown_thread"
+        if normalized == "newer_activity_other_thread_ignored":
+            return "newer_activity_other_thread_ignored"
+        if state == FreshnessState.FRESH:
+            return "fresh"
+        return "other"
+
+    @staticmethod
     def _record_freshness_observation(
         event: AstrMessageEvent,
         state: FreshnessState,
@@ -71,6 +88,10 @@ class ReplyFreshnessMixin:
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_reply_freshness_state", state.value)
             event.set_extra("astrmai_reply_stale_reason", str(reason or "").split(":", 1)[0])
+            event.set_extra(
+                "astrmai_reply_stale_category",
+                ReplyFreshnessMixin._freshness_category(state, reason),
+            )
             event.set_extra("astrmai_reply_age_sec", round(max(0.0, float(reply_age or 0.0)), 1))
             event.set_extra("astrmai_reply_max_age_sec", round(max(0.0, float(max_age or 0.0)), 1))
         return state, reason
@@ -203,11 +224,13 @@ class ReplyFreshnessMixin:
             event_ts,
             max_age_seconds=max_age,
             thread_signature=thread_signature,
+            allow_parallel_threads=not bool(event.get_extra("is_private_chat", False)),
         )
         if freshness_state != FreshnessState.FRESH and stale_reason.startswith("superseded_by_newer_activity"):
             latest_ts, latest_sender_id, latest_sender_name, latest_preview = await self.runtime_coordinator.get_latest_activity(chat_id)
             actor = latest_sender_name or latest_sender_id or "unknown"
-            stale_reason = f"superseded_by_newer_activity:{actor}:{preview_text(latest_preview, 60)}"
+            reason_kind = stale_reason.split(":", 1)[0]
+            stale_reason = f"{reason_kind}:{actor}:{preview_text(latest_preview, 60)}"
         return self._record_freshness_observation(
             event,
             freshness_state,

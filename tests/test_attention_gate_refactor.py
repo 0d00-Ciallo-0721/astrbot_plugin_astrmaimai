@@ -470,6 +470,39 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertAlmostEqual(focus.get_extra("astrmai_primary_mood_value"), 0.45)
         self.assertEqual(focus.get_extra("astrmai_primary_mood_source"), "attention_pre_judge")
 
+    def test_router_skips_separate_mood_call_for_micro_utterance(self):
+        mood_calls = []
+
+        async def _update_mood(chat_id, text):
+            mood_calls.append((chat_id, text))
+            return "neutral", 0.0
+
+        self.gate.state_engine.update_mood = _update_mood
+        judge = _SequenceJudge(["PASS"])
+        self.gate.judge = judge
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent("user-1", "Alice", "行")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "PASS")
+        self.assertEqual(mood_calls, [])
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(
+            focus.get_extra("astrmai_primary_mood_skipped_reason"),
+            "micro_utterance",
+        )
+
     def test_router_ignores_peer_poke_when_judge_times_out(self):
         async def _slow_evaluate(*args, **kwargs):
             await asyncio.sleep(0.05)
@@ -499,6 +532,8 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(decision.action, "IGNORE")
         self.assertEqual(decision.reason, "peer_poke_judge_timeout")
+        self.assertEqual(focus.get_extra("astrmai_judge_outcome"), "timeout")
+        self.assertTrue(focus.get_extra("astrmai_judge_timeout"))
 
     def test_process_event_resumes_private_wait_without_consuming_message(self):
         calls = []

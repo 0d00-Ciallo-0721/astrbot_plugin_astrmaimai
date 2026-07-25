@@ -11,6 +11,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
 from ...infrastructure.runtime.turn_call_ledger import (
+    finalize_turn_telemetry,
     observe_stage,
     record_context_block_stats,
     turn_telemetry_snapshot,
@@ -748,6 +749,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_sent=(bool(event.get_extra("astrmai_reply_sent", False)) if hasattr(event, "get_extra") else False) or bool(reply_text),
             reply_preview=str(reply_text or ""),
         )
+        finalize_turn_telemetry(event, outcome=status)
         telemetry = turn_telemetry_snapshot(event)
         if telemetry:
             item.update(
@@ -764,6 +766,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "context_block_stats": telemetry["context_block_stats"],
                     "stage_ledger": telemetry["stage_ledger"],
                     "reply_stats": telemetry["reply_stats"],
+                    "budget": telemetry["budget"],
                 }
             )
             item["actual_reply_chars"] = int(
@@ -798,7 +801,40 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 item["memory_funnel"] = dict(memory_funnel)
         item["decision_observation"] = {
             "status": str(status or ""),
-            "skip_reason": str(status or "").removeprefix("skipped_") if str(status or "").startswith("skipped_") else "",
+            "skip_reason": (
+                str(event.get_extra("astrmai_wait_reason", "") or "")
+                if hasattr(event, "get_extra") and str(status or "").startswith("skipped_wait")
+                else (
+                    str(status or "").removeprefix("skipped_")
+                    if str(status or "").startswith("skipped_")
+                    else ""
+                )
+            ),
+            "wait_reason": (
+                str(event.get_extra("astrmai_wait_reason", "") or "")
+                if hasattr(event, "get_extra")
+                else ""
+            ),
+            "stale_category": (
+                str(event.get_extra("astrmai_reply_stale_category", "") or "")
+                if hasattr(event, "get_extra")
+                else ""
+            ),
+            "judge_outcome": (
+                str(event.get_extra("astrmai_judge_outcome", "") or "")
+                if hasattr(event, "get_extra")
+                else ""
+            ),
+            "judge_timeout": (
+                bool(event.get_extra("astrmai_judge_timeout", False))
+                if hasattr(event, "get_extra")
+                else False
+            ),
+            "primary_mood_skipped_reason": (
+                str(event.get_extra("astrmai_primary_mood_skipped_reason", "") or "")
+                if hasattr(event, "get_extra")
+                else ""
+            ),
             "judge_action": str(turn_context.attention.judge_action or ""),
             "cognitive_action": str(turn_context.cognitive.action or ""),
             "focus_reason": str(turn_context.attention.focus_reason or ""),
@@ -1360,10 +1396,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if prompt_envelope is not None:
             record_context_block_stats(
                 event,
-                stage="planner.final_prompt",
+                stage="planner.final_prompt_sources",
                 blocks={
-                    "system_prompt": final_system_prompt,
-                    "final_prompt": final_prompt,
                     "raw_user_text": getattr(prompt_envelope, "raw_user_text", ""),
                     "focus_message": getattr(prompt_envelope, "focus_message_text", ""),
                     "direct_context": getattr(prompt_envelope, "direct_context_text", ""),
@@ -1380,8 +1414,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "planner_runtime_instruction": getattr(prompt_envelope, "planner_runtime_instruction_block", ""),
                     "guidance": "\n".join(getattr(prompt_envelope, "guidance_lines", []) or []),
                 },
-                total_chars=len(final_system_prompt or "") + len(final_prompt or ""),
                 metadata={
+                    "scope": "source",
                     "think_level": int(think_level or 0),
                     "is_tool_call_mode": bool(is_tool_call_mode),
                     "is_fast_mode": bool(is_fast_mode),
@@ -1425,6 +1459,24 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if direct_vision_urls:
             final_prompt += "\n(Director note: the user shared photos with you; please respond with the image content in mind.)"
             logger.info(f"[{chat_id}] Scheduled direct-vision payload with {len(direct_vision_urls)} image(s) into executor.")
+
+        focus_text = str(getattr(prompt_envelope, "focus_message_text", "") or "")
+        raw_user_text = str(getattr(prompt_envelope, "raw_user_text", "") or "")
+        record_context_block_stats(
+            event,
+            stage="planner.final_prompt_transmitted",
+            blocks={
+                "system_prompt": final_system_prompt,
+                "user_prompt": final_prompt,
+            },
+            total_chars=len(final_system_prompt or "") + len(final_prompt or ""),
+            metadata={
+                "scope": "transmitted",
+                "focus_occurrences": final_prompt.count(focus_text) if focus_text else 0,
+                "raw_user_occurrences": final_prompt.count(raw_user_text) if raw_user_text else 0,
+                "lane_history_included_separately": True,
+            },
+        )
 
         reply_text = await self.executor.execute(
             event=event,
@@ -1498,6 +1550,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         memory_feedback_summary = prepared["memory_feedback_summary"]
         cognitive_gate = prepared["cognitive_gate"]
         if think_decision.level <= 0 and "group_non_direct" in think_decision.signals:
+            event.set_extra("astrmai_wait_reason", "group_ambient_short_wait")
             event.set_extra("astrmai_cognitive_action", "wait")
             event.set_extra("astrmai_reply_need", "wait")
             event.set_extra("astrmai_social_intent", "observe")
@@ -1590,6 +1643,10 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                         if cognitive_decision.reply_need in {"wait", "ignore"}
                         else cognitive_decision.action
                     )
+                    event.set_extra(
+                        "astrmai_wait_reason",
+                        "cognitive_wait" if skip_reason == "wait" else "cognitive_ignore",
+                    )
                     settle_exc = None
                     try:
                         await self._settle_no_send_relationship_event(
@@ -1679,6 +1736,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             if execution_signal == "wait" or execution_status == "skipped_wait":
                 trace_status = "skipped_wait"
                 skipped_reason = "wait"
+                event.set_extra("astrmai_wait_reason", "execution_wait")
             elif execution_status == "stale_drop":
                 trace_status = "stale_drop"
                 skipped_reason = "stale"

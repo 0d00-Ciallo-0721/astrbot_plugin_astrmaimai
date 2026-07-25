@@ -53,12 +53,22 @@ class ReplyFreshnessBudgetTests(unittest.TestCase):
                 thread_signature="sig-old",
                 salvage_window_seconds=6.0,
             )
-            return stale_state, fresh_same_thread, expired_state
+            parallel_thread_state = await coordinator.evaluate_reply_freshness(
+                "chat-2",
+                10.0,
+                max_age_seconds=30.0,
+                thread_signature="sig-old",
+                salvage_window_seconds=6.0,
+                allow_parallel_threads=True,
+            )
+            return stale_state, fresh_same_thread, expired_state, parallel_thread_state
 
-        stale_state, fresh_same_thread, expired_state = asyncio.run(_run())
+        stale_state, fresh_same_thread, expired_state, parallel_thread_state = asyncio.run(_run())
         self.assertEqual(stale_state[0], FreshnessState.STALE_BUT_SALVAGEABLE)
         self.assertEqual(fresh_same_thread[0], FreshnessState.FRESH)
         self.assertEqual(expired_state[0], FreshnessState.EXPIRED)
+        self.assertEqual(parallel_thread_state[0], FreshnessState.FRESH)
+        self.assertEqual(parallel_thread_state[1], "newer_activity_other_thread_ignored")
 
 
 if __name__ == "__main__":

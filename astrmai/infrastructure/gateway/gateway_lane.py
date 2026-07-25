@@ -289,6 +289,8 @@ class GatewayLaneMixin:
         timeout_override: Optional[float] = None,
         max_retries_override: Optional[int] = None,
         max_models_override: Optional[int] = None,
+        allow_cooldown_override: bool = True,
+        reserve_for_reply: bool = False,
     ) -> LLMCallResult:
         workload_request = self.context_economy.build_request(
             family=self._lane_workload_family(lane_key, tool_mode=False),
@@ -339,7 +341,18 @@ class GatewayLaneMixin:
                     timeout_override=timeout_override,
                     max_retries_override=max_retries_override,
                     max_models_override=max_models_override,
+                    allow_cooldown_override=allow_cooldown_override,
+                    reserve_for_reply=reserve_for_reply,
                 )
+            except asyncio.CancelledError:
+                finish_llm_call(
+                    event,
+                    call_id,
+                    status="cancelled",
+                    error="cancelled",
+                    error_kind="cancelled",
+                )
+                raise
             except Exception as exc:
                 finish_llm_call(
                     event,
@@ -422,7 +435,19 @@ class GatewayLaneMixin:
                 timeout_override=timeout_override,
                 max_retries_override=max_retries_override,
                 max_models_override=max_models_override,
+                allow_cooldown_override=allow_cooldown_override,
+                reserve_for_reply=reserve_for_reply,
             )
+        except asyncio.CancelledError:
+            finish_llm_call(
+                event,
+                call_id,
+                status="cancelled",
+                error="cancelled",
+                error_kind="cancelled",
+                metadata={"history_count": len(history or [])},
+            )
+            raise
         except Exception as exc:
             finish_llm_call(
                 event,

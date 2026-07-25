@@ -466,6 +466,8 @@ class Judge:
             try:
                 lane_key = LaneKey(subsystem="sys1", task_family="judge", scope_id=chat_id)
                 task_models = getattr(self.config.provider, 'task_models', [])
+                timing = getattr(self.config, "timing", None)
+                judge_timeout = float(getattr(timing, "attention_judge_timeout_sec", 3.0) or 3.0)
                 llm_result = await self.gateway.chat_in_lane_result(
                     lane_key=lane_key,
                     base_origin=chat_id,
@@ -474,6 +476,12 @@ class Judge:
                     models=task_models,
                     is_json=True,
                     use_fallback=False,
+                    event=focus_event,
+                    timeout_override=judge_timeout,
+                    max_retries_override=0,
+                    max_models_override=1,
+                    allow_cooldown_override=False,
+                    reserve_for_reply=True,
                 )
                 result = llm_result.parsed_json or {}
                 

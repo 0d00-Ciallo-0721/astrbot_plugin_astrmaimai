@@ -501,7 +501,21 @@ class MemoryV2ServiceTests(unittest.TestCase):
             )
             event = _FakeEvent("remember Alice")
             event.set_extra("astrmai_think_level", 2)
-            bundle = await injection.build_bundle(event=event, prompt="Alice")
+            original_retrieve = injection.retrieval_service.retrieve
+
+            async def retrieve_with_rewrite_trace(query):
+                query.metadata["query_rewrite_trace"] = {
+                    "status": "timeout",
+                    "original_query_fallback": True,
+                }
+                return await original_retrieve(query)
+
+            with patch.object(
+                injection.retrieval_service,
+                "retrieve",
+                side_effect=retrieve_with_rewrite_trace,
+            ):
+                bundle = await injection.build_bundle(event=event, prompt="Alice")
             self.assertTrue(bundle.rendered_prompt_block)
             injected_ids = event.get_extra("astrmai_memory_injection_trace").selected_ids
             self.assertTrue(injected_ids)
@@ -510,6 +524,8 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertGreaterEqual(funnel["candidate_count"], len(injected_ids))
             self.assertEqual(funnel["selected_count"], len(injected_ids))
             self.assertGreater(funnel["rendered_chars"], 0)
+            self.assertEqual(funnel["query_rewrite_trace"]["status"], "timeout")
+            self.assertTrue(funnel["query_rewrite_trace"]["original_query_fallback"])
 
             result = await tools.search_memory(query="Alice", session_id="chat-1", event=event)
             self.assertEqual(result.already_injected_ids, injected_ids)

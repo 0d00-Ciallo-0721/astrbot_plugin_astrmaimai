@@ -436,12 +436,21 @@ class ChatRuntimeCoordinator:
         max_age_seconds: float,
         thread_signature: str = "",
         salvage_window_seconds: float = 6.0,
+        allow_parallel_threads: bool = False,
     ) -> tuple[FreshnessState, str]:
         state = await self._get_state(chat_id)
         if focus_timestamp <= 0:
             return FreshnessState.FRESH, ""
 
         latest_ts = float(state.latest_activity_ts or 0.0)
+        latest_signature = str(state.latest_activity_thread_signature or "")
+        different_known_thread = bool(
+            thread_signature
+            and latest_signature
+            and thread_signature != latest_signature
+        )
+        if allow_parallel_threads and different_known_thread:
+            return FreshnessState.FRESH, "newer_activity_other_thread_ignored"
         if max_age_seconds > 0 and latest_ts and (latest_ts - focus_timestamp) > max(max_age_seconds, 0.0):
             actor = state.latest_activity_sender_name or state.latest_activity_sender_id or "unknown"
             return FreshnessState.EXPIRED, f"reply_age_exceeded:{actor}:{latest_ts - focus_timestamp:.1f}s"
@@ -453,12 +462,16 @@ class ChatRuntimeCoordinator:
         if newer_delta <= 4.0:
             return FreshnessState.FRESH, ""
 
-        latest_signature = str(state.latest_activity_thread_signature or "")
         same_thread = bool(thread_signature and latest_signature and thread_signature == latest_signature)
         if same_thread and newer_delta <= max(6.0, salvage_window_seconds):
             return FreshnessState.FRESH, ""
 
         actor = state.latest_activity_sender_name or state.latest_activity_sender_id or "unknown"
+        reason_kind = (
+            "superseded_by_newer_activity_same_thread"
+            if same_thread
+            else "superseded_by_newer_activity_unknown_thread"
+        )
         if newer_delta <= max(6.0, salvage_window_seconds):
-            return FreshnessState.STALE_BUT_SALVAGEABLE, f"superseded_by_newer_activity:{actor}:{newer_delta:.1f}s"
-        return FreshnessState.EXPIRED, f"superseded_by_newer_activity:{actor}:{newer_delta:.1f}s"
+            return FreshnessState.STALE_BUT_SALVAGEABLE, f"{reason_kind}:{actor}:{newer_delta:.1f}s"
+        return FreshnessState.EXPIRED, f"{reason_kind}:{actor}:{newer_delta:.1f}s"

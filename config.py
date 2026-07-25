@@ -300,6 +300,8 @@ class PrivateChatConfig(BaseModel):
 
 class TimingConfig(BaseModel):
     model_request_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
+    turn_total_budget_sec: float = Field(default=360.0, ge=30.0, le=7200.0)
+    main_reply_reserve_sec: float = Field(default=90.0, ge=0.0, le=1800.0)
     reply_max_age_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
     agent_execution_timeout_sec: int = Field(default=60, ge=1, le=7200)
     fast_mode_execution_timeout_sec: int = Field(default=15, ge=1, le=7200)

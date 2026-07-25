@@ -378,6 +378,18 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertGreaterEqual(turn_trace["continuity"]["system_prompt_length"], 0)
         self.assertGreaterEqual(turn_trace["continuity"]["prompt_length"], 0)
         self.assertGreaterEqual(turn_trace["continuity"]["frozen_prefix_length"], 0)
+        context_stats = turn_trace["context_block_stats"]
+        self.assertEqual(
+            [entry["stage"] for entry in context_stats[-2:]],
+            ["planner.final_prompt_sources", "planner.final_prompt_transmitted"],
+        )
+        self.assertEqual(context_stats[-2]["metadata"]["scope"], "source")
+        self.assertEqual(context_stats[-1]["metadata"]["scope"], "transmitted")
+        self.assertEqual(
+            context_stats[-1]["total_chars"],
+            len(planner.executor.calls[0]["system_prompt"]) + len(planner.executor.calls[0]["prompt"]),
+        )
+        self.assertIn("budget", turn_trace)
         rendered_trace = str(turn_trace)
         self.assertNotIn("focus on this sentence first", rendered_trace)
         self.assertNotIn("final prompt", rendered_trace)
@@ -501,8 +513,13 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertEqual(planner.executor.calls, [])
         self.assertEqual(event.get_extra("astrmai_reply_need"), "wait")
         self.assertEqual(event.get_extra("astrmai_social_intent"), "observe")
+        self.assertEqual(event.get_extra("astrmai_wait_reason"), "group_ambient_short_wait")
         self.assertIn("group_ambient_short_wait", event.get_extra("astrmai_risk_flags"))
         self.assertEqual(planner.turn_trace_history[-1]["status"], "skipped_wait")
+        self.assertEqual(
+            planner.turn_trace_history[-1]["decision_observation"]["wait_reason"],
+            "group_ambient_short_wait",
+        )
 
     def test_planner_downgrades_pushback_during_sharp_reply_cooldown(self):
         decision = self.planner_mod.CognitiveDecision(

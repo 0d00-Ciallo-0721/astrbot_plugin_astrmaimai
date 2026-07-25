@@ -5,6 +5,10 @@ from astrmai.infrastructure.runtime.turn_call_ledger import (
     CONTEXT_BLOCK_STATS_KEY,
     REPLY_STATS_KEY,
     STAGE_LEDGER_KEY,
+    begin_stage,
+    clamp_timeout_to_turn_budget,
+    configure_turn_budget,
+    finalize_turn_telemetry,
     begin_llm_call,
     finish_llm_call,
     observe_stage,
@@ -205,9 +209,39 @@ def test_snapshot_is_detached_from_later_ledger_mutation():
     assert event.get_extra(CALL_LEDGER_KEY)[0]["model"] == "late-model"
 
 
+def test_turn_budget_clamps_noncritical_timeout_and_keeps_reply_reserve():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        configure_turn_budget(event, total_budget_sec=120, main_reply_reserve_sec=30)
+        timeout = clamp_timeout_to_turn_budget(event, 300, reserve_for_reply=True)
+        snapshot = turn_telemetry_snapshot(event)
+
+    assert 0 < timeout <= 90
+    assert snapshot["budget"]["total_budget_sec"] == 120
+    assert snapshot["budget"]["main_reply_reserve_sec"] == 30
+    assert snapshot["budget"]["remaining_ms"] > 0
+
+
+def test_finalize_turn_telemetry_closes_pending_calls_and_stages():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        begin_llm_call(None, stage="attention.judge")
+        begin_stage(None, "memory.query_rewrite")
+        finalized = finalize_turn_telemetry(event, outcome="skipped_wait")
+        snapshot = turn_telemetry_snapshot(event)
+
+    assert finalized == {"calls": 1, "stages": 1}
+    assert snapshot["llm_call_ledger"][0]["status"] == "abandoned"
+    assert snapshot["llm_call_ledger"][0]["error_kind"] == "turn_finalized"
+    assert snapshot["stage_ledger"][0]["status"] == "abandoned"
+
+
 def test_reply_stats_include_privacy_safe_freshness_metrics():
     event = _Event()
     event.set_extra("astrmai_reply_freshness_state", "expired")
+    event.set_extra("astrmai_reply_stale_category", "age_expired")
     event.set_extra("astrmai_reply_stale_reason", "superseded_by_newer_activity:某用户:消息正文")
     event.set_extra("astrmai_reply_age_sec", 95.4)
     event.set_extra("astrmai_reply_max_age_sec", 90.0)
@@ -221,6 +255,7 @@ def test_reply_stats_include_privacy_safe_freshness_metrics():
 
     payload = event.get_extra(REPLY_STATS_KEY)
     assert payload["freshness_state"] == "expired"
+    assert payload["stale_category"] == "age_expired"
     assert payload["stale_reason"] == "superseded_by_newer_activity"
     assert payload["reply_age_sec"] == 95.4
     assert payload["reply_max_age_sec"] == 90.0

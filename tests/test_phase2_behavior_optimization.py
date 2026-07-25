@@ -65,6 +65,32 @@ class QueryRewriteFastFallbackTests(unittest.TestCase):
         self.assertTrue(query.metadata["query_rewrite_trace"]["original_query_fallback"])
         self.assertEqual(query.metadata["query_rewrite_trace"]["rewrite_count"], 0)
 
+    def test_query_rewrite_hard_timeout_does_not_wait_for_cancel_cleanup(self):
+        from astrmai.memory.contracts.memory_query import MemoryQuery
+
+        class Gateway:
+            async def call_data_process_task(self, **_kwargs):
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.3)
+
+        service = self._service(Gateway())
+        service.engine.config.timing.query_rewrite_timeout_sec = 0.05
+        query = MemoryQuery(query="还记得那个吗")
+
+        async def run():
+            started = asyncio.get_running_loop().time()
+            result = await service._rewrite_queries(query)
+            return result, asyncio.get_running_loop().time() - started
+
+        result, elapsed = asyncio.run(run())
+
+        self.assertEqual(result, ["还记得那个吗"])
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(query.metadata["query_rewrite_trace"]["status"], "timeout")
+        self.assertTrue(query.metadata["query_rewrite_trace"]["cancellation_requested"])
+
 
 class ReplyShapePolicyTests(unittest.TestCase):
     def _config(self, **overrides):

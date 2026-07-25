@@ -12,6 +12,11 @@ class GatewayPolicyMixin:
     def _cooldown_key(self, pool_name: str, model_id: str) -> tuple[str, str]:
         return str(pool_name or ""), str(model_id or "")
 
+    @staticmethod
+    def _provider_id(model_id: str) -> str:
+        normalized = str(model_id or "").strip()
+        return normalized.split("/", 1)[0] if "/" in normalized else normalized
+
     def _cleanup_model_cooldowns(self) -> None:
         now = monotonic()
         cooldowns = getattr(self, "_model_cooldowns", {})
@@ -22,10 +27,12 @@ class GatewayPolicyMixin:
     def _model_cooldown_meta(self, pool_name: str, model_id: str) -> Dict[str, Any]:
         self._cleanup_model_cooldowns()
         cooldowns = getattr(self, "_model_cooldowns", {})
-        meta = cooldowns.get(self._cooldown_key(pool_name, model_id), {})
-        if not meta:
+        exact = cooldowns.get(self._cooldown_key(pool_name, model_id), {})
+        provider = cooldowns.get(self._cooldown_key("__provider__", self._provider_id(model_id)), {})
+        candidates = [item for item in (exact, provider) if item]
+        if not candidates:
             return {}
-        return dict(meta)
+        return dict(max(candidates, key=lambda item: float(item.get("until", 0.0) or 0.0)))
 
     def _classify_cooldown_reason(self, error_message: str) -> str:
         lowered = str(error_message or "").lower()
@@ -51,8 +58,13 @@ class GatewayPolicyMixin:
             "until": monotonic() + duration,
             "reason": reason,
             "duration_sec": duration,
+            "provider_id": self._provider_id(model_id),
         }
-        getattr(self, "_model_cooldowns", {})[self._cooldown_key(pool_name, model_id)] = meta
+        cooldowns = getattr(self, "_model_cooldowns", {})
+        cooldowns[self._cooldown_key(pool_name, model_id)] = meta
+        provider_id = self._provider_id(model_id)
+        if provider_id:
+            cooldowns[self._cooldown_key("__provider__", provider_id)] = dict(meta)
         return dict(meta)
 
     def _is_model_cooldown(self, pool_name: str, model_id: str) -> bool:
@@ -65,6 +77,8 @@ class GatewayPolicyMixin:
         pool_name: str,
         primary_models: List[str],
         attempt_queue: List[str],
+        *,
+        allow_override: bool = True,
     ) -> tuple[List[str], List[Dict[str, Any]], bool]:
         self._cleanup_model_cooldowns()
         available: List[str] = []
@@ -85,6 +99,8 @@ class GatewayPolicyMixin:
                 available.append(model_id)
         if available or not attempt_queue:
             return available, skipped, False
+        if not allow_override:
+            return [], skipped, False
         earliest = min(skipped, key=lambda item: float(item.get("cooldown_until", 0.0) or 0.0))
         return [str(earliest.get("model_id", "") or attempt_queue[0])], skipped, True
 

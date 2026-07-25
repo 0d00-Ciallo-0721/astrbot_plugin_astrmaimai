@@ -1112,6 +1112,22 @@
         "maximum": 3600,
         "hint": "普通模型请求允许等待的最长时间。响应通常超过 90 秒的模型建议设置为 180 至 300。"
       },
+      "turn_total_budget_sec": {
+        "description": "单轮聊天总时间预算（秒）",
+        "type": "float",
+        "default": 360.0,
+        "minimum": 30,
+        "maximum": 7200,
+        "hint": "从收到消息到完成回复的总预算。非关键步骤会主动让出最终回复时间；慢模型建议设置为 300 至 900。"
+      },
+      "main_reply_reserve_sec": {
+        "description": "为最终回复预留时间（秒）",
+        "type": "float",
+        "default": 90.0,
+        "minimum": 0,
+        "maximum": 1800,
+        "hint": "意图判决、查询改写等前置步骤不会占用这部分预算，确保仍有时间生成主回复。"
+      },
       "reply_max_age_sec": {
         "description": "聊天回复最长有效时间（秒）",
         "type": "float",

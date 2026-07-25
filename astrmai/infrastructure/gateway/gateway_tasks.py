@@ -194,6 +194,8 @@ class GatewayTaskMixin:
         )
 
     async def call_judge_task(self, prompt: str, system_prompt: str = "", template_envelope: Optional[PromptEnvelope] = None) -> Dict[str, Any]:
+        timing = getattr(getattr(self, "config", None), "timing", None)
+        timeout_sec = float(getattr(timing, "attention_judge_timeout_sec", 3.0) or 3.0)
         workload_policy = self.context_economy.resolve_policy(
             self.context_economy.build_request(
                 family=WorkloadFamily.JUDGE,
@@ -221,6 +223,11 @@ class GatewayTaskMixin:
             workload_policy=workload_policy,
             ledger_stage="attention.judge",
             ledger_family=WorkloadFamily.JUDGE.value,
+            timeout_override=timeout_sec,
+            max_retries_override=0,
+            max_models_override=1,
+            allow_cooldown_override=False,
+            reserve_for_reply=True,
         )
         return result.parsed_json or {}
 
@@ -271,6 +278,8 @@ class GatewayTaskMixin:
         max_retries_override: Optional[int] = None,
         max_models_override: Optional[int] = None,
         use_fallback: bool = True,
+        allow_cooldown_override: bool = True,
+        reserve_for_reply: bool = False,
     ) -> Union[str, Dict[str, Any]]:
         task_models = self._task_models()
         resolved_family = workload_family or self.context_economy.infer_workload_family(
@@ -294,6 +303,8 @@ class GatewayTaskMixin:
                 timeout_override=timeout_override,
                 max_retries_override=max_retries_override,
                 max_models_override=max_models_override,
+                allow_cooldown_override=allow_cooldown_override,
+                reserve_for_reply=reserve_for_reply,
             )
             return result.parsed_json if is_json else result.text
         normalized_origin = str(base_origin or "").strip()
@@ -338,6 +349,8 @@ class GatewayTaskMixin:
             max_retries_override=max_retries_override,
             max_models_override=max_models_override,
             use_fallback=use_fallback,
+            allow_cooldown_override=allow_cooldown_override,
+            reserve_for_reply=reserve_for_reply,
         )
         return result.parsed_json if is_json else result.text
 

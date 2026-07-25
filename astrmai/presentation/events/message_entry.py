@@ -15,6 +15,7 @@ from ...conversation.ingress.dedupe import build_message_signature_text, check_m
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
 from ...infrastructure.runtime.turn_call_ledger import (
     bind_turn_telemetry_identity,
+    configure_turn_budget,
     observe_stage,
 )
 from ...presentation.dto.message_scope import IngressDecision, MessageScope
@@ -102,6 +103,7 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
         try:
             await prepare_turn(event, scope)
             bind_turn_telemetry_identity(event)
+            _configure_turn_budget(facade, event)
             return
         except Exception:
             logger.debug("[AstrMai] facade prepare_conversation_turn degraded", exc_info=True)
@@ -136,7 +138,22 @@ async def _bind_turn_identity(facade: RuntimeFacadeProtocol, event, scope: Messa
     event.set_extra("astrmai_turn_generation", generation)
     event.set_extra("astrmai_turn_created_at", created_at)
     bind_turn_telemetry_identity(event)
+    _configure_turn_budget(facade, event)
     debug_trace(event, "ingress.turn_bound", chat_id=scope.chat_id, thread_id=thread_id, generation=generation, mode=mode)
+
+
+def _configure_turn_budget(facade: RuntimeFacadeProtocol, event) -> None:
+    try:
+        config_getter = getattr(facade, "get_runtime_config", None)
+        config = config_getter() if callable(config_getter) else None
+        timing = getattr(config, "timing", None)
+        configure_turn_budget(
+            event,
+            total_budget_sec=float(getattr(timing, "turn_total_budget_sec", 360.0) or 360.0),
+            main_reply_reserve_sec=float(getattr(timing, "main_reply_reserve_sec", 90.0) or 0.0),
+        )
+    except Exception:
+        logger.debug("[AstrMai] turn budget configuration degraded", exc_info=True)
 
 
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
