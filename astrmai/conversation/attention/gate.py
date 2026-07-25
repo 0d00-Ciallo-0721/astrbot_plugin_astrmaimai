@@ -78,6 +78,7 @@ class AttentionGate:
         runtime_coordinator=None,
         chat_loop_kernel=None,
         conversation_continuity=None,
+        turn_trace_callback=None,
     ):
         self.state_engine = state_engine
         self.judge = judge
@@ -92,6 +93,7 @@ class AttentionGate:
         self.runtime_coordinator = runtime_coordinator
         self.chat_loop_kernel = chat_loop_kernel
         self.conversation_continuity = conversation_continuity
+        self.turn_trace_callback = turn_trace_callback
         self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
         self._proactive_dispatching: dict[str, bool] = {}
         self._deferred_messages: dict[str, list] = {}  # ponytail: R12 — queue blocked messages
@@ -965,6 +967,35 @@ class AttentionGate:
     def bind_chat_loop_kernel(self, chat_loop_kernel) -> None:
         self.chat_loop_kernel = chat_loop_kernel
 
+    def bind_turn_trace_callback(self, callback) -> None:
+        self.turn_trace_callback = callback
+
+    async def _finalize_pre_planner_turn(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        *,
+        status: str,
+        reply_text: str | None = None,
+    ) -> None:
+        callback = self.turn_trace_callback
+        if not callable(callback):
+            return
+        try:
+            result = callback(
+                str(chat_id or getattr(event, "unified_msg_origin", "") or ""),
+                event,
+                status=status,
+                reply_text=reply_text,
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(
+                "[AttentionGate] pre-planner turn trace failed "
+                f"status={status} error_type={type(exc).__name__}"
+            )
+
     async def inject_external_event(self, chat_id: str, event_data: dict):
         event = _SyntheticExternalEvent(dict(event_data or {}, unified_msg_origin=chat_id))
         source = str(event.get_extra("astrmai_loop_source", "") or "").strip()
@@ -1082,10 +1113,20 @@ class AttentionGate:
 
         if not sensor_checked and not await self._passes_sensor_filters(event, msg_str):
             await self._complete_proactive_candidate(event, reason="sensor_filtered")
+            await self._finalize_pre_planner_turn(
+                event,
+                chat_id,
+                status="skipped_sensor_filter",
+            )
             return "FILTERED"
 
         if self._should_ignore_passive_group_image(is_private, extracted_images, is_strong_wakeup):
             await self._complete_proactive_candidate(event, reason="passive_group_image")
+            await self._finalize_pre_planner_turn(
+                event,
+                chat_id,
+                status="skipped_passive_group_image",
+            )
             return "IGNORED_IMAGE"
 
         if is_private and self.private_chat_manager and not is_strong_wakeup:
@@ -1115,11 +1156,21 @@ class AttentionGate:
         throttle_result = self._should_skip_by_throttle(msg_str, extracted_images, chat_state, chat_id, is_private, is_strong_wakeup)
         if throttle_result:
             await self._complete_proactive_candidate(event, reason=str(throttle_result or "throttled").lower())
+            await self._finalize_pre_planner_turn(
+                event,
+                chat_id,
+                status=f"skipped_{str(throttle_result or 'throttled').lower()}",
+            )
             return throttle_result
 
         repeater_result = self._handle_repeater_echo(session, is_private, extracted_images, msg_str)
         if repeater_result:
             await self._complete_proactive_candidate(event, reason=repeater_result)
+            await self._finalize_pre_planner_turn(
+                event,
+                chat_id,
+                status=f"skipped_{str(repeater_result).lower()}",
+            )
             return repeater_result
 
         is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
@@ -1363,23 +1414,42 @@ class AttentionGate:
                     if judge_action == "TOPIC_CONFIRM":
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
-                        await self._send_private_topic_confirmation(
+                        confirmation_text = str(
+                            focus_event.get_extra("astrmai_private_topic_confirmation_text", "")
+                            or "这个话题已经隔了一会儿了，还要继续聊吗？回复“继续”就好～"
+                        )
+                        confirmation_sent = await self._send_private_topic_confirmation(
                             focus_event,
-                            str(
-                                focus_event.get_extra("astrmai_private_topic_confirmation_text", "")
-                                or "这个话题已经隔了一会儿了，还要继续聊吗？回复“继续”就好～"
-                            ),
+                            confirmation_text,
+                        )
+                        await self._finalize_pre_planner_turn(
+                            focus_event,
+                            chat_id,
+                            status="executed_topic_confirmation",
+                            reply_text=confirmation_text if confirmation_sent else None,
                         )
                     elif judge_action == "WAIT":
                         if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
                             await self._complete_proactive_candidate(focus_event, reason="proactive_judge_wait")
+                        if not str(focus_event.get_extra("astrmai_wait_reason", "") or ""):
+                            focus_event.set_extra("astrmai_wait_reason", "attention_judge_wait")
                         async with session.lock:
                             self._append_attention_window(session, batch_events)
+                        await self._finalize_pre_planner_turn(
+                            focus_event,
+                            chat_id,
+                            status="skipped_wait",
+                        )
                     elif judge_action == "IGNORE":
                         if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
                             await self._complete_proactive_candidate(focus_event, reason="proactive_judge_ignore")
                         async with session.lock:
                             self._append_attention_window(session, [focus_event])
+                        await self._finalize_pre_planner_turn(
+                            focus_event,
+                            chat_id,
+                            status="skipped_ignore",
+                        )
                     else:
                         async with session.lock:
                             self._append_attention_window(session, batch_events)

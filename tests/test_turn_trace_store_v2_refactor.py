@@ -49,3 +49,34 @@ def test_global_recent_is_chronological_and_bounded(tmp_path):
     payload = json.loads(store.path.read_text(encoding="utf-8"))
     assert len(payload["recent"]) == 3
     assert len(payload["by_chat"]["chat-a"]) == 2
+
+
+def test_append_replaces_existing_turn_id_instead_of_duplicating(tmp_path):
+    store = TurnTraceSampleStore(tmp_path, max_per_chat=5, max_global=10)
+
+    async def run():
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 1.0,
+                "turn_id": "turn-1",
+                "status": "skipped_wait",
+            }
+        )
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 2.0,
+                "turn_id": "turn-1",
+                "status": "executed",
+            }
+        )
+        return await store.recent(chat_id="chat-a", limit=5)
+
+    items = asyncio.run(run())
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+
+    assert len(items) == 1
+    assert items[0]["status"] == "executed"
+    assert len(payload["by_chat"]["chat-a"]) == 1
+    assert len(payload["recent"]) == 1

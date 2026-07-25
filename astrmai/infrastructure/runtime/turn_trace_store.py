@@ -89,14 +89,28 @@ class TurnTraceSampleStore:
         chat_id = str(sample.get("chat_id", "") or "")
         if not chat_id:
             return
+        turn_id = str(sample.get("turn_id", "") or "")
+        normalized_sample = dict(sample)
         async with self._lock:
             payload = await asyncio.to_thread(self._read_sync)
             by_chat = payload.setdefault("by_chat", {})
             items = list(by_chat.get(chat_id, []) or [])
-            items.append(dict(sample))
+            if turn_id:
+                items = [
+                    item
+                    for item in items
+                    if not isinstance(item, dict) or str(item.get("turn_id", "") or "") != turn_id
+                ]
+            items.append(normalized_sample)
             by_chat[chat_id] = items[-self.max_per_chat :]
             recent = list(payload.get("recent", []) or [])
-            recent.append(dict(sample))
+            if turn_id:
+                recent = [
+                    item
+                    for item in recent
+                    if not isinstance(item, dict) or str(item.get("turn_id", "") or "") != turn_id
+                ]
+            recent.append(normalized_sample)
             payload["recent"] = recent[-self.max_global :]
             await asyncio.to_thread(self._write_sync, payload)
 

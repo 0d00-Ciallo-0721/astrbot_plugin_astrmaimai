@@ -846,7 +846,15 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         }
         item["tool_execution_trace"] = execution_items
         item["tool_lifecycle_trace"] = [dict(entry) for entry in tool_lifecycle_trace if isinstance(entry, dict)][-64:]
-        self.turn_trace_history = [*self.turn_trace_history, item][-300:]
+        turn_id = str(item.get("turn_id", "") or "")
+        existing_history = list(self.turn_trace_history)
+        if turn_id:
+            existing_history = [
+                entry
+                for entry in existing_history
+                if not isinstance(entry, dict) or str(entry.get("turn_id", "") or "") != turn_id
+            ]
+        self.turn_trace_history = [*existing_history, item][-300:]
         if (
             hasattr(event, "get_extra")
             and hasattr(event, "set_extra")
@@ -878,7 +886,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 "[TurnLedger] "
                 f"turn={item.get('turn_id', '')} chat={chat_id} status={status} "
                 f"elapsed_ms={float(item.get('turn_total_elapsed_ms', 0.0) or 0.0):.1f} "
-                f"llm_calls={len(calls)} judge_calls={sum(1 for call in calls if isinstance(call, dict) and call.get('stage') == 'attention.judge')} "
+                f"llm_calls={len(calls)} judge_calls={self._count_judge_calls(calls)} "
                 f"slowest={slowest[0] or 'none'}:{slowest[1]:.1f}ms "
                 f"context_chars={context_chars} "
                 f"memory={int(memory_funnel.get('candidate_count', 0) or 0)}/{int(memory_funnel.get('selected_count', 0) or 0)} "
@@ -887,13 +895,46 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if self.turn_trace_store is not None and hasattr(self.turn_trace_store, "append"):
             try:
                 await self.turn_trace_store.append(item)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "[TurnTrace] sample persistence failed "
+                    f"chat={chat_id} status={status} error_type={type(exc).__name__}"
+                )
         if self.raw_trace_store is not None and hasattr(self.raw_trace_store, "append_many"):
             try:
                 await self.raw_trace_store.append_many(chat_id, self._build_raw_trace_events(chat_id, event))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "[TurnTrace] raw persistence failed "
+                    f"chat={chat_id} status={status} error_type={type(exc).__name__}"
+                )
+
+    async def record_turn_trace(
+        self,
+        chat_id: str,
+        event: AstrMessageEvent,
+        *,
+        status: str,
+        reply_text: str | None = None,
+    ) -> None:
+        await self._remember_turn_trace(
+            chat_id,
+            event,
+            status=status,
+            reply_text=reply_text,
+        )
+
+    @staticmethod
+    def _count_judge_calls(calls: list[dict]) -> int:
+        return sum(
+            1
+            for call in calls
+            if isinstance(call, dict)
+            and (
+                str(call.get("pool", "") or "") == "judge"
+                or str(call.get("stage", "") or "") == "attention.judge"
+            )
+        )
 
     def _build_raw_trace_events(self, chat_id: str, event: AstrMessageEvent) -> list[dict]:
         if not hasattr(event, "get_extra"):
@@ -1363,6 +1404,18 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if think_level <= 0:
             proactive_recall = ""
         event.set_extra("astrmai_prefix_hash", self.context_engine.get_last_prefix_hash(chat_id))
+        record_context_block_stats(
+            event,
+            stage="planner.context_engine_output",
+            blocks={
+                "system_prompt": system_prompt,
+                "proactive_recall": proactive_recall,
+            },
+            metadata={
+                "scope": "constructed",
+                "think_level": int(think_level or 0),
+            },
+        )
 
         if prompt_envelope is not None:
             prompt_envelope.cognitive_drive_block = agency_context or planner_reasoning or sys1_thought or goals_context
@@ -1382,6 +1435,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         )
 
         prefix_status = self.context_engine.get_last_prefix_status(chat_id) if hasattr(self.context_engine, "get_last_prefix_status") else {}
+        frozen_prefix_blocks = dict(prefix_status.get("frozen_prefix_blocks", {}) or {})
+        semi_stable_blocks = dict(prefix_status.get("semi_stable_blocks", {}) or {})
         with observe_stage(event, "planner.prompt_refine") as refine_stage:
             final_system_prompt, final_prompt = await self.prompt_refiner.refine_prompt(
                 event=event,
@@ -1425,6 +1480,19 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "context_dedup_observe_only": bool(
                         (event.get_extra("astrmai_context_dedup_stats", {}) or {}).get("observe_only", False)
                     ),
+                    "persona_core_chars": int(frozen_prefix_blocks.get("persona_core", 0) or 0),
+                    "style_block_chars": int(frozen_prefix_blocks.get("style_block", 0) or 0),
+                    "system_rules_chars": int(frozen_prefix_blocks.get("system_rules", 0) or 0),
+                    "cold_summary_chars": int(semi_stable_blocks.get("cold_summary", 0) or 0),
+                    "stable_state_chars": int(semi_stable_blocks.get("stable_state", 0) or 0),
+                    "stable_private_chat_chars": int(
+                        semi_stable_blocks.get("stable_private_chat", 0) or 0
+                    ),
+                    "stable_expression_chars": int(
+                        semi_stable_blocks.get("stable_expression", 0) or 0
+                    ),
+                    "stable_slang_chars": int(semi_stable_blocks.get("stable_slang", 0) or 0),
+                    "stable_jargon_chars": int(semi_stable_blocks.get("stable_jargon", 0) or 0),
                 },
             )
         turn_context = ensure_turn_context(event)

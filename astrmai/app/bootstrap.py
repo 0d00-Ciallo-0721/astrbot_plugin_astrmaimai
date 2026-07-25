@@ -372,6 +372,11 @@ class PluginBootstrap:
                 "conversation_continuity",
                 None,
             ),
+            turn_trace_callback=getattr(
+                getattr(runtime, "system2_planner", None),
+                "record_turn_trace",
+                None,
+            ),
         )
         return InteractionServices(
             frequency_controller=frequency_controller,

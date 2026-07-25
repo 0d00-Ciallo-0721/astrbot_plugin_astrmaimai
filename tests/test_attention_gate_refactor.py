@@ -332,13 +332,18 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
     def test_judge_wait_keeps_batch_for_next_pass_without_sys2(self):
         captured = []
+        traced = []
         self.gate.judge = _SequenceJudge(["WAIT", "PASS"])
         self.gate._compute_debounce_delay = lambda *args, **kwargs: 0.0
 
         async def fake_sys2(event, events):
             captured.append((event, events))
 
+        async def trace_turn(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
         self.gate.sys2_process = fake_sys2
+        self.gate.bind_turn_trace_callback(trace_turn)
 
         async def _run():
             session = self.gate_mod.SessionContext()
@@ -356,12 +361,22 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(after_wait, ["not done"])
         self.assertEqual(len(captured), 1)
         self.assertEqual([event.message_str for event in captured[0][1]], ["not done", "now done"])
+        self.assertEqual(
+            traced,
+            [("default:GroupMessage:group-1", "skipped_wait", None)],
+        )
 
     def test_judge_ignore_keeps_focus_as_window_only(self):
         captured = []
+        traced = []
         self.gate.judge = _SequenceJudge(["IGNORE"])
         self.gate._compute_debounce_delay = lambda *args, **kwargs: 0.0
         self.gate.sys2_process = lambda event, events: captured.append((event, events))
+
+        async def trace_turn(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        self.gate.bind_turn_trace_callback(trace_turn)
 
         async def _run():
             session = self.gate_mod.SessionContext()
@@ -374,6 +389,10 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.assertEqual(captured, [])
         self.assertEqual(retained, ["skip me"])
+        self.assertEqual(
+            traced,
+            [("default:GroupMessage:group-1", "skipped_ignore", None)],
+        )
 
     def test_strong_wakeup_skips_judge_gate(self):
         captured = []
@@ -993,6 +1012,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         judge_calls = []
         system2_calls = []
         sent = []
+        traced = []
 
         async def unexpected_judge(*args, **kwargs):
             judge_calls.append((args, kwargs))
@@ -1005,8 +1025,12 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         async def send(result):
             sent.append(result)
 
+        async def trace_turn(chat_id, traced_event, *, status, reply_text=None):
+            traced.append((chat_id, traced_event, status, reply_text))
+
         gate._evaluate_judge_gate = unexpected_judge
         gate.sys2_process = unexpected_system2
+        gate.bind_turn_trace_callback(trace_turn)
         event = _FakePrivateEvent("user-1", "Alice", "温泉后来怎么样了")
         event.send = send
         event.plain_result = lambda text: text
@@ -1030,6 +1054,11 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertIn("还要接着聊吗", sent[0])
         self.assertEqual(event.get_extra("judge_action"), "TOPIC_CONFIRM")
         self.assertTrue(event.get_extra("astrmai_topic_confirmation_sent"))
+        self.assertEqual(len(traced), 1)
+        self.assertEqual(traced[0][0], "default:FriendMessage:user-1")
+        self.assertIs(traced[0][1], event)
+        self.assertEqual(traced[0][2], "executed_topic_confirmation")
+        self.assertEqual(traced[0][3], sent[0])
 
     def test_group_direct_image_waits_for_visual_context_before_fast_dispatch(self):
         class _GroupVisionBarrier:

@@ -380,9 +380,14 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertGreaterEqual(turn_trace["continuity"]["frozen_prefix_length"], 0)
         context_stats = turn_trace["context_block_stats"]
         self.assertEqual(
-            [entry["stage"] for entry in context_stats[-2:]],
-            ["planner.final_prompt_sources", "planner.final_prompt_transmitted"],
+            [entry["stage"] for entry in context_stats[-3:]],
+            [
+                "planner.context_engine_output",
+                "planner.final_prompt_sources",
+                "planner.final_prompt_transmitted",
+            ],
         )
+        self.assertEqual(context_stats[-3]["metadata"]["scope"], "constructed")
         self.assertEqual(context_stats[-2]["metadata"]["scope"], "source")
         self.assertEqual(context_stats[-1]["metadata"]["scope"], "transmitted")
         self.assertEqual(
@@ -393,6 +398,16 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         rendered_trace = str(turn_trace)
         self.assertNotIn("focus on this sentence first", rendered_trace)
         self.assertNotIn("final prompt", rendered_trace)
+
+    def test_judge_call_count_accepts_gateway_pool_and_legacy_stage(self):
+        calls = [
+            {"stage": "gateway.chat", "pool": "mood"},
+            {"stage": "gateway.chat", "pool": "judge"},
+            {"stage": "attention.judge", "pool": "task"},
+            {"stage": "gateway.tool", "pool": "dialog"},
+        ]
+
+        self.assertEqual(self.planner_mod.Planner._count_judge_calls(calls), 2)
 
     def test_planner_moves_long_reply_and_mode_runtime_instructions_to_prompt_blocks(self):
         planner = self._make_planner(
