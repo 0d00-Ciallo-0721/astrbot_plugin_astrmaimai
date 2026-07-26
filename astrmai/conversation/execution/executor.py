@@ -41,7 +41,8 @@ from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
 from ..planning.tool_disclosure import normalize_requested_packages, select_tools_by_packages
 from .group_actor_consistency import GroupActorConsistencyGuard
-from .reply_freshness import is_stale_reply_reason, resolve_reply_max_age_seconds
+from .reply_freshness import ReplyFreshnessMixin, is_stale_reply_reason, resolve_reply_max_age_seconds
+from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 
 
 class ConcurrentExecutor:
@@ -424,6 +425,15 @@ class ConcurrentExecutor:
                 return False
         return False
 
+    def _vision_side_path_timeout_override(self) -> float:
+        # OPT-07/RT-05: 单图超时 = min(配置的图片分析超时, turn 剩余预算[留主回复保留额])
+        timing = getattr(self.config, "timing", None)
+        try:
+            configured = float(getattr(timing, "image_analysis_timeout_sec", 30.0) or 30.0)
+        except (TypeError, ValueError):
+            configured = 30.0
+        return clamp_timeout_to_turn_budget(None, max(1.0, configured), reserve_for_reply=True)
+
     async def _evaluate_execution_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
         if not self.runtime_coordinator:
             return FreshnessState.FRESH, ""
@@ -439,6 +449,16 @@ class ConcurrentExecutor:
         elif isinstance(prompt_envelope, PromptEnvelope):
             thread_signature = str(prompt_envelope.thread_signature or "")
 
+        # 与 mark_activity 侧保持同一标识空间：优先 turn thread id
+        turn = event.get_extra("astrmai_turn_identity", None)
+        turn_thread_id = str(
+            getattr(turn, "thread_id", "")
+            or event.get_extra("astrmai_turn_thread_id", "")
+            or ""
+        ).strip()
+        if turn_thread_id:
+            thread_signature = turn_thread_id
+
         max_age_seconds = resolve_reply_max_age_seconds(self.config)
 
         return await self.runtime_coordinator.evaluate_reply_freshness(
@@ -446,6 +466,7 @@ class ConcurrentExecutor:
             focus_timestamp,
             max_age_seconds=max_age_seconds,
             thread_signature=thread_signature,
+            allow_parallel_threads=not bool(event.get_extra("is_private_chat", False)),
         )
 
     async def _acquire_chat_execution_lock(self, chat_id: str):
@@ -679,12 +700,20 @@ class ConcurrentExecutor:
                     created_temp_file_path = temp_file_path
 
                 if temp_file_path and os.path.exists(temp_file_path):
+                    # OPT-07/RT-05: 视觉旁路此前无任何超时/预算约束（三层重试相乘
+                    # 5×3×7 可单图烧穿 360s 轮预算）；每图按剩余预算钳制，耗尽即止
+                    vision_timeout = self._vision_side_path_timeout_override()
+                    if vision_timeout <= 0.5:
+                        saw_exception = True
+                        logger.warning(f"[{chat_id}] vision side-path skipped: turn budget exhausted")
+                        break
                     result_dict = await self.gateway.call_vision_task(
                         image_data=temp_file_path,
                         prompt=VISION_USER_PROMPT,
                         system_prompt=VISION_SYSTEM_PROMPT,
                         lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=chat_id),
                         base_origin=chat_id,
+                        timeout_override=vision_timeout,
                     )
                     payload, invalid_reason = normalize_vision_result(result_dict)
                     if payload is None:
@@ -759,6 +788,8 @@ class ConcurrentExecutor:
     async def _check_pre_model_freshness(self, event: AstrMessageEvent, chat_id: str, label: str) -> bool:
         freshness_state, freshness_reason = await self._evaluate_execution_freshness(event, chat_id)
         if freshness_state == FreshnessState.EXPIRED:
+            # 预检终止也要落 stale 观测字段，否则 trace 的 stale_category 为空无法归因
+            ReplyFreshnessMixin._record_freshness_observation(event, freshness_state, freshness_reason)
             logger.info(f"[{chat_id}] stop expired {label}: {freshness_reason}")
             return False
         return True

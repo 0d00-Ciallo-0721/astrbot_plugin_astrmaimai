@@ -416,50 +416,20 @@ class Judge:
             # =====================================================================
             # 【正常执行 System 1 唤醒大模型判决】
             # =====================================================================
+            # OPT-08/RT-09: 固定 rubric 已迁入 JUDGE_STABLE_PREFIX（system，可被前缀
+            # 缓存），此处只留动态段并按"半稳定在前、易变在后"排序
             prompt = f"""
             你是群聊中的这个角色的潜意识大脑，请完全沉浸于以下设定中：
             [你的核心人设]: {persona_summary if persona_summary else '保持你原本的性格特征'}
             {keyword_reaction_block}
+            【当前可用动作】(action 只能从中选择，取值: {action_schema}):
+            {available_actions}
+
             当前群聊情绪: {state.mood:.2f} (-1.0 到 1.0)。
-            
+
             {history_context}
             【近期发生的连续对话 (请重点基于以上历史语境和以下近期对话进行最终裁决)】:
             {message}
-            
-            【思考与决策流】
-            1. 意图判决 (action): 请从以下【当前可用动作】中选择一个：
-            {available_actions}
-            
-            2. 潜意识生成 (thought): **仅当 action 为 REPLY 或 TOOL_CALL 时**，你需要以第一人称和角色语气，生成一段你此刻脑海中一闪而过的内心戏。如果决定 WAIT 或 IGNORE，请严格留空。
-            
-            3. 记忆提取 (retrieve_keys): **仅当 action 为 REPLY 时**才需要判断当前回复需要调用你脑海中的哪部分【人格记忆 (retrieve_keys)】。如果 action 为 WAIT 或 IGNORE，或者只是极简单的日常寒暄，列表请严格保持为空 []。
-            
-            可选的人格维度 Key:
-            - logic_style (性格逻辑)
-            - speech_style (语言风格)
-            - world_view (世界观)
-            - timeline (生平经历)
-            - relations (人际关系)
-            - skills (技能能力)
-            - values (价值观)
-            - secrets (深层秘密)
-            - ALL (完整降临)
-            
-            并且，请评估【上述近期对话】对你产生的【情绪影响】。
-            可用情绪标签 (mood_tag)：happy(积极/开心), sad(悲伤/遗憾), angry(生气/抱怨), neutral(平静/客观), curious(好奇/困惑), surprise(惊讶)
-            
-            请严格按照以下 JSON 格式输出（必须先输出 reason 进行极简逻辑推理）：
-            {{
-                "reason": "极简的判定理由，例如：'有人在提问' 或 '顺着刚才的话题在聊'（限20字内）",
-                "action": "{action_schema}",
-                "thought": "【仅当 action 选中需要回复的类型时生成】第一人称的真实内心戏。不回复请严格输出空字符串 \"\"",
-                "relevance": int(1-10),
-                "necessity": float(1.0-10.0),
-                "retrieve_keys": ["key1"],
-                "mood_tag": "happy/sad/angry/neutral/curious/surprise",
-                "mood_delta": 0.0
-            }}
-            说明：mood_delta 为情绪变化值（范围 -0.5 到 0.5）。受到夸奖/喜爱时为正数，受到辱骂/指责时为负数，平常对话为 0.0。
             """
             
             plan = BrainActionPlan()

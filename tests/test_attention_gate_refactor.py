@@ -455,6 +455,8 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             calls.append((chat_id, text))
             return "happy", 0.45
 
+        # OPT-08/RT-03: 本测试锁定的是"前置 mood"旧路径的去重语义，显式关闭后置开关
+        self.gate._mood_post_judge_enabled = lambda: False
         self.gate.state_engine.update_mood = _update_mood
         self.gate.judge = _SequenceJudge(["PASS", "PASS"])
         router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
@@ -496,6 +498,8 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             mood_calls.append((chat_id, text))
             return "neutral", 0.0
 
+        # OPT-08/RT-03: micro-utterance 跳过是"前置 mood"路径的子行为，显式关闭后置开关
+        self.gate._mood_post_judge_enabled = lambda: False
         self.gate.state_engine.update_mood = _update_mood
         judge = _SequenceJudge(["PASS"])
         self.gate.judge = judge
@@ -563,6 +567,8 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         manager = _FakePrivateChatManager()
         self.gate.private_chat_manager = manager
+        # OPT-08/RT-03: 本测试断言即时 mood 应用与私聊 wait 复活的组合，走前置路径
+        self.gate._mood_post_judge_enabled = lambda: False
         self.gate.state_engine.update_mood = _update_mood
         event = _FakePrivateEvent("user-1", "Alice", "今天有点难受")
 

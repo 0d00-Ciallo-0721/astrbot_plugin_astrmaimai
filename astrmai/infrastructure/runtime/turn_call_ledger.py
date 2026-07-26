@@ -232,6 +232,28 @@ def turn_telemetry_scope(event: Any):
         _CURRENT_TELEMETRY.reset(token)
 
 
+def detach_turn_telemetry() -> None:
+    """常驻后台任务入口调用：斩断随 asyncio.create_task 复制继承的 turn telemetry。
+
+    懒启动的常驻 worker 若在某个 turn 的处理上下文（main.py turn_telemetry_scope）中
+    创建，将永久携带该轮 deadline，导致 worker 内所有 event=None 的网关调用在原轮
+    预算耗尽后集体秒败（turn_deadline_exhausted）并把账记进陈旧 turn。
+    contextvar 是 task 私有的，置空不影响创建方。
+    """
+    _CURRENT_TELEMETRY.set(None)
+
+
+def rebind_turn_telemetry(event: Any) -> TurnTelemetryContext:
+    """长驻 worker 每处理一个新批次时调用：把 telemetry contextvar 重绑到批次锚点事件。
+
+    使排水循环中晚到批次的网关调用按自己的 turn 预算钳制、账本落回正确的 turn，
+    而不是沿用 worker 创建时刻旧 turn 的 deadline 与 ledger。
+    """
+    context = ensure_turn_telemetry(event)
+    _CURRENT_TELEMETRY.set(context)
+    return context
+
+
 def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
     context = current_turn_telemetry(event)
     if context is None:
@@ -683,11 +705,13 @@ __all__ = [
     "clamp_timeout_to_turn_budget",
     "configure_turn_budget",
     "current_turn_telemetry",
+    "detach_turn_telemetry",
     "ensure_turn_telemetry",
     "finalize_turn_telemetry",
     "finish_stage",
     "finish_llm_call",
     "observe_stage",
+    "rebind_turn_telemetry",
     "record_llm_attempt",
     "record_context_block_stats",
     "record_reply_stats",

@@ -112,7 +112,12 @@ class PreFilters:
         
         if event.get_extra("is_virtual_poke"):
             return True
-        
+
+        # OPT-03/PL-01+ID-03: 后台合成事件（主动开口候选/群友互动叙事）只有 message_str、
+        # 无消息组件，不能被下方"组件文本为空"的过滤绞杀；是否回应交给 judge/playbook 决定
+        if event.get_extra("astrmai_is_proactive_event") or event.get_extra("astrmai_interaction_kind"):
+            return True
+
         # =================================================================
         # 🚀 [新增] 媒体链接白名单防护层 (AstrBot Parser 兼容补丁)
         # =================================================================
@@ -500,8 +505,14 @@ class PreFilters:
         if target_id and not target_id.isdigit() and target_id != bot_id:
             target_id = ""
 
-        if not target_id or target_id == "0": 
-            target_id = bot_id 
+        if not target_id or target_id == "0":
+            # OPT-03/ID-10: 目标缺失时不得伪装成"戳 bot"——旧兜底会导致无端回戳
+            # 并给发起者误结算好感；记为 unknown-target 并跳过整个互动处理
+            logger.debug(
+                f"[AstrMai-Sensor] poke target unresolved (sender={sender_id}); skip interaction handling"
+            )
+            event.set_extra("astrmai_interaction_target_unknown", True)
+            return
         if self._is_counter_poke_echo(chat_id=str(getattr(event, "unified_msg_origin", "") or group_id), sender_id=sender_id, target_id=target_id, bot_id=bot_id):
             logger.debug("[AstrMai-Sensor] ignored recent counter-poke echo")
             return
@@ -535,6 +546,11 @@ class PreFilters:
                     except Exception as e:
                         logger.debug(f"[AstrMai-Sensor] 📡 API 拉取用户 {uid} 信息失败: {e}")
                         
+            # OPT-03/ID-10: 群名片可能被设成签名样长文本（如"…的季节里，希望你别中暑了~"），
+            # 混入互动叙事观感极差；超长或含换行的候选名一律弃用
+            if valid_name and (len(valid_name) > 20 or "\n" in valid_name):
+                valid_name = ""
+
             # 最终兜底
             final_name = valid_name if valid_name else f"群友{uid[-4:]}"
             

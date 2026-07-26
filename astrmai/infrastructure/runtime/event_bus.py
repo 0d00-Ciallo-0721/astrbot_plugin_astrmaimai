@@ -3,6 +3,7 @@ import asyncio
 from typing import Callable, List, Dict, Any
 
 from ...shared.helpers.plugin_helpers import safe_create_task
+from .turn_call_ledger import detach_turn_telemetry
 
 class EventBus:
     """
@@ -136,7 +137,11 @@ class EventBus:
         """专门从队列中消费事件的安全消费者协程，阻断无界限 Task 爆炸，同时实行异步派发防阻塞"""
         from astrbot.api import logger
         import weakref
-        
+
+        # OPT-02/RT-01: worker 在 publish() 内懒启动，会随 create_task 继承首个 turn 的
+        # telemetry contextvar；不斩断则原轮预算耗尽后 worker 内所有 LLM 调用永久秒败
+        detach_turn_telemetry()
+
         while True:
             try:
                 generation, topic, data = await self._event_queue.get()

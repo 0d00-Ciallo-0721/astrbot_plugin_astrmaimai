@@ -189,7 +189,9 @@ class AttentionPrivateChatTests(unittest.TestCase):
         self.assertEqual(sender_id, "user-1")
         self.assertEqual(sender_name, "Alice")
         self.assertEqual(preview, "抱抱")
-        self.assertIsNone(thread_signature)
+        # OPT-01/ID-01: ingress 活动标记必须携带 turn 线程标识（旧断言 None 固化的正是
+        # "签名恒空导致线程隔离失效" 的缺陷行为）
+        self.assertEqual(thread_signature, "sender:user-1")
         self.assertEqual(timestamp, event.get_extra("astrmai_timestamp"))
         self.assertEqual(len(sys2_calls), 1)
 

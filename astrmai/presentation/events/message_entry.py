@@ -153,7 +153,13 @@ def _configure_turn_budget(facade: RuntimeFacadeProtocol, event) -> None:
             main_reply_reserve_sec=float(getattr(timing, "main_reply_reserve_sec", 90.0) or 0.0),
         )
     except Exception:
-        logger.debug("[AstrMai] turn budget configuration degraded", exc_info=True)
+        # OPT-07/TG-03: 接线失败不得静默让预算体系整体失效（clamp 全变 no-op）——
+        # 提级告警并以默认预算兜底
+        logger.warning("[AstrMai] turn budget configuration degraded; falling back to defaults", exc_info=True)
+        try:
+            configure_turn_budget(event, total_budget_sec=360.0, main_reply_reserve_sec=90.0)
+        except Exception:
+            logger.debug("[AstrMai] default turn budget fallback failed", exc_info=True)
 
 
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):

@@ -17,6 +17,9 @@ class SessionContext:
     attention_window: List[Any] = field(default_factory=list)
     attention_window_ts: List[float] = field(default_factory=list)
     is_evaluating: bool = False
+    # OPT-07/RT-05: 私聊图片屏障的 per-burst 截止时间——合并循环多次迭代共享，
+    # 防止每次 prepare_batch 重新起算总额（单图烧穿整轮预算的三缺口之一）
+    vision_burst_deadline: float = 0.0
     last_active_time: float = field(default_factory=time.time)
     last_message_hash: str = ""
     repeat_count: int = 0

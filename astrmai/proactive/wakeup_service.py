@@ -180,7 +180,12 @@ class WakeupService:
 
         async def _on_complete(reply_sent: bool, reply_preview: str, *, target_state=state) -> None:
             if not reply_sent:
-                logger.info(f"[Life] proactive wakeup skipped by planner: {getattr(target_state, 'chat_id', '')}")
+                # OPT-03/PL-02: 不再武断归因为 planner——候选可能死在传感器/节流/judge
+                # 任一层，具体拦截层以 trace.proactive.dispatch_status/blocked_reason 为准
+                logger.info(
+                    f"[Life] proactive wakeup not sent: {getattr(target_state, 'chat_id', '')} "
+                    "(blocked stage recorded in dispatch trace)"
+                )
                 return
             next_wakeup_timestamp = time.time() + wakeup_cooldown
             settle = getattr(self.state_engine, "settle_proactive_wakeup", None)

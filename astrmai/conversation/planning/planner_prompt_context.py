@@ -152,6 +152,11 @@ class PlannerPromptContextMixin:
         *,
         is_lightweight_event: bool,
     ) -> str:
+        if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
+            # OPT-03/ID-06: 主动候选是后台合成事件，sender 是内部占位符
+            # （astrmai_proactive_candidate/主动开口候选），生成归因锁会让模型
+            # 对着幽灵用户说"你"；主动发言不锁定单一对象
+            return ""
         sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip() or cls._safe_event_sender_id(focus_event)
         sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip() or cls._safe_event_sender_name(focus_event)
         chat_id = str(getattr(focus_event, "unified_msg_origin", "") or "").strip()

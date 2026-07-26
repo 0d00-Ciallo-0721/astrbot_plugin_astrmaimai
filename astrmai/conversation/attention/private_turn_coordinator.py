@@ -228,7 +228,17 @@ class PrivateTurnCoordinator:
                 return
             await asyncio.sleep(remaining)
 
-    async def prepare_batch(self, events: list[Any], chat_id: str) -> VisionBarrierOutcome:
+    def vision_total_budget_sec(self) -> float:
+        """OPT-07/RT-05: 供 gate 合并循环持久化 per-burst 截止时间使用。"""
+        return float(self._vision_total_timeout())
+
+    async def prepare_batch(
+        self,
+        events: list[Any],
+        chat_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> VisionBarrierOutcome:
         if not bool(getattr(getattr(self.config, "vision", None), "enable_vision", True)):
             return VisionBarrierOutcome(outcome="disabled")
         if self.image_resolver is None:
@@ -246,7 +256,9 @@ class PrivateTurnCoordinator:
             ]
             return self._aggregate_outcomes(outcomes, elapsed_ms=0)
         started_at = time.monotonic()
-        deadline = started_at + self._vision_total_timeout()
+        # OPT-07/RT-05: 调用方（gate 合并循环）可传入跨迭代持久的 burst deadline，
+        # 未传时保持每批独立总额的旧语义
+        deadline = float(deadline) if deadline else (started_at + self._vision_total_timeout())
         outcomes: list[VisionBarrierOutcome] = []
         for event in events:
             if bool(event.get_extra("astrmai_vision_barrier_complete", False)):

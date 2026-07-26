@@ -48,10 +48,11 @@ def resolve_reply_max_age_seconds(config) -> float:
 
 
 def is_stale_reply_reason(reason: str) -> bool:
+    # 宽前缀（无冒号）同时覆盖 coordinator 的 _same_thread/_unknown_thread 变体与旧格式
     return str(reason or "").startswith(
         (
             "reply_age_exceeded:",
-            "superseded_by_newer_activity:",
+            "superseded_by_newer_activity",
             "stale_",
             "expired",
         )
@@ -218,7 +219,13 @@ class ReplyFreshnessMixin:
                 max_age=max_age,
             )
 
-        thread_signature = str(event.get_extra("astrmai_thread_signature", "") or "")
+        turn = event.get_extra("astrmai_turn_identity", None)
+        thread_signature = str(
+            getattr(turn, "thread_id", "")
+            or event.get_extra("astrmai_turn_thread_id", "")
+            or event.get_extra("astrmai_thread_signature", "")
+            or ""
+        )
         freshness_state, stale_reason = await self.runtime_coordinator.evaluate_reply_freshness(
             chat_id,
             event_ts,

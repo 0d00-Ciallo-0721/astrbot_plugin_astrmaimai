@@ -18,6 +18,7 @@ from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
+from ...infrastructure.runtime.turn_call_ledger import rebind_turn_telemetry
 from .decision_router import AttentionDecisionRouter
 from .event_normalizer import SessionContext, build_normalized_events
 from .focus_selector import score_focus_candidate, select_focus_event
@@ -514,6 +515,14 @@ class AttentionGate:
             )
         )
 
+    def _mood_post_judge_enabled(self) -> bool:
+        attention_cfg = getattr(self.config, "attention", None)
+        return bool(getattr(attention_cfg, "mood_post_judge_enabled", True))
+
+    def _private_skip_judge_enabled(self) -> bool:
+        attention_cfg = getattr(self.config, "attention", None)
+        return bool(getattr(attention_cfg, "private_skip_judge_enabled", True))
+
     async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
         session = await self._get_or_create_session(chat_id)
         now = time.time()
@@ -526,13 +535,23 @@ class AttentionGate:
             session.last_active_user_time = now
         if self.runtime_coordinator and hasattr(self.runtime_coordinator, "mark_activity"):
             try:
+                # ingress 时刻 astrmai_thread_signature 尚未生成（focus 构建后才写入），
+                # 必须用 turn thread id（message_entry 已绑定）保证与 freshness 检查同一标识空间
+                thread_identity = ""
+                if hasattr(event, "get_extra"):
+                    thread_identity = str(event.get_extra("astrmai_turn_thread_id", "") or "").strip()
+                if not thread_identity:
+                    try:
+                        thread_identity = str(resolve_group_thread(event, chat_id).thread_id or "")
+                    except Exception:
+                        thread_identity = ""
                 await self.runtime_coordinator.mark_activity(
                     chat_id,
                     now,
                     activity_sender_id,
                     event.get_sender_name() if hasattr(event, "get_sender_name") else "",
                     str(getattr(event, "message_str", "") or ""),
-                    event.get_extra("astrmai_thread_signature", None) if hasattr(event, "get_extra") else None,
+                    thread_identity,
                 )
             except Exception as exc:
                 logger.debug(f"[AttentionGate] runtime activity mark degraded: {exc}")
@@ -978,6 +997,21 @@ class AttentionGate:
         status: str,
         reply_text: str | None = None,
     ) -> None:
+        # OPT-03/PL-02: pre-planner 终结路径也要填充 proactive 快照，否则合成事件
+        # 死在传感器/节流层时 trace.proactive 恒空，三层诊断都看不出主动链死在哪
+        try:
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                snapshot = ensure_turn_context(event).proactive
+                snapshot.is_proactive = True
+                snapshot.source = str(event.get_extra("astrmai_proactive_source", "") or snapshot.source or "")
+                snapshot.intent_id = str(event.get_extra("astrmai_proactive_intent_id", "") or snapshot.intent_id or "")
+                snapshot.reason = str(event.get_extra("astrmai_proactive_reason", "") or snapshot.reason or "")
+                snapshot.guidance_preview = str(event.get_extra("astrmai_proactive_guidance", "") or "")[:160]
+                snapshot.dispatch_status = str(status or "")
+                if not snapshot.blocked_reason:
+                    snapshot.blocked_reason = str(status or "")
+        except Exception:
+            logger.debug("[AttentionGate] proactive trace fill degraded", exc_info=True)
         callback = self.turn_trace_callback
         if not callable(callback):
             return
@@ -1077,7 +1111,10 @@ class AttentionGate:
             and self.private_turn_coordinator is not None
         )
         if not defer_private_context and not defer_direct_vision_context:
-            await self._apply_primary_mood_update(event, chat_id, msg_str)
+            # OPT-08/RT-03: mood LLM 后置——ambient 消息（88% 最终不回复）不再在
+            # ingress 无条件付一次 3-40s 情绪调用；强唤醒（必回复）保持即时感知
+            if not self._mood_post_judge_enabled() or perception.is_strong_wakeup:
+                await self._apply_primary_mood_update(event, chat_id, msg_str)
 
         forced = await self._handle_force_engage(event, chat_id)
         if forced:
@@ -1299,6 +1336,10 @@ class AttentionGate:
                 session.accumulation_pool.clear()
 
             if batch_events:
+                # OPT-02/RT-01: 排水循环的晚到批次不得沿用 worker 创建时刻旧 turn 的
+                # deadline/账本，逐批把 telemetry contextvar 重绑到本批锚点事件
+                rebind_turn_telemetry(batch_events[-1])
+                pending_mood: tuple[AstrMessageEvent, str] | None = None
                 if is_private and self.private_turn_coordinator is not None:
                     merge_pending_batch = getattr(
                         self.private_turn_coordinator,
@@ -1307,12 +1348,26 @@ class AttentionGate:
                     )
                     if callable(merge_pending_batch):
                         batch_events = merge_pending_batch(chat_id, batch_events)
-                    vision_outcome = await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
+                    # OPT-07/RT-05: burst deadline 跨合并迭代持久化——旧逻辑每次
+                    # prepare_batch 重新起算总额，屏障期间不断有新消息时视觉预算无上界
+                    burst_deadline = float(getattr(session, "vision_burst_deadline", 0.0) or 0.0)
+                    if burst_deadline <= time.monotonic():
+                        budget_getter = getattr(self.private_turn_coordinator, "vision_total_budget_sec", None)
+                        burst_budget = float(budget_getter()) if callable(budget_getter) else 180.0
+                        burst_deadline = time.monotonic() + max(1.0, burst_budget)
+                        session.vision_burst_deadline = burst_deadline
+                    try:
+                        vision_outcome = await self.private_turn_coordinator.prepare_batch(
+                            batch_events, chat_id, deadline=burst_deadline
+                        )
+                    except TypeError:
+                        vision_outcome = await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
                     async with session.lock:
                         if session.accumulation_pool:
                             session.accumulation_pool = batch_events + list(session.accumulation_pool)
                             current_is_strong_wakeup = False
                             continue
+                    session.vision_burst_deadline = 0.0
                     if self._vision_barrier_should_abort(vision_outcome, batch_events[-1]):
                         for prepared_event in batch_events:
                             if not bool(prepared_event.get_extra("astrmai_private_context_recorded", False)):
@@ -1352,11 +1407,16 @@ class AttentionGate:
                             await self._append_dialogue_segment(prepared_event)
                             prepared_event.set_extra("astrmai_private_context_recorded", True)
                     if mood_event is not None and mood_texts:
-                        await self._apply_primary_mood_update(
-                            mood_event,
-                            chat_id,
-                            "\n".join(mood_texts),
-                        )
+                        if self._mood_post_judge_enabled():
+                            # OPT-08/RT-03+ID-09: 私聊情绪感知不再串行阻塞判决前链路，
+                            # 判决通过后 fire-and-forget（见下方 judge_action 后置块）
+                            pending_mood = (mood_event, "\n".join(mood_texts))
+                        else:
+                            await self._apply_primary_mood_update(
+                                mood_event,
+                                chat_id,
+                                "\n".join(mood_texts),
+                            )
                 merged_events = self._merge_attention_window(session, batch_events)
                 events = await self._format_and_filter_messages(merged_events)
                 if events:
@@ -1436,6 +1496,9 @@ class AttentionGate:
                         or focus_candidate.is_reply_to_bot
                         or focus_candidate.has_direct_vision
                         or current_is_strong_wakeup
+                        # OPT-08/ID-09: 私聊 16h 内 judge 18/18 全 REPLY——合并窗+settle
+                        # 已承担"等对方说完"职能，judge 在私聊是纯延迟（可配置关闭）
+                        or (is_private and self._private_skip_judge_enabled())
                     )
                     if topic_confirmation_required:
                         judge_action = "TOPIC_CONFIRM"
@@ -1449,6 +1512,23 @@ class AttentionGate:
                         )
                     focus_event.set_extra("judge_action", judge_action)
                     turn_context.attention.judge_action = judge_action
+                    if (
+                        self._mood_post_judge_enabled()
+                        and judge_action not in {"WAIT", "IGNORE"}
+                        and not bool(focus_event.get_extra("astrmai_primary_mood_applied", False))
+                    ):
+                        # OPT-08/RT-03: 判定为回复类动作后才做情绪感知，且不再阻塞
+                        # 关键路径（fire-and-forget）；WAIT/IGNORE 消息不付情绪调用
+                        mood_target, mood_text = (
+                            pending_mood
+                            if pending_mood is not None
+                            else (focus_event, str(getattr(focus_event, "message_str", "") or ""))
+                        )
+                        if str(mood_text or "").strip():
+                            self._fire_priority_task(
+                                self._apply_primary_mood_update(mood_target, chat_id, mood_text),
+                                mood_target,
+                            )
                     debug_trace(
                         focus_event,
                         "attention_focus_ready",

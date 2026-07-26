@@ -8,6 +8,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.runtime.event_bus import EventBus
+from ...infrastructure.runtime.turn_call_ledger import detach_turn_telemetry
 from ..contracts.memory_query import CommittedMemoryTurn, InstantGateResult
 
 
@@ -355,6 +356,10 @@ class MemoryTurnPipeline:
         return await self.session_summarizer.extract_and_summarize_history(session_id, days=days)
 
     async def _chat_worker(self, chat_id: str, queue: asyncio.Queue[CommittedMemoryTurn]) -> None:
+        # OPT-02/RT-01: per-chat worker 在某轮 turn 上下文中懒创建，必须斩断继承的
+        # telemetry contextvar，否则 instant backfill 等 LLM 调用被陈旧 deadline 钳死
+        # （线上实证 17/17 全败 turn_deadline_exhausted）
+        detach_turn_telemetry()
         while self._running:
             try:
                 turn = await queue.get()

@@ -218,7 +218,12 @@ class CognitiveLoopRefactorTests(unittest.TestCase):
 
         direct_budget_event = _FakeEvent("hello")
         direct_budget_event.set_extra("astrmai_think_level", 1)
-        self.assertTrue(loop.should_run(direct_budget_event))
+        # OPT-08/RT-06: think1 平凡短消息不再无条件运行认知循环（门槛默认 2，可配置回退）
+        self.assertFalse(loop.should_run(direct_budget_event))
+
+        elevated_budget_event = _FakeEvent("hello")
+        elevated_budget_event.set_extra("astrmai_think_level", 2)
+        self.assertTrue(loop.should_run(elevated_budget_event))
 
         short_lookup_event = _FakeEvent("查一下")
         self.assertTrue(loop.should_run(short_lookup_event))

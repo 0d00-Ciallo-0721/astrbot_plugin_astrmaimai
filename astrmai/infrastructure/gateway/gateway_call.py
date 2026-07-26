@@ -191,7 +191,11 @@ class GatewayCallMixin:
         allow_cooldown_override: bool = True,
         reserve_for_reply: bool = False,
     ) -> LLMCallResult:
+        # OPT-08/RT-11: 记录全局信号量排队时长（skipped 轮 judge elapsed 51.7s vs
+        # attempt 数秒的差值疑似排队）；先埋点取证，拆分信号量待数据定论
+        semaphore_wait_started = time.perf_counter()
         async with self._global_semaphore:
+            semaphore_wait_ms = round((time.perf_counter() - semaphore_wait_started) * 1000, 1)
             primary_models, attempt_queue = self._build_attempt_queue(
                 pool_name,
                 models,
@@ -232,6 +236,7 @@ class GatewayCallMixin:
                     metadata={
                         "lane_enabled": bool(contexts),
                         "model_count": len(models or []),
+                        "semaphore_wait_ms": semaphore_wait_ms,
                     },
                 )
             if not attempt_queue:

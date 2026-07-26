@@ -92,6 +92,20 @@ class AttentionConfig(BaseModel):
     thread_reply_priority_enabled: bool = Field(default=True, description="是否让回复/@/唤醒 bot 的消息拥有 Focus Thread 的最高优先级")
     affection_weights: Dict[str, float] = Field(default={"trigger": 20.0, "window": 50.0, "history": 30.0})
     adjudication_threshold: float = Field(default=50.0)
+    mood_post_judge_enabled: bool = Field(
+        default=True,
+        description="情绪感知后置：仅对判定为回复的消息更新情绪（省去最终被忽略消息的 mood LLM 调用）",
+    )
+    private_skip_judge_enabled: bool = Field(
+        default=True,
+        description="私聊跳过 judge 判决（合并窗+settle 已承担等待职能，judge 在私聊近乎恒 REPLY 纯增延迟）",
+    )
+    cognitive_loop_min_think_level: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        description="cognitive_loop 无条件放行的最低 think 等级；低于该级仅在长句/复杂度信号时运行",
+    )
     sensitive_words: List[str] = Field(default=["傻逼", "弱智", "滚", "死", "妈", "废物", "神经", "有病"], description="情感路由权重词：当 Bot 情绪为愤怒/悲伤且消息含这些词时，该发言者获得更高情感权重。注意：这不是内容安全过滤，不会拦截消息。")
 
 
@@ -229,6 +243,10 @@ class MemoryConfig(BaseModel):
     summary_threshold: int = Field(default=30, ge=1)
     recall_top_k: int = Field(default=5, ge=1)
     memory_query_builder_enabled: bool = Field(default=True, repr=False)
+    think1_semantic_intent_enabled: bool = Field(
+        default=True,
+        description="think1 记忆门放宽：关键词未命中时用意图分类器（identity/preference/location 等）判定是否检索",
+    )
     intent_rerank_enabled: bool = Field(default=False, repr=False)
     adaptive_top_k_enabled: bool = Field(default=False, repr=False)
     memory_rrf_fusion_enabled: bool = Field(default=False, repr=False)

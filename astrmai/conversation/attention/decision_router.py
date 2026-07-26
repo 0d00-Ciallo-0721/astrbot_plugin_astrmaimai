@@ -87,6 +87,12 @@ class AttentionDecisionRouter:
             and hasattr(focus_event, "set_extra")
             and not bool(focus_event.get_extra("astrmai_is_proactive_event", False))
             and not bool(focus_event.get_extra("astrmai_primary_mood_applied", False))
+            # OPT-08/RT-03: mood 后置开启时，判决前不再做情绪 LLM（由 gate 在
+            # judge_action 确定后 fire-and-forget，WAIT/IGNORE 不付调用）
+            and not (
+                callable(getattr(self.gate, "_mood_post_judge_enabled", None))
+                and self.gate._mood_post_judge_enabled()
+            )
             and hasattr(self.gate, "state_engine")
             and hasattr(self.gate.state_engine, "update_mood")
         ):

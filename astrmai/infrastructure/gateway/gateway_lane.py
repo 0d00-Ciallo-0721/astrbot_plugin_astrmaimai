@@ -8,7 +8,13 @@ from ..context_economy import PromptEnvelope, WorkloadFamily, WorkloadPolicy
 from ..runtime.lane_manager import LaneKey
 from ..runtime.runtime_contracts import LLMCallResult
 from ..runtime.trace_runtime import append_trace_stage, preview_text
-from ..runtime.turn_call_ledger import begin_llm_call, finish_llm_call, record_llm_attempt
+from ..runtime.turn_call_ledger import (
+    begin_llm_call,
+    current_turn_telemetry,
+    finish_llm_call,
+    record_llm_attempt,
+    remaining_turn_budget,
+)
 from .gateway_exceptions import LLMCascadeFailureException
 from .output_guard import validate_visible_output_text
 
@@ -182,7 +188,16 @@ class GatewayLaneMixin:
     def _tool_loop_total_timeout(self, tool_timeout: float, max_steps: int) -> float:
         """Bound the whole agent run without multiplying the budget by logical steps."""
         del max_steps
-        return max(float(self._api_timeout()), max(0.1, float(tool_timeout or 0.0)))
+        base = max(float(self._api_timeout()), max(0.1, float(tool_timeout or 0.0)))
+        # OPT-07/RT-04: gateway.tool（主回复/工具环）此前完全不受 turn 预算约束
+        # （预算归零后 dialog 照常执行、轮长 420s 实锤）。语义定稿：主回复本身是
+        # main_reply_reserve 的受益者——预算不足时以保留额兜底，而非直接饿死。
+        remaining = remaining_turn_budget(None, reserve_for_reply=False)
+        if remaining is None:
+            return base
+        context = current_turn_telemetry(None)
+        reserve = float(getattr(context, "main_reply_reserve_sec", 0.0) or 0.0)
+        return max(0.1, min(base, max(remaining, reserve)))
 
     @staticmethod
     def _tool_side_effect_count(event: Any) -> int:

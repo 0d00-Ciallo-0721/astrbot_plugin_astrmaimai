@@ -326,7 +326,16 @@ class GroupReplyWaitManager:
                         reply_id_matched = True
                         break
             unique_target_matched = False
-            if state is None and self.threaded_enabled and not has_explicit_thread and sender_id:
+            # turn_thread_id 恒非空（message_entry 必绑）：sender:* 只是缺省回退，不算显式线程；
+            # 但 reply:*（用户引用了别的消息）与 focus 签名一样是显式线程证据，仍应阻止兜底（ID-07）
+            incoming_is_explicit_reply_thread = incoming_turn_thread_id.startswith("reply:")
+            if (
+                state is None
+                and self.threaded_enabled
+                and not incoming_thread_signature
+                and not incoming_is_explicit_reply_thread
+                and sender_id
+            ):
                 target_matches = [
                     (candidate_thread_id, candidate_state)
                     for candidate_thread_id, candidate_state in bucket.items()

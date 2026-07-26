@@ -158,6 +158,13 @@ class CognitiveLoop:
     ) -> None:
         self._write_gate_state(event, gate, ran=ran)
 
+    def _min_loop_think_level(self) -> int:
+        attention_cfg = getattr(self.config, "attention", None)
+        try:
+            return max(1, min(3, int(getattr(attention_cfg, "cognitive_loop_min_think_level", 2) or 2)))
+        except (TypeError, ValueError):
+            return 2
+
     def gate_decision(
         self,
         event: AstrMessageEvent,
@@ -190,7 +197,9 @@ class CognitiveLoop:
                 False,
             )
         readonly_allowed = think_level is not None and think_level >= 3
-        if think_level is not None and think_level >= 1:
+        # OPT-08/RT-06: think1 覆盖 82% 消息、每次 8-35s 意图分类多为平凡结论；
+        # 低于门槛(默认2)的等级不再无条件放行，落到下方长句/复杂度信号判定
+        if think_level is not None and think_level >= self._min_loop_think_level():
             return CognitiveLoopGateDecision(True, "", [f"think_level_{think_level}"], readonly_allowed)
         if len(current_text) >= 12:
             return CognitiveLoopGateDecision(True, "", ["legacy_length"], False)
