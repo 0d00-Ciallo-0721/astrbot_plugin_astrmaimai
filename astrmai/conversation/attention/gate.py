@@ -1084,6 +1084,12 @@ class AttentionGate:
         perception = self.perception_builder.build(event)
         context = perception.as_event_context()
         chat_id = context["chat_id"]
+        try:
+            # OPT-12/TL-07: trace 的 image_count 派生自 perception.image_urls，
+            # 此前从未有人填充（585/585 恒 0），图片轮在观测层不可辨识
+            turn_context.perception.image_urls = list(context.get("extracted_images") or [])
+        except Exception:
+            logger.debug("[AttentionGate] perception image_urls fill degraded", exc_info=True)
         self_id = context["self_id"]
         sender_id = context["sender_id"]
         msg_str = context["msg_str"]

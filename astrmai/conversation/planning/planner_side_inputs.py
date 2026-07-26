@@ -147,7 +147,9 @@ class PlannerSideInputMixin:
         "topic_thread": ("刚才说的", "那个", "这件事", "话题线索"),
         "capability": ("你能做什么", "你有什么工具", "能不能查", "工具列表"),
         "memory_correction": ("你记错了", "不是这样", "改成", "纠正记忆"),
-        "unverified_report": ("听说", "据说", "有人说", "未确认", "不确定"),
+        # OPT-12/TL-06: 旧触发词（听说/据说/有人说/不确定）过于日常，普通闲聊会被
+        # 升级 task tier 并强制 required 工具轮；收紧为明确的"登记/记录"组合意图
+        "unverified_report": ("记录一下听说", "帮我记下传闻", "登记未核实", "记录未确认", "备案传闻"),
         "persona_fact": ("你有没有授权", "你的设定", "官方", "人格事实"),
         "group_activity": ("群里刚才", "谁在聊天", "群活跃", "最近群消息"),
         "route_suggest": ("该发哪里", "要不要私聊", "怎么联系", "路由建议"),
@@ -1005,6 +1007,21 @@ class PlannerSideInputMixin:
             if explicit_tool_intent or (not allowed_families and intent_families is None):
                 allowed_families.update(disclosure_families)
                 turn_tools.allowed_families = sorted(allowed_families)
+            else:
+                # OPT-12/TL-02: 披露层为图片/引用轮特意加的只读查证能力（artifact/
+                # vision/wait/capability）不得被 tease/comfort 等 intent 家族白名单
+                # 静默剥除——否则图片轮无查图工具只能臆测（trace 1785050973 实证）
+                protected_families = disclosure_families & {
+                    "message_artifact",
+                    "vision_message",
+                    "quote_reply",
+                    "topic_thread",
+                    "wait",
+                    "capability",
+                }
+                if protected_families:
+                    allowed_families.update(protected_families)
+                    turn_tools.allowed_families = sorted(allowed_families)
             turn_tools.record_step(
                 "planner.tool_disclosure",
                 [self._canonical_tool_name(tool) for tool in candidate_tools],
@@ -1275,8 +1292,12 @@ class PlannerSideInputMixin:
                 if source_umo or context_summary or delivery_mode:
                     source_type = "群聊" if source_group_id or ":GroupMessage:" in source_umo else "另一个私聊"
                     action_text = "受对方委托传话" if delivery_mode == "relay" else "主动联系当前对方"
+                    # OPT-16/TL-09: 三方消歧指令移到块首——旧版排在块尾，长摘要+长
+                    # 消息时最先被 360 字符截断吃掉，传话场景更易把三方混为一人
                     sys_inject = (
                         f"\n\n我刚才从{source_type}跨会话来到当前私聊，执行的是：{action_text}。\n"
+                        "【三方区分】当前发消息给我的人是收件人，不一定是上一会话的发起人；"
+                        "回复时必须区分发起人、机器人自己和当前收件人，不要把三者混为一人。\n"
                         + (
                             f"【发起人】：{source_sender_name}（QQ：{source_sender_id}）\n"
                             if source_sender_name and source_sender_id
@@ -1286,9 +1307,7 @@ class PlannerSideInputMixin:
                         )
                         + (f"【跨会话摘要】：{context_summary}\n" if context_summary else "")
                         + f"【已经发给当前对方的消息】：{private_message}\n"
-                        "当前发消息给我的人是收件人，不一定是上一会话的发起人。"
-                        "回复时必须区分发起人、机器人自己和当前收件人，不要把三者混为一人；"
-                        "同时自然承接已经发送的消息和对方现在的回应。"
+                        "自然承接已经发送的消息和对方现在的回应。"
                     )
                 else:
                     sys_inject = (

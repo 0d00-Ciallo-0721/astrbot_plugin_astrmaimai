@@ -631,6 +631,9 @@ class ReplyArtifactMixin:
                     logger.debug("[ReplyService] send claim failure marking degraded", exc_info=True)
             if not artifact.sent:
                 raise
+        # OPT-11/ID-05: 满发路径此前从不写 metadata，stage_ledger 恒 0 与 reply_stats
+        # 矛盾（67/67 实证），真 partial 与满发在 stage 层无法区分——无条件落计数
+        artifact.metadata["sent_segment_count"] = sent_segment_count
         if artifact.sent and sent_segment_count < len(artifact.segments):
             artifact.metadata["send_status"] = "partial_sent"
             artifact.metadata["sent_segment_count"] = sent_segment_count

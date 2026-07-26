@@ -1407,9 +1407,17 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
+        # OPT-12/TL-02: wait/capability 是披露层保护家族，comfort/tease 等 intent
+        # 白名单不得剥除（旧断言锁定的正是"连等待与自检能力一并清空"的缺陷）
         self.assertEqual(
             _normalized_tool_names(comfort_tools),
-            {"message_reaction_action", "message_emoji_like_action", "proactive_like_action"},
+            {
+                "message_reaction_action",
+                "message_emoji_like_action",
+                "proactive_like_action",
+                "wait_and_listen",
+                "bot_capability_lookup",
+            },
         )
 
         recall_ctx = SimpleNamespace(shared_dict={})

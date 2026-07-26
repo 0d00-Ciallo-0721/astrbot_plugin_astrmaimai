@@ -1595,7 +1595,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
             self._append_to_structure(
                 structure,
                 "topics",
-                f"这段旧对话主要延续同一组群聊话题，后段落在“{self._preview_text(getattr(latest, 'content', ''), 32)}”。",
+                f"这段旧对话主要延续同一个话题，后段落在“{self._preview_text(getattr(latest, 'content', ''), 32)}”。",
                 [getattr(latest, "event_id", "")] if getattr(latest, "event_id", "") else [],
             )
 

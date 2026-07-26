@@ -58,7 +58,10 @@ class TurnTraceSampleStore:
                 if isinstance(item, dict)
             ],
         }
-        serialized = json.dumps(normalized, ensure_ascii=False, indent=2)
+        # OPT-11/WU-06 短期缓解: 去掉 indent（15MB 实测 dumps 0.46s/条、封顶 ~42MB，
+        # 每条入站消息都在聊天路径上整文件重写且与 WebUI 轮询共锁）；
+        # 结构迁移（JSONL 分片/SQLite）另行专项，读取端需同步
+        serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",

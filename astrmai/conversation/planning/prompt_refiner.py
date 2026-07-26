@@ -663,6 +663,45 @@ class PromptRefiner:
         is_fast_mode: bool = False,
         retrieve_keys: list[str] | None = None,
     ) -> tuple[MemoryInjectionDecision, str]:
+        # OPT-11/TG-04: 外包裹统一补写 skipped funnel——此前 7 条 early-return 全部
+        # 绕过 funnel（executed trace 64/67 缺失），运营者无法区分"合理跳过"与
+        # "仪表坏了"；包裹法天然覆盖未来新增的跳过分支
+        decision, rendered = await self._decide_memory_injection_inner(
+            event,
+            prompt,
+            prompt_envelope=prompt_envelope,
+            disable_rag=disable_rag,
+            is_fast_mode=is_fast_mode,
+            retrieve_keys=retrieve_keys,
+        )
+        try:
+            if (
+                not rendered
+                and hasattr(event, "set_extra")
+                and hasattr(event, "get_extra")
+                and not event.get_extra("astrmai_memory_funnel", None)
+            ):
+                event.set_extra(
+                    "astrmai_memory_funnel",
+                    {
+                        "status": "skipped",
+                        "skip_reason": str(decision.skip_reason or ""),
+                        "policy": str(decision.policy or ""),
+                    },
+                )
+        except Exception:
+            logger.debug("[PromptRefiner] skipped funnel record degraded", exc_info=True)
+        return decision, rendered
+
+    async def _decide_memory_injection_inner(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        prompt_envelope: PromptEnvelope | None = None,
+        disable_rag: bool = False,
+        is_fast_mode: bool = False,
+        retrieve_keys: list[str] | None = None,
+    ) -> tuple[MemoryInjectionDecision, str]:
         retrieve_keys = retrieve_keys or []
         decision = MemoryInjectionDecision(
             policy=self._memory_policy_for_event(event),

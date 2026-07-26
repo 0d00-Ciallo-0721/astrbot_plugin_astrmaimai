@@ -157,7 +157,10 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 error_kind = str(attempt.get("error_kind", "") or "")
                 if error_kind:
                     model_attempt_error_counts[error_kind] += 1
-            if stage == "attention.judge" or "judge" in stage:
+            # OPT-11/RT-02: judge 记账在 pool 字段（stage 是 gateway.chat），旧口径
+            # 按 stage 匹配恒为 0，制造了"judge 重复调用已修复"的假象（真实 max=10）
+            pool = str(call.get("pool", "") or "")
+            if pool == "judge" or stage == "attention.judge" or "judge" in stage:
                 judge_count += 1
         judge_calls_per_turn.append(float(judge_count))
         if not calls:

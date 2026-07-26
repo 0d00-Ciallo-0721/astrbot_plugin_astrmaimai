@@ -349,7 +349,9 @@ class GroupDialogueStore:
             units.append(
                 TopicUnit(
                     slot="topic",
-                    text=f"当前主要是在延续刚才的群聊话题，最近落点是“{self._preview_text(anchor.content, 28)}”。",
+                    # OPT-16/ID-04: 中性措辞——该模板同时服务私聊（1:1 对话被"群聊/
+                    # 群友"话术误导，私聊 15/15 轮实证命中）
+                    text=f"当前主要是在延续刚才的对话，最近落点是“{self._preview_text(anchor.content, 28)}”。",
                     event_ids=[anchor.event_id] if anchor.event_id else [],
                 )
             )
@@ -368,7 +370,7 @@ class GroupDialogueStore:
                 units.append(
                     TopicUnit(
                         slot="event",
-                        text="最近的推进是我刚给过回应，群里现在是在顺着那个回应继续消化细节。",
+                        text="最近的推进是我刚给过回应，对话现在是在顺着那个回应继续消化细节。",
                         event_ids=[latest_assistant.event_id] if latest_assistant.event_id else [],
                     )
                 )

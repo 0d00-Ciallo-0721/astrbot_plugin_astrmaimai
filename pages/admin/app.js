@@ -159,9 +159,15 @@ function isCurrentView(request) {
 async function cachedFetch(key, fetchFn, fallback, ttlMs = DATA_CACHE_TTL_MS) {
   const cached = state.dataCache[key];
   if (cached && Date.now() - Number(cached.updatedAt || 0) <= ttlMs) return cached.data;
-  const data = await safeFetch(fetchFn, cached?.data ?? fallback);
-  state.dataCache[key] = { data, updatedAt: Date.now() };
-  return data;
+  // OPT-16/WU-09: 错误回退不得当作新鲜数据写缓存——否则一次瞬时 bridge/后端故障
+  // 会让该 tab 稳定空白 180 秒（切 tab 也不重试）；失败时沿用旧缓存值但不刷新时间戳
+  try {
+    const data = await fetchFn();
+    state.dataCache[key] = { data, updatedAt: Date.now() };
+    return data;
+  } catch (error) {
+    return await safeFetch(() => { throw error; }, cached?.data ?? fallback);
+  }
 }
 
 function clearDataCache(prefix = "") {
@@ -1274,6 +1280,12 @@ function openTurnTrace(index, source = state.cache.turns) {
       ${section("工具决策 Tools", "", `${renderToolRemovalSummary(item.tools || {})}<pre>${json(item.tools || {})}</pre>`)}
     </div>
     ${section("连续性来源 Continuity", "", `<pre>${json(item.continuity || {})}</pre>`)}
+    ${section("运行账本 Run Ledger", "OPT-11/WU-11：调用账本、阶段账本、回复统计与预算此前已随接口返回但页面零呈现，排查延迟要下载 trace 文件。", `
+      <div class="grid two">
+        ${section("预算 Budget", "", `<pre>${json(item.budget || {})}</pre>`)}
+        ${section("回复统计 Reply Stats", "", `<pre>${json(item.reply_stats || {})}</pre>`)}
+      </div>
+      <pre>${json({ llm_call_ledger: item.llm_call_ledger || [], stage_ledger: item.stage_ledger || [], memory_funnel: item.memory_funnel || {} })}</pre>`)}
   `);
 }
 
@@ -1291,7 +1303,7 @@ async function renderDashboardTools() {
     <tr>
       <td>${formatTime(item.created_at || item.timestamp)}</td>
       <td>${escapeHtml(item.chat_id || "-")}</td>
-      <td>${escapeHtml(item.tool_name || item.name || "-")}</td>
+      <td>${escapeHtml(item.tool_name || item.name || (Array.isArray(item.tool_names) ? item.tool_names.join(", ") : "") || "-")}</td>
       <td>${escapeHtml(item.tool_tier || item.final_tier || "-")}</td>
       <td>${statusChip(item.status || item.lifecycle || "observed", item.status === "failed" ? "danger" : "ok")}</td>
       <td><button class="ghost-button" data-tool-detail="${index}" type="button">详情</button></td>
@@ -1563,7 +1575,7 @@ async function loadReviews() {
     <div class="filter-bar"><label class="inline-label">搜索 <input data-review-search value="${attr(state.cache.reviews.filters.keyword)}" placeholder="词语、含义或场景"></label>${state.reviewTab.startsWith("jargon") ? `<button class="ghost-button" data-jargon-noise-preview type="button">噪声预检</button>` : ""}</div>
     ${subTabs(state.reviewTab, [
       { id: "jargon_pending", label: "黑话待审" },
-      { id: "jargon_all", label: "黑话全量" },
+      { id: "jargon_all", label: "黑话词库（已通过）" },
       { id: "expression_pending", label: "表达待审" },
       { id: "expression_all", label: "表达全量" },
     ], "review-tab")}
@@ -1789,7 +1801,7 @@ async function loadMemories() {
       ${metric("索引异常", indexIssueCount, "缺失、孤立、失效或重复投影")}
     </div>
     ${audit ? `<div class="notice ${Number(audit.suspect_count || 0) ? "warning" : "ok"}">最近审计：扫描 ${Number(audit.scanned || 0)} 条，发现 ${Number(audit.suspect_count || 0)} 条疑似污染。${Object.entries(auditReasons).map(([reason, count]) => `${escapeHtml(reason)} ${Number(count)}`).join(" · ")}</div>` : ""}`,
-    `<button class="ghost-button" data-memory-quality-audit type="button">只读质量审计</button><button class="danger-button" data-memory-quality-quarantine type="button">隔离审计命中项</button><button class="ghost-button" data-memory-index-rebuild type="button">重建召回索引</button>`,
+    `<button class="ghost-button" data-memory-quality-audit type="button">只读质量审计</button><button class="danger-button" data-memory-quality-quarantine type="button">隔离审计命中项</button><button class="ghost-button" data-memory-index-rebuild type="button">重建召回索引</button><button class="ghost-button" data-memory-maintenance-run type="button">执行维护</button>`,
   ) : "";
   content().innerHTML = `
     ${pageHeader("记忆网络 Memories", "以 Canonical v2 长期记忆为主视图；旧事件、反思和实体图谱保留为辅助诊断。")}
@@ -1875,15 +1887,31 @@ async function loadMemories() {
     clearDataCache("memories:");
     loadMemories();
   });
+  // OPT-05/WU-04: 维护端点此前后端已注册但前端从不调用，治理自愈通道断裂
+  $('[data-memory-maintenance-run]')?.addEventListener("click", async () => {
+    if (!await confirmAction("立即执行一次记忆维护（索引一致性修复 + 积压体检）？物理清理受配置开关控制。")) return;
+    // round11 契约：api 层已统一单层解包，禁止再 .data 二次解包
+    const report = (await api.post("/memories/maintenance/run", {})) || {};
+    toast(`维护完成：修复投影 ${Number(report.projection_deleted || 0)}，物理清理 ${Number(report.physically_deleted || 0)}，标记过期 ${Number(report.marked_stale || 0)}`);
+    clearDataCache("memories:");
+    loadMemories();
+  });
   $$('[data-memory-delete]').forEach((button) => button.addEventListener("click", async () => {
     const id = button.dataset.memoryDelete;
     if (!id || !await confirmAction("删除这条记忆记录？", "danger")) return;
-    if (state.memoryTab === "canonical") await api.post(`/memories/canonical/${segment(id)}/delete`);
-    if (state.memoryTab === "events") await api.post(`/memories/events/${segment(id)}/delete`);
-    if (state.memoryTab === "reflections") await api.post(`/memories/reflections/${segment(id)}/delete`);
-    if (state.memoryTab === "nodes") await api.post(`/memories/nodes/${segment(id)}/delete`);
-    if (state.memoryTab === "jargon") await api.post(`/memories/jargon/${segment(id)}/delete`);
-    toast("记忆记录已删除");
+    let deleteResult = null;
+    if (state.memoryTab === "canonical") deleteResult = await api.post(`/memories/canonical/${segment(id)}/delete`);
+    if (state.memoryTab === "events") deleteResult = await api.post(`/memories/events/${segment(id)}/delete`);
+    if (state.memoryTab === "reflections") deleteResult = await api.post(`/memories/reflections/${segment(id)}/delete`);
+    if (state.memoryTab === "nodes") deleteResult = await api.post(`/memories/nodes/${segment(id)}/delete`);
+    if (state.memoryTab === "jargon") deleteResult = await api.post(`/memories/jargon/${segment(id)}/delete`);
+    // OPT-16/WU-12: legacy 只读记录删除返回 readonly/changed=false，此前一律
+    // toast "已删除"而行刷新后仍在——按钮看似坏了
+    if (deleteResult && (deleteResult.status === "readonly" || deleteResult.changed === false)) {
+      toast("该记录为只读历史数据，无法删除（未做任何更改）");
+    } else {
+      toast("记忆记录已删除");
+    }
     clearDataCache("memories:");
     loadMemories();
   }));

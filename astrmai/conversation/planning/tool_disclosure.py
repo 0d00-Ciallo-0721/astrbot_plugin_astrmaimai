@@ -96,7 +96,8 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "vision_message": ("artifact",),
     "cross_reply": ("cross_session",),
     "custom_face": ("fun",),
-    "quote_reply": ("artifact", "native_action"),
+    # OPT-12/TL-08: quote_reply 属 PRECISION_ONLY（plan() 剔除包映射），此处映射
+    # 为死配置且与 TOOL_PACKAGES 矛盾——引用能力只经 exact_tool_names 显式注入
     "message_recall": ("artifact",),
     "topic_thread": ("artifact", "conversation_control"),
     "capability": ("core",),

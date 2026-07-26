@@ -58,10 +58,12 @@ async def canonical_kind_review_stats(
 ) -> dict[str, int]:
     store = plugin_api.get_v2_store() if plugin_api is not None else None
     if store is not None and hasattr(store, "list_canonical"):
-        total = await _count_canonical(store, kind=kind)
         pending = await _count_canonical(store, kind=kind, status="review_pending")
         approved = await _count_canonical(store, kind=kind, status="active")
         rejected = await _count_canonical(store, kind=kind, status="rejected")
+        # OPT-16/WU-12: total 不再混入 deleted/superseded 行（语料量虚高）——
+        # 口径 = 生效中 + 待审核；已驳回单列
+        total = approved + pending
         return {
             "total": total,
             "pending": pending,

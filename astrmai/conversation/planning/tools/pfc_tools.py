@@ -2051,8 +2051,16 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                 _record_tool_execution(event, self.name, status="failed")
                 return f"视觉转述查询失败：读取图片消息 {message_id} 时出错：{exc}"
         else:
+            # OPT-12/TL-03: 执行事件被 sanitize 成 Plain 占位，优先读保留的原始组件
+            preserved_segments = (
+                event.get_extra("astrmai_original_message_segments", None)
+                if hasattr(event, "get_extra")
+                else None
+            )
             payload = {
-                "message": getattr(getattr(event, "message_obj", None), "message", None),
+                "message": preserved_segments
+                if preserved_segments
+                else getattr(getattr(event, "message_obj", None), "message", None),
                 "raw_message": getattr(getattr(event, "message_obj", None), "raw_message", None),
             }
         candidates = _extract_image_candidates(_payload_data(payload))

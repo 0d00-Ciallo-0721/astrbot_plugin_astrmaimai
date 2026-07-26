@@ -260,7 +260,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         turn_context.continuity.semantic_system_hash = str(prefix_status.get("semantic_system_hash", "") or "")
         turn_context.continuity.semantic_system_length = int(prefix_status.get("semantic_system_length", 0) or 0)
         turn_context.continuity.prefix_stable = bool(prefix_status.get("prefix_stable", False))
-        turn_context.continuity.prefix_changed_reason = str(prefix_status.get("prefix_changed_reason", "") or "unavailable_in_trace")
+        # OPT-11/RT-10: 稳定轮 reason 为空串是正常态，旧代码 or "unavailable_in_trace"
+        # 把 61/67 稳定轮标成不可用，缓存趋势分析失真
+        turn_context.continuity.prefix_changed_reason = str(
+            prefix_status.get("prefix_changed_reason", "")
+            or ("stable" if bool(prefix_status.get("prefix_stable", False)) else "unavailable_in_trace")
+        )
         turn_context.continuity.frozen_prefix_length = int(prefix_status.get("frozen_prefix_length", 0) or 0)
         turn_context.continuity.semi_stable_length = int(prefix_status.get("semi_stable_length", 0) or 0)
         turn_context.continuity.frozen_prefix_blocks = dict(prefix_status.get("frozen_prefix_blocks", {}) or {})
@@ -489,6 +494,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             tool_tier = str(event.get_extra("astrmai_tool_tier", "full") or "full")
         tool_names = [str(getattr(tool, "name", "") or "").strip() for tool in tools]
         guidance_lines = list(getattr(prompt_envelope, "guidance_lines", []) or [])
+        # OPT-12/TL-01: 二段披露 585 轮/16h 零触发——唯一入口是模型主动调
+        # bot_capability_lookup，但 guidance 从未提示该自检路径
+        if "bot_capability_lookup" in tool_names:
+            guidance_lines.append(
+                "如果当前工具不足以查证事实，可先调用 bot_capability_lookup(needed_package=...) 申请追加工具包，系统会带新工具重跑本轮再回答。"
+            )
         if event is not None and hasattr(event, "get_extra"):
             required_tools = [
                 str(name or "").strip()
