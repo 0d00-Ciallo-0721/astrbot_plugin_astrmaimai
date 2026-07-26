@@ -4,6 +4,8 @@ from dataclasses import asdict, is_dataclass
 import json
 import sqlite3
 
+from astrbot.api import logger
+
 from ..adapters.plugin_api import PluginApiAdapter
 
 
@@ -16,6 +18,24 @@ class ReviewUiService:
         if self.plugin_api:
             return self.plugin_api.get_expression_pattern_service()
         return None
+
+    async def _sync_expression_projection(self, pattern_id: str, review_status: str) -> None:
+        # OPT-04/WU-05: 表达审批后同步召回索引投影——jargon/canonical 修订路径均有同款，
+        # 唯独 expression 缺失，导致通过的表达在向量召回缺位直至重启、质量面板持续报缺口
+        getter = getattr(self.plugin_api, "get_index_projector", None) if self.plugin_api else None
+        try:
+            projector = getter() if callable(getter) else None
+        except Exception:
+            projector = None
+        if not projector:
+            return
+        try:
+            if review_status in {"approved", "replace"}:
+                await projector.project(str(pattern_id))
+            elif review_status == "rejected":
+                await projector.cleanup_deleted([str(pattern_id)])
+        except Exception:
+            logger.debug("[ReviewUiService] expression projection sync degraded", exc_info=True)
 
     def _runtime_bound(self) -> bool:
         return self._pattern_service() is not None
@@ -213,6 +233,20 @@ class ReviewUiService:
         mapped = self._ACTION_MAP.get(action)
         if mapped is None:
             return {"status": "error", "message": f"Unknown action: {action!r}"}
+        weight_delta = 0.0
+        if weight is not None:
+            # OPT-04/WU-02: UI 传入的是绝对权重，delta 必须相对当前权重计算。
+            # 此前按 weight-1.0 当增量应用，预填值原样保存也会漂移（2.0 → 3.0 封顶）。
+            current_weight = 1.0
+            weight_service = self._pattern_service()
+            if weight_service and hasattr(weight_service, "get_pattern"):
+                try:
+                    current_record = await weight_service.get_pattern(str(review_id))
+                    if current_record is not None:
+                        current_weight = float(getattr(current_record, "weight", 1.0) or 1.0)
+                except Exception:
+                    logger.debug("[ReviewUiService] current weight lookup degraded", exc_info=True)
+            weight_delta = float(weight) - current_weight
         result = await self.plugin_api.submit_review(
             pattern_id=str(review_id),
             decision=mapped,
@@ -220,7 +254,7 @@ class ReviewUiService:
             replacement_expression=replacement or "",
             style=style or "",
             reason=reason or "",
-            weight_delta=float(weight) - 1.0 if weight is not None else 0.0,
+            weight_delta=weight_delta,
         )
         extra_update = {
             key: value
@@ -238,6 +272,7 @@ class ReviewUiService:
             if service and hasattr(service, "update_review"):
                 await service.update_review(str(review_id), modified_by="human:webui", **extra_update)
         if result and result.get("id"):
+            await self._sync_expression_projection(str(review_id), mapped)
             return {"status": "ok", "data": result}
         service = self._pattern_service()
         if service and hasattr(service, "update_review"):
@@ -262,6 +297,7 @@ class ReviewUiService:
                     if abs(delta) > 1e-9:
                         await service.adjust_weight(str(review_id), delta)
                         updated = await service.get_pattern(str(review_id))
+                await self._sync_expression_projection(str(review_id), mapped)
                 data = self._canonical_to_review_item(
                     {
                         "id": getattr(updated, "id", ""),

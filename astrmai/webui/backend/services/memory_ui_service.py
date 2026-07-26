@@ -654,21 +654,55 @@ class MemoryUiService:
         engine = self._memory_engine()
         store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "list_canonical"):
-            result = await store.list_canonical(
-                kind="jargon",
-                status=status,
-                session_id=group_id,
-                limit=page_limit,
-                offset=page_offset,
-            )
-            items = [self._canonical_jargon_view(item) for item in result.get("items", [])]
-            filtered = self._filter_jargon_rows(items, query=query)
+            if not str(query or "").strip():
+                result = await store.list_canonical(
+                    kind="jargon",
+                    status=status,
+                    session_id=group_id,
+                    limit=page_limit,
+                    offset=page_offset,
+                )
+                items = [self._canonical_jargon_view(item) for item in result.get("items", [])]
+                return {
+                    "items": items,
+                    "total": int(result.get("total", len(items)) or 0),
+                    "limit": page_limit,
+                    "offset": page_offset,
+                    "runtime_bound": True,
+                }
+            # OPT-04/WU-10: 关键字过滤必须先于分页——此前只过滤"当前页"且 total 用
+            # 未过滤总数，命中不在当前页时用户看到"暂无数据 + 共 N 条"的矛盾页面
+            matches: list[dict] = []
+            scan_offset = 0
+            scan_chunk = 500
+            scan_cap = 2000
+            scanned = 0
+            while scanned < scan_cap:
+                chunk = await store.list_canonical(
+                    kind="jargon",
+                    status=status,
+                    session_id=group_id,
+                    limit=scan_chunk,
+                    offset=scan_offset,
+                )
+                rows = chunk.get("items", []) or []
+                if not rows:
+                    break
+                views = [self._canonical_jargon_view(item) for item in rows]
+                matches.extend(self._filter_jargon_rows(views, query=query))
+                got = len(rows)
+                scanned += got
+                scan_offset += got
+                if got < scan_chunk:
+                    break
             return {
-                "items": filtered,
-                "total": int(result.get("total", len(filtered)) or 0),
+                "items": matches[page_offset : page_offset + page_limit],
+                "total": len(matches),
                 "limit": page_limit,
                 "offset": page_offset,
                 "runtime_bound": True,
+                # 不做静默截断：扫描触顶时显式告知（>2000 行的库建议后续下推 SQL/FTS）
+                "search_scan_capped": scanned >= scan_cap,
             }
         async with self.db_factory() as db:
             try:
@@ -1317,6 +1351,18 @@ class MemoryUiService:
         return await self.update_jargon(str(jargon_id), payload)
 
     async def reject_jargon(self, jargon_id: str, data: dict | None = None) -> dict[str, object]:
+        # OPT-04/WU-07: runtime 态驳回改软墓碑（status=rejected）而非物理删除——
+        # JargonMiner.existing_terms 依赖含 rejected 的 canonical 行做去重，硬删会让
+        # 同一噪声词下轮挖掘重新回流待审；过期 rejected 行由维护任务按 grace 期 purge。
+        # legacy-only 模式（无 v2 store）不参与挖掘去重，保留原物理删除语义。
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+        if store is not None:
+            payload = dict(data or {})
+            payload.update({"status": "rejected", "manual_action": "reject"})
+            result = await self.update_jargon(str(jargon_id), payload)
+            result["action"] = "reject"
+            result["tombstone"] = True
+            return result
         result = await self.delete_jargon(str(jargon_id))
         result["action"] = "reject"
         return result

@@ -38,9 +38,29 @@ class ExpressionReviewService:
             "create_time": getattr(pattern, "create_time", 0.0),
         }
 
+    _HUMAN_QUEUE_REVIEW_STATUSES = {"pending", "revision_needed", "pending_human"}
+
     async def list_pending_reviews(self, group_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         service = self._pattern_service()
-        if service and hasattr(service, "list_reviewable_patterns"):
+        if service and hasattr(service, "list_patterns"):
+            # OPT-04/WU-03: 人工待审队列独立查询，必须包含 pending_human——
+            # list_reviewable_patterns 是 auto-check 的口径（刻意排除 pending_human，
+            # R09-04），复用它导致"升级人工"的候选计入徽标却永不出现在队列
+            capped = max(int(limit or 50), 1)
+            rows = await service.list_patterns(
+                str(group_id or ""),
+                limit=capped,
+                only_checked=False,
+                include_rejected=False,
+                statuses=["review_pending"],
+            )
+            patterns = [
+                item
+                for item in rows
+                if str(getattr(item, "review_status", "") or "").strip().lower()
+                in self._HUMAN_QUEUE_REVIEW_STATUSES
+            ][:capped]
+        elif service and hasattr(service, "list_reviewable_patterns"):
             patterns = await service.list_reviewable_patterns(group_id=group_id, limit=limit)
         else:
             patterns = await self.db.list_expression_reviews_async(
@@ -102,6 +122,12 @@ class ExpressionReviewService:
                     "review_suggestion": "",
                 }
             )
+            if replacement_expression:
+                # OPT-04/WU-01: "编辑后保存并通过"必须落库人工修订文本；
+                # 此前仅 revise/replace 分支携带 replacement，前端只发 approve/reject，
+                # 人工改的字被静默丢弃且 toast 仍显示成功
+                kwargs["replacement_expression"] = replacement_expression
+                kwargs["apply_replacement"] = True
         elif normalized == "rejected":
             kwargs.update(
                 {
@@ -111,6 +137,10 @@ class ExpressionReviewService:
                     "review_suggestion": "",
                 }
             )
+            if replacement_expression:
+                # OPT-04/WU-01: 编辑驳回同样保留修订文本（记录驳回时的人工意见）
+                kwargs["replacement_expression"] = replacement_expression
+                kwargs["apply_replacement"] = True
         elif normalized in {"revision_needed", "revised", "replace"}:
             kwargs.update(
                 {

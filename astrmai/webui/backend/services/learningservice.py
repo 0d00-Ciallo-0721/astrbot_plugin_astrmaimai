@@ -37,10 +37,16 @@ class LearningService:
     async def expression_cooldowns(self) -> dict[str, Any]:
         planner = self.plugin_api.get_planner()
         selector = getattr(planner, "expression_selector", None) if planner else None
+        # OPT-04/WU-08: 真实属性是 _recent_pattern_keys（tuple 列表，需序列化）；
+        # 旧属性名 _recent_patterns 从未存在，导致该端点自首个提交起恒返回空
+        recent_raw = self._as_dict(selector).get("_recent_pattern_keys", {}) if selector else {}
         return {
             "status": "ok",
             "data": {
-                "recent_patterns": self._as_dict(selector).get("_recent_patterns", {}) if selector else {},
+                "recent_patterns": {
+                    str(scope): [list(item) for item in (entries or [])]
+                    for scope, entries in dict(recent_raw or {}).items()
+                },
             },
             "runtime_bound": selector is not None,
         }

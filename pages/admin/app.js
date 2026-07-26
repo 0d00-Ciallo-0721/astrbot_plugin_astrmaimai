@@ -1507,7 +1507,9 @@ async function loadReviews() {
     activePage = normalized;
   } else if (state.reviewTab === "expression_all") {
     const target = state.cache.reviews.expressionAll;
-    activePage = await cachedFetch(`${tabKey}:${target.page}`, () => api.get(`/reviews?page=${target.page}&page_size=${target.page_size}`), target);
+    // OPT-04/WU-10: 关键字下推给后端（后端已支持 keyword），否则搜索只作用于当前页
+    const expressionKeyword = state.cache.reviews.filters.keyword ? `&keyword=${segment(state.cache.reviews.filters.keyword)}` : "";
+    activePage = await cachedFetch(`${tabKey}:${target.page}:${state.cache.reviews.filters.keyword}`, () => api.get(`/reviews?page=${target.page}&page_size=${target.page_size}${expressionKeyword}`), target);
     state.cache.reviews.expressionAll = { items: asItems(activePage), total: Number(activePage.total ?? asItems(activePage).length), page: Number(activePage.page ?? target.page), page_size: Number(activePage.page_size ?? target.page_size) };
     activePage = state.cache.reviews.expressionAll;
   } else {
@@ -1536,7 +1538,7 @@ async function loadReviews() {
           <button class="primary-button" data-edit-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">编辑通过</button>
           <button class="primary-button" data-approve-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">批准</button>
           ${reviewMode === "jargon" ? "" : `<button class="ghost-button" data-edit-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">备注驳回</button>`}
-          <button class="danger-button" data-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">${reviewMode === "jargon" ? (state.reviewTab === "jargon_all" ? "删除" : "驳回并删除") : "驳回"}</button>
+          <button class="danger-button" data-reject-review="${attr(id)}" data-review-kind="${reviewMode}" type="button">${reviewMode === "jargon" ? (state.reviewTab === "jargon_all" ? "下架" : "驳回") : "驳回"}</button>
         </td>
       </tr>
     `;
@@ -1668,7 +1670,7 @@ function bindReviewActions() {
   $$('[data-reject-review]').forEach((button) => button.addEventListener("click", async () => {
     if (!button.dataset.rejectReview) return;
     if (button.dataset.reviewKind === "jargon") {
-      if (!await confirmAction(state.reviewTab === "jargon_all" ? "确认删除这条已通过黑话？删除后不可恢复。" : "确认驳回并删除这条黑话？删除后不可恢复。")) return;
+      if (!await confirmAction(state.reviewTab === "jargon_all" ? "确认下架这条已通过黑话？将进入驳回墓碑（同词不再回流待审），过期由维护任务清理。" : "确认驳回这条黑话？驳回后同词不再回流待审（进入墓碑，过期由维护任务清理）。")) return;
       await api.post(`/memories/jargon/${segment(button.dataset.rejectReview)}/reject`);
     } else {
       await api.post(`/reviews/${segment(button.dataset.rejectReview)}/submit`, { action: "reject" });

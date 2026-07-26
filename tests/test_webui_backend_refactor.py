@@ -747,7 +747,10 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(legacy_count, 0)
         self.assertEqual(remaining["total"], 0)
 
-    def test_runtime_jargon_delete_cleans_projection(self):
+    def test_runtime_jargon_reject_tombstones_and_cleans_projection(self):
+        # OPT-04/WU-07: runtime 态驳回改软墓碑（status=rejected），不再物理删除——
+        # 硬删会抹掉挖掘器 existing_terms 依赖的去重墓碑，噪声词回流待审。
+        # 旧断言 physical_delete=True 锁定的正是该缺陷行为。
         from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
 
         calls = []
@@ -758,13 +761,18 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                     id=memory_id,
                     kind="jargon",
                     content="hiyohiyo",
+                    status="active",
+                    summary="招呼语",
                     session_id="chat-1",
                     metadata={"meaning": "招呼语"},
                 )
 
-            async def hard_delete(self, memory_id, kind=""):
-                calls.append(("delete", memory_id, kind))
+            async def update_memory(self, memory_id, **kwargs):
+                calls.append(("update", memory_id, str(kwargs.get("status") or ""), str(kwargs.get("visibility") or "")))
                 return 1
+
+            async def hard_delete(self, memory_id, kind=""):
+                raise AssertionError("runtime 态驳回不得物理删除")
 
         class _Projector:
             async def cleanup_deleted(self, memory_ids):
@@ -778,9 +786,19 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             def get_index_projector(self):
                 return _Projector()
 
+            def get_memory_engine(self):
+                return None
+
         result = asyncio.run(MemoryUiService(None, _PluginApi()).reject_jargon("mem-jargon-1"))
-        self.assertTrue(result["physical_delete"])
-        self.assertEqual(calls, [("delete", "mem-jargon-1", "jargon"), ("projector", ["mem-jargon-1"])])
+        self.assertTrue(result["tombstone"])
+        self.assertEqual(result["action"], "reject")
+        self.assertEqual(
+            calls,
+            [
+                ("update", "mem-jargon-1", "rejected", "maintenance_only"),
+                ("projector", ["mem-jargon-1"]),
+            ],
+        )
 
     def test_memory_route_file_exposes_jargon_review_endpoints(self):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "routes" / "memory_routes.py"
