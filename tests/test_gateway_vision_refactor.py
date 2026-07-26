@@ -605,6 +605,52 @@ class GatewayVisionRefactorTests(unittest.TestCase):
             context_mod.WorkloadFamily.VISION,
         )
 
+    def test_call_vision_task_forwards_timeout_override(self):
+        from astrmai.infrastructure.gateway.gateway_tasks import GatewayTaskMixin
+
+        captured = {}
+
+        class _Gateway(GatewayTaskMixin):
+            lane_manager = None
+            router = None
+            context_economy = SimpleNamespace(
+                build_request=lambda **kwargs: kwargs,
+                resolve_policy=lambda request: request,
+            )
+
+            def _vision_models(self):
+                return ["vision-model"]
+
+            def _filter_cooldown_attempt_queue(self, *_args):
+                return (["vision-model"], [], False)
+
+            async def _elastic_call_result(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    parsed_json={"description": "ok", "emotion_tags": []},
+                    model_id="vision-model",
+                )
+
+            def _is_model_cooldown(self, *_args):
+                return False
+
+            def _open_model_cooldown(self, *_args):
+                return None
+
+            def _classify_failure_kind(self, *_args):
+                return SimpleNamespace(value="unknown")
+
+        result = asyncio.run(
+            _Gateway().call_vision_task(
+                image_data="image.png",
+                prompt="describe",
+                timeout_override=12.5,
+            )
+        )
+
+        self.assertEqual(result["description"], "ok")
+        self.assertEqual(captured["timeout_override"], 12.5)
+
     def test_get_agent_models_combines_router_rankings_and_records_filter_state(self):
         task_mod = importlib.import_module("astrmai.infrastructure.gateway.gateway_tasks")
 

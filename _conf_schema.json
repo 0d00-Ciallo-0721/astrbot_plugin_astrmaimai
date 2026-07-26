@@ -619,12 +619,6 @@
     "type": "object",
     "description": "私聊连续对话",
     "items": {
-      "image_analysis_retries": {
-        "description": "私聊图片识别重试次数",
-        "type": "int",
-        "default": 2,
-        "hint": "视觉模型临时失败时自动重试；全部失败后会明确按图片读取失败处理，不会猜测内容。"
-      },
       "topic_continuity_enabled": {
         "description": "启用私聊话题承接",
         "type": "bool",
@@ -1246,7 +1240,15 @@
         "default": 45.0,
         "minimum": 1,
         "maximum": 1200,
-        "hint": "视觉模型分析图片并形成转述的等待时间。慢视觉模型建议设置为 180 至 300。"
+        "hint": "单次视觉模型调用的最长等待时间。最终等待还会受到“整轮图片识别总时限”限制。"
+      },
+      "vision_barrier_total_timeout_sec": {
+        "description": "整轮图片识别总时限（秒）",
+        "type": "float",
+        "default": 180.0,
+        "minimum": 1,
+        "maximum": 3600,
+        "hint": "从读取图片文件开始，到所有图片识别和重试结束的总等待上限。图片数量和重试次数不会把这个时间继续放大。慢模型可设置为 180 至 300。"
       }
     }
   },
@@ -1277,6 +1279,21 @@
         "type": "float",
         "default": 0.5,
         "hint": "用于控制普通场景的看图频率。私聊图片以及群聊中明确 @ 机器人的图片始终会尝试识别，不受此概率影响；关闭“启用看图能力”后则所有图片都不会识别。"
+      },
+      "vision_reply_policy": {
+        "description": "图片识别超时后的回复方式",
+        "type": "string",
+        "default": "超时后忽略图片并继续回复",
+        "options": ["超时后忽略图片并继续回复", "必须识别成功后再回复"],
+        "hint": "“超时后忽略图片并继续回复”会把未识别图片替换成“[图片]”，保留文字继续回答；“必须识别成功后再回复”会在识别失败时停止本轮回答并提示用户重发，适合必须先看图才能回答的场景。"
+      },
+      "image_analysis_retries": {
+        "description": "图片识别失败重试次数",
+        "type": "int",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 5,
+        "hint": "只在整轮图片识别总时限内重试。达到总时限后会立即按上面的回复方式处理，不会继续等待。"
       },
       "use_native_main_reply_vision": {
         "description": "主回复原生识图直通开关",

@@ -46,6 +46,7 @@ class GatewayTaskMixin:
         persona_id: str = "",
         workload_family: WorkloadFamily = WorkloadFamily.VISION,
         template_envelope: Optional[PromptEnvelope] = None,
+        timeout_override: Optional[float] = None,
     ) -> Dict[str, Any]:
         vision_models = self._vision_models()
         if not vision_models:
@@ -87,6 +88,7 @@ class GatewayTaskMixin:
                         persona_id=persona_id,
                         template_envelope=template_envelope,
                         result_validator=self._normalize_vision_failure_reason,
+                        timeout_override=timeout_override,
                     )
                     parsed = result.parsed_json or {}
                     is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
@@ -162,6 +164,7 @@ class GatewayTaskMixin:
                     result_validator=self._normalize_vision_failure_reason,
                     ledger_stage="multimodal.vision",
                     ledger_family=workload_family.value,
+                    timeout_override=timeout_override,
                 )
                 parsed = result.parsed_json or {}
                 is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)

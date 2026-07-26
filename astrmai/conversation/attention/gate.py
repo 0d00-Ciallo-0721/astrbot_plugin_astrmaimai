@@ -1070,7 +1070,13 @@ class AttentionGate:
         session = await self._get_or_create_session(chat_id)
 
         defer_private_context = bool(is_private and self.private_turn_coordinator is not None)
-        if not defer_private_context:
+        defer_direct_vision_context = bool(
+            not is_private
+            and perception.is_strong_wakeup
+            and extracted_images
+            and self.private_turn_coordinator is not None
+        )
+        if not defer_private_context and not defer_direct_vision_context:
             await self._apply_primary_mood_update(event, chat_id, msg_str)
 
         forced = await self._handle_force_engage(event, chat_id)
@@ -1090,14 +1096,25 @@ class AttentionGate:
 
         if not is_private and is_strong_wakeup:
             prepare_direct_event = getattr(self.private_turn_coordinator, "prepare_direct_event", None)
+            vision_outcome = None
             if callable(prepare_direct_event):
                 try:
-                    await prepare_direct_event(event, chat_id)
+                    vision_outcome = await prepare_direct_event(event, chat_id)
                 except Exception as exc:
                     logger.warning(
                         f"[AttentionGate] direct group vision barrier degraded for {chat_id}: {exc}",
                         exc_info=True,
                     )
+            if self._vision_barrier_should_abort(vision_outcome, event):
+                failure_text = await self._send_required_vision_failure(event)
+                await self._complete_proactive_candidate(event, reason="vision_required_failed")
+                await self._finalize_pre_planner_turn(
+                    event,
+                    chat_id,
+                    status="skipped_vision_required",
+                    reply_text=failure_text,
+                )
+                return "VISION_REQUIRED_FAILED"
             perception = self.perception_builder.build(event)
             context = perception.as_event_context()
             msg_str = context["msg_str"]
@@ -1106,6 +1123,12 @@ class AttentionGate:
             is_at_bot = perception.is_at_bot
             is_reply = perception.is_reply_to_bot
             is_strong_wakeup = perception.is_strong_wakeup
+            if defer_direct_vision_context:
+                await self._apply_primary_mood_update(
+                    event,
+                    chat_id,
+                    str(event.get_extra("astrmai_rich_text", msg_str) or msg_str),
+                )
 
         fast_result = None if is_private else await self._handle_fast_wakeup(event, chat_id, is_strong_wakeup)
         if fast_result:
@@ -1237,6 +1260,25 @@ class AttentionGate:
             logger.warning(f"[AttentionGate] private topic confirmation send failed: {exc}")
             return False
 
+    @staticmethod
+    def _vision_barrier_should_abort(outcome: Any, event: AstrMessageEvent) -> bool:
+        if bool(event.get_extra("astrmai_vision_required_failed", False)):
+            return True
+        return bool(getattr(outcome, "should_abort", False))
+
+    async def _send_required_vision_failure(self, event: AstrMessageEvent) -> str | None:
+        text = "这张图片暂时没有识别成功，请稍后再发一次。"
+        if not hasattr(event, "send") or not hasattr(event, "plain_result"):
+            return None
+        try:
+            await event.send(event.plain_result(text))
+            event.set_extra("astrmai_reply_sent", True)
+            event.set_extra("astrmai_vision_failure_notice_sent", True)
+            return text
+        except Exception as exc:
+            logger.warning(f"[AttentionGate] required vision failure notice send failed: {exc}")
+            return None
+
     async def _debounce_and_judge(
         self,
         chat_id: str,
@@ -1265,12 +1307,33 @@ class AttentionGate:
                     )
                     if callable(merge_pending_batch):
                         batch_events = merge_pending_batch(chat_id, batch_events)
-                    await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
+                    vision_outcome = await self.private_turn_coordinator.prepare_batch(batch_events, chat_id)
                     async with session.lock:
                         if session.accumulation_pool:
                             session.accumulation_pool = batch_events + list(session.accumulation_pool)
                             current_is_strong_wakeup = False
                             continue
+                    if self._vision_barrier_should_abort(vision_outcome, batch_events[-1]):
+                        for prepared_event in batch_events:
+                            if not bool(prepared_event.get_extra("astrmai_private_context_recorded", False)):
+                                await self._append_dialogue_segment(prepared_event)
+                                prepared_event.set_extra("astrmai_private_context_recorded", True)
+                        focus_event = batch_events[-1]
+                        failure_text = await self._send_required_vision_failure(focus_event)
+                        async with session.lock:
+                            self._append_attention_window(session, batch_events)
+                        await self._finalize_pre_planner_turn(
+                            focus_event,
+                            chat_id,
+                            status="skipped_vision_required",
+                            reply_text=failure_text,
+                        )
+                        async with session.lock:
+                            if session.accumulation_pool:
+                                current_is_strong_wakeup = False
+                                continue
+                            session.is_evaluating = False
+                            return
                     mood_event = None
                     mood_texts: list[str] = []
                     for prepared_event in batch_events:

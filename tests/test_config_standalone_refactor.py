@@ -16,6 +16,8 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertTrue(hasattr(config.sys3, "enable_work_mode"))
         self.assertTrue(hasattr(config.vision, "use_native_main_reply_vision"))
         self.assertTrue(hasattr(config.vision, "native_main_reply_failure_cooldown_sec"))
+        self.assertEqual(config.vision.vision_reply_policy, "超时后忽略图片并继续回复")
+        self.assertEqual(config.vision.image_analysis_retries, 2)
         self.assertTrue(hasattr(config, "conversation"))
         self.assertEqual(config.conversation.compaction_trigger_segments, 40)
         self.assertEqual(config.conversation.compaction_keep_recent_segments, 16)
@@ -29,6 +31,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.timing.model_request_timeout_sec, 15.0)
         self.assertEqual(config.timing.fast_mode_execution_timeout_sec, 15)
         self.assertEqual(config.timing.reply_max_age_sec, 0.0)
+        self.assertEqual(config.timing.vision_barrier_total_timeout_sec, 180.0)
         self.assertEqual(config.evolution.jargon_min_count, 2)
         self.assertEqual(config.evolution.expression_min_count, 2)
 
@@ -63,6 +66,19 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.infra.api_timeout, 300.0)
         self.assertEqual(config.agent.timeout, 900)
         self.assertEqual(config.reply.stale_reply_max_age_sec, 1200.0)
+
+    def test_legacy_private_vision_retries_migrate_to_vision_namespace(self):
+        config = AstrMaiConfig(private_chat={"image_analysis_retries": 4})
+
+        self.assertEqual(config.vision.image_analysis_retries, 4)
+        self.assertEqual(config.private_chat.image_analysis_retries, 4)
+
+    def test_vision_policy_aliases_and_invalid_values_are_normalized(self):
+        strict = AstrMaiConfig(vision={"vision_reply_policy": "strict"})
+        invalid = AstrMaiConfig(vision={"vision_reply_policy": "unknown"})
+
+        self.assertEqual(strict.vision.vision_reply_policy, "必须识别成功后再回复")
+        self.assertEqual(invalid.vision.vision_reply_policy, "超时后忽略图片并继续回复")
 
     def test_workmode_timeout_accepts_long_running_model_budget(self):
         config = AstrMaiConfig(timing={"workmode_execution_timeout_sec": 9999})
@@ -136,6 +152,12 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertIn("summary_threshold", performance_items)
         self.assertIn("use_native_main_reply_vision", vision_items)
         self.assertIn("native_main_reply_failure_cooldown_sec", vision_items)
+        self.assertEqual(
+            vision_items["vision_reply_policy"]["options"],
+            ["超时后忽略图片并继续回复", "必须识别成功后再回复"],
+        )
+        self.assertEqual(vision_items["image_analysis_retries"]["default"], 2)
+        self.assertNotIn("image_analysis_retries", schema["private_chat"]["items"])
         self.assertIn("jargon_min_count", evolution_items)
         self.assertIn("expression_min_count", evolution_items)
         self.assertEqual(performance_items["summary_threshold"]["default"], 300)
@@ -155,6 +177,8 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(timing_items["workmode_execution_timeout_sec"]["default"], 120)
         self.assertEqual(timing_items["workmode_execution_timeout_sec"]["maximum"], 86400)
         self.assertEqual(timing_items["image_resolve_timeout_sec"]["maximum"], 600)
+        self.assertEqual(timing_items["vision_barrier_total_timeout_sec"]["default"], 180.0)
+        self.assertEqual(timing_items["vision_barrier_total_timeout_sec"]["maximum"], 3600)
         self.assertNotIn("judge_timeout", schema["attention"]["items"])
         self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)
         self.assertNotIn("tool_timeout", schema["sys3"]["items"])

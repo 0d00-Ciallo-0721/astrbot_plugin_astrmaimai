@@ -100,7 +100,13 @@ class VisualCortex:
             "emotion_tags": ImagePipeline._safe_json_tags(getattr(memory, "emotion_tags", "[]")),
         }
 
-    async def analyze_image_path(self, picid: str, image_path: str, scope_id: str = "global") -> dict | None:
+    async def analyze_image_path(
+        self,
+        picid: str,
+        image_path: str,
+        scope_id: str = "global",
+        timeout_override: float | None = None,
+    ) -> dict | None:
         scoped_picid = f"{scope_id}:{picid}"
         cached = None
         if self.db_service is not None:
@@ -108,6 +114,7 @@ class VisualCortex:
         cached_payload = self._memory_payload(cached)
         if cached_payload and cached_payload.get("description"):
             logger.info(f"[AstrMai-VisualCortex] cache hit for {picid}, skip duplicate analysis.")
+            cached_payload["_cache_hit"] = True
             return cached_payload
 
         result_dict = await self.gateway.call_vision_task(
@@ -115,10 +122,12 @@ class VisualCortex:
             prompt=VISION_USER_PROMPT,
             system_prompt=VISION_SYSTEM_PROMPT,
             lane_key=self._build_lane_key(scope_id),
+            timeout_override=timeout_override,
         )
         payload, _invalid_reason = normalize_vision_result(result_dict)
         if payload is None:
             return None
+        payload["_cache_hit"] = False
         if self.db_service is not None:
             await asyncio.to_thread(
                 self._upsert_visual_memory,

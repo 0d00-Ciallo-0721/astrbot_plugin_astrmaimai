@@ -264,6 +264,11 @@ class InfraConfig(BaseModel):
 class VisionConfig(BaseModel):
     enable_vision: bool = Field(default=True, description="多模态视觉总开关")
     image_recognition_probability: float = Field(default=0.5, ge=0.0, le=1.0, description="图片被送入视觉皮层解析的概率 (0.0~1.0)")
+    vision_reply_policy: str = Field(
+        default="超时后忽略图片并继续回复",
+        description="图片识别超时后的回复策略",
+    )
+    image_analysis_retries: int = Field(default=2, ge=1, le=5, description="图片识别失败重试次数")
     use_native_main_reply_vision: bool = Field(
         default=False,
         description="主回复原生识图直通开关，仅当当前主回复模型支持原生图片输入时再开启；插件不会自动判断模型能力。",
@@ -317,6 +322,7 @@ class TimingConfig(BaseModel):
     private_input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0)
     image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
     image_analysis_timeout_sec: float = Field(default=45.0, ge=1.0, le=1200.0)
+    vision_barrier_total_timeout_sec: float = Field(default=180.0, ge=1.0, le=3600.0)
 
 
 class AstrMaiConfig(BaseModel):
@@ -370,17 +376,53 @@ class AstrMaiConfig(BaseModel):
             normalized["timing"] = timing_values
         return normalized
 
+    @staticmethod
+    def _normalize_legacy_vision_namespace(data: dict) -> dict:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        raw_vision = normalized.get("vision")
+        vision_values = dict(raw_vision) if isinstance(raw_vision, dict) else {}
+        private_chat = normalized.get("private_chat")
+        if (
+            "image_analysis_retries" not in vision_values
+            and isinstance(private_chat, dict)
+            and "image_analysis_retries" in private_chat
+        ):
+            vision_values["image_analysis_retries"] = private_chat["image_analysis_retries"]
+        policy = str(
+            vision_values.get("vision_reply_policy", "超时后忽略图片并继续回复")
+            or ""
+        ).strip()
+        policy_aliases = {
+            "strict": "必须识别成功后再回复",
+            "require_analysis": "必须识别成功后再回复",
+            "timeout_fallback": "超时后忽略图片并继续回复",
+            "fallback": "超时后忽略图片并继续回复",
+        }
+        policy = policy_aliases.get(policy, policy)
+        if policy not in {"必须识别成功后再回复", "超时后忽略图片并继续回复"}:
+            policy = "超时后忽略图片并继续回复"
+        vision_values["vision_reply_policy"] = policy
+        normalized["vision"] = vision_values
+        return normalized
+
     def _sync_legacy_timing_aliases(self) -> None:
         for timing_field, section_name, legacy_field in LEGACY_TIMING_NAMESPACE_FIELDS:
             section = getattr(self, section_name, None)
             if section is not None:
                 setattr(section, legacy_field, getattr(self.timing, timing_field))
 
+    def _sync_legacy_vision_aliases(self) -> None:
+        self.private_chat.image_analysis_retries = self.vision.image_analysis_retries
+
     def __init__(self, **data):
         normalized = self._normalize_legacy_memory_namespace(data)
         normalized = self._normalize_legacy_timing_namespace(normalized)
+        normalized = self._normalize_legacy_vision_namespace(normalized)
         super().__init__(**normalized)
         self._sync_legacy_timing_aliases()
+        self._sync_legacy_vision_aliases()
         # ── 互斥配置检测 ──
         if getattr(self.sys3, "enable_work_mode", False) and not self.provider.agent_models:
             from astrbot.api import logger

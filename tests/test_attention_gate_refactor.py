@@ -1102,6 +1102,74 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         )
         self.assertEqual(captured, [("你看\n[图片转述：一只白猫坐在窗边]", True)])
 
+    def test_group_required_vision_failure_stops_before_dispatch(self):
+        class _RequiredVisionBarrier:
+            async def prepare_direct_event(self, event, chat_id):
+                event.set_extra("astrmai_vision_required_failed", True)
+                return SimpleNamespace(should_abort=True)
+
+        self.gate.private_turn_coordinator = _RequiredVisionBarrier()
+        system2_calls = []
+        self.gate.sys2_process = lambda event, events: system2_calls.append((event, events))
+        event = _FakeEvent("user-1", "Alice", "你看", extras={"wakeup": True})
+        sent = []
+
+        async def send(result):
+            sent.append(result)
+
+        event.send = send
+        event.plain_result = lambda text: text
+
+        status = asyncio.run(self.gate.process_event(event))
+
+        self.assertEqual(status, "VISION_REQUIRED_FAILED")
+        self.assertEqual(system2_calls, [])
+        self.assertEqual(sent, ["这张图片暂时没有识别成功，请稍后再发一次。"])
+        self.assertTrue(event.get_extra("astrmai_vision_failure_notice_sent"))
+
+    def test_private_required_vision_failure_stops_before_mood_judge_and_system2(self):
+        class _RequiredVisionBarrier:
+            async def wait_for_input_stability(self, session):
+                return None
+
+            async def prepare_batch(self, events, chat_id):
+                events[-1].set_extra("astrmai_vision_required_failed", True)
+                return SimpleNamespace(should_abort=True)
+
+        mood_calls = []
+        judge_calls = []
+        system2_calls = []
+        self.gate.private_turn_coordinator = _RequiredVisionBarrier()
+        self.gate._apply_primary_mood_update = lambda *args: mood_calls.append(args)
+        self.gate._evaluate_judge_gate = lambda *args, **kwargs: judge_calls.append((args, kwargs))
+        self.gate.sys2_process = lambda *args: system2_calls.append(args)
+        event = _FakePrivateEvent("user-1", "Alice", "这张图是什么")
+        sent = []
+
+        async def send(result):
+            sent.append(result)
+
+        event.send = send
+        event.plain_result = lambda text: text
+
+        async def run():
+            session = self.gate_mod.SessionContext()
+            session.accumulation_pool = [event]
+            session.is_evaluating = True
+            await self.gate._debounce_and_judge(
+                event.unified_msg_origin,
+                session,
+                "bot-1",
+                is_private=True,
+            )
+
+        asyncio.run(run())
+
+        self.assertEqual(mood_calls, [])
+        self.assertEqual(judge_calls, [])
+        self.assertEqual(system2_calls, [])
+        self.assertEqual(sent, ["这张图片暂时没有识别成功，请稍后再发一次。"])
+
     def test_group_perception_uses_unified_origin_as_chat_id(self):
         event = _FakeEvent("user-1", "Alice", "hello")
         event.unified_msg_origin = "napcat-a:GroupMessage:group-1"

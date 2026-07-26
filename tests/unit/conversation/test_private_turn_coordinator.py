@@ -10,6 +10,7 @@ class _Event:
     def __init__(self, text=""):
         self.message_str = text
         self.message_obj = SimpleNamespace(message_id="m1")
+        self.unified_msg_origin = "ff:FriendMessage:user-1"
         self._extras = {}
 
     def get_extra(self, key, default=None):
@@ -40,6 +41,64 @@ class _VisualCortex:
 class _EmojiVisualCortex:
     async def analyze_image_path(self, picid, image_path, scope_id="global"):
         return {"type": "emoji", "description": "熊猫头低着头，文字为“我太难了”。通常用于自我调侃。", "emotion_tags": ["无奈", "自嘲"]}
+
+
+class _SlowVisualCortex:
+    def __init__(self):
+        self.calls = 0
+
+    async def analyze_image_path(self, picid, image_path, scope_id="global", timeout_override=None):
+        self.calls += 1
+        await asyncio.sleep(0.2)
+        return {"type": "image", "description": "迟到的图片描述", "emotion_tags": []}
+
+
+class _PartialVisualCortex:
+    def __init__(self):
+        self.calls = 0
+
+    async def analyze_image_path(self, picid, image_path, scope_id="global", timeout_override=None):
+        self.calls += 1
+        if self.calls == 1:
+            return {"type": "image", "description": "第一张识别成功", "emotion_tags": []}
+        return None
+
+
+class _TwoImageResolver:
+    async def resolve_event_images(self, event):
+        from astrmai.multimodal.napcat_image_resolver import ImageResolutionBatch, ResolvedImage
+
+        return ImageResolutionBatch(
+            had_images=True,
+            images=[
+                ResolvedImage(index=0, source_ref="first", local_path="first.jpg"),
+                ResolvedImage(index=1, source_ref="second", local_path="second.jpg"),
+            ],
+        )
+
+
+class _PerEventResolver:
+    async def resolve_event_images(self, event):
+        from astrmai.multimodal.napcat_image_resolver import ImageResolutionBatch, ResolvedImage
+
+        message_id = str(event.message_obj.message_id)
+        return ImageResolutionBatch(
+            had_images=True,
+            images=[
+                ResolvedImage(
+                    index=0,
+                    source_ref=message_id,
+                    local_path=f"{message_id}.jpg",
+                )
+            ],
+        )
+
+
+class _MixedSpeedVisualCortex:
+    async def analyze_image_path(self, picid, image_path, scope_id="global", timeout_override=None):
+        if image_path == "slow.jpg":
+            await asyncio.sleep(0.2)
+        return {"type": "image", "description": f"识别完成:{image_path}", "emotion_tags": []}
 
 
 class _Persistence:
@@ -247,7 +306,7 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         second = _Event("后续文字")
         calls = []
 
-        async def prepare(event, chat_id):
+        async def prepare(event, chat_id, **_kwargs):
             calls.append(event.message_str)
             if event is first:
                 raise RuntimeError("unexpected vision failure")
@@ -259,7 +318,274 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertEqual(calls, ["第一张", "后续文字"])
         self.assertTrue(first.get_extra("astrmai_vision_barrier_complete"))
         self.assertTrue(first.get_extra("astrmai_vision_barrier_failed"))
-        self.assertIn("禁止猜测", first.get_extra("astrmai_rich_text"))
+        self.assertIn("[图片]", first.get_extra("astrmai_rich_text"))
+
+    def test_timeout_fallback_uses_placeholder_and_clears_image_refs(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=5,
+            ),
+            timing=SimpleNamespace(
+                image_resolve_timeout_sec=1.0,
+                image_analysis_timeout_sec=1.0,
+                vision_barrier_total_timeout_sec=0.05,
+            ),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+                image_analysis_retries=5,
+            ),
+        )
+        persistence = _Persistence()
+        cortex = _SlowVisualCortex()
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_Resolver(),
+            visual_cortex=cortex,
+            persistence=persistence,
+        )
+        event = _Event("你看")
+
+        started = time.monotonic()
+        outcome = asyncio.run(coordinator.prepare_batch([event], "ff:FriendMessage:user-1"))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
+        self.assertEqual(outcome.timeout_count, 1)
+        self.assertEqual(cortex.calls, 1)
+        self.assertEqual(event.get_extra("direct_image_refs"), [])
+        self.assertEqual(event.get_extra("extracted_image_refs"), [])
+        self.assertIn("你看", event.get_extra("astrmai_rich_text"))
+        self.assertIn("[图片]", event.get_extra("astrmai_rich_text"))
+        self.assertTrue(event.get_extra("astrmai_vision_no_guess"))
+        self.assertEqual(persistence.marked, [])
+
+    def test_required_vision_failure_aborts_without_placeholder_reply_context(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=2,
+            ),
+            timing=SimpleNamespace(
+                image_resolve_timeout_sec=1.0,
+                image_analysis_timeout_sec=1.0,
+                vision_barrier_total_timeout_sec=0.05,
+            ),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="必须识别成功后再回复",
+                image_analysis_retries=2,
+            ),
+        )
+        persistence = _Persistence()
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_Resolver(),
+            visual_cortex=_SlowVisualCortex(),
+            persistence=persistence,
+        )
+        event = _Event("这张图是什么")
+
+        outcome = asyncio.run(coordinator.prepare_direct_event(event, "ff:GroupMessage:group-1"))
+
+        self.assertEqual(outcome.downstream_action, "abort_required_vision")
+        self.assertTrue(outcome.should_abort)
+        self.assertTrue(event.get_extra("astrmai_vision_required_failed"))
+        self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text", ""))
+        self.assertEqual(persistence.marked, [])
+
+    def test_partial_success_keeps_successful_description_but_does_not_mark_complete(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=1,
+            ),
+            timing=SimpleNamespace(
+                image_resolve_timeout_sec=1.0,
+                image_analysis_timeout_sec=1.0,
+                vision_barrier_total_timeout_sec=1.0,
+            ),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+                image_analysis_retries=1,
+            ),
+        )
+        persistence = _Persistence()
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_TwoImageResolver(),
+            visual_cortex=_PartialVisualCortex(),
+            persistence=persistence,
+        )
+        event = _Event("两张图")
+
+        outcome = asyncio.run(coordinator.prepare_batch([event], "ff:FriendMessage:user-1"))
+
+        self.assertEqual(outcome.image_count, 2)
+        self.assertEqual(outcome.analyzed_count, 1)
+        self.assertEqual(outcome.failed_count, 1)
+        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
+        self.assertIn("第一张识别成功", event.get_extra("astrmai_rich_text"))
+        self.assertEqual(event.get_extra("astrmai_rich_text").count("[图片]"), 1)
+        self.assertEqual(persistence.marked, [])
+
+    def test_fallback_does_not_duplicate_existing_image_placeholder(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(input_settle_sec=0.0),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        event = _Event("你看 [图片]")
+
+        outcome = coordinator._apply_failed_policy(
+            event,
+            image_count=1,
+            failed_count=1,
+            timeout_count=1,
+            elapsed_ms=10,
+            outcome="timeout",
+        )
+
+        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
+        self.assertEqual(event.get_extra("astrmai_rich_text").count("[图片]"), 1)
+
+    def test_outcome_summary_uses_real_scope_and_excludes_image_content(self):
+        from astrmai.conversation.attention.private_turn_coordinator import (
+            PrivateTurnCoordinator,
+            VisionBarrierOutcome,
+        )
+
+        event = _Event("敏感图片正文")
+        outcome = VisionBarrierOutcome(
+            policy="timeout_fallback",
+            outcome="timeout",
+            image_count=1,
+            failed_count=1,
+            timeout_count=1,
+            elapsed_ms=50,
+            downstream_action="continue_with_placeholder",
+        )
+
+        PrivateTurnCoordinator._record_outcome(event, outcome, "")
+
+        payload = event.get_extra("astrmai_vision_barrier_outcome")
+        self.assertEqual(payload["scope"], "private")
+        self.assertEqual(payload["downstream_action"], "continue_with_placeholder")
+        self.assertNotIn("description", payload)
+        self.assertNotIn("content", payload)
+        self.assertNotIn("raw_query", payload)
+
+    def test_missing_resolver_obeys_required_vision_policy_for_image_event(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(input_settle_sec=0.0),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="必须识别成功后再回复",
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        event = _Event("帮我看看")
+        event.set_extra("extracted_image_refs", ["opaque-image-ref"])
+
+        outcome = asyncio.run(
+            coordinator.prepare_direct_event(event, "ff:GroupMessage:group-1")
+        )
+
+        self.assertTrue(outcome.should_abort)
+        self.assertEqual(outcome.outcome, "resolver_unavailable")
+        self.assertTrue(event.get_extra("astrmai_vision_required_failed"))
+
+    def test_missing_resolver_does_not_block_text_only_event(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(input_settle_sec=0.0),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="必须识别成功后再回复",
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        event = _Event("纯文字")
+
+        outcome = asyncio.run(
+            coordinator.prepare_direct_event(event, "ff:GroupMessage:group-1")
+        )
+
+        self.assertFalse(outcome.should_abort)
+        self.assertEqual(outcome.outcome, "resolver_unavailable")
+
+    def test_slow_vision_in_one_session_does_not_block_another_session(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=1,
+            ),
+            timing=SimpleNamespace(
+                image_resolve_timeout_sec=1.0,
+                image_analysis_timeout_sec=1.0,
+                vision_barrier_total_timeout_sec=0.05,
+            ),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+                image_analysis_retries=1,
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_PerEventResolver(),
+            visual_cortex=_MixedSpeedVisualCortex(),
+            persistence=_Persistence(),
+        )
+        slow_event = _Event("慢图")
+        slow_event.message_obj.message_id = "slow"
+        fast_event = _Event("快图")
+        fast_event.message_obj.message_id = "fast"
+
+        async def run():
+            slow_task = asyncio.create_task(
+                coordinator.prepare_direct_event(slow_event, "ff:FriendMessage:slow-user")
+            )
+            fast_task = asyncio.create_task(
+                coordinator.prepare_direct_event(fast_event, "ff:FriendMessage:fast-user")
+            )
+            fast_outcome = await fast_task
+            slow_done_when_fast_completed = slow_task.done()
+            slow_outcome = await slow_task
+            return fast_outcome, slow_done_when_fast_completed, slow_outcome
+
+        fast_outcome, slow_done_when_fast_completed, slow_outcome = asyncio.run(run())
+
+        self.assertEqual(fast_outcome.outcome, "success")
+        self.assertFalse(slow_done_when_fast_completed)
+        self.assertEqual(slow_outcome.downstream_action, "continue_with_placeholder")
 
 
 if __name__ == "__main__":
