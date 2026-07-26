@@ -104,8 +104,7 @@ def infer_provider_capabilities(provider_or_type: Any) -> ProviderCapabilities:
     )
 
 
-def resolve_provider_capabilities(context: Any, provider_id: str) -> ProviderCapabilities:
-    provider = None
+def _lookup_provider(context: Any, provider_id: str) -> Any:
     for accessor_name in ("get_provider_by_id", "get_provider"):
         accessor = getattr(context, accessor_name, None) if context is not None else None
         if not callable(accessor):
@@ -115,7 +114,34 @@ def resolve_provider_capabilities(context: Any, provider_id: str) -> ProviderCap
         except Exception:
             provider = None
         if provider is not None:
-            break
-    if provider is not None:
-        return infer_provider_capabilities(provider)
-    return infer_provider_capabilities(provider_id)
+            return provider
+    return None
+
+
+def resolve_provider_capabilities(context: Any, provider_id: str) -> ProviderCapabilities:
+    # OPT-09/RT-08: 网关传入的是完整模型 ID（如 code2/deepseek-v4-flash），旧实现
+    # 直接拿它当 provider type 匹配家族表必然 unknown（线上 1005/1005 全 unknown，
+    # cache_control/远程会话特性形同虚设）。按 '/' 前缀降级查 provider 对象，
+    # 字符串回退也用前缀（gemini/xx → gemini 家族）。
+    normalized_id = str(provider_id or "").strip()
+    prefix = normalized_id.split("/", 1)[0] if "/" in normalized_id else ""
+    for candidate in filter(None, (normalized_id, prefix)):
+        provider = _lookup_provider(context, candidate)
+        if provider is not None:
+            return infer_provider_capabilities(provider)
+    all_getter = getattr(context, "get_all_providers", None) if context is not None else None
+    if callable(all_getter):
+        try:
+            providers = list(all_getter() or [])
+        except Exception:
+            providers = []
+        for provider in providers:
+            meta = _provider_meta(provider)
+            registered_id = str(
+                getattr(meta, "id", None) or getattr(provider, "id", "") or ""
+            ).strip()
+            if registered_id and (
+                registered_id == normalized_id or normalized_id.startswith(f"{registered_id}/")
+            ):
+                return infer_provider_capabilities(provider)
+    return infer_provider_capabilities(prefix or normalized_id)

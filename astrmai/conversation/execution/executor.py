@@ -113,6 +113,16 @@ class ConcurrentExecutor:
                 )
                 sanitized_message_obj.message = [Plain(safe_text)]
                 sanitized_event.message_obj = sanitized_message_obj
+                # OPT-12/TL-03: 原始组件以 extra 保留供只读工具（vision/artifact）
+                # 解析——sanitize 后"当前消息"路径必然假阴性（首调"没有发现图片"，
+                # 实测一轮浪费 4 次工具调用 21.5s）；该 extra 不回流 prompt
+                try:
+                    sanitized_event.set_extra(
+                        "astrmai_original_message_segments",
+                        list(getattr(event.message_obj, "message", None) or []),
+                    )
+                except Exception:
+                    logger.debug("[Executor] original segments preserve degraded", exc_info=True)
             return sanitized_event
         except Exception:
             logger.debug("[Executor] _build_sanitized_execution_event failed", exc_info=True)
@@ -424,6 +434,18 @@ class ConcurrentExecutor:
                 logger.debug("[AstrMai-exec] _is_executor_failure_fatal inner failed", exc_info=True)
                 return False
         return False
+
+    @staticmethod
+    def _side_effect_footprint(event: AstrMessageEvent) -> int:
+        # OPT-09/TL-04: 只统计真实对外副作用（待提交 QQ 动作 + 跨会话已发送），
+        # 不含纯查询工具——gateway 侧旧计数把查询也算副作用，一次查询即禁重试
+        if event is None or not hasattr(event, "get_extra"):
+            return 0
+        pending = event.get_extra("astrmai_pending_actions", []) or []
+        sends = event.get_extra("astrmai_cross_session_sends", []) or []
+        pending_count = len(pending) if isinstance(pending, list) else 0
+        sends_count = len(sends) if isinstance(sends, list) else 0
+        return pending_count + sends_count
 
     def _vision_side_path_timeout_override(self) -> float:
         # OPT-07/RT-05: 单图超时 = min(配置的图片分析超时, turn 剩余预算[留主回复保留额])
@@ -962,6 +984,10 @@ class ConcurrentExecutor:
         attempted_models: list[str] = []
         agent_models = self.gateway.get_agent_models()
         selection_meta = dict(getattr(self.gateway, "_last_agent_model_selection", {}) or {})
+        # OPT-09/TL-04: 级联重试前记录真实副作用基线——工具已发过私聊/戳人/表情后
+        # 换模型整轮重跑会重复真实动作（space_transition 去重键含精确文本，跨模型
+        # 措辞不同必失配）
+        side_effect_baseline = self._side_effect_footprint(event)
         for index, provider_id in enumerate(agent_models):
             if not await self._check_pre_model_freshness(event, chat_id, "tool execution"):
                 if hasattr(event, "set_extra"):
@@ -1096,6 +1122,7 @@ class ConcurrentExecutor:
             except Exception as exc:
                 last_error = str(exc)
                 last_failure_kind = self._classify_execution_failure_kind(last_error)
+                side_effects_recorded = self._side_effect_footprint(event) > side_effect_baseline
                 debug_trace(
                     event,
                     "execution.executor.model_failure",
@@ -1104,11 +1131,23 @@ class ConcurrentExecutor:
                     model=provider_id,
                     failure_kind=last_failure_kind,
                     fatal=self._is_executor_failure_fatal(last_error),
-                    will_retry_or_switch=index < len(agent_models) - 1,
+                    side_effects_recorded=side_effects_recorded,
+                    will_retry_or_switch=(index < len(agent_models) - 1) and not side_effects_recorded,
                     error_preview=preview_text(last_error, 120),
                     skipped_cooldown_models=list(selection_meta.get("skipped_cooldown_models", []) or []),
                     cooldown_overridden=bool(selection_meta.get("cooldown_overridden", False)),
                 )
+                if side_effects_recorded:
+                    # OPT-09/TL-04: 已执行真实副作用的失败轮不得换模型整轮重跑；
+                    # 清空待提交动作，防止随 fatal fallback 文本一起被 commit
+                    logger.error(
+                        f"[{chat_id}] tool model {provider_id} failed after real side effects; "
+                        "stopping cascade to avoid replaying sends/actions"
+                    )
+                    if hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_pending_actions", [])
+                        event.set_extra("astrmai_side_effect_cascade_stop", True)
+                    break
                 logger.warning(f"[{chat_id}] tool model {provider_id} failed, trying next: {exc}")
                 continue
 

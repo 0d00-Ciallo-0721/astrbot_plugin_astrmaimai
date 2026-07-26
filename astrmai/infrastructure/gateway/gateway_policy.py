@@ -187,5 +187,12 @@ class GatewayPolicyMixin:
             "timed out",
             "408",
             "504",
+            # OPT-09/TG-02: 配置漂移的 provider（生产实证 openai/deepseek-v4-pro
+            # 不存在）永远不可能成功，必须单次尝试即切下一模型，不得 backoff 空转
+            "没有找到",
+            "providernotfounderror",
+            "provider not found",
+            "not found",
+            "unknown provider",
         )
         return any(keyword in lowered for keyword in fatal_keywords) or "content=none" in lowered

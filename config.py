@@ -27,6 +27,52 @@ LEGACY_TIMING_NAMESPACE_FIELDS = (
 )
 
 
+def load_astrmai_config(raw_config: dict | None) -> "AstrMaiConfig":
+    """OPT-10/PL-06: 坏配置降级加载而非整插件拒载。
+
+    旧行为：任一越界值（负超时、超范围概率等）触发 ValidationError → 插件下线、
+    所有会话失去响应，错误只在框架日志。现改为：剔除违例字段回退默认并逐项
+    ERROR 告警；剔除后仍失败则整体回退默认配置。
+    """
+    from pydantic import ValidationError
+
+    data = dict(raw_config or {})
+    try:
+        return AstrMaiConfig(**data)
+    except ValidationError as exc:
+        try:
+            from astrbot.api import logger
+        except Exception:  # pragma: no cover - 独立脚本环境
+            import logging
+
+            logger = logging.getLogger("astrmai.config")
+        pruned = dict(data)
+        for error in exc.errors():
+            loc = [str(part) for part in (error.get("loc") or ())]
+            if not loc:
+                continue
+            section = loc[0]
+            if len(loc) == 1:
+                dropped = pruned.pop(section, None)
+            else:
+                section_data = pruned.get(section)
+                if not isinstance(section_data, dict):
+                    dropped = pruned.pop(section, None)
+                else:
+                    section_data = dict(section_data)
+                    dropped = section_data.pop(loc[1], None)
+                    pruned[section] = section_data
+            logger.error(
+                f"[AstrMai] 配置项 {'.'.join(loc)} 非法（{error.get('msg', '')}），"
+                f"已剔除并回退默认值；原值预览: {str(dropped)[:80]}"
+            )
+        try:
+            return AstrMaiConfig(**pruned)
+        except ValidationError:
+            logger.error("[AstrMai] 剔除违例字段后配置仍不自洽，整体回退默认配置")
+            return AstrMaiConfig()
+
+
 class ProviderConfig(BaseModel):
     fallback_models: List[str] = Field(default=[])
     agent_models: List[str] = Field(default=[])
@@ -58,7 +104,9 @@ class PersonaConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    max_steps: int = Field(default=5, ge=1)
+    # OPT-10/PL-11: executor 硬下限为 5（安全底线），声明与行为对齐——
+    # 旧 ge=1 允许 UI 设 1-4 但实际无效
+    max_steps: int = Field(default=5, ge=5)
     timeout: int = Field(default=60, ge=1)
 
 
@@ -77,13 +125,11 @@ class System1Config(BaseModel):
 
 
 class AttentionConfig(BaseModel):
-    debounce_window: float = Field(default=2.0, ge=0.0)
+    # OPT-10/PL-05: debounce_window/throttle_*/repeater_threshold/max_message_length
+    # 为功能重构后的死配置（防抖硬编码分档、限流改能量驱动、复读阈值硬编码 3），
+    # 已随 schema 一并删除——UI 不再展示无效承诺
     judge_timeout: float = Field(default=3.0, ge=0.1, description="System1 Judge attention gate timeout in seconds")
     bg_pool_size: int = Field(default=20, ge=1)
-    throttle_probability: float = Field(default=0.1, ge=0.0, le=1.0)
-    throttle_min_entropy: int = Field(default=2, ge=0)
-    repeater_threshold: int = Field(default=3, ge=1)
-    max_message_length: int = Field(default=100, ge=1)
     focus_thread_enabled: bool = Field(default=True, description="启用 Focus Thread 算法，在窗口内选择主线程作为本轮回复目标")
     focus_thread_core_max_messages: int = Field(default=4, description="Focus Thread 核心消息的最大条数")
     focus_thread_related_max_messages: int = Field(default=3, description="Focus Thread 相关补充消息的最大条数")
@@ -119,7 +165,6 @@ class EnergyConfig(BaseModel):
 class MoodConfig(BaseModel):
     decay_interval: int = Field(default=3600, ge=1)
     decay_rate: float = Field(default=0.1, ge=0.0, le=1.0)
-    unknown_decay: float = Field(default=0.1, ge=0.0, le=1.0)
 
 
 class EvolutionConfig(BaseModel):
@@ -133,7 +178,6 @@ class EvolutionConfig(BaseModel):
     review_min_count: int = Field(default=2, ge=1, description="表达进入自动审核前所需的最少命中次数")
     expression_min_count: int = Field(default=2, ge=1, description="表达候选进入模型增强前所需的最少独立证据次数")
     enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
-    enable_relationship_engine: bool = Field(default=True, description="启动好感度四维关系图谱推演")
     jargon_min_count: int = Field(default=2, ge=1, description="黑话进入自动审核前所需的最少证据次数")
     review_runner_interval_sec: int = Field(default=60, ge=30, le=600)
     review_runner_min_interval_sec: int = Field(default=45, ge=15)
@@ -190,7 +234,6 @@ class ReplyConfig(BaseModel):
         description="表情标签及其模型识别说明；标签名同时对应 AstrBot 数据目录下 memes_data/memes 中的同名文件夹",
     )
     typing_speed_factor: float = Field(default=0.1, ge=0.0, description="模拟打字等待的强度系数，越大看起来越像在慢慢打字")
-    enable_content_safety_filter: bool = Field(default=False, description="启用基础内容安全过滤（NSFW/自残/PII 检测）")
 
 
 class TTSConfig(BaseModel):
@@ -246,6 +289,14 @@ class MemoryConfig(BaseModel):
     think1_semantic_intent_enabled: bool = Field(
         default=True,
         description="think1 记忆门放宽：关键词未命中时用意图分类器（identity/preference/location 等）判定是否检索",
+    )
+    maintenance_schedule_enabled: bool = Field(
+        default=True,
+        description="按日调度记忆维护（索引一致性修复 + 积压清理）；此前 run_once 无任何调度方",
+    )
+    maintenance_purge_enabled: bool = Field(
+        default=False,
+        description="维护调度是否执行物理清理（过期待审/墓碑 purge）；建议先观察一周 dry 报告再开启",
     )
     intent_rerank_enabled: bool = Field(default=False, repr=False)
     adaptive_top_k_enabled: bool = Field(default=False, repr=False)
@@ -322,6 +373,10 @@ class PrivateChatConfig(BaseModel):
 
 
 class TimingConfig(BaseModel):
+    # OPT-10/PL-03: schema 把该开关挂在 timing 分节（UI 写 timing.turn_merge_enabled），
+    # 而消费方读 private_chat.turn_merge_enabled——旧模型无此字段被 extra-ignore 静默
+    # 丢弃，UI 关闭无效。None=未设置（回退 private_chat 侧）。
+    turn_merge_enabled: bool | None = Field(default=None, repr=False)
     model_request_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
     turn_total_budget_sec: float = Field(default=360.0, ge=30.0, le=7200.0)
     main_reply_reserve_sec: float = Field(default=90.0, ge=0.0, le=1800.0)

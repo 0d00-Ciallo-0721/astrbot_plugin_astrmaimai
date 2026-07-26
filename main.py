@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - older stubs/runtime compatibility
     LLMResponse = Any
 
 try:
-    from .config import AstrMaiConfig
+    from .config import AstrMaiConfig, load_astrmai_config
     from .astrmai.app import PluginFacade, build_runtime_context, export_legacy_attrs
     from .astrmai.presentation.commands import handle_mai_help, handle_work_mode
     from .astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
@@ -24,7 +24,7 @@ try:
 except ImportError:
     if __package__:
         raise
-    from config import AstrMaiConfig
+    from config import AstrMaiConfig, load_astrmai_config
     from astrmai.app import PluginFacade, build_runtime_context, export_legacy_attrs
     from astrmai.presentation.commands import handle_mai_help, handle_work_mode
     from astrmai.infrastructure.runtime.reverse_session import maybe_attach_reverse_session_block
@@ -62,7 +62,8 @@ class AstrMaiPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.raw_config = config or {}
-        self.config = AstrMaiConfig(**self.raw_config)
+        # OPT-10/PL-06: 坏配置降级加载（剔除违例字段+告警）而非整插件拒载
+        self.config = load_astrmai_config(self.raw_config)
         self.runtime = build_runtime_context(context, self.config, self.raw_config)
         self.facade = PluginFacade(self.runtime)
         self.runtime.bind_host_plugin(self)

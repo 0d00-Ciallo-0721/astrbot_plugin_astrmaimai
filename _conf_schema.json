@@ -18,7 +18,11 @@
       "command_prefixes": {
         "description": "系统命令前缀",
         "type": "list",
-        "default": ["/", "!", "！"],
+        "default": [
+          "/",
+          "!",
+          "！"
+        ],
         "hint": "以这些前缀开头的内容会优先按命令处理，而不是进入普通聊天流程。"
       },
       "whitelist_ids": {
@@ -42,14 +46,20 @@
       "external_result_sources": {
         "description": "外部插件结果白名单",
         "type": "list",
-        "default": ["astrbot_builtin"],
+        "default": [
+          "astrbot_builtin"
+        ],
         "hint": "仅嗅探这些来源的插件输出并记入上下文。'*' 表示所有来源。留空则不嗅探任何外部结果。"
       },
       "error_interception_mode": {
         "description": "错误拦截模式",
         "type": "string",
         "default": "block_only",
-        "options": ["block_and_stop", "block_only", "log_only"],
+        "options": [
+          "block_and_stop",
+          "block_only",
+          "log_only"
+        ],
         "hint": "可选择：拦截并停止后续处理、仅拦截错误消息、仅记录日志。一般建议选择“仅拦截错误消息”。"
       }
     }
@@ -429,12 +439,6 @@
         "type": "float",
         "default": 0.1,
         "hint": "值越大，发送前的等待感越明显，看起来更像在慢慢打字；值越小，回复会更利落。"
-      },
-      "enable_content_safety_filter": {
-        "description": "启用基础内容安全过滤",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，会检测不适宜内容、自残风险和个人身份信息，并把高风险回复替换为兜底文本；关闭后不进行这项检测。"
       }
     }
   },
@@ -508,41 +512,11 @@
     "type": "object",
     "description": "群聊注意力与触发控制",
     "items": {
-      "debounce_window": {
-        "description": "消息聚合窗口（秒）",
-        "type": "float",
-        "default": 2.0,
-        "hint": "短时间内连续出现的消息会先聚合，再统一判断要不要回复。"
-      },
       "bg_pool_size": {
         "description": "后台观察缓存条数",
         "type": "int",
         "default": 20,
         "hint": "用于保留最近一段群聊窗口，帮助机器人判断当前该接哪条消息。"
-      },
-      "throttle_probability": {
-        "description": "低优先级窗口放行概率",
-        "type": "float",
-        "default": 0.1,
-        "hint": "用于降低无关回复频率。值越低，机器人越不容易对低价值内容插话。"
-      },
-      "throttle_min_entropy": {
-        "description": "最小有效文本量",
-        "type": "int",
-        "default": 2,
-        "hint": "过短、信息量过低的内容会更容易被忽略。"
-      },
-      "repeater_threshold": {
-        "description": "重复消息拦截阈值",
-        "type": "int",
-        "default": 3,
-        "hint": "同类消息连续堆积到这个数量后，会更倾向于判定为刷屏。"
-      },
-      "max_message_length": {
-        "description": "单条消息最大处理长度",
-        "type": "int",
-        "default": 100,
-        "hint": "超过这个长度的单条消息会被限制处理，防止超长文本占满上下文。"
       },
       "focus_thread_enabled": {
         "description": "启用主线程识别",
@@ -610,7 +584,16 @@
       "sensitive_words": {
         "description": "高风险敏感词列表",
         "type": "list",
-        "default": ["傻逼", "弱智", "滚", "死", "妈", "废物", "神经", "有病"],
+        "default": [
+          "傻逼",
+          "弱智",
+          "滚",
+          "死",
+          "妈",
+          "废物",
+          "神经",
+          "有病"
+        ],
         "hint": "当机器人处于愤怒或悲伤状态，且消息包含这些词时，会提高该发言者的情感关注度。这不是内容安全过滤，不会拦截或屏蔽消息。"
       },
       "mood_post_judge_enabled": {
@@ -729,6 +712,18 @@
         "default": true,
         "hint": "开启后，'我叫什么名字/我喜欢吃什么'这类身份、偏好、地点问句即使不含'记得/之前'等关键词也会检索记忆；关闭则退回仅关键词触发（注入更省但容易失忆）。"
       },
+      "maintenance_schedule_enabled": {
+        "description": "按日调度记忆维护任务",
+        "type": "bool",
+        "default": true,
+        "hint": "每日低峰自动执行索引一致性修复与积压体检并输出日志报告。此前该维护只能靠手动接口触发，待审积压与索引缺口无法自愈。"
+      },
+      "maintenance_purge_enabled": {
+        "description": "维护任务允许物理清理",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后维护任务会真正删除过期的待审候选与驳回墓碑（含各自宽限期保护）；建议先保持关闭观察一周维护日志报告，确认清理范围符合预期再开启。"
+      },
       "intent_rerank_enabled": {
         "description": "启用按问题意图重排记忆",
         "type": "bool",
@@ -844,12 +839,6 @@
         "type": "bool",
         "default": true,
         "hint": "开启后，机器人会从群聊里学习大家常用的表达方式、梗和语气。"
-      },
-      "enable_relationship_engine": {
-        "description": "启用关系变化引擎",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，机器人会根据互动频率和态度变化，动态更新对不同用户的熟悉度和关系感。"
       },
       "min_mining_context": {
         "description": "学习所需最小上下文量",
@@ -1022,7 +1011,9 @@
       "proactive_quiet_hours": {
         "description": "主动开口安静时段",
         "type": "list",
-        "default": ["23:30-07:30"],
+        "default": [
+          "23:30-07:30"
+        ],
         "hint": "格式示例：23:30-07:30。处于这些本地时间段时，不主动发起话题，只记录候选与阻断原因。"
       },
       "silence_threshold": {
@@ -1102,12 +1093,6 @@
         "type": "float",
         "default": 0.1,
         "hint": "值越大，情绪恢复到平稳状态越快。"
-      },
-      "unknown_decay": {
-        "description": "异常情绪平滑参数",
-        "type": "float",
-        "default": 0.1,
-        "hint": "用于处理来源不明确或波动较大的情绪变化。"
       }
     }
   },
@@ -1284,7 +1269,7 @@
         "description": "最大推理步数",
         "type": "int",
         "default": 5,
-        "hint": "值越大，复杂任务能思考得更深，但速度也可能更慢。"
+        "hint": "值越大，复杂任务能思考得更深，但速度也可能更慢。最小值为五（执行层安全底线，低于五的设置无效）。"
       }
     }
   },
@@ -1308,7 +1293,10 @@
         "description": "图片识别超时后的回复方式",
         "type": "string",
         "default": "超时后忽略图片并继续回复",
-        "options": ["超时后忽略图片并继续回复", "必须识别成功后再回复"],
+        "options": [
+          "超时后忽略图片并继续回复",
+          "必须识别成功后再回复"
+        ],
         "hint": "“超时后忽略图片并继续回复”会把未识别图片替换成“[图片]”，保留文字继续回答；“必须识别成功后再回复”会在识别失败时停止本轮回答并提示用户重发，适合必须先看图才能回答的场景。"
       },
       "image_analysis_retries": {
@@ -1394,4 +1382,3 @@
     }
   }
 }
-

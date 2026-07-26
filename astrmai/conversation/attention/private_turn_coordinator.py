@@ -127,6 +127,12 @@ class PrivateTurnCoordinator:
         return max(0.0, float(getattr(self._private_config(), "input_settle_sec", 1.5) or 0.0))
 
     def turn_merge_enabled(self) -> bool:
+        # OPT-10/PL-03: UI 开关在 timing 分节，优先读之（运行时实证旧代码该开关无效）；
+        # 未设置时回退 private_chat 侧默认
+        timing = getattr(getattr(self, "config", None), "timing", None)
+        timing_value = getattr(timing, "turn_merge_enabled", None)
+        if isinstance(timing_value, bool):
+            return timing_value
         return bool(getattr(self._private_config(), "turn_merge_enabled", True))
 
     @staticmethod

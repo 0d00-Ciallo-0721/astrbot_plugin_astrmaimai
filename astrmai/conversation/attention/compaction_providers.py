@@ -21,12 +21,37 @@ from ...infrastructure.runtime.turn_call_ledger import (
 class CompactionProviderMixin:
     """Provider-calling methods extracted from ContextCompactionEngine."""
 
+    def _compaction_provider_validated(self, context, configured: str) -> bool:
+        cache = getattr(self, "_compaction_provider_validation", None)
+        if cache is None:
+            cache = {}
+            self._compaction_provider_validation = cache
+        if configured in cache:
+            return cache[configured]
+        valid = True
+        accessor = getattr(context, "get_provider_by_id", None) if context is not None else None
+        if callable(accessor):
+            try:
+                valid = accessor(configured) is not None
+            except Exception:
+                valid = True  # 校验接口异常时不拦截，保持旧行为
+        if not valid:
+            logger.warning(
+                f"[Compaction] configured compaction_provider_id '{configured}' 不存在，"
+                "已从候选剔除（仅告警一次）；请在配置页修正"
+            )
+        cache[configured] = valid
+        return valid
+
     async def _resolve_provider_candidates(self, chat_id: str) -> list[str]:
         candidates: list[str] = []
         configured = str(self.provider_id or "").strip()
-        if configured:
-            candidates.append(configured)
         context = getattr(self.gateway, "context", None) if self.gateway else None
+        if configured:
+            # OPT-09/RT-07: 配置残留的旧 provider（生产实证 openai/deepseek-v4-pro）
+            # 会让每次压缩首试必败；做一次性存在校验，无效则剔除并 WARN 一次
+            if self._compaction_provider_validated(context, configured):
+                candidates.append(configured)
         if context is not None and hasattr(context, "get_current_chat_provider_id"):
             try:
                 current_provider = await context.get_current_chat_provider_id(chat_id)
