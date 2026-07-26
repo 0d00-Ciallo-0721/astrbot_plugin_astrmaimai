@@ -1,6 +1,6 @@
 # OPT-11 观测契约完整性（funnel / 口径 / trace 存储性能）
 
-状态：未开始 ｜ 优先级：P2 ｜ 依赖：无（OPT-08 的量化验收依赖本 OPT 的口径修正，建议先做 RT-02 部分） ｜ 覆盖发现：TG-04(P2)、ID-05(P2)、RT-10(P3)、RT-02(P2)、WU-06(P2)、WU-11(P3) ｜ 本轮审计三次差点被观测层误导（judge"已修复"假象、dispatch abandoned 伪影、funnel 缺失误判），这些失真必须清掉。
+状态：代码完成（结构迁移另立专项） ｜ 优先级：P2 ｜ 依赖：无（OPT-08 的量化验收依赖本 OPT 的口径修正，建议先做 RT-02 部分） ｜ 覆盖发现：TG-04(P2)、ID-05(P2)、RT-10(P3)、RT-02(P2)、WU-06(P2)、WU-11(P3) ｜ 本轮审计三次差点被观测层误导（judge"已修复"假象、dispatch abandoned 伪影、funnel 缺失误判），这些失真必须清掉。
 
 ## 目标
 
@@ -41,4 +41,13 @@
 
 ## 完成记录
 
-（完成后填写：字段填充率前后、append 耗时压测、管理页截图）
+**2026-07-26 代码侧完成**：
+
+- TG-04：`prompt_refiner._decide_memory_injection` 改为**外包裹**统一补写 skipped funnel（内部逻辑整体移入 `_decide_memory_injection_inner`）——比逐个 early-return 打点更稳，天然覆盖未来新增分支。
+- ID-05：`reply_artifact_builder` 发送循环结束后无条件写 `sent_segment_count`（满发路径此前从不写，stage 恒 0 与 reply_stats 矛盾）。
+- RT-10：`planner.py` 稳定轮 `prefix_changed_reason` 落 `stable`（旧 `or "unavailable_in_trace"` 把 61/67 稳定轮标成不可用）。
+- RT-02：`scripts/analyze_turn_ledger.py` judge 口径改按 `pool` 判定（旧 stage 匹配恒 0，制造了"judge 重复调用已修复"的假象）。
+- WU-06 短期缓解：trace 序列化去 indent 改紧凑分隔符（15MB 实测 dumps 0.46s/条，每条入站消息都在聊天路径整文件重写）。**结构迁移（JSONL 分片/SQLite）另立专项**——读取端（WebUI recent + 分析脚本）需同步迁移，不宜与本批混做。
+- WU-11：Turn Context 弹窗新增"运行账本"区块（budget/reply_stats/llm_call_ledger/stage_ledger/memory_funnel），披露表工具列兼容 `tool_names` 数组。
+- 过程记录：新增维护按钮时误用 `result?.data ||` 二次解包，被 round11 契约测试当场拦下（该 pin 正是为历史双层解包 bug 设立）。
+- 受影响套件 150 passed。

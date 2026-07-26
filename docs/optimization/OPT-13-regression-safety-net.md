@@ -1,6 +1,17 @@
 # OPT-13 回归测试安全网（五张网 + 文档基线）
 
-状态：未开始 ｜ 优先级：P1 ｜ 依赖：与对应修复 OPT 同批落地（"先补测试再改代码"） ｜ 覆盖发现：TG-01(P1)、TG-05(P2)、TG-06(P2)、TG-07(P2)、TG-08(P3) ｜ 单元测试习惯良好（1673 条 0 收集错误），系统性缺口全在"跨模块行为不变式"——单元全绿、组合回归无人发现，且恰好集中在最近 5 个提交的热改区。
+状态：核心完成（TG-07 记专项遗留） ｜ 优先级：P1 ｜ 依赖：与对应修复 OPT 同批落地（"先补测试再改代码"） ｜ 覆盖发现：TG-01(P1)、TG-05(P2)、TG-06(P2)、TG-07(P2)、TG-08(P3) ｜ 单元测试习惯良好（1673 条 0 收集错误），系统性缺口全在"跨模块行为不变式"——单元全绿、组合回归无人发现，且恰好集中在最近 5 个提交的热改区。
+
+## 完成记录
+
+**2026-07-26 核心完成**：
+
+- TG-06：`tests/regression/webui/test_fe_be_contract_alignment.py`——静态解析 app.js 全部 api 调用路径（模板参数归一 {p}）与 plugin_pages 注册表比对，断言 FE ⊆ BE + 解析健全性下限（防正则腐化）。首跑即绿（当前契约完好，含 OPT-04/05 新增路径），护栏就位。
+- TG-05：`test_memory_write_retrieve_inject.py` 追加修订闭环——写入→旧内容命中→`store.update_memory` 修订→新内容命中且旧表述消失→注入渲染新内容（真实 store+FTS wiring，此前三层测试全部绕开）。
+- TG-01（聚焦链版）：`test_group_identity_chain.py`——双 sender 交替+B 直接唤醒场景断言三源一致（focus 事件 sender == speaker block QQ == 画像层将用的 get_sender_id），并锁 focus_context 缺失时回退事件身份、群边界提示词在位。**完整 gate→planner→executor 三段拼装 e2e 仍为专项遗留**（装配成本高，塌缩点已被本链覆盖）。
+- TG-08：session-state.md Test Status 更新（1774 collected、signin flaky 根因与恢复命令）。
+- **TG-07 遗留**：vision barrier 的 gate 侧三条并发交织分支（慢 prepare_batch 期间回填 re-merge、abort 后池续跑、resolve 超时 outcome）需要事件同步器级 harness，现有 gate fixture 不含 coordinator 装配；OPT-07 已为该区域加了 burst deadline 行为，coordinator 自身 17 条测试在位。作为独立专项排入后续（建议与下次触碰 gate 排水循环的改动同批）。
+- 过程佐证：OPT-05 实施中 `_run_maintenance_cycle` 被误截断，正是被既有"子服务失败隔离"装配断言当场抓获——本 OPT 主张的防回归价值已有实证。
 
 ## 目标
 

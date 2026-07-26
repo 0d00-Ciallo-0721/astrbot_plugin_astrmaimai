@@ -192,6 +192,47 @@ class MemoryWriteRetrieveInjectIntegrationTests(unittest.TestCase):
         self.assertIn("火锅", bundle.rendered_prompt_block)
         self.assertTrue(bundle.items)
 
+    def test_revision_updates_are_visible_to_retrieval_and_injection(self):
+        # OPT-13/TG-05: 记忆闭环的"修订"腿——写入→检索命中旧内容→修订→
+        # 检索/注入必须立即反映新内容且旧表述不再命中。此前三层测试
+        # （WebUI mock、store 单测、写检注集成）全部绕开该 wiring。
+        from astrmai.memory.contracts.memory_query import MemoryQuery, MemoryWriteRequest
+
+        async def run():
+            store, writer, retrieval, injection = self._services()
+            memory_id = await writer.write(
+                MemoryWriteRequest(
+                    source="summary",
+                    kind="preference",
+                    session_id="chat-1",
+                    sender_id="user-1",
+                    content="小明喜欢吃寿司",
+                    summary="小明喜欢吃寿司",
+                    dedup_key="food:revision-case",
+                )
+            )
+            before = await retrieval.retrieve(
+                MemoryQuery(query="寿司", session_id="chat-1", top_k=3)
+            )
+            await store.update_memory(
+                memory_id,
+                content="小明其实喜欢吃拉面（寿司过敏，已修正）",
+                summary="小明喜欢拉面，寿司过敏",
+            )
+            after = await retrieval.retrieve(
+                MemoryQuery(query="拉面", session_id="chat-1", top_k=3)
+            )
+            bundle = await injection.build_bundle(event=_Event("我喜欢吃什么来着"), prompt="拉面")
+            return memory_id, before, after, bundle
+
+        memory_id, before, after, bundle = asyncio.run(run())
+        self.assertTrue(any(item.id == memory_id for item in before), "修订前应能按旧内容命中")
+        self.assertTrue(any(item.id == memory_id for item in after), "修订后应能按新内容命中")
+        revised = next(item for item in after if item.id == memory_id)
+        self.assertIn("拉面", revised.content)
+        self.assertNotIn("喜欢吃寿司", revised.content)
+        self.assertIn("拉面", bundle.rendered_prompt_block)
+
 
 if __name__ == "__main__":
     unittest.main()

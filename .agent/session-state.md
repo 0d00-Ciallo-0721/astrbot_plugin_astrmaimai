@@ -31,9 +31,9 @@ main.py → PluginFacade
 ```
 
 ## Test Status
-- **1142 passed, 1 skipped**（从 936 增长）
-- 真实行覆盖率 72.9%
-- 全量回归排除 .agent/session-state.md 绝对路径检查通过
+- **1774 collected（2026-07-26，OPT-01~10 波次后）**；全量回归绿（排除绝对路径检查与 3 个 signin 时间窗历史 flaky——`group_signin_service.py` 按 `tm_hour==SIGN_HOUR` 判定且测试未注入时钟，仅签到时段能过，待注入时钟修复）
+- 历史基线：1142 passed（2026-07-05）、真实行覆盖率 72.9%
+- 恢复命令：`PYTHONIOENCODING=utf-8 python -m pytest -q -k "not test_project_files_do_not_embed_local_absolute_paths and not test_group_signin"`
 
 ## Key Documents (Codex 入口)
 | 文件 | 用途 |

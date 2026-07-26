@@ -1,6 +1,6 @@
 # OPT-12 工具链路修复（图片轮工具可见性 / 披露死路 / 触发词误伤）
 
-状态：未开始 ｜ 优先级：P2 ｜ 依赖：无 ｜ 覆盖发现：TL-02(P2)、TL-03(P2)、TL-07(P2)、TL-01(P2)、TL-06(P2/LIKELY)、TL-08(P3) ｜ 工具系统的观测无缺口（trace 空是因为模型真不调工具），失败面集中在三处接缝。
+状态：代码完成 ｜ 优先级：P2 ｜ 依赖：无 ｜ 覆盖发现：TL-02(P2)、TL-03(P2)、TL-07(P2)、TL-01(P2)、TL-06(P2/LIKELY)、TL-08(P3) ｜ 工具系统的观测无缺口（trace 空是因为模型真不调工具），失败面集中在三处接缝。
 
 ## 目标
 
@@ -41,4 +41,13 @@
 
 ## 完成记录
 
-（完成后填写：图片轮工具命中率、expanded 使用率、误触发统计）
+**2026-07-26 代码侧完成**：
+
+- TL-02：`planner_side_inputs` 在 intent 家族白名单分支新增**保护家族**（message_artifact/vision_message/quote_reply/topic_thread/wait/capability）——披露层为图片/引用轮特意加的只读查证能力不再被 tease/comfort 静默剥除。
+- TL-03：`executor._build_sanitized_execution_event` 以 `astrmai_original_message_segments` extra 保留原始组件；`pfc_tools` 视觉工具当前消息分支优先读该 extra（sanitize 后首调必答"没有发现图片"的假阴性消除，不回流 prompt 保住防注入语义）。
+- TL-07：`gate.process_event` 填充 `turn_context.perception.image_urls`（trace image_count 派生自它，585/585 恒 0 使图片轮不可辨识）。
+- TL-01：`planner._append_tool_guidance` 在工具集含 `bot_capability_lookup` 时追加自检提示（二段披露 16h 零触发的唯一入口从未被提示过）。
+- TL-06：`unverified_report` 触发词由日常词（听说/据说/不确定）收紧为"记录一下听说/登记未核实"等明确登记意图组合。
+- TL-08：删除 `FAMILY_TO_PACKAGES["quote_reply"]` 死映射（PRECISION_ONLY 家族在 plan() 中被剔除，映射永不生效且与 TOOL_PACKAGES 矛盾）。
+- 既有契约更新 1 处：`test_agency_tier_none_and_social_intent_constrain_tools` 的 comfort 期望集合补入 wait/capability（旧断言锁定的正是"连等待与自检能力一并清空"）。
+- 受影响套件 184+70 passed。

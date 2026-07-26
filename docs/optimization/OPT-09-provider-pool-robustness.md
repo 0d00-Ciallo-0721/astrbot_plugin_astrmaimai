@@ -1,6 +1,17 @@
 # OPT-09 Provider 与模型池健壮性（not-found / 能力解析 / 级联副作用）
 
-状态：未开始 ｜ 优先级：P1 ｜ 依赖：无 ｜ 覆盖发现：RT-07(P3，已吸收 PL-07)、TG-02(P1)、RT-08(P2)、TL-04(P1/LIKELY) ｜ 配置漂移已在生产发生（openai/deepseek-v4-pro 不存在仍被引用），失败处理链条上有三处接缝。
+状态：代码完成 ｜ 优先级：P1 ｜ 依赖：无 ｜ 覆盖发现：RT-07(P3，已吸收 PL-07)、TG-02(P1)、RT-08(P2)、TL-04(P1/LIKELY) ｜ 配置漂移已在生产发生（openai/deepseek-v4-pro 不存在仍被引用），失败处理链条上有三处接缝。
+
+## 完成记录
+
+**2026-07-26 代码侧完成**：
+
+- TG-02：`gateway_policy._is_fatal_failure` 增补 not-found 关键字族（含中文"没有找到"）——不存在的 provider 单次尝试即切下一模型，不再 backoff 空转；失败矩阵测试锚定（not-found×3 fatal / 502/连接重置/客户端超时 non-fatal / 429/quota 既有语义不变）。
+- RT-08：`resolve_provider_capabilities` 重写——完整模型 ID 按 '/' 前缀降级：对象查找（全 ID→前缀）→ `get_all_providers` 注册 ID 前缀扫描 → 字符串前缀家族回退（gemini/xx 正确落 gemini 家族），终结 1005/1005 全 unknown。
+- RT-07：compaction 配置 provider 一次性存在校验（实例级缓存，只查一次、只告警一次），无效剔除；校验接口异常时不拦截保持旧行为。
+- TL-04：executor 工具级联新增**真实副作用护栏**——`_side_effect_footprint`（只计 pending_actions + cross_session_sends，修正了 gateway 侧把纯查询也当副作用的口径）；失败时足迹超过进入循环前基线 → 停止级联 + 清空待提交动作 + 打 `astrmai_side_effect_cascade_stop` 标记，防止跨模型重放真实发送。**决策记录**：不在级联层强制 fatal 终止——gateway 的 fatal 语义是"本模型别重试"，换模型（可能换 provider）对 429/quota 类是合法救济。
+- 测试：`tests/regression/architecture/test_provider_pool_robustness.py` 10 条（stash 红验证 6 红）；compaction/gateway_policy 相关 47 项既有测试全绿。
+- 待部署验收：ProviderNotFoundError 不再出现 backoff 重试序列；GatewayUsage/trace provider 家族分布非 unknown；灰度观察 cache_control 启用后 429 情况。
 
 ## 目标
 

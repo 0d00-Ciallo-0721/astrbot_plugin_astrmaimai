@@ -1,6 +1,18 @@
 # OPT-05 记忆数据质量与维护调度
 
-状态：未开始 ｜ 优先级：P1 ｜ 依赖：无（WU-07 的墓碑过期依赖本 OPT） ｜ 覆盖发现：ML-03(P1)、ML-04(P1)、ML-10(P2)、WU-04(P1) ｜ 两条随运行时间单调恶化的数据损耗 + 治理自愈通道的结构性断裂。
+状态：代码完成（purge 默认关，观察一周后手动开启） ｜ 优先级：P1 ｜ 依赖：无（WU-07 的墓碑过期依赖本 OPT） ｜ 覆盖发现：ML-03(P1)、ML-04(P1)、ML-10(P2)、WU-04(P1) ｜ 两条随运行时间单调恶化的数据损耗 + 治理自愈通道的结构性断裂。
+
+## 完成记录
+
+**2026-07-26 代码侧完成**：
+
+- ML-03：`instant_memory_gate._authority_dedup_key`——like/dislike 多值属性追加归一化 value 片段（去空白/小写/32 字符），不同偏好共存、同偏好复述仍去重；display_name/server_count 等单值属性保持 attribute 级覆盖语义。
+- ML-04：`memory_index_projector.cleanup_deleted` 改为**先** `FaissVecDB.delete(doc_id)`（内部按 doc_id 反查 int id 并同步删 embedding）**后**兜底 SQL 行删除——顺序关键，反过来 faiss 查不到 int id；faiss 不可用时回退旧 SQL 路径；FTS 键仍用 int id。审计时发现的"rebuild 无人调"由 WU-04 调度一并解决。
+- ML-10：实际缓冲格式比审计更糟（`用户/旁白：{text}` 连 sender 都没有）；改为结构化条目（sender_id/text），join 时渲染成摘要解析器**已认识**的 `[序号] 发送者: 内容` 格式——解析器零改动，speaker_ids 落到 QQ 号；热更前的旧字符串条目原样透传。
+- WU-04：`proactive_task._run_maintenance_cycle` 接入 `_run_memory_store_maintenance`（每日节流、INFO 报告）；**purge 分步启用**用调度侧保守策略实现——`memory.maintenance_purge_enabled=False`（默认）时各类宽限期推到 1e12 秒，索引一致性修复照跑、零物理删除，服务端 run_once 零改动；管理页记忆质量面板新增"执行维护"按钮接通既有端点。新配置两枚（schema+pydantic 同步，纯中文文案）。
+- 过程事故记录：首次插入把 signin/digest 块截进了新方法尾部，被既有隔离测试 `test_proactive_task_maintenance_cycle_isolates_subservice_failures` 当场抓获——该测试正是 OPT-13 主张的"装配断言"价值实证。
+- 测试：新增 `tests/regression/memory/test_memory_data_quality_hotfix.py` 12 条（stash 红验证 11/12）；受影响套件 287 passed。
+- 待部署验收：embedding 与 documents 行数差值不再增长；新群摘要 `speaker_ids` 非空；维护日志每日出现且 purge 报告为零删除；一周后核对报告再开 `maintenance_purge_enabled`；偏好共存 SQL 采样。
 
 ## 目标
 

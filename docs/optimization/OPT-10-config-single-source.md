@@ -1,6 +1,17 @@
 # OPT-10 配置真源与容错（死键清理 / 降级加载）
 
-状态：未开始 ｜ 优先级：P1 ｜ 依赖：无 ｜ 覆盖发现：PL-03(P1)、PL-04(P1)、PL-05(P2)、PL-06(P2)、PL-11(P3) ｜ 全量矩阵见 `../../.agent/claude-full-audit-20260727/config_consumption_matrix.md`（209 键：死键 9、pydantic-only 12、getattr 第三层漂移 11、仅 25 键有 UI 范围提示）。
+状态：代码完成 ｜ 优先级：P1 ｜ 依赖：无 ｜ 覆盖发现：PL-03(P1)、PL-04(P1)、PL-05(P2)、PL-06(P2)、PL-11(P3) ｜ 全量矩阵见 `../../.agent/claude-full-audit-20260727/config_consumption_matrix.md`。
+
+## 完成记录
+
+**2026-07-26 代码侧完成**：
+
+- PL-06：新增 `config.load_astrmai_config`——ValidationError 时按错误定位逐项剔除违例字段并 ERROR 告警（含值预览），剔除后重建；仍失败整体回退默认配置；main.py 接入。实测连 legacy 别名连带产生的非法值（infra.api_timeout=-5 → timing.model_request_timeout_sec=None）也被正确逐项剔除。严格构造器 `AstrMaiConfig(**raw)` 语义保留供测试/校验用。
+- PL-03：审计阶段方向修正——normalizer 是 section→timing 的读入方向，别名表不下发；正确修法为 TimingConfig 增设可空 `turn_merge_enabled`（保住 UI 写入值）+ coordinator 双源读取（timing 优先、private_chat 回退）。实测 `{'timing':{'turn_merge_enabled':False}}` 端到端生效。
+- PL-04+PL-05：9 个死键 schema 与 pydantic **双侧删除**（含虚假内容安全开关——按文档推荐取"诚实优先"删除路径，未实现过滤功能；决策已记录，如需真实过滤应走 output_guard 专项）。schema 经 json 往返重排为规范 indent=2 格式。
+- PL-11：`agent.max_steps` 声明下限 ge=1→ge=5 与执行层硬底线对齐 + schema hint 说明；旧配置里的 1-4 值经 PL-06 降级加载自动回退默认 5 并告警（两项修复天然协同）。
+- **结构性守卫**：新增 `test_config_single_source.py::SchemaPydanticContractTests`——遍历 schema 全部叶子键断言映射到 pydantic 字段或合法 timing 别名，从机制上杜绝再出现"挂错分节被静默丢弃"的死开关（该守卫同时反向验证了本轮新增的全部配置键）。
+- 测试：新增 12 条 + 既有 config/coordinator 套件 52 passed 一次通过。
 
 ## 目标
 

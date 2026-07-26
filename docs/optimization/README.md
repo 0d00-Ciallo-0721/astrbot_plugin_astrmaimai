@@ -10,18 +10,18 @@
 | [OPT-02](OPT-02-background-budget-leak.md) | 后台任务 contextvar 预算泄漏（记忆抽取复活） | P0 | 无 | 代码完成（待线上日志复采验收） |
 | [OPT-03](OPT-03-proactive-chain-revival.md) | 主动行为链复活（wakeup/poke/签到） | P0 | 无 | 代码完成（待线上首条主动消息验收） |
 | [OPT-04](OPT-04-review-calibration-loop.md) | 人工校准与审核闭环（WebUI 七连修） | P1 | 无 | 代码完成（待 WebUI 手测验收） |
-| [OPT-05](OPT-05-memory-data-quality.md) | 记忆数据质量与维护调度（偏好覆盖/幽灵向量） | P1 | 无 | 未开始 |
+| [OPT-05](OPT-05-memory-data-quality.md) | 记忆数据质量与维护调度（偏好覆盖/幽灵向量） | P1 | 无 | 代码完成（purge 默认关，观察后开启） |
 | [OPT-06](OPT-06-memory-read-path.md) | 记忆读取链恢复（注入率 2.9%→目标区间） | P1 | OPT-02 | 代码完成（待注入率/时延复采） |
 | [OPT-07](OPT-07-turn-budget-unification.md) | 延迟预算统一（tool/vision 纳入 turn 预算） | P1 | OPT-02（已完成） | 代码完成（待事故样本复采归零） |
 | [OPT-08](OPT-08-llm-cost-reduction.md) | 模型调用成本削减（mood/cognitive/judge 缓存） | P1 | 量化验收建议先做 OPT-11 口径 | 代码完成（待调用量复采 + judge A/B） |
-| [OPT-09](OPT-09-provider-pool-robustness.md) | Provider 与模型池健壮性（not-found/级联副作用） | P1 | 无 | 未开始 |
-| [OPT-10](OPT-10-config-single-source.md) | 配置真源与容错（死键清理/降级加载） | P1 | 无 | 未开始 |
-| [OPT-11](OPT-11-observability-contract.md) | 观测契约完整性（funnel/口径/trace 存储） | P2 | 无 | 未开始 |
-| [OPT-12](OPT-12-tool-chain-fixes.md) | 工具链路修复（图片轮工具可见性等） | P2 | 无 | 未开始 |
-| [OPT-13](OPT-13-regression-safety-net.md) | 回归测试安全网（身份/预算/契约五张网） | P1 | 与对应修复同批 | 未开始 |
-| [OPT-14](OPT-14-lifecycle-resilience.md) | 生命周期与重载韧性（重载失忆/闩锁） | P2 | 无 | 未开始 |
-| [OPT-15](OPT-15-learning-dream-governance.md) | 学习与 Dream 治理（毒丸/幻觉晋升） | P2 | 无 | 未开始 |
-| [OPT-16](OPT-16-interaction-polish.md) | 交互打磨（私聊话术/撤回/空态三义性） | P2 | 无 | 未开始 |
+| [OPT-09](OPT-09-provider-pool-robustness.md) | Provider 与模型池健壮性（not-found/级联副作用） | P1 | 无 | 代码完成 |
+| [OPT-10](OPT-10-config-single-source.md) | 配置真源与容错（死键清理/降级加载） | P1 | 无 | 代码完成 |
+| [OPT-11](OPT-11-observability-contract.md) | 观测契约完整性（funnel/口径/trace 存储） | P2 | 无 | 代码完成（结构迁移另立专项） |
+| [OPT-12](OPT-12-tool-chain-fixes.md) | 工具链路修复（图片轮工具可见性等） | P2 | 无 | 代码完成 |
+| [OPT-13](OPT-13-regression-safety-net.md) | 回归测试安全网（身份/预算/契约五张网） | P1 | 与对应修复同批 | 核心完成（TG-07 专项遗留） |
+| [OPT-14](OPT-14-lifecycle-resilience.md) | 生命周期与重载韧性（重载失忆/闩锁） | P2 | 无 | 未开始（需运行环境取证） |
+| [OPT-15](OPT-15-learning-dream-governance.md) | 学习与 Dream 治理（毒丸/幻觉晋升） | P2 | 无 | 代码完成 |
+| [OPT-16](OPT-16-interaction-polish.md) | 交互打磨（私聊话术/撤回/空态三义性） | P2 | 无 | 部分完成（ID-08 留专项） |
 
 推荐主线：**OPT-01 → OPT-02 → OPT-03 → OPT-04 → OPT-06 → OPT-07 → OPT-08**（先止住用户正在受害的三个 P0，再修运营者手里的校准工具，然后恢复记忆读取、统一预算、削成本），OPT-13 的测试按"先补测试再改代码"纪律拆进对应 OPT 同批落地，其余按依赖穿插。
 
