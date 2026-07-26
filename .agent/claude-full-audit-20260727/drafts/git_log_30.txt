@@ -1,0 +1,30 @@
+4da2910|2026-07-27|feat: add configurable vision timeout policy
+c4aee57|2026-07-26|fix: complete turn trace observability
+20bb585|2026-07-26|feat: harden turn budgets and observability
+858b8b3|2026-07-25|feat: optimize conversation telemetry and reply behavior
+f09cf65|2026-07-25|fix: harden event learning and memory maintenance
+0c0d570|2026-07-24|feat: add per-turn call and context ledger
+88d0237|2026-07-24|fix: stabilize private conversation continuity
+fe12bcc|2026-07-20|fix: harden private chat vision batching
+cfcc6f0|2026-07-19|fix: passthrough framework plugin commands
+4417ece|2026-07-19|fix: centralize runtime timeout settings
+5e7c3f9|2026-07-19|feat: structure and localize cognitive feedback
+320663f|2026-07-19|feat: improve memory quality governance
+ddc73ea|2026-07-19|fix: verify group member mentions before sending
+bb10a8a|2026-07-18|feat: improve learning observability and admin workflows
+60f70e1|2026-07-18|feat: add manual learning calibration
+bc5b8e4|2026-07-18|fix: surface v2 memory data in admin pages
+658f8b1|2026-07-18|fix: isolate group dialog context by speaker thread
+c265d06|2026-07-18|feat: add optional tts reply bridge
+4d16a82|2026-07-18|fix: route proactive and poke interactions through attention
+8a1d790|2026-07-18|fix: stabilize vision transcription and poke attribution
+3a38e12|2026-07-17|feat: improve poke interactions and tool clarification
+cc598f7|2026-07-17|feat: expand chat tool disclosure
+4f74cd1|2026-07-16|fix: restore learning and memory dashboard status
+14ea3e0|2026-07-16|fix: harden runtime handlers and cross-session relay
+16400bf|2026-07-15|feat: redesign user profile admin page
+4828f69|2026-07-15|feat: make chat tools reliable across sessions
+f68f2ad|2026-07-15|fix: throttle empty dream maintenance attempts
+88ce321|2026-07-15|fix: stop logging full judge prompts
+8a672f5|2026-07-15|feat: add qq actions and persona tuning
+47d2e12|2026-07-15|fix: stabilize conversation concurrency and vision handling
