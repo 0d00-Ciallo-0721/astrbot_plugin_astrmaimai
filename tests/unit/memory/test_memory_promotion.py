@@ -85,7 +85,8 @@ class MemoryPromotionTests(unittest.TestCase):
             promoted_id = report["promoted"][0]["memory_id"]
             promoted = await store.get_canonical(promoted_id, include_inactive=True)
             self.assertEqual(promoted.kind, "fact")
-            self.assertEqual(promoted.confidence, 1.0)
+            # OPT-15/ML-08: 梦境晋升不再自封满置信（旧断言 1.0 锁定的正是缺陷）
+            self.assertEqual(promoted.confidence, 0.95)
             self.assertEqual(promoted.sender_id, "zlj")
             metadata = dict(promoted.metadata or {})
             self.assertEqual(metadata["promotion_source"], "dream_audit_pipeline")

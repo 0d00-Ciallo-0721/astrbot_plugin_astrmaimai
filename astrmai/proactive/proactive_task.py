@@ -788,6 +788,10 @@ class ProactiveTask:
         except Exception as exc:
             logger.error(f"[ProactiveTask] decay maintenance degraded: {exc}")
         try:
+            await self._run_memory_store_maintenance()
+        except Exception as exc:
+            logger.error(f"[ProactiveTask] memory store maintenance degraded: {exc}")
+        try:
             await self.group_signin_service.run_once()
         except Exception as exc:
             logger.error(f"[ProactiveTask] group signin maintenance degraded: {exc}")
@@ -795,6 +799,47 @@ class ProactiveTask:
             self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
         except Exception as exc:
             logger.error(f"[ProactiveTask] heartflow topic digest scheduling degraded: {exc}")
+
+    _MEMORY_STORE_MAINTENANCE_INTERVAL_SEC = 24 * 3600.0
+    # OPT-05/WU-04 分步启用：purge 未开时把各类宽限期推到天文数字——索引一致性
+    # 修复照常运行，但不产生任何物理删除（首周观察期的保守策略）
+    _MAINTENANCE_NO_PURGE_POLICY = {
+        "stale_grace_seconds": 1e12,
+        "pending_jargon_grace_seconds": 1e12,
+        "pending_human_jargon_grace_seconds": 1e12,
+        "rejected_jargon_grace_seconds": 1e12,
+        "pending_expression_grace_seconds": 1e12,
+        "rejected_expression_grace_seconds": 1e12,
+    }
+
+    async def _run_memory_store_maintenance(self) -> None:
+        # OPT-05/WU-04: MemoryMaintenanceService.run_once（索引一致性修复 + 黑话/
+        # 表达积压过期清理 + 墓碑 purge）此前无任何调度方——唯一入口是前端从不
+        # 调用的 WebUI 端点，待审积压只增不减、投影缺口重启前不自愈
+        memory_cfg = getattr(self.config, "memory", None)
+        if not bool(getattr(memory_cfg, "maintenance_schedule_enabled", True)):
+            return
+        engine = getattr(self, "memory_engine", None)
+        maintenance = getattr(engine, "maintenance_service", None) if engine else None
+        if maintenance is None or not hasattr(maintenance, "run_once"):
+            return
+        now = time.time()
+        last_run = float(getattr(self, "_last_store_maintenance_at", 0.0) or 0.0)
+        if now - last_run < self._MEMORY_STORE_MAINTENANCE_INTERVAL_SEC:
+            return
+        self._last_store_maintenance_at = now
+        purge_enabled = bool(getattr(memory_cfg, "maintenance_purge_enabled", False))
+        policy = {} if purge_enabled else dict(self._MAINTENANCE_NO_PURGE_POLICY)
+        report = await maintenance.run_once(policy=policy)
+        logger.info(
+            "[ProactiveTask] memory store maintenance completed: "
+            f"purge_enabled={purge_enabled} "
+            f"physically_deleted={report.get('physically_deleted', 0)} "
+            f"projection_deleted={report.get('projection_deleted', 0)} "
+            f"marked_stale={report.get('marked_stale', 0)} "
+            f"index_repair={report.get('index_repair', {})} "
+            f"errors={len(report.get('errors', []) or [])}"
+        )
 
     async def _loop(self):
         while self._is_running:

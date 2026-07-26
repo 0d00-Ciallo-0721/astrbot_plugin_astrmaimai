@@ -94,20 +94,39 @@ class MemoryIndexProjector:
         if not memory_ids or not hasattr(self.engine, "_execute_documents_write"):
             return 0
         deleted = 0
+        faiss_db = getattr(self.engine, "faiss_db", None)
+        faiss_delete = getattr(faiss_db, "delete", None) if faiss_db is not None else None
         for memory_id in memory_ids:
             try:
                 rows = await self.engine._run_documents_query(
-                    "SELECT id FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
+                    "SELECT id, doc_id FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
                     (memory_id,),
                     db_path=self._documents_db_path(),
                 )
-                doc_ids = [row[0] for row in rows if row]
-                deleted += await self.engine._execute_documents_write(
+                int_ids = [row[0] for row in rows if row]
+                doc_keys = [str(row[1]) for row in rows if row and len(row) > 1 and row[1]]
+                # OPT-05/ML-04: 必须走 FaissVecDB.delete 才会同步删除 embedding——
+                # 旧实现只删 documents 行与 FTS，嵌入向量成为幽灵、top-k 名额被
+                # 已删条目挤占且索引文件只增不减。顺序关键：faiss.delete 内部按
+                # doc_id 反查 int id，必须先于任何 documents 行删除执行。
+                if callable(faiss_delete):
+                    for doc_key in doc_keys:
+                        try:
+                            await faiss_delete(doc_key)
+                            deleted += 1
+                        except Exception:
+                            logger.debug(
+                                f"[MemoryIndexProjector] faiss delete degraded doc_id={doc_key}",
+                                exc_info=True,
+                            )
+                removed_rows = await self.engine._execute_documents_write(
                     "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
                     (memory_id,),
                     db_path=self._documents_db_path(),
                 )
-                await self._delete_fts_rows(doc_ids)
+                if not callable(faiss_delete):
+                    deleted += removed_rows
+                await self._delete_fts_rows(int_ids)
                 self._clear_pending(memory_id)
             except Exception as exc:
                 logger.warning(f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc}")

@@ -33,6 +33,21 @@ class InstantMemoryGate:
     def refresh_config(self, config: Any) -> None:
         self.config = config
 
+    # OPT-05/ML-03: like/dislike 是多值属性——旧 dedup_key 只到 attribute 级，
+    # 新"喜欢"会 supersede 值不同的旧"喜欢"（先说喜欢咖啡再说喜欢猫，咖啡被吞）；
+    # 追加归一化 value 片段使不同偏好共存，同一偏好复述仍去重
+    _MULTI_VALUE_ATTRIBUTES = {"like", "dislike"}
+
+    @classmethod
+    def _authority_dedup_key(cls, claim) -> str:
+        base = f"{claim.subject_id}:{claim.entity}:{claim.attribute}"
+        attribute = str(claim.attribute or "").strip().lower()
+        if attribute in cls._MULTI_VALUE_ATTRIBUTES:
+            normalized_value = "".join(str(claim.value or "").lower().split())[:32]
+            if normalized_value:
+                return f"{base}:{normalized_value}"
+        return base
+
     async def process_committed_turn(self, turn: CommittedMemoryTurn) -> InstantGateResult:
         if turn.is_proactive:
             return InstantGateResult()
@@ -153,7 +168,7 @@ class InstantMemoryGate:
                         "gate_category": category,
                         "instant_write": True,
                     },
-                    dedup_key=f"{primary_claim.subject_id}:{primary_claim.entity}:{primary_claim.attribute}",
+                    dedup_key=self._authority_dedup_key(primary_claim),
                     created_at=float(turn.committed_at or 0.0),
                 )
                 return request, {

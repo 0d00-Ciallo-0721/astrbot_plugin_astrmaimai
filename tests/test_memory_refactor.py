@@ -197,9 +197,11 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertTrue(result["performed"])
         self.assertTrue(gate.hit)
         self.assertTrue(turn.instant_gate_hit)
+        # OPT-05/ML-10: 缓冲改结构化条目（旧拼接串连 sender 都没有，摘要解析器
+        # 只能全落 unknown）；渲染成 "[序号] 发送者: 内容" 交给解析器
         self.assertEqual(
             pipeline._session_history_buffer["chat-3"]["buffer"],
-            ["用户/旁白：我叫小明", "Bot：好的"],
+            [{"sender": "旁白", "text": "我叫小明"}, {"sender": "Bot", "text": "好的"}],
         )
 
     def test_memory_turn_pipeline_ignores_proactive_turns(self):
@@ -270,7 +272,7 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertTrue(record_result["performed"])
         self.assertEqual(
             pipeline._session_history_buffer["chat-drop"]["buffer"],
-            ["用户/旁白：hello", "Bot：hi"],
+            [{"sender": "旁白", "text": "hello"}, {"sender": "Bot", "text": "hi"}],
         )
         self.assertTrue(eligibility["candidate_present"])
         self.assertEqual(eligibility["reason"], "below_threshold")
@@ -351,8 +353,8 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertFalse(turn.instant_gate_hit)
         buffered = pipeline._session_history_buffer["chat-queue-full"]["buffer"]
         self.assertEqual(len(buffered), 2)
-        self.assertIn("hello", buffered[0])
-        self.assertIn("hi", buffered[1])
+        self.assertIn("hello", buffered[0]["text"])
+        self.assertIn("hi", buffered[1]["text"])
 
     def test_memory_turn_pipeline_sweep_loop_triggers_idle_timeout_maintenance(self):
         pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")

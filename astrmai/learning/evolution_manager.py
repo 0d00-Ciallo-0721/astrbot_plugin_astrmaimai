@@ -58,6 +58,9 @@ class EvolutionManager:
         self._mining_tasks: Dict[str, asyncio.Task] = {}
         self._backlog_task: asyncio.Task | None = None
         self._backlog_failure_until: dict[str, float] = {}
+        # OPT-15/ML-09: 按群连续失败计数——毒丸批次 3 次后跳过，不再每 30min 原样
+        # 重试永久卡死该群学习
+        self._backlog_failure_counts: dict[str, int] = {}
         self._last_backlog_report: dict[str, Any] = {}
         self._last_expression_backfill: dict[str, Any] = {}
         self._last_mining_outcomes: dict[str, dict[str, Any]] = {}
@@ -806,7 +809,36 @@ class EvolutionManager:
                 processed_count += 1
                 report["processed_groups"].append({"group_id": group_id, "log_count": len(logs)})
                 self._backlog_failure_until.pop(group_id, None)
+                self._backlog_failure_counts.pop(group_id, None)
+                # OPT-15/ML-09: 成功路径此前零日志，16.6h 观测窗无法区分"没跑"与"没失败"
+                logger.info(
+                    f"[Evolution-Backlog] mined group={group_id} logs={len(logs)} "
+                    f"processed_total={processed_count}"
+                )
             except Exception as exc:
+                failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
+                self._backlog_failure_counts[group_id] = failure_count
+                if failure_count >= 3:
+                    # OPT-15/ML-09: 毒丸跳过——把坏批次记为已消费（fail-closed 防丢数据
+                    # 的初衷保留：只在连续三败后放行，且跳过量以本批为界）
+                    try:
+                        await self._record_mining_outcome(
+                            group_id,
+                            logs,
+                            status="skipped",
+                            reason="poison_pill_after_3_failures",
+                            retryable=False,
+                        )
+                    except Exception:
+                        logger.debug("[Evolution-Backlog] poison outcome record degraded", exc_info=True)
+                    self._backlog_failure_counts.pop(group_id, None)
+                    self._backlog_failure_until.pop(group_id, None)
+                    logger.error(
+                        f"[Evolution-Backlog] poison batch skipped for {group_id} "
+                        f"after {failure_count} consecutive failures: {exc}"
+                    )
+                    report["errors"].append({"group_id": group_id, "error": f"poison_skipped: {exc}"})
+                    continue
                 self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
                 logger.warning(f"[Evolution-Backlog] mining failed for {group_id}: {exc}")
                 report["errors"].append({"group_id": group_id, "error": str(exc)})

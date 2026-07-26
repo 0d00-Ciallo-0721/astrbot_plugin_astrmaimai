@@ -230,9 +230,12 @@ class DreamScheduler:
 
             if not pending["maintenance_memory_done"]:
                 try:
+                    # OPT-15/ML-07: 运维摘要写入独立日记会话，不得进入真实会话的
+                    # 可检索层（importance=0.65 的 active 记忆会被注入聊天 prompt，
+                    # 用户可能看到 bot 提及"维护动作"）
                     await self.memory_engine.add_memory(
                         content=f"[dream_maintenance] {maintenance['summary']}",
-                        session_id=session_id,
+                        session_id="__dream_diary__",
                         importance=0.65,
                     )
                     pending["maintenance_memory_done"] = True

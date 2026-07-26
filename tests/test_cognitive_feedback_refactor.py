@@ -956,7 +956,9 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
 
             async def add_memory(self, **kwargs):
                 self.add_calls.append(kwargs["session_id"])
-                if kwargs["session_id"] == "chat-1" and self.maintenance_failures:
+                # OPT-15/ML-07: 维护摘要已改写独立日记会话，失败注入改按内容前缀
+                content = str(kwargs.get("content") or "")
+                if content.startswith("[dream_maintenance]") and self.maintenance_failures:
                     self.maintenance_failures -= 1
                     raise RuntimeError("temporary write failure")
 
@@ -1002,8 +1004,9 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
         self.assertEqual(scheduler.describe_status()["pending_completions"], 0)
         self.assertTrue(second["performed"])
         self.assertEqual(agent.calls, 1)
-        self.assertEqual(memory.add_calls.count("__dream_diary__"), 1)
-        self.assertEqual(memory.add_calls.count("chat-1"), 2)
+        # OPT-15/ML-07: 运维摘要不再写入真实会话——日记 1 + 维护失败 1 + 维护重试 1
+        self.assertEqual(memory.add_calls.count("__dream_diary__"), 3)
+        self.assertEqual(memory.add_calls.count("chat-1"), 0)
 
     def test_diary_service_should_run_covers_full_early_morning_window(self):
         service = self.diary_mod.DiaryService(

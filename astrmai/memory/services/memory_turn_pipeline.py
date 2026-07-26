@@ -135,9 +135,13 @@ class MemoryTurnPipeline:
                 {"buffer": [], "last_update": now, "cooldown_until": 0.0, "failures": 0, "last_run_at": 0.0},
             )
             if turn.user_text:
-                session_data["buffer"].append(f"用户/旁白：{turn.user_text}")
+                # OPT-05/ML-10: 结构化存 sender——旧格式"用户/旁白：{text}"根本不带
+                # 发送者，摘要解析器只能全落 unknown，群记忆无法归属到人
+                session_data["buffer"].append(
+                    {"sender": str(turn.sender_id or "").strip() or "旁白", "text": str(turn.user_text)}
+                )
             if turn.assistant_text:
-                session_data["buffer"].append(f"Bot：{turn.assistant_text}")
+                session_data["buffer"].append({"sender": "Bot", "text": str(turn.assistant_text)})
             session_data["last_update"] = now
             pending_messages = len(session_data["buffer"])
         await self._observe_turn(
@@ -278,7 +282,9 @@ class MemoryTurnPipeline:
             messages_to_process = buffer.copy()
             session_data["buffer"] = []
 
-        history_text = "\n".join(messages_to_process)
+        history_text = "\n".join(
+            self._render_buffer_line(index + 1, item) for index, item in enumerate(messages_to_process)
+        )
         try:
             await self._observe_chat(
                 chat_id,
@@ -354,6 +360,17 @@ class MemoryTurnPipeline:
 
     async def extract_and_summarize_history(self, session_id: str, days: int = 1):
         return await self.session_summarizer.extract_and_summarize_history(session_id, days=days)
+
+    @staticmethod
+    def _render_buffer_line(index: int, entry: Any) -> str:
+        # OPT-05/ML-10: 渲染成摘要解析器已认识的 "[序号] 发送者: 内容" 格式
+        # （session_memory_summarizer._build_topic_messages 的正则），speaker_ids
+        # 得以落到具体 QQ 号；字符串条目为热更前旧数据，原样透传
+        if isinstance(entry, dict):
+            sender = str(entry.get("sender") or "旁白").strip() or "旁白"
+            text = str(entry.get("text") or "")
+            return f"[{index}] {sender}: {text}"
+        return str(entry)
 
     async def _chat_worker(self, chat_id: str, queue: asyncio.Queue[CommittedMemoryTurn]) -> None:
         # OPT-02/RT-01: per-chat worker 在某轮 turn 上下文中懒创建，必须斩断继承的

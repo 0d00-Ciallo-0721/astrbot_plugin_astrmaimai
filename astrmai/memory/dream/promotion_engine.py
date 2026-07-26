@@ -98,6 +98,14 @@ class MemoryPromotionEngine:
             canonical_source_ids[key].append(str(evidence.get("memory_id") or ""))
             report["scanned_canonical"] += 1
         for key, evidence in self._iter_detected_facts(maintenance_result):
+            # OPT-15/ML-08: 同一回合内重复项不得计为多份证据——单次 LLM 响应把同一
+            # 事实重复 3 遍即可伪造晋升阈值，幻觉会变成权威事实覆盖用户亲述
+            turn_id = str(evidence.get("turn_id") or "")
+            if turn_id and any(
+                str(existing.get("turn_id") or "") == turn_id for existing in grouped[key]
+            ):
+                report["scanned_detected_facts"] += 1
+                continue
             grouped[key].append(evidence)
             canonical_source_ids[key].append(str(evidence.get("memory_id") or ""))
             report["scanned_detected_facts"] += 1
@@ -145,7 +153,9 @@ class MemoryPromotionEngine:
                     content=f"{entity}:{attribute}={value}",
                     summary=value[:240],
                     importance=0.9,
-                    confidence=1.0,
+                    # OPT-15/ML-08: 梦境晋升不得自封满置信——上限取解析证据的
+                    # 实际置信水平，权威覆盖判定仍由 conflict_resolver 把关
+                    confidence=0.95,
                     metadata=metadata,
                     dedup_key=dedup_key,
                     source_ref=f"dream_promotion:{dedup_key}",

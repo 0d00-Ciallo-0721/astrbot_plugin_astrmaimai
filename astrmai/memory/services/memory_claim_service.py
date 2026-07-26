@@ -86,8 +86,13 @@ class MemoryClaimExtractor:
                 )
 
         if any(keyword in lowered for keyword in SERVER_KEYWORDS) or any(keyword in text for keyword in ZH_SERVER_KEYWORDS):
+            # OPT-15/ML-11: 演示场景遗留规则收紧——要求第一人称占有句式，
+            # 否则聊 MC 服务器人数（"服务器 100 人在线"）会被记成用户资产
+            possession_markers = ("我有", "我的", "my ", "i have", "i own")
+            has_possession = any(marker in text or marker in lowered for marker in possession_markers)
             match = SERVER_COUNT_PATTERN.search(text) or ZH_SERVER_COUNT_PATTERN.search(text)
-            value = match.group(1) if match else ""
+            # 纠错语境（"说错了/不是X是Y"）本身即指向用户自述事实，等同占有证据
+            value = match.group(1) if (match and (has_possession or correction)) else ""
             if value:
                 claims.append(
                     MemoryClaim(
