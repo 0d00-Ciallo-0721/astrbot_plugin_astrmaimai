@@ -110,12 +110,15 @@ class InstantMemoryGate:
         fallback_used = False
         subject_id = str(turn.sender_id or turn.chat_id or "")
         try:
+            # OPT-06/ML-06: 内联路径只做规则抽取（allow_llm=False）——此前规则无 claim 时
+            # 同步等 LLM 5-44s，拖长 turn 与同 chat 后续处理；LLM 精炼由后台 backfill 承担
             claims = await self.claim_extractor.extract(
                 user_text=str(raw_text or ""),
                 assistant_text=str(extracted_fact or ""),
                 subject_id=subject_id,
                 turn_id=str(turn.turn_id or ""),
                 context_hint=source,
+                allow_llm=False,
             )
             if claims:
                 decision = self.conflict_resolver.resolve(claims)

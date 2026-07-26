@@ -903,12 +903,29 @@ class MemoryRetrievalService:
         }
         query.metadata = metadata
 
-    async def _call_deep_json(self, prompt: str) -> dict:
+    async def _call_deep_json(self, prompt: str, *, scope_id: str = "") -> dict:
         gateway = getattr(self.engine, "gateway", None) if self.engine else None
         if not gateway or not hasattr(gateway, "call_data_process_task"):
             return {}
+        # OPT-06/ML-02: rerank/guidance 两次 LLM 此前不带 lane/超时/预算钳制，
+        # 深检索被拖到 50-92s 把整轮回复拖成 stale_drop（线上 3 次深检索 2 次如此收场）
+        timeout_override = clamp_timeout_to_turn_budget(None, 12.0, reserve_for_reply=True)
+        if timeout_override <= 0.5:
+            return {}
         try:
-            response = await gateway.call_data_process_task(prompt=prompt, is_json=True)
+            response = await gateway.call_data_process_task(
+                prompt=prompt,
+                is_json=True,
+                lane_key=LaneKey(
+                    subsystem="bg",
+                    task_family="memory",
+                    scope_id=str(scope_id or "global"),
+                    scope_kind="chat" if scope_id else "global",
+                ),
+                base_origin=str(scope_id or ""),
+                timeout_override=timeout_override,
+                max_retries_override=0,
+            )
         except TypeError:
             response = await gateway.call_data_process_task(prompt, is_json=True)
         if isinstance(response, str):
@@ -934,6 +951,9 @@ class MemoryRetrievalService:
     async def _rerank_candidates(self, query: MemoryQuery, candidates: list[MemoryCandidate]) -> list[MemoryCandidate]:
         if len(candidates) <= 1:
             return candidates
+        # OPT-06/ML-02: 候选数不超过 top_k 时排序不影响最终选集，跳过整次 LLM rerank
+        if len(candidates) <= max(int(query.top_k or 5), 1):
+            return candidates
         prompt = (
             "Rerank these memory candidates for the query. "
             "Return JSON only: {\"ids\": [\"memory_id\", ...]}.\n"
@@ -941,7 +961,7 @@ class MemoryRetrievalService:
             f"Candidates: {json.dumps(self._candidate_payload(candidates), ensure_ascii=False)}"
         )
         try:
-            data = await self._call_deep_json(prompt)
+            data = await self._call_deep_json(prompt, scope_id=str(query.session_id or ""))
             ranked_ids = [str(item) for item in data.get("ids", []) if str(item).strip()]
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep rerank degraded: {exc}")
@@ -975,7 +995,7 @@ class MemoryRetrievalService:
             f"Candidates: {json.dumps(self._candidate_payload(candidates), ensure_ascii=False)}"
         )
         try:
-            data = await self._call_deep_json(prompt)
+            data = await self._call_deep_json(prompt, scope_id=str(query.session_id or ""))
             return str(data.get("guidance") or "").strip()[:500]
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep compress degraded: {exc}")

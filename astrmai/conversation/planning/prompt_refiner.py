@@ -442,6 +442,32 @@ class PromptRefiner:
         except (TypeError, ValueError):
             return None
 
+    _THINK1_MEMORY_INTENTS = {
+        "identity",
+        "location",
+        "food_preference",
+        "preference_general",
+        "dislike",
+        "recent_reference",
+    }
+
+    def _think1_memory_gate_passes(self, current_query: str) -> bool:
+        # OPT-06/ML-05: think1 只认 10 个关键词导致注入率 2.9%、私聊 0/19——
+        # "我叫什么名字/我喜欢吃什么"这类身份、偏好问句读不回已写事实。
+        # 关键词未命中时复用 QueryIntentClassifier 的语义意图放行（可配置关闭）。
+        if self._has_memory_intent(current_query):
+            return True
+        memory_cfg = getattr(self.config, "memory", None)
+        if not bool(getattr(memory_cfg, "think1_semantic_intent_enabled", True)):
+            return False
+        try:
+            from ...memory.services.memory_query_builder import QueryIntentClassifier
+
+            _primary, intents, _confidence = QueryIntentClassifier().classify(str(current_query or ""))
+        except Exception:
+            return False
+        return bool(set(intents or []) & self._THINK1_MEMORY_INTENTS)
+
     @staticmethod
     def _has_memory_intent(text: str) -> bool:
         lowered = str(text or "").lower()
@@ -679,7 +705,7 @@ class PromptRefiner:
             decision.policy = "none"
             decision.skip_reason = "think_level_0"
             return decision, ""
-        if think_level == 1 and not self._has_memory_intent(current_query):
+        if think_level == 1 and not self._think1_memory_gate_passes(current_query):
             decision.skip_reason = "think_level_1_no_memory_intent"
             return decision, ""
         if disable_rag or is_fast_mode:

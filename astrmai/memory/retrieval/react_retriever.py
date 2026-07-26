@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from typing import Dict, List, Optional
 
 from astrbot.api import logger
 
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ..contracts.memory_query import MemoryQuery
 from ..contracts.retrieval_trace import RetrievalTrace
 
@@ -67,12 +69,23 @@ class ReActRetriever:
         collected_info: List[Dict[str, str]] = []
         final_answer = ""
 
+        # OPT-06/ML-02(RT-12): 逐步无超时的 react 循环是 memory.injection 尾延迟 92s 的
+        # 来源之一；整个循环受 turn 预算约束，预算耗尽即收束到已收集信息
+        react_budget_sec = clamp_timeout_to_turn_budget(None, 20.0, reserve_for_reply=True)
+        if react_budget_sec <= 0.5:
+            return ""
+        react_deadline = time.monotonic() + react_budget_sec
+
         for iteration in range(self.MAX_ITERATIONS):
+            if time.monotonic() >= react_deadline:
+                logger.debug("[ReAct] iteration budget exhausted; finalizing with collected info")
+                break
             action = await self._react_step(
                 question,
                 chat_id,
                 collected_info,
                 is_last_round=(iteration == self.MAX_ITERATIONS - 1),
+                step_timeout_sec=max(0.5, react_deadline - time.monotonic()),
             )
             if not action:
                 break
@@ -163,6 +176,7 @@ class ReActRetriever:
         chat_id: str,
         collected_info: List[Dict],
         is_last_round: bool = False,
+        step_timeout_sec: float | None = None,
     ) -> Optional[Dict]:
         info_text = "no facts collected yet" if not collected_info else "\n".join(
             f"[{item['tool']}] query: {item['query']} -> result: {item['result'][:300]}"
@@ -182,11 +196,15 @@ class ReActRetriever:
             'Return strict JSON: {"thinking":"...", "tool":"...", "args":{}}'
         )
         try:
+            step_kwargs = {}
+            if step_timeout_sec is not None:
+                step_kwargs["timeout_override"] = max(0.5, min(8.0, float(step_timeout_sec)))
             result = await self.gateway.call_data_process_task(
                 prompt,
                 is_json=True,
                 lane_key=self._retrieval_lane(chat_id),
                 base_origin=chat_id,
+                **step_kwargs,
             )
             return self._safe_parse_json(result)
         except Exception as exc:  # pragma: no cover - defensive fallback

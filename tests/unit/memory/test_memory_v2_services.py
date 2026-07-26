@@ -1781,6 +1781,16 @@ class MemoryV2ServiceTests(unittest.TestCase):
                     dedup_key="deep:green",
                 )
             )
+            # OPT-06/ML-02: 候选数<=top_k 时跳过 LLM rerank；补第三条记忆使 rerank 真实运行
+            await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="summary",
+                    kind="memory",
+                    session_id="chat-1",
+                    content="Alice likes red pens.",
+                    dedup_key="deep:red",
+                )
+            )
             gateway = _Gateway()
             gateway.target_id = target_id
             retrieval = self.retrieval_mod.MemoryRetrievalService(store, engine=_Engine(gateway))
@@ -1789,7 +1799,8 @@ class MemoryV2ServiceTests(unittest.TestCase):
             )
             self.assertEqual(rows[0].id, target_id)
             self.assertIn("bookmark", rows[0].metadata["deep_guidance"])
-            self.assertEqual({item.id for item in rows}, {first_id, target_id})
+            self.assertEqual(len(rows), 2)
+            self.assertIn(target_id, {item.id for item in rows})
 
         asyncio.run(run())
 

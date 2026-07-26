@@ -128,9 +128,12 @@ class MemoryClaimExtractor:
         subject_id: str = "",
         turn_id: str = "",
         context_hint: str = "",
+        allow_llm: bool = True,
     ) -> list[MemoryClaim]:
         claims = self._rule_extract(user_text=user_text, subject_id=subject_id, turn_id=turn_id)
-        if claims or not self.gateway or self.prompt_registry is None:
+        # OPT-06/ML-06: allow_llm=False 时只做规则抽取——发送后内联路径不得同步等
+        # 5-44s 的 LLM（拖长 turn 与同 chat 后续处理），LLM 精炼交给后台 backfill
+        if claims or not allow_llm or not self.gateway or self.prompt_registry is None:
             return claims
         try:
             envelope = self.prompt_registry.render_template(
