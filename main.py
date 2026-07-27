@@ -114,7 +114,7 @@ class AstrMaiPlugin(Star):
 
     async def _ensure_runtime_started(self, source: str) -> None:
         logger.info(f"[AstrMai] runtime startup requested source={source}")
-        await self.facade.on_program_start()
+        await self.facade.on_program_start(source=source)
 
     @filter.on_astrbot_loaded()
     async def on_program_start(self):

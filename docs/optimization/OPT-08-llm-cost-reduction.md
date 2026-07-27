@@ -50,6 +50,27 @@
 - RT-09 prompt 重排有判决分布漂移风险——A/B 门槛不过就回退重排幅度。
 - 每项独立提交可单独 revert。
 
-## 完成记录
+### G7 补充（2026-07-26）：RT-11 信号量拆分（从 LIKELY 转为已实施）
 
-（完成后填写：各池调用数/延迟分位数前后对比表、judge A/B 结果、私聊首响分布）
+OPT-08 只埋了 `semaphore_wait_ms` 取证点；本次补齐拆分实现。
+
+**设计要点：不放大总并发**。原全局信号量的目的是 429 保护，直接调大是错的。改为
+"总闸不变 + 后台加一层子限流器"：
+
+- `model_gateway`：新增 `_background_semaphore = Semaphore(max - reserved)`；
+  `reserved` 由 `infra.critical_path_reserved_slots`（默认 1）控制，热更新时一并重建。
+- `gateway_call._concurrency_slot(critical_path)`：关键路径直取全局槽；后台**先取子槽
+  再取全局槽**——顺序关键，反序会让后台攥着全局槽等子槽，反而把关键路径堵死。
+- 边界收敛：`reserved=0` 不创建子信号量（完全等同旧行为）；`reserved>=max` 自动收敛到
+  `max-1`（后台至少 1 个槽）；`max=1` 时无法预留。
+- 配置：`infra.critical_path_reserved_slots`（schema + pydantic 双侧，纯中文 hint）。
+
+**测试**：`tests/regression/architecture/test_gateway_concurrency_priority.py` 9 条
+（槽位算术 5 / 并发行为 4），含**429 红线断言**（关键路径+后台同时在飞数不得超总上限）。
+红验证 **8 红 1 绿**（13.7s 快速失败）。
+
+**过程改进**：首版红验证时测试**挂死**而非失败——实现缺失时后台任务抛异常，等待信号量的
+主协程永远等下去。已给所有等待加 `asyncio.wait_for(timeout=2.0)`：挂死的测试比失败的测试
+更糟，回归时会拖死整个 CI。
+
+全量回归 **1829 passed, 1 skipped**。

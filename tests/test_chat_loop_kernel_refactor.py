@@ -1367,8 +1367,13 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(_run()), [])
         self.assertFalse(event.stopped)
-        self.assertEqual(event.get_extra("astrmai_event_route"), "notice_passthrough")
+        # G3/ID-08: 撤回 notice 改走专用路由（用于给热区打墓碑），旧断言锁定的
+        # notice_passthrough 正是"撤回事件被直接丢弃、原文留在上下文"的缺陷；
+        # 本用例的核心意图——不进 AstrMai 处理链、不 stop 事件、放行其它插件——不变
+        self.assertEqual(event.get_extra("astrmai_event_route"), "recall_notice")
         self.assertEqual(event.get_extra("astrmai_notice_type"), "group_recall")
+        self.assertTrue(event.get_extra("astrmai_non_conversational", False))
+        self.assertEqual(event.get_extra("astrmai_recalled_message_id"), "message-1")
         self.assertEqual(calls, [])
 
     def test_message_entry_keeps_poke_notice_on_dedicated_path(self):

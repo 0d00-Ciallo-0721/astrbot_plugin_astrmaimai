@@ -23,7 +23,7 @@ class StartupHooksP2GapCoverageTests(unittest.TestCase):
             def __init__(self):
                 self.called = False
 
-            async def on_program_start(self):
+            async def on_program_start(self, *, source: str = ""):
                 self.called = True
 
         lifecycle = _Lifecycle()
@@ -40,7 +40,7 @@ class StartupHooksP2GapCoverageTests(unittest.TestCase):
             startup_hooks_mod.logger.exception = startup_hooks_mod.logger.error
 
         class _Lifecycle:
-            async def on_program_start(self):
+            async def on_program_start(self, *, source: str = ""):
                 raise RuntimeError("startup failed")
 
         with self.assertRaisesRegex(RuntimeError, "startup failed"):

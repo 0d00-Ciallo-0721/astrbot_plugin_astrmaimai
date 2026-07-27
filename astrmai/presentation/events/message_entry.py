@@ -94,6 +94,10 @@ def _classify_event_route(event) -> tuple[str, dict]:
     sub_type = str(payload.get("sub_type") or "").strip().lower()
     if notice_type == "poke" or sub_type in {"poke", "戳一戳"}:
         return "poke_notice", payload
+    # G3/ID-08: 撤回通知此前混在 notice_passthrough 里被直接丢弃，被撤回的消息
+    # 原文继续留在对话上下文可被 bot 复述
+    if notice_type in {"group_recall", "friend_recall"} or sub_type in {"group_recall", "friend_recall", "recall"}:
+        return "recall_notice", payload
     return "notice_passthrough", payload
 
 
@@ -164,6 +168,36 @@ def _configure_turn_budget(facade: RuntimeFacadeProtocol, event) -> None:
 
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     event_route, notice_payload = _classify_event_route(event)
+    if event_route == "recall_notice":
+        # G3/ID-08: 给热区里对应消息打墓碑（内容替换为 [已撤回]，speaker 与时序保留），
+        # 随后与其它 notice 一样按非对话事件终止——不进入判决/回复链路
+        recalled_id = str(
+            notice_payload.get("message_id")
+            or notice_payload.get("msg_id")
+            or notice_payload.get("target_message_id")
+            or ""
+        ).strip()
+        chat_id = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        try:
+            event.set_extra("astrmai_event_route", event_route)
+            event.set_extra("astrmai_notice_type", str(notice_payload.get("notice_type") or "recall"))
+            event.set_extra("astrmai_non_conversational", True)
+            event.set_extra("astrmai_recalled_message_id", recalled_id)
+            marked = False
+            handler = getattr(facade, "handle_message_recall", None)
+            if recalled_id and callable(handler):
+                marked = bool(await handler(chat_id, recalled_id))
+            event.set_extra("astrmai_recall_tombstoned", marked)
+            debug_trace(
+                event,
+                "ingress.recall_notice",
+                chat_id=chat_id,
+                recalled_message_id=recalled_id,
+                tombstoned=marked,
+            )
+        except Exception:
+            logger.debug("[AstrMai] recall notice handling degraded", exc_info=True)
+        return
     if event_route == "notice_passthrough":
         notice_type = str(notice_payload.get("notice_type") or "unknown").strip().lower()
         sub_type = str(notice_payload.get("sub_type") or "").strip().lower()

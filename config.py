@@ -146,6 +146,16 @@ class AttentionConfig(BaseModel):
         default=True,
         description="私聊跳过 judge 判决（合并窗+settle 已承担等待职能，judge 在私聊近乎恒 REPLY 纯增延迟）",
     )
+    judge_ignore_focus_cooldown_enabled: bool = Field(
+        default=True,
+        description="被判决忽略的消息在后续批次降权，避免同一条消息被反复判决（强唤醒不受影响）",
+    )
+    judge_ignore_focus_penalty: int = Field(
+        default=150,
+        ge=0,
+        le=1000,
+        description="每被忽略一轮的焦点扣分（0 等同关闭降权）",
+    )
     cognitive_loop_min_think_level: int = Field(
         default=2,
         ge=1,
@@ -251,6 +261,10 @@ class TTSConfig(BaseModel):
 
 class ConversationConfig(BaseModel):
     enable_dialogue_store: bool = Field(default=True)
+    dialogue_store_persist_enabled: bool = Field(
+        default=True,
+        description="插件重载时把群对话热/温区落盘并在启动时恢复（受 warm_zone_ttl 与快照 schema 版本双重约束）",
+    )
     enable_context_compaction: bool = Field(default=True)
     enable_prefix_caching: bool = Field(default=True)
     context_dedup_enabled: bool = Field(default=True, description="启用提示词上下文来源感知去重")
@@ -326,6 +340,12 @@ class InfraConfig(BaseModel):
     backoff_factor: float = Field(default=1.5, ge=0.0)
     api_timeout: float = Field(default=15.0, ge=1.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
     max_concurrent_llm_calls: int = Field(default=3, ge=1, description="全局 LLM 并发请求上限，防止后台任务雪崩导致 429")
+    critical_path_reserved_slots: int = Field(
+        default=1,
+        ge=0,
+        le=8,
+        description="为用户可见回复链保留的并发槽位；后台任务最多占用 上限-该值 个槽（总并发不变）",
+    )
     rate_limit_model_cooldown_sec: int = Field(default=120, ge=0, description="模型触发 429/rate limit 后的运行期冷却时间（秒）")
     quota_model_cooldown_sec: int = Field(default=1800, ge=0, description="模型触发 403/配额/权限失败后的运行期冷却时间（秒）")
 

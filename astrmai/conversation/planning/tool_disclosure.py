@@ -346,6 +346,35 @@ class ToolDisclosurePlanner:
         packages.append(package)
         reasons.append(f"{package}:{reason}")
 
+    # G5/TL-01: 语义意图 → 只读查询包。复用 OPT-06 在 prompt_refiner 引入的同款
+    # QueryIntentClassifier，保持"记忆检索门"与"工具披露"对身份类问句的判定一致。
+    # 只映射"查得到答案"的意图：identity/location 对应 QQ 身份查询工具。
+    # 刻意不映射 recent_reference（"你还记得我之前说的吗"）——那是记忆回想，
+    # 由记忆注入链路（OPT-06）服务，并包联系人路由工具属于语义错配
+    # （既有 test_agency_tier_none_and_social_intent_constrain_tools 抓出过此错）。
+    _SEMANTIC_INTENT_PACKAGES = {
+        "identity": "identity",
+        "location": "identity",
+    }
+
+    @classmethod
+    def _semantic_intent_packages(cls, text: str, existing: list[str]) -> list[str]:
+        query = str(text or "").strip()
+        if not query:
+            return []
+        try:
+            from ...memory.services.memory_query_builder import QueryIntentClassifier
+
+            _primary, intents, _confidence = QueryIntentClassifier().classify(query)
+        except Exception:
+            return []
+        resolved: list[str] = []
+        for intent in intents or []:
+            package = cls._SEMANTIC_INTENT_PACKAGES.get(str(intent or "").strip())
+            if package and package not in existing and package not in resolved:
+                resolved.append(package)
+        return resolved
+
     def plan(
         self,
         *,
@@ -394,6 +423,11 @@ class ToolDisclosurePlanner:
             self._append_package(packages, reasons, "identity", "identity_signal")
         if self._contains_any(text, self.RELATIONSHIP_KEYWORDS):
             self._append_package(packages, reasons, "relationship", "relationship_signal")
+        # G5/TL-01 后半：关键词未命中时用语义意图兜底并包只读查询工具。
+        # 二段披露（模型自检调 bot_capability_lookup）16h 零触发，不能只靠它；
+        # 这里让"我叫什么名字/我们是什么关系"这类问句即使不含关键词也拿到工具。
+        for package in self._semantic_intent_packages(text, packages):
+            self._append_package(packages, reasons, package, f"{package}_semantic_intent")
         if self._contains_any(text, self.CROSS_SESSION_KEYWORDS):
             self._append_package(packages, reasons, "cross_session", "cross_session_signal")
         if self._contains_any(text, self.MEMORY_GOVERNANCE_KEYWORDS):

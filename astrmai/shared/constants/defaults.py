@@ -15,6 +15,8 @@ def _tupleize(values: Any) -> tuple[str, ...]:
 @dataclass(frozen=True, slots=True)
 class GatewaySettings:
     max_concurrent_llm_calls: int = 3
+    # G7/RT-11: 为关键路径（用户可见回复链）保留的并发槽位数
+    critical_path_reserved_slots: int = 1
     llm_retries: int = 2
     backoff_factor: float = 1.5
     api_timeout: float = 15.0
@@ -89,6 +91,7 @@ def build_infrastructure_settings(config: Any) -> InfrastructureSettings:
     return InfrastructureSettings(
         gateway=GatewaySettings(
             max_concurrent_llm_calls=_min_int(getattr(infra, "max_concurrent_llm_calls", None), 3, 1),
+            critical_path_reserved_slots=_min_int(getattr(infra, "critical_path_reserved_slots", None), 1, 0),
             llm_retries=int(_num(getattr(infra, "llm_retries", None), 2)),
             backoff_factor=float(_num(getattr(infra, "backoff_factor", None), 1.5)),
             api_timeout=_min_float(getattr(infra, "api_timeout", None), 15.0, 1.0),

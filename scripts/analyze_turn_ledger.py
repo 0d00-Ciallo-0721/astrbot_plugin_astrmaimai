@@ -42,7 +42,23 @@ def load_traces(
     instrumentation_version: str = "",
     since: float = 0.0,
 ) -> list[dict[str, Any]]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    # G8/WU-06: 同时支持 append-only JSONL（新格式）与整文件 JSON（历史快照，
+    # 例如 .agent/runtime-observability-* 里已归档的样本）
+    text = Path(path).read_text(encoding="utf-8")
+    if str(path).endswith(".jsonl"):
+        payload = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                item = json.loads(stripped)
+            except Exception:
+                continue  # 崩溃截断的半行
+            if isinstance(item, dict):
+                payload.append(item)
+    else:
+        payload = json.loads(text)
     if isinstance(payload, list):
         source = _safe_list(payload)
     elif isinstance(payload, dict):

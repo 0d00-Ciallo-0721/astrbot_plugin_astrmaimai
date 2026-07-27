@@ -44,7 +44,42 @@ def score_focus_candidate(gate, candidate, normalized_events):
     delta = max(0.0, (latest_ts - (candidate.timestamp or latest_ts))) if candidate.timestamp else 0.0
     recency_bonus = max(0, 90 - int(delta * 5))
     score += recency_bonus
+
+    # G6/RT-02 附带：被 judge 判过 IGNORE 的事件会被放回 window，下一批仍可能再次
+    # 被选中重复判决（线上实测同一 focus 150s 内判 10 次，judge 池 539 次调用中
+    # 521 次花在最终被忽略的消息上）。对这类事件降权，让新消息优先。
+    # 豁免：强唤醒信号（@bot/回复bot/点名/直接视觉）永远不受冷却影响。
+    ignored_rounds = _ignored_round_count(candidate.event)
+    if ignored_rounds and not _is_strong_signal(candidate, reply_priority_enabled, is_historical):
+        # 注意：不能写 `or 150`——penalty=0 是"关闭降权"的合法取值，会被 falsy 吞掉
+        raw_penalty = getattr(attention_config, "judge_ignore_focus_penalty", 150)
+        try:
+            penalty_per_round = max(0, int(150 if raw_penalty is None else raw_penalty))
+        except (TypeError, ValueError):
+            penalty_per_round = 150
+        if penalty_per_round:
+            score -= penalty_per_round * ignored_rounds
+            reason = "judge_ignored_cooldown"
     return score, reason
+
+
+def _is_strong_signal(candidate, reply_priority_enabled: bool, is_historical: bool) -> bool:
+    if is_historical:
+        return False
+    if candidate.has_direct_vision:
+        return True
+    if not reply_priority_enabled:
+        return False
+    return bool(candidate.is_reply_to_bot or candidate.is_at_bot or candidate.is_direct_wakeup)
+
+
+def _ignored_round_count(event) -> int:
+    if not hasattr(event, "get_extra"):
+        return 0
+    try:
+        return max(0, int(event.get_extra("astrmai_judge_ignored_rounds", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def select_focus_event(gate, events, self_id: str, normalized_events=None, *, is_private: bool = False):

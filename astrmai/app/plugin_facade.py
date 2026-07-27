@@ -69,8 +69,8 @@ class PluginFacade(RuntimeFacadeProtocol):
             weight_delta=weight_delta,
         )
 
-    async def on_program_start(self) -> None:
-        await run_startup_hook(self.runtime, self.lifecycle_manager)
+    async def on_program_start(self, *, source: str = "") -> None:
+        await run_startup_hook(self.runtime, self.lifecycle_manager, source=source)
 
     async def on_global_message(self, event):
         async for result in handle_global_message(self, event):
@@ -120,6 +120,21 @@ class PluginFacade(RuntimeFacadeProtocol):
         await self.clear_group_runtime_state(chat_id, group_id=group_id)
         logger.info(f"[AstrMai] bot left group {group_id}; cleared runtime state for {chat_id}")
         return True
+
+    async def handle_message_recall(self, chat_id: str, event_id: str) -> bool:
+        """G3/ID-08: 撤回通知 → 对话热区打墓碑，防止 bot 后续原文复述已撤回内容。
+
+        只改展示层（store 里的 segment 内容），不动原始事件存储。
+        """
+        store = getattr(self.runtime, "dialogue_store", None)
+        marker = getattr(store, "mark_recalled", None) if store is not None else None
+        if not callable(marker):
+            return False
+        try:
+            return bool(await marker(str(chat_id or ""), str(event_id or "")))
+        except Exception:
+            logger.warning("[AstrMai] message recall tombstone failed", exc_info=True)
+            return False
 
     async def clear_group_runtime_state(self, chat_id: str, *, group_id: str = "") -> dict[str, bool]:
         result: dict[str, bool] = {}

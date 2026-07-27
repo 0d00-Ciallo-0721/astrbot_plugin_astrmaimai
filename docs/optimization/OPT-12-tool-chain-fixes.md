@@ -51,3 +51,21 @@
 - TL-08：删除 `FAMILY_TO_PACKAGES["quote_reply"]` 死映射（PRECISION_ONLY 家族在 plan() 中被剔除，映射永不生效且与 TOOL_PACKAGES 矛盾）。
 - 既有契约更新 1 处：`test_agency_tier_none_and_social_intent_constrain_tools` 的 comfort 期望集合补入 wait/capability（旧断言锁定的正是"连等待与自检能力一并清空"）。
 - 受影响套件 184+70 passed。
+
+### G5 补充（2026-07-26）：TL-01 后半 —— 语义意图直接并包
+
+OPT-12 只做了 guidance 提示（告知模型可调 `bot_capability_lookup` 自检）；二段披露 16h 零触发
+说明不能只依赖模型自检。本次补齐"识别到信号即直接并包"。
+
+- `tool_disclosure.plan()`：关键词未命中时用 `QueryIntentClassifier`（与 OPT-06 记忆检索门**同一个
+  分类器**，两处对身份类问句判定一致）兜底并包，reason 标 `<package>_semantic_intent` 与
+  关键词命中的 `_signal` 区分开；关键词已命中时不重复并包。
+- **映射决策（含一次纠错）**：初版把 `recent_reference → relationship`，被既有
+  `test_agency_tier_none_and_social_intent_constrain_tools` 抓出——"你还记得我之前说的吗"是
+  **记忆回想**，并包 `qq_friend_lookup`/`contact_route_suggest_tool` 等联系人路由工具属语义错配。
+  最终只保留 `identity/location → identity`（"查得到答案"的意图），记忆回想交给 OPT-06 的注入链路。
+  该决策已写成负向断言固化。
+- 测试：`tests/regression/conversation/test_semantic_tool_disclosure.py` 6 条（红验证 3 红），
+  含闲聊/空消息保持 core-only 的负向对照；既有 49 项工具相关测试**无需修改**即通过。
+
+全量回归 **1811 passed, 1 skipped**。

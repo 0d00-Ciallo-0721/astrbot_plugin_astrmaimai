@@ -27,11 +27,13 @@ def test_v1_payload_remains_readable_and_migrates_on_append(tmp_path):
         return old_items
 
     old_items = asyncio.run(run())
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    # G8/WU-06: 落盘格式由整文件 JSON 改为 append-only JSONL；legacy 历史在首次
+    # 写入时自动迁移，读取端语义（v1 可读、追加后新旧共存）保持不变
+    lines = [line for line in store.jsonl_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    migrated = [json.loads(line) for line in lines]
     assert old_items[0]["status"] == "executed"
-    assert payload["version"] == 2
-    assert payload["by_chat"]["chat-a"][0]["status"] == "executed"
-    assert payload["recent"][0]["chat_id"] == "chat-b"
+    assert any(item["chat_id"] == "chat-a" and item["status"] == "executed" for item in migrated)
+    assert migrated[-1]["chat_id"] == "chat-b"
 
 
 def test_global_recent_is_chronological_and_bounded(tmp_path):
@@ -46,9 +48,16 @@ def test_global_recent_is_chronological_and_bounded(tmp_path):
 
     items = asyncio.run(run())
     assert [item["turn_id"] for item in items] == ["b4", "a3", "c2"]
-    payload = json.loads(store.path.read_text(encoding="utf-8"))
-    assert len(payload["recent"]) == 3
-    assert len(payload["by_chat"]["chat-a"]) == 2
+    # G8/WU-06: max_global 由读取端兜底 + 周期性压实共同保证（append-only 下
+    # 两次压实之间文件行数可短暂超出，上限由 max_global*COMPACTION_FACTOR 护栏兜住）
+    asyncio.run(asyncio.to_thread(store._compact_sync))
+    compacted = [
+        json.loads(line)
+        for line in store.jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(compacted) <= 3
+    assert len([item for item in compacted if item["chat_id"] == "chat-a"]) <= 2
 
 
 def test_append_replaces_existing_turn_id_instead_of_duplicating(tmp_path):
@@ -74,9 +83,16 @@ def test_append_replaces_existing_turn_id_instead_of_duplicating(tmp_path):
         return await store.recent(chat_id="chat-a", limit=5)
 
     items = asyncio.run(run())
-    payload = json.loads(store.path.read_text(encoding="utf-8"))
 
     assert len(items) == 1
     assert items[0]["status"] == "executed"
-    assert len(payload["by_chat"]["chat-a"]) == 1
-    assert len(payload["recent"]) == 1
+    # G8/WU-06: append-only 下旧行不再被物理删除，由「后写覆盖先写」在读取端去重；
+    # 压实后物理合并为单行
+    asyncio.run(asyncio.to_thread(store._compact_sync))
+    compacted = [
+        json.loads(line)
+        for line in store.jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(compacted) == 1
+    assert compacted[0]["status"] == "executed"

@@ -215,10 +215,16 @@ class PluginBootstrap:
         state_engine = StateEngine(persistence, gateway, event_bus=event_bus)
         dialogue_store = None
         if runtime.feature_flags.dialogue_store_enabled:
+            # G4/PL-09: 传入 cache 目录以支持跨重载的上下文快照（开关见
+            # conversation.dialogue_store_persist_enabled；关闭时不传目录即完全禁用）
+            snapshot_dir = None
+            if bool(getattr(conversation_settings, "dialogue_store_persist_enabled", True)):
+                snapshot_dir = getattr(getattr(persistence, "persistence", persistence), "cache_dir", None)
             dialogue_store = GroupDialogueStore(
                 hot_zone_ttl_seconds=getattr(conversation_settings, "hot_zone_ttl_seconds", 30.0),
                 warm_zone_ttl_seconds=getattr(conversation_settings, "warm_zone_ttl_seconds", 300.0),
                 warm_zone_max_tokens=getattr(conversation_settings, "warm_zone_max_tokens", 1200),
+                snapshot_dir=snapshot_dir,
             )
         db_service.dialogue_store = dialogue_store
         gateway.dialogue_store = dialogue_store

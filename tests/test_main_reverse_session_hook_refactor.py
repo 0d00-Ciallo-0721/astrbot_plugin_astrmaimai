@@ -143,7 +143,7 @@ class ReverseSessionMainHookTests(unittest.TestCase):
         calls = []
 
         class _Facade:
-            async def on_program_start(self):
+            async def on_program_start(self, *, source: str = ""):
                 calls.append("start")
 
         plugin.facade = _Facade()

@@ -36,20 +36,51 @@ class GlobalModelGateway(
         self._model_cooldowns: dict[tuple[str, str], dict[str, Any]] = {}
         self._last_agent_model_selection: dict[str, Any] = {}
         self._global_semaphore = asyncio.Semaphore(max(1, int(self.settings.max_concurrent_llm_calls)))
+        self._background_semaphore = self._build_background_semaphore()
         logger.info(
-            f"[Gateway] global concurrency limiter ready, max={self.settings.max_concurrent_llm_calls}"
+            f"[Gateway] global concurrency limiter ready, max={self.settings.max_concurrent_llm_calls}, "
+            f"background_max={self._background_limit()}"
         )
+
+    # G7/RT-11: 关键路径与后台调用此前共用一把全局信号量(默认3)，高峰期被忽略消息的
+    # judge/mood 占满槽位、真实回复排队（skipped 轮 judge ledger elapsed 51.7s 而
+    # attempt 仅数秒）。解法不是放大总并发（那会破坏 429 保护），而是给后台调用加一层
+    # 子限流器：后台最多占 max-reserved 个槽，剩余槽位始终为关键路径保留。
+    def _reserved_critical_slots(self) -> int:
+        raw = getattr(self.settings, "critical_path_reserved_slots", 1)
+        try:
+            reserved = int(1 if raw is None else raw)
+        except (TypeError, ValueError):
+            reserved = 1
+        total = max(1, int(self.settings.max_concurrent_llm_calls))
+        # 至少给后台留 1 个槽，否则后台任务永远拿不到配额（total=1 时无法预留）
+        return max(0, min(reserved, total - 1))
+
+    def _background_limit(self) -> int:
+        total = max(1, int(self.settings.max_concurrent_llm_calls))
+        return max(1, total - self._reserved_critical_slots())
+
+    def _build_background_semaphore(self) -> asyncio.Semaphore | None:
+        total = max(1, int(self.settings.max_concurrent_llm_calls))
+        limit = self._background_limit()
+        return None if limit >= total else asyncio.Semaphore(limit)
 
     def refresh_config(self, config):
         """ponytail: hot-reload config into gateway"""
         self.config = config
         from ...shared.constants.defaults import build_infrastructure_settings
         old_limit = max(1, int(getattr(self.settings, "max_concurrent_llm_calls", 1) or 1))
+        old_reserved = self._reserved_critical_slots()
         self.settings = build_infrastructure_settings(config).gateway
         new_limit = max(1, int(self.settings.max_concurrent_llm_calls))
-        if new_limit != old_limit:
+        new_reserved = self._reserved_critical_slots()
+        if new_limit != old_limit or new_reserved != old_reserved:
             self._global_semaphore = asyncio.Semaphore(new_limit)
-            logger.info(f"[Gateway] concurrency limiter rebuilt, max={new_limit}")
+            self._background_semaphore = self._build_background_semaphore()
+            logger.info(
+                f"[Gateway] concurrency limiter rebuilt, max={new_limit}, "
+                f"background_max={self._background_limit()}"
+            )
 
     def get_models_for_task(self, pool_name: str, models: List[str]) -> List[str]:
         return self.router.get_ranked_models(pool_name, models)

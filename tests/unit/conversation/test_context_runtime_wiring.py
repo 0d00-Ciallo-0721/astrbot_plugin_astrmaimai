@@ -460,9 +460,16 @@ class ContextRuntimeWiringTests(unittest.TestCase):
             await raw_store.append({"created_at": 1.0, "chat_id": "chat-1", "stage": "raw"})
             await turn_store.append({"created_at": 2.0, "chat_id": "chat-1", "stage": "turn"})
             raw_payload = json.loads(raw_store.path.read_text(encoding="utf-8"))
-            turn_payload = json.loads(turn_store.path.read_text(encoding="utf-8"))
             self.assertEqual(raw_payload["by_chat"]["chat-1"][0]["stage"], "raw")
-            self.assertEqual(turn_payload["by_chat"]["chat-1"][0]["stage"], "turn")
+            # G8/WU-06: turn trace 落盘改 append-only JSONL（raw trace 仍是整文件 JSON）；
+            # 断言从"整文件结构"改为"JSONL 行内容"，写入原子性由 tmp+replace 压实路径保证
+            turn_lines = [
+                json.loads(line)
+                for line in turn_store.jsonl_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(turn_lines[0]["stage"], "turn")
+            self.assertEqual(turn_lines[0]["chat_id"], "chat-1")
 
         asyncio.run(run())
 

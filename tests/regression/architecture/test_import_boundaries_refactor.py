@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 ASTRMAI_ROOT = ROOT / "astrmai"
 TEST_ROOT = ROOT / "tests"
-SKIPPED_SCAN_PARTS = {"venv", ".venv", "site-packages", "artifacts"}
+SKIPPED_SCAN_PARTS = {"venv", ".venv", "site-packages", "artifacts", ".claude"}
 
 
 def _iter_python_files(root: Path):

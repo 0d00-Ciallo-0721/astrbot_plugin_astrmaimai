@@ -9,6 +9,17 @@ from types import SimpleNamespace
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
+# G1 (OPT-13): 签到窗口判定用 time.localtime（机器本地时区），因此测试时间戳必须
+# 按“本地时间”构造。旧代码硬编码 epoch 1768695000.0——它只在 UTC+8 下等于 08:10
+# （写测试时的机器时区），在别的时区（如本机 UTC-8 为 16:10）直接落到窗口外，
+# 导致 3 个用例随机器时区红/绿。下面的 helper 由本地时间反推 epoch，时区无关。
+_SIGN_DAY = (2026, 1, 18)
+
+
+def _local_ts(hour: int, minute: int = 0) -> float:
+    year, month, day = _SIGN_DAY
+    return time.mktime((year, month, day, int(hour), int(minute), 0, 0, 0, -1))
+
 
 class _FakeApi:
     def __init__(self, *, should_fail=False):
@@ -69,7 +80,7 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         persistence = _FakePersistence()
         service = self._build_service(states=[state], api=api, dispatcher=dispatcher, persistence=persistence)
 
-        asyncio.run(service.run_once(now_ts=1768695000.0))
+        asyncio.run(service.run_once(now_ts=_local_ts(self.mod.GroupSigninService.SIGN_HOUR, 10)))
 
         self.assertEqual(api.calls, [("set_group_sign", {"group_id": "12345"})])
         self.assertEqual(len(dispatcher.intents), 1)
@@ -91,7 +102,7 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         dispatcher = _FakeDispatcher()
         service = self._build_service(states=[state], api=api, dispatcher=dispatcher)
 
-        asyncio.run(service.run_once(now_ts=1768695000.0))
+        asyncio.run(service.run_once(now_ts=_local_ts(self.mod.GroupSigninService.SIGN_HOUR, 10)))
 
         self.assertEqual(api.calls, [])
         self.assertEqual(dispatcher.intents, [])
@@ -103,7 +114,7 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         persistence = _FakePersistence()
         service = self._build_service(states=[state], api=api, dispatcher=dispatcher, persistence=persistence)
 
-        asyncio.run(service.run_once(now_ts=1768695000.0))
+        asyncio.run(service.run_once(now_ts=_local_ts(self.mod.GroupSigninService.SIGN_HOUR, 10)))
 
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(dispatcher.intents, [])
@@ -129,7 +140,7 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         persistence = _FailFinalPersistence()
         service = self._build_service(states=[state], api=api, dispatcher=dispatcher, persistence=persistence)
 
-        asyncio.run(service.run_once(now_ts=1768695000.0))
+        asyncio.run(service.run_once(now_ts=_local_ts(self.mod.GroupSigninService.SIGN_HOUR, 10)))
 
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(dispatcher.intents, [])
@@ -147,10 +158,25 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
             api=restarted_api,
             dispatcher=restarted_dispatcher,
         )
-        asyncio.run(restarted.run_once(now_ts=1768695000.0))
+        asyncio.run(restarted.run_once(now_ts=_local_ts(self.mod.GroupSigninService.SIGN_HOUR, 10)))
 
         self.assertEqual(restarted_api.calls, [])
         self.assertEqual(restarted_dispatcher.intents, [])
+
+    def test_sign_window_predicate_is_timezone_independent(self):
+        # G1 (OPT-13) 锚定：窗口判定必须只依赖“本地小时”，测试时间戳一律由
+        # _local_ts 从 SIGN_HOUR 派生——任何机器时区下结论一致。
+        # 若有人再把时间戳写成裸 epoch，本用例会在非 UTC+8 机器上立刻变红。
+        service_cls = self.mod.GroupSigninService
+        sign_hour = service_cls.SIGN_HOUR
+
+        self.assertTrue(service_cls._within_sign_window(_local_ts(sign_hour, 0)))
+        self.assertTrue(service_cls._within_sign_window(_local_ts(sign_hour, 59)))
+        self.assertFalse(service_cls._within_sign_window(_local_ts(sign_hour - 1, 59)))
+        self.assertFalse(service_cls._within_sign_window(_local_ts(sign_hour + 1, 0)))
+
+        # 派生时间戳的本地小时就是 SIGN_HOUR（构造即保证，与机器时区无关）
+        self.assertEqual(time.localtime(_local_ts(sign_hour, 10)).tm_hour, sign_hour)
 
     def test_run_once_before_window_skips_all_groups(self):
         state = SimpleNamespace(chat_id="default:GroupMessage:12345", group_config={}, is_dirty=False)
@@ -158,7 +184,7 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         dispatcher = _FakeDispatcher()
         service = self._build_service(states=[state], api=api, dispatcher=dispatcher)
 
-        before_window = time.mktime((2026, 1, 18, 7, 0, 0, 0, 0, -1))
+        before_window = _local_ts(self.mod.GroupSigninService.SIGN_HOUR - 1)
         asyncio.run(service.run_once(now_ts=before_window))
 
         self.assertEqual(api.calls, [])
@@ -170,7 +196,7 @@ class GroupSigninServiceRefactorTests(unittest.TestCase):
         dispatcher = _FakeDispatcher()
         service = self._build_service(states=[state], api=api, dispatcher=dispatcher)
 
-        after_window = time.mktime((2026, 1, 18, 15, 0, 0, 0, 0, -1))
+        after_window = _local_ts(self.mod.GroupSigninService.SIGN_HOUR + 7)
         asyncio.run(service.run_once(now_ts=after_window))
 
         self.assertEqual(api.calls, [])

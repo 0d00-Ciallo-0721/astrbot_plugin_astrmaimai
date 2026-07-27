@@ -25,8 +25,12 @@ class RuntimeFacadeProtocol(Protocol):
 
     # ── lifecycle ──
 
-    async def on_program_start(self) -> None:
-        """Hook invoked once after the plugin boots."""
+    async def on_program_start(self, *, source: str = "") -> None:
+        """Hook invoked once after the plugin boots.
+
+        source 标识启动来源（plugin_initialize / astrbot_loaded），决定终止闩锁
+        能否复位——见 PluginLifecycleManager._LATCH_RESET_SOURCES。
+        """
         ...
 
     async def on_global_message(self, event: Any) -> AsyncIterator[Any]:

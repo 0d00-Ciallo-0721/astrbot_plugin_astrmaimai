@@ -515,6 +515,10 @@ class AttentionGate:
             )
         )
 
+    def _judge_ignore_cooldown_enabled(self) -> bool:
+        attention_cfg = getattr(self.config, "attention", None)
+        return bool(getattr(attention_cfg, "judge_ignore_focus_cooldown_enabled", True))
+
     def _mood_post_judge_enabled(self) -> bool:
         attention_cfg = getattr(self.config, "attention", None)
         return bool(getattr(attention_cfg, "mood_post_judge_enabled", True))
@@ -1592,6 +1596,14 @@ class AttentionGate:
                     elif judge_action == "IGNORE":
                         if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):
                             await self._complete_proactive_candidate(focus_event, reason="proactive_judge_ignore")
+                        # G6/RT-02: 记录被忽略轮次——事件放回 window 后，focus 评分层
+                        # 按该计数降权，避免同一条消息被反复判决（可配置关闭）
+                        if self._judge_ignore_cooldown_enabled():
+                            try:
+                                previous_rounds = int(focus_event.get_extra("astrmai_judge_ignored_rounds", 0) or 0)
+                            except (TypeError, ValueError):
+                                previous_rounds = 0
+                            focus_event.set_extra("astrmai_judge_ignored_rounds", previous_rounds + 1)
                         async with session.lock:
                             self._append_attention_window(session, [focus_event])
                         await self._finalize_pre_planner_turn(

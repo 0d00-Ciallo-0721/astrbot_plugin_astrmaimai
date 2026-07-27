@@ -1,6 +1,6 @@
 # OPT-14 生命周期与重载韧性
 
-状态：未开始（本轮未动，取证条件不具备） ｜ 优先级：P2 ｜ 依赖：无 ｜ 覆盖发现：PL-09(P2)、PL-10(P3/NEEDS_RUNTIME_EVIDENCE) ｜ 热更新路径本身设计良好（校验前置、组件级联刷新、失败回滚），弱点在重载的副作用。
+状态：**已完成**（G4，2026-07-26） ｜ 优先级：P2 ｜ 依赖：无 ｜ 覆盖发现：PL-09(P2)、PL-10(P3/NEEDS_RUNTIME_EVIDENCE) ｜ 热更新路径本身设计良好（校验前置、组件级联刷新、失败回滚），弱点在重载的副作用。
 
 ## 目标
 
@@ -31,4 +31,42 @@
 
 ## 完成记录
 
-本轮未实施。PL-10 需 AstrBot 面板禁用→启用实测取证（NEEDS_RUNTIME_EVIDENCE），PL-09 的对话快照持久化需设计 TTL/schema 演进策略，两者都不适合在无运行环境的批次里推进。建议与下次真实环境验收同批做。
+**2026-07-26（G4）代码侧完成**：
+
+### PL-10 终止闩锁 —— 按启动来源区分，而非一刀切复位
+
+原计划是"允许 `_terminated` 状态下重新初始化"。实施时发现既有测试
+`test_terminated_lifecycle_cannot_be_restarted_by_late_hook` 守护的是**另一个真实场景**：
+shutdown 期间迟到的框架 hook 不得复活插件。两者存在真实张力，一刀切复位会破坏后者。
+
+**解法**：把 `main.py` 早已区分的启动来源（`plugin_initialize` / `astrbot_loaded`）
+贯通到生命周期层——`main → facade.on_program_start(source=) → startup_hooks → lifecycle`
+四层各带默认值保持向后兼容。`_LATCH_RESET_SOURCES = {"plugin_initialize"}`：
+
+- 面板禁用→启用（复用同一实例）→ 复位闩锁并正常启动（PL-10 修复目标）
+- 迟到的 `astrbot_loaded` / 无来源 → 维持拒启 + WARN（既有保护不变）
+
+结果：两条既有测试**无需修改**即保持绿，新旧语义共存。
+
+### PL-09 对话上下文快照
+
+**策略三要素**（对齐 `dream_scheduler_state.json` 先例：原子写 tmp+replace、`asyncio.to_thread`、容错吞异常）：
+
+- **TTL**：只导出/恢复 `warm_zone_ttl_seconds` 内的 segment，落盘与恢复**两侧各校验一次**
+  （快照静置期间可能过期）；陈旧上下文宁可不要。
+- **schema 版本门槛**：`SNAPSHOT_SCHEMA_VERSION = 1`，不匹配整份弃用 + WARN，**不做半解析**
+  （避免旧结构恢复出畸形 segment 污染上下文）；文件损坏同样安全返回 0。
+- **写入时机**：`terminate` 钩子，且**排在 `coordinator.shutdown()` 之前**——顺序关键，
+  否则运行态已被清空。恢复在 `_complete_startup` 开头。
+- 容量护栏：最多 64 个 chat × 每 chat 40 条 segment，防止快照文件无界膨胀。
+- 开关：`conversation.dialogue_store_persist_enabled`（默认开；关闭时 bootstrap 不传
+  `snapshot_dir`，store 内部所有快照方法直接 no-op）。schema + pydantic 双侧登记。
+
+**测试**：`tests/regression/architecture/test_lifecycle_resilience.py` 13 条
+（闩锁 3 / 快照 6 / 装配 3 + 与 G3 协同的墓碑跨重载存活 1），**红验证 10 红 → 13 绿**。
+
+**过程记录**：新写的 `restore_snapshot` 里用了 `str(chat_id or "")`，被既有 R11 守卫
+`test_resolve_chat_key_exists` 当场抓住（该模式会把 None 强制成空串、让所有 None-chat 共享
+同一线程）——改用 `_resolve_chat_key` 统一口径。另有 3 处测试桩因 `source` 新参数需同步更新。
+
+全量回归 **1805 passed, 1 skipped**。

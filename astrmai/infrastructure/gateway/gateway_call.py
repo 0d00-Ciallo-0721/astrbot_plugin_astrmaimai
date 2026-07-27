@@ -1,5 +1,6 @@
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from astrbot.api import logger
@@ -164,6 +165,24 @@ class GatewayCallMixin:
             logger.warning(f"[Gateway] benchmark recording degraded after successful call: {exc}")
         return economy_payload
 
+    @asynccontextmanager
+    async def _concurrency_slot(self, critical_path: bool):
+        """G7/RT-11: 关键路径直取全局槽；后台调用须先过子限流器。
+
+        总并发仍受 `_global_semaphore` 约束（429 保护不变），但后台最多占用
+        max-reserved 个槽，保证关键路径不会被 ambient judge/mood 饿死。
+        获取顺序关键：先 background 后 global——反之后台会攥着全局槽等子槽，
+        反而把关键路径堵死。
+        """
+        background_semaphore = None if critical_path else getattr(self, "_background_semaphore", None)
+        if background_semaphore is None:
+            async with self._global_semaphore:
+                yield
+            return
+        async with background_semaphore:
+            async with self._global_semaphore:
+                yield
+
     async def _elastic_call_result(
         self,
         pool_name: str,
@@ -191,10 +210,10 @@ class GatewayCallMixin:
         allow_cooldown_override: bool = True,
         reserve_for_reply: bool = False,
     ) -> LLMCallResult:
-        # OPT-08/RT-11: 记录全局信号量排队时长（skipped 轮 judge elapsed 51.7s vs
-        # attempt 数秒的差值疑似排队）；先埋点取证，拆分信号量待数据定论
+        # OPT-08/RT-11: 记录信号量排队时长（skipped 轮 judge elapsed 51.7s vs
+        # attempt 数秒的差值即排队）；G7 起按 critical_path 分流配额
         semaphore_wait_started = time.perf_counter()
-        async with self._global_semaphore:
+        async with self._concurrency_slot(ledger_critical_path):
             semaphore_wait_ms = round((time.perf_counter() - semaphore_wait_started) * 1000, 1)
             primary_models, attempt_queue = self._build_attempt_queue(
                 pool_name,

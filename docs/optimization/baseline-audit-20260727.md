@@ -2,6 +2,23 @@
 
 > 代码基线: HEAD=4da2910 · 运行时证据: `.agent/runtime-observability-c4aee57-20260726/`（585 traces / 16h / 15 会话）+ 1.3MB AstrBot 框架日志 + 364KB 诊断日志。所有 OPT 的"验收标准"以本文件的数字为对照基线。
 
+## ⚠️ 口径变更切换点（2026-07-26 优化阶段落地后新增）
+
+**本文件的数字是 c4aee57 基线口径。下述三处口径在优化阶段已经改变，复采后的新报表与本文件数字不可直接逐项比较**——差异可能来自口径而非行为改善。做前后对比时请先确认对照的是同一口径。
+
+| # | 口径 | 旧（本文件基线） | 新（当前代码） | 影响的基线数字 | 变更处 |
+|---|---|---|---|---|---|
+| 1 | **judge 调用计数** | 按 `stage` 字符串匹配判定 judge 调用——匹配恒不中，judge 恒计为 0 | 按 `pool == "judge"` 判定 | 本文件所有"judge 调用次数/占比"为 **0 的行都是仪表假象**，真实值需用新脚本对同一份归档重跑 | RT-02 / OPT-11，`scripts/analyze_turn_ledger.py` |
+| 2 | **发送段数（total）计数** | 满发路径从不写 `sent_segment_count`，恒为 0——与同一轮的 `reply_stats.segment_count` 自相矛盾 | 发送循环结束后无条件写入实际发送段数 | 任何按 `sent_segment_count` 聚合的「发送总量 / 满发率 / 截断率」，旧数据全部低估（满发轮计 0），新旧不可比 | ID-05 / OPT-11，`reply_artifact_builder.py` |
+| 3 | **trace 序列化格式** | 单文件 `turn_trace_samples.json`（整文件读改写 + indent） | append-only `turn_trace_samples.jsonl`（同 turn 后写覆盖先写，周期性压实） | 采样文件路径与形态变了；`per-chat 上限`由"写入即刻生效"变为"压实后保证"，两次压实间样本数可短暂超出配置值 | WU-06 / OPT-11 + G8 |
+
+**复采操作**：`scripts/analyze_turn_ledger.py` 双格式可读（`.jsonl` 与 legacy `.json` 均可），
+所以**用当前脚本重跑 `.agent/runtime-observability-c4aee57-20260726/` 的历史归档**即可拿到
+「同口径的旧基线」——这对口径 1 有效（judge 计数是脚本侧口径，重跑即可修正）。
+口径 2 属于**写入端**变更，历史归档里根本没记过正确值，重跑也补不回来，只能从复采的新数据起算。
+本文件正文数字对口径 1、2 未涉及的指标（漏斗状态分布、时延分位、记忆注入率等）仍然直接可用。历史归档转换用
+`scripts/convert_turn_trace_to_jsonl.py`（已在 585 样本上实测，转换前后分析结果一致）。
+
 ## 代码与测试规模
 
 - `astrmai/` 业务代码 **80,683 行**（13 个子包）；最大文件 `pfc_tools.py` 2991L、`chat_loop_kernel.py` 2336L、`v2_store.py` 2031L、`planner.py` 1911L。

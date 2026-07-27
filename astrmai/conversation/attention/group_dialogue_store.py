@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
+from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger
 
 from .topic_units import ColdSummaryStructure, TopicUnit
 
@@ -26,6 +30,9 @@ class DialogueSegment:
     is_reply_to_bot: bool = False
     has_direct_vision: bool = False
     is_image_only: bool = False
+    # G3/ID-08: 被撤回的消息保留占位（speaker 与时序不变），内容替换为墓碑文案，
+    # 避免 bot 在后续回复里原文复述用户已撤回的内容
+    is_recalled: bool = False
 
 
 @dataclass(slots=True)
@@ -51,10 +58,25 @@ class WarmContextBundle:
 
 
 class GroupDialogueStore:
-    def __init__(self, *, hot_zone_ttl_seconds: float = 30.0, warm_zone_ttl_seconds: float = 300.0, warm_zone_max_tokens: int = 1200):
+    # G4/PL-09: 快照 schema 版本——不兼容即整份弃用（不做半解析），避免旧结构
+    # 恢复出畸形 segment 污染上下文
+    SNAPSHOT_SCHEMA_VERSION = 1
+    SNAPSHOT_FILENAME = "dialogue_store_state.json"
+    SNAPSHOT_MAX_CHATS = 64
+    SNAPSHOT_MAX_SEGMENTS_PER_CHAT = 40
+
+    def __init__(
+        self,
+        *,
+        hot_zone_ttl_seconds: float = 30.0,
+        warm_zone_ttl_seconds: float = 300.0,
+        warm_zone_max_tokens: int = 1200,
+        snapshot_dir: Any = None,
+    ):
         self.hot_zone_ttl_seconds = float(hot_zone_ttl_seconds or 30.0)
         self.warm_zone_ttl_seconds = float(warm_zone_ttl_seconds or 300.0)
         self.warm_zone_max_tokens = int(warm_zone_max_tokens or 1200)
+        self.snapshot_dir = snapshot_dir
         self._threads: dict[str, DialogueThread] = {}
         self._lock = asyncio.Lock()
 
@@ -130,6 +152,151 @@ class GroupDialogueStore:
             async with thread.lock:
                 thread.segments.append(segment)
         return segment
+
+    RECALLED_PLACEHOLDER = "[已撤回]"
+
+    async def mark_recalled(self, chat_id: str, event_id: str) -> bool:
+        """G3/ID-08: 把已撤回消息的内容换成墓碑，保留 speaker 与时序。
+
+        只改展示层内容——原始事件存储不动。返回是否命中（未命中说明该消息
+        不在热区，属正常情况：可能早已被压缩进冷区或从未进入本 store）。
+        """
+        target_id = str(event_id or "").strip()
+        if not target_id:
+            return False
+        async with self._lock:
+            thread = self._get_thread(self._resolve_chat_key(chat_id))
+            async with thread.lock:
+                hit = False
+                for segment in thread.segments:
+                    if str(segment.event_id or "") != target_id or segment.is_recalled:
+                        continue
+                    segment.content = self.RECALLED_PLACEHOLDER
+                    segment.is_recalled = True
+                    segment.message_kind = "text"
+                    segment.has_direct_vision = False
+                    segment.is_image_only = False
+                    segment.token_estimate = self._estimate_tokens(self.RECALLED_PLACEHOLDER)
+                    hit = True
+                return hit
+
+    # ---- G4/PL-09 快照持久化 ---------------------------------------------
+    # 背景：本 store 纯内存，AstrBot 面板改配置触发插件重载即丢全部群热/温区，
+    # 表现为 bot "突然接不上话"。策略三要素：
+    #   TTL      —— 只恢复 warm_zone_ttl_seconds 内的 segment（陈旧上下文宁可不要）
+    #   版本门槛 —— schema 不匹配整份弃用并 WARN，不做半解析
+    #   写入时机 —— terminate 钩子（对齐 dream_scheduler_state.json 先例）
+
+    def snapshot_path(self) -> Path | None:
+        if not self.snapshot_dir:
+            return None
+        try:
+            return Path(self.snapshot_dir) / self.SNAPSHOT_FILENAME
+        except Exception:
+            return None
+
+    def _serialize_segment(self, segment: DialogueSegment) -> dict:
+        return {field.name: getattr(segment, field.name) for field in dataclass_fields(DialogueSegment)}
+
+    def _deserialize_segment(self, payload: dict) -> DialogueSegment | None:
+        valid_names = {field.name for field in dataclass_fields(DialogueSegment)}
+        data = {key: value for key, value in dict(payload or {}).items() if key in valid_names}
+        try:
+            return DialogueSegment(**data)
+        except Exception:
+            return None
+
+    async def export_snapshot(self) -> dict:
+        now = time.time()
+        chats: dict[str, dict] = {}
+        async with self._lock:
+            threads = list(self._threads.items())
+        for chat_id, thread in threads[: self.SNAPSHOT_MAX_CHATS]:
+            async with thread.lock:
+                fresh = [
+                    segment
+                    for segment in thread.segments
+                    if now - float(segment.timestamp or 0.0) <= self.warm_zone_ttl_seconds
+                ][-self.SNAPSHOT_MAX_SEGMENTS_PER_CHAT :]
+                if not fresh and not thread.cold_summary:
+                    continue
+                chats[chat_id] = {
+                    "segments": [self._serialize_segment(segment) for segment in fresh],
+                    "cold_summary": thread.cold_summary,
+                }
+        return {
+            "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
+            "saved_at": now,
+            "chats": chats,
+        }
+
+    async def persist_snapshot(self) -> bool:
+        path = self.snapshot_path()
+        if path is None:
+            return False
+        payload = await self.export_snapshot()
+        if not payload.get("chats"):
+            return False
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(path)
+
+        try:
+            await asyncio.to_thread(_write)
+            logger.info(f"[DialogueStore] persisted context snapshot for {len(payload['chats'])} chats")
+            return True
+        except Exception as exc:
+            logger.warning(f"[DialogueStore] failed to persist context snapshot: {exc}")
+            return False
+
+    async def restore_snapshot(self) -> int:
+        path = self.snapshot_path()
+        if path is None or not path.exists():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"[DialogueStore] context snapshot unreadable; ignored: {exc}")
+            return 0
+        version = int(payload.get("schema_version", 0) or 0)
+        if version != self.SNAPSHOT_SCHEMA_VERSION:
+            logger.warning(
+                f"[DialogueStore] context snapshot schema {version} != {self.SNAPSHOT_SCHEMA_VERSION}; discarded"
+            )
+            return 0
+        now = time.time()
+        restored = 0
+        for chat_id, chat_payload in dict(payload.get("chats", {}) or {}).items():
+            # 用 _resolve_chat_key 统一口径（R11 禁止 str(x or "") 式空串强制）
+            try:
+                key = self._resolve_chat_key(chat_id)
+            except ValueError:
+                continue
+            segments: list[DialogueSegment] = []
+            for item in list((chat_payload or {}).get("segments", []) or []):
+                segment = self._deserialize_segment(item)
+                if segment is None:
+                    continue
+                # TTL 二次校验：快照落盘到恢复之间可能已经过期
+                if now - float(segment.timestamp or 0.0) > self.warm_zone_ttl_seconds:
+                    continue
+                segments.append(segment)
+            cold_summary = str((chat_payload or {}).get("cold_summary", "") or "")
+            if not segments and not cold_summary:
+                continue
+            async with self._lock:
+                thread = self._get_thread(key)
+            async with thread.lock:
+                thread.segments = segments + thread.segments
+                if cold_summary and not thread.cold_summary:
+                    thread.cold_summary = cold_summary
+            restored += 1
+        if restored:
+            logger.info(f"[DialogueStore] restored context snapshot for {restored} chats")
+        return restored
 
     async def set_cold_summary(self, chat_id: str, summary: str) -> None:
         async with self._lock:

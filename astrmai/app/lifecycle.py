@@ -50,10 +50,23 @@ class PluginLifecycleManager:
             self.runtime.mark_degraded("memory.engine", str(exc))
             logger.warning(f"[AstrMai] Memory engine start degraded: {exc}")
 
-    async def on_program_start(self) -> None:
+    # G4/PL-10: 只有"显式重新初始化插件实例"才允许复位终止闩锁。
+    # 两个场景有真实张力，必须按来源区分：
+    #   plugin_initialize —— 面板禁用→启用复用同一实例，旧实现会让插件静默死到
+    #                        进程重启（PL-10 要修的就是它）
+    #   astrbot_loaded / 无来源 —— shutdown 期间迟到的框架 hook，绝不能复活插件
+    #                        （既有 test_terminated_lifecycle_cannot_be_restarted_by_late_hook 守护）
+    _LATCH_RESET_SOURCES = frozenset({"plugin_initialize"})
+
+    async def on_program_start(self, *, source: str = "") -> None:
         if self._terminated:
-            logger.warning("[AstrMai] runtime startup rejected reason=terminated")
-            return
+            if str(source or "").strip() not in self._LATCH_RESET_SOURCES:
+                logger.warning(
+                    f"[AstrMai] runtime startup rejected reason=terminated source={source or 'unknown'}"
+                )
+                return
+            logger.info("[AstrMai] runtime re-initialized after terminate; resetting shutdown latch")
+            self._terminated = False
         if self.runtime.status.is_running and self.runtime.status.lifecycle_started:
             logger.debug("[AstrMai] runtime startup skipped reason=already_running")
             return
@@ -74,8 +87,30 @@ class PluginLifecycleManager:
         maximum = max(initial, float(getattr(persona_config, "retry_max_interval_sec", 300.0) or 300.0))
         return initial, maximum
 
+    async def _restore_dialogue_snapshot(self) -> None:
+        # G4/PL-09: 重载后恢复群对话热/温区（TTL 与 schema 版本双重约束在 store 内部）
+        store = getattr(self.runtime, "dialogue_store", None)
+        restore = getattr(store, "restore_snapshot", None) if store is not None else None
+        if not callable(restore):
+            return
+        try:
+            await restore()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] dialogue snapshot restore degraded: {exc}")
+
+    async def _persist_dialogue_snapshot(self) -> None:
+        store = getattr(self.runtime, "dialogue_store", None)
+        persist = getattr(store, "persist_snapshot", None) if store is not None else None
+        if not callable(persist):
+            return
+        try:
+            await persist()
+        except Exception as exc:
+            logger.warning(f"[AstrMai] dialogue snapshot persist degraded: {exc}")
+
     async def _complete_startup(self) -> None:
         logger.info("[AstrMai] Initializing Memory Engine...")
+        await self._restore_dialogue_snapshot()
         await self.initialize_memory()
         if self._shutdown_requested:
             return
@@ -309,6 +344,10 @@ class PluginLifecycleManager:
         self._terminated = True
         self._shutdown_requested = True
         self.runtime.set_boot_phase("shutdown.start")
+
+        # G4/PL-09: 先落盘上下文快照，再 cancel 在飞任务——顺序关键，
+        # coordinator.shutdown 会清空运行态
+        await self._persist_dialogue_snapshot()
 
         try:
             coordinator = getattr(self.runtime, "runtime_coordinator", None)

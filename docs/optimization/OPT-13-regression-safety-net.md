@@ -1,6 +1,6 @@
 # OPT-13 回归测试安全网（五张网 + 文档基线）
 
-状态：核心完成（TG-07 记专项遗留） ｜ 优先级：P1 ｜ 依赖：与对应修复 OPT 同批落地（"先补测试再改代码"） ｜ 覆盖发现：TG-01(P1)、TG-05(P2)、TG-06(P2)、TG-07(P2)、TG-08(P3) ｜ 单元测试习惯良好（1673 条 0 收集错误），系统性缺口全在"跨模块行为不变式"——单元全绿、组合回归无人发现，且恰好集中在最近 5 个提交的热改区。
+状态：**已完成**（五张网全部落地） ｜ 优先级：P1 ｜ 依赖：与对应修复 OPT 同批落地（"先补测试再改代码"） ｜ 覆盖发现：TG-01(P1)、TG-05(P2)、TG-06(P2)、TG-07(P2)、TG-08(P3) ｜ 单元测试习惯良好（1673 条 0 收集错误），系统性缺口全在"跨模块行为不变式"——单元全绿、组合回归无人发现，且恰好集中在最近 5 个提交的热改区。
 
 ## 完成记录
 
@@ -10,8 +10,18 @@
 - TG-05：`test_memory_write_retrieve_inject.py` 追加修订闭环——写入→旧内容命中→`store.update_memory` 修订→新内容命中且旧表述消失→注入渲染新内容（真实 store+FTS wiring，此前三层测试全部绕开）。
 - TG-01（聚焦链版）：`test_group_identity_chain.py`——双 sender 交替+B 直接唤醒场景断言三源一致（focus 事件 sender == speaker block QQ == 画像层将用的 get_sender_id），并锁 focus_context 缺失时回退事件身份、群边界提示词在位。**完整 gate→planner→executor 三段拼装 e2e 仍为专项遗留**（装配成本高，塌缩点已被本链覆盖）。
 - TG-08：session-state.md Test Status 更新（1774 collected、signin flaky 根因与恢复命令）。
-- **TG-07 遗留**：vision barrier 的 gate 侧三条并发交织分支（慢 prepare_batch 期间回填 re-merge、abort 后池续跑、resolve 超时 outcome）需要事件同步器级 harness，现有 gate fixture 不含 coordinator 装配；OPT-07 已为该区域加了 burst deadline 行为，coordinator 自身 17 条测试在位。作为独立专项排入后续（建议与下次触碰 gate 排水循环的改动同批）。
+- **TG-07 已完成**（G2，2026-07-26）：见下方 G2 小节。
 - 过程佐证：OPT-05 实施中 `_run_maintenance_cycle` 被误截断，正是被既有"子服务失败隔离"装配断言当场抓获——本 OPT 主张的防回归价值已有实证。
+
+### G1 补充（2026-07-26）：signin 时间窗 flaky 根因修复
+
+**根因与审计描述不同**（审计记为"测试未注入时钟"，实际相反）：`run_once(now_ts=...)` 早已支持时钟注入，测试也传了值——但传的是**硬编码 epoch `1768695000.0`**。该值只在 UTC+8 下等于 08:10（写测试时的机器时区），而 `_within_sign_window` 用 `time.localtime`（机器本地时区），在本机 UTC-8 下解析为 16:10 直接落到窗口外。同文件另两个窗口用例用 `time.mktime((...))` 按本地时间构造，因此一直是绿的——修法就是统一到后者。
+
+- 改动（**测试单侧，生产代码零改动**）：新增 `_local_ts(hour, minute)` helper 由本地时间反推 epoch；5 处硬编码 epoch 与 2 处硬编码小时全部改为从 `GroupSigninService.SIGN_HOUR` 派生（SIGN_HOUR 若调整测试自动跟随）。
+- 新增锚定用例 `test_sign_window_predicate_is_timezone_independent`：断言窗口谓词在 `SIGN_HOUR:00/:59` 为真、`SIGN_HOUR-1:59` 与 `SIGN_HOUR+1:00` 为假，并断言派生时间戳的本地小时恒等于 SIGN_HOUR——任何人再塞裸 epoch，本用例会在非 UTC+8 机器上立刻变红。
+- 红验证：stash 掉测试改动后 **3 红**；恢复后 7/7 绿。
+- **验收达成**：`PYTHONIOENCODING=utf-8 python -m pytest -q -k "not test_project_files_do_not_embed_local_absolute_paths"` → **1777 passed, 1 skipped，无需任何 `--ignore`**。此命令从此为标准回归命令。
+- 注：Windows 下 `TZ` 环境变量不影响 `time.localtime`（`tzset` 仅 Unix），故时区无关性靠"按本地时间构造"从机制上保证，而非靠切时区跑测试验证。
 
 ## 目标
 
@@ -49,6 +59,30 @@
 - 纯加测试，低风险；TG-07 的并发交织用例需事件同步器，写法上避免 sleep 竞态（用 asyncio.Event 显式控制）。
 - 唯一中风险是把现状"固化错了"——TG-01/07 的断言先与 OPT-01 修复后的预期语义对齐，不锚定 bug 行为。
 
-## 完成记录
+### G2 补充（2026-07-26）：TG-07 vision barrier 并发交织测试
 
-（完成后填写：新增测试清单与首次红/绿记录、契约测试自检结果）
+新增 `tests/regression/conversation/test_vision_barrier_interleaving.py` 5 条，用
+`asyncio.Event` 精确控制交织时刻（零 sleep 竞态）：
+
+- **re-merge 分支**：屏障执行中注入晚到消息 → 断言第二轮 `prepare_batch` 携带 `[旧, 新]`
+  全量批次、且全程零重复派发（现有 fixture 的 stub 瞬时返回，永远命中不到此分支）。
+- **burst deadline 跨迭代持久化**（OPT-07/RT-05 锚定）：主断言用**时钟无关**口径——
+  整个 burst 只允许调用一次 `vision_total_budget_sec()`。
+- **abort 分支**：3 条消息的批次只发 **1 次**失败通知（不是 3 次）；通知发出瞬间注入新消息
+  → 断言 worker 继续处理新批次，池排空后才 `is_evaluating=False` 收工。
+- **resolve 超时**：明细层 `_prepare_event` 断言 `outcome=resolve_timeout`/`timeout_count=1`，
+  批次层断言 `downstream_action` 按策略分流（require_analysis→abort_required_vision /
+  timeout_fallback→continue_with_placeholder）。
+
+**红验证（含两次自我纠错，均记录在案）**：
+
+1. 首版把 `resolve_timeout` 断言在聚合层——聚合按设计归并为 `failed`，断言层次错误；
+   改为明细层断 outcome、批次层断 downstream_action。
+2. 首版红验证（把 burst deadline 改回每轮重算）**没抓住**：Windows `time.monotonic()`
+   分辨率约 15.6ms，两轮迭代落在同一刻度，deadline 数值恰好相等。改为断言预算获取器
+   调用次数后，注入同一回归 → **精确变红 1 条**，恢复后 5/5 绿。
+3. 另修正测试自身缺陷：同一 coordinator 跨两次 `asyncio.run` 复用，`asyncio.Event` 绑定
+   前一个事件循环 → 第二次 await 抛异常被吞成 `unexpected_failure`，**两条用例原本都在
+   验证错误的代码路径**；改为每次 `asyncio.run` 用全新实例。
+
+**生产代码零改动**（纯补测试）；全量回归 **1782 passed, 1 skipped**。
