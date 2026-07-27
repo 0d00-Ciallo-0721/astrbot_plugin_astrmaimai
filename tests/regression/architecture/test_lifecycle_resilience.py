@@ -14,9 +14,14 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from astrmai.app.lifecycle import PluginLifecycleManager
 from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
+from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
+from astrmai.infrastructure.runtime.event_bus import EventBus
+from astrmai.multimodal.visual_cortex import VisualCortex
+from astrmai.workmode.cron_guard.heartbeat import CronHeartbeatGuard
 
 
 class TerminateLatchTests(unittest.TestCase):
@@ -83,6 +88,131 @@ class TerminateLatchTests(unittest.TestCase):
         asyncio.run(manager.on_program_start())
 
         self.assertEqual(started, [], "已在运行时不得重复启动（既有语义不能被 PL-10 破坏）")
+
+
+class RuntimeReinitializeTests(unittest.TestCase):
+    """显式重新启用必须恢复真正的运行能力，而不只是复位生命周期布尔值。"""
+
+    def setUp(self):
+        EventBus._instance = None
+
+    def tearDown(self):
+        EventBus._instance = None
+
+    def test_runtime_coordinator_reopens_after_shutdown(self):
+        async def _run():
+            coordinator = ChatRuntimeCoordinator()
+            await coordinator.shutdown()
+            self.assertEqual(await coordinator.advance_generation("chat", "thread"), 0)
+
+            await coordinator.reopen()
+
+            generation = await coordinator.advance_generation("chat", "thread")
+            claimed = await coordinator.claim_send("chat", "send-1")
+            return generation, claimed
+
+        generation, claimed = asyncio.run(_run())
+
+        self.assertGreater(generation, 0)
+        self.assertTrue(claimed)
+
+    def test_visual_cortex_worker_can_restart_after_stop(self):
+        async def _run():
+            cortex = VisualCortex(gateway=Mock(), db_service=Mock())
+            cortex.start()
+            first_task = cortex._worker_task
+            cortex.stop()
+            await asyncio.sleep(0)
+
+            cortex.start()
+            second_task = cortex._worker_task
+            running = cortex.describe_status()["worker_running"]
+            cortex.stop()
+            await asyncio.sleep(0)
+            return first_task, second_task, running
+
+        first_task, second_task, running = asyncio.run(_run())
+
+        self.assertIsNot(first_task, second_task)
+        self.assertTrue(running)
+
+    def test_visual_cortex_stop_discards_pending_tasks_before_restart(self):
+        async def _run():
+            cortex = VisualCortex(gateway=Mock(), db_service=Mock())
+            self.assertTrue(cortex.submit_task("old-1", "payload-1"))
+            self.assertTrue(cortex.submit_task("old-2", "payload-2"))
+
+            cortex.stop()
+            await asyncio.wait_for(cortex.queue.join(), timeout=1.0)
+
+            cortex.start()
+            status = cortex.describe_status()
+            cortex.stop()
+            await asyncio.sleep(0)
+            return status
+
+        status = asyncio.run(_run())
+
+        self.assertEqual(status["queue_size"], 0)
+        self.assertTrue(status["worker_running"])
+
+    def test_cron_guard_can_restart_after_stop(self):
+        guard = CronHeartbeatGuard(db_service=Mock(), context=SimpleNamespace(cron_manager=None))
+
+        guard.stop()
+        guard.start()
+
+        self.assertTrue(guard.describe_status()["running"])
+
+    def test_prepare_reinitialize_reopens_services_and_rebinds_learning(self):
+        async def _run():
+            event_bus = EventBus()
+            state_handler = AsyncMock()
+            reply_handler = AsyncMock()
+            mining_handler = AsyncMock()
+            coordinator = SimpleNamespace(reopen=AsyncMock())
+            persona = SimpleNamespace(reopen=Mock())
+            cron_guard = SimpleNamespace(start=Mock())
+            runtime = SimpleNamespace(
+                runtime_coordinator=coordinator,
+                persona_summarizer=persona,
+                cron_guard=cron_guard,
+                event_bus=event_bus,
+                state_engine=SimpleNamespace(on_learning_message_recorded=state_handler),
+                memory_engine=SimpleNamespace(
+                    on_learning_bot_reply_recorded=reply_handler,
+                    on_learning_mining_completed=mining_handler,
+                ),
+            )
+            manager = PluginLifecycleManager.__new__(PluginLifecycleManager)
+            manager.runtime = runtime
+
+            await manager._prepare_reinitialize()
+
+            topics = {
+                topic: [ref() if callable(getattr(ref, "__call__", None)) and type(ref).__name__ == "WeakMethod" else ref
+                        for ref in refs]
+                for topic, refs in event_bus.subscribers.items()
+            }
+            return coordinator, persona, cron_guard, event_bus, topics
+
+        coordinator, persona, cron_guard, event_bus, topics = asyncio.run(_run())
+
+        coordinator.reopen.assert_awaited_once()
+        persona.reopen.assert_called_once()
+        cron_guard.start.assert_called_once()
+        self.assertIn(
+            event_bus.TOPIC_LEARNING_MESSAGE_RECORDED,
+            topics,
+        )
+        self.assertIn(
+            event_bus.TOPIC_LEARNING_BOT_REPLY_RECORDED,
+            topics,
+        )
+        self.assertIn(
+            event_bus.TOPIC_LEARNING_MINING_COMPLETED,
+            topics,
+        )
 
 
 class DialogueSnapshotTests(unittest.TestCase):

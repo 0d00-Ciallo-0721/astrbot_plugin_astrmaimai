@@ -66,6 +66,7 @@ class PluginLifecycleManager:
                 )
                 return
             logger.info("[AstrMai] runtime re-initialized after terminate; resetting shutdown latch")
+            await self._prepare_reinitialize()
             self._terminated = False
         if self.runtime.status.is_running and self.runtime.status.lifecycle_started:
             logger.debug("[AstrMai] runtime startup skipped reason=already_running")
@@ -80,6 +81,48 @@ class PluginLifecycleManager:
         self.runtime.status.persona_state = "pending"
         self.runtime.set_boot_phase("lifecycle.starting")
         self._startup_task = self.track_task(self._complete_startup())
+
+    async def _prepare_reinitialize(self) -> None:
+        coordinator = getattr(self.runtime, "runtime_coordinator", None)
+        reopen_coordinator = getattr(coordinator, "reopen", None)
+        if callable(reopen_coordinator):
+            await reopen_coordinator()
+
+        persona_summarizer = getattr(self.runtime, "persona_summarizer", None)
+        reopen_persona = getattr(persona_summarizer, "reopen", None)
+        if callable(reopen_persona):
+            reopen_persona()
+
+        cron_guard = getattr(self.runtime, "cron_guard", None)
+        start_cron_guard = getattr(cron_guard, "start", None)
+        if callable(start_cron_guard):
+            start_cron_guard()
+
+        self._bind_learning_collaboration()
+
+    def _bind_learning_collaboration(self) -> None:
+        event_bus = getattr(self.runtime, "event_bus", None)
+        state_engine = getattr(self.runtime, "state_engine", None)
+        memory_engine = getattr(self.runtime, "memory_engine", None)
+        if event_bus is None or state_engine is None or memory_engine is None:
+            return
+        bindings = (
+            (
+                event_bus.TOPIC_LEARNING_MESSAGE_RECORDED,
+                getattr(state_engine, "on_learning_message_recorded", None),
+            ),
+            (
+                event_bus.TOPIC_LEARNING_BOT_REPLY_RECORDED,
+                getattr(memory_engine, "on_learning_bot_reply_recorded", None),
+            ),
+            (
+                event_bus.TOPIC_LEARNING_MINING_COMPLETED,
+                getattr(memory_engine, "on_learning_mining_completed", None),
+            ),
+        )
+        for topic, callback in bindings:
+            if callable(callback):
+                event_bus.subscribe(topic, callback)
 
     def _persona_retry_bounds(self) -> tuple[float, float]:
         persona_config = getattr(self.runtime.config, "persona", None)
@@ -292,6 +335,9 @@ class PluginLifecycleManager:
         self.runtime.set_boot_phase("lifecycle.workmode")
         if not self.runtime.cron_guard:
             return
+        start_guard = getattr(self.runtime.cron_guard, "start", None)
+        if callable(start_guard):
+            start_guard()
         try:
             await self.runtime.cron_guard.reload_all_lost_jobs()
         except Exception as exc:

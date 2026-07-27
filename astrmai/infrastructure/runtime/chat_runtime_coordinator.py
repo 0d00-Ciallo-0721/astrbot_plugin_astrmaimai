@@ -417,6 +417,12 @@ class ChatRuntimeCoordinator:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
 
+    async def reopen(self) -> None:
+        """Re-enable the coordinator after an explicit plugin reinitialize."""
+        async with self._lock:
+            self._states.clear()
+            self._shutdown = False
+
     async def prune_inactive(self, max_idle_sec: float = 1800) -> int:
         now = time.time()
         async with self._lock:

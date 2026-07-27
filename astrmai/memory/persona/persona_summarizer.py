@@ -149,6 +149,10 @@ class PersonaSummarizer:
         self.pending_core_tasks.clear()
         self._background_tasks.clear()
 
+    def reopen(self) -> None:
+        """Allow the same summarizer instance to serve an explicit plugin reload."""
+        self._closed = False
+
     def _compute_hash(self, text: str) -> str:
         """计算人设内容的 Hash 值，用于缓存 Key"""
         return hashlib.sha256(text.encode("utf-8")).hexdigest()

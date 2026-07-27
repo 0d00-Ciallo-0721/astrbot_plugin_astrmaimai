@@ -23,13 +23,30 @@ class VisualCortex:
         self._worker_task = None
 
     def start(self):
-        if self._worker_task is None:
+        if self._worker_task is None or self._worker_task.done():
             self._worker_task = safe_create_task(self._worker())
             logger.info("[AstrMai-VisualCortex] async multimodal worker started.")
 
     def stop(self):
         if self._worker_task:
             self._worker_task.cancel()
+            self._worker_task = None
+        discarded = self._discard_pending_tasks()
+        if discarded:
+            logger.info(
+                f"[AstrMai-VisualCortex] discarded {discarded} pending image task(s) during shutdown."
+            )
+
+    def _discard_pending_tasks(self) -> int:
+        discarded = 0
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return discarded
+            else:
+                self.queue.task_done()
+                discarded += 1
 
     def submit_task(self, picid: str, base64_data: str) -> bool:
         try:

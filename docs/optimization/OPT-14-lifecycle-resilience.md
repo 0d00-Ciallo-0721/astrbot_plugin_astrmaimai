@@ -70,3 +70,19 @@ shutdown 期间迟到的框架 hook 不得复活插件。两者存在真实张�
 同一线程）——改用 `_resolve_chat_key` 统一口径。另有 3 处测试桩因 `source` 新参数需同步更新。
 
 全量回归 **1805 passed, 1 skipped**。
+
+### 交付审计补充（2026-07-26）
+
+在发布候选审计中继续验证了“同一个插件实例被禁用后再启用”的完整服务树，而不只验证
+生命周期管理器本身：
+
+- `ChatRuntimeCoordinator.reopen()` 清除关闭闩锁与残留会话状态，允许新消息重新进入。
+- `PersonaSummarizer.reopen()` 恢复后台人格任务接收能力。
+- `VisualCortex.start()` 可在旧 worker 已结束时重建 worker；`stop()` 会排空尚未处理的图片任务，
+  防止禁用前图片在重新启用后迟到注入新会话。
+- `CronHeartbeatGuard.start()` 恢复运行标志，避免同实例重启后心跳永久静默。
+- 生命周期重启时重新绑定学习系统的 EventBus 订阅，避免 terminate 中解除订阅后无法恢复。
+
+新增回归覆盖同实例 `terminate → initialize`、视觉 worker 重启、视觉待处理队列丢弃、
+persona/coordinator/cron 服务复开和学习订阅重绑。交付审计时全量结果为
+`1853 passed, 1 skipped, 1 deselected`。

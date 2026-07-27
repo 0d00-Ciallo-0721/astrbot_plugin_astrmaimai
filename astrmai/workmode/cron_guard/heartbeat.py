@@ -79,6 +79,9 @@ class CronHeartbeatGuard:
             except Exception as exc:
                 logger.error(f"[CronGuard] heartbeat degraded: {exc}")
 
+    def start(self):
+        self._is_running = True
+
     def stop(self):
         self._is_running = False
 
