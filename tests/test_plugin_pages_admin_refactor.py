@@ -65,6 +65,8 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/update", paths)
         self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/restore", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/regenerate", paths)
+        self.assertIn(f"{PLUGIN_API_PREFIX}/persona/slices/regeneration-status", paths)
         self.assertNotIn(f"{PLUGIN_API_PREFIX}/persona", paths)
         self.assertFalse(any(path.startswith(f"{PLUGIN_API_PREFIX}/config") for path in paths))
 
@@ -84,6 +86,7 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn((f"{PLUGIN_API_PREFIX}/users/<user_id>/slices/<index>/delete", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/update", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/restore", ("POST",)), mutating)
+        self.assertIn((f"{PLUGIN_API_PREFIX}/persona/slices/regenerate", ("POST",)), mutating)
         self.assertIn((f"{PLUGIN_API_PREFIX}/learning/expression-backfill", ("POST",)), mutating)
         self.assertNotIn((f"{PLUGIN_API_PREFIX}/persona/save", ("POST",)), mutating)
 
@@ -195,6 +198,9 @@ class PluginPagesAdminRefactorTests(unittest.TestCase):
         self.assertIn("restorePersonaFields", app_js)
         self.assertIn("/persona/slices/update", app_js)
         self.assertIn("/persona/slices/restore", app_js)
+        self.assertIn("/persona/slices/regenerate", app_js)
+        self.assertIn("/persona/slices/regeneration-status", app_js)
+        self.assertIn("重新生成人格8维度切片", app_js)
         self.assertIn("派生人格微调", app_js)
         self.assertIn("角色切片读取失败", app_js)
         self.assertIn("Bridge 初始化中", app_js)

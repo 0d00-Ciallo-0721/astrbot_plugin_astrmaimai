@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import time
+import uuid
 from typing import Dict, Any, Tuple
 from astrbot.api import logger
 from ...infrastructure.context_economy import PromptTemplateId
@@ -28,6 +29,8 @@ class PersonaSummarizer:
         "secrets",
     )
     MANUAL_CORE_FIELDS = ("summary", "first_person_rewrite", "style")
+    DERIVATION_VERSION = 2
+    REGENERATION_CACHE_PREFIX = "__persona_regeneration__:"
 
     def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None, memory_engine=None):
         self.persistence = persistence
@@ -39,6 +42,8 @@ class PersonaSummarizer:
         # 运行时任务锁
         self.pending_tasks: Dict[str, asyncio.Task] = {}
         self.pending_core_tasks: Dict[str, asyncio.Task] = {}
+        self.regeneration_tasks: Dict[str, asyncio.Task] = {}
+        self.regeneration_jobs: Dict[str, Dict[str, Any]] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._cache_generations: Dict[str, int] = {}
         self._verified_core_hashes: Dict[str, str] = {}
@@ -139,7 +144,14 @@ class PersonaSummarizer:
         self._closed = True
         for cache_key in list(self._cache_generations):
             self._cache_generations[cache_key] += 1
-        tasks = list({*self._background_tasks, *self.pending_tasks.values(), *self.pending_core_tasks.values()})
+        tasks = list(
+            {
+                *self._background_tasks,
+                *self.pending_tasks.values(),
+                *self.pending_core_tasks.values(),
+                *self.regeneration_tasks.values(),
+            }
+        )
         for task in tasks:
             if task and not task.done():
                 task.cancel()
@@ -147,6 +159,7 @@ class PersonaSummarizer:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.pending_tasks.clear()
         self.pending_core_tasks.clear()
+        self.regeneration_tasks.clear()
         self._background_tasks.clear()
 
     def reopen(self) -> None:
@@ -614,9 +627,15 @@ Rules:
             payload["core_components"][component] = "completed"
             await self._persist_cache(strict=True)
 
-    async def _initialize_core(self, original_prompt: str, cache_key: str) -> Dict[str, Any]:
+    async def _initialize_core(
+        self,
+        original_prompt: str,
+        cache_key: str,
+        *,
+        force_compression: bool = False,
+    ) -> Dict[str, Any]:
         threshold = int(getattr(getattr(self.config, "performance", None), "summary_threshold", 300) or 300)
-        if not original_prompt or len(original_prompt) < threshold:
+        if not force_compression and (not original_prompt or len(original_prompt) < threshold):
             include_self_lore = bool(
                 getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False)
             )
@@ -803,6 +822,7 @@ Rules:
         cache_key: str,
         generation: int | None = None,
         raise_on_failure: bool = False,
+        skip_self_lore: bool = False,
     ):
         """
         后台静默提取 8 大维度切片任务。
@@ -823,7 +843,7 @@ Rules:
         # 🟢 [Phase 8] 触发原典清洗与向量化重铸
         # ==========================================
         try:
-            include_self_lore = bool(
+            include_self_lore = not skip_self_lore and bool(
                 getattr(getattr(self.config, "persona", None), "include_self_lore_in_prompt", False)
             )
             cached_payload = self.cache.get(cache_key, {})
@@ -940,6 +960,277 @@ Rules:
                 pending_task = self.pending_tasks.get(cache_key)
                 if pending_task is current_task or not isinstance(pending_task, asyncio.Task):
                     self.pending_tasks.pop(cache_key, None)
+
+    def get_regeneration_status(self, cache_key: str) -> Dict[str, Any]:
+        clean_key = str(cache_key or "").strip()
+        job = self.regeneration_jobs.get(clean_key)
+        if not isinstance(job, dict):
+            return {
+                "state": "idle",
+                "cache_key": clean_key,
+                "derivation_version": self.DERIVATION_VERSION,
+                "completed_components": 0,
+                "total_components": 11,
+            }
+        staging_key = str(job.get("_staging_key", "") or "")
+        staging = self.cache.get(staging_key, {}) if staging_key else {}
+        core_status = staging.get("core_components", {}) if isinstance(staging, dict) else {}
+        shard_status = staging.get("shard_status", {}) if isinstance(staging, dict) else {}
+        core_completed = sum(
+            1 for name in self.MANUAL_CORE_FIELDS if core_status.get(name) == "completed"
+        )
+        shard_completed = sum(
+            1 for name in self.REQUIRED_SHARDS if shard_status.get(name) == "completed"
+        )
+        completed_components = max(
+            int(job.get("completed_components", 0) or 0),
+            core_completed + shard_completed,
+        )
+        return {
+            "job_id": str(job.get("job_id", "") or ""),
+            "cache_key": clean_key,
+            "state": str(job.get("state", "idle") or "idle"),
+            "stage": str(job.get("stage", "") or ""),
+            "completed_components": min(11, completed_components),
+            "total_components": 11,
+            "started_at": float(job.get("started_at", 0.0) or 0.0),
+            "finished_at": float(job.get("finished_at", 0.0) or 0.0),
+            "error": str(job.get("error", "") or ""),
+            "failed_component": str(job.get("failed_component", "") or ""),
+            "derivation_version": self.DERIVATION_VERSION,
+            "clears_manual_overrides": bool(job.get("clear_manual_overrides", True)),
+            "self_lore_preserved": bool(job.get("self_lore_preserved", True)),
+        }
+
+    async def start_regeneration(
+        self,
+        cache_key: str,
+        *,
+        expected_timestamp: float | None = None,
+        clear_manual_overrides: bool = True,
+        idempotency_key: str = "",
+    ) -> Dict[str, Any]:
+        clean_key = str(cache_key or "").strip()
+        if not clean_key:
+            raise ValueError("persona cache key is required")
+        if self._closed:
+            raise RuntimeError("persona summarizer is closed")
+
+        async with self._manual_update_lock:
+            async with self._lock:
+                payload = self.cache.get(clean_key)
+                if not isinstance(payload, dict):
+                    raise ValueError("persona cache was not found")
+                self._check_manual_timestamp(payload, expected_timestamp)
+                original_prompt = str(payload.get("raw", "") or "").strip()
+                if not original_prompt:
+                    raise ValueError("original persona prompt is unavailable")
+                previous_job = self.regeneration_jobs.get(clean_key)
+                requested_job_id = str(idempotency_key or "").strip()
+                if (
+                    requested_job_id
+                    and isinstance(previous_job, dict)
+                    and str(previous_job.get("job_id", "") or "") == requested_job_id
+                ):
+                    return self.get_regeneration_status(clean_key)
+                active_task = self.regeneration_tasks.get(clean_key)
+                if active_task is not None and not active_task.done():
+                    return self.get_regeneration_status(clean_key)
+                original_timestamp = float(payload.get("timestamp", 0.0) or 0.0)
+
+            await self._cancel_shard_task_for_manual_update(clean_key)
+            job_id = str(idempotency_key or "").strip() or uuid.uuid4().hex
+            staging_key = f"{self.REGENERATION_CACHE_PREFIX}{job_id}"
+            self.regeneration_jobs[clean_key] = {
+                "job_id": job_id,
+                "state": "queued",
+                "stage": "queued",
+                "started_at": time.time(),
+                "finished_at": 0.0,
+                "error": "",
+                "failed_component": "",
+                "completed_components": 0,
+                "clear_manual_overrides": bool(clear_manual_overrides),
+                "self_lore_preserved": True,
+                "_staging_key": staging_key,
+                "_original_timestamp": original_timestamp,
+            }
+            task = safe_create_task(
+                self._run_full_regeneration(
+                    clean_key,
+                    staging_key,
+                    original_prompt,
+                    original_timestamp=original_timestamp,
+                    clear_manual_overrides=bool(clear_manual_overrides),
+                ),
+                name=f"persona-regeneration:{clean_key}",
+                track_set=self._background_tasks,
+            )
+            self.regeneration_tasks[clean_key] = task
+            task.add_done_callback(
+                lambda completed, key=clean_key: self._handle_regeneration_task_result(key, completed)
+            )
+            return self.get_regeneration_status(clean_key)
+
+    def _handle_regeneration_task_result(self, cache_key: str, task: asyncio.Task) -> None:
+        if self.regeneration_tasks.get(cache_key) is task:
+            self.regeneration_tasks.pop(cache_key, None)
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(
+                    f"[PersonaSummarizer] full regeneration task failed [{cache_key}]: {exc}",
+                    exc_info=exc,
+                )
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_full_regeneration(
+        self,
+        cache_key: str,
+        staging_key: str,
+        original_prompt: str,
+        *,
+        original_timestamp: float,
+        clear_manual_overrides: bool,
+    ) -> None:
+        job = self.regeneration_jobs[cache_key]
+        job["state"] = "running"
+        job["stage"] = "core"
+        old_payload = copy.deepcopy(self.cache.get(cache_key, {}))
+        try:
+            self._cache_generations.setdefault(staging_key, 0)
+            await self._initialize_core(
+                original_prompt,
+                staging_key,
+                force_compression=True,
+            )
+            job["stage"] = "shards"
+            await self._generate_all_shards_background(
+                original_prompt,
+                staging_key,
+                raise_on_failure=True,
+                skip_self_lore=True,
+            )
+            staging_payload = copy.deepcopy(self.cache.get(staging_key, {}))
+            if not self._full_cache_is_ready(
+                staging_payload,
+                original_prompt,
+                include_self_lore=False,
+            ):
+                raise RuntimeError("regenerated persona cache is incomplete")
+
+            include_self_lore = bool(
+                getattr(
+                    getattr(self.config, "persona", None),
+                    "include_self_lore_in_prompt",
+                    False,
+                )
+            )
+            self_lore_ready = bool(old_payload.get("self_lore_ready", False))
+            if include_self_lore and not self_lore_ready:
+                job["stage"] = "self_lore"
+                if self.memory_engine is None or not hasattr(self.memory_engine, "add_persona_lore"):
+                    raise RuntimeError("memory_engine is unavailable for self-lore initialization")
+                lore_id = await self.memory_engine.add_persona_lore(original_prompt, cache_key)
+                if not str(lore_id or "").strip():
+                    raise RuntimeError("self-lore write returned an empty memory id")
+                self_lore_ready = True
+
+            job["stage"] = "commit"
+            async with self._manual_update_lock:
+                async with self._lock:
+                    current = self.cache.get(cache_key)
+                    if not isinstance(current, dict):
+                        raise RuntimeError("persona cache disappeared during regeneration")
+                    self._check_manual_timestamp(current, original_timestamp)
+                    staging_payload["self_lore_ready"] = (
+                        not include_self_lore or self_lore_ready
+                    )
+                    staging_payload["is_full_ready"] = bool(staging_payload["self_lore_ready"])
+                    staging_payload["persona_state"] = (
+                        "full_ready" if staging_payload["is_full_ready"] else "core_ready"
+                    )
+                    staging_payload["derivation_version"] = self.DERIVATION_VERSION
+                    staging_payload["regenerated_at"] = time.time()
+                    staging_payload["timestamp"] = time.time()
+                    staging_payload["manual_revision"] = int(
+                        current.get("manual_revision", 0) or 0
+                    ) + (1 if clear_manual_overrides else 0)
+                    if clear_manual_overrides:
+                        staging_payload.pop("manual_overrides", None)
+                        staging_payload.pop("generated_baseline", None)
+                        staging_payload.pop("manual_updated_at", None)
+                    else:
+                        overrides = current.get("manual_overrides", {})
+                        if isinstance(overrides, dict) and overrides:
+                            staging_payload["generated_baseline"] = self._manual_generated_snapshot(
+                                staging_payload
+                            )
+                            current_shards = current.get("shards", {})
+                            for field in overrides:
+                                if field in self.MANUAL_CORE_FIELDS:
+                                    staging_payload[field] = str(current.get(field, "") or "")
+                                elif field.startswith("shards.") and isinstance(current_shards, dict):
+                                    shard_name = field.split(".", 1)[1]
+                                    if shard_name in self.REQUIRED_SHARDS:
+                                        staging_payload["shards"][shard_name] = str(
+                                            current_shards.get(shard_name, "") or ""
+                                        )
+                            staging_payload["manual_overrides"] = copy.deepcopy(overrides)
+                            if "manual_updated_at" in current:
+                                staging_payload["manual_updated_at"] = current["manual_updated_at"]
+                            self._refresh_manual_readiness(staging_payload)
+                    self.cache[cache_key] = staging_payload
+                    self.cache.pop(staging_key, None)
+                    try:
+                        await self._persist_cache(strict=True)
+                    except Exception:
+                        self.cache[cache_key] = old_payload
+                        self.cache.pop(staging_key, None)
+                        try:
+                            await self._persist_cache(strict=False)
+                        except Exception as rollback_exc:
+                            logger.error(
+                                f"[PersonaSummarizer] persona regeneration rollback persistence "
+                                f"failed [{cache_key}]: {rollback_exc}"
+                            )
+                        raise
+
+            job["state"] = "completed"
+            job["stage"] = "completed"
+            job["completed_components"] = 11
+            job["finished_at"] = time.time()
+            logger.info(
+                f"[PersonaSummarizer] full persona regeneration completed "
+                f"[{cache_key}] version={self.DERIVATION_VERSION}"
+            )
+        except asyncio.CancelledError:
+            job["state"] = "cancelled"
+            job["stage"] = "cancelled"
+            job["finished_at"] = time.time()
+            raise
+        except Exception as exc:
+            failed_stage = str(job.get("stage", "") or "unknown")
+            job["state"] = "failed"
+            job["stage"] = "failed"
+            job["failed_component"] = failed_stage
+            job["error"] = str(exc).replace(original_prompt, "[persona-redacted]")[:500]
+            job["finished_at"] = time.time()
+            logger.warning(f"[PersonaSummarizer] full persona regeneration failed [{cache_key}]: {exc}")
+        finally:
+            async with self._lock:
+                if staging_key in self.cache:
+                    self.cache.pop(staging_key, None)
+                    try:
+                        await self._persist_cache(strict=False)
+                    except Exception as cleanup_exc:
+                        logger.error(
+                            f"[PersonaSummarizer] persona regeneration staging cleanup "
+                            f"persistence failed [{cache_key}]: {cleanup_exc}"
+                        )
+            self._cache_generations.pop(staging_key, None)
+            self._verified_core_hashes.pop(staging_key, None)
 
 # [修改] 替换 call_judge 为 call_persona_task
     async def _summarize_core_identity_with_retry(

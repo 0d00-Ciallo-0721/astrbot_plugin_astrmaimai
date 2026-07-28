@@ -1,5 +1,5 @@
 const API_PREFIX = "admin";
-const ADMIN_BUILD_VERSION = "2026.07.20-r6";
+const ADMIN_BUILD_VERSION = "2026.07.28-r7";
 const SCHEDULER_POLL_INTERVAL_MS = 45000;
 const DASHBOARD_CACHE_TTL_MS = 180000;
 const DATA_CACHE_TTL_MS = 180000;
@@ -52,6 +52,7 @@ const state = {
   schedulerChatLoop: null,
   schedulerChatId: "",
   schedulerPollTimer: null,
+  personaRegenerationPollTimer: null,
   lastApiErrorToastAt: 0,
   lastApiErrorKey: "",
   selectedReviews: new Set(),
@@ -2143,6 +2144,7 @@ async function loadPersonaSlices() {
     const result = await cachedFetch("persona:slices", () => api.get("/persona/slices"), {});
     if (!isCurrentView(request)) return;
     state.cache.personaSlices = result;
+    schedulePersonaRegenerationPoll(result.regeneration);
   } catch (error) {
     state.cache.personaSlices = {};
     state.cache.personaSlicesError = error.message || String(error);
@@ -2150,6 +2152,73 @@ async function loadPersonaSlices() {
   }
   if (!isCurrentView(request)) return;
   renderPersonaSlices();
+}
+
+function stopPersonaRegenerationPolling() {
+  if (state.personaRegenerationPollTimer) {
+    clearTimeout(state.personaRegenerationPollTimer);
+    state.personaRegenerationPollTimer = null;
+  }
+}
+
+function schedulePersonaRegenerationPoll(regeneration = {}) {
+  stopPersonaRegenerationPolling();
+  if (!["queued", "running"].includes(String(regeneration?.state || ""))) return;
+  state.personaRegenerationPollTimer = setTimeout(async () => {
+    state.personaRegenerationPollTimer = null;
+    if (state.current !== "personaSlices") return;
+    try {
+      const previousState = String(state.cache.personaSlices?.regeneration?.state || "");
+      const status = await api.get("/persona/slices/regeneration-status");
+      if (state.current !== "personaSlices") return;
+      state.cache.personaSlices = {
+        ...(state.cache.personaSlices || {}),
+        regeneration: status,
+      };
+      const nextState = String(status?.state || "");
+      if (["completed", "failed", "cancelled"].includes(nextState)) {
+        clearDataCache("persona:");
+        await loadPersonaSlices();
+        if (nextState === "completed" && previousState !== "completed") {
+          toast("人格核心与 8 维切片已重新生成");
+        } else if (nextState === "failed" && previousState !== "failed") {
+          toast(`人格重建失败：${status.error || "旧人格已保留"}`);
+        }
+        return;
+      }
+      renderPersonaSlices();
+      schedulePersonaRegenerationPoll(status);
+    } catch (error) {
+      toast(`人格重建状态读取失败：${error.message || error}`);
+      schedulePersonaRegenerationPoll(state.cache.personaSlices?.regeneration || {});
+    }
+  }, 2500);
+}
+
+async function startPersonaRegeneration() {
+  const persona = state.cache.personaSlices || {};
+  const regeneration = persona.regeneration || {};
+  if (["queued", "running"].includes(String(regeneration.state || ""))) {
+    toast("人格重建已经在进行中");
+    return;
+  }
+  const confirmed = await confirmAction(
+    "确认重新生成人格核心内容与 8 维切片？生成期间继续使用当前人格；全部成功后才会替换，并清除当前人工微调。失败时旧人格会完整保留。",
+  );
+  if (!confirmed) return;
+  const result = await api.post("/persona/slices/regenerate", {
+    cache_key: persona.cache_key || "",
+    expected_timestamp: persona.timestamp || 0,
+    clear_manual_overrides: true,
+    idempotency_key: window.crypto?.randomUUID?.() || `persona-${Date.now()}`,
+  });
+  state.cache.personaSlices = {
+    ...persona,
+    regeneration: result,
+  };
+  renderPersonaSlices();
+  schedulePersonaRegenerationPoll(result);
+  toast("人格重建已开始，当前人格会继续正常服务");
 }
 
 function renderReadonlyText(value, empty = "暂无内容") {
@@ -2295,8 +2364,13 @@ function renderPersonaSlices() {
   const style = persona.style || "";
   const ready = Boolean(persona.is_full_ready);
   const pending = Boolean(persona.pending_task);
+  const regeneration = persona.regeneration || {};
+  const regenerationRunning = ["queued", "running"].includes(String(regeneration.state || ""));
+  const regenerationProgress = Number(regeneration.total_components || 11) > 0
+    ? Math.round((Number(regeneration.completed_components || 0) / Number(regeneration.total_components || 11)) * 100)
+    : 0;
   content().innerHTML = `
-    ${pageHeader("角色理解与微调 Persona Slices", "查看并微调 AstrMai 从 AstrBot 人格中提炼出的核心内容与 8 类角色切片。", `<button class="ghost-button" data-persona-slices-json type="button">诊断 JSON</button>${Object.keys(persona.manual_overrides || {}).length ? `<button class="ghost-button" data-restore-persona-all type="button">恢复全部 AI 版本</button>` : ""}`)}
+    ${pageHeader("角色理解与微调 Persona Slices", "查看并微调 AstrMai 从 AstrBot 人格中提炼出的核心内容与 8 类角色切片。", `<button class="primary-button" data-regenerate-persona type="button" ${regenerationRunning ? "disabled" : ""}>${regenerationRunning ? "正在重新生成..." : "重新生成人格8维度切片"}</button><button class="ghost-button" data-persona-slices-json type="button">诊断 JSON</button>${Object.keys(persona.manual_overrides || {}).length ? `<button class="ghost-button" data-restore-persona-all type="button">恢复全部 AI 版本</button>` : ""}`)}
     ${section("管理边界", "本页只修改 AstrMai 的派生人格缓存，保存后下一轮聊天生效；不会修改 AstrBot 原始人格或 self-lore。", `
       <div class="chip-row">
         ${statusChip("配置：AstrBot 插件配置页", "muted")}
@@ -2310,6 +2384,20 @@ function renderPersonaSlices() {
       ${metric("切片状态", ready ? "ready" : (pending ? "building" : "partial"), ready ? "8 类切片已生成" : "可能仍在后台构建")}
       ${metric("缓存时间", formatTime(persona.timestamp), "persona_cache 时间戳")}
     </div>
+    ${String(regeneration.state || "idle") !== "idle" ? section(
+      "人格重建状态",
+      regenerationRunning
+        ? "后台正在生成；聊天仍使用当前已生效人格。"
+        : (regeneration.state === "completed" ? "新版本已原子替换并生效。" : "重建未生效，旧人格保持不变。"),
+      `
+        <div class="grid">
+          ${metric("状态", regeneration.state || "idle", regeneration.stage || "-")}
+          ${metric("进度", `${regeneration.completed_components || 0}/${regeneration.total_components || 11}`, `${regenerationProgress}%`)}
+          ${metric("派生版本", regeneration.derivation_version || persona.derivation_version || "-", "人格压缩算法版本")}
+          ${metric("结束时间", formatTime(regeneration.finished_at), regeneration.error || "无错误")}
+        </div>
+      `,
+    ) : ""}
     <div class="grid two">
       ${section("核心摘要 Summary", `用于压缩长人格，降低即时回复 token 成本。${persona.manual_overrides?.summary ? " 当前为人工版本。" : ""}`, renderReadonlyText(summary), persona.manual_overrides?.summary ? `<button class="ghost-button" data-restore-persona-field="summary" type="button">恢复</button>` : "")}
       ${section("第一人称自觉 First Person Rewrite", `ContextEngine 优先使用这段短自述来稳定扮演视角。${persona.manual_overrides?.first_person_rewrite ? " 当前为人工版本。" : ""}`, renderReadonlyText(firstPerson), persona.manual_overrides?.first_person_rewrite ? `<button class="ghost-button" data-restore-persona-field="first_person_rewrite" type="button">恢复</button>` : "")}
@@ -2325,6 +2413,7 @@ function renderPersonaSlices() {
     `)}
   `;
   $('[data-persona-slices-json]')?.addEventListener("click", () => openModal("Persona Slices Diagnostic", `<pre>${json(state.cache.personaSlices || {})}</pre>`));
+  $('[data-regenerate-persona]')?.addEventListener("click", () => startPersonaRegeneration().catch((error) => toast(`人格重建启动失败：${error.message || error}`)));
   $('[data-edit-persona-core]')?.addEventListener("click", () => openPersonaCoreEditor(persona));
   $$('[data-edit-persona-shard]').forEach((button) => button.addEventListener("click", () => openPersonaShardEditor(persona, button.dataset.editPersonaShard)));
   $$('[data-restore-persona-field]').forEach((button) => button.addEventListener("click", () => restorePersonaFields([button.dataset.restorePersonaField]).catch((error) => toast(`恢复失败：${error.message || error}`))));
@@ -2342,6 +2431,9 @@ async function loadCurrent() {
   };
   if (state.current !== "dashboard") {
     stopSchedulerPolling();
+  }
+  if (state.current !== "personaSlices") {
+    stopPersonaRegenerationPolling();
   }
   try {
     await (loaders[state.current] || loadDashboard)();

@@ -633,6 +633,12 @@ class AstrMaiAdminPageApi:
     async def restore_persona_slices(self, request: Any) -> dict[str, Any]:
         return await PersonaUiService(self.plugin_api).restore_persona_slices(await self._body(request))
 
+    async def regenerate_persona_slices(self, request: Any) -> dict[str, Any]:
+        return await PersonaUiService(self.plugin_api).regenerate_persona_slices(await self._body(request))
+
+    async def persona_regeneration_status(self, request: Any) -> dict[str, Any]:
+        return await PersonaUiService(self.plugin_api).get_persona_regeneration_status()
+
 
 def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
     """Register ~85 admin API endpoints under /astrmai/admin.
@@ -770,6 +776,8 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/persona/slices", api.persona_slices, "AstrMai persona slices"),
         ("POST", "/persona/slices/update", api.update_persona_slices, "AstrMai update derived persona slices"),
         ("POST", "/persona/slices/restore", api.restore_persona_slices, "AstrMai restore generated persona slices"),
+        ("POST", "/persona/slices/regenerate", api.regenerate_persona_slices, "AstrMai regenerate persona slices"),
+        ("GET", "/persona/slices/regeneration-status", api.persona_regeneration_status, "AstrMai persona regeneration status"),
     ]
 
     registered: set[tuple[str, str]] = set()

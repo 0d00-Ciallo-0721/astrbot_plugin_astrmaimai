@@ -29,6 +29,12 @@ class PersonaUiService:
         cache_key, payload = self._select_cache_payload(cache, persona_id)
         pending_tasks = self._pending_tasks(self.plugin_api)
         pending_task = cache_key in pending_tasks
+        summarizer = self.plugin_api.get_persona_summarizer()
+        regeneration = (
+            summarizer.get_regeneration_status(cache_key)
+            if summarizer is not None and hasattr(summarizer, "get_regeneration_status")
+            else {"state": "idle", "cache_key": cache_key}
+        )
         raw_text = str(payload.get("raw", "") or "")
         shards = payload.get("shards", {})
         if not isinstance(shards, dict):
@@ -38,7 +44,11 @@ class PersonaUiService:
             "data": {
                 "persona_id": persona_id,
                 "cache_key": cache_key,
-                "cache_keys": list(cache.keys()) if isinstance(cache, dict) else [],
+                "cache_keys": [
+                    str(key)
+                    for key in cache
+                    if not str(key).startswith("__persona_regeneration__:")
+                ] if isinstance(cache, dict) else [],
                 "summary": str(payload.get("summary", "") or ""),
                 "first_person_rewrite": str(payload.get("first_person_rewrite", "") or ""),
                 "style": str(payload.get("style", "") or ""),
@@ -53,6 +63,8 @@ class PersonaUiService:
                 "manual_revision": int(payload.get("manual_revision", 0) or 0),
                 "manual_updated_at": float(payload.get("manual_updated_at", 0.0) or 0.0),
                 "generated_baseline_available": isinstance(payload.get("generated_baseline"), dict),
+                "derivation_version": int(payload.get("derivation_version", 0) or 0),
+                "regeneration": regeneration,
                 "raw_length": len(raw_text),
                 "self_lore": {
                     "available": self.plugin_api.get_memory_engine() is not None,
@@ -179,6 +191,56 @@ class PersonaUiService:
             return {"status": "error", "code": "persona_restore_failed", "message": str(exc)}
         return await self.get_persona_slices()
 
+    async def regenerate_persona_slices(self, data: dict[str, Any]) -> dict[str, Any]:
+        summarizer = self.plugin_api.get_persona_summarizer()
+        if summarizer is None or not hasattr(summarizer, "start_regeneration"):
+            return {"status": "error", "code": "runtime_unavailable", "message": "人格运行时尚未就绪"}
+        allowed = {
+            "cache_key",
+            "expected_timestamp",
+            "clear_manual_overrides",
+            "idempotency_key",
+        }
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            return {
+                "status": "error",
+                "code": "invalid_fields",
+                "message": "包含不允许的重建参数：" + ", ".join(unknown),
+            }
+        cache = await self.plugin_api.read_persona_cache()
+        persona_id = self._resolve_persona_id(self.plugin_api)
+        cache_key, _ = self._select_cache_payload(cache, persona_id)
+        requested_key = str(data.get("cache_key", "") or cache_key).strip()
+        if requested_key != cache_key:
+            return {"status": "error", "code": "stale_cache_key", "message": "当前人格已经变化，请重新读取页面"}
+        clear_manual_overrides = data.get("clear_manual_overrides", True)
+        if not isinstance(clear_manual_overrides, bool):
+            return {
+                "status": "error",
+                "code": "invalid_fields",
+                "message": "清除人工微调标记必须是布尔值",
+            }
+        try:
+            result = await summarizer.start_regeneration(
+                cache_key,
+                expected_timestamp=self._expected_timestamp(data),
+                clear_manual_overrides=clear_manual_overrides,
+                idempotency_key=str(data.get("idempotency_key", "") or ""),
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return {"status": "error", "code": "persona_regeneration_failed", "message": str(exc)}
+        return {"status": "ok", "data": result}
+
+    async def get_persona_regeneration_status(self) -> dict[str, Any]:
+        cache = await self.plugin_api.read_persona_cache()
+        persona_id = self._resolve_persona_id(self.plugin_api)
+        cache_key, _ = self._select_cache_payload(cache, persona_id)
+        summarizer = self.plugin_api.get_persona_summarizer()
+        if summarizer is None or not hasattr(summarizer, "get_regeneration_status"):
+            return {"status": "ok", "data": {"state": "idle", "cache_key": cache_key}}
+        return {"status": "ok", "data": summarizer.get_regeneration_status(cache_key)}
+
     def _resolve_persona_id(self, plugin_api: Any) -> str:
         try:
             config = plugin_api.get_runtime_config()
@@ -205,7 +267,7 @@ class PersonaUiService:
         if any(key in cache for key in ("summary", "first_person_rewrite", "shards")):
             return persona_id or "global", dict(cache)
         for key, value in cache.items():
-            if isinstance(value, dict):
+            if isinstance(value, dict) and not str(key).startswith("__persona_regeneration__:"):
                 return str(key), dict(value)
         return persona_id or "global", {}
 
