@@ -59,6 +59,7 @@ class PromptEnvelope:
     warm_zone_quote_event_ids: list[str] = field(default_factory=list)
     last_assistant_reply: str = ""
     current_speaker_block: str = ""
+    referenced_entity_block: str = ""
     focus_message_text: str = ""
     focus_message_identity: str = ""
     direct_context_text: str = ""

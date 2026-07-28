@@ -411,10 +411,26 @@ class MemoryRetrievalService:
         )
         return await self._finalize_retrieval(query, candidates)
 
+    @staticmethod
+    def _query_rewrite_eligible(query: MemoryQuery) -> bool:
+        metadata = dict(query.metadata or {})
+        if "query_rewrite_eligible" in metadata:
+            return bool(metadata.get("query_rewrite_eligible"))
+        return query.policy == "deep" or (query.think_level is not None and query.think_level >= 3)
+
     async def retrieve_deep(self, query: MemoryQuery) -> list[MemoryCandidate]:
         queries = [query.query]
         try:
-            queries = await self._rewrite_queries(query)
+            if self._query_rewrite_eligible(query):
+                queries = await self._rewrite_queries(query)
+            else:
+                self._record_query_rewrite_trace(
+                    query,
+                    status="skipped_not_eligible",
+                    elapsed_ms=0.0,
+                    rewrite_count=0,
+                    skip_reason="query_policy",
+                )
             candidate_pool_limit = self._explicit_candidate_limit(query) or max(
                 int(query.top_k or 5) * max(int(self.scoring.deep_temporal_candidate_pool_factor or 4), 1),
                 max(int(self.scoring.deep_temporal_candidate_pool_min or 20), 1),
@@ -796,7 +812,7 @@ class MemoryRetrievalService:
             self._record_query_rewrite_trace(query, status="gateway_unavailable", elapsed_ms=0.0, rewrite_count=0)
             return [base_query]
         timing = getattr(getattr(self.engine, "config", None), "timing", None)
-        configured_timeout_sec = max(0.01, float(getattr(timing, "query_rewrite_timeout_sec", 8.0) or 8.0))
+        configured_timeout_sec = max(0.01, float(getattr(timing, "query_rewrite_timeout_sec", 3.0) or 3.0))
         timeout_sec = clamp_timeout_to_turn_budget(
             None,
             configured_timeout_sec,
@@ -890,6 +906,7 @@ class MemoryRetrievalService:
         configured_timeout_sec: float = 0.0,
         effective_timeout_sec: float = 0.0,
         cancellation_requested: bool = False,
+        skip_reason: str = "",
     ) -> None:
         metadata = dict(query.metadata or {})
         metadata["query_rewrite_trace"] = {
@@ -901,6 +918,8 @@ class MemoryRetrievalService:
             "effective_timeout_sec": round(max(0.0, float(effective_timeout_sec or 0.0)), 3),
             "cancellation_requested": bool(cancellation_requested),
         }
+        if skip_reason:
+            metadata["query_rewrite_trace"]["skip_reason"] = str(skip_reason)
         query.metadata = metadata
 
     async def _call_deep_json(self, prompt: str, *, scope_id: str = "") -> dict:

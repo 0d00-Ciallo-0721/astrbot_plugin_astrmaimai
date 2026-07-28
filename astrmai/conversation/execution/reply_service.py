@@ -116,6 +116,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             total_chars=len(artifact.visible_text or ""),
             strategy=str(artifact.metadata.get("segment_strategy", "") or ""),
             send_status=str(artifact.metadata.get("send_status", "") or ""),
+            reply_completed=bool(artifact.blocked or freshness_state == FreshnessState.EXPIRED),
             metadata=artifact.metadata,
         )
         if artifact.blocked:
@@ -160,6 +161,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
                 strategy=str(artifact.metadata.get("segment_strategy", "") or ""),
                 send_status=str(artifact.metadata.get("send_status", "failed") or "failed"),
                 sent_segment_count=int(artifact.metadata.get("sent_segment_count", 0) or 0),
+                reply_completed=True,
                 metadata=artifact.metadata,
             )
             artifact.blocked_reason = artifact.blocked_reason or "send_failed"
@@ -179,6 +181,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             strategy=str(artifact.metadata.get("segment_strategy", "") or ""),
             send_status=str(artifact.metadata.get("send_status", "sent") or "sent"),
             sent_segment_count=int(artifact.metadata.get("sent_segment_count", len(artifact.segments or [])) or 0),
+            reply_completed=True,
             metadata=artifact.metadata,
         )
         try:

@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import random
+import re
 import time
 from typing import List
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
 from ...infrastructure.runtime.turn_call_ledger import (
     finalize_turn_telemetry,
@@ -1076,6 +1078,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         decision: CognitiveDecision | None,
         goal_summary: str = "",
         is_lightweight_event: bool = False,
+        *,
+        event: AstrMessageEvent | None = None,
     ) -> None:
         focus_preview = ""
         if prompt_envelope is not None:
@@ -1090,6 +1094,21 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if not reply_need and decision:
             reply_need = getattr(decision, "action", "") or "reply"
         action_taken = "reply" if reply_text else ("tool" if tools else "none")
+        history_policy = DialogHistoryPolicy.from_event(event)
+        sender_id = history_policy.current_sender_id
+        source_event_id = ""
+        if event is not None:
+            if not sender_id:
+                try:
+                    sender_id = str(event.get_sender_id() or "").strip()
+                except Exception:
+                    sender_id = ""
+            message_obj = getattr(event, "message_obj", None)
+            source_event_id = str(
+                getattr(message_obj, "message_id", "")
+                or getattr(event, "message_id", "")
+                or ""
+            ).strip()
         self.conversation_continuity.record(
             chat_id=chat_id,
             focus_preview=focus_preview,
@@ -1100,6 +1119,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_preview=str(reply_text or "")[:120],
             reply_need=reply_need,
             lightweight_event=is_lightweight_event,
+            sender_id=sender_id,
+            source_event_id=source_event_id,
+            topic_epoch=history_policy.topic_epoch if history_policy.group_id else None,
         )
 
     @staticmethod
@@ -1157,6 +1179,73 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         except Exception as exc:
             logger.debug(f"[Planner] dialogue segment append degraded: {exc}")
 
+    @classmethod
+    def _extract_group_social_candidates(cls, reply_text: str) -> list[tuple[str, str]]:
+        text = " ".join(str(reply_text or "").split())
+        if not text:
+            return []
+        candidates: list[tuple[str, str]] = []
+        direct_patterns = (
+            r"(?:称号|昵称|外号)(?:是|叫|为|：|:)\s*[「『“\"]?([^「」『』“”\"\n，。！？]{2,48})",
+            r"[「『“\"]([^「」『』“”\"\n]{2,48})[」』”\"]\s*(?:这个)?(?:称号|昵称|外号)",
+        )
+        for pattern in direct_patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                value = str(match.group(1) or "").strip(" \t-—:：，。！？♡")
+                if value:
+                    candidates.append(("title", value))
+        for match in re.finditer(r"[「『“\"]([^「」『』“”\"\n]{2,40})[」』”\"]", text):
+            value = str(match.group(1) or "").strip(" \t-—:：，。！？♡")
+            if value.endswith(("骑士", "达人", "大师", "专家", "冠军", "之王")):
+                candidates.append(("title", value))
+        unique: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in candidates:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique.append(item)
+        return unique[:4]
+
+    async def _record_group_social_candidates(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        reply_text: str,
+        *,
+        source_event_id: str,
+    ) -> None:
+        store = getattr(self, "dialogue_store", None)
+        history_policy = DialogHistoryPolicy.from_event(event)
+        if store is None or not history_policy.group_id:
+            return
+        conversation_config = getattr(self.config, "conversation", None)
+        if not bool(getattr(conversation_config, "group_social_ownership_check_enabled", True)):
+            return
+        owner_id = str(history_policy.current_sender_id or "").strip()
+        if not owner_id:
+            try:
+                owner_id = str(event.get_sender_id() or "").strip()
+            except Exception:
+                owner_id = ""
+        if not owner_id:
+            return
+        try:
+            owner_name = str(event.get_sender_name() or "").strip()
+        except Exception:
+            owner_name = ""
+        for kind, value in self._extract_group_social_candidates(reply_text):
+            await store.upsert_social_candidate(
+                chat_id,
+                kind=kind,
+                value=value,
+                owner_id=owner_id,
+                owner_name=owner_name,
+                topic_epoch=history_policy.topic_epoch,
+                source_event_id=source_event_id,
+                confidence=0.5,
+            )
+
     async def _record_planner_dialogue_segment(self, event: AstrMessageEvent, chat_id: str, reply_text: str, *, focus_context=None) -> None:
         store = getattr(self, "dialogue_store", None)
         if store is None:
@@ -1165,9 +1254,10 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if not content:
             return
         try:
+            reply_event_id = f"reply:{chat_id}:{int(time.time() * 1000)}"
             await store.append_segment(
                 chat_id,
-                event_id=f"reply:{chat_id}:{int(time.time() * 1000)}",
+                event_id=reply_event_id,
                 speaker_id=str(getattr(self.context, "bot_id", "") or getattr(self.gateway, "bot_id", "") or ""),
                 speaker_name=str(getattr(getattr(self.gateway.config, "system1", None), "nicknames", ["Bot"])[0] if getattr(getattr(self.gateway.config, "system1", None), "nicknames", None) else "Bot"),
                 content=content,
@@ -1175,6 +1265,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 message_kind="text",
                 is_bot=True,
                 timestamp=time.time(),
+            )
+            await self._record_group_social_candidates(
+                event,
+                chat_id,
+                content,
+                source_event_id=reply_event_id,
             )
             if self.context_compaction is not None:
                 try:
@@ -1716,6 +1812,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                         None,
                         cognitive_decision,
                         is_lightweight_event=bool(planning_context.get("is_lightweight_event", False)),
+                        event=event,
                     )
                     skip_reason = (
                         cognitive_decision.reply_need
@@ -1834,6 +1931,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 cognitive_decision,
                 goal_summary=side_inputs.get("planner_reasoning", ""),
                 is_lightweight_event=bool(planning_context.get("is_lightweight_event", False)),
+                event=event,
             )
             self._apply_turn_continuity_context(event, chat_id)
             try:
@@ -1860,6 +1958,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             cognitive_decision,
             goal_summary=side_inputs.get("planner_reasoning", ""),
             is_lightweight_event=bool(planning_context.get("is_lightweight_event", False)),
+            event=event,
         )
         self._apply_turn_continuity_context(event, chat_id)
         await self._finalize_proactive_event(event, reply_text)

@@ -159,6 +159,10 @@ def emit_legacy_prompt_envelope_extras(
     event.set_extra("astrmai_focus_thread_text", legacy_focus_thread_text)
     event.set_extra("astrmai_ambient_background_text", prompt_envelope.ambient_background_text)
     event.set_extra("astrmai_recent_transcript", prompt_envelope.recent_transcript)
+    event.set_extra(
+        "astrmai_referenced_entity_block",
+        getattr(prompt_envelope, "referenced_entity_block", ""),
+    )
     event.set_extra("astrmai_recent_transcript_reason", getattr(prompt_envelope, "recent_transcript_reason", ""))
     event.set_extra("astrmai_warm_zone_summary", getattr(prompt_envelope, "warm_zone_summary", ""))
     event.set_extra("astrmai_warm_zone_quotes", getattr(prompt_envelope, "warm_zone_quotes", ""))
@@ -189,6 +193,9 @@ def read_legacy_prompt_envelope(event: Any, *, prompt: str = "") -> PromptEnvelo
         warm_zone_summary=str(event.get_extra("astrmai_warm_zone_summary", "") or "").strip(),
         warm_zone_quotes=str(event.get_extra("astrmai_warm_zone_quotes", "") or "").strip(),
         last_assistant_reply="",
+        referenced_entity_block=str(
+            event.get_extra("astrmai_referenced_entity_block", "") or ""
+        ).strip(),
         focus_message_text=focus_message_text,
         direct_context_text=direct_context_text,
         related_context_text=related_context_text,

@@ -15,8 +15,15 @@ class MessageRenderer:
         return str(text or "").strip()
 
     @classmethod
-    def render_event(cls, event: AstrMessageEvent) -> str:
+    def render_event(cls, event: AstrMessageEvent, *, include_identity: bool = False) -> str:
         speaker = cls._normalize_text(event.get_sender_name()) or "群友"
+        if include_identity:
+            try:
+                sender_id = cls._normalize_text(event.get_sender_id())
+            except Exception:
+                sender_id = ""
+            if sender_id:
+                speaker = f"{speaker}（QQ: {sender_id}）"
         text = cls._normalize_text(event.get_extra("astrmai_rich_text", event.message_str))
         interaction = cls._normalize_text(event.get_extra("astrmai_interaction_kind", ""))
         if interaction:

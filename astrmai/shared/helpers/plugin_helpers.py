@@ -27,7 +27,15 @@ def format_model_pool(models: List[str], default: str = "Unconfigured") -> str:
     return f"{models[0]} (+{len(models) - 1})"
 
 
-def safe_create_task(coro, name: str = "", track_set: set = None):
+def safe_create_task(
+    coro,
+    name: str = "",
+    track_set: set = None,
+    *,
+    event: Any = None,
+    task_name: str | None = None,
+    metadata: dict[str, Any] | None = None,
+):
     """ponytail: fire-and-forget with error logging, add structured task management when needed.
     
     Wraps asyncio.create_task() with automatic exception logging via add_done_callback.
@@ -63,6 +71,15 @@ def safe_create_task(coro, name: str = "", track_set: set = None):
             _astrbot_logger.error(f"[AstrMai] background task '{task_name}' crashed: {exc}", exc_info=exc)
 
     task.add_done_callback(_log_task_result)
+    if event is not None:
+        from ...infrastructure.runtime.turn_call_ledger import attach_background_task_trace
+
+        attach_background_task_trace(
+            task,
+            event,
+            task_name or name or (task.get_name() if hasattr(task, "get_name") else "background"),
+            metadata=metadata,
+        )
     if owns_loop:
         try:
             loop.run_until_complete(task)

@@ -18,7 +18,7 @@ from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
-from ...infrastructure.runtime.turn_call_ledger import rebind_turn_telemetry
+from ...infrastructure.runtime.turn_call_ledger import attach_background_task_trace, rebind_turn_telemetry
 from .decision_router import AttentionDecisionRouter
 from .event_normalizer import SessionContext, build_normalized_events
 from .focus_selector import score_focus_candidate, select_focus_event
@@ -421,6 +421,12 @@ class AttentionGate:
         task = asyncio.create_task(self._run_background_task(coro, event))
         task._astrmai_inner_coro = coro
         self._background_tasks.add(task)
+        attach_background_task_trace(
+            task,
+            event,
+            "attention.background",
+            metadata={"chat_id": str(getattr(event, "unified_msg_origin", "") or "")},
+        )
         task.add_done_callback(self._handle_task_result)
         return task
 
@@ -429,6 +435,12 @@ class AttentionGate:
         task = asyncio.create_task(managed_coro)
         task._astrmai_inner_coro = coro
         self._background_tasks.add(task)
+        attach_background_task_trace(
+            task,
+            event,
+            "attention.priority",
+            metadata={"chat_id": str(getattr(event, "unified_msg_origin", "") or "")},
+        )
         task.add_done_callback(self._handle_task_result)
         return task
 
@@ -452,6 +464,7 @@ class AttentionGate:
         *,
         is_private: bool = False,
         is_strong_wakeup: bool = False,
+        event: Any = None,
     ):
         task = asyncio.create_task(
             self._debounce_and_judge(
@@ -462,8 +475,14 @@ class AttentionGate:
                 is_strong_wakeup=is_strong_wakeup,
             )
         )
-        task._worker_context = SimpleNamespace(chat_id=chat_id, session=session, self_id=self_id)
+        task._worker_context = SimpleNamespace(chat_id=chat_id, session=session, self_id=self_id, event=event)
         self._session_tasks.add(task)
+        attach_background_task_trace(
+            task,
+            event,
+            "attention.session_worker",
+            metadata={"chat_id": str(chat_id or "")},
+        )
         task.add_done_callback(self._handle_session_worker_result)
         return task
 
@@ -479,6 +498,12 @@ class AttentionGate:
             if worker_context is not None:
                 recovery = asyncio.create_task(self._recover_failed_session_worker(worker_context))
                 self._background_tasks.add(recovery)
+                attach_background_task_trace(
+                    recovery,
+                    getattr(worker_context, "event", None),
+                    "attention.session_worker_recovery",
+                    metadata={"chat_id": str(getattr(worker_context, "chat_id", "") or "")},
+                )
                 recovery.add_done_callback(self._handle_background_task_result)
 
     async def _recover_failed_session_worker(self, worker_context):
@@ -491,7 +516,12 @@ class AttentionGate:
             has_pending = bool(session.accumulation_pool)
             session.is_evaluating = False
         if has_pending:
-            self._spawn_session_worker(chat_id, session, self_id)
+            self._spawn_session_worker(
+                chat_id,
+                session,
+                self_id,
+                event=getattr(worker_context, "event", None),
+            )
 
     def _handle_background_task_result(self, task: asyncio.Task):
         self._background_tasks.discard(task)
@@ -1266,6 +1296,7 @@ class AttentionGate:
                 self_id,
                 is_private=is_private,
                 is_strong_wakeup=is_strong_wakeup,
+                event=event,
             )
         return "BUFFERED"
 

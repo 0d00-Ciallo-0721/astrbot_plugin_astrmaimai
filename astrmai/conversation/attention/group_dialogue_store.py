@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -57,6 +58,21 @@ class WarmContextBundle:
     topic_preview: str = ""
 
 
+@dataclass(slots=True)
+class GroupSocialStateItem:
+    state_id: str
+    kind: str
+    value: str
+    owner_id: str
+    owner_name: str
+    created_at: float
+    updated_at: float
+    topic_epoch: int = 0
+    status: str = "candidate"
+    confidence: float = 0.5
+    evidence_event_ids: list[str] = field(default_factory=list)
+
+
 class GroupDialogueStore:
     # G4/PL-09: 快照 schema 版本——不兼容即整份弃用（不做半解析），避免旧结构
     # 恢复出畸形 segment 污染上下文
@@ -78,6 +94,7 @@ class GroupDialogueStore:
         self.warm_zone_max_tokens = int(warm_zone_max_tokens or 1200)
         self.snapshot_dir = snapshot_dir
         self._threads: dict[str, DialogueThread] = {}
+        self._social_states: dict[str, list[GroupSocialStateItem]] = {}
         self._lock = asyncio.Lock()
 
     def _get_thread(self, chat_id: str) -> DialogueThread:
@@ -89,7 +106,10 @@ class GroupDialogueStore:
 
     async def clear_chat(self, chat_id: str) -> bool:
         async with self._lock:
-            return self._threads.pop(self._resolve_chat_key(chat_id), None) is not None
+            key = self._resolve_chat_key(chat_id)
+            thread_removed = self._threads.pop(key, None) is not None
+            social_removed = self._social_states.pop(key, None) is not None
+            return thread_removed or social_removed
 
     @staticmethod
     def _resolve_chat_key(chat_id) -> str:
@@ -206,11 +226,182 @@ class GroupDialogueStore:
         except Exception:
             return None
 
+    @staticmethod
+    def _serialize_social_state(item: GroupSocialStateItem) -> dict:
+        return {field.name: getattr(item, field.name) for field in dataclass_fields(GroupSocialStateItem)}
+
+    @staticmethod
+    def _deserialize_social_state(payload: dict) -> GroupSocialStateItem | None:
+        valid_names = {field.name for field in dataclass_fields(GroupSocialStateItem)}
+        data = {key: value for key, value in dict(payload or {}).items() if key in valid_names}
+        try:
+            data["evidence_event_ids"] = [
+                str(item).strip()
+                for item in list(data.get("evidence_event_ids", []) or [])
+                if str(item).strip()
+            ][-8:]
+            item = GroupSocialStateItem(**data)
+            if not str(item.owner_id or "").strip() or not str(item.value or "").strip():
+                return None
+            if item.status not in {"candidate", "confirmed", "rejected"}:
+                return None
+            return item
+        except Exception:
+            return None
+
+    @staticmethod
+    def _social_state_id(kind: str, value: str, owner_id: str) -> str:
+        payload = "\x1f".join((str(kind), str(owner_id), str(value))).encode("utf-8")
+        return "social_" + hashlib.sha256(payload).hexdigest()[:20]
+
+    async def upsert_social_candidate(
+        self,
+        chat_id: str,
+        *,
+        kind: str,
+        value: str,
+        owner_id: str,
+        owner_name: str = "",
+        topic_epoch: int = 0,
+        source_event_id: str = "",
+        confidence: float = 0.5,
+        now: float | None = None,
+    ) -> GroupSocialStateItem | None:
+        key = self._resolve_chat_key(chat_id)
+        normalized_kind = str(kind or "").strip().lower()
+        normalized_value = self._normalize_message_text(value)
+        normalized_owner_id = str(owner_id or "").strip()
+        if not normalized_kind or not normalized_value or not normalized_owner_id:
+            return None
+        timestamp = time.time() if now is None else float(now)
+        state_id = self._social_state_id(normalized_kind, normalized_value, normalized_owner_id)
+        evidence_id = str(source_event_id or "").strip()
+        async with self._lock:
+            items = self._social_states.setdefault(key, [])
+            existing = next((item for item in items if item.state_id == state_id), None)
+            if existing is not None:
+                existing.updated_at = timestamp
+                existing.owner_name = str(owner_name or existing.owner_name or "").strip()
+                existing.topic_epoch = max(0, int(topic_epoch or existing.topic_epoch or 0))
+                existing.confidence = max(
+                    0.0,
+                    min(1.0, max(float(existing.confidence or 0.0), float(confidence or 0.0))),
+                )
+                if evidence_id and evidence_id not in existing.evidence_event_ids:
+                    existing.evidence_event_ids.append(evidence_id)
+                    existing.evidence_event_ids = existing.evidence_event_ids[-8:]
+                return existing
+            item = GroupSocialStateItem(
+                state_id=state_id,
+                kind=normalized_kind,
+                value=normalized_value,
+                owner_id=normalized_owner_id,
+                owner_name=str(owner_name or "").strip(),
+                created_at=timestamp,
+                updated_at=timestamp,
+                topic_epoch=max(0, int(topic_epoch or 0)),
+                confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+                evidence_event_ids=[evidence_id] if evidence_id else [],
+            )
+            items.append(item)
+            self._social_states[key] = items[-80:]
+            return item
+
+    async def set_social_state_status(
+        self,
+        chat_id: str,
+        state_id: str,
+        status: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        key = self._resolve_chat_key(chat_id)
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"candidate", "confirmed", "rejected"}:
+            return False
+        async with self._lock:
+            for item in self._social_states.get(key, []):
+                if item.state_id != str(state_id or "").strip():
+                    continue
+                item.status = normalized_status
+                item.updated_at = time.time() if now is None else float(now)
+                return True
+        return False
+
+    async def get_social_context_items(
+        self,
+        chat_id: str,
+        *,
+        current_sender_id: str,
+        topic_epoch: int = 0,
+        ttl_seconds: float = 86400.0,
+        ownership_check_enabled: bool = True,
+        now: float | None = None,
+    ) -> list[GroupSocialStateItem]:
+        key = self._resolve_chat_key(chat_id)
+        timestamp = time.time() if now is None else float(now)
+        sender_id = str(current_sender_id or "").strip()
+        ttl = max(60.0, float(ttl_seconds or 86400.0))
+        async with self._lock:
+            items = list(self._social_states.get(key, []))
+        selected: list[GroupSocialStateItem] = []
+        for item in items:
+            if item.status == "rejected" or timestamp - float(item.updated_at or 0.0) > ttl:
+                continue
+            if ownership_check_enabled:
+                if not sender_id or item.owner_id != sender_id:
+                    continue
+            elif item.owner_id and sender_id and item.owner_id != sender_id:
+                continue
+            selected.append(item)
+        selected.sort(
+            key=lambda item: (
+                item.status == "confirmed",
+                item.topic_epoch == max(0, int(topic_epoch or 0)),
+                item.updated_at,
+            ),
+            reverse=True,
+        )
+        return selected[:8]
+
+    async def render_social_context(
+        self,
+        chat_id: str,
+        *,
+        current_sender_id: str,
+        topic_epoch: int = 0,
+        ttl_seconds: float = 86400.0,
+        ownership_check_enabled: bool = True,
+        now: float | None = None,
+    ) -> str:
+        items = await self.get_social_context_items(
+            chat_id,
+            current_sender_id=current_sender_id,
+            topic_epoch=topic_epoch,
+            ttl_seconds=ttl_seconds,
+            ownership_check_enabled=ownership_check_enabled,
+            now=now,
+        )
+        if not items:
+            return ""
+        lines = ["当前发言人的群内互动状态（已校验归属）："]
+        for item in items:
+            status = "已确认" if item.status == "confirmed" else "待确认"
+            owner = item.owner_name or item.owner_id
+            lines.append(f"- {item.kind}：{item.value}（归属：{owner}，{status}）")
+        lines.append("这些状态只属于当前发言人；待确认内容只能作为互动线索，不能冒充已证实事实。")
+        return "\n".join(lines)
+
     async def export_snapshot(self) -> dict:
         now = time.time()
         chats: dict[str, dict] = {}
         async with self._lock:
             threads = list(self._threads.items())
+            social_states = {
+                chat_id: [self._serialize_social_state(item) for item in items]
+                for chat_id, items in self._social_states.items()
+                if items
+            }
         for chat_id, thread in threads[: self.SNAPSHOT_MAX_CHATS]:
             async with thread.lock:
                 fresh = [
@@ -228,6 +419,7 @@ class GroupDialogueStore:
             "schema_version": self.SNAPSHOT_SCHEMA_VERSION,
             "saved_at": now,
             "chats": chats,
+            "social_states": social_states,
         }
 
     async def persist_snapshot(self) -> bool:
@@ -235,7 +427,7 @@ class GroupDialogueStore:
         if path is None:
             return False
         payload = await self.export_snapshot()
-        if not payload.get("chats"):
+        if not payload.get("chats") and not payload.get("social_states"):
             return False
 
         def _write() -> None:
@@ -246,7 +438,10 @@ class GroupDialogueStore:
 
         try:
             await asyncio.to_thread(_write)
-            logger.info(f"[DialogueStore] persisted context snapshot for {len(payload['chats'])} chats")
+            logger.info(
+                "[DialogueStore] persisted context snapshot for "
+                f"{len(payload['chats'])} chats and {len(payload.get('social_states', {}))} social scopes"
+            )
             return True
         except Exception as exc:
             logger.warning(f"[DialogueStore] failed to persist context snapshot: {exc}")
@@ -269,6 +464,7 @@ class GroupDialogueStore:
             return 0
         now = time.time()
         restored = 0
+        restored_chat_ids: set[str] = set()
         for chat_id, chat_payload in dict(payload.get("chats", {}) or {}).items():
             # 用 _resolve_chat_key 统一口径（R11 禁止 str(x or "") 式空串强制）
             try:
@@ -294,9 +490,33 @@ class GroupDialogueStore:
                 if cold_summary and not thread.cold_summary:
                     thread.cold_summary = cold_summary
             restored += 1
+            restored_chat_ids.add(key)
+        restored_social = 0
+        for chat_id, items_payload in dict(payload.get("social_states", {}) or {}).items():
+            try:
+                key = self._resolve_chat_key(chat_id)
+            except ValueError:
+                continue
+            items: list[GroupSocialStateItem] = []
+            for item_payload in list(items_payload or []):
+                item = self._deserialize_social_state(item_payload)
+                if item is None or item.status == "rejected":
+                    continue
+                items.append(item)
+            if not items:
+                continue
+            async with self._lock:
+                existing = {item.state_id: item for item in self._social_states.get(key, [])}
+                for item in items:
+                    existing.setdefault(item.state_id, item)
+                self._social_states[key] = list(existing.values())[-80:]
+            restored_social += 1
+            restored_chat_ids.add(key)
         if restored:
             logger.info(f"[DialogueStore] restored context snapshot for {restored} chats")
-        return restored
+        if restored_social:
+            logger.info(f"[DialogueStore] restored social state for {restored_social} chats")
+        return len(restored_chat_ids)
 
     async def set_cold_summary(self, chat_id: str, summary: str) -> None:
         async with self._lock:
@@ -362,8 +582,10 @@ class GroupDialogueStore:
                 thread.segments = thread.segments[-keep_recent_segments:]
                 return list(drained)
 
-    def _format_segment_line(self, segment: DialogueSegment) -> str:
+    def _format_segment_line(self, segment: DialogueSegment, *, include_identity: bool = False) -> str:
         speaker = segment.speaker_name or segment.speaker_id or ("Bot" if segment.is_bot else "User")
+        if include_identity and segment.speaker_id and not segment.is_bot:
+            speaker = f"{speaker}（QQ: {segment.speaker_id}）"
         prefix_bits: list[str] = []
         if segment.is_reply_to_bot:
             target = segment.reply_target_sender_name or segment.reply_target_sender_id or "Bot"
@@ -687,7 +909,13 @@ class GroupDialogueStore:
                 break
         return "\n".join(selected).strip()
 
-    def _build_warm_quotes(self, segments: list[DialogueSegment], *, max_tokens: int) -> tuple[str, list[str], bool]:
+    def _build_warm_quotes(
+        self,
+        segments: list[DialogueSegment],
+        *,
+        max_tokens: int,
+        include_identity: bool = False,
+    ) -> tuple[str, list[str], bool]:
         if not segments or max_tokens <= 0:
             return "", [], False
         candidate_pool = segments[-8:] if len(segments) > 8 else list(segments)
@@ -702,7 +930,7 @@ class GroupDialogueStore:
         selected: list[DialogueSegment] = []
         used = 0
         for segment in ordered:
-            line = self._format_segment_line(segment)
+            line = self._format_segment_line(segment, include_identity=include_identity)
             if not line:
                 continue
             estimate = max(1, self._estimate_tokens(line))
@@ -725,7 +953,7 @@ class GroupDialogueStore:
             None,
         )
         if latest_direct_user is not None and latest_direct_user not in selected:
-            line = self._format_segment_line(latest_direct_user)
+            line = self._format_segment_line(latest_direct_user, include_identity=include_identity)
             estimate = max(1, self._estimate_tokens(line))
             if used + estimate <= max_tokens or not selected:
                 selected.append(latest_direct_user)
@@ -735,7 +963,7 @@ class GroupDialogueStore:
         latest_assistant = next((segment for segment in reversed(_scan_window) if segment.role == "assistant" or segment.is_bot), None)
         has_latest_assistant = bool(latest_assistant and latest_assistant in selected)
         if latest_assistant is not None and not has_latest_assistant:
-            line = self._format_segment_line(latest_assistant)
+            line = self._format_segment_line(latest_assistant, include_identity=include_identity)
             estimate = max(1, self._estimate_tokens(line))
             if used + estimate <= max_tokens or not selected:
                 selected.append(latest_assistant)
@@ -748,7 +976,11 @@ class GroupDialogueStore:
                 continue
             seen_keys.add(key)
             deduped.append(segment)
-        lines = [self._format_segment_line(segment) for segment in deduped if self._format_segment_line(segment)]
+        lines = [
+            self._format_segment_line(segment, include_identity=include_identity)
+            for segment in deduped
+            if self._format_segment_line(segment, include_identity=include_identity)
+        ]
         quote_event_ids = [segment.event_id for segment in deduped if segment.event_id]
         return "\n".join(lines).strip(), quote_event_ids, has_latest_assistant
 
@@ -758,6 +990,7 @@ class GroupDialogueStore:
         *,
         max_age_seconds: float | None = None,
         max_tokens: int | None = None,
+        include_identity: bool = False,
     ) -> WarmContextBundle:
         chat_key = self._resolve_chat_key(chat_id)
         max_age_seconds = self.warm_zone_ttl_seconds if max_age_seconds is None else float(max_age_seconds)
@@ -785,6 +1018,7 @@ class GroupDialogueStore:
                 quote_text, quote_event_ids, has_latest_assistant = self._build_warm_quotes(
                     candidates,
                     max_tokens=quote_budget if quote_budget > 0 else max_tokens,
+                    include_identity=include_identity,
                 )
                 return WarmContextBundle(
                     summary_text=summary_text,

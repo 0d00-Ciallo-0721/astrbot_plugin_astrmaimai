@@ -36,6 +36,7 @@ from ...multimodal.vision_prompt import (
     normalize_vision_result,
     render_vision_record,
 )
+from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
@@ -220,6 +221,8 @@ class ConcurrentExecutor:
                     status="missing",
                     reason="model_did_not_call_required_tool",
                 )
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_required_tool_missing", list(missing))
         return missing
 
     @staticmethod
@@ -546,24 +549,10 @@ class ConcurrentExecutor:
         if not self._is_group_chat_event(event, chat_id):
             return LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id), chat_id
 
-        thread_id = str(event.get_extra("astrmai_turn_thread_id", "") or "").strip()
-        if not thread_id:
-            focus_context = event.get_extra("astrmai_focus_thread_context", None)
-            if isinstance(focus_context, FocusThreadContext):
-                thread_id = str(focus_context.thread_signature or "").strip()
-        if not thread_id:
-            try:
-                sender_id = str(event.get_sender_id() or "").strip()
-            except Exception:
-                sender_id = ""
-            if sender_id:
-                thread_id = f"sender:{sender_id}"
-
-        scope_suffix = self._sanitize_lane_scope(thread_id)
-        if not scope_suffix:
-            return LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id), chat_id
-        scoped_origin = f"{chat_id}@@thread:{scope_suffix}"
-        scoped_id = f"{chat_id}#{scope_suffix}"
+        history_policy = DialogHistoryPolicy.from_event(event)
+        topic_epoch = max(1, int(history_policy.topic_epoch or 1))
+        scoped_origin = f"{chat_id}@@topic:{topic_epoch}"
+        scoped_id = f"{chat_id}#topic:{topic_epoch}"
         return LaneKey(subsystem="sys2", task_family="dialog", scope_id=scoped_id), scoped_origin
 
     def _execution_runtime_values(self, event: AstrMessageEvent, chat_id: str) -> dict[str, Any]:

@@ -3,6 +3,7 @@ import base64
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -69,6 +70,34 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
             {},
             {},
         ])
+
+    def test_vector_store_timeout_returns_lexical_fallback_and_opens_circuit(self):
+        from astrmai.memory.retrieval import vector_store
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            async def retrieve(self, **kwargs):
+                return []
+
+        config = SimpleNamespace(
+            timing=SimpleNamespace(
+                faiss_timeout_sec=4.0,
+                faiss_failure_threshold=1,
+                faiss_circuit_breaker_cooldown_sec=30.0,
+            )
+        )
+        retriever = VectorRetriever(_Faiss(), config=config)
+
+        async def _timeout(awaitable, *args, **kwargs):
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with patch.object(vector_store.asyncio, "wait_for", new=_timeout):
+            results = asyncio.run(retriever.search("hello"))
+
+        self.assertEqual(results, [])
+        self.assertEqual(retriever._failure_count, 1)
+        self.assertTrue(retriever._circuit_open())
 
     def test_dream_update_resolves_legacy_id_to_canonical_memory(self):
         from astrmai.memory.dream.dream_agent import DreamAgent

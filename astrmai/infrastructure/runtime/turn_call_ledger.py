@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import time
@@ -14,6 +15,8 @@ CALL_LEDGER_KEY = "astrmai_llm_call_ledger"
 CONTEXT_BLOCK_STATS_KEY = "astrmai_context_block_stats"
 REPLY_STATS_KEY = "astrmai_reply_stats"
 STAGE_LEDGER_KEY = "astrmai_stage_ledger"
+BACKGROUND_TASK_LEDGER_KEY = "astrmai_background_task_ledger"
+VISION_OBSERVATION_KEY = "astrmai_vision_observation"
 TELEMETRY_CONTEXT_KEY = "astrmai_turn_telemetry"
 TRACE_SCHEMA_VERSION = 2
 INSTRUMENTATION_VERSION = "2026.07.25-v2"
@@ -40,10 +43,14 @@ class TurnTelemetryContext:
     total_budget_sec: float = 0.0
     main_reply_reserve_sec: float = 0.0
     finalized_at: float = 0.0
+    reply_completed_at: float = 0.0
+    trace_finalized_at: float = 0.0
     sequence: int = 0
     calls: list[dict[str, Any]] = field(default_factory=list)
     context_blocks: list[dict[str, Any]] = field(default_factory=list)
     stages: list[dict[str, Any]] = field(default_factory=list)
+    background_tasks: list[dict[str, Any]] = field(default_factory=list)
+    vision_observation: dict[str, Any] = field(default_factory=dict)
     reply_stats: dict[str, Any] = field(default_factory=dict)
 
     def next_sequence(self) -> int:
@@ -122,6 +129,8 @@ def ensure_turn_telemetry(event: Any) -> TurnTelemetryContext:
         event.set_extra(CALL_LEDGER_KEY, context.calls)
         event.set_extra(CONTEXT_BLOCK_STATS_KEY, context.context_blocks)
         event.set_extra(STAGE_LEDGER_KEY, context.stages)
+        event.set_extra(BACKGROUND_TASK_LEDGER_KEY, context.background_tasks)
+        event.set_extra(VISION_OBSERVATION_KEY, context.vision_observation)
         event.set_extra(REPLY_STATS_KEY, context.reply_stats)
     return context
 
@@ -209,6 +218,7 @@ def finalize_turn_telemetry(event: Any = None, *, outcome: str = "") -> dict[str
         )
         finalized_stages += 1
     context.finalized_at = now
+    context.trace_finalized_at = now
     return {"calls": finalized_calls, "stages": finalized_stages}
 
 
@@ -260,6 +270,57 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         return {}
     captured_at = time.time()
     remaining = remaining_turn_budget(event)
+    reply_completed_elapsed_ms = (
+        round(max(0.0, context.reply_completed_at - context.started_at) * 1000, 1)
+        if context.reply_completed_at
+        else None
+    )
+    trace_finalized_at = context.trace_finalized_at or context.finalized_at
+    trace_finalized_elapsed_ms = (
+        round(max(0.0, trace_finalized_at - context.started_at) * 1000, 1)
+        if trace_finalized_at
+        else None
+    )
+    trace_finalize_lag_ms = (
+        round(max(0.0, trace_finalized_at - context.reply_completed_at) * 1000, 1)
+        if trace_finalized_at and context.reply_completed_at
+        else None
+    )
+    history_policy = _event_extra(event, "astrmai_dialog_history_policy", {})
+    if not isinstance(history_policy, Mapping):
+        history_policy = {}
+    history_debug_enabled = bool(
+        _event_extra(event, "astrmai_group_history_debug_trace_enabled", False)
+    )
+    history_policy_summary = {
+        "history_mode": str(history_policy.get("history_mode", "") or ""),
+        "group_id": str(history_policy.get("group_id", "") or ""),
+        "topic_epoch": int(history_policy.get("topic_epoch", 0) or 0),
+        "current_sender_id": str(history_policy.get("current_sender_id", "") or ""),
+        "approved_event_ids": [
+            str(item)
+            for item in list(history_policy.get("approved_event_ids", []) or [])
+            if str(item)
+        ][:16],
+        "provider_session_allowed": bool(history_policy.get("allow_provider_session", False)),
+        "rotation_reason": str(history_policy.get("rotation_reason", "") or ""),
+        "debug_enabled": history_debug_enabled,
+    }
+    if history_debug_enabled:
+        history_policy_summary.update(
+            {
+                "thread_key": str(history_policy.get("thread_key", "") or ""),
+                "topic_age_seconds": round(
+                    max(0.0, float(history_policy.get("topic_age_seconds", 0.0) or 0.0)),
+                    3,
+                ),
+                "continuity_evidence": [
+                    str(item)
+                    for item in list(history_policy.get("continuity_evidence", []) or [])
+                    if str(item)
+                ][:12],
+            }
+        )
     return {
         "trace_schema_version": TRACE_SCHEMA_VERSION,
         "instrumentation_version": INSTRUMENTATION_VERSION,
@@ -273,6 +334,11 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         "started_at": context.started_at,
         "captured_at": captured_at,
         "total_elapsed_ms": round(max(0.0, captured_at - context.started_at) * 1000, 1),
+        "reply_completed_at": context.reply_completed_at or None,
+        "trace_finalized_at": trace_finalized_at or None,
+        "reply_completed_elapsed_ms": reply_completed_elapsed_ms,
+        "trace_finalized_elapsed_ms": trace_finalized_elapsed_ms,
+        "trace_finalize_lag_ms": trace_finalize_lag_ms,
         "budget": {
             "total_budget_sec": context.total_budget_sec,
             "main_reply_reserve_sec": context.main_reply_reserve_sec,
@@ -282,7 +348,11 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         "llm_call_ledger": copy.deepcopy(context.calls[-_MAX_ENTRIES:]),
         "context_block_stats": copy.deepcopy(context.context_blocks[-16:]),
         "stage_ledger": copy.deepcopy(context.stages[-_MAX_ENTRIES:]),
+        "background_task_ledger": copy.deepcopy(context.background_tasks[-_MAX_ENTRIES:]),
+        "vision_observation": copy.deepcopy(context.vision_observation),
+        "tool_ledger_summary": _tool_ledger_summary(event, context.calls),
         "reply_stats": copy.deepcopy(context.reply_stats),
+        "dialog_history_policy": history_policy_summary,
     }
 
 
@@ -341,6 +411,80 @@ def _count_tools(tools: Any) -> int:
         return len(tools)
     except Exception:
         return 0
+
+
+def _tool_ledger_summary(event: Any, calls: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Build a compact, content-free summary of tool disclosure and execution."""
+    execution_trace = _event_extra(event, "astrmai_tool_execution_trace", [])
+    execution_trace = (
+        [item for item in execution_trace if isinstance(item, Mapping)]
+        if isinstance(execution_trace, list)
+        else []
+    )
+    lifecycle_trace = _event_extra(event, "astrmai_tool_lifecycle_trace", [])
+    lifecycle_trace = (
+        [item for item in lifecycle_trace if isinstance(item, Mapping)]
+        if isinstance(lifecycle_trace, list)
+        else []
+    )
+    turn_context = _event_extra(event, TELEMETRY_CONTEXT_KEY)
+    tools_state = getattr(turn_context, "tools", None)
+    if tools_state is None:
+        tools_state = getattr(_event_extra(event, "astrmai_turn_context"), "tools", None)
+
+    def _names(value: Any, limit: int = 32) -> list[str]:
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        result: list[str] = []
+        for item in value:
+            name = str(item or "").strip()
+            if name and name not in result:
+                result.append(name[:120])
+            if len(result) >= limit:
+                break
+        return result
+
+    candidates = _names(
+        getattr(tools_state, "available_tools", None)
+        or getattr(tools_state, "initial_tools", None)
+        or _event_extra(event, "astrmai_available_tools", [])
+    )
+    selected = _names(
+        [
+            item.get("tool_name") or item.get("tool")
+            for item in execution_trace
+            if str(item.get("status", "success") or "success") == "success"
+        ]
+    )
+    missing = _names(
+        _event_extra(event, "astrmai_required_tool_missing", [])
+        or _event_extra(event, "astrmai_missing_required_tools", [])
+    )
+    failures = [
+        str(item.get("reason") or item.get("error_kind") or item.get("status") or "").strip()
+        for item in [*execution_trace, *lifecycle_trace]
+        if str(item.get("status", "") or "").lower() in {"failed", "failure", "error", "missing"}
+    ]
+    tool_calls = list(calls)
+    tool_loop_steps = sum(
+        1
+        for item in tool_calls
+        if str(item.get("stage", "") or "").startswith("gateway.tool")
+    )
+    return {
+        "tool_disclosure_tier": str(
+            getattr(tools_state, "disclosure_tier", "")
+            or _event_extra(event, "astrmai_tool_tier", "")
+            or ""
+        ).strip(),
+        "tool_candidates": candidates,
+        "selected_tool": selected,
+        "tool_call_count": len(execution_trace),
+        "tool_loop_steps": tool_loop_steps,
+        "tool_failure_reason": next((item[:120] for item in failures if item), ""),
+        "required_tool_missing": missing,
+        "final_reply_after_tool": bool(selected and getattr(turn_context, "reply_completed_at", 0.0)),
+    }
 
 
 def begin_llm_call(
@@ -644,6 +788,7 @@ def record_reply_stats(
     strategy: str = "",
     send_status: str = "",
     sent_segment_count: int = 0,
+    reply_completed: bool = False,
     metadata: Mapping[str, Any] | None = None,
 ) -> None:
     context = current_turn_telemetry(event)
@@ -686,13 +831,171 @@ def record_reply_stats(
                 payload[key.removeprefix("astrmai_")] = round(max(0.0, float(value)), 1)
     context.reply_stats.clear()
     context.reply_stats.update(payload)
+    if reply_completed:
+        context.reply_completed_at = time.time()
+        context.reply_stats["reply_completed_at"] = context.reply_completed_at
     if event is not None and hasattr(event, "set_extra"):
         event.set_extra(REPLY_STATS_KEY, context.reply_stats)
+
+
+def record_vision_observation(
+    event: Any,
+    payload: Mapping[str, Any],
+) -> None:
+    """Store privacy-safe image/vision barrier facts for the current turn.
+
+    The payload intentionally accepts only counts, statuses, source categories and
+    opaque IDs. It must never receive image paths, URLs, descriptions or message
+    text.
+    """
+    context = current_turn_telemetry(event)
+    if context is None:
+        return
+    allowed = {
+        "policy",
+        "outcome",
+        "image_count",
+        "resolved_count",
+        "analyzed_count",
+        "failed_count",
+        "timeout_count",
+        "attempt_count",
+        "image_source",
+        "image_resolve_status",
+        "vision_barrier_status",
+        "vision_wait_ms",
+        "vision_timeout_ms",
+        "vision_fallback",
+        "visual_memory_id",
+        "visual_memory_ids",
+        "scope",
+    }
+    normalized: dict[str, Any] = {}
+    for key in allowed:
+        value = payload.get(key)
+        if key in {"image_source", "visual_memory_ids"}:
+            if isinstance(value, (list, tuple, set)):
+                normalized[key] = [str(item)[:80] for item in value if str(item).strip()][:16]
+            elif value is not None and str(value).strip():
+                normalized[key] = [str(value)[:80]]
+            else:
+                normalized[key] = []
+        elif isinstance(value, bool):
+            normalized[key] = value
+        elif isinstance(value, (int, float)):
+            normalized[key] = max(0, round(float(value), 1))
+        elif value is not None:
+            normalized[key] = str(value)[:120]
+    context.vision_observation.clear()
+    context.vision_observation.update(normalized)
+    if event is not None and hasattr(event, "set_extra"):
+        event.set_extra(VISION_OBSERVATION_KEY, context.vision_observation)
+
+
+def record_background_task(
+    event: Any,
+    task_name: str,
+    *,
+    status: str,
+    started_at: float | None = None,
+    error_kind: str = "",
+    error: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Record a privacy-safe result for a fire-and-forget task bound to a turn."""
+    context = current_turn_telemetry(event)
+    if context is None:
+        return
+    finished_at = time.time()
+    started = float(started_at or finished_at)
+    item: dict[str, Any] = {
+        "task_name": str(task_name or ""),
+        "status": str(status or ""),
+        "started_at": started,
+        "finished_at": finished_at,
+        "elapsed_ms": round(max(0.0, finished_at - started) * 1000, 1),
+        "error_kind": str(error_kind or ""),
+        "error_hash": _text_hash(error),
+    }
+    if metadata:
+        item["metadata"] = {
+            str(key): value
+            for key, value in metadata.items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+    context.background_tasks.append(item)
+    del context.background_tasks[:-_MAX_ENTRIES]
+    if event is not None and hasattr(event, "set_extra"):
+        event.set_extra(BACKGROUND_TASK_LEDGER_KEY, context.background_tasks)
+
+
+def attach_background_task_trace(
+    task: asyncio.Task,
+    event: Any,
+    task_name: str,
+    *,
+    started_at: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> asyncio.Task:
+    """Consume a task result and write a structured completion record.
+
+    This callback deliberately never re-raises. It is safe for fire-and-forget
+    tasks and prevents ``Task exception was never retrieved`` from hiding the
+    owning turn's failure reason.
+    """
+    started = float(started_at or time.time())
+
+    def _done(done_task: asyncio.Task) -> None:
+        if done_task.cancelled():
+            record_background_task(
+                event,
+                task_name,
+                status="cancelled",
+                started_at=started,
+                error_kind="cancelled",
+                metadata=metadata,
+            )
+            return
+        try:
+            error = done_task.exception()
+        except asyncio.CancelledError:
+            record_background_task(
+                event,
+                task_name,
+                status="cancelled",
+                started_at=started,
+                error_kind="cancelled",
+                metadata=metadata,
+            )
+            return
+        if error is None:
+            record_background_task(
+                event,
+                task_name,
+                status="completed",
+                started_at=started,
+                metadata=metadata,
+            )
+            return
+        record_background_task(
+            event,
+            task_name,
+            status="failed",
+            started_at=started,
+            error_kind=type(error).__name__,
+            error=str(error),
+            metadata=metadata,
+        )
+
+    task.add_done_callback(_done)
+    return task
 
 
 __all__ = [
     "CALL_LEDGER_KEY",
     "CONTEXT_BLOCK_STATS_KEY",
+    "BACKGROUND_TASK_LEDGER_KEY",
+    "VISION_OBSERVATION_KEY",
     "INSTRUMENTATION_VERSION",
     "REPLY_STATS_KEY",
     "STAGE_LEDGER_KEY",
@@ -714,7 +1017,10 @@ __all__ = [
     "rebind_turn_telemetry",
     "record_llm_attempt",
     "record_context_block_stats",
+    "record_background_task",
+    "record_vision_observation",
     "record_reply_stats",
+    "attach_background_task_trace",
     "remaining_turn_budget",
     "turn_telemetry_scope",
     "turn_telemetry_snapshot",

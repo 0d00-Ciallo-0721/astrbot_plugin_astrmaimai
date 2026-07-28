@@ -272,6 +272,34 @@ class ConversationConfig(BaseModel):
     conversation_generation_enabled: bool = Field(default=True, repr=False)
     reply_send_claim_enabled: bool = Field(default=True, repr=False)
     group_thread_wait_enabled: bool = Field(default=True, repr=False)
+    group_shared_history_enabled: bool = Field(
+        default=True,
+        description="启用群聊共享话题历史；参与者事实仍按 QQ 号隔离",
+    )
+    group_topic_active_ttl_sec: int = Field(
+        default=1200,
+        description="群聊当前话题自动承接时长（秒）",
+    )
+    group_topic_confirm_after_sec: int = Field(
+        default=1800,
+        description="群聊旧话题需要明确证据后才能承接的时间边界（秒）",
+    )
+    group_social_state_ttl_sec: int = Field(
+        default=86400,
+        description="群聊称号、昵称和游戏规则等临时社交状态的默认有效期（秒）",
+    )
+    group_social_ownership_check_enabled: bool = Field(
+        default=True,
+        description="启用群聊称号、昵称、关系和承诺的 QQ 归属校验",
+    )
+    group_provider_topic_session_enabled: bool = Field(
+        default=True,
+        description="按群聊话题 epoch 隔离模型远端会话",
+    )
+    group_history_debug_trace_enabled: bool = Field(
+        default=False,
+        description="记录群聊历史策略的详细调试轨迹；日常使用建议关闭",
+    )
     non_conversational_guard_enabled: bool = Field(default=True, repr=False)
     conversation_concurrency_debug_trace_enabled: bool = Field(default=False, repr=False)
     qq_native_tools_enabled: bool = Field(default=True, repr=False)
@@ -408,9 +436,12 @@ class TimingConfig(BaseModel):
     cognitive_loop_timeout_sec: float = Field(default=2.5, ge=0.1, le=600.0)
     mood_analysis_timeout_sec: float = Field(default=30.0, ge=1.0, le=600.0)
     memory_react_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
-    query_rewrite_timeout_sec: float = Field(default=8.0, ge=0.5, le=60.0)
+    query_rewrite_timeout_sec: float = Field(default=3.0, ge=0.5, le=60.0)
     compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
     embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
+    faiss_timeout_sec: float = Field(default=4.0, ge=0.5, le=60.0)
+    faiss_failure_threshold: int = Field(default=3, ge=1, le=10)
+    faiss_circuit_breaker_cooldown_sec: float = Field(default=30.0, ge=5.0, le=600.0)
     private_wait_timeout_sec: int = Field(default=300, ge=1, le=7200)
     private_input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0)
     image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)

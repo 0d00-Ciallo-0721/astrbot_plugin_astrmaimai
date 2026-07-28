@@ -558,6 +558,82 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(focus.get_extra("astrmai_judge_outcome"), "timeout")
         self.assertTrue(focus.get_extra("astrmai_judge_timeout"))
 
+    def test_router_keeps_private_chat_responsive_when_judge_times_out(self):
+        async def _slow_evaluate(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(action="PASS")
+
+        self.gate.config.attention.judge_timeout = 0.001
+        self.gate.judge = SimpleNamespace(evaluate=_slow_evaluate)
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakePrivateEvent("user-1", "Alice", "继续刚才的话题")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:FriendMessage:user-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "PASS")
+        self.assertEqual(focus.get_extra("astrmai_judge_fallback_action"), "pass")
+        self.assertEqual(focus.get_extra("astrmai_judge_failure_type"), "timeout")
+
+    def test_router_does_not_promote_unmentioned_group_timeout_to_reply(self):
+        async def _slow_evaluate(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(action="PASS")
+
+        self.gate.config.attention.judge_timeout = 0.001
+        self.gate.judge = SimpleNamespace(evaluate=_slow_evaluate)
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent("user-1", "Alice", "群友之间的普通闲聊")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "WAIT")
+        self.assertEqual(focus.get_extra("astrmai_judge_fallback_action"), "wait")
+        self.assertEqual(focus.get_extra("astrmai_judge_fallback_reason"), "group_unmentioned")
+
+    def test_router_treats_empty_judge_result_like_a_failure(self):
+        async def _empty_evaluate(*args, **kwargs):
+            return SimpleNamespace(action="")
+
+        self.gate.judge = SimpleNamespace(evaluate=_empty_evaluate)
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakePrivateEvent("user-1", "Alice", "你还记得吗")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:FriendMessage:user-1",
+                focus,
+                {"core_events": [focus]},
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "PASS")
+        self.assertEqual(focus.get_extra("astrmai_judge_outcome"), "empty_response")
+        self.assertEqual(focus.get_extra("astrmai_judge_failure_type"), "empty_response")
+
     def test_process_event_resumes_private_wait_without_consuming_message(self):
         calls = []
 

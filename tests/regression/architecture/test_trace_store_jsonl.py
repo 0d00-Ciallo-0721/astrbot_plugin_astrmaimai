@@ -146,6 +146,22 @@ class JsonlAppendTests(unittest.TestCase):
 
         self.assertEqual([item["turn_id"] for item in items], ["t9", "t8", "t7"])
 
+    def test_reset_replaces_json_and_jsonl_with_valid_empty_capture(self):
+        store = self._store()
+
+        async def _run():
+            await store.append(_sample("old", created_at=1.0))
+            await store.reset(capture_started_at=123.0)
+            return await store.recent(limit=10)
+
+        self.assertEqual(asyncio.run(_run()), [])
+        payload = json.loads(store.path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["capture_started_at"], 123.0)
+        self.assertEqual(payload["by_chat"], {})
+        self.assertEqual(payload["recent"], [])
+        self.assertEqual(store.jsonl_path.read_text(encoding="utf-8"), "")
+
     def test_truncated_line_is_skipped_not_fatal(self):
         store = self._store()
 

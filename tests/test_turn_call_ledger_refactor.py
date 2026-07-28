@@ -1,8 +1,10 @@
 import asyncio
+from types import SimpleNamespace
 
 from astrmai.infrastructure.runtime.turn_call_ledger import (
     CALL_LEDGER_KEY,
     CONTEXT_BLOCK_STATS_KEY,
+    BACKGROUND_TASK_LEDGER_KEY,
     REPLY_STATS_KEY,
     STAGE_LEDGER_KEY,
     begin_stage,
@@ -12,6 +14,7 @@ from astrmai.infrastructure.runtime.turn_call_ledger import (
     begin_llm_call,
     finish_llm_call,
     observe_stage,
+    attach_background_task_trace,
     record_context_block_stats,
     record_reply_stats,
     turn_telemetry_scope,
@@ -97,6 +100,55 @@ def test_context_block_stats_identify_exact_duplicate_blocks():
     assert payload["duplicate_block_count"] == 1
     assert payload["blocks"]["recent"]["duplicate_of"] == "focus"
     assert payload["duplicate_pairs"] == [{"block": "recent", "duplicate_of": "focus"}]
+
+
+def test_tool_ledger_summary_exposes_execution_without_prompt_content():
+    event = _Event()
+    event.set_extra(
+        "astrmai_tool_execution_trace",
+        [
+            {"tool_name": "qq_friend_lookup", "status": "success"},
+            {"tool_name": "send_message", "status": "error", "reason": "target_not_found"},
+        ],
+    )
+    event.set_extra(
+        "astrmai_tool_lifecycle_trace",
+        [{"tool": "send_message", "phase": "tool_completed", "status": "failed", "reason": "target_not_found"}],
+    )
+    event.set_extra("astrmai_tool_tier", "chat")
+    event.set_extra("astrmai_required_tool_missing", ["send_message"])
+    event.set_extra(
+        "astrmai_turn_context",
+        SimpleNamespace(
+            tools=SimpleNamespace(
+                available_tools=["qq_friend_lookup", "send_message"],
+                disclosure_tier="chat",
+            )
+        ),
+    )
+    with turn_telemetry_scope(event) as telemetry:
+        first = begin_llm_call(event, stage="gateway.tool", tools=["qq_friend_lookup"], max_steps=4)
+        finish_llm_call(event, first, model="model-a")
+        second = begin_llm_call(event, stage="gateway.tool", tools=["send_message"], max_steps=4)
+        finish_llm_call(event, second, model="model-a", status="error", error_kind="target_not_found")
+        record_reply_stats(
+            event,
+            segment_count=1,
+            segment_lengths=[2],
+            total_chars=2,
+            reply_completed=True,
+        )
+
+    summary = turn_telemetry_snapshot(event)["tool_ledger_summary"]
+    assert summary["tool_disclosure_tier"] == "chat"
+    assert summary["tool_candidates"] == ["qq_friend_lookup", "send_message"]
+    assert summary["selected_tool"] == ["qq_friend_lookup"]
+    assert summary["tool_call_count"] == 2
+    assert summary["tool_loop_steps"] == 2
+    assert summary["tool_failure_reason"] == "target_not_found"
+    assert summary["required_tool_missing"] == ["send_message"]
+    assert summary["final_reply_after_tool"] is True
+    assert "target_not_found" not in str(summary["tool_candidates"])
 
 
 def test_reply_stats_support_multiple_segments_and_sent_count():
@@ -195,6 +247,70 @@ def test_snapshot_is_versioned_and_contains_no_prompt_text():
     assert "隐私回答" not in str(snapshot)
 
 
+def test_dialog_history_policy_summary_contains_ids_but_not_conversation_text():
+    event = _Event()
+    event.set_extra(
+        "astrmai_dialog_history_policy",
+        {
+            "history_mode": "current_topic",
+            "group_id": "552752264",
+            "topic_epoch": 7,
+            "current_sender_id": "10002",
+            "approved_event_ids": ["event-a", "event-b"],
+            "allow_provider_session": True,
+            "rotation_reason": "weak_window_evidence",
+            "continuity_evidence": ["reply_reference"],
+            "raw_query": "用户群聊正文不应写入摘要轨迹",
+            "topic_text": "焦糖布丁称号",
+        },
+    )
+
+    with turn_telemetry_scope(event):
+        snapshot = turn_telemetry_snapshot(event)
+
+    policy = snapshot["dialog_history_policy"]
+    assert policy["history_mode"] == "current_topic"
+    assert policy["group_id"] == "552752264"
+    assert policy["topic_epoch"] == 7
+    assert policy["current_sender_id"] == "10002"
+    assert policy["approved_event_ids"] == ["event-a", "event-b"]
+    assert policy["provider_session_allowed"] is True
+    assert "用户群聊正文" not in str(policy)
+    assert "焦糖布丁称号" not in str(policy)
+
+
+def test_dialog_history_policy_debug_fields_require_explicit_flag():
+    event = _Event()
+    event.set_extra(
+        "astrmai_dialog_history_policy",
+        {
+            "history_mode": "current_topic",
+            "group_id": "552752264",
+            "thread_key": "group:552752264",
+            "topic_epoch": 7,
+            "topic_age_seconds": 12.3456,
+            "continuity_evidence": ["reply_reference"],
+        },
+    )
+
+    with turn_telemetry_scope(event):
+        default_snapshot = turn_telemetry_snapshot(event)
+    default_policy = default_snapshot["dialog_history_policy"]
+    assert default_policy["debug_enabled"] is False
+    assert "thread_key" not in default_policy
+    assert "topic_age_seconds" not in default_policy
+    assert "continuity_evidence" not in default_policy
+
+    event.set_extra("astrmai_group_history_debug_trace_enabled", True)
+    with turn_telemetry_scope(event):
+        debug_snapshot = turn_telemetry_snapshot(event)
+    policy = debug_snapshot["dialog_history_policy"]
+    assert policy["debug_enabled"] is True
+    assert policy["thread_key"] == "group:552752264"
+    assert policy["topic_age_seconds"] == 12.346
+    assert policy["continuity_evidence"] == ["reply_reference"]
+
+
 def test_snapshot_is_detached_from_later_ledger_mutation():
     event = _Event()
 
@@ -236,6 +352,50 @@ def test_finalize_turn_telemetry_closes_pending_calls_and_stages():
     assert snapshot["llm_call_ledger"][0]["status"] == "abandoned"
     assert snapshot["llm_call_ledger"][0]["error_kind"] == "turn_finalized"
     assert snapshot["stage_ledger"][0]["status"] == "abandoned"
+
+
+def test_reply_completion_and_trace_finalization_have_separate_timings():
+    event = _Event()
+
+    record_reply_stats(
+        event,
+        segment_count=1,
+        segment_lengths=[4],
+        total_chars=4,
+        send_status="sent",
+        reply_completed=True,
+    )
+    finalize_turn_telemetry(event, outcome="completed")
+    snapshot = turn_telemetry_snapshot(event)
+
+    assert snapshot["reply_completed_at"] is not None
+    assert snapshot["trace_finalized_at"] is not None
+    assert snapshot["reply_completed_elapsed_ms"] >= 0
+    assert snapshot["trace_finalized_elapsed_ms"] >= snapshot["reply_completed_elapsed_ms"]
+    assert snapshot["trace_finalize_lag_ms"] >= 0
+
+
+def test_background_task_trace_consumes_failures_without_raw_error_text():
+    event = _Event()
+
+    async def fail():
+        raise RuntimeError("用户私密正文不应进入账本")
+
+    async def run():
+        task = asyncio.create_task(fail())
+        attach_background_task_trace(task, event, "memory.background")
+        await task
+
+    try:
+        asyncio.run(run())
+    except RuntimeError:
+        pass
+
+    entry = event.get_extra(BACKGROUND_TASK_LEDGER_KEY)[0]
+    assert entry["status"] == "failed"
+    assert entry["error_kind"] == "RuntimeError"
+    assert entry["error_hash"]
+    assert "用户私密正文" not in str(entry)
 
 
 def test_reply_stats_include_privacy_safe_freshness_metrics():

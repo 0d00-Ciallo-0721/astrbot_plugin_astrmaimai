@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from astrbot.api import logger
 
+from ...conversation.contracts.dialog_history_policy import DialogHistoryPolicy
 from ..context_economy import PromptEnvelope, WorkloadFamily, WorkloadPolicy
 from ..runtime.lane_manager import LaneKey
 from ..runtime.runtime_contracts import LLMCallResult
@@ -125,7 +126,13 @@ class GatewayLaneMixin:
             )
         except Exception as exc:
             logger.warning(f"[Gateway] lane request trace degraded after successful call: {exc}")
-        if artifact_text:
+        history_policy = DialogHistoryPolicy.from_event(event)
+        skip_history_persist = bool(
+            history_policy.group_id
+            and history_policy.history_mode == "none"
+            and history_policy.rotation_reason == "lightweight_event"
+        )
+        if artifact_text and not skip_history_persist:
             try:
                 artifact = self._build_lane_artifact(result, artifact_text)
                 await self.lane_manager.append_visible_reply_artifact(
@@ -153,6 +160,15 @@ class GatewayLaneMixin:
             "skipped_cooldown_models": list(skipped_cooldown_models),
             "cooldown_overridden": bool(cooldown_overridden),
         }
+        if history_policy.group_id:
+            trace_kwargs.update(
+                history_mode=history_policy.history_mode,
+                topic_epoch=history_policy.topic_epoch,
+                current_sender_id=history_policy.current_sender_id,
+                approved_event_ids=list(history_policy.approved_event_ids),
+                provider_session_allowed=history_policy.allow_provider_session,
+                history_persist_skipped=skip_history_persist,
+            )
         if protocol_passthrough is not None:
             trace_kwargs["protocol_passthrough"] = protocol_passthrough
         if protocol_type is not None:
@@ -227,11 +243,22 @@ class GatewayLaneMixin:
             meta["lane_rotate_reason"] = workload_trace.get("lane_rotate_reason", "")
         return meta
 
-    def _lane_request_kwargs(self, lane_umo: str, workload_policy: WorkloadPolicy) -> Callable[[str], Dict[str, Any]]:
+    def _lane_request_kwargs(
+        self,
+        lane_umo: str,
+        workload_policy: WorkloadPolicy,
+        *,
+        allow_provider_session: bool = True,
+    ) -> Callable[[str], Dict[str, Any]]:
         def _factory(actual_model: str) -> Dict[str, Any]:
             capabilities = self._provider_capabilities(actual_model)
             kwargs: Dict[str, Any] = {}
-            if self.lane_manager and workload_policy.use_provider_session and capabilities.supports_remote_session:
+            if (
+                allow_provider_session
+                and self.lane_manager
+                and workload_policy.use_provider_session
+                and capabilities.supports_remote_session
+            ):
                 kwargs["session_id"] = self.context_economy.build_provider_session_id(
                     lane_manager=self.lane_manager,
                     lane_umo=lane_umo,
@@ -402,6 +429,13 @@ class GatewayLaneMixin:
             schema_id=workload_policy.schema_id,
             persona_core_version=workload_policy.persona_core_version,
         )
+        history_policy = DialogHistoryPolicy.from_event(event)
+        group_policy_active = bool(history_policy.group_id)
+        if group_policy_active and not history_policy.uses_lane_history:
+            history = []
+        allow_provider_session = bool(
+            not group_policy_active or history_policy.allow_provider_session
+        )
         lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
         seed_trace = self.context_economy.build_trace(
             policy=workload_policy,
@@ -442,7 +476,11 @@ class GatewayLaneMixin:
                     workload_policy.effective_prefix_hash,
                     seed_trace.as_dict(),
                 ),
-                request_kwargs_factory=self._lane_request_kwargs(lane_umo, workload_policy),
+                request_kwargs_factory=self._lane_request_kwargs(
+                    lane_umo,
+                    workload_policy,
+                    allow_provider_session=allow_provider_session,
+                ),
                 workload_policy=workload_policy,
                 record_economy=False,
                 result_validator=result_validator,
@@ -494,7 +532,11 @@ class GatewayLaneMixin:
             )
         provider_caps = self._provider_capabilities(result.model_id)
         provider_session_id = ""
-        if workload_policy.use_provider_session and provider_caps.supports_remote_session:
+        if (
+            allow_provider_session
+            and workload_policy.use_provider_session
+            and provider_caps.supports_remote_session
+        ):
             provider_session_id = self.context_economy.build_provider_session_id(
                 lane_manager=self.lane_manager,
                 lane_umo=lane_umo,
@@ -716,6 +758,13 @@ class GatewayLaneMixin:
             schema_id=workload_policy.schema_id,
             persona_core_version=workload_policy.persona_core_version,
         )
+        history_policy = DialogHistoryPolicy.from_event(event)
+        group_policy_active = bool(history_policy.group_id)
+        if group_policy_active and not history_policy.uses_lane_history:
+            history = []
+        allow_provider_session = bool(
+            not group_policy_active or history_policy.allow_provider_session
+        )
         lane_runtime_meta = await self.lane_manager.get_runtime_meta(lane_umo)
         last_error = ""
         last_raw_completion = ""
@@ -737,7 +786,11 @@ class GatewayLaneMixin:
                 attempted_models.append(model_id)
             report_pool = lane_key.task_family if model_id in primary_models else "fallback"
             capabilities = self._provider_capabilities(model_id)
-            tool_kwargs = self._lane_request_kwargs(lane_umo, workload_policy)(model_id)
+            tool_kwargs = self._lane_request_kwargs(
+                lane_umo,
+                workload_policy,
+                allow_provider_session=allow_provider_session,
+            )(model_id)
             side_effect_count_before = self._tool_side_effect_count(event)
             last_raw_completion = ""
             attempt_started = asyncio.get_running_loop().time()

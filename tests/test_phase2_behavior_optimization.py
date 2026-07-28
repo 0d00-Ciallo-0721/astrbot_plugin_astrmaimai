@@ -91,6 +91,35 @@ class QueryRewriteFastFallbackTests(unittest.TestCase):
         self.assertEqual(query.metadata["query_rewrite_trace"]["status"], "timeout")
         self.assertTrue(query.metadata["query_rewrite_trace"]["cancellation_requested"])
 
+    def test_ineligible_deep_query_skips_rewrite_without_calling_gateway(self):
+        from astrmai.memory.contracts.memory_query import MemoryQuery
+
+        service = self._service(SimpleNamespace())
+        query = MemoryQuery(
+            query="普通聊天",
+            policy="deep",
+            metadata={"query_rewrite_eligible": False},
+        )
+        rewrite_called = False
+
+        async def fail_if_rewritten(_query):
+            nonlocal rewrite_called
+            rewrite_called = True
+            raise AssertionError("rewrite must be skipped")
+
+        async def retrieve_without_gateway(_query, _queries, **_kwargs):
+            return []
+
+        service._rewrite_queries = fail_if_rewritten
+        service._retrieve_queries = retrieve_without_gateway
+
+        result = asyncio.run(service.retrieve_deep(query))
+
+        self.assertEqual(result, [])
+        self.assertFalse(rewrite_called)
+        self.assertEqual(query.metadata["query_rewrite_trace"]["status"], "skipped_not_eligible")
+        self.assertEqual(query.metadata["query_rewrite_trace"]["skip_reason"], "query_policy")
+
 
 class ReplyShapePolicyTests(unittest.TestCase):
     def _config(self, **overrides):

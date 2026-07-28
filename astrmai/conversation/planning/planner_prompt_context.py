@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import List, Optional
 
 from astrbot.api import logger
@@ -8,9 +9,11 @@ from astrbot.api.event import AstrMessageEvent
 from ...infrastructure.compat.legacy_compat import emit_legacy_prompt_envelope_extras, read_legacy_focus_thread_context
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import preview_text
+from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyMode
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..reply_shape_policy import resolve_reply_shape_policy, set_reply_shape_policy
+from .group_entity_resolution import event_group_id, resolve_group_references
 from .message_renderer import MessageRenderer
 
 
@@ -119,6 +122,8 @@ class PlannerPromptContextMixin:
 
     @staticmethod
     def _render_event_line(message_event: AstrMessageEvent) -> str:
+        # Keep the legacy transcript shape stable; the typed speaker/entity
+        # boundary carries QQ IDs separately without rewriting every quote.
         return MessageRenderer.render_event(message_event)
 
     @staticmethod
@@ -143,6 +148,26 @@ class PlannerPromptContextMixin:
             return str(message_event.get_sender_name() or "").strip()
         except Exception:
             return ""
+
+    @staticmethod
+    def _safe_event_id(message_event: AstrMessageEvent) -> str:
+        message_obj = getattr(message_event, "message_obj", None)
+        return str(
+            getattr(message_obj, "message_id", "")
+            or getattr(message_event, "message_id", "")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _has_reply_reference(message_event: AstrMessageEvent) -> bool:
+        message_chain = getattr(getattr(message_event, "message_obj", None), "message", None) or []
+        return any(
+            str(getattr(component, "type", component.__class__.__name__))
+            .lstrip("_")
+            .lower()
+            == "reply"
+            for component in message_chain
+        )
 
     @classmethod
     def _build_current_speaker_block(
@@ -177,6 +202,8 @@ class PlannerPromptContextMixin:
             f"- 会话: {chat_id or 'unknown'}",
             f"- 消息类型: {message_kind}",
             "历史里的其他发言人只是背景，不能当作当前用户，也不要把他们的名字、身份或关系套到当前用户身上。",
+            "当前发言人身份只决定本轮消息归因，不自动改变人格中的默认称呼或固定关系；条件关系称呼必须有当前消息或稳定事实支持。",
+            "机器人过去的回复、群友玩笑和摘要中的关系词不是关系证据，不能据此把当前发言人升级为某个固定对象。",
         ]
         if cls._is_group_event(focus_event):
             lines.append("这是群聊；如果前文出现过其他群友，本轮仍只把眼前这条消息归因给上述 QQ。")
@@ -254,6 +281,7 @@ class PlannerPromptContextMixin:
         current_speaker_block: str,
         near_context_priority: bool,
         focus_message_identity: str = "",
+        referenced_entity_block: str = "",
     ) -> PromptEnvelope:
         return PromptEnvelope(
             raw_user_text=focus_message_text,
@@ -269,6 +297,7 @@ class PlannerPromptContextMixin:
             warm_zone_quote_event_ids=list(warm_zone_quote_event_ids or []),
             last_assistant_reply=last_assistant_reply,
             current_speaker_block=current_speaker_block,
+            referenced_entity_block=referenced_entity_block,
             focus_message_text=focus_message_text,
             focus_message_identity=focus_message_identity,
             direct_context_text=direct_context_text,
@@ -297,14 +326,28 @@ class PlannerPromptContextMixin:
         }
         return guidance_map.get(reply_mode, ["顺着当前对话自然回应。"])
 
-    async def _get_recent_dialogue_transcript(self, chat_id: str, max_age_seconds: float = 900.0) -> str:
+    async def _get_recent_dialogue_transcript(
+        self,
+        chat_id: str,
+        max_age_seconds: float = 900.0,
+        *,
+        history_policy: DialogHistoryPolicy | None = None,
+    ) -> str:
         lane_manager = getattr(self.gateway, "lane_manager", None)
         if not lane_manager:
             return ""
+        lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id)
+        base_origin = chat_id
+        if history_policy is not None and history_policy.group_id:
+            if not history_policy.uses_lane_history:
+                return ""
+            topic_scope = f"{chat_id}#topic:{max(1, history_policy.topic_epoch)}"
+            lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id=topic_scope)
+            base_origin = f"{chat_id}@@topic:{max(1, history_policy.topic_epoch)}"
         try:
             return await lane_manager.get_recent_transcript(
-                lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
-                base_origin=chat_id,
+                lane_key=lane_key,
+                base_origin=base_origin,
                 max_turns=4,
                 max_age_seconds=max_age_seconds,
             )
@@ -314,8 +357,8 @@ class PlannerPromptContextMixin:
                 return ""
             try:
                 return await lane_manager.get_recent_transcript(
-                    lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
-                    base_origin=chat_id,
+                    lane_key=lane_key,
+                    base_origin=base_origin,
                     max_turns=4,
                 )
             except Exception as fallback_exc:
@@ -325,7 +368,13 @@ class PlannerPromptContextMixin:
             logger.debug(f"[{chat_id}] recent transcript load failed: {exc}")
             return ""
 
-    async def _get_warm_context_bundle(self, chat_id: str):
+    async def _get_warm_context_bundle(
+        self,
+        chat_id: str,
+        *,
+        include_identity: bool = False,
+        max_age_seconds: float = 300.0,
+    ):
         context_engine = getattr(self, "context_engine", None)
         context_db = getattr(context_engine, "db", None)
         store = (
@@ -337,10 +386,109 @@ class PlannerPromptContextMixin:
         if not store:
             return None
         try:
-            return await store.get_warm_context_bundle(chat_id, max_age_seconds=300.0, max_tokens=1200)
+            return await store.get_warm_context_bundle(
+                chat_id,
+                max_age_seconds=max_age_seconds,
+                max_tokens=1200,
+                include_identity=include_identity,
+            )
+        except TypeError:
+            # Keep compatibility with lightweight test doubles and older
+            # stores during plugin reloads.
+            try:
+                return await store.get_warm_context_bundle(
+                    chat_id,
+                    max_age_seconds=max_age_seconds,
+                    max_tokens=1200,
+                )
+            except Exception as exc:
+                logger.debug(f"[{chat_id}] warm transcript compatibility load failed: {exc}")
+                return None
         except Exception as exc:
             logger.debug(f"[{chat_id}] warm transcript load failed: {exc}")
             return None
+
+    async def _get_group_social_context(
+        self,
+        chat_id: str,
+        history_policy: DialogHistoryPolicy,
+    ) -> str:
+        if not history_policy.group_id or not history_policy.current_sender_id:
+            return ""
+        store = getattr(self, "dialogue_store", None)
+        if store is None or not hasattr(store, "render_social_context"):
+            return ""
+        conversation_config = getattr(getattr(self.gateway, "config", None), "conversation", None)
+        ownership_check_enabled = bool(
+            getattr(conversation_config, "group_social_ownership_check_enabled", True)
+        )
+        ttl_seconds = float(
+            getattr(conversation_config, "group_social_state_ttl_sec", 86400) or 86400
+        )
+        try:
+            return await store.render_social_context(
+                chat_id,
+                current_sender_id=history_policy.current_sender_id,
+                topic_epoch=history_policy.topic_epoch,
+                ttl_seconds=ttl_seconds,
+                ownership_check_enabled=ownership_check_enabled,
+            )
+        except Exception as exc:
+            logger.debug(f"[{chat_id}] group social context load failed: {exc}")
+            return ""
+
+    async def _resolve_referenced_entity_context(
+        self,
+        *,
+        focus_event: AstrMessageEvent,
+        focus_context: FocusThreadContext,
+        event_messages: List[AstrMessageEvent],
+        context_events: List[AstrMessageEvent],
+        focus_message_text: str,
+    ) -> tuple[list[dict], str]:
+        group_id = event_group_id(focus_event)
+        if not group_id:
+            return [], ""
+        raw_text = str(
+            focus_event.get_extra("astrmai_rich_text", focus_event.message_str) or ""
+        ).strip()
+        if not raw_text:
+            raw_text = focus_message_text
+        events: list[AstrMessageEvent] = []
+        seen_ids: set[int] = set()
+        for candidate in [focus_event, *event_messages, *context_events, *focus_context.all_thread_events()]:
+            if candidate is None or id(candidate) in seen_ids:
+                continue
+            seen_ids.add(id(candidate))
+            events.append(candidate)
+        sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+        sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip()
+        if not sender_id:
+            try:
+                sender_id = str(focus_event.get_sender_id() or "").strip()
+            except Exception:
+                sender_id = ""
+        if not sender_name:
+            try:
+                sender_name = str(focus_event.get_sender_name() or "").strip()
+            except Exception:
+                sender_name = ""
+        context_engine = getattr(self, "context_engine", None)
+        db_service = (
+            getattr(context_engine, "db_service", None)
+            or getattr(context_engine, "db", None)
+            or getattr(self.gateway, "db_service", None)
+        )
+        entities, block = await resolve_group_references(
+            raw_text,
+            group_id=group_id,
+            current_sender_id=sender_id,
+            current_sender_name=sender_name,
+            events=events,
+            db_service=db_service,
+        )
+        serialized = [entity.as_dict() for entity in entities]
+        return serialized, block
 
     async def _get_compaction_trace_status(self, chat_id: str, focus_context: FocusThreadContext | None):
         compaction = getattr(self, "context_compaction", None)
@@ -416,6 +564,35 @@ class PlannerPromptContextMixin:
 
         window_lines = [self._render_event_line(message_event) for message_event in context_events]
         focus_message_text = self._build_focus_message_text(focus_event, focus_context)
+        history_policy = DialogHistoryPolicy()
+        if self._is_group_event(focus_event):
+            history_policy = self.conversation_continuity.evaluate_group_message(
+                chat_id,
+                focus_message_text,
+                sender_id=self._safe_event_sender_id(focus_event),
+                has_reply_reference=self._has_reply_reference(focus_event),
+            )
+            if is_lightweight_event:
+                history_policy = replace(
+                    history_policy,
+                    history_mode="none",
+                    allow_provider_session=False,
+                    rotation_reason="lightweight_event",
+                )
+            conversation_config = getattr(getattr(self.gateway, "config", None), "conversation", None)
+            history_debug_enabled = bool(
+                getattr(conversation_config, "group_history_debug_trace_enabled", False)
+            )
+            if hasattr(event, "set_extra"):
+                event.set_extra("astrmai_group_history_debug_trace_enabled", history_debug_enabled)
+            if focus_event is not event and hasattr(focus_event, "set_extra"):
+                focus_event.set_extra(
+                    "astrmai_group_history_debug_trace_enabled",
+                    history_debug_enabled,
+                )
+            history_policy.bind(event)
+            if focus_event is not event:
+                history_policy.bind(focus_event)
         direct_context_text = self._build_direct_context_text(
             root_event=thread_root_event,
             focus_event=focus_event,
@@ -427,14 +604,47 @@ class PlannerPromptContextMixin:
         )
         ambient_background_text = self._build_ambient_background_text(ambient_events)
         raw_window_text = focus_message_text
-        warm_bundle = None if is_lightweight_event else await self._get_warm_context_bundle(chat_id)
+        allow_group_history = not history_policy.group_id or history_policy.history_mode != "none"
+        warm_bundle = (
+            None
+            if is_lightweight_event or not allow_group_history
+            else await self._get_warm_context_bundle(
+                chat_id,
+                include_identity=self._is_group_event(focus_event),
+                max_age_seconds=(
+                    history_policy.topic_age_seconds + 120.0
+                    if history_policy.group_id and history_policy.history_mode == "explicit_recall"
+                    else 300.0
+                ),
+            )
+        )
         warm_zone_summary = "" if warm_bundle is None else str(getattr(warm_bundle, "summary_text", "") or "").strip()
         warm_zone_quotes = "" if warm_bundle is None else str(getattr(warm_bundle, "quote_text", "") or "").strip()
         warm_topics_preview = "" if warm_bundle is None else str(getattr(warm_bundle, "topic_preview", "") or "").strip()
         warm_zone_quote_event_ids = [] if warm_bundle is None else list(getattr(warm_bundle, "quote_event_ids", []) or [])
+        if history_policy.group_id:
+            history_policy = replace(
+                history_policy,
+                approved_event_ids=tuple(warm_zone_quote_event_ids),
+            )
+            history_policy.bind(event)
+            if focus_event is not event:
+                history_policy.bind(focus_event)
         warm_zone_has_latest_assistant = bool(getattr(warm_bundle, "has_latest_assistant", False)) if warm_bundle is not None else False
         warm_zone_transcript = "\n".join(part for part in (warm_zone_summary, warm_zone_quotes) if part).strip()
-        recent_transcript = "" if is_lightweight_event else await self._get_recent_dialogue_transcript(chat_id)
+        recent_transcript = (
+            ""
+            if is_lightweight_event or not allow_group_history
+            else await self._get_recent_dialogue_transcript(
+                chat_id,
+                max_age_seconds=(
+                    max(300.0, min(history_policy.topic_age_seconds + 120.0, 1800.0))
+                    if history_policy.group_id
+                    else 900.0
+                ),
+                history_policy=history_policy if history_policy.group_id else None,
+            )
+        )
         compaction_trace_status = {} if is_lightweight_event else await self._get_compaction_trace_status(chat_id, focus_context)
         post_compaction_recovery_rounds = int(compaction_trace_status.get("post_compaction_recovery_rounds", 0) or 0)
         include_recent, recent_transcript_reason = self._should_include_recent_transcript(
@@ -470,6 +680,18 @@ class PlannerPromptContextMixin:
             focus_context,
             is_lightweight_event=is_lightweight_event,
         )
+        group_social_context = await self._get_group_social_context(chat_id, history_policy)
+        if group_social_context:
+            current_speaker_block = "\n".join(
+                part for part in (current_speaker_block, group_social_context) if part
+            )
+        referenced_entities, referenced_entity_block = await self._resolve_referenced_entity_context(
+            focus_event=focus_event,
+            focus_context=focus_context,
+            event_messages=event_messages,
+            context_events=context_events,
+            focus_message_text=focus_message_text,
+        )
 
         prompt_envelope = self._build_prompt_envelope(
             focus_context=focus_context,
@@ -489,6 +711,7 @@ class PlannerPromptContextMixin:
             warm_zone_quote_event_ids=warm_zone_quote_event_ids,
             last_assistant_reply=last_assistant_reply,
             current_speaker_block=current_speaker_block,
+            referenced_entity_block=referenced_entity_block,
             near_context_priority=near_context_priority,
             focus_message_identity=self._render_event_line(focus_event),
         )
@@ -516,6 +739,27 @@ class PlannerPromptContextMixin:
             prompt_envelope.guidance_lines.append("这是轻互动，只回应当前动作，不要接旧话题或复述历史。")
         if current_speaker_block and (is_lightweight_event or near_context_priority):
             prompt_envelope.guidance_lines.append("本轮先遵守当前发言人边界；不要把近期脉络中的其他人名当作当前用户。")
+        if referenced_entity_block:
+            prompt_envelope.guidance_lines.append(
+                "本轮提及对象已经单独标注；第三方对象不能替代当前发言人，未确认身份时不要猜测或擅自 @。"
+            )
+        if history_policy.group_id:
+            if history_policy.history_mode == "none":
+                prompt_envelope.guidance_lines.append(
+                    "当前群消息没有足够的话题承接证据；只根据当前消息、明确回复引用和本轮实体信息回答，不延续旧称号、旧玩笑或旧关系。"
+                )
+            elif history_policy.history_mode == "current_topic":
+                prompt_envelope.guidance_lines.append(
+                    "这是同一群聊话题的共同上下文；可以承接群友共同形成的话题，但必须按每条消息的发言人身份正确归因。"
+                )
+            else:
+                prompt_envelope.guidance_lines.append(
+                    "用户明确回忆旧事；只使用本轮检索或明确引用到的旧信息，不恢复隐藏的旧模型会话。"
+                )
+            if group_social_context:
+                prompt_envelope.guidance_lines.append(
+                    "群内称号、昵称、承诺和小游戏状态必须遵守上方归属；不得把其他群友的状态转移给当前发言人。"
+                )
         interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
         if interaction_kind == "poke":
             poke_hint = str(focus_event.get_extra("astrmai_poke_reply_hint", "") or "").strip()
@@ -546,7 +790,18 @@ class PlannerPromptContextMixin:
                 prompt_envelope.guidance_lines.append(f"群友互戳互动策略：{poke_hint}")
         event.set_extra("astrmai_lightweight_event", is_lightweight_event)
         event.set_extra("astrmai_focus_thread_context", focus_context)
-        emit_legacy_prompt_envelope_extras(event, prompt_envelope, use_lane_history=True)
+        event.set_extra("astrmai_referenced_entities", referenced_entities)
+        event.set_extra("astrmai_referenced_entity_block", referenced_entity_block)
+        if focus_event is not event:
+            focus_event.set_extra("astrmai_referenced_entities", referenced_entities)
+            focus_event.set_extra("astrmai_referenced_entity_block", referenced_entity_block)
+        emit_legacy_prompt_envelope_extras(
+            event,
+            prompt_envelope,
+            use_lane_history=(
+                history_policy.uses_lane_history if history_policy.group_id else True
+            ),
+        )
 
         if getattr(getattr(self.gateway.config, "global_settings", None), "debug_mode", False):
             logger.debug(
@@ -567,4 +822,6 @@ class PlannerPromptContextMixin:
             "prompt_envelope": prompt_envelope,
             "near_context_priority": near_context_priority,
             "is_lightweight_event": is_lightweight_event,
+            "referenced_entities": referenced_entities,
+            "dialog_history_policy": history_policy,
         }

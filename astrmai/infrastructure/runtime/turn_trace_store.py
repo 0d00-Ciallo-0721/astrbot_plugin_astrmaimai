@@ -198,6 +198,32 @@ class TurnTraceSampleStore:
         if self._line_count > self.max_global * self.COMPACTION_FACTOR:
             self._compact_sync()
 
+    def _reset_sync(self, *, capture_started_at: float | None = None) -> None:
+        """Atomically start a fresh JSON/JSONL capture window."""
+        payload = {
+            "version": 2,
+            "capture_started_at": float(capture_started_at or time.time()),
+            "by_chat": {},
+            "recent": [],
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        json_tmp = self.path.with_suffix(self.path.suffix + ".reset.tmp")
+        jsonl_tmp = self.jsonl_path.with_suffix(self.jsonl_path.suffix + ".reset.tmp")
+        try:
+            json_tmp.write_text(serialized, encoding="utf-8")
+            jsonl_tmp.write_text("", encoding="utf-8")
+            os.replace(json_tmp, self.path)
+            os.replace(jsonl_tmp, self.jsonl_path)
+            self._line_count = 0
+        finally:
+            json_tmp.unlink(missing_ok=True)
+            jsonl_tmp.unlink(missing_ok=True)
+
+    async def reset(self, *, capture_started_at: float | None = None) -> None:
+        """Reset both trace formats without leaving an invalid partial file."""
+        async with self._lock:
+            await asyncio.to_thread(self._reset_sync, capture_started_at=capture_started_at)
+
     async def append(self, sample: dict[str, Any]) -> None:
         chat_id = str(sample.get("chat_id", "") or "")
         if not chat_id:

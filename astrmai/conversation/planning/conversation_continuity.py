@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 import re
 
+from ..contracts.dialog_history_policy import DialogHistoryPolicy
+
 
 @dataclass(slots=True)
 class ConversationTurnRecord:
@@ -18,6 +20,9 @@ class ConversationTurnRecord:
     reply_preview: str
     reply_need: str = "reply"
     goal_status: str = ""
+    sender_id: str = ""
+    source_event_id: str = ""
+    topic_epoch: int = 0
 
 
 @dataclass(slots=True)
@@ -34,6 +39,10 @@ class ConversationContinuityState:
     last_action_taken: str = ""
     continuity_weight: str = ""
     topic_confirmation_requested_at: float = 0.0
+    topic_epoch: int = 0
+    last_sender_id: str = ""
+    last_event_id: str = ""
+    topic_participants: set[str] = field(default_factory=set)
     turns: list[ConversationTurnRecord] = field(default_factory=list)
 
 
@@ -51,31 +60,58 @@ class ConversationContinuityStore:
         self._topic_confirm_after_seconds = 1800.0
         self._topic_confirmation_wait_seconds = 120.0
         self._topic_summary_max_chars = 300
+        self._group_shared_history_enabled = True
+        self._group_topic_active_ttl_seconds = 1200.0
+        self._group_topic_confirm_after_seconds = 1800.0
+        self._group_provider_topic_session_enabled = True
 
     def refresh_config(self, config: Any) -> None:
         """Refresh private-topic timing without changing existing conversation state."""
         private_config = getattr(config, "private_chat", None)
-        if private_config is None:
-            return
-        self._topic_continuity_enabled = bool(
-            getattr(private_config, "topic_continuity_enabled", True)
-        )
-        self._topic_active_ttl_seconds = max(
-            600.0,
-            float(getattr(private_config, "topic_active_ttl_sec", 900) or 900),
-        )
-        self._topic_confirm_after_seconds = max(
-            1800.0,
-            float(getattr(private_config, "topic_confirm_after_sec", 1800) or 1800),
-        )
-        self._topic_confirmation_wait_seconds = max(
-            30.0,
-            float(getattr(private_config, "topic_confirmation_wait_sec", 120) or 120),
-        )
-        self._topic_summary_max_chars = max(
-            80,
-            int(getattr(private_config, "topic_summary_max_chars", 300) or 300),
-        )
+        if private_config is not None:
+            self._topic_continuity_enabled = bool(
+                getattr(private_config, "topic_continuity_enabled", True)
+            )
+            self._topic_active_ttl_seconds = max(
+                600.0,
+                float(getattr(private_config, "topic_active_ttl_sec", 900) or 900),
+            )
+            self._topic_confirm_after_seconds = max(
+                1800.0,
+                float(getattr(private_config, "topic_confirm_after_sec", 1800) or 1800),
+            )
+            self._topic_confirmation_wait_seconds = max(
+                30.0,
+                float(getattr(private_config, "topic_confirmation_wait_sec", 120) or 120),
+            )
+            self._topic_summary_max_chars = max(
+                80,
+                int(getattr(private_config, "topic_summary_max_chars", 300) or 300),
+            )
+        conversation_config = getattr(config, "conversation", None)
+        if conversation_config is not None:
+            self._group_shared_history_enabled = bool(
+                getattr(conversation_config, "group_shared_history_enabled", True)
+            )
+            active = max(
+                60.0,
+                min(
+                    86400.0,
+                    float(getattr(conversation_config, "group_topic_active_ttl_sec", 1200) or 1200),
+                ),
+            )
+            confirm = max(
+                active,
+                min(
+                    172800.0,
+                    float(getattr(conversation_config, "group_topic_confirm_after_sec", 1800) or 1800),
+                ),
+            )
+            self._group_topic_active_ttl_seconds = active
+            self._group_topic_confirm_after_seconds = confirm
+            self._group_provider_topic_session_enabled = bool(
+                getattr(conversation_config, "group_provider_topic_session_enabled", True)
+            )
 
     def _state(self, chat_id: str) -> ConversationContinuityState:
         state = self._states.get(chat_id)
@@ -162,6 +198,9 @@ class ConversationContinuityStore:
                 "为什么",
                 "咋办",
                 "怎么办",
+                "why",
+                "what about",
+                "then",
             )
         )
 
@@ -221,6 +260,124 @@ class ConversationContinuityStore:
         if not last_update:
             return 0.0
         return max(0.0, now - last_update)
+
+    @classmethod
+    def _is_explicit_history_recall(cls, text: str) -> bool:
+        normalized = cls._normalize_topic_text(text)
+        return any(
+            marker in normalized
+            for marker in (
+                "昨天",
+                "前天",
+                "上次",
+                "之前",
+                "前几天",
+                "以前",
+                "还记得",
+                "我们聊过",
+                "刚才那个",
+                "之前那个",
+            )
+        )
+
+    def evaluate_group_message(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        sender_id: str = "",
+        has_reply_reference: bool = False,
+        approved_event_ids: Iterable[str] = (),
+        now: float | None = None,
+    ) -> DialogHistoryPolicy:
+        now = time.time() if now is None else float(now)
+        normalized_chat_id = str(chat_id or "").strip()
+        normalized_sender_id = str(sender_id or "").strip()
+        thread_key = f"group:{normalized_chat_id}"
+        if not self._group_shared_history_enabled:
+            return DialogHistoryPolicy(
+                history_mode="current_topic",
+                group_id=normalized_chat_id,
+                thread_key=thread_key,
+                topic_epoch=0,
+                current_sender_id=normalized_sender_id,
+                approved_event_ids=tuple(str(item) for item in approved_event_ids if str(item)),
+                allow_provider_session=True,
+                rotation_reason="group_history_legacy_mode",
+                continuity_evidence=("feature_disabled",),
+            )
+
+        state = self._state(normalized_chat_id)
+        current_text = self._topic_message_text(text)
+        explicit_recall = self._is_explicit_history_recall(current_text)
+        explicit_switch = self._is_explicit_topic_switch(current_text)
+        age_seconds = self._topic_age_seconds(state, now)
+        has_topic = bool(state.current_topic and state.last_goal_update_ts)
+        same_topic = bool(
+            has_topic
+            and self._is_same_topic(
+                state.last_focus_preview or state.current_topic,
+                current_text,
+                threshold=(
+                    self.TOPIC_SIMILARITY_THRESHOLD
+                    if age_seconds <= self._group_topic_active_ttl_seconds
+                    else self.WEAK_TOPIC_SIMILARITY_THRESHOLD
+                ),
+            )
+        )
+        followup_like = self._is_short_topic_followup(current_text)
+        evidence: list[str] = []
+        if has_reply_reference:
+            evidence.append("reply_reference")
+        if same_topic:
+            evidence.append("topic_similarity")
+        if followup_like:
+            evidence.append("short_followup")
+        if explicit_recall:
+            evidence.append("explicit_recall")
+        if normalized_sender_id and normalized_sender_id in state.topic_participants:
+            evidence.append("known_participant")
+
+        next_epoch = max(1, int(state.topic_epoch or 0))
+        mode = "none"
+        rotation_reason = ""
+        allow_provider_session = False
+        if explicit_recall:
+            next_epoch = max(1, int(state.topic_epoch or 0) + 1)
+            mode = "explicit_recall"
+            rotation_reason = "explicit_history_recall"
+        elif not has_topic and followup_like and not explicit_switch:
+            next_epoch = max(1, int(state.topic_epoch or 0) + 1)
+            mode = "current_topic"
+            rotation_reason = "recent_history_bootstrap"
+        elif not has_topic or explicit_switch:
+            next_epoch = max(1, int(state.topic_epoch or 0) + 1)
+            rotation_reason = "initial_topic" if not has_topic else "explicit_topic_switch"
+        elif age_seconds <= self._group_topic_active_ttl_seconds:
+            mode = "current_topic"
+            allow_provider_session = self._group_provider_topic_session_enabled
+        elif age_seconds <= self._group_topic_confirm_after_seconds and (
+            has_reply_reference or same_topic or followup_like
+        ):
+            mode = "current_topic"
+            allow_provider_session = self._group_provider_topic_session_enabled
+            rotation_reason = "weak_window_evidence"
+        else:
+            next_epoch = max(1, int(state.topic_epoch or 0) + 1)
+            rotation_reason = "topic_stale" if age_seconds > self._group_topic_confirm_after_seconds else "new_topic"
+
+        return DialogHistoryPolicy(
+            history_mode=mode,
+            group_id=normalized_chat_id,
+            thread_key=thread_key,
+            topic_epoch=next_epoch,
+            current_sender_id=normalized_sender_id,
+            approved_event_ids=tuple(str(item) for item in approved_event_ids if str(item)),
+            allow_provider_session=allow_provider_session,
+            rotation_reason=rotation_reason,
+            topic_age_seconds=age_seconds,
+            continuity_evidence=tuple(evidence),
+        )
 
     def _private_topic_summary(
         self,
@@ -404,6 +561,9 @@ class ConversationContinuityStore:
         state.last_action_taken = ""
         state.continuity_weight = ""
         state.topic_confirmation_requested_at = 0.0
+        state.last_sender_id = ""
+        state.last_event_id = ""
+        state.topic_participants.clear()
         state.turns = []
         return True
 
@@ -434,6 +594,10 @@ class ConversationContinuityStore:
             "turn_count": int(state.turn_count or 0),
             "last_social_intent": state.last_social_intent,
             "last_action_taken": state.last_action_taken,
+            "topic_epoch": int(state.topic_epoch or 0),
+            "last_sender_id": state.last_sender_id,
+            "last_event_id": state.last_event_id,
+            "topic_participants": sorted(state.topic_participants),
         }
 
     def summary(self, chat_id: str, *, now: float | None = None) -> str:
@@ -480,6 +644,9 @@ class ConversationContinuityStore:
         reply_preview: str = "",
         reply_need: str = "reply",
         lightweight_event: bool = False,
+        sender_id: str = "",
+        source_event_id: str = "",
+        topic_epoch: int | None = None,
         now: float | None = None,
     ) -> ConversationTurnRecord:
         now = time.time() if now is None else now
@@ -495,6 +662,9 @@ class ConversationContinuityStore:
             action_taken=str(action_taken or ""),
             reply_preview=str(reply_preview or "")[:160],
             reply_need=str(reply_need or "reply"),
+            sender_id=str(sender_id or ""),
+            source_event_id=str(source_event_id or ""),
+            topic_epoch=max(0, int(topic_epoch or 0)),
         )
         # 设计意图：lightweight_event 和 wait/ignore 是非实质性轮次，
         # 不应推进对话主题/目标状态机。仅记录轮次，不更新 state.current_topic、
@@ -532,6 +702,10 @@ class ConversationContinuityStore:
                 state.current_topic = item.focus_preview
             elif goal_status in {"guarded", "observing"} and not same_topic:
                 state.current_topic = item.focus_preview
+        if topic_epoch is not None and int(topic_epoch or 0) > 0:
+            state.topic_epoch = int(topic_epoch)
+        elif goal_status in {"new", "redirected"} or state.topic_epoch <= 0:
+            state.topic_epoch = max(1, int(state.topic_epoch or 0) + 1)
         if item.goal_summary:
             state.current_goal = item.goal_summary
         elif goal_status in {"new", "redirected"}:
@@ -546,6 +720,10 @@ class ConversationContinuityStore:
         state.last_focus_preview = item.focus_preview or state.last_focus_preview
         state.last_social_intent = item.social_intent
         state.last_action_taken = item.action_taken
+        state.last_sender_id = item.sender_id or state.last_sender_id
+        state.last_event_id = item.source_event_id or state.last_event_id
+        if item.sender_id:
+            state.topic_participants.add(item.sender_id)
         state.continuity_weight = self._continuity_weight(state, now)
         item.goal_status = goal_status
         state.turns = [*self.recent(chat_id, now=now), item][-self.MAX_TURNS_PER_CHAT :]

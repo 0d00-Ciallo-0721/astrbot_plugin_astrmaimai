@@ -131,6 +131,8 @@ def _render_first_person_rewrite(payload: dict[str, Any], template_version: str)
             role_framing="You are refining a persona summary into a short first-person note for internal self-awareness continuity.",
             task_rules=(
                 "Use first person voice. Keep it natural and compact. "
+                "Preserve the distinction between the default interlocutor address, conditional relationship addresses, "
+                "and names used only for specific people; do not turn a conditional relationship into the identity of every user. "
                 "Do not mention prompts, AI, tools, or system instructions."
             ),
             format_constraints="Output plain text only, within 120 characters if possible.",
@@ -455,7 +457,8 @@ class PromptTemplateRegistry:
                     version="v3",
                     task_rules=(
                         "把原始人设极致压缩为核心身份骨架。优先提取：核心身份与萌属性标签、"
-                        "对用户的绝对关系锚点、初始互动底色。控制在 200 字内。"
+                        "对默认对话者的关系与称呼范围、初始互动底色。若关系只针对特定人物，标记为条件关系，"
+                        "不得把它泛化给所有用户。控制在 200 字内。"
                     ),
                 ),
             ),
@@ -468,7 +471,9 @@ class PromptTemplateRegistry:
                     version="v1",
                     task_rules=(
                         "提取语言与排版绝对规范。重点总结：第一人称自称、对用户称谓、"
-                        "标志性口白、文本排版偏好、社交语气。控制在 200 字内。"
+                        "标志性口白、文本排版偏好、社交语气。称呼必须区分“默认对用户/对话者称呼”、"
+                        "“有明确条件才使用的关系称呼”和“仅用于第三方或原文特定人物的称呼”；"
+                        "只保留原文明确证据，不能把某个关系对象的称呼泛化给所有用户。控制在 200 字内。"
                     ),
                 ),
             ),
@@ -489,7 +494,11 @@ class PromptTemplateRegistry:
                 renderer=_persona_shard_renderer(
                     template_id=PromptTemplateId.PERSONA_SPEECH_STYLE,
                     version="v1",
-                    task_rules="提取语言风格：自称、称呼、口白、符号偏好、语速句式、社交语气。没有就返回“无”。",
+                    task_rules=(
+                        "提取语言风格：自称、默认对用户称呼、条件关系称呼、口白、符号偏好、"
+                        "语速句式、社交语气。称呼必须标注适用范围；不确定的关系不要补全，"
+                        "不要把角色对某个特定人物的称呼写成所有用户的默认身份。没有就返回“无”。"
+                    ),
                 ),
             ),
             PromptTemplateId.PERSONA_WORLD_VIEW.value: PromptTemplateSpec(
@@ -509,7 +518,11 @@ class PromptTemplateRegistry:
                 renderer=_persona_shard_renderer(
                     template_id=PromptTemplateId.PERSONA_TIMELINE,
                     version="v1",
-                    task_rules="提取生平经历：起源与童年、核心转折事件、与用户的历史渊源、当前处境。没有就返回“无”。",
+                    task_rules=(
+                        "提取生平经历：起源与童年、核心转折事件、与用户的历史渊源、当前处境。"
+                        "历史渊源中的称呼和关系必须区分默认对话者关系、条件关系和特定人物关系；"
+                        "不要把特定人物的关系扩展给所有用户。没有就返回“无”。"
+                    ),
                 ),
             ),
             PromptTemplateId.PERSONA_RELATIONS.value: PromptTemplateSpec(
@@ -519,7 +532,11 @@ class PromptTemplateRegistry:
                 renderer=_persona_shard_renderer(
                     template_id=PromptTemplateId.PERSONA_RELATIONS,
                     version="v1",
-                    task_rules="提取人际关系：对用户的核心感情锚点、敌意对象、友方 NPC 态度、社交边界感。没有就返回“无”。",
+                    task_rules=(
+                        "提取人际关系：对默认对话者的核心感情锚点、条件关系、特定人物、敌意对象、"
+                        "友方 NPC 态度和社交边界感。明确标注关系适用范围；陌生群友不能因历史称呼或玩笑自动获得核心关系。"
+                        "没有就返回“无”。"
+                    ),
                 ),
             ),
             PromptTemplateId.PERSONA_SKILLS.value: PromptTemplateSpec(

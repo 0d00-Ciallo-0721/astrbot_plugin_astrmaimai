@@ -438,7 +438,7 @@ class RefactoredExecutorTests(unittest.TestCase):
         mode, kwargs = gateway.calls[0]
         self.assertEqual(mode, "chat")
         self.assertEqual(kwargs["lane_key"].task_family, "dialog")
-        self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1")
+        self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1@@topic:1")
         self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "lane-text-reply")])
         self.assertEqual(
             evolution.calls,

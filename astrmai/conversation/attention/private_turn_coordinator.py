@@ -9,6 +9,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.runtime.trace_runtime import debug_trace
+from ...infrastructure.runtime.turn_call_ledger import record_vision_observation
 from ...multimodal.vision_prompt import normalize_vision_result, render_vision_record
 
 
@@ -352,12 +353,57 @@ class PrivateTurnCoordinator:
             all(bool(event.get_extra("astrmai_vision_barrier_complete", False)) for event in image_events),
         )
         focus_event.set_extra("astrmai_vision_barrier_failed", bool(failed_count))
+        self._bind_batch_vision_observation(events, focus_event)
         if not str(focus_event.get_extra("astrmai_rich_text", "") or "").strip():
             focus_event.set_extra(
                 "astrmai_rich_text",
                 str(getattr(focus_event, "message_str", "") or "").strip(),
             )
         self._append_vision_context(focus_event, records, failed_count)
+
+    @staticmethod
+    def _bind_batch_vision_observation(events: list[Any], focus_event: Any) -> None:
+        observations = [
+            dict(event.get_extra("astrmai_vision_observability", {}) or {})
+            for event in events
+            if isinstance(event.get_extra("astrmai_vision_observability", {}), dict)
+        ]
+        if not observations:
+            return
+        sources: list[str] = []
+        memory_ids: list[str] = []
+        for item in observations:
+            for source in list(item.get("image_source", []) or []):
+                if source not in sources:
+                    sources.append(str(source))
+            for memory_id in list(item.get("visual_memory_ids", []) or []):
+                if memory_id not in memory_ids:
+                    memory_ids.append(str(memory_id))
+        payload = {
+            "policy": str(observations[-1].get("policy", "") or ""),
+            "outcome": "failed" if any(item.get("outcome") == "failed" for item in observations) else "success",
+            "image_count": sum(int(item.get("image_count", 0) or 0) for item in observations),
+            "resolved_count": sum(int(item.get("resolved_count", 0) or 0) for item in observations),
+            "analyzed_count": sum(int(item.get("analyzed_count", 0) or 0) for item in observations),
+            "failed_count": sum(int(item.get("failed_count", 0) or 0) for item in observations),
+            "timeout_count": sum(int(item.get("timeout_count", 0) or 0) for item in observations),
+            "attempt_count": sum(int(item.get("attempt_count", 0) or 0) for item in observations),
+            "image_source": sources,
+            "image_resolve_status": "failed" if any(
+                item.get("image_resolve_status") == "failed" for item in observations
+            ) else "success",
+            "vision_barrier_status": "failed" if any(
+                item.get("vision_barrier_status") == "failed" for item in observations
+            ) else "completed",
+            "vision_wait_ms": sum(int(item.get("vision_wait_ms", 0) or 0) for item in observations),
+            "vision_timeout_ms": sum(int(item.get("vision_timeout_ms", 0) or 0) for item in observations),
+            "vision_fallback": any(bool(item.get("vision_fallback", False)) for item in observations),
+            "visual_memory_id": memory_ids[0] if memory_ids else "",
+            "visual_memory_ids": memory_ids,
+            "scope": "private",
+        }
+        focus_event.set_extra("astrmai_vision_observability", payload)
+        record_vision_observation(focus_event, payload)
 
     @classmethod
     def _bind_batch_text_context(cls, events: list[Any], focus_event: Any) -> None:
@@ -385,6 +431,7 @@ class PrivateTurnCoordinator:
 
     async def prepare_direct_event(self, event: Any, chat_id: str) -> VisionBarrierOutcome:
         """Resolve a directly addressed image before group decision/dispatch."""
+        event.set_extra("astrmai_vision_image_sources", self._image_source_categories(event))
         if not bool(getattr(getattr(self.config, "vision", None), "enable_vision", True)):
             return VisionBarrierOutcome(outcome="disabled")
         if self.image_resolver is None:
@@ -421,6 +468,7 @@ class PrivateTurnCoordinator:
         resolve_timeout = min(self._vision_resolve_timeout(), self._remaining_seconds(deadline))
         analysis_timeout = self._vision_analysis_timeout()
         retries = self._vision_retries()
+        event.set_extra("astrmai_vision_image_sources", self._image_source_categories(event))
         try:
             resolution = await asyncio.wait_for(
                 self.image_resolver.resolve_event_images(event),
@@ -646,6 +694,31 @@ class PrivateTurnCoordinator:
                     refs.append(normalized)
         return len(refs)
 
+    @staticmethod
+    def _image_source_categories(event: Any) -> list[str]:
+        categories: list[str] = []
+        for key in (
+            "direct_vision_urls",
+            "direct_image_refs",
+            "extracted_image_urls",
+            "extracted_image_refs",
+        ):
+            for ref in list(event.get_extra(key, []) or []):
+                value = str(ref or "").strip().lower()
+                if not value:
+                    continue
+                if value.startswith(("http://", "https://")):
+                    category = "url"
+                elif value.startswith(("file://", "/", "\\")) or ":\\" in value:
+                    category = "local_file"
+                elif value.startswith("data:"):
+                    category = "data_uri"
+                else:
+                    category = "opaque_ref"
+                if category not in categories:
+                    categories.append(category)
+        return categories or ["unknown"]
+
     def _aggregate_outcomes(
         self,
         outcomes: list[VisionBarrierOutcome],
@@ -699,7 +772,33 @@ class PrivateTurnCoordinator:
             "downstream_action": outcome.downstream_action,
             "scope": "private" if "FriendMessage" in effective_chat_id else "group",
         }
+        source_categories = list(event.get_extra("astrmai_vision_image_sources", []) or [])
+        records = list(event.get_extra("astrmai_vision_records", []) or [])
+        memory_ids = [
+            str(record.get("picid", "") or "")[:80]
+            for record in records
+            if str(record.get("picid", "") or "").strip()
+        ]
+        if outcome.outcome in {"success", "partial_failure"}:
+            resolve_status = "success"
+        elif outcome.outcome in {"resolve_failed", "resolver_unavailable", "resolve_timeout"}:
+            resolve_status = "timeout" if outcome.outcome == "resolve_timeout" else "failed"
+        else:
+            resolve_status = "unknown"
+        observation = {
+            **payload,
+            "image_source": source_categories,
+            "image_resolve_status": resolve_status,
+            "vision_barrier_status": "failed" if outcome.failed_count else "completed",
+            "vision_wait_ms": outcome.elapsed_ms,
+            "vision_timeout_ms": outcome.elapsed_ms if outcome.timeout_count else 0,
+            "vision_fallback": outcome.downstream_action == "continue_with_placeholder",
+            "visual_memory_id": memory_ids[0] if memory_ids else "",
+            "visual_memory_ids": memory_ids,
+        }
         event.set_extra("astrmai_vision_barrier_outcome", payload)
+        event.set_extra("astrmai_vision_observability", observation)
+        record_vision_observation(event, observation)
         debug_trace(event, "vision.barrier", chat_id=effective_chat_id, **payload)
 
     @staticmethod

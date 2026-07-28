@@ -8,6 +8,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
+from ...shared.helpers.plugin_helpers import is_direct_call_event
 from ..reply_shape_policy import resolve_reply_shape_policy
 
 
@@ -40,6 +41,55 @@ class AttentionDecisionRouter:
             return True
         return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters) or any(
             parameter.name == "focus_thread" for parameter in parameters
+        )
+
+    @staticmethod
+    def _is_private_event(event: Any) -> bool:
+        try:
+            return not bool(event.get_group_id())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_direct_event(event: Any) -> bool:
+        try:
+            return bool(is_direct_call_event(event))
+        except Exception:
+            return False
+
+    def _fallback_decision(
+        self,
+        focus_event: Any,
+        *,
+        interaction_kind: str,
+        reason: str,
+    ) -> AttentionDecision:
+        """Choose a conservative fallback when System1 has no usable result.
+
+        Private messages and explicit bot mentions are direct requests and must
+        remain responsive. Unmentioned group traffic should not be promoted to
+        a reply merely because the judge failed.
+        """
+        if interaction_kind == "peer_poke":
+            action = "IGNORE"
+            fallback_reason = "peer_poke"
+        elif self._is_private_event(focus_event) or self._is_direct_event(focus_event):
+            action = "PASS"
+            fallback_reason = "direct"
+        else:
+            action = "WAIT"
+            fallback_reason = "group_unmentioned"
+        if focus_event is not None and hasattr(focus_event, "set_extra"):
+            focus_event.set_extra("astrmai_judge_fallback_action", action.lower())
+            focus_event.set_extra("astrmai_judge_fallback_reason", fallback_reason)
+        return AttentionDecision(
+            action=action,
+            raw_action=action,
+            reason=(
+                f"peer_poke_{reason}"
+                if interaction_kind == "peer_poke"
+                else f"{reason}:{fallback_reason}"
+            ),
         )
 
     async def _run_judge_with_hard_deadline(
@@ -129,9 +179,12 @@ class AttentionDecisionRouter:
         if judge_timeout <= 0.0:
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "budget_exhausted")
-            if interaction_kind == "peer_poke":
-                return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="peer_poke_judge_timeout")
-            return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_budget_exhausted")
+                focus_event.set_extra("astrmai_judge_failure_type", "budget_exhausted")
+            return self._fallback_decision(
+                focus_event,
+                interaction_kind=interaction_kind,
+                reason="judge_budget_exhausted",
+            )
 
         judge_evaluate = self.gate.judge.evaluate
         if self._judge_supports_context_kwargs(judge_evaluate):
@@ -158,21 +211,36 @@ class AttentionDecisionRouter:
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "timeout")
                 focus_event.set_extra("astrmai_judge_timeout", True)
+                focus_event.set_extra("astrmai_judge_failure_type", "timeout")
             if self._consecutive_timeouts % 10 == 1:
                 logger.warning(
                     f"[AttentionGate] Judge timeout x{self._consecutive_timeouts} for {chat_id}; passing through"
                 )
-            if interaction_kind == "peer_poke":
-                return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="peer_poke_judge_timeout")
-            return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_timeout")
+            return self._fallback_decision(
+                focus_event,
+                interaction_kind=interaction_kind,
+                reason="judge_timeout",
+            )
         except Exception as exc:
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_outcome", "degraded")
+                focus_event.set_extra("astrmai_judge_failure_type", type(exc).__name__)
             logger.debug(f"[AttentionGate] Judge degraded: {exc}")
-            if interaction_kind == "peer_poke":
-                return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="peer_poke_judge_degraded")
-            return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_degraded")
+            return self._fallback_decision(
+                focus_event,
+                interaction_kind=interaction_kind,
+                reason="judge_degraded",
+            )
 
+        if result is None or not str(getattr(result, "action", "") or "").strip():
+            if focus_event is not None and hasattr(focus_event, "set_extra"):
+                focus_event.set_extra("astrmai_judge_outcome", "empty_response")
+                focus_event.set_extra("astrmai_judge_failure_type", "empty_response")
+            return self._fallback_decision(
+                focus_event,
+                interaction_kind=interaction_kind,
+                reason="judge_empty_response",
+            )
         raw_action = str(getattr(result, "action", "PASS") or "PASS").upper()
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_outcome", raw_action.lower())

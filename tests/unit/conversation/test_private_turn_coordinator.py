@@ -495,6 +495,52 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertNotIn("content", payload)
         self.assertNotIn("raw_query", payload)
 
+    def test_vision_observation_records_statuses_and_opaque_memory_ids(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+        from astrmai.infrastructure.runtime.turn_call_ledger import turn_telemetry_snapshot
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=1,
+            ),
+            timing=SimpleNamespace(
+                image_resolve_timeout_sec=1.0,
+                image_analysis_timeout_sec=1.0,
+                vision_barrier_total_timeout_sec=2.0,
+            ),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+                image_analysis_retries=1,
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_Resolver(),
+            visual_cortex=_VisualCortex(),
+        )
+        event = _Event("帮我看看")
+        event.set_extra("extracted_image_refs", ["https://example.invalid/image.jpg"])
+
+        outcome = asyncio.run(
+            coordinator.prepare_direct_event(event, "ff:FriendMessage:user-1")
+        )
+
+        self.assertEqual(outcome.outcome, "success")
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["image_source"], ["url"])
+        self.assertEqual(observation["image_resolve_status"], "success")
+        self.assertEqual(observation["vision_barrier_status"], "completed")
+        self.assertFalse(observation["vision_fallback"])
+        self.assertTrue(observation["visual_memory_id"])
+        self.assertNotIn("description", observation)
+        snapshot = turn_telemetry_snapshot(event)
+        self.assertEqual(snapshot["vision_observation"]["image_count"], 1)
+        self.assertNotIn("resolved.jpg", str(snapshot["vision_observation"]))
+
     def test_missing_resolver_obeys_required_vision_policy_for_image_event(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 

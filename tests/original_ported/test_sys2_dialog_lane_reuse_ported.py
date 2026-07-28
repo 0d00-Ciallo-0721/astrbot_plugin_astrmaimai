@@ -104,8 +104,8 @@ class Sys2DialogLaneReusePortedTests(unittest.TestCase):
         mode, kwargs = gateway.calls[0]
         self.assertEqual(mode, "chat")
         self.assertEqual(kwargs["lane_key"].task_family, "dialog")
-        self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1@@thread:sender:user-1")
-        self.assertEqual(kwargs["lane_key"].scope_id, "default:GroupMessage:group-1#sender:user-1")
+        self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1@@topic:1")
+        self.assertEqual(kwargs["lane_key"].scope_id, "default:GroupMessage:group-1#topic:1")
 
     def test_private_text_mode_keeps_chat_scoped_dialog_lane(self):
         gateway = _FakeGateway()

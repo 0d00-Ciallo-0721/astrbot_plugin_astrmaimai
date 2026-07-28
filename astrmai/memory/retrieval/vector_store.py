@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from typing import List, Dict, Any, Optional
@@ -17,6 +18,40 @@ class VectorRetriever:
         # ID 映射缓存优化 (int_id -> uuid)
         self._id_cache: Dict[int, str] = {}
         self._cache_max_size = 1000
+        self._failure_count = 0
+        self._unavailable_until = 0.0
+
+    def _timing_value(self, name: str, default: float) -> float:
+        timing = getattr(self.config, "timing", None)
+        if timing is None and isinstance(self.config, dict):
+            timing = self.config.get("timing")
+        value = getattr(timing, name, None) if timing is not None else None
+        if value is None and isinstance(timing, dict):
+            value = timing.get(name)
+        try:
+            return float(value if value is not None else default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _failure_threshold(self) -> int:
+        return max(1, int(self._timing_value("faiss_failure_threshold", 3.0)))
+
+    def _circuit_open(self) -> bool:
+        return time.monotonic() < self._unavailable_until
+
+    def _mark_failure(self, reason: str) -> None:
+        self._failure_count += 1
+        if self._failure_count >= self._failure_threshold():
+            cooldown = max(5.0, self._timing_value("faiss_circuit_breaker_cooldown_sec", 30.0))
+            self._unavailable_until = time.monotonic() + cooldown
+            logger.warning(
+                f"[VectorStore] Faiss circuit opened: failures={self._failure_count} "
+                f"cooldown_sec={cooldown:.1f} reason={reason}"
+            )
+
+    def _mark_success(self) -> None:
+        self._failure_count = 0
+        self._unavailable_until = 0.0
 
     @staticmethod
     def _normalize_metadata(raw_metadata: Any) -> Dict[str, Any]:
@@ -53,6 +88,9 @@ class VectorRetriever:
         """执行向量相似度搜索"""
         if not query or not query.strip():
             return []
+        if self._circuit_open():
+            logger.warning("[VectorStore] Faiss circuit open; using lexical fallback")
+            return []
             
         # 预处理查询
         tokens = self.processor.tokenize(query)
@@ -69,14 +107,23 @@ class VectorRetriever:
 
         # 执行原生检索
         try:
-            faiss_results = await self.faiss_db.retrieve(
-                query=processed_query,
-                k=k,
-                fetch_k=fetch_k,
-                rerank=False,
-                metadata_filters=metadata_filters if metadata_filters else None,
+            faiss_results = await asyncio.wait_for(
+                self.faiss_db.retrieve(
+                    query=processed_query,
+                    k=k,
+                    fetch_k=fetch_k,
+                    rerank=False,
+                    metadata_filters=metadata_filters if metadata_filters else None,
+                ),
+                timeout=max(0.5, self._timing_value("faiss_timeout_sec", 4.0)),
             )
+            self._mark_success()
+        except asyncio.TimeoutError:
+            self._mark_failure("timeout")
+            logger.warning("[VectorStore] Faiss search timed out; using lexical fallback")
+            return []
         except Exception as e:
+            self._mark_failure(type(e).__name__)
             logger.error(f"[VectorStore] Faiss 原生检索异常: {e}")
             return []
 

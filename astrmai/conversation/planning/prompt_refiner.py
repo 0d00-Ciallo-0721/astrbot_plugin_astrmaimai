@@ -153,9 +153,11 @@ class PromptRefiner:
         return (
             "---最终发言人归因锁---\n"
             f"当前唯一对话对象是 {display_name}（QQ {display_id}）。"
-            "回复中的第二人称、昵称和关系称呼必须指向这一位；"
-            "历史群友只能作为第三方背景。除非当前消息明确提到某位群友，"
-            "不要从历史、记忆、内在驱动或工具参数中补出其他人的名字。"
+            "回复中的第二人称和直接称呼只能指向这一位；"
+            "但当前发言人身份不会自动改变人格中的默认称呼，也不会自动获得某个固定关系。"
+            "关系称呼只有在当前消息或稳定事实明确支持时才能使用；"
+            "历史群友只能作为第三方背景，机器人旧回复、记忆、内在驱动或工具参数都不能单独证明关系。"
+            "除非当前消息明确提到某位群友，不要从历史、记忆、内在驱动或工具参数中补出其他人的名字。"
         )
 
     def _resolve_soft_background_budget(
@@ -906,6 +908,7 @@ class PromptRefiner:
         related_context_text = prompt_envelope.related_context_text.strip()
         background_window_text = prompt_envelope.ambient_background_text.strip()
         current_speaker_block = str(getattr(prompt_envelope, "current_speaker_block", "") or "").strip()
+        referenced_entity_block = str(getattr(prompt_envelope, "referenced_entity_block", "") or "").strip()
         focus_reason = prompt_envelope.focus_reason.strip()
         focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
         near_context_priority = bool(prompt_envelope.near_context_priority)
@@ -1096,6 +1099,8 @@ class PromptRefiner:
                 )
         if current_speaker_block:
             sections.append(f"---当前发言人边界---\n{PromptEnvelope.sanitize_inline_text(current_speaker_block)}")
+        if referenced_entity_block:
+            sections.append(f"---本轮提及对象边界---\n{PromptEnvelope.sanitize_inline_text(referenced_entity_block)}")
         if focus_message_text:
             sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(PromptEnvelope.sanitize_user_input(focus_message_text))}")
         if direct_context_text:

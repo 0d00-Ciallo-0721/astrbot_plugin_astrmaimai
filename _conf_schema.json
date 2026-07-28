@@ -247,6 +247,48 @@
         "default": true,
         "hint": "开启后，群聊等待状态和对话轮次会按群内话题线程隔离，减少不同用户或不同话题互相串扰；关闭后使用整群共用状态。"
       },
+      "group_shared_history_enabled": {
+        "description": "启用群聊共享话题历史",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，同一个群当前话题的聊天历史由所有群友共同参与，不会按每个人拆成孤立会话；称号、昵称等人物状态仍会按账号归属隔离。"
+      },
+      "group_topic_active_ttl_sec": {
+        "description": "群聊话题直接承接时间（秒）",
+        "type": "int",
+        "default": 1200,
+        "hint": "在这段时间内，回复引用、相似话题和简短追问可以直接承接当前群话题。默认 1200 秒，即 20 分钟。"
+      },
+      "group_topic_confirm_after_sec": {
+        "description": "群聊旧话题停止自动承接时间（秒）",
+        "type": "int",
+        "default": 1800,
+        "hint": "超过这个时间后，不再自动恢复旧话题；只有用户明确说“上次、之前、还记得”等回忆表达时才会检索旧内容。默认 1800 秒，即 30 分钟。"
+      },
+      "group_social_state_ttl_sec": {
+        "description": "群内人物互动状态保留时间（秒）",
+        "type": "int",
+        "default": 86400,
+        "hint": "称号、昵称、承诺和小游戏状态在群内保留多久。读取时会校验所属账号，避免把一个人的状态套到另一个人身上。默认保留 1 天。"
+      },
+      "group_social_ownership_check_enabled": {
+        "description": "校验群内人物状态归属",
+        "type": "bool",
+        "default": true,
+        "hint": "强烈建议开启。开启后，称号、昵称、承诺和小游戏状态只会提供给其所属账号，不会因共享群聊历史而串给其他群友。"
+      },
+      "group_provider_topic_session_enabled": {
+        "description": "同一群话题复用模型会话",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，仅在确认属于同一群话题时复用模型会话；新话题、旧话题回忆和无承接证据的消息会切断隐藏会话，减少上下文污染。"
+      },
+      "group_history_debug_trace_enabled": {
+        "description": "启用群聊历史详细调试轨迹",
+        "type": "bool",
+        "default": false,
+        "hint": "仅排查群聊串话时开启。默认轨迹只记录模式、话题编号、发言人编号和事件编号，不记录聊天正文。"
+      },
       "non_conversational_guard_enabled": {
         "description": "隔离测试与控制消息",
         "type": "bool",
@@ -1216,7 +1258,7 @@
       "query_rewrite_timeout_sec": {
         "description": "记忆查询改写快速等待时间（秒）",
         "type": "float",
-        "default": 8.0,
+        "default": 3.0,
         "minimum": 0.5,
         "maximum": 60,
         "hint": "仅限制可选的查询改写步骤。超时后立即使用用户原话检索，不会阻塞正常记忆召回。"
@@ -1236,6 +1278,30 @@
         "minimum": 1,
         "maximum": 600,
         "hint": "向量模型单次生成向量的等待时间，仅影响向量检索。"
+      },
+      "faiss_timeout_sec": {
+        "description": "向量检索最长等待时间（秒）",
+        "type": "float",
+        "default": 4.0,
+        "minimum": 0.5,
+        "maximum": 60,
+        "hint": "向量检索超时后立即使用文字检索，不会阻塞本轮聊天。"
+      },
+      "faiss_failure_threshold": {
+        "description": "向量检索连续失败次数",
+        "type": "int",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "hint": "连续失败达到次数后暂时跳过向量检索，减少重复等待。"
+      },
+      "faiss_circuit_breaker_cooldown_sec": {
+        "description": "向量检索暂时熔断时间（秒）",
+        "type": "float",
+        "default": 30.0,
+        "minimum": 5,
+        "maximum": 600,
+        "hint": "熔断期间直接使用文字检索，时间到后自动尝试恢复。"
       },
       "private_wait_timeout_sec": {
         "description": "私聊等待下一句时间（秒）",

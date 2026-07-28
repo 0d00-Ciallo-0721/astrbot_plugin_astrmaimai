@@ -1249,7 +1249,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
         engine.summarizer.get_summary = _summary
         envelope = importlib.import_module("astrmai.conversation.contracts.prompt_envelope").PromptEnvelope()
 
-        asyncio.run(
+        system_prompt, _, _ = asyncio.run(
             engine.build_prompt(
                 chat_id="default:GroupMessage:group-1",
                 event_messages=[],
@@ -1269,6 +1269,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertGreaterEqual(status["semi_stable_length"], 0)
         self.assertIn("persona_core", status["frozen_prefix_blocks"])
         self.assertIn("style_block", status["frozen_prefix_blocks"])
+        self.assertIn("addressing_boundary", status["frozen_prefix_blocks"])
         self.assertIn("system_rules", status["frozen_prefix_blocks"])
         self.assertIn("cold_summary", status["semi_stable_blocks"])
         self.assertIn("stable_expression", status["semi_stable_blocks"])
@@ -1279,6 +1280,11 @@ class PersonaContextRefactorTests(unittest.TestCase):
             "current_message_first",
             {item["key"] for item in status["system_rules_items"]},
         )
+        self.assertIn(
+            "addressing_scope",
+            {item["key"] for item in status["system_rules_items"]},
+        )
+        self.assertIn("称呼与关系边界", system_prompt)
 
     def test_context_engine_compresses_cold_summary_for_soft_background(self):
         dialogue_store = SimpleNamespace(
