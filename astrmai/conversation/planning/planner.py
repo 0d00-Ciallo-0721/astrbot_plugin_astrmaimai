@@ -1641,6 +1641,17 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
 
         focus_text = str(getattr(prompt_envelope, "focus_message_text", "") or "")
         raw_user_text = str(getattr(prompt_envelope, "raw_user_text", "") or "")
+        lane_history_included = bool(event.get_extra("astrmai_use_lane_history", False))
+        rendered_history_source = str(
+            getattr(prompt_envelope, "recent_transcript_source", "") or ""
+        ).strip()
+        if rendered_history_source.lower() in {"", "empty", "none"}:
+            rendered_history_source = "rendered_prompt"
+        history_primary_source = (
+            "lane_history"
+            if lane_history_included
+            else rendered_history_source
+        )
         record_context_block_stats(
             event,
             stage="planner.final_prompt_transmitted",
@@ -1653,7 +1664,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 "scope": "transmitted",
                 "focus_occurrences": final_prompt.count(focus_text) if focus_text else 0,
                 "raw_user_occurrences": final_prompt.count(raw_user_text) if raw_user_text else 0,
-                "lane_history_included_separately": True,
+                "lane_history_included_separately": lane_history_included,
+                "history_primary_source": history_primary_source,
             },
         )
 

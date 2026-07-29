@@ -283,11 +283,18 @@ class PromptRefiner:
     ) -> tuple[str, dict[str, object]]:
         proactive_text = str(proactive_recall or "").strip()
         injection_text = str(injection or "").strip()
+        deduped_proactive_text, removed_lines = self._deduplicate_transcript_with_stats(
+            proactive_text,
+            [injection_text],
+            min_dedup_length=6,
+        )
+        proactive_text = deduped_proactive_text
         memory_parts = [part for part in (proactive_text, injection_text) if part]
         rendered = "\n".join(memory_parts).strip()
         return rendered, {
             "rendered_chars": len(rendered),
             "trimmed_sections": [],
+            "dedup_removed_lines": removed_lines,
             "proactive_recall": proactive_text,
             "injection": injection_text,
             "sections": {
@@ -1066,9 +1073,15 @@ class PromptRefiner:
             "observe_only": context_dedup_observe_only,
             "recent_removed_lines": recent_removed_lines,
             "warm_removed_lines": warm_removed_lines,
-            "removed_lines": recent_removed_lines + warm_removed_lines,
+            "memory_removed_lines": int(memory_meta.get("dedup_removed_lines", 0) or 0),
+            "removed_lines": (
+                recent_removed_lines
+                + warm_removed_lines
+                + int(memory_meta.get("dedup_removed_lines", 0) or 0)
+            ),
             "recent_chars": len(recent_transcript),
             "warm_chars": len(warm_zone_transcript),
+            "memory_chars": len(memory_text),
         }
         set_extra = getattr(event, "set_extra", None)
         if callable(set_extra):

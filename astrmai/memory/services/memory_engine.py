@@ -85,6 +85,7 @@ class MemoryEngine:
         self.session_summarizer = None
         self.memory_observer = None
         self.observability_hub = None
+        self.index_projector = None
 
         self._faiss_lock = asyncio.Lock()
         self._is_ready = False
@@ -895,8 +896,9 @@ class MemoryEngine:
         return await self.recall_persona_lore(query=query, persona_id=persona_id, top_k=kwargs.get("top_k", 3))
 
     async def start_background_tasks(self):
-        if self.index_projector is not None:
-            await self.index_projector.start()
+        projector = getattr(self, "index_projector", None)
+        if projector is not None:
+            await projector.start()
         raw_trace_store = getattr(getattr(self, "db_service", None), "raw_trace_store", None)
         self.memory_observer = MemoryObserver(
             raw_trace_store,

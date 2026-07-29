@@ -197,6 +197,27 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertIn("Dave: separate transcript line", transcript_block)
         self.assertIn("---前因---\nCarol: longer duplicated clue", final_prompt)
 
+    def test_memory_block_deduplicates_proactive_recall_against_current_injection(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=False)),
+            react_retriever=None,
+        )
+
+        rendered, metadata = refiner._render_memory_block_for_budget(
+            proactive_recall="共同事实：用户喜欢焦糖布丁\n主动回忆独有线索",
+            injection="共同事实：用户喜欢焦糖布丁\n本轮检索独有线索",
+        )
+
+        self.assertEqual(rendered.count("共同事实：用户喜欢焦糖布丁"), 1)
+        self.assertIn("主动回忆独有线索", rendered)
+        self.assertIn("本轮检索独有线索", rendered)
+        self.assertEqual(metadata["dedup_removed_lines"], 1)
+        self.assertEqual(
+            metadata["sections"]["proactive_recall"],
+            "主动回忆独有线索",
+        )
+
     def test_source_aware_dedup_removes_current_speaker_only(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=None,

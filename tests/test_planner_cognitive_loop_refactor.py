@@ -390,6 +390,8 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertEqual(context_stats[-3]["metadata"]["scope"], "constructed")
         self.assertEqual(context_stats[-2]["metadata"]["scope"], "source")
         self.assertEqual(context_stats[-1]["metadata"]["scope"], "transmitted")
+        self.assertFalse(context_stats[-1]["metadata"]["lane_history_included_separately"])
+        self.assertEqual(context_stats[-1]["metadata"]["history_primary_source"], "rendered_prompt")
         self.assertEqual(
             context_stats[-1]["total_chars"],
             len(planner.executor.calls[0]["system_prompt"]) + len(planner.executor.calls[0]["prompt"]),
