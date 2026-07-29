@@ -1263,6 +1263,30 @@
         "maximum": 60,
         "hint": "仅限制可选的查询改写步骤。超时后立即使用用户原话检索，不会阻塞正常记忆召回。"
       },
+      "deep_memory_total_budget_sec": {
+        "description": "深度记忆整条链路总预算（秒）",
+        "type": "float",
+        "default": 12.0,
+        "minimum": 1,
+        "maximum": 120,
+        "hint": "查询改写、记忆重排和记忆压缩共同使用这段时间。预算耗尽后立即使用已有文字检索结果继续回复，避免多阶段串行等待。"
+      },
+      "memory_rerank_timeout_sec": {
+        "description": "记忆智能重排单步上限（秒）",
+        "type": "float",
+        "default": 5.0,
+        "minimum": 0.5,
+        "maximum": 30,
+        "hint": "只限制候选记忆的模型重排步骤，并且不会超过深度记忆总预算。超时后保留本地排序结果。"
+      },
+      "memory_compress_timeout_sec": {
+        "description": "记忆压缩整理单步上限（秒）",
+        "type": "float",
+        "default": 4.0,
+        "minimum": 0.5,
+        "maximum": 30,
+        "hint": "只限制记忆压缩步骤，并且不会超过深度记忆总预算。超时后直接使用已选记忆，不影响最终回复。"
+      },
       "compaction_timeout_sec": {
         "description": "上下文压缩超时（秒）",
         "type": "float",

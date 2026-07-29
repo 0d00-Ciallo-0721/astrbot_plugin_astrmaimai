@@ -1377,6 +1377,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         event.set_extra("astrmai_think_level", think_decision.level)
         event.set_extra("astrmai_think_reason", think_decision.reason)
         event.set_extra("astrmai_think_signals", list(think_decision.signals))
+        event.set_extra("astrmai_pipeline_route", think_decision.route)
         turn_context.cognitive.think_level = int(think_decision.level)
         turn_context.cognitive.think_reason = think_decision.reason
         turn_context.cognitive.think_signals = list(think_decision.signals)
@@ -1416,6 +1417,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             "reflection_summary": reflection_summary,
             "cooldown_tags": cooldown_tags,
             "think_decision": think_decision,
+            "pipeline_route": think_decision.route,
             "memory_feedback_summary": memory_feedback_summary,
             "cognitive_gate": cognitive_gate,
         }

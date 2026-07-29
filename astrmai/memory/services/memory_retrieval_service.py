@@ -64,6 +64,65 @@ class MemoryRetrievalService:
         if component not in degraded:
             degraded.append(component)
 
+    def _timing_config(self):
+        return getattr(getattr(self.engine, "config", None), "timing", None) if self.engine else None
+
+    def _begin_deep_memory_budget(self, query: MemoryQuery) -> float:
+        timing = self._timing_config()
+        configured = max(1.0, float(getattr(timing, "deep_memory_total_budget_sec", 12.0) or 12.0))
+        effective = clamp_timeout_to_turn_budget(None, configured, reserve_for_reply=True)
+        metadata = dict(query.metadata or {})
+        metadata["_deep_memory_deadline_mono"] = time.monotonic() + max(0.0, effective)
+        metadata["deep_memory_budget_trace"] = {
+            "configured_budget_sec": round(configured, 3),
+            "effective_budget_sec": round(max(0.0, effective), 3),
+            "status": "running" if effective > 0.0 else "budget_exhausted",
+            "stages": {},
+        }
+        query.metadata = metadata
+        return max(0.0, effective)
+
+    @staticmethod
+    def _remaining_deep_memory_budget(query: MemoryQuery | None) -> float | None:
+        if query is None:
+            return None
+        metadata = query.metadata if isinstance(query.metadata, dict) else {}
+        deadline = metadata.get("_deep_memory_deadline_mono")
+        if deadline is None:
+            return None
+        try:
+            return max(0.0, float(deadline) - time.monotonic())
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _record_deep_memory_stage(
+        cls,
+        query: MemoryQuery | None,
+        stage: str,
+        *,
+        status: str,
+        elapsed_ms: float = 0.0,
+        timeout_sec: float = 0.0,
+    ) -> None:
+        if query is None:
+            return
+        metadata = dict(query.metadata or {})
+        trace = metadata.get("deep_memory_budget_trace")
+        if not isinstance(trace, dict):
+            trace = {"stages": {}}
+        stages = trace.get("stages")
+        if not isinstance(stages, dict):
+            stages = {}
+        stages[str(stage or "unknown")] = {
+            "status": str(status or "unknown"),
+            "elapsed_ms": round(max(0.0, float(elapsed_ms or 0.0)), 2),
+            "timeout_sec": round(max(0.0, float(timeout_sec or 0.0)), 3),
+        }
+        trace["stages"] = stages
+        metadata["deep_memory_budget_trace"] = trace
+        query.metadata = metadata
+
     @staticmethod
     def _matched_sources(value) -> list[str]:
         values = [value] if isinstance(value, str) else list(value or [])
@@ -420,6 +479,16 @@ class MemoryRetrievalService:
 
     async def retrieve_deep(self, query: MemoryQuery) -> list[MemoryCandidate]:
         queries = [query.query]
+        deep_started = time.perf_counter()
+        deep_budget = self._begin_deep_memory_budget(query)
+        if deep_budget <= 0.0:
+            candidates = await self._retrieve_queries(
+                query,
+                [query.query],
+                top_k=query.top_k,
+                candidate_pool_limit=self._candidate_limit(query),
+            )
+            return await self._finalize_retrieval(query, candidates)
         try:
             if self._query_rewrite_eligible(query):
                 queries = await self._rewrite_queries(query)
@@ -450,9 +519,18 @@ class MemoryRetrievalService:
             if guidance:
                 for item in candidates:
                     item.metadata.setdefault("deep_guidance", guidance)
-            return await self._finalize_retrieval(query, candidates)
+            result = await self._finalize_retrieval(query, candidates)
+            trace = dict((query.metadata or {}).get("deep_memory_budget_trace") or {})
+            trace["status"] = "completed"
+            trace["elapsed_ms"] = round((time.perf_counter() - deep_started) * 1000, 2)
+            query.metadata["deep_memory_budget_trace"] = trace
+            return result
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep retrieval degraded: {exc}")
+            trace = dict((query.metadata or {}).get("deep_memory_budget_trace") or {})
+            trace["status"] = "degraded"
+            trace["elapsed_ms"] = round((time.perf_counter() - deep_started) * 1000, 2)
+            query.metadata["deep_memory_budget_trace"] = trace
             candidates = await self._retrieve_queries(
                 query,
                 [query.query],
@@ -818,6 +896,9 @@ class MemoryRetrievalService:
             configured_timeout_sec,
             reserve_for_reply=True,
         )
+        remaining_budget = self._remaining_deep_memory_budget(query)
+        if remaining_budget is not None:
+            timeout_sec = min(timeout_sec, remaining_budget)
         if timeout_sec <= 0.0:
             self._record_query_rewrite_trace(
                 query,
@@ -887,6 +968,13 @@ class MemoryRetrievalService:
             effective_timeout_sec=timeout_sec,
             cancellation_requested=cancellation_requested,
         )
+        self._record_deep_memory_stage(
+            query,
+            "query_rewrite",
+            status=status,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            timeout_sec=timeout_sec,
+        )
         return result
 
     @staticmethod
@@ -922,31 +1010,88 @@ class MemoryRetrievalService:
             metadata["query_rewrite_trace"]["skip_reason"] = str(skip_reason)
         query.metadata = metadata
 
-    async def _call_deep_json(self, prompt: str, *, scope_id: str = "") -> dict:
+    async def _call_deep_json(
+        self,
+        prompt: str,
+        *,
+        query: MemoryQuery | None = None,
+        scope_id: str = "",
+        stage: str = "deep_json",
+    ) -> dict:
         gateway = getattr(self.engine, "gateway", None) if self.engine else None
         if not gateway or not hasattr(gateway, "call_data_process_task"):
+            self._record_deep_memory_stage(query, stage, status="gateway_unavailable")
             return {}
-        # OPT-06/ML-02: rerank/guidance 两次 LLM 此前不带 lane/超时/预算钳制，
-        # 深检索被拖到 50-92s 把整轮回复拖成 stale_drop（线上 3 次深检索 2 次如此收场）
-        timeout_override = clamp_timeout_to_turn_budget(None, 12.0, reserve_for_reply=True)
+        timing = self._timing_config()
+        configured_timeout = 12.0
+        if query is not None and stage == "rerank":
+            configured_timeout = float(getattr(timing, "memory_rerank_timeout_sec", 5.0) or 5.0)
+        elif query is not None and stage == "compress":
+            configured_timeout = float(getattr(timing, "memory_compress_timeout_sec", 4.0) or 4.0)
+        timeout_override = clamp_timeout_to_turn_budget(None, configured_timeout, reserve_for_reply=True)
+        remaining_budget = self._remaining_deep_memory_budget(query)
+        if remaining_budget is not None:
+            timeout_override = min(timeout_override, remaining_budget)
         if timeout_override <= 0.5:
+            self._record_deep_memory_stage(
+                query,
+                stage,
+                status="budget_exhausted",
+                timeout_sec=timeout_override,
+            )
             return {}
+        started = time.perf_counter()
         try:
-            response = await gateway.call_data_process_task(
-                prompt=prompt,
-                is_json=True,
-                lane_key=LaneKey(
-                    subsystem="bg",
-                    task_family="memory",
-                    scope_id=str(scope_id or "global"),
-                    scope_kind="chat" if scope_id else "global",
+            response = await asyncio.wait_for(
+                gateway.call_data_process_task(
+                    prompt=prompt,
+                    is_json=True,
+                    lane_key=LaneKey(
+                        subsystem="bg",
+                        task_family="memory",
+                        scope_id=str(scope_id or "global"),
+                        scope_kind="chat" if scope_id else "global",
+                    ),
+                    base_origin=str(scope_id or ""),
+                    timeout_override=timeout_override,
+                    max_retries_override=0,
+                    max_models_override=1,
+                    use_fallback=False,
+                    allow_cooldown_override=False,
+                    reserve_for_reply=True,
                 ),
-                base_origin=str(scope_id or ""),
-                timeout_override=timeout_override,
-                max_retries_override=0,
+                timeout=timeout_override,
             )
         except TypeError:
-            response = await gateway.call_data_process_task(prompt, is_json=True)
+            response = await asyncio.wait_for(
+                gateway.call_data_process_task(prompt, is_json=True),
+                timeout=timeout_override,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            self._record_deep_memory_stage(
+                query,
+                stage,
+                status="timeout",
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                timeout_sec=timeout_override,
+            )
+            return {}
+        except Exception:
+            self._record_deep_memory_stage(
+                query,
+                stage,
+                status="error",
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                timeout_sec=timeout_override,
+            )
+            raise
+        self._record_deep_memory_stage(
+            query,
+            stage,
+            status="success",
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            timeout_sec=timeout_override,
+        )
         if isinstance(response, str):
             return json.loads(response)
         return response if isinstance(response, dict) else {}
@@ -980,7 +1125,12 @@ class MemoryRetrievalService:
             f"Candidates: {json.dumps(self._candidate_payload(candidates), ensure_ascii=False)}"
         )
         try:
-            data = await self._call_deep_json(prompt, scope_id=str(query.session_id or ""))
+            data = await self._call_deep_json(
+                prompt,
+                query=query,
+                scope_id=str(query.session_id or ""),
+                stage="rerank",
+            )
             ranked_ids = [str(item) for item in data.get("ids", []) if str(item).strip()]
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep rerank degraded: {exc}")
@@ -1014,7 +1164,12 @@ class MemoryRetrievalService:
             f"Candidates: {json.dumps(self._candidate_payload(candidates), ensure_ascii=False)}"
         )
         try:
-            data = await self._call_deep_json(prompt, scope_id=str(query.session_id or ""))
+            data = await self._call_deep_json(
+                prompt,
+                query=query,
+                scope_id=str(query.session_id or ""),
+                stage="compress",
+            )
             return str(data.get("guidance") or "").strip()[:500]
         except Exception as exc:
             logger.warning(f"[MemoryRetrievalService] deep compress degraded: {exc}")

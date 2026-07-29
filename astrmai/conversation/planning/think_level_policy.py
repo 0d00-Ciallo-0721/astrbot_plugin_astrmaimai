@@ -13,6 +13,21 @@ class ThinkLevelDecision:
     level: int = 1
     reason: str = "default"
     signals: list[str] = field(default_factory=list)
+    route: str = ""
+
+    def __post_init__(self) -> None:
+        if self.route:
+            return
+        if self.reason == "sys3_tool_call":
+            self.route = "tool"
+        elif self.level >= 3:
+            self.route = "deep_memory"
+        elif self.level == 2:
+            self.route = "cognitive_chat"
+        elif self.level <= 0:
+            self.route = "fast_chat"
+        else:
+            self.route = "normal_chat"
 
 
 class ThinkLevelPolicy:

@@ -129,6 +129,55 @@ class DeepRetrievalBudgetTests(unittest.TestCase):
         self.assertAlmostEqual(captured.get("timeout_override"), 12.0, places=3)
         self.assertIsNotNone(captured.get("lane_key"))
         self.assertEqual(captured.get("max_retries_override"), 0)
+        self.assertEqual(captured.get("max_models_override"), 1)
+        self.assertFalse(captured.get("use_fallback"))
+        self.assertFalse(captured.get("allow_cooldown_override"))
+
+    def test_deep_memory_stages_share_one_deadline(self):
+        class _Gateway:
+            def __init__(self):
+                self.calls = []
+
+            async def call_data_process_task(self, *args, **kwargs):
+                self.calls.append(dict(kwargs))
+                return {"ids": []}
+
+        gateway = _Gateway()
+        service = self._service_with_gateway(gateway)
+        service.engine.config = SimpleNamespace(
+            timing=SimpleNamespace(
+                deep_memory_total_budget_sec=1.0,
+                memory_rerank_timeout_sec=5.0,
+                memory_compress_timeout_sec=4.0,
+            )
+        )
+        query = MemoryQuery(query="q", session_id="chat-1", top_k=1, metadata={})
+        query.metadata["_deep_memory_deadline_mono"] = time.monotonic() + 0.8
+
+        async def _run():
+            first = await service._call_deep_json(
+                "prompt",
+                query=query,
+                scope_id="chat-1",
+                stage="rerank",
+            )
+            query.metadata["_deep_memory_deadline_mono"] = time.monotonic() - 0.1
+            second = await service._call_deep_json(
+                "prompt",
+                query=query,
+                scope_id="chat-1",
+                stage="compress",
+            )
+            return first, second
+
+        first, second = asyncio.run(_run())
+
+        self.assertEqual(first, {"ids": []})
+        self.assertEqual(second, {})
+        self.assertEqual(len(gateway.calls), 1)
+        self.assertLessEqual(gateway.calls[0]["timeout_override"], 0.81)
+        trace = query.metadata["deep_memory_budget_trace"]["stages"]
+        self.assertEqual(trace["compress"]["status"], "budget_exhausted")
 
     def test_small_candidate_set_skips_rerank(self):
         class _Gateway:

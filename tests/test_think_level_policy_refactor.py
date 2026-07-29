@@ -171,3 +171,23 @@ def test_sharp_and_long_cooldowns_skip_simple_turns_only():
     assert simple.reason in {"short_ack", "cooldown_simple_turn"}
     assert tool.level == 3
     assert meme_cooldown.level == 1
+
+
+def test_think_level_decision_exposes_stable_pipeline_route():
+    policy = ThinkLevelPolicy()
+
+    fast = policy.decide(event=_Event("好", group_id=""))
+    normal = policy.decide(event=_Event("今天过得怎么样", group_id=""))
+    cognitive = policy.decide(event=_Event("为什么我总是感到焦虑", group_id=""))
+    deep_memory = policy.decide(event=_Event("你还记得我上次说了什么吗", group_id=""))
+    tool = policy.decide(
+        event=_Event("查一下天气", group_id=""),
+        judge_action="TOOL_CALL",
+        is_tool_call_mode=True,
+    )
+
+    assert fast.route == "fast_chat"
+    assert normal.route == "normal_chat"
+    assert cognitive.route == "cognitive_chat"
+    assert deep_memory.route == "deep_memory"
+    assert tool.route == "tool"
