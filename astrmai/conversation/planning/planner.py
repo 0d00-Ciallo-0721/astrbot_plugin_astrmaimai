@@ -74,6 +74,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         runtime_coordinator=None,
         cross_session_handoff_store=None,
         cognitive_loop=None,
+        visual_cortex=None,
     ):
         self.gateway = gateway
         self.context_engine = context_engine
@@ -140,6 +141,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             evolution_manager,
             config=gateway.config,
             runtime_coordinator=runtime_coordinator,
+            visual_cortex=visual_cortex,
         )
 
     def refresh_config(self, config) -> None:

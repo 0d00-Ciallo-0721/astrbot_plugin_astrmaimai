@@ -795,6 +795,15 @@ class PrivateTurnCoordinator:
             "vision_fallback": outcome.downstream_action == "continue_with_placeholder",
             "visual_memory_id": memory_ids[0] if memory_ids else "",
             "visual_memory_ids": memory_ids,
+            "vision_path": "barrier",
+            "vision_call_status": "failed" if outcome.failed_count else "success",
+            "visual_memory_write_status": (
+                "persisted_or_cache_hit"
+                if memory_ids
+                else "not_available"
+            ),
+            "prompt_injected": bool(records) or outcome.downstream_action == "continue_with_placeholder",
+            "fallback_reason": outcome.outcome if outcome.failed_count else "",
         }
         event.set_extra("astrmai_vision_barrier_outcome", payload)
         event.set_extra("astrmai_vision_observability", observation)

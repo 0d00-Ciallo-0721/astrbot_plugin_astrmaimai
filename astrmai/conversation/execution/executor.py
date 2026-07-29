@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import re
 import time
 from time import monotonic
@@ -43,7 +44,10 @@ from ..planning.tool_contracts import record_tool_lifecycle
 from ..planning.tool_disclosure import normalize_requested_packages, select_tools_by_packages
 from .group_actor_consistency import GroupActorConsistencyGuard
 from .reply_freshness import ReplyFreshnessMixin, is_stale_reply_reason, resolve_reply_max_age_seconds
-from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
+from ...infrastructure.runtime.turn_call_ledger import (
+    clamp_timeout_to_turn_budget,
+    record_vision_observation,
+)
 
 
 class ConcurrentExecutor:
@@ -55,6 +59,7 @@ class ConcurrentExecutor:
         evolution_manager,
         config=None,
         runtime_coordinator=None,
+        visual_cortex=None,
     ):
         self.context = context
         self.gateway = gateway
@@ -62,6 +67,7 @@ class ConcurrentExecutor:
         self.evolution_manager = evolution_manager
         self.config = config if config else gateway.config
         self.runtime_coordinator = runtime_coordinator
+        self.visual_cortex = visual_cortex
         self._chat_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
@@ -349,6 +355,16 @@ class ConcurrentExecutor:
         vision_cfg = getattr(self.config, "vision", None)
         return bool(getattr(vision_cfg, "use_native_main_reply_vision", False))
 
+    def _vision_reply_policy(self) -> str:
+        vision_cfg = getattr(self.config, "vision", None)
+        raw = str(
+            getattr(vision_cfg, "vision_reply_policy", "超时后忽略图片并继续回复")
+            or ""
+        ).strip()
+        if raw in {"必须识别成功后再回复", "require_analysis", "strict"}:
+            return "require_analysis"
+        return "timeout_fallback"
+
     def _native_main_reply_breaker_until(self, chat_id: str) -> float:
         now = monotonic()
         breaker_until = float(self._native_vision_breakers.get(chat_id, 0.0) or 0.0)
@@ -373,6 +389,8 @@ class ConcurrentExecutor:
     ) -> tuple[bool, str, float]:
         if not self._native_main_reply_vision_enabled():
             return False, "disabled", 0.0
+        if self._vision_reply_policy() == "require_analysis":
+            return False, "strict_requires_relay_analysis", 0.0
         if not vision_bundle.direct_image_urls:
             return False, str(event.get_extra("vision_direct_skip_reason", "") or "not_direct_path"), 0.0
         breaker_until = self._native_main_reply_breaker_until(chat_id)
@@ -678,24 +696,43 @@ class ConcurrentExecutor:
         import tempfile
         from PIL import Image
 
+        started_at = monotonic()
+        policy = self._vision_reply_policy()
         logger.info(f"[{chat_id}] vision direct path triggered in executor")
         self._mark_vision_direct_state(event, invoked=True, outcome="skipped")
         vision_descriptions: list[str] = []
+        visual_memory_ids: list[str] = []
+        image_sources: list[str] = []
+        failed_count = 0
+        resolved_count = 0
+        timeout_count = 0
+        attempt_count = 0
         saw_invalid_output = False
         saw_exception = False
         for url_or_path in vision_bundle.direct_image_urls:
             temp_file_path = None
             created_temp_file_path = None
+            item_succeeded = False
+            source_text = str(url_or_path or "").strip()
+            source_lower = source_text.lower()
+            if source_lower.startswith("data:"):
+                source_category = "data_uri"
+            elif source_lower.startswith(("http://", "https://")):
+                source_category = "url"
+            elif source_text:
+                source_category = "local_file"
+            else:
+                source_category = "unknown"
+            if source_category not in image_sources:
+                image_sources.append(source_category)
             try:
                 image_bytes = None
-                if str(url_or_path).startswith("data:image"):
-                    _, encoded = str(url_or_path).split(",", 1)
+                if source_text.startswith("data:image"):
+                    _, encoded = source_text.split(",", 1)
                     image_bytes = base64.b64decode(encoded)
-                # ponytail: sync file I/O in async context — acceptable for local temp files.
-                # If this becomes a bottleneck, wrap in asyncio.to_thread().
-                elif os.path.exists(url_or_path):
-                    temp_file_path = url_or_path
-                elif str(url_or_path).startswith("http"):
+                elif os.path.exists(source_text):
+                    temp_file_path = source_text
+                elif source_text.startswith("http"):
                     logger.debug(f"[{chat_id}] remote image URL skipped because remote fetching is disabled: {url_or_path}")
 
                 if image_bytes:
@@ -711,26 +748,42 @@ class ConcurrentExecutor:
                     created_temp_file_path = temp_file_path
 
                 if temp_file_path and os.path.exists(temp_file_path):
-                    # OPT-07/RT-05: 视觉旁路此前无任何超时/预算约束（三层重试相乘
-                    # 5×3×7 可单图烧穿 360s 轮预算）；每图按剩余预算钳制，耗尽即止
+                    resolved_count += 1
                     vision_timeout = self._vision_side_path_timeout_override()
                     if vision_timeout <= 0.5:
                         saw_exception = True
+                        timeout_count += 1
                         logger.warning(f"[{chat_id}] vision side-path skipped: turn budget exhausted")
-                        break
-                    result_dict = await self.gateway.call_vision_task(
-                        image_data=temp_file_path,
-                        prompt=VISION_USER_PROMPT,
-                        system_prompt=VISION_SYSTEM_PROMPT,
-                        lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=chat_id),
-                        base_origin=chat_id,
-                        timeout_override=vision_timeout,
-                    )
+                        continue
+                    attempt_count += 1
+                    picid = hashlib.sha256(
+                        f"{chat_id}:{source_text}".encode("utf-8", errors="ignore")
+                    ).hexdigest()
+                    if self.visual_cortex is not None and hasattr(self.visual_cortex, "analyze_image_path"):
+                        vision_call = self.visual_cortex.analyze_image_path(
+                            picid,
+                            temp_file_path,
+                            scope_id=chat_id,
+                            timeout_override=vision_timeout,
+                        )
+                    else:
+                        vision_call = self.gateway.call_vision_task(
+                            image_data=temp_file_path,
+                            prompt=VISION_USER_PROMPT,
+                            system_prompt=VISION_SYSTEM_PROMPT,
+                            lane_key=LaneKey(subsystem="sys1", task_family="vision", scope_id=chat_id),
+                            base_origin=chat_id,
+                            timeout_override=vision_timeout,
+                        )
+                    result_dict = await asyncio.wait_for(vision_call, timeout=vision_timeout)
                     payload, invalid_reason = normalize_vision_result(result_dict)
                     if payload is None:
                         saw_invalid_output = True
                         logger.warning(f"[{chat_id}] vision side-path invalid output: {invalid_reason}")
                         continue
+                    item_succeeded = True
+                    if self.visual_cortex is not None:
+                        visual_memory_ids.append(f"{chat_id}:{picid}")
                     vision_line = render_vision_record(payload)
                     if payload.get("type") == "image":
                         description = str(payload.get("description") or "").strip()
@@ -741,6 +794,10 @@ class ConcurrentExecutor:
                         feeling_line = f"\n它给我的感觉是：{', '.join(tags)}。" if tags else ""
                         vision_line = f"我刚看到一张图片，画面是：{description}{suffix}{feeling_line}\n{vision_line}"
                     vision_descriptions.append(vision_line)
+            except asyncio.TimeoutError:
+                saw_exception = True
+                timeout_count += 1
+                logger.warning(f"[{chat_id}] vision side-path hard timeout")
             except Exception as exc:
                 saw_exception = True
                 attempted_models, failure_reason, failure_kind = self._extract_cascade_failure_meta(exc)
@@ -760,7 +817,10 @@ class ConcurrentExecutor:
                     except Exception:
                         logger.debug("[Executor] temp file cleanup failed", exc_info=True)
                         pass
+                if not item_succeeded:
+                    failed_count += 1
 
+        prompt_injected = bool(vision_descriptions)
         if vision_descriptions:
             vision_inject = (
                 "\n\n"
@@ -794,6 +854,56 @@ class ConcurrentExecutor:
                 outcome="exception",
                 details="no_usable_image_input",
             )
+
+        fallback_reason = ""
+        if failed_count:
+            if policy == "require_analysis":
+                event.set_extra("astrmai_vision_required_failed", True)
+                fallback_reason = "required_analysis_failed"
+            else:
+                model_prompt += "\n\n" + "\n".join("[图片]" for _ in range(failed_count))
+                prompt_injected = True
+                fallback_reason = "placeholder"
+
+        elapsed_ms = int((monotonic() - started_at) * 1000)
+        if failed_count and policy == "require_analysis":
+            observation_outcome = "required_failed"
+        elif failed_count and vision_descriptions:
+            observation_outcome = "partial_fallback"
+        elif failed_count:
+            observation_outcome = "fallback"
+        else:
+            observation_outcome = "success"
+        observation = {
+            "policy": policy,
+            "outcome": observation_outcome,
+            "image_count": len(vision_bundle.direct_image_urls),
+            "resolved_count": resolved_count,
+            "analyzed_count": len(vision_descriptions),
+            "failed_count": failed_count,
+            "timeout_count": timeout_count,
+            "attempt_count": attempt_count,
+            "image_source": image_sources,
+            "image_resolve_status": "failed" if failed_count and not vision_descriptions else "success",
+            "vision_barrier_status": "failed" if failed_count else "completed",
+            "vision_wait_ms": elapsed_ms,
+            "vision_timeout_ms": elapsed_ms if timeout_count else 0,
+            "vision_fallback": bool(failed_count and policy != "require_analysis"),
+            "visual_memory_id": visual_memory_ids[0] if visual_memory_ids else "",
+            "visual_memory_ids": visual_memory_ids,
+            "scope": "private" if "FriendMessage" in chat_id else "group",
+            "vision_path": "direct",
+            "vision_call_status": "failed" if failed_count else "success",
+            "visual_memory_write_status": (
+                "persisted_or_cache_hit"
+                if visual_memory_ids
+                else "not_available"
+            ),
+            "prompt_injected": prompt_injected,
+            "fallback_reason": fallback_reason,
+        }
+        event.set_extra("astrmai_vision_observability", observation)
+        record_vision_observation(event, observation)
         return model_prompt, system_prompt
 
     async def _check_pre_model_freshness(self, event: AstrMessageEvent, chat_id: str, label: str) -> bool:
@@ -804,6 +914,32 @@ class ConcurrentExecutor:
             logger.info(f"[{chat_id}] stop expired {label}: {freshness_reason}")
             return False
         return True
+
+    async def _send_required_vision_failure(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+    ) -> Optional[str]:
+        text = "这张图片暂时没有识别成功，请稍后再发一次。"
+        sent = False
+        if hasattr(event, "send") and hasattr(event, "plain_result"):
+            try:
+                await event.send(event.plain_result(text))
+                sent = True
+            except Exception as exc:
+                logger.warning(f"[{chat_id}] required vision failure notice degraded: {exc}")
+        if not sent:
+            try:
+                artifact = await self.reply_engine.handle_reply(event, text, chat_id)
+                sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
+            except Exception as exc:
+                logger.warning(f"[{chat_id}] required vision fallback send failed: {exc}")
+        event.set_extra("astrmai_vision_failure_notice_sent", sent)
+        event.set_extra(
+            "astrmai_execution_status",
+            "skipped_vision_required" if sent else "fatal_no_send",
+        )
+        return text if sent else None
 
     async def _finalize_reply(self, event: AstrMessageEvent, chat_id: str, bot_id: str, reply_text: str, *, trace_mode: str, model: str) -> Optional[str]:
         actor_guard = GroupActorConsistencyGuard.inspect_and_repair(event, reply_text)
@@ -1274,6 +1410,8 @@ class ConcurrentExecutor:
                 api_prompt, relay_system_prompt = await self._inject_direct_vision_context(
                     event, chat_id, prompt, system_prompt, vision_bundle
                 )
+                if bool(event.get_extra("astrmai_vision_required_failed", False)):
+                    return await self._send_required_vision_failure(event, chat_id)
 
                 if tools is None or len(tools) == 0:
                     return await self._run_text_mode(event, chat_id, api_prompt, relay_system_prompt, runtime)

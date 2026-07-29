@@ -12,7 +12,7 @@ from tests.helpers.executor_stubs import install_executor_stubs
 
 
 class _FakeGateway:
-    def __init__(self, vision_result):
+    def __init__(self, vision_result, *, vision_policy="超时后忽略图片并继续回复"):
         self.calls = []
         self.vision_result = vision_result
         self.config = SimpleNamespace(
@@ -20,7 +20,7 @@ class _FakeGateway:
             infra=SimpleNamespace(api_timeout=15),
             global_settings=SimpleNamespace(debug_mode=False, enable_error_interception=False, admin_ids=[]),
             reply=SimpleNamespace(fallback_text="fallback"),
-            vision=SimpleNamespace(),
+            vision=SimpleNamespace(vision_reply_policy=vision_policy),
         )
 
     async def call_vision_task(self, **kwargs):
@@ -38,6 +38,25 @@ class _FakeReplyService:
 class _FakeEvolution:
     async def process_bot_reply(self, chat_id, bot_id, reply_text):
         return None
+
+
+class _FakeVisualCortex:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def analyze_image_path(self, picid, image_path, scope_id="global", timeout_override=None):
+        self.calls.append(
+            {
+                "picid": picid,
+                "image_path": image_path,
+                "scope_id": scope_id,
+                "timeout_override": timeout_override,
+            }
+        )
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
 
 
 class _FakeEvent:
@@ -78,14 +97,15 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         except Exception:
             pass
 
-    def _executor(self, vision_result):
-        gateway = _FakeGateway(vision_result=vision_result)
+    def _executor(self, vision_result, *, visual_cortex=None, vision_policy="超时后忽略图片并继续回复"):
+        gateway = _FakeGateway(vision_result=vision_result, vision_policy=vision_policy)
         executor = self.executor_mod.ConcurrentExecutor(
             context=SimpleNamespace(),
             gateway=gateway,
             reply_engine=_FakeReplyService(),
             evolution_manager=_FakeEvolution(),
             config=gateway.config,
+            visual_cortex=visual_cortex,
         )
         return executor, gateway
 
@@ -123,10 +143,11 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
             except OSError:
                 pass
 
-        self.assertEqual(model_prompt, "prompt")
+        self.assertEqual(model_prompt, "prompt\n\n[图片]")
         self.assertEqual(system_prompt, "system")
         self.assertTrue(event.get_extra("vision_direct_invoked"))
         self.assertEqual(event.get_extra("vision_direct_outcome"), "invalid_output")
+        self.assertTrue(event.get_extra("astrmai_vision_observability")["vision_fallback"])
 
     def test_invalid_tags_are_dropped_but_description_is_kept(self):
         executor, _gateway = self._executor(
@@ -188,6 +209,107 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         self.assertIn("聊天系统中的视觉转述模块", gateway.calls[0][1]["system_prompt"])
         self.assertEqual(event.get_extra("vision_direct_outcome"), "success")
 
+    def test_direct_vision_reuses_visual_cortex_and_records_persistence_observation(self):
+        visual_cortex = _FakeVisualCortex(
+            {
+                "type": "image",
+                "description": "桌上放着一杯焦糖布丁。",
+                "emotion_tags": ["开心"],
+                "_cache_hit": False,
+            }
+        )
+        executor, gateway = self._executor({}, visual_cortex=visual_cortex)
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        try:
+            model_prompt, _system_prompt = asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    "prompt",
+                    "system",
+                    self._vision_bundle(temp_image.name),
+                )
+            )
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertIn("焦糖布丁", model_prompt)
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(len(visual_cortex.calls), 1)
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["vision_path"], "direct")
+        self.assertEqual(observation["visual_memory_write_status"], "persisted_or_cache_hit")
+        self.assertTrue(observation["visual_memory_ids"])
+        self.assertTrue(observation["prompt_injected"])
+
+    def test_direct_vision_timeout_fallback_injects_image_placeholder(self):
+        visual_cortex = _FakeVisualCortex(asyncio.TimeoutError())
+        executor, _gateway = self._executor({}, visual_cortex=visual_cortex)
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        try:
+            model_prompt, _system_prompt = asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    "prompt",
+                    "system",
+                    self._vision_bundle(temp_image.name),
+                )
+            )
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(model_prompt, "prompt\n\n[图片]")
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["outcome"], "fallback")
+        self.assertTrue(observation["vision_fallback"])
+        self.assertEqual(observation["fallback_reason"], "placeholder")
+
+    def test_direct_vision_strict_policy_stops_placeholder_fallback(self):
+        visual_cortex = _FakeVisualCortex(RuntimeError("vision unavailable"))
+        executor, _gateway = self._executor(
+            {},
+            visual_cortex=visual_cortex,
+            vision_policy="必须识别成功后再回复",
+        )
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        try:
+            model_prompt, _system_prompt = asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    "prompt",
+                    "system",
+                    self._vision_bundle(temp_image.name),
+                )
+            )
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(model_prompt, "prompt")
+        self.assertTrue(event.get_extra("astrmai_vision_required_failed"))
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["outcome"], "required_failed")
+        self.assertFalse(observation["vision_fallback"])
+
     def test_no_direct_vision_urls_marks_skip_reason(self):
         executor, _gateway = self._executor({"description": "unused", "emotion_tags": []})
         event = _FakeEvent()
@@ -247,11 +369,12 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
             except OSError:
                 pass
 
-        self.assertEqual(model_prompt, "prompt")
+        self.assertEqual(model_prompt, "prompt\n\n[图片]")
         self.assertEqual(system_prompt, "system")
         self.assertEqual(event.get_extra("vision_direct_outcome"), "exception")
         self.assertEqual(event.get_extra("vision_direct_attempted_models"), ["vision-a", "vision-b"])
         self.assertEqual(event.get_extra("vision_direct_failure_reason"), "empty_description")
+        self.assertTrue(event.get_extra("astrmai_vision_observability")["vision_fallback"])
         self.assertEqual(len(gateway.calls), 1)
 
     def test_remote_image_ref_is_ignored_when_remote_fetching_is_disabled(self):
@@ -275,9 +398,12 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
 
         model_prompt, system_prompt = asyncio.run(_run())
 
-        self.assertEqual(model_prompt, "prompt")
+        self.assertEqual(model_prompt, "prompt\n\n[图片]")
         self.assertEqual(system_prompt, "system")
         self.assertEqual(event.get_extra("vision_direct_outcome"), "exception")
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["resolved_count"], 0)
+        self.assertTrue(observation["vision_fallback"])
 
 
 if __name__ == "__main__":

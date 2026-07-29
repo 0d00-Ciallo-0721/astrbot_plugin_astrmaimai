@@ -331,6 +331,7 @@ class PluginBootstrap:
             sys3_router=runtime.sys3_router,
             runtime_coordinator=runtime.runtime_coordinator,
             cross_session_handoff_store=runtime.cross_session_handoff_store,
+            visual_cortex=runtime.visual_cortex,
         )
         system2_runner = System2Runner(runtime)
         self._bind_learning_collaboration(runtime, evolution)

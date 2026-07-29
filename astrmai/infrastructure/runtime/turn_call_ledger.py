@@ -869,6 +869,11 @@ def record_vision_observation(
         "visual_memory_id",
         "visual_memory_ids",
         "scope",
+        "vision_path",
+        "vision_call_status",
+        "visual_memory_write_status",
+        "prompt_injected",
+        "fallback_reason",
     }
     normalized: dict[str, Any] = {}
     for key in allowed:
