@@ -93,6 +93,7 @@ class GatewayTaskMixin:
                     parsed = result.parsed_json or {}
                     is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
                     if is_valid:
+                        parsed["_vision_model_id"] = result.model_id or model_id
                         return parsed
                     last_error = failure_reason
                     last_kind = self._classify_failure_kind(failure_reason).value
@@ -169,6 +170,7 @@ class GatewayTaskMixin:
                 parsed = result.parsed_json or {}
                 is_valid, failure_reason = self._normalize_vision_failure_reason(parsed)
                 if is_valid:
+                    parsed["_vision_model_id"] = result.model_id or model_id
                     return parsed
                 last_error = failure_reason
                 last_kind = self._classify_failure_kind(failure_reason).value

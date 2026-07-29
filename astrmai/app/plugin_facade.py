@@ -242,6 +242,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("system2_planner", getattr(self.runtime, "system2_planner", None)),
             ("context_compaction", getattr(self.runtime, "context_compaction", None)),
             ("persona_summarizer", getattr(self.runtime, "persona_summarizer", None)),
+            ("visual_cortex", getattr(self.runtime, "visual_cortex", None)),
             ("evolution", getattr(self.runtime, "evolution", None)),
             ("expression_governance_runner", getattr(self.runtime, "expression_governance_runner", None)),
             ("memory_engine", getattr(self.runtime, "memory_engine", None)),

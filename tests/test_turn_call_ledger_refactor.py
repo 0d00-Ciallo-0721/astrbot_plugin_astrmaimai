@@ -17,6 +17,7 @@ from astrmai.infrastructure.runtime.turn_call_ledger import (
     attach_background_task_trace,
     record_context_block_stats,
     record_reply_stats,
+    record_vision_observation,
     turn_telemetry_scope,
     turn_telemetry_snapshot,
 )
@@ -100,6 +101,43 @@ def test_context_block_stats_identify_exact_duplicate_blocks():
     assert payload["duplicate_block_count"] == 1
     assert payload["blocks"]["recent"]["duplicate_of"] == "focus"
     assert payload["duplicate_pairs"] == [{"block": "recent", "duplicate_of": "focus"}]
+
+
+def test_vision_observation_keeps_diagnostics_without_source_or_description():
+    event = _Event()
+
+    record_vision_observation(
+        event,
+        {
+            "vision_path": "direct",
+            "vision_call_status": "failed",
+            "image_count": 1,
+            "cache_hit_count": 0,
+            "cache_miss_count": 1,
+            "singleflight_wait_count": 0,
+            "asset_ids": ["opaque-asset-id"],
+            "binding_count": 0,
+            "failure_stage": "resolve",
+            "skip_reason": "remote_fetch_disabled",
+            "model_ids": ["vision-model"],
+            "analysis_prompt_version": "v2",
+            "asset_storage_status": "disabled",
+            "final_status": "fallback",
+            "source_ref": "https://private.example/image.png",
+            "description": "用户图片里的私密文字",
+        },
+    )
+
+    payload = event.get_extra("astrmai_vision_observation")
+    assert payload["failure_stage"] == "resolve"
+    assert payload["skip_reason"] == "remote_fetch_disabled"
+    assert payload["asset_ids"] == ["opaque-asset-id"]
+    assert payload["model_ids"] == ["vision-model"]
+    assert payload["analysis_prompt_version"] == "v2"
+    assert "source_ref" not in payload
+    assert "description" not in payload
+    assert "private.example" not in str(payload)
+    assert "私密文字" not in str(payload)
 
 
 def test_tool_ledger_summary_exposes_execution_without_prompt_content():

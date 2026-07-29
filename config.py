@@ -381,6 +381,38 @@ class InfraConfig(BaseModel):
 class VisionConfig(BaseModel):
     enable_vision: bool = Field(default=True, description="多模态视觉总开关")
     image_recognition_probability: float = Field(default=0.5, ge=0.0, le=1.0, description="图片被送入视觉皮层解析的概率 (0.0~1.0)")
+    enable_visual_result_cache: bool = Field(
+        default=True,
+        description="复用已经识别过的相同图片，避免重复调用视觉模型",
+    )
+    store_visual_asset_files: bool = Field(
+        default=False,
+        description="是否保存标准化后的图片副本；默认只保存图片指纹和转述结果",
+    )
+    visual_asset_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3650,
+        description="标准化图片副本的保留天数",
+    )
+    visual_asset_max_disk_mb: int = Field(
+        default=512,
+        ge=16,
+        le=102400,
+        description="标准化图片副本最多占用的磁盘空间（MB）",
+    )
+    visual_asset_max_edge_px: int = Field(
+        default=1600,
+        ge=256,
+        le=4096,
+        description="保存标准化图片副本时的最长边像素",
+    )
+    visual_prompt_version: str = Field(
+        default="v1",
+        min_length=1,
+        max_length=64,
+        description="图片转述规则版本；修改后相同图片会重新识别",
+    )
     vision_reply_policy: str = Field(
         default="超时后忽略图片并继续回复",
         description="图片识别超时后的回复策略",

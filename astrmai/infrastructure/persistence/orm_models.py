@@ -153,6 +153,59 @@ class VisualMemory(SQLModel, table=True):
     timestamp: float = Field(default_factory=time.time)
 
 
+class VisualAsset(SQLModel, table=True):
+    """Content-addressed visual analysis shared across messages and sessions."""
+
+    __table_args__ = {"extend_existing": True}
+
+    asset_id: str = Field(primary_key=True)
+    blob_hash: str = Field(default="", index=True)
+    pixel_hash: str = Field(default="", index=True)
+    perceptual_hash: str = Field(default="", index=True)
+    prompt_version: str = Field(default="v1", index=True)
+    type: str = Field(default="image")
+    description: str = Field(default="")
+    emotion_tags: str = Field(default="[]")
+    model_id: str = Field(default="")
+    mime_type: str = Field(default="")
+    width: int = Field(default=0)
+    height: int = Field(default=0)
+    frame_count: int = Field(default=1)
+    byte_size: int = Field(default=0)
+    storage_path: str = Field(default="")
+    status: str = Field(default="ready", index=True)
+    hit_count: int = Field(default=0)
+    last_error: str = Field(default="")
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+    last_access_at: float = Field(default_factory=time.time, index=True)
+
+
+class VisualMessageBinding(SQLModel, table=True):
+    """Maps one concrete message image to its reusable visual asset."""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "chat_id",
+            "message_id",
+            "image_index",
+            name="uq_visual_message_binding",
+        ),
+        {"extend_existing": True},
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    chat_id: str = Field(default="", index=True)
+    message_id: str = Field(default="", index=True)
+    sender_id: str = Field(default="", index=True)
+    image_index: int = Field(default=0)
+    asset_id: str = Field(default="", index=True)
+    legacy_picid: str = Field(default="", index=True)
+    source_ref_hash: str = Field(default="")
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+
+
 class MemoryNode(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
@@ -238,5 +291,7 @@ __all__ = [
     "MessageLog",
     "SocialRelation",
     "UserProfile",
+    "VisualAsset",
+    "VisualMessageBinding",
     "VisualMemory",
 ]

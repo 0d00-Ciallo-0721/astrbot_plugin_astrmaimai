@@ -19,6 +19,8 @@ _EXPORTS = {
     "ProfileRepository": (".repositories.profile_repository", "ProfileRepository"),
     "ReviewRepository": (".repositories.review_repository", "ReviewRepository"),
     "SocialRelation": (".orm_models", "SocialRelation"),
+    "VisualAsset": (".orm_models", "VisualAsset"),
+    "VisualMessageBinding": (".orm_models", "VisualMessageBinding"),
     "VisualMemory": (".orm_models", "VisualMemory"),
 }
 

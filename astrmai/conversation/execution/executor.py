@@ -682,12 +682,42 @@ class ConcurrentExecutor:
         vision_bundle: VisionBundle,
     ) -> tuple[str, str]:
         if not vision_bundle.direct_image_urls:
+            skip_reason = str(
+                event.get_extra("vision_direct_skip_reason", "") or "not_direct_path"
+            )
             self._mark_vision_direct_state(
                 event,
                 invoked=False,
                 outcome="skipped",
-                skip_reason=str(event.get_extra("vision_direct_skip_reason", "") or "not_direct_path"),
+                skip_reason=skip_reason,
             )
+            observation = {
+                "policy": self._vision_reply_policy(),
+                "outcome": "skipped",
+                "image_count": 0,
+                "resolved_count": 0,
+                "analyzed_count": 0,
+                "failed_count": 0,
+                "timeout_count": 0,
+                "attempt_count": 0,
+                "image_source": [],
+                "image_resolve_status": "skipped",
+                "vision_barrier_status": "skipped",
+                "vision_wait_ms": 0,
+                "vision_timeout_ms": 0,
+                "vision_fallback": False,
+                "visual_memory_ids": [],
+                "scope": "private" if "FriendMessage" in chat_id else "group",
+                "vision_path": "direct",
+                "vision_call_status": "skipped",
+                "visual_memory_write_status": "not_applicable",
+                "prompt_injected": False,
+                "fallback_reason": "",
+                "skip_reason": skip_reason,
+                "final_status": "skipped",
+            }
+            event.set_extra("astrmai_vision_observability", observation)
+            record_vision_observation(event, observation)
             return model_prompt, system_prompt
 
         import base64
@@ -702,14 +732,35 @@ class ConcurrentExecutor:
         self._mark_vision_direct_state(event, invoked=True, outcome="skipped")
         vision_descriptions: list[str] = []
         visual_memory_ids: list[str] = []
+        asset_ids: list[str] = []
+        model_ids: list[str] = []
         image_sources: list[str] = []
         failed_count = 0
         resolved_count = 0
         timeout_count = 0
         attempt_count = 0
+        cache_hit_count = 0
+        cache_miss_count = 0
+        singleflight_wait_count = 0
+        binding_count = 0
+        asset_storage_statuses: list[str] = []
+        prompt_versions: list[str] = []
+        failure_stages: list[str] = []
+        skip_reasons: list[str] = []
         saw_invalid_output = False
         saw_exception = False
-        for url_or_path in vision_bundle.direct_image_urls:
+        message_obj = getattr(event, "message_obj", None)
+        message_id = str(
+            getattr(message_obj, "message_id", "")
+            or getattr(message_obj, "id", "")
+            or getattr(event, "message_id", "")
+            or ""
+        )
+        try:
+            sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            sender_id = ""
+        for image_index, url_or_path in enumerate(vision_bundle.direct_image_urls):
             temp_file_path = None
             created_temp_file_path = None
             item_succeeded = False
@@ -733,7 +784,18 @@ class ConcurrentExecutor:
                 elif os.path.exists(source_text):
                     temp_file_path = source_text
                 elif source_text.startswith("http"):
-                    logger.debug(f"[{chat_id}] remote image URL skipped because remote fetching is disabled: {url_or_path}")
+                    if "resolve" not in failure_stages:
+                        failure_stages.append("resolve")
+                    if "remote_fetch_disabled" not in skip_reasons:
+                        skip_reasons.append("remote_fetch_disabled")
+                    logger.info(
+                        f"[{chat_id}] vision direct image skipped: remote_fetch_disabled"
+                    )
+                elif source_text:
+                    if "resolve" not in failure_stages:
+                        failure_stages.append("resolve")
+                    if "source_unavailable" not in skip_reasons:
+                        skip_reasons.append("source_unavailable")
 
                 if image_bytes:
                     try:
@@ -753,6 +815,10 @@ class ConcurrentExecutor:
                     if vision_timeout <= 0.5:
                         saw_exception = True
                         timeout_count += 1
+                        if "budget" not in failure_stages:
+                            failure_stages.append("budget")
+                        if "turn_budget_exhausted" not in skip_reasons:
+                            skip_reasons.append("turn_budget_exhausted")
                         logger.warning(f"[{chat_id}] vision side-path skipped: turn budget exhausted")
                         continue
                     attempt_count += 1
@@ -760,12 +826,27 @@ class ConcurrentExecutor:
                         f"{chat_id}:{source_text}".encode("utf-8", errors="ignore")
                     ).hexdigest()
                     if self.visual_cortex is not None and hasattr(self.visual_cortex, "analyze_image_path"):
-                        vision_call = self.visual_cortex.analyze_image_path(
-                            picid,
-                            temp_file_path,
-                            scope_id=chat_id,
-                            timeout_override=vision_timeout,
-                        )
+                        try:
+                            vision_call = self.visual_cortex.analyze_image_path(
+                                picid,
+                                temp_file_path,
+                                scope_id=chat_id,
+                                timeout_override=vision_timeout,
+                                binding_context={
+                                    "chat_id": chat_id,
+                                    "message_id": message_id,
+                                    "sender_id": sender_id,
+                                    "image_index": image_index,
+                                    "source_ref": source_text,
+                                },
+                            )
+                        except TypeError:
+                            vision_call = self.visual_cortex.analyze_image_path(
+                                picid,
+                                temp_file_path,
+                                scope_id=chat_id,
+                                timeout_override=vision_timeout,
+                            )
                     else:
                         vision_call = self.gateway.call_vision_task(
                             image_data=temp_file_path,
@@ -779,11 +860,53 @@ class ConcurrentExecutor:
                     payload, invalid_reason = normalize_vision_result(result_dict)
                     if payload is None:
                         saw_invalid_output = True
+                        if "analysis" not in failure_stages:
+                            failure_stages.append("analysis")
+                        if "invalid_model_output" not in skip_reasons:
+                            skip_reasons.append("invalid_model_output")
                         logger.warning(f"[{chat_id}] vision side-path invalid output: {invalid_reason}")
                         continue
                     item_succeeded = True
+                    model_id = str(
+                        (result_dict or {}).get("_model_id", "")
+                        or (result_dict or {}).get("_vision_model_id", "")
+                    )
+                    if model_id and model_id not in model_ids:
+                        model_ids.append(model_id)
                     if self.visual_cortex is not None:
-                        visual_memory_ids.append(f"{chat_id}:{picid}")
+                        memory_id = str(
+                            (result_dict or {}).get("_visual_memory_id", "")
+                            or f"{chat_id}:{picid}"
+                        )
+                        if memory_id not in visual_memory_ids:
+                            visual_memory_ids.append(memory_id)
+                        asset_id = str((result_dict or {}).get("_asset_id", "") or "")
+                        if asset_id and asset_id not in asset_ids:
+                            asset_ids.append(asset_id)
+                        cache_kind = str(
+                            (result_dict or {}).get("_cache_kind", "miss") or "miss"
+                        )
+                        if bool((result_dict or {}).get("_cache_hit", False)):
+                            cache_hit_count += 1
+                        elif cache_kind == "miss":
+                            cache_miss_count += 1
+                        if bool((result_dict or {}).get("_singleflight_join", False)):
+                            singleflight_wait_count += 1
+                        if (
+                            str((result_dict or {}).get("_binding_status", "") or "")
+                            == "persisted"
+                        ):
+                            binding_count += 1
+                        storage_status = str(
+                            (result_dict or {}).get("_asset_storage_status", "") or ""
+                        )
+                        if storage_status and storage_status not in asset_storage_statuses:
+                            asset_storage_statuses.append(storage_status)
+                        prompt_version = str(
+                            (result_dict or {}).get("_prompt_version", "") or ""
+                        )
+                        if prompt_version and prompt_version not in prompt_versions:
+                            prompt_versions.append(prompt_version)
                     vision_line = render_vision_record(payload)
                     if payload.get("type") == "image":
                         description = str(payload.get("description") or "").strip()
@@ -797,10 +920,22 @@ class ConcurrentExecutor:
             except asyncio.TimeoutError:
                 saw_exception = True
                 timeout_count += 1
+                if "analysis" not in failure_stages:
+                    failure_stages.append("analysis")
+                if "hard_timeout" not in skip_reasons:
+                    skip_reasons.append("hard_timeout")
                 logger.warning(f"[{chat_id}] vision side-path hard timeout")
             except Exception as exc:
                 saw_exception = True
+                if "analysis" not in failure_stages:
+                    failure_stages.append("analysis")
                 attempted_models, failure_reason, failure_kind = self._extract_cascade_failure_meta(exc)
+                normalized_failure_reason = str(failure_reason or failure_kind or "").strip()
+                if (
+                    normalized_failure_reason
+                    and normalized_failure_reason not in skip_reasons
+                ):
+                    skip_reasons.append(normalized_failure_reason)
                 logger.error(f"[{chat_id}] vision side-path failed: {exc}")
                 self._mark_vision_direct_state(
                     event,
@@ -901,6 +1036,17 @@ class ConcurrentExecutor:
             ),
             "prompt_injected": prompt_injected,
             "fallback_reason": fallback_reason,
+            "cache_hit_count": cache_hit_count,
+            "cache_miss_count": cache_miss_count,
+            "singleflight_wait_count": singleflight_wait_count,
+            "asset_ids": asset_ids,
+            "binding_count": binding_count,
+            "failure_stage": ",".join(failure_stages),
+            "skip_reason": ",".join(skip_reasons),
+            "model_ids": model_ids,
+            "analysis_prompt_version": prompt_versions[0] if prompt_versions else "",
+            "asset_storage_status": ",".join(asset_storage_statuses),
+            "final_status": observation_outcome,
         }
         event.set_extra("astrmai_vision_observability", observation)
         record_vision_observation(event, observation)

@@ -1429,6 +1429,48 @@
         "default": 0.5,
         "hint": "用于控制普通场景的看图频率。私聊图片以及群聊中明确 @ 机器人的图片始终会尝试识别，不受此概率影响；关闭“启用看图能力”后则所有图片都不会识别。"
       },
+      "enable_visual_result_cache": {
+        "description": "复用已经识别过的相同图片",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会按图片内容指纹复用已有转述。同一张图片即使换了消息、文件名或聊天窗口，也不会重复调用视觉模型。"
+      },
+      "store_visual_asset_files": {
+        "description": "保存可复用的图片副本",
+        "type": "bool",
+        "default": false,
+        "hint": "默认只保存图片指纹和转述结果，不保存图片文件。开启后会在插件数据目录保存缩小并标准化后的副本，便于后续查看或复用；请根据隐私需求决定是否开启。"
+      },
+      "visual_asset_retention_days": {
+        "description": "图片副本保留天数",
+        "type": "int",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 3650,
+        "hint": "超过此天数且近期没有被使用的标准化图片副本会被清理。图片转述文字和内容指纹仍会保留。"
+      },
+      "visual_asset_max_disk_mb": {
+        "description": "图片副本磁盘上限（兆字节）",
+        "type": "int",
+        "default": 512,
+        "minimum": 16,
+        "maximum": 102400,
+        "hint": "图片副本超过此空间后，会优先清理最久未使用的文件，不会删除图片转述结果。"
+      },
+      "visual_asset_max_edge_px": {
+        "description": "图片副本最长边像素",
+        "type": "int",
+        "default": 1600,
+        "minimum": 256,
+        "maximum": 4096,
+        "hint": "只影响可选的标准化图片副本，不影响发送给视觉模型的原图。数值越小越省磁盘。"
+      },
+      "visual_prompt_version": {
+        "description": "图片转述规则版本",
+        "type": "string",
+        "default": "v1",
+        "hint": "修改此值后，相同图片会按新的转述规则重新识别。一般保持默认；只有调整视觉提示词并希望刷新旧缓存时才修改。"
+      },
       "vision_reply_policy": {
         "description": "图片识别超时后的回复方式",
         "type": "string",

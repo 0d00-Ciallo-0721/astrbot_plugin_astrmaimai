@@ -6,6 +6,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel, Session, create_engine
+
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
 
@@ -458,6 +461,53 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("message_id_not_bound", result)
         self.assertEqual(event.bot.api.calls, [])
+
+    def test_04d_vision_message_reads_reusable_asset_binding(self):
+        from astrmai.infrastructure.persistence.orm_models import (
+            VisualAsset,
+            VisualMessageBinding,
+        )
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(engine)
+        event = _FakeEvent(group_id="777", message_id="msg-stored")
+        with Session(engine) as session:
+            session.add(
+                VisualAsset(
+                    asset_id="asset-stored",
+                    type="emoji",
+                    description="一只猫举着写有加油的牌子",
+                    emotion_tags='["鼓励", "开心"]',
+                )
+            )
+            session.add(
+                VisualMessageBinding(
+                    chat_id=event.unified_msg_origin,
+                    message_id="msg-stored",
+                    image_index=0,
+                    asset_id="asset-stored",
+                )
+            )
+            session.commit()
+
+        class _DB:
+            def get_session(self):
+                return Session(engine)
+
+        result = asyncio.run(
+            self.mod.VisionMessageAnalyzeTool(db_service=_DB()).call(
+                _wrap_event(event),
+                message_id="msg-stored",
+            )
+        )
+
+        self.assertIn("一只猫举着写有加油的牌子", result)
+        self.assertIn("鼓励", result)
+        self.assertIn("emoji", result)
 
     def test_05_cross_session_reply_lookup_reads_friend_history(self):
         event = _FakeEvent(group_id="777")

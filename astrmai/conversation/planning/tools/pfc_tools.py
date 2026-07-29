@@ -14,7 +14,9 @@ from astrbot.api.event import MessageChain
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
+from sqlmodel import select
 
+from ....infrastructure.persistence.orm_models import VisualAsset, VisualMessageBinding
 from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoff
 from ....presentation.dto.message_scope import MessageScope
 from ...contracts.qq_action import PendingQQAction
@@ -2001,6 +2003,7 @@ class QQForwardMessageLookupTool(FunctionTool[AstrAgentContext]):
 
 @dataclass
 class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
+    db_service: Any = None
     name: str = "vision_message_analyze_tool"
     description: str = (
         "查询当前/指定图片消息的视觉转述结果；如果已由 VisualCortex 分析，会返回图片描述、类型和情绪标签。"
@@ -2038,6 +2041,56 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
             tags = selected.get("emotion_tags") or selected.get("tags") or []
             _record_tool_execution(event, self.name)
             return f"视觉转述结果：type={img_type}；tags={tags}；description={_truncate_text(desc, 600)}"
+        if not message_id:
+            message_obj = getattr(event, "message_obj", None)
+            message_id = str(
+                getattr(message_obj, "message_id", "")
+                or getattr(message_obj, "id", "")
+                or ""
+            ).strip()
+        if message_id and self.db_service is not None:
+            try:
+                chat_id = str(
+                    getattr(event, "unified_msg_origin", "")
+                    or getattr(event, "session_id", "")
+                    or ""
+                )
+                with self.db_service.get_session() as session:
+                    statement = select(VisualMessageBinding).where(
+                        VisualMessageBinding.message_id == message_id,
+                        VisualMessageBinding.image_index == image_index - 1,
+                    )
+                    if chat_id:
+                        statement = statement.where(
+                            VisualMessageBinding.chat_id == chat_id
+                        )
+                    binding = session.exec(statement).first()
+                    asset = (
+                        session.get(VisualAsset, binding.asset_id)
+                        if binding is not None
+                        else None
+                    )
+                if asset is not None and str(asset.description or "").strip():
+                    tags = []
+                    try:
+                        import json
+
+                        parsed_tags = json.loads(str(asset.emotion_tags or "[]"))
+                        if isinstance(parsed_tags, list):
+                            tags = parsed_tags
+                    except (TypeError, ValueError):
+                        tags = []
+                    _record_tool_execution(event, self.name)
+                    return (
+                        "视觉转述结果："
+                        f"type={str(asset.type or 'image')}；"
+                        f"tags={tags}；"
+                        f"description={_truncate_text(str(asset.description or ''), 600)}"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    f"[VisionMessageAnalyzeTool] visual asset lookup degraded: {exc}"
+                )
         binding_error = _message_id_binding_error(event, message_id)
         if binding_error:
             _record_tool_execution(event, self.name, status="failed")

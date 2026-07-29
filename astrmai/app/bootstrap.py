@@ -269,7 +269,22 @@ class PluginBootstrap:
         visual_cortex = None
         if runtime.feature_flags.vision_enabled:
             try:
-                visual_cortex = VisualCortex(gateway, db_service)
+                visual_asset_dir = (
+                    Path(
+                        getattr(
+                            runtime.persistence,
+                            "cache_dir",
+                            Path("data") / "plugin_data" / "astrmai" / "cache",
+                        )
+                    ).parent
+                    / "visual_assets"
+                )
+                visual_cortex = VisualCortex(
+                    gateway,
+                    db_service,
+                    config=runtime.config,
+                    asset_dir=visual_asset_dir,
+                )
             except Exception as exc:
                 self._record_optional_failure(runtime, "multimodal.visual_cortex", exc)
                 logger.warning(f"[AstrMai] VisualCortex init failed, vision disabled: {exc}", exc_info=True)

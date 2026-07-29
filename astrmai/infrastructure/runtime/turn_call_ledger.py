@@ -874,11 +874,22 @@ def record_vision_observation(
         "visual_memory_write_status",
         "prompt_injected",
         "fallback_reason",
+        "cache_hit_count",
+        "cache_miss_count",
+        "singleflight_wait_count",
+        "asset_ids",
+        "binding_count",
+        "failure_stage",
+        "skip_reason",
+        "model_ids",
+        "analysis_prompt_version",
+        "asset_storage_status",
+        "final_status",
     }
     normalized: dict[str, Any] = {}
     for key in allowed:
         value = payload.get(key)
-        if key in {"image_source", "visual_memory_ids"}:
+        if key in {"image_source", "visual_memory_ids", "asset_ids", "model_ids"}:
             if isinstance(value, (list, tuple, set)):
                 normalized[key] = [str(item)[:80] for item in value if str(item).strip()][:16]
             elif value is not None and str(value).strip():

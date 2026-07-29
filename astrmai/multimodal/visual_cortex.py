@@ -1,26 +1,70 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
+from sqlmodel import select
 
-from ..infrastructure.persistence.orm_models import VisualMemory
+from ..infrastructure.persistence.orm_models import (
+    VisualAsset,
+    VisualMemory,
+    VisualMessageBinding,
+)
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..shared.helpers.plugin_helpers import safe_create_task
 
 from .image_pipeline import ImagePipeline
+from .visual_asset_identity import (
+    VisualAssetIdentity,
+    build_visual_asset_identity,
+    store_normalized_visual_asset,
+)
 from .vision_prompt import VISION_SYSTEM_PROMPT, VISION_USER_PROMPT, normalize_vision_result
 
 
 class VisualCortex:
     """Refactoring-side multimodal worker owning image queue and vision analysis."""
 
-    def __init__(self, gateway, db_service):
+    def __init__(self, gateway, db_service, *, config=None, asset_dir: str | Path | None = None):
         self.gateway = gateway
         self.db_service = db_service
+        self.config = config
+        self.asset_dir = Path(asset_dir) if asset_dir else self._default_asset_dir()
         self.queue = asyncio.Queue(maxsize=100)  # ponytail: R11 — cap queue to prevent OOM
         self._worker_task = None
+        self._inflight_lock = asyncio.Lock()
+        self._inflight: dict[str, asyncio.Task] = {}
+        self._last_cleanup_at = 0.0
+
+    def _default_asset_dir(self) -> Path:
+        persistence = getattr(self.db_service, "persistence", None)
+        cache_dir = getattr(persistence, "cache_dir", None)
+        if cache_dir:
+            try:
+                return Path(cache_dir).parent / "visual_assets"
+            except TypeError:
+                pass
+        return Path("data") / "plugin_data" / "astrmai" / "visual_assets"
+
+    def refresh_config(self, config) -> None:
+        self.config = config
+
+    def _vision_config(self):
+        return getattr(self.config, "vision", None)
+
+    def _prompt_version(self) -> str:
+        value = str(getattr(self._vision_config(), "visual_prompt_version", "v1") or "v1")
+        return value.strip() or "v1"
+
+    def _cache_enabled(self) -> bool:
+        return bool(getattr(self._vision_config(), "enable_visual_result_cache", True))
+
+    def _file_storage_enabled(self) -> bool:
+        return bool(getattr(self._vision_config(), "store_visual_asset_files", False))
 
     def start(self):
         if self._worker_task is None or self._worker_task.done():
@@ -31,6 +75,9 @@ class VisualCortex:
         if self._worker_task:
             self._worker_task.cancel()
             self._worker_task = None
+        for task in tuple(self._inflight.values()):
+            task.cancel()
+        self._inflight.clear()
         discarded = self._discard_pending_tasks()
         if discarded:
             logger.info(
@@ -61,6 +108,9 @@ class VisualCortex:
             "worker_running": self._worker_task is not None and not self._worker_task.done(),
             "queue_size": self.queue.qsize(),
             "db_bound": self.db_service is not None,
+            "content_cache_enabled": self._cache_enabled(),
+            "asset_file_storage_enabled": self._file_storage_enabled(),
+            "inflight_count": len(self._inflight),
         }
 
     async def _worker(self):
@@ -88,7 +138,13 @@ class VisualCortex:
         with self.db_service.get_session() as session:
             return session.get(VisualMemory, scoped_picid)
 
-    def _upsert_visual_memory(self, scoped_picid: str, img_type: str, description: str, tags_json_str: str) -> None:
+    def _upsert_visual_memory(
+        self,
+        scoped_picid: str,
+        img_type: str,
+        description: str,
+        tags_json_str: str,
+    ) -> str:
         with self.db_service.get_session() as session:
             memory = session.get(VisualMemory, scoped_picid)
             if not memory:
@@ -106,6 +162,210 @@ class VisualCortex:
                 memory.emotion_tags = tags_json_str
                 memory.timestamp = time.time()
             session.commit()
+        return "persisted"
+
+    def _get_visual_asset(self, asset_id: str):
+        with self.db_service.get_session() as session:
+            asset = session.get(VisualAsset, asset_id)
+            if asset is not None:
+                asset.hit_count = int(asset.hit_count or 0) + 1
+                asset.last_access_at = time.time()
+                session.add(asset)
+                session.commit()
+                session.refresh(asset)
+            return asset
+
+    def _upsert_visual_asset(
+        self,
+        identity: VisualAssetIdentity,
+        *,
+        img_type: str,
+        description: str,
+        tags_json_str: str,
+        model_id: str,
+        storage_path: str = "",
+        status: str = "ready",
+        last_error: str = "",
+    ) -> str:
+        now = time.time()
+        with self.db_service.get_session() as session:
+            asset = session.get(VisualAsset, identity.asset_id)
+            if asset is None:
+                asset = VisualAsset(
+                    asset_id=identity.asset_id,
+                    blob_hash=identity.blob_hash,
+                    pixel_hash=identity.pixel_hash,
+                    perceptual_hash=identity.perceptual_hash,
+                    prompt_version=identity.prompt_version,
+                    type=img_type,
+                    description=description,
+                    emotion_tags=tags_json_str,
+                    model_id=model_id,
+                    mime_type=identity.mime_type,
+                    width=identity.width,
+                    height=identity.height,
+                    frame_count=identity.frame_count,
+                    byte_size=identity.byte_size,
+                    storage_path=storage_path,
+                    status=status,
+                    last_error=last_error,
+                    created_at=now,
+                    updated_at=now,
+                    last_access_at=now,
+                )
+            else:
+                asset.blob_hash = identity.blob_hash
+                asset.pixel_hash = identity.pixel_hash
+                asset.perceptual_hash = identity.perceptual_hash
+                asset.prompt_version = identity.prompt_version
+                asset.type = img_type
+                asset.description = description
+                asset.emotion_tags = tags_json_str
+                asset.model_id = model_id
+                asset.mime_type = identity.mime_type
+                asset.width = identity.width
+                asset.height = identity.height
+                asset.frame_count = identity.frame_count
+                asset.byte_size = identity.byte_size
+                if storage_path:
+                    asset.storage_path = storage_path
+                asset.status = status
+                asset.last_error = last_error
+                asset.updated_at = now
+                asset.last_access_at = now
+            session.add(asset)
+            session.commit()
+        return "persisted"
+
+    def _upsert_message_binding(
+        self,
+        *,
+        asset_id: str,
+        legacy_picid: str,
+        binding_context: dict[str, Any] | None,
+    ) -> str:
+        context = dict(binding_context or {})
+        chat_id = str(context.get("chat_id", "") or "")
+        message_id = str(context.get("message_id", "") or "")
+        if not chat_id or not message_id:
+            return "skipped_missing_message_identity"
+        image_index = max(0, int(context.get("image_index", 0) or 0))
+        source_ref_hash = str(context.get("source_ref_hash", "") or "")
+        raw_source_ref = str(context.get("source_ref", "") or "")
+        if not source_ref_hash and raw_source_ref:
+            source_ref_hash = hashlib.sha256(raw_source_ref.encode("utf-8")).hexdigest()
+        now = time.time()
+        with self.db_service.get_session() as session:
+            statement = select(VisualMessageBinding).where(
+                VisualMessageBinding.chat_id == chat_id,
+                VisualMessageBinding.message_id == message_id,
+                VisualMessageBinding.image_index == image_index,
+            )
+            binding = session.exec(statement).first()
+            if binding is None:
+                binding = VisualMessageBinding(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    sender_id=str(context.get("sender_id", "") or ""),
+                    image_index=image_index,
+                    asset_id=asset_id,
+                    legacy_picid=legacy_picid,
+                    source_ref_hash=source_ref_hash,
+                    created_at=now,
+                    updated_at=now,
+                )
+            else:
+                binding.sender_id = str(context.get("sender_id", "") or binding.sender_id or "")
+                binding.asset_id = asset_id
+                binding.legacy_picid = legacy_picid
+                binding.source_ref_hash = source_ref_hash or binding.source_ref_hash
+                binding.updated_at = now
+            session.add(binding)
+            session.commit()
+        return "persisted"
+
+    def _cleanup_asset_files(self) -> dict[str, int]:
+        if not self.asset_dir.is_dir() or self.db_service is None:
+            return {"removed": 0, "bytes_removed": 0}
+        config = self._vision_config()
+        retention_sec = max(
+            86400,
+            int(getattr(config, "visual_asset_retention_days", 30) or 30) * 86400,
+        )
+        max_bytes = max(
+            16 * 1024 * 1024,
+            int(getattr(config, "visual_asset_max_disk_mb", 512) or 512) * 1024 * 1024,
+        )
+        now = time.time()
+        with self.db_service.get_session() as session:
+            assets = list(
+                session.exec(
+                    select(VisualAsset).where(VisualAsset.storage_path != "")
+                ).all()
+            )
+            entries: list[tuple[VisualAsset, Path, int]] = []
+            for asset in assets:
+                path = self.asset_dir / Path(str(asset.storage_path or "")).name
+                size = path.stat().st_size if path.is_file() else 0
+                entries.append((asset, path, size))
+
+            remove_ids = {
+                asset.asset_id
+                for asset, _path, _size in entries
+                if now - float(asset.last_access_at or asset.updated_at or now) > retention_sec
+            }
+            remaining = sum(
+                size for asset, _path, size in entries if asset.asset_id not in remove_ids
+            )
+            if remaining > max_bytes:
+                for asset, _path, size in sorted(
+                    entries,
+                    key=lambda item: float(item[0].last_access_at or item[0].updated_at or 0),
+                ):
+                    if remaining <= max_bytes:
+                        break
+                    if asset.asset_id not in remove_ids:
+                        remove_ids.add(asset.asset_id)
+                        remaining -= size
+
+            removed = 0
+            bytes_removed = 0
+            for asset, path, size in entries:
+                if asset.asset_id not in remove_ids:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "[AstrMai-Vision] asset cleanup failed "
+                        f"asset={asset.asset_id[:12]} error={type(exc).__name__}"
+                    )
+                    continue
+                asset.storage_path = ""
+                asset.updated_at = now
+                session.add(asset)
+                removed += 1
+                bytes_removed += size
+            if removed:
+                session.commit()
+        return {"removed": removed, "bytes_removed": bytes_removed}
+
+    async def _maybe_cleanup_asset_files(self) -> None:
+        now = time.time()
+        if now - self._last_cleanup_at < 3600:
+            return
+        self._last_cleanup_at = now
+        try:
+            result = await asyncio.to_thread(self._cleanup_asset_files)
+            if result["removed"]:
+                logger.info(
+                    "[AstrMai-Vision] asset cleanup completed "
+                    f"removed={result['removed']} bytes_removed={result['bytes_removed']}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"[AstrMai-Vision] asset cleanup degraded error={type(exc).__name__}"
+            )
 
     @staticmethod
     def _memory_payload(memory) -> dict | None:
@@ -117,42 +377,312 @@ class VisualCortex:
             "emotion_tags": ImagePipeline._safe_json_tags(getattr(memory, "emotion_tags", "[]")),
         }
 
+    @staticmethod
+    def _asset_payload(asset) -> dict | None:
+        if asset is None or str(getattr(asset, "status", "")) != "ready":
+            return None
+        return {
+            "type": str(getattr(asset, "type", "image") or "image"),
+            "description": str(getattr(asset, "description", "") or ""),
+            "emotion_tags": ImagePipeline._safe_json_tags(
+                getattr(asset, "emotion_tags", "[]")
+            ),
+            "_asset_id": str(getattr(asset, "asset_id", "") or ""),
+            "_model_id": str(getattr(asset, "model_id", "") or ""),
+            "_prompt_version": str(getattr(asset, "prompt_version", "") or ""),
+            "_asset_storage_status": (
+                "stored" if str(getattr(asset, "storage_path", "") or "") else "not_stored"
+            ),
+        }
+
+    def _on_inflight_done(self, asset_id: str, task: asyncio.Task) -> None:
+        if self._inflight.get(asset_id) is task:
+            self._inflight.pop(asset_id, None)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except Exception:
+            return
+        if error is not None:
+            logger.warning(
+                "[AstrMai-Vision] in-flight analysis failed "
+                f"asset={asset_id[:12]} error={type(error).__name__}"
+            )
+
+    async def _run_vision_analysis(
+        self,
+        identity: VisualAssetIdentity,
+        image_path: str,
+        scope_id: str,
+        timeout_override: float | None,
+    ) -> dict | None:
+        started_at = time.monotonic()
+        logger.info(
+            "[AstrMai-Vision] model call started "
+            f"asset={identity.asset_id[:12]} prompt_version={identity.prompt_version}"
+        )
+        try:
+            result_dict = await self.gateway.call_vision_task(
+                image_data=image_path,
+                prompt=VISION_USER_PROMPT,
+                system_prompt=VISION_SYSTEM_PROMPT,
+                lane_key=self._build_lane_key(scope_id),
+                timeout_override=timeout_override,
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "[AstrMai-Vision] model call cancelled "
+                f"asset={identity.asset_id[:12]} "
+                f"elapsed_ms={round((time.monotonic() - started_at) * 1000, 1)}"
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[AstrMai-Vision] model call failed "
+                f"asset={identity.asset_id[:12]} error={type(exc).__name__} "
+                f"elapsed_ms={round((time.monotonic() - started_at) * 1000, 1)}"
+            )
+            raise
+        payload, invalid_reason = normalize_vision_result(result_dict)
+        elapsed_ms = round((time.monotonic() - started_at) * 1000, 1)
+        if payload is None:
+            logger.warning(
+                "[AstrMai-Vision] model call returned unusable result "
+                f"asset={identity.asset_id[:12]} reason={invalid_reason or 'invalid_result'} "
+                f"elapsed_ms={elapsed_ms}"
+            )
+            return None
+        model_id = str(
+            (result_dict or {}).get("_vision_model_id", "")
+            or (result_dict or {}).get("_model_id", "")
+        )
+        storage_path = ""
+        storage_status = "disabled"
+        if self._file_storage_enabled():
+            try:
+                storage_path = await asyncio.to_thread(
+                    store_normalized_visual_asset,
+                    image_path,
+                    asset_id=identity.asset_id,
+                    asset_dir=self.asset_dir,
+                    max_edge_px=int(
+                        getattr(self._vision_config(), "visual_asset_max_edge_px", 1600)
+                        or 1600
+                    ),
+                )
+                storage_status = "stored"
+            except Exception as exc:
+                storage_status = f"failed:{type(exc).__name__}"
+                logger.warning(
+                    "[AstrMai-Vision] asset file storage degraded "
+                    f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
+                )
+        asset_write_status = "skipped_no_db"
+        if self.db_service is not None:
+            try:
+                asset_write_status = await asyncio.to_thread(
+                    self._upsert_visual_asset,
+                    identity,
+                    img_type=payload["type"],
+                    description=payload["description"],
+                    tags_json_str=ImagePipeline.serialize_tags(payload["emotion_tags"]),
+                    model_id=model_id,
+                    storage_path=storage_path,
+                )
+            except Exception as exc:
+                asset_write_status = f"failed:{type(exc).__name__}"
+                logger.warning(
+                    "[AstrMai-Vision] asset persistence degraded "
+                    f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
+                )
+        payload.update(
+            {
+                "_asset_id": identity.asset_id,
+                "_cache_hit": False,
+                "_cache_kind": "miss",
+                "_singleflight_join": False,
+                "_model_id": model_id,
+                "_prompt_version": identity.prompt_version,
+                "_asset_write_status": asset_write_status,
+                "_asset_storage_status": storage_status,
+            }
+        )
+        logger.info(
+            "[AstrMai-Vision] model call completed "
+            f"asset={identity.asset_id[:12]} model={model_id or 'unknown'} "
+            f"elapsed_ms={elapsed_ms} asset_write={asset_write_status} "
+            f"storage={storage_status}"
+        )
+        await self._maybe_cleanup_asset_files()
+        return payload
+
     async def analyze_image_path(
         self,
         picid: str,
         image_path: str,
         scope_id: str = "global",
         timeout_override: float | None = None,
+        binding_context: dict[str, Any] | None = None,
     ) -> dict | None:
         scoped_picid = f"{scope_id}:{picid}"
-        cached = None
-        if self.db_service is not None:
-            cached = await asyncio.to_thread(self._get_cached_memory, scoped_picid)
-        cached_payload = self._memory_payload(cached)
-        if cached_payload and cached_payload.get("description"):
-            logger.info(f"[AstrMai-VisualCortex] cache hit for {picid}, skip duplicate analysis.")
-            cached_payload["_cache_hit"] = True
-            return cached_payload
-
-        result_dict = await self.gateway.call_vision_task(
-            image_data=image_path,
-            prompt=VISION_USER_PROMPT,
-            system_prompt=VISION_SYSTEM_PROMPT,
-            lane_key=self._build_lane_key(scope_id),
-            timeout_override=timeout_override,
-        )
-        payload, _invalid_reason = normalize_vision_result(result_dict)
-        if payload is None:
-            return None
-        payload["_cache_hit"] = False
-        if self.db_service is not None:
-            await asyncio.to_thread(
-                self._upsert_visual_memory,
-                scoped_picid,
-                payload["type"],
-                payload["description"],
-                ImagePipeline.serialize_tags(payload["emotion_tags"]),
+        identity_started = time.monotonic()
+        try:
+            identity = await asyncio.to_thread(
+                build_visual_asset_identity,
+                image_path,
+                prompt_version=self._prompt_version(),
             )
+        except Exception as exc:
+            logger.warning(
+                "[AstrMai-Vision] identity failed "
+                f"legacy={hashlib.sha256(scoped_picid.encode('utf-8')).hexdigest()[:12]} "
+                f"error={type(exc).__name__}"
+            )
+            raise
+        logger.info(
+            "[AstrMai-Vision] identity ready "
+            f"asset={identity.asset_id[:12]} bytes={identity.byte_size} "
+            f"size={identity.width}x{identity.height} frames={identity.frame_count} "
+            f"elapsed_ms={round((time.monotonic() - identity_started) * 1000, 1)}"
+        )
+
+        payload = None
+        if self.db_service is not None and self._cache_enabled():
+            try:
+                asset = await asyncio.to_thread(self._get_visual_asset, identity.asset_id)
+                payload = self._asset_payload(asset)
+            except Exception as exc:
+                logger.warning(
+                    "[AstrMai-Vision] content cache lookup degraded "
+                    f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
+                )
+            if payload and payload.get("description"):
+                payload["_cache_hit"] = True
+                payload["_cache_kind"] = "content"
+                payload["_singleflight_join"] = False
+                logger.info(
+                    "[AstrMai-Vision] content cache hit "
+                    f"asset={identity.asset_id[:12]} prompt_version={identity.prompt_version}"
+                )
+
+        if (
+            payload is None
+            and self.db_service is not None
+            and self._cache_enabled()
+            and identity.prompt_version == "v1"
+        ):
+            legacy = await asyncio.to_thread(self._get_cached_memory, scoped_picid)
+            payload = self._memory_payload(legacy)
+            if payload and payload.get("description"):
+                payload.update(
+                    {
+                        "_asset_id": identity.asset_id,
+                        "_cache_hit": True,
+                        "_cache_kind": "legacy",
+                        "_singleflight_join": False,
+                        "_model_id": "",
+                        "_prompt_version": identity.prompt_version,
+                        "_asset_storage_status": "not_stored",
+                    }
+                )
+                try:
+                    await asyncio.to_thread(
+                        self._upsert_visual_asset,
+                        identity,
+                        img_type=payload["type"],
+                        description=payload["description"],
+                        tags_json_str=ImagePipeline.serialize_tags(payload["emotion_tags"]),
+                        model_id="",
+                        status="ready",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[AstrMai-Vision] legacy cache migration degraded "
+                        f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
+                    )
+                logger.info(
+                    "[AstrMai-Vision] legacy cache migrated "
+                    f"asset={identity.asset_id[:12]}"
+                )
+
+        if payload is None:
+            joined = False
+            async with self._inflight_lock:
+                task = self._inflight.get(identity.asset_id)
+                if task is None or task.done():
+                    task = asyncio.create_task(
+                        self._run_vision_analysis(
+                            identity,
+                            image_path,
+                            scope_id,
+                            timeout_override,
+                        )
+                    )
+                    self._inflight[identity.asset_id] = task
+                    task.add_done_callback(
+                        lambda done, asset_id=identity.asset_id: self._on_inflight_done(
+                            asset_id, done
+                        )
+                    )
+                    logger.info(
+                        "[AstrMai-Vision] content cache miss "
+                        f"asset={identity.asset_id[:12]}"
+                    )
+                else:
+                    joined = True
+                    logger.info(
+                        "[AstrMai-Vision] joined in-flight analysis "
+                        f"asset={identity.asset_id[:12]}"
+                    )
+            payload = await asyncio.shield(task)
+            if payload is None:
+                return None
+            payload = dict(payload)
+            if joined:
+                payload["_cache_kind"] = "singleflight"
+                payload["_singleflight_join"] = True
+
+        tags_json = ImagePipeline.serialize_tags(payload.get("emotion_tags", []))
+        legacy_write_status = "skipped_no_db"
+        binding_status = "skipped_no_db"
+        if self.db_service is not None:
+            try:
+                legacy_write_status = await asyncio.to_thread(
+                    self._upsert_visual_memory,
+                    scoped_picid,
+                    str(payload.get("type", "image") or "image"),
+                    str(payload.get("description", "") or ""),
+                    tags_json,
+                )
+            except Exception as exc:
+                legacy_write_status = f"failed:{type(exc).__name__}"
+                logger.warning(
+                    "[AstrMai-Vision] legacy projection failed "
+                    f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
+                )
+            try:
+                binding_status = await asyncio.to_thread(
+                    self._upsert_message_binding,
+                    asset_id=identity.asset_id,
+                    legacy_picid=scoped_picid,
+                    binding_context=binding_context,
+                )
+            except Exception as exc:
+                binding_status = f"failed:{type(exc).__name__}"
+                logger.warning(
+                    "[AstrMai-Vision] message binding failed "
+                    f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
+                )
+        payload["_asset_id"] = identity.asset_id
+        payload["_visual_memory_id"] = scoped_picid
+        payload["_legacy_write_status"] = legacy_write_status
+        payload["_binding_status"] = binding_status
+        logger.info(
+            "[AstrMai-Vision] persistence finalized "
+            f"asset={identity.asset_id[:12]} cache={payload.get('_cache_kind', 'miss')} "
+            f"legacy={legacy_write_status} binding={binding_status}"
+        )
         return payload
 
     async def process_image_async(self, picid: str, base64_data: str, scope_id: str = "global"):

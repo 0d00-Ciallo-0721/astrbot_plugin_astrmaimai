@@ -372,6 +372,8 @@ class PrivateTurnCoordinator:
             return
         sources: list[str] = []
         memory_ids: list[str] = []
+        asset_ids: list[str] = []
+        model_ids: list[str] = []
         for item in observations:
             for source in list(item.get("image_source", []) or []):
                 if source not in sources:
@@ -379,6 +381,12 @@ class PrivateTurnCoordinator:
             for memory_id in list(item.get("visual_memory_ids", []) or []):
                 if memory_id not in memory_ids:
                     memory_ids.append(str(memory_id))
+            for asset_id in list(item.get("asset_ids", []) or []):
+                if asset_id not in asset_ids:
+                    asset_ids.append(str(asset_id))
+            for model_id in list(item.get("model_ids", []) or []):
+                if model_id not in model_ids:
+                    model_ids.append(str(model_id))
         payload = {
             "policy": str(observations[-1].get("policy", "") or ""),
             "outcome": "failed" if any(item.get("outcome") == "failed" for item in observations) else "success",
@@ -401,6 +409,32 @@ class PrivateTurnCoordinator:
             "visual_memory_id": memory_ids[0] if memory_ids else "",
             "visual_memory_ids": memory_ids,
             "scope": "private",
+            "cache_hit_count": sum(
+                int(item.get("cache_hit_count", 0) or 0) for item in observations
+            ),
+            "cache_miss_count": sum(
+                int(item.get("cache_miss_count", 0) or 0) for item in observations
+            ),
+            "singleflight_wait_count": sum(
+                int(item.get("singleflight_wait_count", 0) or 0)
+                for item in observations
+            ),
+            "asset_ids": asset_ids,
+            "binding_count": sum(
+                int(item.get("binding_count", 0) or 0) for item in observations
+            ),
+            "model_ids": model_ids,
+            "analysis_prompt_version": str(
+                observations[-1].get("analysis_prompt_version", "") or ""
+            ),
+            "asset_storage_status": str(
+                observations[-1].get("asset_storage_status", "") or ""
+            ),
+            "final_status": (
+                "failed"
+                if any(item.get("final_status") == "failed" for item in observations)
+                else "success"
+            ),
         }
         focus_event.set_extra("astrmai_vision_observability", payload)
         record_vision_observation(focus_event, payload)
@@ -433,7 +467,12 @@ class PrivateTurnCoordinator:
         """Resolve a directly addressed image before group decision/dispatch."""
         event.set_extra("astrmai_vision_image_sources", self._image_source_categories(event))
         if not bool(getattr(getattr(self.config, "vision", None), "enable_vision", True)):
-            return VisionBarrierOutcome(outcome="disabled")
+            outcome = VisionBarrierOutcome(
+                policy=self._vision_policy(),
+                outcome="disabled",
+            )
+            self._record_outcome(event, outcome, chat_id)
+            return outcome
         if self.image_resolver is None:
             image_count = self._event_image_count(event)
             if image_count:
@@ -445,7 +484,12 @@ class PrivateTurnCoordinator:
                     elapsed_ms=0,
                     outcome="resolver_unavailable",
                 )
-            return VisionBarrierOutcome(outcome="resolver_unavailable")
+            outcome = VisionBarrierOutcome(
+                policy=self._vision_policy(),
+                outcome="resolver_unavailable",
+            )
+            self._record_outcome(event, outcome, chat_id)
+            return outcome
         if bool(event.get_extra("astrmai_vision_barrier_complete", False)):
             return VisionBarrierOutcome(outcome="already_complete")
         started_at = time.monotonic()
@@ -494,7 +538,12 @@ class PrivateTurnCoordinator:
                 outcome="resolve_failed",
             )
         if not resolution.had_images:
-            return VisionBarrierOutcome(policy=self._vision_policy())
+            outcome = VisionBarrierOutcome(
+                policy=self._vision_policy(),
+                outcome="no_images",
+            )
+            self._record_outcome(event, outcome, chat_id)
+            return outcome
 
         local_paths = [item.local_path for item in resolution.images]
         picids = [self._build_picid(event, item.index, item.source_ref) for item in resolution.images]
@@ -527,6 +576,9 @@ class PrivateTurnCoordinator:
                         image.local_path,
                         chat_id,
                         call_timeout,
+                        event=event,
+                        image_index=image.index,
+                        source_ref=image.source_ref,
                     )
                     if result and str(result.get("description", "") or "").strip():
                         break
@@ -555,6 +607,27 @@ class PrivateTurnCoordinator:
                         "type": str(payload.get("type") or "image"),
                         "description": description,
                         "emotion_tags": list(payload.get("emotion_tags") or []),
+                        "asset_id": str((result or {}).get("_asset_id", "") or ""),
+                        "visual_memory_id": str(
+                            (result or {}).get("_visual_memory_id", "") or ""
+                        ),
+                        "cache_kind": str((result or {}).get("_cache_kind", "miss") or "miss"),
+                        "singleflight_join": bool(
+                            (result or {}).get("_singleflight_join", False)
+                        ),
+                        "binding_status": str(
+                            (result or {}).get("_binding_status", "") or ""
+                        ),
+                        "legacy_write_status": str(
+                            (result or {}).get("_legacy_write_status", "") or ""
+                        ),
+                        "asset_storage_status": str(
+                            (result or {}).get("_asset_storage_status", "") or ""
+                        ),
+                        "model_id": str((result or {}).get("_model_id", "") or ""),
+                        "prompt_version": str(
+                            (result or {}).get("_prompt_version", "") or ""
+                        ),
                     }
                 )
             else:
@@ -611,17 +684,50 @@ class PrivateTurnCoordinator:
         image_path: str,
         chat_id: str,
         timeout_sec: float,
+        *,
+        event: Any | None = None,
+        image_index: int = 0,
+        source_ref: str = "",
     ) -> dict | None:
         analyze = self.visual_cortex.analyze_image_path
+        message_obj = getattr(event, "message_obj", None)
+        message_id = str(
+            getattr(message_obj, "message_id", "")
+            or getattr(message_obj, "id", "")
+            or getattr(event, "message_id", "")
+            or ""
+        )
+        sender_id = ""
+        if event is not None and hasattr(event, "get_sender_id"):
+            try:
+                sender_id = str(event.get_sender_id() or "")
+            except Exception:
+                sender_id = ""
+        binding_context = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "sender_id": sender_id,
+            "image_index": image_index,
+            "source_ref": source_ref,
+        }
         try:
             coroutine = analyze(
                 picid,
                 image_path,
                 scope_id=chat_id,
                 timeout_override=timeout_sec,
+                binding_context=binding_context,
             )
         except TypeError:
-            coroutine = analyze(picid, image_path, scope_id=chat_id)
+            try:
+                coroutine = analyze(
+                    picid,
+                    image_path,
+                    scope_id=chat_id,
+                    timeout_override=timeout_sec,
+                )
+            except TypeError:
+                coroutine = analyze(picid, image_path, scope_id=chat_id)
         return await asyncio.wait_for(coroutine, timeout=timeout_sec)
 
     def _apply_failed_policy(
@@ -775,35 +881,99 @@ class PrivateTurnCoordinator:
         source_categories = list(event.get_extra("astrmai_vision_image_sources", []) or [])
         records = list(event.get_extra("astrmai_vision_records", []) or [])
         memory_ids = [
-            str(record.get("picid", "") or "")[:80]
+            str(record.get("visual_memory_id", "") or record.get("picid", "") or "")[:80]
             for record in records
-            if str(record.get("picid", "") or "").strip()
+            if str(record.get("visual_memory_id", "") or record.get("picid", "") or "").strip()
         ]
+        asset_ids = [
+            str(record.get("asset_id", "") or "")[:80]
+            for record in records
+            if str(record.get("asset_id", "") or "").strip()
+        ]
+        model_ids = list(
+            dict.fromkeys(
+                str(record.get("model_id", "") or "")[:80]
+                for record in records
+                if str(record.get("model_id", "") or "").strip()
+            )
+        )
+        prompt_versions = list(
+            dict.fromkeys(
+                str(record.get("prompt_version", "") or "")[:64]
+                for record in records
+                if str(record.get("prompt_version", "") or "").strip()
+            )
+        )
+        cache_miss_count = sum(
+            1 for record in records if str(record.get("cache_kind", "miss")) == "miss"
+        )
+        singleflight_wait_count = sum(
+            1 for record in records if bool(record.get("singleflight_join", False))
+        )
+        binding_count = sum(
+            1 for record in records if str(record.get("binding_status", "")) == "persisted"
+        )
+        storage_statuses = list(
+            dict.fromkeys(
+                str(record.get("asset_storage_status", "") or "")[:80]
+                for record in records
+                if str(record.get("asset_storage_status", "") or "").strip()
+            )
+        )
         if outcome.outcome in {"success", "partial_failure"}:
             resolve_status = "success"
         elif outcome.outcome in {"resolve_failed", "resolver_unavailable", "resolve_timeout"}:
             resolve_status = "timeout" if outcome.outcome == "resolve_timeout" else "failed"
         else:
             resolve_status = "unknown"
+        skipped = outcome.outcome in {
+            "disabled",
+            "no_images",
+            "already_complete",
+            "not_applicable",
+        }
         observation = {
             **payload,
             "image_source": source_categories,
             "image_resolve_status": resolve_status,
-            "vision_barrier_status": "failed" if outcome.failed_count else "completed",
+            "vision_barrier_status": (
+                "skipped" if skipped else "failed" if outcome.failed_count else "completed"
+            ),
             "vision_wait_ms": outcome.elapsed_ms,
             "vision_timeout_ms": outcome.elapsed_ms if outcome.timeout_count else 0,
             "vision_fallback": outcome.downstream_action == "continue_with_placeholder",
             "visual_memory_id": memory_ids[0] if memory_ids else "",
             "visual_memory_ids": memory_ids,
             "vision_path": "barrier",
-            "vision_call_status": "failed" if outcome.failed_count else "success",
+            "vision_call_status": (
+                "skipped" if skipped else "failed" if outcome.failed_count else "success"
+            ),
             "visual_memory_write_status": (
                 "persisted_or_cache_hit"
                 if memory_ids
                 else "not_available"
             ),
-            "prompt_injected": bool(records) or outcome.downstream_action == "continue_with_placeholder",
+            "prompt_injected": (
+                False
+                if skipped
+                else bool(records) or outcome.downstream_action == "continue_with_placeholder"
+            ),
             "fallback_reason": outcome.outcome if outcome.failed_count else "",
+            "cache_hit_count": outcome.cache_hit_count,
+            "cache_miss_count": cache_miss_count,
+            "singleflight_wait_count": singleflight_wait_count,
+            "asset_ids": asset_ids,
+            "binding_count": binding_count,
+            "failure_stage": (
+                "resolve"
+                if outcome.outcome in {"resolve_failed", "resolver_unavailable", "resolve_timeout"}
+                else "analysis" if outcome.failed_count else ""
+            ),
+            "skip_reason": outcome.outcome if skipped else "",
+            "model_ids": model_ids,
+            "analysis_prompt_version": prompt_versions[0] if prompt_versions else "",
+            "asset_storage_status": ",".join(storage_statuses),
+            "final_status": outcome.outcome,
         }
         event.set_extra("astrmai_vision_barrier_outcome", payload)
         event.set_extra("astrmai_vision_observability", observation)

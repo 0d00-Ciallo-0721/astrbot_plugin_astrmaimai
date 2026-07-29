@@ -1,4 +1,9 @@
 from .image_pipeline import ImagePipeline, PreparedImage
+from .visual_asset_identity import (
+    VisualAssetIdentity,
+    build_visual_asset_identity,
+    store_normalized_visual_asset,
+)
 from .visual_cortex import VisualCortex
 from .meme.meme_config import DEFAULT_MEMES_SOURCE_DIR, MEMES_DIR
 from .meme.meme_init import init_meme_storage
@@ -24,8 +29,11 @@ __all__ = [
     "ImagePipeline",
     "MEMES_DIR",
     "PreparedImage",
+    "VisualAssetIdentity",
     "VisualCortex",
+    "build_visual_asset_identity",
     "describe_multimodal_capabilities",
     "init_meme_storage",
     "send_meme",
+    "store_normalized_visual_asset",
 ]
