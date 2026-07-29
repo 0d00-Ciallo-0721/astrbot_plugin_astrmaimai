@@ -1553,6 +1553,12 @@ class AttentionGate:
                         )
                     focus_event.set_extra("judge_action", judge_action)
                     turn_context.attention.judge_action = judge_action
+                    turn_context.attention.prefilter_action = str(
+                        focus_event.get_extra("astrmai_attention_prefilter_action", "") or ""
+                    )
+                    turn_context.attention.prefilter_reason = str(
+                        focus_event.get_extra("astrmai_attention_prefilter_reason", "") or ""
+                    )
                     if (
                         self._mood_post_judge_enabled()
                         and judge_action not in {"WAIT", "IGNORE"}

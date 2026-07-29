@@ -19,6 +19,12 @@ class AttentionDecision:
     reason: str = ""
 
 
+@dataclass(slots=True)
+class AttentionPrefilterDecision:
+    action: str = "NEED_JUDGE"
+    reason: str = "ambiguous_group_message"
+
+
 class AttentionDecisionRouter:
     """Runs System1 Judge as a lightweight attention gate."""
 
@@ -56,6 +62,130 @@ class AttentionDecisionRouter:
             return bool(is_direct_call_event(event))
         except Exception:
             return False
+
+    @staticmethod
+    def _event_text(event: Any) -> str:
+        if event is None:
+            return ""
+        if hasattr(event, "get_extra"):
+            rich_text = str(event.get_extra("astrmai_rich_text", "") or "").strip()
+            if rich_text:
+                return rich_text
+        return str(getattr(event, "message_str", "") or "").strip()
+
+    @staticmethod
+    def _event_timestamp(event: Any) -> float:
+        if event is None:
+            return 0.0
+        if hasattr(event, "get_extra"):
+            value = event.get_extra("astrmai_timestamp", getattr(event, "timestamp", 0.0))
+        else:
+            value = getattr(event, "timestamp", 0.0)
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _is_active_bot_continuation(
+        self,
+        focus_event: Any,
+        focus_thread: Any,
+        events: list[Any],
+    ) -> bool:
+        if self._is_private_event(focus_event):
+            return False
+        try:
+            focus_index = next(index for index, event in enumerate(events) if event is focus_event)
+        except StopIteration:
+            return False
+        previous_event = None
+        for event in reversed(events[:focus_index]):
+            if self._event_text(event):
+                previous_event = event
+                break
+        if previous_event is None:
+            return False
+        bot_id = str(getattr(getattr(self.gate, "state_engine", None), "bot_id", "") or "")
+        try:
+            previous_sender_id = str(previous_event.get_sender_id() or "")
+        except Exception:
+            previous_sender_id = ""
+        if not bot_id or previous_sender_id != bot_id:
+            return False
+        current_ts = self._event_timestamp(focus_event)
+        previous_ts = self._event_timestamp(previous_event)
+        if current_ts > 0.0 and previous_ts > 0.0 and current_ts - previous_ts > 180.0:
+            return False
+        text = self._event_text(focus_event).strip().lower()
+        explicit_continuations = {
+            "?",
+            "？",
+            "嗯",
+            "嗯嗯",
+            "好",
+            "好的",
+            "行",
+            "可以",
+            "对",
+            "不对",
+            "继续",
+            "然后呢",
+            "那个呢",
+            "还有呢",
+            "是吗",
+            "为什么",
+            "啥意思",
+            "什么意思",
+            "我呢",
+            "那我呢",
+            "再说一遍",
+        }
+        root_reason = str(getattr(focus_thread, "root_reason", "") or "")
+        return text in explicit_continuations or root_reason == "recent_assistant_turn"
+
+    def _classify_prefilter(
+        self,
+        focus_event: Any,
+        focus_thread: Any,
+        events: list[Any],
+        *,
+        is_strong_wakeup: bool,
+    ) -> AttentionPrefilterDecision:
+        if is_strong_wakeup:
+            return AttentionPrefilterDecision("FORCE_PASS", "strong_wakeup")
+        if not self._is_private_event(focus_event) and self._is_direct_event(focus_event):
+            return AttentionPrefilterDecision("FORCE_PASS", "direct_request")
+        if self._is_active_bot_continuation(focus_event, focus_thread, events):
+            return AttentionPrefilterDecision("FORCE_PASS", "active_bot_continuation")
+
+        interaction_kind = ""
+        image_refs: list[Any] = []
+        if focus_event is not None and hasattr(focus_event, "get_extra"):
+            interaction_kind = str(
+                focus_event.get_extra("astrmai_interaction_kind", "") or ""
+            ).strip()
+            image_refs = list(
+                focus_event.get_extra(
+                    "extracted_image_refs",
+                    focus_event.get_extra("extracted_image_urls", []),
+                )
+                or []
+            )
+        if (
+            not self._is_private_event(focus_event)
+            and not self._event_text(focus_event)
+            and not interaction_kind
+            and not image_refs
+        ):
+            return AttentionPrefilterDecision("DROP", "empty_group_event")
+        return AttentionPrefilterDecision()
+
+    @staticmethod
+    def _record_prefilter(event: Any, decision: AttentionPrefilterDecision) -> None:
+        if event is None or not hasattr(event, "set_extra"):
+            return
+        event.set_extra("astrmai_attention_prefilter_action", decision.action.lower())
+        event.set_extra("astrmai_attention_prefilter_reason", decision.reason)
 
     def _fallback_decision(
         self,
@@ -126,8 +256,27 @@ class AttentionDecisionRouter:
         *,
         is_strong_wakeup: bool,
     ) -> AttentionDecision:
-        if is_strong_wakeup or not self.gate.judge or not hasattr(self.gate.judge, "evaluate"):
-            return AttentionDecision(action="PASS", raw_action="PASS", reason="skip_judge")
+        prefilter = self._classify_prefilter(
+            focus_event,
+            focus_thread,
+            events,
+            is_strong_wakeup=is_strong_wakeup,
+        )
+        self._record_prefilter(focus_event, prefilter)
+        if prefilter.action == "FORCE_PASS":
+            return AttentionDecision(
+                action="PASS",
+                raw_action="PASS",
+                reason=f"prefilter:{prefilter.reason}",
+            )
+        if prefilter.action == "DROP":
+            return AttentionDecision(
+                action="IGNORE",
+                raw_action="IGNORE",
+                reason=f"prefilter:{prefilter.reason}",
+            )
+        if not self.gate.judge or not hasattr(self.gate.judge, "evaluate"):
+            return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_unavailable")
         interaction_kind = ""
         if focus_event is not None and hasattr(focus_event, "get_extra"):
             interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
@@ -250,4 +399,8 @@ class AttentionDecisionRouter:
         return AttentionDecision(action="PASS", raw_action=raw_action, reason="judge_pass")
 
 
-__all__ = ["AttentionDecision", "AttentionDecisionRouter"]
+__all__ = [
+    "AttentionDecision",
+    "AttentionDecisionRouter",
+    "AttentionPrefilterDecision",
+]

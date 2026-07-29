@@ -1322,10 +1322,10 @@
       "faiss_circuit_breaker_cooldown_sec": {
         "description": "向量检索暂时熔断时间（秒）",
         "type": "float",
-        "default": 30.0,
+        "default": 180.0,
         "minimum": 5,
         "maximum": 600,
-        "hint": "熔断期间直接使用文字检索，时间到后自动尝试恢复。"
+        "hint": "熔断期间直接使用文字检索，时间到后自动尝试恢复。慢服务建议保持 120～300 秒，避免刚恢复就再次超时。"
       },
       "projection_retry_interval_sec": {
         "description": "记忆索引修复扫描间隔（秒）",

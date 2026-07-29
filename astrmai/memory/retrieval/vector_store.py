@@ -42,7 +42,7 @@ class VectorRetriever:
     def _mark_failure(self, reason: str) -> None:
         self._failure_count += 1
         if self._failure_count >= self._failure_threshold():
-            cooldown = max(5.0, self._timing_value("faiss_circuit_breaker_cooldown_sec", 30.0))
+            cooldown = max(5.0, self._timing_value("faiss_circuit_breaker_cooldown_sec", 180.0))
             self._unavailable_until = time.monotonic() + cooldown
             logger.warning(
                 f"[VectorStore] Faiss circuit opened: failures={self._failure_count} "
@@ -84,12 +84,60 @@ class VectorRetriever:
         doc_id = await self.faiss_db.insert(content=content, metadata=metadata)
         return doc_id
 
-    async def search(self, query: str, k: int = 10, session_id: Optional[str] = None, persona_id: Optional[str] = None) -> List[SearchResult]:
+    def _record_observation(
+        self,
+        observation: Optional[Dict[str, Any]],
+        *,
+        status: str,
+        started_at: float,
+        timeout_sec: float,
+        result_count: int = 0,
+        error_type: str = "",
+    ) -> None:
+        if observation is None:
+            return
+        cooldown_remaining = max(0.0, self._unavailable_until - time.monotonic())
+        observation.clear()
+        observation.update(
+            {
+                "status": str(status or "unknown"),
+                "elapsed_ms": round(max(0.0, time.monotonic() - started_at) * 1000.0, 1),
+                "timeout_sec": round(max(0.0, float(timeout_sec or 0.0)), 3),
+                "result_count": max(0, int(result_count or 0)),
+                "failure_count": max(0, int(self._failure_count or 0)),
+                "circuit_open": bool(self._circuit_open()),
+                "cooldown_remaining_sec": round(cooldown_remaining, 3),
+                "error_type": str(error_type or ""),
+            }
+        )
+
+    async def search(
+        self,
+        query: str,
+        k: int = 10,
+        session_id: Optional[str] = None,
+        persona_id: Optional[str] = None,
+        observation: Optional[Dict[str, Any]] = None,
+    ) -> List[SearchResult]:
         """执行向量相似度搜索"""
+        started_at = time.monotonic()
+        timeout_sec = max(0.5, self._timing_value("faiss_timeout_sec", 4.0))
         if not query or not query.strip():
+            self._record_observation(
+                observation,
+                status="empty_query",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+            )
             return []
         if self._circuit_open():
             logger.warning("[VectorStore] Faiss circuit open; using lexical fallback")
+            self._record_observation(
+                observation,
+                status="circuit_open",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+            )
             return []
             
         # 预处理查询
@@ -115,16 +163,30 @@ class VectorRetriever:
                     rerank=False,
                     metadata_filters=metadata_filters if metadata_filters else None,
                 ),
-                timeout=max(0.5, self._timing_value("faiss_timeout_sec", 4.0)),
+                timeout=timeout_sec,
             )
             self._mark_success()
         except asyncio.TimeoutError:
             self._mark_failure("timeout")
             logger.warning("[VectorStore] Faiss search timed out; using lexical fallback")
+            self._record_observation(
+                observation,
+                status="timeout",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                error_type="TimeoutError",
+            )
             return []
         except Exception as e:
             self._mark_failure(type(e).__name__)
             logger.error(f"[VectorStore] Faiss 原生检索异常: {e}")
+            self._record_observation(
+                observation,
+                status="error",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                error_type=type(e).__name__,
+            )
             return []
 
         out = []
@@ -142,5 +204,12 @@ class VectorRetriever:
                 metadata=self._normalize_metadata(doc_data.get("metadata")),
                 source="vector"
             ))
-            
+
+        self._record_observation(
+            observation,
+            status="success",
+            started_at=started_at,
+            timeout_sec=timeout_sec,
+            result_count=len(out),
+        )
         return out

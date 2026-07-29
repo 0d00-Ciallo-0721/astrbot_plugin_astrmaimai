@@ -200,10 +200,33 @@ class MemoryEngine:
             await db.commit()
             return cursor.rowcount
 
-    async def search_memories(self, query: str, *, top_k: int, session_id: str = None, persona_id: str = None):
+    async def search_memories(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        session_id: str = None,
+        persona_id: str = None,
+        observation: dict | None = None,
+    ):
         if not await self._ensure_faiss_initialized():
+            if observation is not None:
+                observation.clear()
+                observation.update(
+                    {
+                        "vector": {"status": "initialization_failed"},
+                        "fallback_source": "none",
+                        "fused_result_count": 0,
+                    }
+                )
             return []
-        return await self.retriever.search(query, k=top_k, session_id=session_id, persona_id=persona_id)
+        return await self.retriever.search(
+            query,
+            k=top_k,
+            session_id=session_id,
+            persona_id=persona_id,
+            observation=observation,
+        )
 
     # Backward-compatible alias — prefer search_memories() in new code.
     _search_memories = search_memories

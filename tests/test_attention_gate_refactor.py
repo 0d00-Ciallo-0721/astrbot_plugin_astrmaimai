@@ -526,6 +526,118 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             "micro_utterance",
         )
 
+    def test_router_force_passes_short_continuation_immediately_after_bot(self):
+        judge = _SequenceJudge(["IGNORE"])
+        self.gate.judge = judge
+        self.gate.state_engine.bot_id = "bot-1"
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        bot_event = _FakeEvent(
+            "bot-1",
+            "AstrMai",
+            "还想继续聊这个吗？",
+            extras={"astrmai_timestamp": 100.0},
+        )
+        focus = _FakeEvent(
+            "user-1",
+            "Alice",
+            "继续",
+            extras={"astrmai_timestamp": 120.0},
+        )
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                SimpleNamespace(root_reason=""),
+                [bot_event, focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "PASS")
+        self.assertEqual(decision.reason, "prefilter:active_bot_continuation")
+        self.assertEqual(judge.calls, [])
+        self.assertEqual(
+            focus.get_extra("astrmai_attention_prefilter_action"),
+            "force_pass",
+        )
+
+    def test_router_keeps_ambiguous_short_group_message_for_judge(self):
+        judge = _SequenceJudge(["IGNORE"])
+        self.gate.judge = judge
+        self.gate.state_engine.bot_id = "bot-1"
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        other_user = _FakeEvent("user-2", "Bob", "你觉得呢")
+        focus = _FakeEvent("user-1", "Alice", "继续")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                SimpleNamespace(root_reason=""),
+                [other_user, focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "IGNORE")
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(
+            focus.get_extra("astrmai_attention_prefilter_action"),
+            "need_judge",
+        )
+
+    def test_router_drops_empty_unmentioned_group_event_without_judge(self):
+        judge = _SequenceJudge(["PASS"])
+        self.gate.judge = judge
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent("user-1", "Alice", "")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                SimpleNamespace(root_reason=""),
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "IGNORE")
+        self.assertEqual(decision.reason, "prefilter:empty_group_event")
+        self.assertEqual(judge.calls, [])
+
+    def test_router_keeps_empty_private_event_on_judge_path(self):
+        judge = _SequenceJudge(["PASS"])
+        self.gate.judge = judge
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakePrivateEvent("user-1", "Alice", "")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:FriendMessage:user-1",
+                focus,
+                SimpleNamespace(root_reason=""),
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "PASS")
+        self.assertEqual(len(judge.calls), 1)
+        self.assertEqual(
+            focus.get_extra("astrmai_attention_prefilter_action"),
+            "need_judge",
+        )
+
     def test_router_ignores_peer_poke_when_judge_times_out(self):
         async def _slow_evaluate(*args, **kwargs):
             await asyncio.sleep(0.05)

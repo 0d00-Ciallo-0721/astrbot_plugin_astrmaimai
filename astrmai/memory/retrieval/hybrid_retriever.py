@@ -42,9 +42,17 @@ class HybridRetriever:
             
         return doc_id
 
-    async def search(self, query: str, k: int = 10, session_id: Optional[str] = None, persona_id: Optional[str] = None) -> List[SearchResult]:
+    async def search(
+        self,
+        query: str,
+        k: int = 10,
+        session_id: Optional[str] = None,
+        persona_id: Optional[str] = None,
+        observation: Optional[Dict[str, Any]] = None,
+    ) -> List[SearchResult]:
         # 🟢 [核心修复 3] 动态协程构造：隔离损坏的检索源，杜绝 asyncio.gather 因 NoneType 彻底瘫痪
         tasks = []
+        vector_observation: Dict[str, Any] = {}
         
         if self.bm25:
             tasks.append(self.bm25.search(query, k=k*2, session_id=session_id, persona_id=persona_id))
@@ -53,10 +61,19 @@ class HybridRetriever:
             tasks.append(dummy_bm25())
             
         if self.vector:
-            tasks.append(self.vector.search(query, k=k*2, session_id=session_id, persona_id=persona_id))
+            tasks.append(
+                self.vector.search(
+                    query,
+                    k=k*2,
+                    session_id=session_id,
+                    persona_id=persona_id,
+                    observation=vector_observation,
+                )
+            )
         else:
             async def dummy_vector(): return []
             tasks.append(dummy_vector())
+            vector_observation["status"] = "unavailable"
 
         # 并行发起带有过滤参数的检索
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -68,8 +85,26 @@ class HybridRetriever:
             logger.error(f"[Hybrid] BM25 查询异常 (已被沙盒隔离): {results[0]}")
         if isinstance(results[1], Exception):
             logger.error(f"[Hybrid] Vector 查询异常 (已被沙盒隔离): {results[1]}")
+
+        if observation is not None:
+            observation.clear()
+            observation.update(
+                {
+                    "bm25_status": "error" if isinstance(results[0], Exception) else "success",
+                    "bm25_result_count": len(bm25_res or []),
+                    "vector": dict(vector_observation),
+                    "vector_result_count": len(vec_res or []),
+                }
+            )
             
         if not bm25_res and not vec_res:
+            if observation is not None:
+                observation["fused_result_count"] = 0
+                observation["fallback_source"] = (
+                    "bm25_empty"
+                    if vector_observation.get("status") in {"timeout", "error", "circuit_open", "unavailable"}
+                    else "none"
+                )
             return []
             
         # RRF 融合
@@ -77,6 +112,16 @@ class HybridRetriever:
         
         # 时间衰减加权
         final_results = self._apply_weighting(fused)
+        if observation is not None:
+            observation["fused_result_count"] = len(final_results)
+            if bm25_res and vec_res:
+                observation["fallback_source"] = "hybrid"
+            elif bm25_res:
+                observation["fallback_source"] = "bm25"
+            elif vec_res:
+                observation["fallback_source"] = "vector"
+            else:
+                observation["fallback_source"] = "none"
         return final_results
 
     def _apply_weighting(self, results: List[SearchResult]) -> List[SearchResult]:

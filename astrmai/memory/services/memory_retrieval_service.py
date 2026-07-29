@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from difflib import SequenceMatcher
+import inspect
 import json
 import math
 import re
@@ -669,6 +670,24 @@ class MemoryRetrievalService:
             logger.warning(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
             self._mark_degraded(query, "hybrid")
             hybrid_results = []
+        hybrid_observations = trace.get("hybrid_observations", [])
+        latest_hybrid_observation = hybrid_observations[-1] if hybrid_observations else {}
+        vector_status = str(
+            (latest_hybrid_observation.get("vector") or {}).get("status") or ""
+        )
+        if vector_status in {"timeout", "error", "circuit_open", "unavailable", "initialization_failed"}:
+            if canonical_results:
+                fallback_source = "canonical_fts"
+            elif int(latest_hybrid_observation.get("bm25_result_count", 0) or 0) > 0:
+                fallback_source = "bm25"
+            else:
+                fallback_source = "none"
+            trace["vector_fallback"] = {
+                "used": fallback_source != "none",
+                "source": fallback_source,
+                "vector_status": vector_status,
+                "candidate_count": len(canonical_results or []) + len(hybrid_results or []),
+            }
         pending_lookup = getattr(self.store, "pending_projection_ids", None)
         if canonical_results and callable(pending_lookup):
             try:
@@ -699,17 +718,42 @@ class MemoryRetrievalService:
     async def _hybrid_search(self, query: MemoryQuery, visibility_mode: str) -> list[MemoryCandidate]:
         if not self.engine or not hasattr(self.engine, "search_memories"):
             return []
+        observation: dict = {}
         try:
-            results = await self.engine.search_memories(
-                query.query,
-                top_k=self._explicit_candidate_limit(query) or max(int(query.top_k or 5), 1),
-                session_id=self._resolved_session_id(query),
-                persona_id=query.persona_id or None,
-            )
+            search_memories = self.engine.search_memories
+            search_kwargs = {
+                "top_k": self._explicit_candidate_limit(query) or max(int(query.top_k or 5), 1),
+                "session_id": self._resolved_session_id(query),
+                "persona_id": query.persona_id or None,
+            }
+            try:
+                parameters = inspect.signature(search_memories).parameters.values()
+                supports_observation = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    or parameter.name == "observation"
+                    for parameter in parameters
+                )
+            except (TypeError, ValueError):
+                supports_observation = True
+            if supports_observation:
+                search_kwargs["observation"] = observation
+            else:
+                observation["status"] = "unsupported"
+            results = await search_memories(query.query, **search_kwargs)
         except Exception as exc:
             logger.debug(f"[MemoryRetrievalService] hybrid engine search failed: {exc}")
             self._mark_degraded(query, "hybrid")
+            observation.setdefault("status", "error")
+            observation["error_type"] = type(exc).__name__
+            self._trace_bucket(query).setdefault("hybrid_observations", []).append(
+                dict(observation)
+            )
             return []
+        observation.setdefault("status", "success")
+        observation["raw_result_count"] = len(results or [])
+        self._trace_bucket(query).setdefault("hybrid_observations", []).append(
+            dict(observation)
+        )
 
         excluded = {str(item) for item in query.exclude_ids or [] if str(item).strip()}
         layer_set = {str(item) for item in query.layers or [] if str(item).strip()}

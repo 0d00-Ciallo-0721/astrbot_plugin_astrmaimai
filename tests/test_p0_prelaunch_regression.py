@@ -76,7 +76,11 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         from astrmai.memory.retrieval.vector_store import VectorRetriever
 
         class _Faiss:
+            def __init__(self):
+                self.calls = 0
+
             async def retrieve(self, **kwargs):
+                self.calls += 1
                 return []
 
         config = SimpleNamespace(
@@ -86,18 +90,70 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
                 faiss_circuit_breaker_cooldown_sec=30.0,
             )
         )
-        retriever = VectorRetriever(_Faiss(), config=config)
+        faiss = _Faiss()
+        retriever = VectorRetriever(faiss, config=config)
+        observation = {}
 
         async def _timeout(awaitable, *args, **kwargs):
             awaitable.close()
             raise asyncio.TimeoutError
 
         with patch.object(vector_store.asyncio, "wait_for", new=_timeout):
-            results = asyncio.run(retriever.search("hello"))
+            results = asyncio.run(retriever.search("hello", observation=observation))
 
         self.assertEqual(results, [])
         self.assertEqual(retriever._failure_count, 1)
         self.assertTrue(retriever._circuit_open())
+        self.assertEqual(observation["status"], "timeout")
+        self.assertTrue(observation["circuit_open"])
+        self.assertGreater(observation["cooldown_remaining_sec"], 0.0)
+
+        second_observation = {}
+        second_results = asyncio.run(
+            retriever.search("hello again", observation=second_observation)
+        )
+        self.assertEqual(second_results, [])
+        self.assertEqual(faiss.calls, 0)
+        self.assertEqual(second_observation["status"], "circuit_open")
+
+    def test_hybrid_retriever_reports_bm25_fallback_when_vector_is_unhealthy(self):
+        from astrmai.memory.retrieval.hybrid_retriever import HybridRetriever
+        from astrmai.memory.utils import SearchResult
+
+        class _BM25:
+            async def search(self, *args, **kwargs):
+                return [
+                    SearchResult(
+                        doc_id=1,
+                        score=0.8,
+                        content="lexical",
+                        metadata={},
+                        source="bm25",
+                    )
+                ]
+
+        class _Vector:
+            async def search(self, *args, observation=None, **kwargs):
+                observation.update(
+                    {
+                        "status": "circuit_open",
+                        "circuit_open": True,
+                        "result_count": 0,
+                    }
+                )
+                return []
+
+        observation = {}
+        results = asyncio.run(
+            HybridRetriever(_BM25(), _Vector()).search(
+                "hello",
+                observation=observation,
+            )
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(observation["fallback_source"], "bm25")
+        self.assertEqual(observation["vector"]["status"], "circuit_open")
 
     def test_dream_update_resolves_legacy_id_to_canonical_memory(self):
         from astrmai.memory.dream.dream_agent import DreamAgent

@@ -444,7 +444,7 @@ class TimingConfig(BaseModel):
     embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
     faiss_timeout_sec: float = Field(default=4.0, ge=0.5, le=60.0)
     faiss_failure_threshold: int = Field(default=3, ge=1, le=10)
-    faiss_circuit_breaker_cooldown_sec: float = Field(default=30.0, ge=5.0, le=600.0)
+    faiss_circuit_breaker_cooldown_sec: float = Field(default=180.0, ge=5.0, le=600.0)
     projection_retry_interval_sec: float = Field(default=60.0, ge=5.0, le=3600.0)
     projection_retry_base_delay_sec: float = Field(default=30.0, ge=1.0, le=3600.0)
     projection_retry_max_delay_sec: float = Field(default=900.0, ge=5.0, le=86400.0)

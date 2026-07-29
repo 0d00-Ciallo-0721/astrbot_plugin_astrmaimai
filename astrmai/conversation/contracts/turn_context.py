@@ -40,6 +40,8 @@ class AttentionSnapshot:
     window_events: list[Any] = field(default_factory=list)
     focus_thread: Any = None
     judge_action: str = ""
+    prefilter_action: str = ""
+    prefilter_reason: str = ""
     retrieve_keys: list[str] = field(default_factory=list)
     is_fast_mode: bool = False
     is_lightweight_event: bool = False
@@ -386,6 +388,8 @@ def build_turn_trace_summary(
         },
         "attention": {
             "judge_action": attention.judge_action,
+            "prefilter_action": attention.prefilter_action,
+            "prefilter_reason": attention.prefilter_reason,
             "retrieve_keys": list(attention.retrieve_keys or []),
             "is_fast_mode": bool(attention.is_fast_mode),
             "is_lightweight_event": bool(attention.is_lightweight_event),
