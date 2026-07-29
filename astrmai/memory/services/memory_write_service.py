@@ -139,9 +139,11 @@ class MemoryWriteService:
                 if projected is False:
                     reason_getter = getattr(self.index_projector, "pending_reason", None)
                     reason = reason_getter(memory_id) if callable(reason_getter) else "unknown"
+                    scheduled_getter = getattr(self.index_projector, "retry_scheduled", None)
+                    scheduled = bool(scheduled_getter(memory_id)) if callable(scheduled_getter) else False
                     logger.warning(
                         f"[MemoryWrite] index projection pending repair memory_id={memory_id} "
-                        f"reason={reason or 'unknown'} repair_scheduled=true"
+                        f"reason={reason or 'unknown'} repair_scheduled={str(scheduled).lower()}"
                     )
             except Exception as exc:
                 logger.warning(f"[MemoryWrite] index projection failed for {memory_id}: {exc}")

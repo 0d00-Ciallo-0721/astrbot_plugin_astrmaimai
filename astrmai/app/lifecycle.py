@@ -420,9 +420,13 @@ class PluginLifecycleManager:
 
     async def _terminate_impl(self) -> None:
         try:
-            memory_pipeline = getattr(self.runtime.memory_engine, "memory_pipeline", None)
-            if memory_pipeline:
-                await memory_pipeline.stop()
+            stop_memory = getattr(self.runtime.memory_engine, "stop_background_tasks", None)
+            if callable(stop_memory):
+                await stop_memory()
+            else:
+                memory_pipeline = getattr(self.runtime.memory_engine, "memory_pipeline", None)
+                if memory_pipeline:
+                    await memory_pipeline.stop()
         except Exception as exc:
             logger.warning(f"[AstrMai] Memory pipeline shutdown degraded: {exc}")
 

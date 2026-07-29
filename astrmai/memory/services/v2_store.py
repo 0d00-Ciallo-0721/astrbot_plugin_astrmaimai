@@ -299,9 +299,141 @@ class MemoryV2Store:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_projection_outbox (
+                    memory_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_memory_projection_outbox_due
+                ON memory_projection_outbox(status, next_retry_at)
+                """
+            )
             await self._ensure_fts_projection(db)
             await db.commit()
         self._initialized = True
+
+    async def schedule_projection_retry(
+        self,
+        memory_id: str,
+        reason: str,
+        *,
+        base_delay_sec: float = 30.0,
+        max_delay_sec: float = 900.0,
+    ) -> bool:
+        await self.initialize()
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return False
+        now = self._now()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT attempts, created_at FROM memory_projection_outbox WHERE memory_id = ? LIMIT 1",
+                (clean_id,),
+            )
+            row = await cursor.fetchone()
+            attempts = int(row[0] or 0) + 1 if row else 1
+            created_at = float(row[1] or now) if row else now
+            delay = min(
+                max(float(max_delay_sec or 900.0), 1.0),
+                max(float(base_delay_sec or 30.0), 1.0) * (2 ** max(attempts - 1, 0)),
+            )
+            await db.execute(
+                """
+                INSERT INTO memory_projection_outbox(
+                    memory_id, status, attempts, next_retry_at, last_error, created_at, updated_at
+                ) VALUES (?, 'pending', ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    status = 'pending',
+                    attempts = excluded.attempts,
+                    next_retry_at = excluded.next_retry_at,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_id, attempts, now + delay, str(reason or "unknown")[:500], created_at, now),
+            )
+            await db.commit()
+        return True
+
+    async def complete_projection_retry(self, memory_id: str) -> None:
+        await self.initialize()
+        clean_id = str(memory_id or "").strip()
+        if not clean_id:
+            return
+        async with connect_aiosqlite(self.db_path) as db:
+            await db.execute("DELETE FROM memory_projection_outbox WHERE memory_id = ?", (clean_id,))
+            await db.commit()
+
+    async def list_due_projection_retries(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT memory_id, attempts, next_retry_at, last_error
+                FROM memory_projection_outbox
+                WHERE status = 'pending' AND next_retry_at <= ?
+                ORDER BY next_retry_at ASC
+                LIMIT ?
+                """,
+                (self._now(), max(1, int(limit or 25))),
+            )
+            rows = await cursor.fetchall()
+        return [
+            {
+                "memory_id": str(row[0] or ""),
+                "attempts": int(row[1] or 0),
+                "next_retry_at": float(row[2] or 0.0),
+                "last_error": str(row[3] or ""),
+            }
+            for row in rows
+            if row and str(row[0] or "").strip()
+        ]
+
+    async def pending_projection_ids(self, memory_ids: list[str]) -> set[str]:
+        await self.initialize()
+        ids = list(dict.fromkeys(str(item or "").strip() for item in memory_ids if str(item or "").strip()))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                f"""
+                SELECT memory_id FROM memory_projection_outbox
+                WHERE status = 'pending' AND memory_id IN ({placeholders})
+                """,
+                tuple(ids),
+            )
+            rows = await cursor.fetchall()
+        return {str(row[0]) for row in rows if row and row[0]}
+
+    async def projection_retry_snapshot(self, *, limit: int = 1000) -> dict[str, str]:
+        await self.initialize()
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT memory_id, last_error
+                FROM memory_projection_outbox
+                WHERE status = 'pending'
+                ORDER BY updated_at ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit or 1000)),),
+            )
+            rows = await cursor.fetchall()
+        return {
+            str(row[0]): str(row[1] or "unknown")
+            for row in rows
+            if row and str(row[0] or "").strip()
+        }
 
     async def _ensure_fts_projection(self, db) -> None:
         canonical_cursor = await db.execute("SELECT COUNT(*) FROM canonical_memories WHERE status = 'active'")

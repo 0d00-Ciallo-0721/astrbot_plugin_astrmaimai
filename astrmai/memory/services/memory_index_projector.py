@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 from astrbot.api import logger
@@ -14,6 +15,42 @@ class MemoryIndexProjector:
         self.engine = engine
         self._pending_projection_ids: set[str] = set()
         self._pending_projection_reasons: dict[str, str] = {}
+        self._pending_projection_scheduled: dict[str, bool] = {}
+        self._retry_task: asyncio.Task | None = None
+        self._retry_stop = asyncio.Event()
+
+    def _config_value(self, name: str, default):
+        config = getattr(self.engine, "config", None)
+        timing_config = getattr(config, "timing", None)
+        if timing_config is not None and hasattr(timing_config, name):
+            return getattr(timing_config, name)
+        memory_config = getattr(config, "memory", None)
+        return getattr(memory_config, name, default)
+
+    async def _mark_pending_persisted(self, memory_id: str, reason: str) -> bool:
+        self._mark_pending(memory_id, reason)
+        store = getattr(self.engine, "v2_store", None)
+        schedule = getattr(store, "schedule_projection_retry", None)
+        if not callable(schedule):
+            return False
+        scheduled = bool(
+            await schedule(
+                memory_id,
+                reason,
+                base_delay_sec=float(self._config_value("projection_retry_base_delay_sec", 30.0) or 30.0),
+                max_delay_sec=float(self._config_value("projection_retry_max_delay_sec", 900.0) or 900.0),
+            )
+        )
+        self._pending_projection_scheduled[memory_id] = scheduled
+        return scheduled
+
+    async def _clear_pending_persisted(self, memory_id: str) -> None:
+        self._clear_pending(memory_id)
+        self._pending_projection_scheduled.pop(memory_id, None)
+        store = getattr(self.engine, "v2_store", None)
+        complete = getattr(store, "complete_projection_retry", None)
+        if callable(complete):
+            await complete(memory_id)
 
     def _mark_pending(self, memory_id: str, reason: str) -> None:
         if not memory_id:
@@ -28,6 +65,9 @@ class MemoryIndexProjector:
     def pending_reason(self, memory_id: str) -> str:
         return str(self._pending_projection_reasons.get(str(memory_id or ""), "") or "")
 
+    def retry_scheduled(self, memory_id: str) -> bool:
+        return bool(self._pending_projection_scheduled.get(str(memory_id or ""), False))
+
     def _documents_db_path(self) -> str | None:
         return getattr(self.engine, "db_path", None)
 
@@ -35,10 +75,10 @@ class MemoryIndexProjector:
         if not memory_id:
             return False
         if not getattr(self.engine, "retriever", None):
-            self._mark_pending(memory_id, "retriever_not_ready")
+            scheduled = await self._mark_pending_persisted(memory_id, "retriever_not_ready")
             logger.info(
                 f"[MemoryIndexProjector] projection deferred memory_id={memory_id} "
-                "reason=retriever_not_ready repair_scheduled=true"
+                f"reason=retriever_not_ready repair_scheduled={str(scheduled).lower()}"
             )
             return False
         try:
@@ -46,7 +86,7 @@ class MemoryIndexProjector:
                 candidate = await self.engine.v2_store.get_by_id(memory_id, allow_stale=False)
                 if not candidate:
                     await self.delete_projection(memory_id)
-                    self._clear_pending(memory_id)
+                    await self._clear_pending_persisted(memory_id)
                     return True
                 request = MemoryWriteRequest(
                     source=candidate.source,
@@ -76,16 +116,77 @@ class MemoryIndexProjector:
             )
             metadata.update(dict(request.metadata or {}))
             await self.engine.retriever.add_memory(request.content, metadata)
-            self._clear_pending(memory_id)
+            await self._clear_pending_persisted(memory_id)
             return True
         except Exception as exc:
             reason = f"projection_error:{type(exc).__name__}"
-            self._mark_pending(memory_id, reason)
+            scheduled = await self._mark_pending_persisted(memory_id, reason)
             logger.warning(
                 f"[MemoryIndexProjector] projection degraded memory_id={memory_id} "
-                f"reason={reason} repair_scheduled=true"
+                f"reason={reason} repair_scheduled={str(scheduled).lower()}"
             )
             return False
+
+    async def start(self) -> None:
+        if self._retry_task is not None and not self._retry_task.done():
+            return
+        self._retry_stop = asyncio.Event()
+        self._retry_task = asyncio.create_task(
+            self._retry_loop(),
+            name="astrmai-memory-projection-retry",
+        )
+
+    async def stop(self) -> None:
+        self._retry_stop.set()
+        task = self._retry_task
+        self._retry_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _retry_loop(self) -> None:
+        interval = max(
+            5.0,
+            float(self._config_value("projection_retry_interval_sec", 60.0) or 60.0),
+        )
+        while not self._retry_stop.is_set():
+            try:
+                await self.retry_due(limit=int(self._config_value("projection_retry_batch_size", 20) or 20))
+                await asyncio.wait_for(self._retry_stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"[MemoryIndexProjector] retry worker degraded: {exc}")
+                await asyncio.sleep(min(interval, 30.0))
+
+    async def retry_due(self, *, limit: int = 20) -> dict:
+        store = getattr(self.engine, "v2_store", None)
+        list_due = getattr(store, "list_due_projection_retries", None)
+        if not callable(list_due):
+            return {"attempted": 0, "projected": 0, "failed": 0}
+        rows = await list_due(limit=max(1, int(limit or 20)))
+        result = {"attempted": 0, "projected": 0, "failed": 0}
+        for row in rows:
+            memory_id = str((row or {}).get("memory_id") or "")
+            if not memory_id:
+                continue
+            result["attempted"] += 1
+            if await self.project(memory_id):
+                result["projected"] += 1
+            else:
+                result["failed"] += 1
+        if result["attempted"]:
+            logger.info(
+                "[MemoryIndexProjector] retry batch "
+                f"attempted={result['attempted']} projected={result['projected']} failed={result['failed']}"
+            )
+        return result
 
     async def delete_projection(self, memory_id: str) -> int:
         return await self.cleanup_deleted([memory_id])
@@ -127,7 +228,7 @@ class MemoryIndexProjector:
                 if not callable(faiss_delete):
                     deleted += removed_rows
                 await self._delete_fts_rows(int_ids)
-                self._clear_pending(memory_id)
+                await self._clear_pending_persisted(memory_id)
             except Exception as exc:
                 logger.warning(f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc}")
         return deleted
@@ -153,6 +254,16 @@ class MemoryIndexProjector:
         return count
 
     async def check_consistency(self) -> dict:
+        persisted_pending: dict[str, str] = {}
+        snapshot = getattr(self.engine.v2_store, "projection_retry_snapshot", None)
+        if callable(snapshot):
+            try:
+                persisted_pending = await snapshot()
+            except Exception as exc:
+                logger.warning(f"[MemoryIndexProjector] projection outbox snapshot degraded: {exc}")
+        pending_ids = set(self._pending_projection_ids) | set(persisted_pending)
+        pending_reasons = dict(persisted_pending)
+        pending_reasons.update(self._pending_projection_reasons)
         report = {
             "missing_projection_ids": [],
             "orphan_projection_ids": [],
@@ -160,8 +271,8 @@ class MemoryIndexProjector:
             "duplicate_projection_ids": [],
             "projection_count": 0,
             "canonical_projectable_count": 0,
-            "pending_projection_count": len(self._pending_projection_ids),
-            "pending_projection_reasons": dict(self._pending_projection_reasons),
+            "pending_projection_count": len(pending_ids),
+            "pending_projection_reasons": pending_reasons,
         }
         try:
             projectable = await self.engine.v2_store.list_projectable()
@@ -174,9 +285,9 @@ class MemoryIndexProjector:
                 by_canonical.setdefault(canonical_id, []).append(doc_id)
             projected_ids = set(by_canonical)
             report["missing_projection_ids"] = sorted(projectable_ids - projected_ids)
-            if self._pending_projection_ids:
+            if pending_ids:
                 report["missing_projection_ids"] = sorted(
-                    set(report["missing_projection_ids"]) | (self._pending_projection_ids & projectable_ids)
+                    set(report["missing_projection_ids"]) | (pending_ids & projectable_ids)
                 )
             for canonical_id, doc_ids in by_canonical.items():
                 if len(doc_ids) > 1:

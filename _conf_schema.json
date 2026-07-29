@@ -1327,6 +1327,38 @@
         "maximum": 600,
         "hint": "熔断期间直接使用文字检索，时间到后自动尝试恢复。"
       },
+      "projection_retry_interval_sec": {
+        "description": "记忆索引修复扫描间隔（秒）",
+        "type": "float",
+        "default": 60.0,
+        "minimum": 5,
+        "maximum": 3600,
+        "hint": "后台按此间隔扫描写入成功但尚未进入检索索引的记忆。"
+      },
+      "projection_retry_base_delay_sec": {
+        "description": "记忆索引首次重试等待（秒）",
+        "type": "float",
+        "default": 30.0,
+        "minimum": 1,
+        "maximum": 3600,
+        "hint": "首次索引投影失败后的等待时间；连续失败会自动延长。"
+      },
+      "projection_retry_max_delay_sec": {
+        "description": "记忆索引重试最大间隔（秒）",
+        "type": "float",
+        "default": 900.0,
+        "minimum": 5,
+        "maximum": 86400,
+        "hint": "指数退避的上限，避免向量服务异常时反复请求。"
+      },
+      "projection_retry_batch_size": {
+        "description": "每轮最多修复的记忆索引条数",
+        "type": "int",
+        "default": 20,
+        "minimum": 1,
+        "maximum": 200,
+        "hint": "限制单轮后台修复规模，避免抢占正常聊天资源。"
+      },
       "private_wait_timeout_sec": {
         "description": "私聊等待下一句时间（秒）",
         "type": "int",

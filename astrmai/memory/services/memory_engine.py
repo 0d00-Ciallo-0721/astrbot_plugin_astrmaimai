@@ -872,6 +872,8 @@ class MemoryEngine:
         return await self.recall_persona_lore(query=query, persona_id=persona_id, top_k=kwargs.get("top_k", 3))
 
     async def start_background_tasks(self):
+        if self.index_projector is not None:
+            await self.index_projector.start()
         raw_trace_store = getattr(getattr(self, "db_service", None), "raw_trace_store", None)
         self.memory_observer = MemoryObserver(
             raw_trace_store,
@@ -890,6 +892,14 @@ class MemoryEngine:
             observer=self.memory_observer,
         )
         await self.memory_pipeline.start()
+
+    async def stop_background_tasks(self):
+        pipeline = getattr(self, "memory_pipeline", None)
+        if pipeline is not None:
+            await pipeline.stop()
+        projector = getattr(self, "index_projector", None)
+        if projector is not None:
+            await projector.stop()
 
     async def run_memory_maintenance(self, chat_id: str) -> dict:
         pipeline = getattr(self, "memory_pipeline", None)

@@ -669,6 +669,27 @@ class MemoryRetrievalService:
             logger.warning(f"[MemoryRetrievalService] hybrid search degraded: {hybrid_results}")
             self._mark_degraded(query, "hybrid")
             hybrid_results = []
+        pending_lookup = getattr(self.store, "pending_projection_ids", None)
+        if canonical_results and callable(pending_lookup):
+            try:
+                pending_ids = await pending_lookup(
+                    [str(getattr(candidate, "id", "") or "") for candidate in canonical_results]
+                )
+            except Exception as exc:
+                logger.debug(f"[MemoryRetrievalService] projection outbox lookup degraded: {exc}")
+                pending_ids = set()
+            if pending_ids:
+                for candidate in canonical_results:
+                    if str(getattr(candidate, "id", "") or "") not in pending_ids:
+                        continue
+                    candidate.metadata = dict(getattr(candidate, "metadata", {}) or {})
+                    matched_by = self._matched_sources(candidate.metadata.get("matched_by"))
+                    candidate.metadata["matched_by"] = sorted(set(matched_by) | {"read_your_write_fallback"})
+                    candidate.metadata["index_projection_pending"] = True
+                trace["read_your_write_fallback"] = {
+                    "used": True,
+                    "candidate_count": len(pending_ids),
+                }
         candidates = self._fuse_candidates(canonical_results, hybrid_results, query)
         exclude_kinds = {str(item) for item in query.exclude_kinds or [] if str(item).strip()}
         if exclude_kinds:
