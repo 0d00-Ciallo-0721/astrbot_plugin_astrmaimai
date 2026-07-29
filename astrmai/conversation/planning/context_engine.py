@@ -398,18 +398,25 @@ class ContextEngine:
         raw_persona = str(persona_payload.get("raw", "") or "")
         summary = str(persona_payload.get("summary", "") or raw_persona)
         first_person_rewrite = str(persona_payload.get("first_person_rewrite", "") or "")
-        style = str(persona_payload.get("style", "") or "")
         shards = dict(persona_payload.get("shards", {}) or {})
 
-        if "ALL" in retrieve_keys or is_fast_mode:
+        core_parts: list[str] = []
+        for value in (summary, first_person_rewrite):
+            value = value.strip()
+            if value and value not in core_parts:
+                core_parts.append(value)
+        compact_core = "\n\n".join(core_parts)
+
+        if "ALL" in retrieve_keys:
             base = raw_persona or summary
         else:
-            base = first_person_rewrite or summary
+            base = compact_core
             extra_lines = []
-            for key in retrieve_keys:
-                value = shards.get(key)
-                if value and value != "无":
-                    extra_lines.append(f"- {key}: {value}")
+            if not is_fast_mode:
+                for key in retrieve_keys:
+                    value = shards.get(key)
+                    if value and value != "无":
+                        extra_lines.append(f"- {key}: {value}")
             if extra_lines:
                 base += "\n\n临时加载的人格切片：\n" + "\n".join(extra_lines)
         if not base:
@@ -430,6 +437,7 @@ class ContextEngine:
         return "\n".join(
             [
                 "默认称呼按原始人设、核心摘要和说话方式中明确标注的“对用户/对话者”规则执行；该规则适用于当前正在回应的人。",
+                "默认称呼属于表达风格，称呼风格不等于关系证明；使用默认称呼不会自动赋予当前发言人恋人、亲属、配偶或其他专属身份。",
                 "人设中限定给某种关系、身份或特定对象的称呼，只能在当前消息或稳定关系事实明确支持时使用，不能因为昵称相似、群友玩笑或上一轮称呼而扩大范围。",
                 "机器人过去说过的话、群友转述、记忆摘要和表达习惯只是背景材料，不是关系事实；它们不能单独证明当前发言人就是某个固定关系对象。",
                 "群聊中当前发言人只由本轮发言人边界确定，其他群友只能作为第三方背景；私聊同样只把当前会话用户作为本轮对话者。",

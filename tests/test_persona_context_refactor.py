@@ -829,7 +829,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
         self.assertEqual(persistence.saved, {"persona-1": {"summary": "cached"}})
 
-    def test_context_engine_prefers_first_person_rewrite_and_honors_disable_rag_injection(self):
+    def test_context_engine_combines_compact_summary_and_first_person_rewrite(self):
         memory_engine = _FakeMemoryEngine()
 
         class _FakeSummarizer:
@@ -875,7 +875,8 @@ class PersonaContextRefactorTests(unittest.TestCase):
         system_prompt, style_variant, proactive_recall = prompt_bundle
 
         self.assertIn("I know who I am and I answer in my own voice.", system_prompt)
-        self.assertNotIn("She is described in third person.", system_prompt)
+        self.assertIn("She is described in third person.", system_prompt)
+        self.assertNotIn("Raw persona", system_prompt)
         self.assertIsInstance(style_variant, str)
         self.assertEqual(proactive_recall, "")
         self.assertEqual(recall_block, "")

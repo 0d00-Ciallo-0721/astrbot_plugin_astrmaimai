@@ -30,6 +30,61 @@ class _Event:
 
 
 class PersonaAddressingScopeTests(unittest.TestCase):
+    def test_core_only_uses_compact_persona_without_raw_prompt(self):
+        engine = ContextEngine.__new__(ContextEngine)
+        block = engine._build_role_block(
+            {
+                "raw": "RAW_PERSONA_SENTINEL",
+                "summary": "核心摘要",
+                "first_person_rewrite": "第一人称短自述",
+                "shards": {"relations": "关系切片"},
+            },
+            retrieve_keys=[],
+            is_fast_mode=True,
+        )
+
+        self.assertIn("核心摘要", block)
+        self.assertIn("第一人称短自述", block)
+        self.assertNotIn("RAW_PERSONA_SENTINEL", block)
+        self.assertNotIn("关系切片", block)
+
+    def test_normal_mode_only_adds_selected_persona_shards(self):
+        engine = ContextEngine.__new__(ContextEngine)
+        block = engine._build_role_block(
+            {
+                "raw": "RAW_PERSONA_SENTINEL",
+                "summary": "核心摘要",
+                "first_person_rewrite": "第一人称短自述",
+                "shards": {
+                    "relations": "关系切片",
+                    "timeline": "生平切片",
+                },
+            },
+            retrieve_keys=["relations"],
+            is_fast_mode=False,
+        )
+
+        self.assertIn("核心摘要", block)
+        self.assertIn("第一人称短自述", block)
+        self.assertIn("关系切片", block)
+        self.assertNotIn("生平切片", block)
+        self.assertNotIn("RAW_PERSONA_SENTINEL", block)
+
+    def test_all_mode_is_the_only_path_that_loads_raw_persona(self):
+        engine = ContextEngine.__new__(ContextEngine)
+        block = engine._build_role_block(
+            {
+                "raw": "RAW_PERSONA_SENTINEL",
+                "summary": "核心摘要",
+                "first_person_rewrite": "第一人称短自述",
+                "shards": {},
+            },
+            retrieve_keys=["ALL"],
+            is_fast_mode=False,
+        )
+
+        self.assertIn("RAW_PERSONA_SENTINEL", block)
+
     def test_stable_boundary_preserves_default_rule_without_promoting_relationship(self):
         engine = ContextEngine.__new__(ContextEngine)
         block = engine._build_addressing_boundary_block(
@@ -44,6 +99,7 @@ class PersonaAddressingScopeTests(unittest.TestCase):
         self.assertIn("限定给某种关系", block)
         self.assertIn("不能因为昵称相似", block)
         self.assertIn("机器人过去说过的话", block)
+        self.assertIn("称呼风格不等于关系证明", block)
         self.assertNotIn("QQ", block)
 
     def test_current_speaker_boundary_does_not_turn_identity_into_relationship(self):
