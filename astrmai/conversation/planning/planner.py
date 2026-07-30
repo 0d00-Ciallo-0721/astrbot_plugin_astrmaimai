@@ -1257,16 +1257,86 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             return
         try:
             reply_event_id = f"reply:{chat_id}:{int(time.time() * 1000)}"
+            focus_event = getattr(focus_context, "focus_event", None) or event
+            history_policy = DialogHistoryPolicy.from_event(focus_event)
+            if not history_policy.group_id:
+                history_policy = DialogHistoryPolicy.from_event(event)
+            target_sender_id = str(history_policy.current_sender_id or "").strip()
+            if not target_sender_id:
+                try:
+                    target_sender_id = str(focus_event.get_sender_id() or "").strip()
+                except Exception:
+                    target_sender_id = ""
+            try:
+                target_sender_name = str(focus_event.get_sender_name() or "").strip()
+            except Exception:
+                target_sender_name = ""
+            message_obj = getattr(focus_event, "message_obj", None)
+            source_event_id = str(
+                getattr(message_obj, "message_id", "")
+                or getattr(focus_event, "message_id", "")
+                or ""
+            ).strip()
+            social_event = str(
+                focus_event.get_extra("astrmai_group_social_signal", "")
+                or focus_event.get_extra("astrmai_social_intent", "")
+                or event.get_extra("astrmai_group_social_signal", "")
+                or event.get_extra("astrmai_social_intent", "")
+                or ""
+            ).strip()
+            stance = str(
+                focus_event.get_extra("astrmai_stance", "")
+                or event.get_extra("astrmai_stance", "")
+                or ""
+            ).strip()
+            if social_event in {"boundary_violation", "pushback", "boundary"}:
+                stance = stance or "reject"
+            if stance in {"pushback", "boundary", "refuse", "refusal"}:
+                stance = "reject"
+            bot_id = str(
+                getattr(self.context, "bot_id", "")
+                or getattr(self.gateway, "bot_id", "")
+                or ""
+            )
+            if (
+                social_event
+                in {
+                    "boundary_violation",
+                    "insult",
+                    "conflict",
+                    "promise",
+                }
+                and target_sender_id
+                and ":GroupMessage:" in chat_id
+            ):
+                await store.observe_social_incident(
+                    chat_id,
+                    kind=social_event,
+                    actor_id=target_sender_id,
+                    actor_name=target_sender_name,
+                    target_id=bot_id,
+                    target_name="Bot",
+                    evidence_event_id=source_event_id,
+                    topic_epoch=history_policy.topic_epoch,
+                    stance=stance,
+                )
             await store.append_segment(
                 chat_id,
                 event_id=reply_event_id,
-                speaker_id=str(getattr(self.context, "bot_id", "") or getattr(self.gateway, "bot_id", "") or ""),
+                speaker_id=bot_id,
                 speaker_name=str(getattr(getattr(self.gateway.config, "system1", None), "nicknames", ["Bot"])[0] if getattr(getattr(self.gateway.config, "system1", None), "nicknames", None) else "Bot"),
                 content=content,
                 role="assistant",
                 message_kind="text",
                 is_bot=True,
+                reply_target_sender_id=target_sender_id,
+                reply_target_sender_name=target_sender_name,
                 timestamp=time.time(),
+                topic_epoch=history_policy.topic_epoch,
+                causal_parent_event_id=source_event_id,
+                source_event_ids=[source_event_id] if source_event_id else [],
+                stance=stance,
+                social_event=social_event,
             )
             await self._record_group_social_candidates(
                 event,
@@ -1571,6 +1641,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "recent_transcript": getattr(prompt_envelope, "recent_transcript", ""),
                     "warm_zone_transcript": getattr(prompt_envelope, "warm_zone_transcript", ""),
                     "last_assistant_reply": getattr(prompt_envelope, "last_assistant_reply", ""),
+                    "current_speaker": getattr(prompt_envelope, "current_speaker_block", ""),
                     "state": getattr(prompt_envelope, "state_block", ""),
                     "memory": getattr(prompt_envelope, "memory_block", ""),
                     "background_memory": getattr(prompt_envelope, "background_memory_block", ""),

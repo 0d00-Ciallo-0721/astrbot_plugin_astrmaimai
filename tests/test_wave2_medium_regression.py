@@ -200,6 +200,10 @@ class Wave2MediumRegressionTests(unittest.TestCase):
 
         self.assertEqual(engine.classify_interaction_type("滚开"), RelationshipEvent.INSULT)
         self.assertEqual(engine.classify_interaction_type("你真是个 sb"), RelationshipEvent.INSULT)
+        self.assertEqual(
+            engine.classify_interaction_type("吃我的肉棒好不好"),
+            RelationshipEvent.BOUNDARY_VIOLATION,
+        )
         self.assertEqual(engine.classify_interaction_type("我喜欢摇滚音乐"), RelationshipEvent.NORMAL_CHAT)
         self.assertEqual(engine.classify_interaction_type("passbook migration"), RelationshipEvent.NORMAL_CHAT)
 

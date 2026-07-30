@@ -9,6 +9,7 @@ from astrbot.api.event import AstrMessageEvent
 from ...infrastructure.compat.legacy_compat import emit_legacy_prompt_envelope_extras, read_legacy_focus_thread_context
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import preview_text
+from ..attention.group_context_snapshot import GroupContextSnapshotBuilder
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyMode
 from ..contracts.prompt_envelope import PromptEnvelope
@@ -437,6 +438,60 @@ class PlannerPromptContextMixin:
             logger.debug(f"[{chat_id}] group social context load failed: {exc}")
             return ""
 
+    async def _get_group_causal_context(
+        self,
+        chat_id: str,
+        history_policy: DialogHistoryPolicy,
+        focus_event: AstrMessageEvent,
+    ) -> str:
+        if not history_policy.group_id or not history_policy.current_sender_id:
+            return ""
+        store = getattr(self, "dialogue_store", None)
+        if store is None:
+            return ""
+        conversation_config = getattr(getattr(self.gateway, "config", None), "conversation", None)
+        builder = GroupContextSnapshotBuilder(
+            store,
+            actor_tail_ttl_sec=float(
+                getattr(conversation_config, "group_actor_tail_ttl_sec", 1200) or 1200
+            ),
+            actor_tail_max_segments=int(
+                getattr(conversation_config, "group_actor_tail_max_segments", 8) or 8
+            ),
+            pending_direct_ttl_sec=float(
+                getattr(conversation_config, "group_pending_direct_ttl_sec", 1200) or 1200
+            ),
+            social_incident_ttl_sec=float(
+                getattr(conversation_config, "group_social_incident_ttl_sec", 1800) or 1800
+            ),
+            max_chars=int(
+                getattr(conversation_config, "group_context_snapshot_max_chars", 5500) or 5500
+            ),
+        )
+        try:
+            sender_name = str(focus_event.get_sender_name() or "").strip()
+        except Exception:
+            sender_name = ""
+        try:
+            snapshot = await builder.build(
+                chat_id,
+                current_sender_id=history_policy.current_sender_id,
+                current_sender_name=sender_name,
+                topic_epoch=history_policy.topic_epoch,
+                watermark=int(
+                    focus_event.get_extra("astrmai_group_activity_watermark", 0) or 0
+                ),
+            )
+            if hasattr(focus_event, "set_extra"):
+                focus_event.set_extra(
+                    "astrmai_group_context_snapshot",
+                    snapshot.trace_payload(),
+                )
+            return snapshot.text
+        except Exception as exc:
+            logger.debug(f"[{chat_id}] group causal context load failed: {exc}")
+            return ""
+
     async def _resolve_referenced_entity_context(
         self,
         *,
@@ -681,9 +736,23 @@ class PlannerPromptContextMixin:
             is_lightweight_event=is_lightweight_event,
         )
         group_social_context = await self._get_group_social_context(chat_id, history_policy)
+        group_causal_context = await self._get_group_causal_context(
+            chat_id,
+            history_policy,
+            focus_event,
+        )
+        if focus_event is not event and hasattr(event, "set_extra"):
+            event.set_extra(
+                "astrmai_group_context_snapshot",
+                focus_event.get_extra("astrmai_group_context_snapshot", {}),
+            )
         if group_social_context:
             current_speaker_block = "\n".join(
                 part for part in (current_speaker_block, group_social_context) if part
+            )
+        if group_causal_context:
+            current_speaker_block = "\n".join(
+                part for part in (current_speaker_block, group_causal_context) if part
             )
         referenced_entities, referenced_entity_block = await self._resolve_referenced_entity_context(
             focus_event=focus_event,
@@ -759,6 +828,11 @@ class PlannerPromptContextMixin:
             if group_social_context:
                 prompt_envelope.guidance_lines.append(
                     "群内称号、昵称、承诺和小游戏状态必须遵守上方归属；不得把其他群友的状态转移给当前发言人。"
+                )
+            if group_causal_context:
+                prompt_envelope.guidance_lines.append(
+                    "群聊因果快照优先于共享背景：先承接当前发言人与 Bot 的真实上一轮，"
+                    "不要把复读 Bot 原话的群友误认成事件当事人或支持者。"
                 )
         interaction_kind = str(focus_event.get_extra("astrmai_interaction_kind", "") or "").strip().lower()
         if interaction_kind == "poke":

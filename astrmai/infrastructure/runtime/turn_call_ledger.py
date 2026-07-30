@@ -321,6 +321,41 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
                 ][:12],
             }
         )
+    group_context_raw = _event_extra(event, "astrmai_group_context_snapshot", {})
+    if not isinstance(group_context_raw, Mapping):
+        group_context_raw = {}
+    group_context_snapshot = {
+        "watermark": int(group_context_raw.get("watermark", 0) or 0),
+        "candidate_count": int(group_context_raw.get("candidate_count", 0) or 0),
+        "selected_count": int(group_context_raw.get("selected_count", 0) or 0),
+        "actor_tail_count": int(group_context_raw.get("actor_tail_count", 0) or 0),
+        "pending_direct_count": int(
+            group_context_raw.get("pending_direct_count", 0) or 0
+        ),
+        "bot_turn_count": int(group_context_raw.get("bot_turn_count", 0) or 0),
+        "social_incident_count": int(
+            group_context_raw.get("social_incident_count", 0) or 0
+        ),
+        "echo_filtered_count": int(
+            group_context_raw.get("echo_filtered_count", 0) or 0
+        ),
+        "topic_bridge": bool(group_context_raw.get("topic_bridge", False)),
+        "exclusion_reasons": [
+            str(item)[:80]
+            for item in list(group_context_raw.get("exclusion_reasons", []) or [])
+            if str(item)
+        ][:12],
+        "text_chars": int(group_context_raw.get("text_chars", 0) or 0),
+        "stale_action": str(
+            _event_extra(event, "astrmai_group_stale_action", "") or ""
+        )[:40],
+        "focus_watermark": int(
+            _event_extra(event, "astrmai_group_focus_watermark", 0) or 0
+        ),
+        "pending_superseded_count": int(
+            _event_extra(event, "astrmai_group_pending_superseded_count", 0) or 0
+        ),
+    }
     return {
         "trace_schema_version": TRACE_SCHEMA_VERSION,
         "instrumentation_version": INSTRUMENTATION_VERSION,
@@ -353,6 +388,7 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         "tool_ledger_summary": _tool_ledger_summary(event, context.calls),
         "reply_stats": copy.deepcopy(context.reply_stats),
         "dialog_history_policy": history_policy_summary,
+        "group_context_snapshot": group_context_snapshot,
     }
 
 

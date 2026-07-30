@@ -270,6 +270,10 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
     def test_process_event_fast_mode_engages_on_direct_wakeup(self):
         captured = []
+        store_mod = importlib.import_module(
+            "astrmai.conversation.attention.group_dialogue_store"
+        )
+        self.gate.dialogue_store = store_mod.GroupDialogueStore()
 
         async def fake_sys2(event, events):
             captured.append((event, events))
@@ -301,6 +305,23 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(turn_context.attention.retrieve_keys, ["CORE_ONLY"])
         self.assertTrue(turn_context.attention.is_fast_mode)
         self.assertEqual(len(captured), 1)
+        actor_tail = asyncio.run(
+            self.gate.dialogue_store.get_actor_tail(
+                "default:GroupMessage:group-1",
+                current_sender_id="user-1",
+                now=123.1,
+            )
+        )
+        pending = asyncio.run(
+            self.gate.dialogue_store.get_pending_direct_items(
+                "default:GroupMessage:group-1",
+                current_sender_id="user-1",
+                now=123.1,
+            )
+        )
+        self.assertEqual([segment.content for segment in actor_tail], ["AstrMai"])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].event_id, actor_tail[0].event_id)
 
         for item in captured:
             if asyncio.iscoroutine(item):

@@ -160,6 +160,7 @@ class RelationshipEvent:
     IGNORE = "ignore"                    # 被无视
     ARGUMENT = "argument"               # 争吵
     RUDENESS = "rudeness"               # 粗鲁行为
+    BOUNDARY_VIOLATION = "boundary_violation"  # 明确的性/身体边界冒犯
     SPAM = "spam"                       # 刷屏
 
     # 中性
@@ -198,6 +199,7 @@ class RelationshipEngine:
         RelationshipEvent.IGNORE:            {"trust": -0.3, "familiarity": -0.2, "emotion_bond": -0.5, "respect": -0.3},
         RelationshipEvent.ARGUMENT:          {"trust": -2.0, "familiarity": 0.5, "emotion_bond": -2.5, "respect": -1.5},
         RelationshipEvent.RUDENESS:          {"trust": -1.5, "familiarity": 0.1, "emotion_bond": -2.0, "respect": -2.5},
+        RelationshipEvent.BOUNDARY_VIOLATION: {"trust": -3.5, "familiarity": 0.0, "emotion_bond": -4.0, "respect": -4.5},
         RelationshipEvent.SPAM:              {"trust": 0.0, "familiarity": 0.1, "emotion_bond": -0.5, "respect": -1.5},
     }
 
@@ -522,6 +524,20 @@ class RelationshipEngine:
             return RelationshipEvent.NORMAL_CHAT
 
         lower = text.lower()
+
+        # 明确的性/身体边界冒犯必须独立于普通粗鲁行为记账，避免下一轮
+        # 又把同一 QQ 当作没有前因的普通熟人。
+        boundary_words = {
+            "肉棒",
+            "鸡巴",
+            "强奸",
+            "给你草",
+            "给你肏",
+            "脱光",
+            "床上等我",
+        }
+        if any(w in lower for w in boundary_words):
+            return RelationshipEvent.BOUNDARY_VIOLATION
 
         # 侮辱检测
         if self._contains_insult(lower):

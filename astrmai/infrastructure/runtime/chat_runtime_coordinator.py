@@ -24,6 +24,18 @@ class SendClaimState:
 
 
 @dataclass
+class ActivityRecord:
+    sequence: int
+    timestamp: float
+    sender_id: str = ""
+    sender_name: str = ""
+    preview: str = ""
+    thread_signature: str = ""
+    event_id: str = ""
+    is_direct: bool = False
+
+
+@dataclass
 class ChatRuntimeState:
     sys2_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     executor_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -36,6 +48,8 @@ class ChatRuntimeState:
     latest_activity_preview: str = ""
     latest_activity_thread_signature: str = ""
     activity_times: List[float] = field(default_factory=list)
+    activity_sequence: int = 0
+    activity_records: List[ActivityRecord] = field(default_factory=list)
     turn_generations: Dict[str, int] = field(default_factory=dict)
     active_turn_tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     send_claims: Dict[str, SendClaimState] = field(default_factory=dict)
@@ -320,13 +334,17 @@ class ChatRuntimeCoordinator:
         sender_name: str = "",
         preview: str = "",
         thread_signature: str = "",
-    ) -> None:
+        *,
+        event_id: str = "",
+        is_direct: bool = False,
+    ) -> int:
         async with self._lock:
             if self._shutdown:
-                return
+                return 0
             state = self._states.setdefault(chat_id, ChatRuntimeState())
             if timestamp < state.latest_activity_ts:
-                return
+                return int(state.activity_sequence or 0)
+            state.activity_sequence = int(state.activity_sequence or 0) + 1
             state.latest_activity_ts = float(timestamp or 0.0)
             state.latest_activity_sender_id = str(sender_id or "")
             state.latest_activity_sender_name = str(sender_name or "")
@@ -337,6 +355,23 @@ class ChatRuntimeCoordinator:
                 for item in state.activity_times
                 if state.latest_activity_ts - float(item or 0.0) <= 1800.0
             ][-31:] + [state.latest_activity_ts]
+            state.activity_records = [
+                item
+                for item in state.activity_records
+                if state.latest_activity_ts - float(item.timestamp or 0.0) <= 1800.0
+            ][-63:] + [
+                ActivityRecord(
+                    sequence=state.activity_sequence,
+                    timestamp=state.latest_activity_ts,
+                    sender_id=state.latest_activity_sender_id,
+                    sender_name=state.latest_activity_sender_name,
+                    preview=state.latest_activity_preview,
+                    thread_signature=state.latest_activity_thread_signature,
+                    event_id=str(event_id or ""),
+                    is_direct=bool(is_direct),
+                )
+            ]
+            return state.activity_sequence
 
     async def get_latest_activity(self, chat_id: str) -> tuple[float, str, str, str]:
         state = await self._get_state(chat_id)
@@ -378,6 +413,8 @@ class ChatRuntimeCoordinator:
                 "latest_activity_preview": state.latest_activity_preview,
                 "latest_activity_thread_signature": state.latest_activity_thread_signature,
                 "activity_times": activity_times[:],
+                "activity_watermark": int(state.activity_sequence or 0),
+                "activity_record_count": len(state.activity_records),
                 "recent_activity_count_60s": len(recent_60s),
                 "recent_activity_count": len(recent_5m),
                 "executor_pending": int(state.executor_pending or 0),
@@ -443,6 +480,8 @@ class ChatRuntimeCoordinator:
         thread_signature: str = "",
         salvage_window_seconds: float = 6.0,
         allow_parallel_threads: bool = False,
+        focus_sender_id: str = "",
+        focus_watermark: int = 0,
     ) -> tuple[FreshnessState, str]:
         state = await self._get_state(chat_id)
         if focus_timestamp <= 0:
@@ -450,6 +489,25 @@ class ChatRuntimeCoordinator:
 
         latest_ts = float(state.latest_activity_ts or 0.0)
         latest_signature = str(state.latest_activity_thread_signature or "")
+        if focus_watermark > 0 and focus_sender_id:
+            newer_records = [
+                record
+                for record in state.activity_records
+                if int(record.sequence or 0) > int(focus_watermark or 0)
+            ]
+            same_actor_direct = [
+                record
+                for record in newer_records
+                if record.sender_id == str(focus_sender_id or "") and record.is_direct
+            ]
+            if same_actor_direct:
+                newest = same_actor_direct[-1]
+                delta = max(0.0, float(newest.timestamp or 0.0) - float(focus_timestamp or 0.0))
+                actor = newest.sender_name or newest.sender_id or "unknown"
+                return (
+                    FreshnessState.STALE_BUT_SALVAGEABLE,
+                    f"same_actor_direct_update:{actor}:{delta:.1f}s",
+                )
         different_known_thread = bool(
             thread_signature
             and latest_signature

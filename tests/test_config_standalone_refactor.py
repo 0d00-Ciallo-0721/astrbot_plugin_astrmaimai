@@ -177,6 +177,13 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(evolution_items["expression_min_count"]["default"], 2)
         self.assertEqual(schema["conversation"]["items"]["compaction_trigger_segments"]["default"], 40)
         self.assertEqual(schema["conversation"]["items"]["compaction_keep_recent_segments"]["default"], 16)
+        conversation_items = schema["conversation"]["items"]
+        self.assertEqual(conversation_items["group_actor_tail_ttl_sec"]["default"], 1200)
+        self.assertEqual(conversation_items["group_actor_tail_max_segments"]["default"], 8)
+        self.assertEqual(conversation_items["group_pending_direct_ttl_sec"]["default"], 1200)
+        self.assertEqual(conversation_items["group_social_incident_ttl_sec"]["default"], 1800)
+        self.assertEqual(conversation_items["group_context_snapshot_max_chars"]["default"], 5500)
+        self.assertTrue(conversation_items["group_pre_send_freshness_enabled"]["default"])
         memory_items = schema["memory"]["items"]
         self.assertTrue(memory_items["memory_query_builder_enabled"]["default"])
         self.assertFalse(memory_items["intent_rerank_enabled"]["default"])

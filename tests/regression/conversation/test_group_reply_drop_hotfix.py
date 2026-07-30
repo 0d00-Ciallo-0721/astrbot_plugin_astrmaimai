@@ -58,15 +58,26 @@ class _RecordingCoordinator:
         self.mark_activity_calls = []
         self.freshness_calls = []
 
-    async def mark_activity(self, chat_id, timestamp, sender_id="", sender_name="", preview="", thread_signature=""):
+    async def mark_activity(
+        self,
+        chat_id,
+        timestamp,
+        sender_id="",
+        sender_name="",
+        preview="",
+        thread_signature="",
+        **kwargs,
+    ):
         self.mark_activity_calls.append(
             {
                 "chat_id": chat_id,
                 "timestamp": timestamp,
                 "sender_id": sender_id,
                 "thread_signature": thread_signature,
+                **kwargs,
             }
         )
+        return len(self.mark_activity_calls)
 
     async def evaluate_reply_freshness(self, chat_id, focus_timestamp, **kwargs):
         self.freshness_calls.append({"chat_id": chat_id, "focus_timestamp": focus_timestamp, **kwargs})
@@ -145,6 +156,7 @@ class ReplyFreshnessThreadIdentityTests(unittest.TestCase):
         event = _MockEvent(sender_id="777")
         event.set_extra("astrmai_timestamp", time.time() - 5.0)
         event.set_extra("astrmai_turn_thread_id", "sender:777")
+        event.set_extra("astrmai_group_activity_watermark", 7)
 
         state, reason = asyncio.run(host._check_reply_freshness(event, event.unified_msg_origin))
 
@@ -152,6 +164,8 @@ class ReplyFreshnessThreadIdentityTests(unittest.TestCase):
         call = coordinator.freshness_calls[0]
         self.assertEqual(call.get("thread_signature"), "sender:777")
         self.assertTrue(call.get("allow_parallel_threads"))
+        self.assertEqual(call.get("focus_sender_id"), "777")
+        self.assertEqual(call.get("focus_watermark"), 7)
 
     def test_check_reply_freshness_consistent_when_both_identities_present(self):
         coordinator = _RecordingCoordinator()

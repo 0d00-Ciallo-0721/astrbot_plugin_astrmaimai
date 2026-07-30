@@ -22,6 +22,7 @@ from ...infrastructure.runtime.turn_call_ledger import attach_background_task_tr
 from .decision_router import AttentionDecisionRouter
 from .event_normalizer import SessionContext, build_normalized_events
 from .focus_selector import score_focus_candidate, select_focus_event
+from .group_context_snapshot import classify_group_social_signal, is_group_direct_correction
 from .perception import PerceptionBuilder
 from .thread_builder import build_focus_thread, resolve_thread_root
 from .vision_binding import extract_image_base64, extract_image_base64_from_url
@@ -579,14 +580,41 @@ class AttentionGate:
                         thread_identity = str(resolve_group_thread(event, chat_id).thread_id or "")
                     except Exception:
                         thread_identity = ""
-                await self.runtime_coordinator.mark_activity(
-                    chat_id,
-                    now,
-                    activity_sender_id,
-                    event.get_sender_name() if hasattr(event, "get_sender_name") else "",
-                    str(getattr(event, "message_str", "") or ""),
-                    thread_identity,
+                is_direct = bool(
+                    event.get_extra("astrmai_group_direct_wakeup", False)
+                    or event.get_extra("is_private_chat", False)
                 )
+                if not is_direct:
+                    try:
+                        bot_id = str(getattr(self.state_engine, "bot_id", "") or "")
+                        is_direct = bool(
+                            self._is_at_bot_event(event, bot_id)
+                            or self._is_reply_to_bot_event(event, bot_id)
+                        )
+                    except Exception:
+                        is_direct = False
+                try:
+                    watermark = await self.runtime_coordinator.mark_activity(
+                        chat_id,
+                        now,
+                        activity_sender_id,
+                        event.get_sender_name() if hasattr(event, "get_sender_name") else "",
+                        str(getattr(event, "message_str", "") or ""),
+                        thread_identity,
+                        event_id=self._build_message_id(event),
+                        is_direct=is_direct,
+                    )
+                except TypeError:
+                    watermark = await self.runtime_coordinator.mark_activity(
+                        chat_id,
+                        now,
+                        activity_sender_id,
+                        event.get_sender_name() if hasattr(event, "get_sender_name") else "",
+                        str(getattr(event, "message_str", "") or ""),
+                        thread_identity,
+                    )
+                if hasattr(event, "set_extra"):
+                    event.set_extra("astrmai_group_activity_watermark", int(watermark or 0))
             except Exception as exc:
                 logger.debug(f"[AttentionGate] runtime activity mark degraded: {exc}")
         return now
@@ -809,9 +837,42 @@ class AttentionGate:
         ):
             return
         try:
+            bot_id = str(getattr(self.state_engine, "bot_id", "") or "")
+            is_at_bot = self._is_at_bot_event(event, bot_id)
+            is_reply_to_bot = self._is_reply_to_bot_event(event, bot_id)
+            event_id = self._build_message_id(event)
+            topic_epoch = 0
+            history_policy = event.get_extra("astrmai_dialog_history_policy", None)
+            if history_policy is not None:
+                topic_epoch = int(
+                    getattr(history_policy, "topic_epoch", 0)
+                    if not isinstance(history_policy, dict)
+                    else history_policy.get("topic_epoch", 0)
+                    or 0
+                )
+            create_pending_direct = bool(
+                is_at_bot
+                or is_reply_to_bot
+                or event.get_extra("astrmai_group_direct_wakeup", False)
+                or event.get_extra("astrmai_force_engage", False)
+            )
+            if (
+                create_pending_direct
+                and ":GroupMessage:" in chat_id
+                and is_group_direct_correction(content)
+            ):
+                superseded_count = await store.supersede_pending_direct_for_actor(
+                    chat_id,
+                    actor_id=sender_id,
+                    superseded_by_event_id=event_id,
+                )
+                event.set_extra(
+                    "astrmai_group_pending_superseded_count",
+                    int(superseded_count or 0),
+                )
             await store.append_segment(
                 chat_id,
-                event_id=self._build_message_id(event),
+                event_id=event_id,
                 speaker_id=sender_id,
                 speaker_name=str(event.get_sender_name() or ""),
                 content=content,
@@ -820,12 +881,40 @@ class AttentionGate:
                 is_bot=False,
                 reply_target_sender_id=self._extract_reply_target(event)[0],
                 reply_target_sender_name=self._extract_reply_target(event)[1],
-                is_at_bot=self._is_at_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
-                is_reply_to_bot=self._is_reply_to_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
+                is_at_bot=is_at_bot,
+                is_reply_to_bot=is_reply_to_bot,
                 has_direct_vision=bool(event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls")) or []),
                 is_image_only=self._is_image_only(event),
                 timestamp=float(getattr(event, "timestamp", 0.0) or time.time()),
+                topic_epoch=topic_epoch,
+                create_pending_direct=create_pending_direct,
             )
+            if ":GroupMessage:" in chat_id:
+                social_signal = classify_group_social_signal(content)
+                is_direct_to_bot = bool(
+                    create_pending_direct
+                    or event.get_extra("astrmai_group_direct_wakeup", False)
+                    or event.get_extra("astrmai_force_engage", False)
+                )
+                if social_signal in {"apology", "reconciliation"} and is_direct_to_bot:
+                    await store.resolve_social_incidents(
+                        chat_id,
+                        actor_id=sender_id,
+                        resolution_event_id=event_id,
+                        resolution_kind=social_signal,
+                    )
+                elif social_signal and is_direct_to_bot:
+                    await store.observe_social_incident(
+                        chat_id,
+                        kind=social_signal,
+                        actor_id=sender_id,
+                        actor_name=str(event.get_sender_name() or ""),
+                        target_id=bot_id if is_at_bot or is_reply_to_bot else "",
+                        target_name="Bot" if is_at_bot or is_reply_to_bot else "",
+                        evidence_event_id=event_id,
+                        topic_epoch=topic_epoch,
+                    )
+                event.set_extra("astrmai_group_social_signal", social_signal)
         except Exception as exc:
             logger.debug(f"[AttentionGate] dialogue segment append degraded: {exc}")
 
@@ -937,6 +1026,7 @@ class AttentionGate:
         if not self._is_simple_wakeup_payload(getattr(event, "message_str", "")):
             return None
         event.set_extra("astrmai_group_direct_wakeup", True)
+        await self._append_dialogue_segment(event)
         return await self._engage_immediately(event, chat_id, ["CORE_ONLY"], fast_mode=True)
 
     async def _passes_sensor_filters(self, event: AstrMessageEvent, msg_str: str) -> bool:

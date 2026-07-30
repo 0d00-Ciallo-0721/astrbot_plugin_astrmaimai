@@ -34,6 +34,15 @@ class DialogueSegment:
     # G3/ID-08: 被撤回的消息保留占位（speaker 与时序不变），内容替换为墓碑文案，
     # 避免 bot 在后续回复里原文复述用户已撤回的内容
     is_recalled: bool = False
+    sequence: int = 0
+    topic_epoch: int = 0
+    causal_parent_event_id: str = ""
+    provenance: str = "original"
+    echo_of_event_id: str = ""
+    outcome: str = ""
+    source_event_ids: list[str] = field(default_factory=list)
+    stance: str = ""
+    social_event: str = ""
 
 
 @dataclass(slots=True)
@@ -73,10 +82,56 @@ class GroupSocialStateItem:
     evidence_event_ids: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class PendingDirectItem:
+    pending_id: str
+    event_id: str
+    speaker_id: str
+    speaker_name: str
+    content: str
+    created_at: float
+    updated_at: float
+    topic_epoch: int = 0
+    status: str = "pending"
+    resolved_by_event_id: str = ""
+
+
+@dataclass(slots=True)
+class BotTurnRecord:
+    turn_id: str
+    timestamp: float
+    target_sender_id: str
+    target_sender_name: str
+    source_event_ids: list[str]
+    reply_text: str
+    reply_hash: str
+    stance: str = ""
+    social_event: str = ""
+    topic_epoch: int = 0
+
+
+@dataclass(slots=True)
+class GroupSocialIncident:
+    incident_id: str
+    kind: str
+    actor_id: str
+    actor_name: str
+    target_id: str
+    target_name: str
+    created_at: float
+    updated_at: float
+    topic_epoch: int = 0
+    status: str = "open"
+    stance: str = ""
+    evidence_event_ids: list[str] = field(default_factory=list)
+    resolution_event_id: str = ""
+    resolution_kind: str = ""
+
+
 class GroupDialogueStore:
     # G4/PL-09: 快照 schema 版本——不兼容即整份弃用（不做半解析），避免旧结构
     # 恢复出畸形 segment 污染上下文
-    SNAPSHOT_SCHEMA_VERSION = 1
+    SNAPSHOT_SCHEMA_VERSION = 2
     SNAPSHOT_FILENAME = "dialogue_store_state.json"
     SNAPSHOT_MAX_CHATS = 64
     SNAPSHOT_MAX_SEGMENTS_PER_CHAT = 40
@@ -95,6 +150,10 @@ class GroupDialogueStore:
         self.snapshot_dir = snapshot_dir
         self._threads: dict[str, DialogueThread] = {}
         self._social_states: dict[str, list[GroupSocialStateItem]] = {}
+        self._pending_direct: dict[str, list[PendingDirectItem]] = {}
+        self._bot_turns: dict[str, list[BotTurnRecord]] = {}
+        self._social_incidents: dict[str, list[GroupSocialIncident]] = {}
+        self._sequence_by_chat: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     def _get_thread(self, chat_id: str) -> DialogueThread:
@@ -109,7 +168,17 @@ class GroupDialogueStore:
             key = self._resolve_chat_key(chat_id)
             thread_removed = self._threads.pop(key, None) is not None
             social_removed = self._social_states.pop(key, None) is not None
-            return thread_removed or social_removed
+            pending_removed = self._pending_direct.pop(key, None) is not None
+            bot_turns_removed = self._bot_turns.pop(key, None) is not None
+            incidents_removed = self._social_incidents.pop(key, None) is not None
+            self._sequence_by_chat.pop(key, None)
+            return (
+                thread_removed
+                or social_removed
+                or pending_removed
+                or bot_turns_removed
+                or incidents_removed
+            )
 
     @staticmethod
     def _resolve_chat_key(chat_id) -> str:
@@ -149,9 +218,20 @@ class GroupDialogueStore:
         has_direct_vision: bool = False,
         is_image_only: bool = False,
         timestamp: float | None = None,
+        topic_epoch: int = 0,
+        causal_parent_event_id: str = "",
+        provenance: str = "original",
+        echo_of_event_id: str = "",
+        outcome: str = "",
+        source_event_ids: list[str] | None = None,
+        stance: str = "",
+        social_event: str = "",
+        create_pending_direct: bool = False,
     ) -> DialogueSegment:
+        chat_key = self._resolve_chat_key(chat_id)
+        created_at = float(timestamp or time.time())
         segment = DialogueSegment(
-            timestamp=float(timestamp or time.time()),
+            timestamp=created_at,
             event_id=str(event_id or ""),
             speaker_id=str(speaker_id or ""),
             speaker_name=str(speaker_name or ""),
@@ -166,12 +246,398 @@ class GroupDialogueStore:
             is_reply_to_bot=bool(is_reply_to_bot),
             has_direct_vision=bool(has_direct_vision),
             is_image_only=bool(is_image_only),
+            topic_epoch=max(0, int(topic_epoch or 0)),
+            causal_parent_event_id=str(causal_parent_event_id or ""),
+            provenance=str(provenance or "original"),
+            echo_of_event_id=str(echo_of_event_id or ""),
+            outcome=str(outcome or ""),
+            source_event_ids=[
+                str(item).strip()
+                for item in list(source_event_ids or [])
+                if str(item).strip()
+            ][-8:],
+            stance=str(stance or ""),
+            social_event=str(social_event or ""),
         )
         async with self._lock:
-            thread = self._get_thread(self._resolve_chat_key(chat_id))
+            thread = self._get_thread(chat_key)
             async with thread.lock:
+                next_sequence = int(self._sequence_by_chat.get(chat_key, 0) or 0) + 1
+                self._sequence_by_chat[chat_key] = next_sequence
+                segment.sequence = next_sequence
+                if not segment.is_bot and segment.provenance == "original":
+                    echo = self._find_recent_bot_echo(thread.segments, segment.content, created_at)
+                    if echo is not None:
+                        segment.provenance = "bot_echo"
+                        segment.echo_of_event_id = echo.event_id
                 thread.segments.append(segment)
+            if create_pending_direct and not segment.is_bot and segment.provenance != "bot_echo":
+                pending_id = self._stable_id(
+                    "pending",
+                    chat_key,
+                    segment.event_id or str(segment.sequence),
+                )
+                items = self._pending_direct.setdefault(chat_key, [])
+                items.append(
+                    PendingDirectItem(
+                        pending_id=pending_id,
+                        event_id=segment.event_id,
+                        speaker_id=segment.speaker_id,
+                        speaker_name=segment.speaker_name,
+                        content=segment.content,
+                        created_at=created_at,
+                        updated_at=created_at,
+                        topic_epoch=segment.topic_epoch,
+                    )
+                )
+                self._pending_direct[chat_key] = items[-80:]
+            if segment.is_bot:
+                self._record_bot_turn_locked(chat_key, segment)
         return segment
+
+    @staticmethod
+    def _stable_id(prefix: str, *parts: str) -> str:
+        payload = "\x1f".join(str(part or "") for part in parts).encode("utf-8")
+        return f"{prefix}_" + hashlib.sha256(payload).hexdigest()[:20]
+
+    @classmethod
+    def _normalize_echo_text(cls, text: str) -> str:
+        normalized = cls._normalize_message_text(text).lower()
+        return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
+
+    @classmethod
+    def _find_recent_bot_echo(
+        cls,
+        segments: list[DialogueSegment],
+        content: str,
+        timestamp: float,
+    ) -> DialogueSegment | None:
+        normalized = cls._normalize_echo_text(content)
+        if len(normalized) < 8:
+            return None
+        for candidate in reversed(segments[-24:]):
+            if not candidate.is_bot and candidate.role != "assistant":
+                continue
+            if timestamp - float(candidate.timestamp or 0.0) > 900.0:
+                break
+            if cls._normalize_echo_text(candidate.content) == normalized:
+                return candidate
+        return None
+
+    def _record_bot_turn_locked(self, chat_key: str, segment: DialogueSegment) -> None:
+        source_ids = list(segment.source_event_ids or [])
+        if not source_ids and segment.causal_parent_event_id:
+            source_ids = [segment.causal_parent_event_id]
+        reply_hash = hashlib.sha256(segment.content.encode("utf-8")).hexdigest()[:20]
+        turn = BotTurnRecord(
+            turn_id=segment.event_id or self._stable_id(
+                "bot_turn",
+                chat_key,
+                str(segment.sequence),
+            ),
+            timestamp=segment.timestamp,
+            target_sender_id=segment.reply_target_sender_id,
+            target_sender_name=segment.reply_target_sender_name,
+            source_event_ids=source_ids[-8:],
+            reply_text=segment.content,
+            reply_hash=reply_hash,
+            stance=segment.stance,
+            social_event=segment.social_event,
+            topic_epoch=segment.topic_epoch,
+        )
+        turns = self._bot_turns.setdefault(chat_key, [])
+        turns.append(turn)
+        self._bot_turns[chat_key] = turns[-80:]
+        for pending in self._pending_direct.get(chat_key, []):
+            source_match = bool(pending.event_id and pending.event_id in source_ids)
+            target_match = bool(
+                turn.target_sender_id
+                and pending.speaker_id == turn.target_sender_id
+                and pending.status == "pending"
+            )
+            if pending.status == "pending" and (source_match or target_match):
+                pending.status = "answered"
+                pending.resolved_by_event_id = turn.turn_id
+                pending.updated_at = turn.timestamp
+
+    async def get_actor_tail(
+        self,
+        chat_id: str,
+        *,
+        current_sender_id: str,
+        ttl_seconds: float = 1200.0,
+        max_items: int = 8,
+        now: float | None = None,
+    ) -> list[DialogueSegment]:
+        key = self._resolve_chat_key(chat_id)
+        sender_id = str(current_sender_id or "").strip()
+        if not sender_id:
+            return []
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            thread = self._threads.get(key)
+            if thread is None:
+                return []
+            async with thread.lock:
+                selected = [
+                    segment
+                    for segment in thread.segments
+                    if segment.speaker_id == sender_id
+                    and not segment.is_bot
+                    and timestamp - float(segment.timestamp or 0.0) <= max(60.0, ttl_seconds)
+                ]
+        return selected[-max(1, int(max_items or 1)) :]
+
+    async def get_pending_direct_items(
+        self,
+        chat_id: str,
+        *,
+        current_sender_id: str,
+        ttl_seconds: float = 1200.0,
+        include_answered: bool = False,
+        now: float | None = None,
+    ) -> list[PendingDirectItem]:
+        key = self._resolve_chat_key(chat_id)
+        sender_id = str(current_sender_id or "").strip()
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            items = self._pending_direct.get(key, [])
+            ttl = max(60.0, ttl_seconds)
+            for item in items:
+                if (
+                    item.status == "pending"
+                    and timestamp - float(item.updated_at or 0.0) > ttl
+                ):
+                    item.status = "expired"
+                    item.updated_at = timestamp
+            items = list(items)
+        return [
+            item
+            for item in items
+            if item.speaker_id == sender_id
+            and (
+                item.status == "expired"
+                or timestamp - float(item.updated_at or 0.0) <= max(60.0, ttl_seconds)
+            )
+            and (include_answered or item.status == "pending")
+        ][-8:]
+
+    async def set_pending_direct_status(
+        self,
+        chat_id: str,
+        *,
+        event_id: str,
+        status: str,
+        resolved_by_event_id: str = "",
+        now: float | None = None,
+    ) -> bool:
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {
+            "pending",
+            "answered",
+            "superseded",
+            "withdrawn",
+            "expired",
+        }:
+            raise ValueError(f"unsupported pending direct status: {status}")
+        target_event_id = str(event_id or "").strip()
+        if not target_event_id:
+            return False
+        key = self._resolve_chat_key(chat_id)
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            for item in self._pending_direct.get(key, []):
+                if item.event_id != target_event_id:
+                    continue
+                item.status = normalized_status
+                item.updated_at = timestamp
+                item.resolved_by_event_id = str(resolved_by_event_id or "")
+                return True
+        return False
+
+    async def supersede_pending_direct_for_actor(
+        self,
+        chat_id: str,
+        *,
+        actor_id: str,
+        superseded_by_event_id: str,
+        now: float | None = None,
+    ) -> int:
+        key = self._resolve_chat_key(chat_id)
+        normalized_actor = str(actor_id or "").strip()
+        replacement_event_id = str(superseded_by_event_id or "").strip()
+        if not normalized_actor or not replacement_event_id:
+            return 0
+        timestamp = time.time() if now is None else float(now)
+        updated = 0
+        async with self._lock:
+            for item in self._pending_direct.get(key, []):
+                if item.speaker_id != normalized_actor or item.status != "pending":
+                    continue
+                if item.event_id == replacement_event_id:
+                    continue
+                item.status = "superseded"
+                item.updated_at = timestamp
+                item.resolved_by_event_id = replacement_event_id
+                updated += 1
+        return updated
+
+    async def get_recent_bot_turns(
+        self,
+        chat_id: str,
+        *,
+        target_sender_id: str,
+        ttl_seconds: float = 1200.0,
+        max_items: int = 4,
+        now: float | None = None,
+    ) -> list[BotTurnRecord]:
+        key = self._resolve_chat_key(chat_id)
+        sender_id = str(target_sender_id or "").strip()
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            turns = list(self._bot_turns.get(key, []))
+        selected = [
+            turn
+            for turn in turns
+            if turn.target_sender_id == sender_id
+            and timestamp - float(turn.timestamp or 0.0) <= max(60.0, ttl_seconds)
+        ]
+        return selected[-max(1, int(max_items or 1)) :]
+
+    async def observe_social_incident(
+        self,
+        chat_id: str,
+        *,
+        kind: str,
+        actor_id: str,
+        actor_name: str = "",
+        target_id: str = "",
+        target_name: str = "",
+        evidence_event_id: str = "",
+        topic_epoch: int = 0,
+        stance: str = "",
+        now: float | None = None,
+    ) -> GroupSocialIncident | None:
+        key = self._resolve_chat_key(chat_id)
+        normalized_kind = str(kind or "").strip().lower()
+        normalized_actor = str(actor_id or "").strip()
+        if not normalized_kind or not normalized_actor:
+            return None
+        timestamp = time.time() if now is None else float(now)
+        evidence_id = str(evidence_event_id or "").strip()
+        async with self._lock:
+            incidents = self._social_incidents.setdefault(key, [])
+            existing = next(
+                (
+                    item
+                    for item in reversed(incidents)
+                    if item.status == "open"
+                    and item.kind == normalized_kind
+                    and item.actor_id == normalized_actor
+                    and item.target_id == str(target_id or "").strip()
+                ),
+                None,
+            )
+            if existing is not None:
+                existing.updated_at = timestamp
+                existing.actor_name = str(actor_name or existing.actor_name or "")
+                existing.stance = str(stance or existing.stance or "")
+                if evidence_id and evidence_id not in existing.evidence_event_ids:
+                    existing.evidence_event_ids.append(evidence_id)
+                    existing.evidence_event_ids = existing.evidence_event_ids[-8:]
+                return existing
+            incident = GroupSocialIncident(
+                incident_id=self._stable_id(
+                    "incident",
+                    key,
+                    normalized_kind,
+                    normalized_actor,
+                    str(target_id or ""),
+                    evidence_id or str(timestamp),
+                ),
+                kind=normalized_kind,
+                actor_id=normalized_actor,
+                actor_name=str(actor_name or ""),
+                target_id=str(target_id or ""),
+                target_name=str(target_name or ""),
+                created_at=timestamp,
+                updated_at=timestamp,
+                topic_epoch=max(0, int(topic_epoch or 0)),
+                stance=str(stance or ""),
+                evidence_event_ids=[evidence_id] if evidence_id else [],
+            )
+            incidents.append(incident)
+            self._social_incidents[key] = incidents[-80:]
+            return incident
+
+    async def resolve_social_incidents(
+        self,
+        chat_id: str,
+        *,
+        actor_id: str,
+        resolution_event_id: str,
+        resolution_kind: str,
+        now: float | None = None,
+    ) -> int:
+        key = self._resolve_chat_key(chat_id)
+        normalized_actor = str(actor_id or "").strip()
+        if not normalized_actor:
+            return 0
+        timestamp = time.time() if now is None else float(now)
+        resolved = 0
+        async with self._lock:
+            for incident in self._social_incidents.get(key, []):
+                if incident.status != "open" or incident.actor_id != normalized_actor:
+                    continue
+                incident.status = "resolved"
+                incident.updated_at = timestamp
+                incident.resolution_event_id = str(resolution_event_id or "")
+                incident.resolution_kind = str(resolution_kind or "")
+                resolved += 1
+        return resolved
+
+    async def get_social_incidents(
+        self,
+        chat_id: str,
+        *,
+        current_sender_id: str,
+        ttl_seconds: float = 1800.0,
+        include_resolved: bool = False,
+        now: float | None = None,
+    ) -> list[GroupSocialIncident]:
+        key = self._resolve_chat_key(chat_id)
+        sender_id = str(current_sender_id or "").strip()
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            incidents = list(self._social_incidents.get(key, []))
+        return [
+            item
+            for item in incidents
+            if item.actor_id == sender_id
+            and timestamp - float(item.updated_at or 0.0) <= max(60.0, ttl_seconds)
+            and (include_resolved or item.status == "open")
+        ][-8:]
+
+    async def count_recent_bot_echoes(
+        self,
+        chat_id: str,
+        *,
+        ttl_seconds: float = 1200.0,
+        now: float | None = None,
+    ) -> int:
+        key = self._resolve_chat_key(chat_id)
+        timestamp = time.time() if now is None else float(now)
+        async with self._lock:
+            thread = self._threads.get(key)
+            if thread is None:
+                return 0
+            async with thread.lock:
+                return sum(
+                    1
+                    for segment in thread.segments
+                    if segment.provenance == "bot_echo"
+                    and timestamp - float(segment.timestamp or 0.0) <= max(60.0, ttl_seconds)
+                )
 
     RECALLED_PLACEHOLDER = "[已撤回]"
 
@@ -198,6 +664,14 @@ class GroupDialogueStore:
                     segment.is_image_only = False
                     segment.token_estimate = self._estimate_tokens(self.RECALLED_PLACEHOLDER)
                     hit = True
+                if hit:
+                    for pending in self._pending_direct.get(
+                        self._resolve_chat_key(chat_id),
+                        [],
+                    ):
+                        if pending.event_id == target_id and pending.status == "pending":
+                            pending.status = "withdrawn"
+                            pending.updated_at = time.time()
                 return hit
 
     # ---- G4/PL-09 快照持久化 ---------------------------------------------
@@ -246,6 +720,51 @@ class GroupDialogueStore:
             if item.status not in {"candidate", "confirmed", "rejected"}:
                 return None
             return item
+        except Exception:
+            return None
+
+    @staticmethod
+    def _serialize_dataclass(item: Any) -> dict:
+        return {field.name: getattr(item, field.name) for field in dataclass_fields(type(item))}
+
+    @staticmethod
+    def _deserialize_pending_direct(payload: dict) -> PendingDirectItem | None:
+        try:
+            valid_names = {field.name for field in dataclass_fields(PendingDirectItem)}
+            return PendingDirectItem(
+                **{key: value for key, value in dict(payload or {}).items() if key in valid_names}
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _deserialize_bot_turn(payload: dict) -> BotTurnRecord | None:
+        try:
+            valid_names = {field.name for field in dataclass_fields(BotTurnRecord)}
+            data = {key: value for key, value in dict(payload or {}).items() if key in valid_names}
+            data["source_event_ids"] = [
+                str(item).strip()
+                for item in list(data.get("source_event_ids", []) or [])
+                if str(item).strip()
+            ][-8:]
+            return BotTurnRecord(**data)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _deserialize_social_incident(payload: dict) -> GroupSocialIncident | None:
+        try:
+            valid_names = {field.name for field in dataclass_fields(GroupSocialIncident)}
+            data = {key: value for key, value in dict(payload or {}).items() if key in valid_names}
+            data["evidence_event_ids"] = [
+                str(item).strip()
+                for item in list(data.get("evidence_event_ids", []) or [])
+                if str(item).strip()
+            ][-8:]
+            incident = GroupSocialIncident(**data)
+            if incident.status not in {"open", "resolved", "expired"}:
+                return None
+            return incident
         except Exception:
             return None
 
@@ -402,6 +921,22 @@ class GroupDialogueStore:
                 for chat_id, items in self._social_states.items()
                 if items
             }
+            pending_direct = {
+                chat_id: [self._serialize_dataclass(item) for item in items[-80:]]
+                for chat_id, items in self._pending_direct.items()
+                if items
+            }
+            bot_turns = {
+                chat_id: [self._serialize_dataclass(item) for item in items[-80:]]
+                for chat_id, items in self._bot_turns.items()
+                if items
+            }
+            social_incidents = {
+                chat_id: [self._serialize_dataclass(item) for item in items[-80:]]
+                for chat_id, items in self._social_incidents.items()
+                if items
+            }
+            sequence_by_chat = dict(self._sequence_by_chat)
         for chat_id, thread in threads[: self.SNAPSHOT_MAX_CHATS]:
             async with thread.lock:
                 fresh = [
@@ -420,6 +955,10 @@ class GroupDialogueStore:
             "saved_at": now,
             "chats": chats,
             "social_states": social_states,
+            "pending_direct": pending_direct,
+            "bot_turns": bot_turns,
+            "social_incidents": social_incidents,
+            "sequence_by_chat": sequence_by_chat,
         }
 
     async def persist_snapshot(self) -> bool:
@@ -427,7 +966,16 @@ class GroupDialogueStore:
         if path is None:
             return False
         payload = await self.export_snapshot()
-        if not payload.get("chats") and not payload.get("social_states"):
+        if not any(
+            payload.get(key)
+            for key in (
+                "chats",
+                "social_states",
+                "pending_direct",
+                "bot_turns",
+                "social_incidents",
+            )
+        ):
             return False
 
         def _write() -> None:
@@ -457,9 +1005,10 @@ class GroupDialogueStore:
             logger.warning(f"[DialogueStore] context snapshot unreadable; ignored: {exc}")
             return 0
         version = int(payload.get("schema_version", 0) or 0)
-        if version != self.SNAPSHOT_SCHEMA_VERSION:
+        if version not in {1, self.SNAPSHOT_SCHEMA_VERSION}:
             logger.warning(
-                f"[DialogueStore] context snapshot schema {version} != {self.SNAPSHOT_SCHEMA_VERSION}; discarded"
+                f"[DialogueStore] context snapshot schema {version} is unsupported; "
+                f"current={self.SNAPSHOT_SCHEMA_VERSION}; discarded"
             )
             return 0
         now = time.time()
@@ -512,10 +1061,61 @@ class GroupDialogueStore:
                 self._social_states[key] = list(existing.values())[-80:]
             restored_social += 1
             restored_chat_ids.add(key)
+        restored_causal = 0
+        causal_specs = (
+            ("pending_direct", self._pending_direct, self._deserialize_pending_direct),
+            ("bot_turns", self._bot_turns, self._deserialize_bot_turn),
+            ("social_incidents", self._social_incidents, self._deserialize_social_incident),
+        )
+        for payload_key, target, deserializer in causal_specs:
+            for chat_id, items_payload in dict(payload.get(payload_key, {}) or {}).items():
+                try:
+                    key = self._resolve_chat_key(chat_id)
+                except ValueError:
+                    continue
+                items = [
+                    item
+                    for item in (
+                        deserializer(item_payload)
+                        for item_payload in list(items_payload or [])
+                    )
+                    if item is not None
+                ][-80:]
+                if not items:
+                    continue
+                async with self._lock:
+                    existing = {
+                        getattr(item, "pending_id", "")
+                        or getattr(item, "turn_id", "")
+                        or getattr(item, "incident_id", ""): item
+                        for item in target.get(key, [])
+                    }
+                    for item in items:
+                        item_id = (
+                            getattr(item, "pending_id", "")
+                            or getattr(item, "turn_id", "")
+                            or getattr(item, "incident_id", "")
+                        )
+                        existing.setdefault(item_id, item)
+                    target[key] = list(existing.values())[-80:]
+                restored_causal += 1
+                restored_chat_ids.add(key)
+        async with self._lock:
+            for chat_id, sequence in dict(payload.get("sequence_by_chat", {}) or {}).items():
+                try:
+                    key = self._resolve_chat_key(chat_id)
+                    self._sequence_by_chat[key] = max(
+                        int(self._sequence_by_chat.get(key, 0) or 0),
+                        int(sequence or 0),
+                    )
+                except (TypeError, ValueError):
+                    continue
         if restored:
             logger.info(f"[DialogueStore] restored context snapshot for {restored} chats")
         if restored_social:
             logger.info(f"[DialogueStore] restored social state for {restored_social} chats")
+        if restored_causal:
+            logger.info(f"[DialogueStore] restored causal state for {restored_causal} scopes")
         return len(restored_chat_ids)
 
     async def set_cold_summary(self, chat_id: str, summary: str) -> None:

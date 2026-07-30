@@ -265,6 +265,42 @@
         "default": 1800,
         "hint": "超过这个时间后，不再自动恢复旧话题；只有用户明确说“上次、之前、还记得”等回忆表达时才会检索旧内容。默认 1800 秒，即 30 分钟。"
       },
+      "group_actor_tail_ttl_sec": {
+        "description": "当前群友消息承接时间（秒）",
+        "type": "int",
+        "default": 1200,
+        "hint": "机器人回复某位群友时，会优先查看这个人在该群最近说过的话。可跨越短期话题切换，但不会混入其他群友。默认 1200 秒，即 20 分钟。"
+      },
+      "group_actor_tail_max_segments": {
+        "description": "当前群友近期消息上限",
+        "type": "int",
+        "default": 8,
+        "hint": "每轮最多提供多少条当前发言人自己的近期消息。过高会增加上下文，过低可能接不上连续追问，建议保持 6～10 条。"
+      },
+      "group_pending_direct_ttl_sec": {
+        "description": "直接消息待回应时间（秒）",
+        "type": "int",
+        "default": 1200,
+        "hint": "群友明确提及、回复或直接呼叫机器人后，即使本轮暂时等待，也会在这段时间内保留为待回应消息。机器人已回答、消息撤回或过期后会结束。"
+      },
+      "group_social_incident_ttl_sec": {
+        "description": "群聊短期事件保留时间（秒）",
+        "type": "int",
+        "default": 1800,
+        "hint": "边界冒犯、冲突、承诺、道歉和和解等短期事件保留多久。事件按账号归属，道歉只会解决同一个人的事件。"
+      },
+      "group_context_snapshot_max_chars": {
+        "description": "群聊因果上下文长度上限",
+        "type": "int",
+        "default": 5500,
+        "hint": "限制每轮注入的群聊因果快照长度。快照优先保存当前发言人、机器人上次对其的回应、待回应消息和未解决事件。"
+      },
+      "group_pre_send_freshness_enabled": {
+        "description": "发送前检查群聊新消息",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，生成期间如果同一位群友又直接补充或纠正，旧回复会缩短或丢弃；其他群友的无关消息不会打断当前回复。"
+      },
       "group_social_state_ttl_sec": {
         "description": "群内人物互动状态保留时间（秒）",
         "type": "int",

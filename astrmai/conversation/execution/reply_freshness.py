@@ -53,6 +53,7 @@ def is_stale_reply_reason(reason: str) -> bool:
         (
             "reply_age_exceeded:",
             "superseded_by_newer_activity",
+            "same_actor_direct_update:",
             "stale_",
             "expired",
         )
@@ -71,6 +72,8 @@ class ReplyFreshnessMixin:
             return "newer_activity_same_thread"
         if normalized.startswith("superseded_by_newer_activity_unknown_thread"):
             return "newer_activity_unknown_thread"
+        if normalized.startswith("same_actor_direct_update"):
+            return "same_actor_direct_update"
         if normalized == "newer_activity_other_thread_ignored":
             return "newer_activity_other_thread_ignored"
         if state == FreshnessState.FRESH:
@@ -226,13 +229,54 @@ class ReplyFreshnessMixin:
             or event.get_extra("astrmai_thread_signature", "")
             or ""
         )
-        freshness_state, stale_reason = await self.runtime_coordinator.evaluate_reply_freshness(
-            chat_id,
-            event_ts,
-            max_age_seconds=max_age,
-            thread_signature=thread_signature,
-            allow_parallel_threads=not bool(event.get_extra("is_private_chat", False)),
+        conversation_config = getattr(getattr(self, "config", None), "conversation", None)
+        group_freshness_enabled = bool(
+            getattr(conversation_config, "group_pre_send_freshness_enabled", True)
         )
+        focus_sender_id = ""
+        try:
+            focus_sender_id = str(event.get_sender_id() or "")
+        except Exception:
+            focus_sender_id = ""
+        focus_watermark = int(event.get_extra("astrmai_group_activity_watermark", 0) or 0)
+        freshness_kwargs = {
+            "max_age_seconds": max_age,
+            "thread_signature": thread_signature,
+            "allow_parallel_threads": not bool(event.get_extra("is_private_chat", False)),
+        }
+        if group_freshness_enabled and not bool(event.get_extra("is_private_chat", False)):
+            freshness_kwargs.update(
+                {
+                    "focus_sender_id": focus_sender_id,
+                    "focus_watermark": focus_watermark,
+                }
+            )
+        try:
+            freshness_state, stale_reason = await self.runtime_coordinator.evaluate_reply_freshness(
+                chat_id,
+                event_ts,
+                **freshness_kwargs,
+            )
+        except TypeError:
+            freshness_kwargs.pop("focus_sender_id", None)
+            freshness_kwargs.pop("focus_watermark", None)
+            freshness_state, stale_reason = await self.runtime_coordinator.evaluate_reply_freshness(
+                chat_id,
+                event_ts,
+                **freshness_kwargs,
+            )
+        if hasattr(event, "set_extra"):
+            event.set_extra(
+                "astrmai_group_stale_action",
+                (
+                    "late_rewrite"
+                    if freshness_state == FreshnessState.STALE_BUT_SALVAGEABLE
+                    else "drop"
+                    if freshness_state == FreshnessState.EXPIRED
+                    else "send"
+                ),
+            )
+            event.set_extra("astrmai_group_focus_watermark", focus_watermark)
         if freshness_state != FreshnessState.FRESH and stale_reason.startswith("superseded_by_newer_activity"):
             latest_ts, latest_sender_id, latest_sender_name, latest_preview = await self.runtime_coordinator.get_latest_activity(chat_id)
             actor = latest_sender_name or latest_sender_id or "unknown"

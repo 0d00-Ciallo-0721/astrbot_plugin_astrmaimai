@@ -284,6 +284,40 @@ class ConversationConfig(BaseModel):
         default=1800,
         description="群聊旧话题需要明确证据后才能承接的时间边界（秒）",
     )
+    group_actor_tail_ttl_sec: int = Field(
+        default=1200,
+        ge=60,
+        le=7200,
+        description="当前群友自己的近期消息可跨短期话题承接的时长（秒）",
+    )
+    group_actor_tail_max_segments: int = Field(
+        default=8,
+        ge=2,
+        le=20,
+        description="每轮最多注入多少条当前群友自己的近期消息",
+    )
+    group_pending_direct_ttl_sec: int = Field(
+        default=1200,
+        ge=60,
+        le=7200,
+        description="群友直接呼叫 Bot 后，尚未回答消息的保留时长（秒）",
+    )
+    group_social_incident_ttl_sec: int = Field(
+        default=1800,
+        ge=60,
+        le=86400,
+        description="群聊边界冒犯、冲突、道歉等短期事件的保留时长（秒）",
+    )
+    group_context_snapshot_max_chars: int = Field(
+        default=5500,
+        ge=800,
+        le=16000,
+        description="单轮群聊因果快照允许注入提示词的最大字符数",
+    )
+    group_pre_send_freshness_enabled: bool = Field(
+        default=True,
+        description="发送前检查当前群友是否又发了新的直接补充或纠正",
+    )
     group_social_state_ttl_sec: int = Field(
         default=86400,
         description="群聊称号、昵称和游戏规则等临时社交状态的默认有效期（秒）",

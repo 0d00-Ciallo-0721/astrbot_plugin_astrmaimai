@@ -486,3 +486,42 @@ def test_reply_stats_include_short_reply_policy_without_message_content():
     assert payload["humanlike_short_reply_before_len"] == 42
     assert "visible_text" not in payload
     assert "不应写入账本" not in str(payload)
+
+
+def test_group_context_snapshot_telemetry_is_privacy_safe():
+    event = _Event()
+    event.set_extra(
+        "astrmai_group_context_snapshot",
+        {
+            "watermark": 19,
+            "candidate_count": 7,
+            "selected_count": 5,
+            "actor_tail_count": 3,
+            "pending_direct_count": 1,
+            "bot_turn_count": 1,
+            "social_incident_count": 1,
+            "echo_filtered_count": 2,
+            "topic_bridge": True,
+            "exclusion_reasons": ["bot_echo_not_used_as_user_stance"],
+            "text_chars": 820,
+            "private_text": "小欣的群聊原文不能进入账本",
+        },
+    )
+    event.set_extra("astrmai_group_stale_action", "late_rewrite")
+    event.set_extra("astrmai_group_focus_watermark", 19)
+    event.set_extra("astrmai_group_pending_superseded_count", 1)
+
+    with turn_telemetry_scope(event):
+        snapshot = turn_telemetry_snapshot(event)
+
+    payload = snapshot["group_context_snapshot"]
+    assert payload["watermark"] == 19
+    assert payload["selected_count"] == 5
+    assert payload["pending_direct_count"] == 1
+    assert payload["echo_filtered_count"] == 2
+    assert payload["topic_bridge"] is True
+    assert payload["stale_action"] == "late_rewrite"
+    assert payload["focus_watermark"] == 19
+    assert payload["pending_superseded_count"] == 1
+    assert "private_text" not in payload
+    assert "小欣的群聊原文" not in str(snapshot)

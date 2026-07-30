@@ -338,6 +338,7 @@ class StateEngine:
             RelationshipEvent.INSULT,
             RelationshipEvent.RUDENESS,
             RelationshipEvent.ARGUMENT,
+            RelationshipEvent.BOUNDARY_VIOLATION,
             RelationshipEvent.SPAM,
         }:
             return event_type
