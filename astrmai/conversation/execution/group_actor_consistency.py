@@ -63,6 +63,9 @@ class GroupActorConsistencyGuard:
             actor_id = str(getattr(perception, "sender_id", "") or "").strip() or actor_id
             actor_name = str(getattr(perception, "sender_name", "") or "").strip() or actor_name
             focus_context = event.get_extra("astrmai_focus_thread_context", None)
+            turn_target = getattr(focus_context, "turn_target", None)
+            actor_id = str(getattr(turn_target, "target_actor_id", "") or "").strip() or actor_id
+            actor_name = str(getattr(turn_target, "target_actor_name", "") or "").strip() or actor_name
             actor_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip() or actor_id
             actor_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip() or actor_name
         return actor_id, actor_name

@@ -1068,18 +1068,11 @@ class ConcurrentExecutor:
     ) -> Optional[str]:
         text = "这张图片暂时没有识别成功，请稍后再发一次。"
         sent = False
-        if hasattr(event, "send") and hasattr(event, "plain_result"):
-            try:
-                await event.send(event.plain_result(text))
-                sent = True
-            except Exception as exc:
-                logger.warning(f"[{chat_id}] required vision failure notice degraded: {exc}")
-        if not sent:
-            try:
-                artifact = await self.reply_engine.handle_reply(event, text, chat_id)
-                sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
-            except Exception as exc:
-                logger.warning(f"[{chat_id}] required vision fallback send failed: {exc}")
+        try:
+            artifact = await self.reply_engine.handle_reply(event, text, chat_id)
+            sent = bool(getattr(artifact, "sent", False)) if artifact is not None else True
+        except Exception as exc:
+            logger.warning(f"[{chat_id}] required vision fallback send failed: {exc}")
         event.set_extra("astrmai_vision_failure_notice_sent", sent)
         event.set_extra(
             "astrmai_execution_status",
@@ -1127,8 +1120,12 @@ class ConcurrentExecutor:
                 event.set_extra("astrmai_execution_status", "send_failed")
                 raise RuntimeError(blocked_reason or send_status or "visible reply was not sent")
             return None
-        if hasattr(self.evolution_manager, "process_bot_reply"):
-            await self.evolution_manager.process_bot_reply(chat_id, bot_id, reply_text)
+        committed_turn = event.get_extra("astrmai_committed_bot_turn", None)
+        committed_text = str(
+            getattr(committed_turn, "persistable_text", "")
+            or getattr(artifact, "persistable_text", "")
+            or reply_text
+        ).strip()
         event.set_extra(
             "astrmai_execution_status",
             "partial_sent"
@@ -1140,9 +1137,9 @@ class ConcurrentExecutor:
             "execution.executor.exit",
             mode=trace_mode,
             model=model,
-            reply_preview=preview_text(reply_text, 120),
+            reply_preview=preview_text(committed_text, 120),
         )
-        return reply_text
+        return committed_text
 
     async def _run_text_mode(
         self,

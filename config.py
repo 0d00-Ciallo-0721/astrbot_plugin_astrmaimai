@@ -156,6 +156,24 @@ class AttentionConfig(BaseModel):
         le=1000,
         description="每被忽略一轮的焦点扣分（0 等同关闭降权）",
     )
+    participation_policy_enabled: bool = Field(
+        default=True,
+        description="启用群聊参与评分与短期承接观测",
+    )
+    participation_force_pass_enabled: bool = Field(
+        default=True,
+        description="高置信明确互动跳过 Judge，直接进入回复流程",
+    )
+    participation_drop_enabled: bool = Field(
+        default=False,
+        description="高置信无关消息直接丢弃；默认关闭并仅做影子观测",
+    )
+    participation_hysteresis_ttl_sec: int = Field(
+        default=180,
+        ge=10,
+        le=1800,
+        description="已参与话题和当前对象的短期承接时间（秒）",
+    )
     cognitive_loop_min_think_level: int = Field(
         default=2,
         ge=1,
@@ -201,6 +219,8 @@ class EvolutionConfig(BaseModel):
 
 class LifeConfig(BaseModel):
     enable_proactive: bool = Field(default=True, description="是否启用主动发言功能")
+    enable_private_proactive: bool = Field(default=True, description="是否允许在私聊中主动发言")
+    enable_group_proactive: bool = Field(default=True, description="是否允许在群聊中主动发言")
     proactive_quiet_hours: List[str] = Field(
         default_factory=lambda: ["23:30-07:30"],
         description="主动开口安静时段列表，格式 HH:MM-HH:MM；留空表示关闭 quiet hours",
@@ -209,6 +229,9 @@ class LifeConfig(BaseModel):
     wakeup_min_energy: float = Field(default=0.6, ge=0.0, le=1.0)
     wakeup_cost: float = Field(default=0.2, ge=0.0, le=1.0)
     wakeup_cooldown: int = Field(default=28800, ge=0)
+    proactive_max_unanswered: int = Field(default=2, ge=0, le=20, description="连续主动发言未获用户回应的上限")
+    proactive_failure_retry_sec: int = Field(default=900, ge=10, le=86400, description="主动发言失败后的重试间隔（秒）")
+    proactive_claim_lease_sec: int = Field(default=300, ge=10, le=3600, description="主动任务领取租约时长（秒）")
     profiling_msg_threshold: int = Field(default=50, ge=1)
     dream_interval_min: int = Field(default=30, ge=1, description="后台触发梦境整理记忆的周期(分钟)")
     dream_time_ranges: List[str] = Field(default_factory=list, description="允许触发 dream 的时间段列表，格式 HH:MM-HH:MM")
@@ -354,6 +377,37 @@ class ConversationConfig(BaseModel):
     compaction_keep_recent_segments: int = Field(default=16, ge=1)
     compaction_summary_max_tokens: int = Field(default=450, ge=1)
     enable_token_estimator: bool = False
+
+
+class ArchitectureRolloutConfig(BaseModel):
+    shadow_enabled: bool = Field(
+        default=True,
+        description="同时计算新旧上下文架构结果并记录差异，不改变实际回复行为",
+    )
+    canonical_read_enabled: bool = Field(
+        default=True,
+        description="下游读取规范化 ConversationEvent；关闭时保留写入但回退旧事件字段",
+    )
+    turn_target_read_enabled: bool = Field(
+        default=True,
+        description="使用 TurnTarget/ActorSet 作为本轮人物归属；关闭时回退旧目标推断",
+    )
+    committed_history_enabled: bool = Field(
+        default=True,
+        description="注意力承接只读取实际发送成功的机器人回复",
+    )
+    context_renderer_enabled: bool = Field(
+        default=True,
+        description="使用类型化 ContextPackage 渲染上下文；关闭时回退旧提示词字段",
+    )
+    memory_actor_filter_enabled: bool = Field(
+        default=True,
+        description="群聊记忆按当前人物白名单过滤；关闭时仅记录过滤差异",
+    )
+    proactive_due_enabled: bool = Field(
+        default=True,
+        description="主动发言读取持久化到期队列；关闭时仅扫描当前内存会话",
+    )
 
 
 class MemoryConfig(BaseModel):
@@ -652,6 +706,9 @@ class AstrMaiConfig(BaseModel):
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
+    architecture_rollout: ArchitectureRolloutConfig = Field(
+        default_factory=ArchitectureRolloutConfig
+    )
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     infra: InfraConfig = Field(default_factory=InfraConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)

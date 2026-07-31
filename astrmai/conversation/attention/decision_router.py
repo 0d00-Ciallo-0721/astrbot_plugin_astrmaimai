@@ -10,6 +10,16 @@ from astrbot.api import logger
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ...shared.helpers.plugin_helpers import is_direct_call_event
 from ..reply_shape_policy import resolve_reply_shape_policy
+from ..runtime.architecture_rollout import (
+    ArchitectureTimer,
+    record_architecture_observation,
+    rollout_enabled,
+)
+from .participation_policy import (
+    ParticipationPolicy,
+    ParticipationResult,
+    ParticipationState,
+)
 
 
 @dataclass(slots=True)
@@ -31,6 +41,8 @@ class AttentionDecisionRouter:
     def __init__(self, gate: Any):
         self.gate = gate
         self._consecutive_timeouts = 0
+        self.participation_policy = ParticipationPolicy()
+        self._participation_states: dict[str, ParticipationState] = {}
 
     @staticmethod
     def _consume_background_result(task: asyncio.Task) -> None:
@@ -85,6 +97,128 @@ class AttentionDecisionRouter:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _event_id(event: Any) -> str:
+        if event is None:
+            return ""
+        canonical = (
+            event.get_extra("astrmai_conversation_event", None)
+            if hasattr(event, "get_extra")
+            else None
+        )
+        return str(
+            getattr(canonical, "event_id", "")
+            or (
+                event.get_extra("astrmai_conversation_event_id", "")
+                if hasattr(event, "get_extra")
+                else ""
+            )
+            or getattr(getattr(event, "message_obj", None), "message_id", "")
+            or ""
+        ).strip()
+
+    def _strong_wakeup_event_ids(
+        self,
+        events: list[Any],
+        focus_event: Any,
+        *,
+        is_strong_wakeup: bool,
+    ) -> tuple[str, ...]:
+        event_ids: list[str] = []
+        for event in events:
+            canonical = (
+                event.get_extra("astrmai_conversation_event", None)
+                if hasattr(event, "get_extra")
+                else None
+            )
+            is_direct = self._is_direct_event(event) or bool(
+                getattr(canonical, "is_at_bot", False)
+                or getattr(canonical, "is_reply_to_bot", False)
+                or getattr(canonical, "is_direct_wakeup", False)
+            )
+            if event is focus_event and is_strong_wakeup:
+                is_direct = True
+            if not is_direct:
+                continue
+            event_id = self._event_id(event)
+            if event_id and event_id not in event_ids:
+                event_ids.append(event_id)
+        return tuple(event_ids)
+
+    def _attention_config(self) -> Any:
+        return getattr(getattr(self.gate, "config", None), "attention", None)
+
+    async def _recent_committed_turn(
+        self,
+        chat_id: str,
+        focus_event: Any,
+        *,
+        ttl_seconds: float,
+    ) -> Any:
+        store = getattr(self.gate, "dialogue_store", None)
+        if store is None or not hasattr(store, "get_recent_bot_turns"):
+            return None
+        try:
+            sender_id = str(focus_event.get_sender_id() or "").strip()
+        except Exception:
+            sender_id = ""
+        if not sender_id:
+            return None
+        now = self._event_timestamp(focus_event) or None
+        try:
+            turns = await store.get_recent_bot_turns(
+                chat_id,
+                target_sender_id=sender_id,
+                ttl_seconds=ttl_seconds,
+                max_items=1,
+                now=now,
+            )
+        except Exception as exc:
+            logger.debug(f"[AttentionGate] committed turn lookup degraded: {exc}")
+            return None
+        return turns[-1] if turns else None
+
+    @staticmethod
+    def _record_participation(event: Any, result: ParticipationResult) -> None:
+        if event is None or not hasattr(event, "set_extra"):
+            return
+        event.set_extra("astrmai_participation_score", result.score)
+        event.set_extra("astrmai_participation_signals", list(result.signals))
+        event.set_extra("astrmai_participation_phase", result.phase)
+        event.set_extra("astrmai_participation_phase_age_ms", result.phase_age_ms)
+        event.set_extra("astrmai_prefilter_shadow_action", result.action.lower())
+        event.set_extra(
+            "astrmai_strong_wakeup_override",
+            bool(result.strong_wakeup_event_ids),
+        )
+        event.set_extra(
+            "astrmai_strong_wakeup_event_ids",
+            list(result.strong_wakeup_event_ids),
+        )
+        event.set_extra(
+            "astrmai_observation_invalidated_reason",
+            result.invalidated_reason,
+        )
+
+    @staticmethod
+    def _record_judge_agreement(
+        event: Any,
+        *,
+        shadow_action: str,
+        judge_action: str,
+    ) -> None:
+        if event is None or not hasattr(event, "set_extra"):
+            return
+        normalized_shadow = str(shadow_action or "NEED_JUDGE").upper()
+        normalized_judge = str(judge_action or "").upper()
+        if normalized_shadow == "FORCE_PASS":
+            agreement: bool | None = normalized_judge in {"PASS", "REPLY", "TOOL_CALL"}
+        elif normalized_shadow == "DROP":
+            agreement = normalized_judge == "IGNORE"
+        else:
+            agreement = None
+        event.set_extra("astrmai_prefilter_judge_agreement", agreement)
 
     def _is_active_bot_continuation(
         self,
@@ -256,25 +390,132 @@ class AttentionDecisionRouter:
         *,
         is_strong_wakeup: bool,
     ) -> AttentionDecision:
-        prefilter = self._classify_prefilter(
-            focus_event,
-            focus_thread,
-            events,
-            is_strong_wakeup=is_strong_wakeup,
+        attention_config = self._attention_config()
+        participation_enabled = bool(
+            getattr(attention_config, "participation_policy_enabled", True)
         )
+        participation_result: ParticipationResult | None = None
+        is_private = self._is_private_event(focus_event)
+        if participation_enabled and not is_private:
+            ttl_seconds = float(
+                getattr(
+                    attention_config,
+                    "participation_hysteresis_ttl_sec",
+                    180.0,
+                )
+                or 180.0
+            )
+            strong_event_ids = self._strong_wakeup_event_ids(
+                events,
+                focus_event,
+                is_strong_wakeup=is_strong_wakeup,
+            )
+            committed_timer = ArchitectureTimer()
+            shadow_committed_turn = await self._recent_committed_turn(
+                chat_id,
+                focus_event,
+                ttl_seconds=ttl_seconds,
+            )
+            committed_history_enabled = rollout_enabled(
+                getattr(self.gate, "config", None),
+                "committed_history_enabled",
+                True,
+            )
+            recent_committed_turn = (
+                shadow_committed_turn if committed_history_enabled else None
+            )
+            record_architecture_observation(
+                focus_event,
+                "committed_history",
+                {
+                    "read_enabled": committed_history_enabled,
+                    "shadow_found": shadow_committed_turn is not None,
+                    "commit_id": str(
+                        getattr(shadow_committed_turn, "commit_id", "") or ""
+                    ),
+                    "target_actor_id": str(
+                        getattr(shadow_committed_turn, "target_actor_id", "") or ""
+                    ),
+                    "elapsed_ms": committed_timer.elapsed_ms,
+                },
+            )
+            participation_result, next_state = self.participation_policy.evaluate(
+                focus_event=focus_event,
+                batch_events=events,
+                strong_wakeup_event_ids=strong_event_ids,
+                recent_committed_turn=recent_committed_turn,
+                previous_state=self._participation_states.get(chat_id),
+                ttl_seconds=ttl_seconds,
+            )
+            self._participation_states[chat_id] = next_state
+            self._record_participation(focus_event, participation_result)
+
+            force_pass_enabled = bool(
+                getattr(attention_config, "participation_force_pass_enabled", True)
+            )
+            drop_enabled = bool(
+                getattr(attention_config, "participation_drop_enabled", False)
+            )
+            legacy_continuation = (
+                getattr(self.gate, "dialogue_store", None) is None
+                and self._is_active_bot_continuation(
+                    focus_event,
+                    focus_thread,
+                    events,
+                )
+            )
+            if legacy_continuation:
+                prefilter = AttentionPrefilterDecision(
+                    "FORCE_PASS",
+                    "active_bot_continuation",
+                )
+            elif participation_result.action == "FORCE_PASS" and (
+                force_pass_enabled or bool(strong_event_ids)
+            ):
+                if is_strong_wakeup:
+                    reason = "strong_wakeup"
+                elif self._is_direct_event(focus_event):
+                    reason = "direct_request"
+                else:
+                    reason = participation_result.reason
+                prefilter = AttentionPrefilterDecision("FORCE_PASS", reason)
+            elif participation_result.action == "DROP" and (
+                drop_enabled or "empty_event" in participation_result.signals
+            ):
+                reason = (
+                    "empty_group_event"
+                    if "empty_event" in participation_result.signals
+                    else participation_result.reason
+                )
+                prefilter = AttentionPrefilterDecision("DROP", reason)
+            else:
+                prefilter = AttentionPrefilterDecision()
+        else:
+            prefilter = self._classify_prefilter(
+                focus_event,
+                focus_thread,
+                events,
+                is_strong_wakeup=is_strong_wakeup,
+            )
         self._record_prefilter(focus_event, prefilter)
         if prefilter.action == "FORCE_PASS":
+            if focus_event is not None and hasattr(focus_event, "set_extra"):
+                focus_event.set_extra("astrmai_judge_avoided", True)
             return AttentionDecision(
                 action="PASS",
                 raw_action="PASS",
                 reason=f"prefilter:{prefilter.reason}",
             )
         if prefilter.action == "DROP":
+            if focus_event is not None and hasattr(focus_event, "set_extra"):
+                focus_event.set_extra("astrmai_judge_avoided", True)
             return AttentionDecision(
                 action="IGNORE",
                 raw_action="IGNORE",
                 reason=f"prefilter:{prefilter.reason}",
             )
+        if focus_event is not None and hasattr(focus_event, "set_extra"):
+            focus_event.set_extra("astrmai_judge_avoided", False)
         if not self.gate.judge or not hasattr(self.gate.judge, "evaluate"):
             return AttentionDecision(action="PASS", raw_action="PASS", reason="judge_unavailable")
         interaction_kind = ""
@@ -393,6 +634,12 @@ class AttentionDecisionRouter:
         raw_action = str(getattr(result, "action", "PASS") or "PASS").upper()
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_outcome", raw_action.lower())
+        if participation_result is not None:
+            self._record_judge_agreement(
+                focus_event,
+                shadow_action=participation_result.action,
+                judge_action=raw_action,
+            )
         self._consecutive_timeouts = 0  # 重置计数器
         if raw_action in {"WAIT", "IGNORE", "TOOL_CALL"}:
             return AttentionDecision(action=raw_action, raw_action=raw_action, reason="judge_gate")

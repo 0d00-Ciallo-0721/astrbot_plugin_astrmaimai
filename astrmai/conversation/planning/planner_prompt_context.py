@@ -9,11 +9,18 @@ from astrbot.api.event import AstrMessageEvent
 from ...infrastructure.compat.legacy_compat import emit_legacy_prompt_envelope_extras, read_legacy_focus_thread_context
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.trace_runtime import preview_text
+from ...infrastructure.runtime.turn_call_ledger import record_context_block_stats
 from ..attention.group_context_snapshot import GroupContextSnapshotBuilder
+from ..contracts.context_package import ContextBlock, ContextPackage
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyMode
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..reply_shape_policy import resolve_reply_shape_policy, set_reply_shape_policy
+from ..runtime.architecture_rollout import (
+    ArchitectureTimer,
+    record_architecture_observation,
+    rollout_enabled,
+)
 from .group_entity_resolution import event_group_id, resolve_group_references
 from .message_renderer import MessageRenderer
 
@@ -183,8 +190,11 @@ class PlannerPromptContextMixin:
             # （astrmai_proactive_candidate/主动开口候选），生成归因锁会让模型
             # 对着幽灵用户说"你"；主动发言不锁定单一对象
             return ""
-        sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip() or cls._safe_event_sender_id(focus_event)
-        sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip() or cls._safe_event_sender_name(focus_event)
+        turn_target = getattr(focus_context, "turn_target", None)
+        sender_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
+        sender_name = str(getattr(turn_target, "target_actor_name", "") or "").strip()
+        sender_id = sender_id or str(getattr(focus_context, "focus_sender_id", "") or "").strip() or cls._safe_event_sender_id(focus_event)
+        sender_name = sender_name or str(getattr(focus_context, "focus_sender_name", "") or "").strip() or cls._safe_event_sender_name(focus_event)
         chat_id = str(getattr(focus_event, "unified_msg_origin", "") or "").strip()
         if not sender_id and not sender_name:
             return ""
@@ -283,6 +293,7 @@ class PlannerPromptContextMixin:
         near_context_priority: bool,
         focus_message_identity: str = "",
         referenced_entity_block: str = "",
+        context_package: ContextPackage | None = None,
     ) -> PromptEnvelope:
         return PromptEnvelope(
             raw_user_text=focus_message_text,
@@ -312,6 +323,7 @@ class PlannerPromptContextMixin:
             freshness_state=focus_context.freshness_budget.state or FreshnessState.FRESH,
             thread_signature=focus_context.thread_signature,
             guidance_lines=self._build_guidance_lines(focus_context.reply_mode),
+            context_package=context_package,
         )
 
     @staticmethod
@@ -516,8 +528,11 @@ class PlannerPromptContextMixin:
                 continue
             seen_ids.add(id(candidate))
             events.append(candidate)
-        sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
-        sender_name = str(getattr(focus_context, "focus_sender_name", "") or "").strip()
+        turn_target = getattr(focus_context, "turn_target", None)
+        sender_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
+        sender_name = str(getattr(turn_target, "target_actor_name", "") or "").strip()
+        sender_id = sender_id or str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+        sender_name = sender_name or str(getattr(focus_context, "focus_sender_name", "") or "").strip()
         if not sender_id:
             try:
                 sender_id = str(focus_event.get_sender_id() or "").strip()
@@ -761,6 +776,122 @@ class PlannerPromptContextMixin:
             context_events=context_events,
             focus_message_text=focus_message_text,
         )
+        turn_target = focus_context.turn_target
+        actor_set = focus_context.actor_set
+        target_kind = getattr(getattr(turn_target, "target_kind", None), "value", "none")
+        current_actor_id = str(
+            getattr(actor_set, "current_actor_id", "")
+            or self._safe_event_sender_id(focus_event)
+            or ""
+        ).strip()
+        target_actor_id = str(getattr(turn_target, "target_actor_id", "") or "").strip()
+        target_event_id = str(getattr(turn_target, "target_event_id", "") or "").strip()
+        turn_instruction = (
+            "本轮必须按事件和参与者 ID 归因；"
+            f"current_actor_id={current_actor_id or 'unknown'}; "
+            f"target_kind={target_kind}; "
+            f"target_actor_id={target_actor_id or 'none'}; "
+            f"target_event_id={target_event_id or 'none'}。"
+            "共享时间线仅提供群聊事实，owned_turn_batch 只标记本轮归属，"
+            "不得把其他成员的话、关系或情绪转移给当前发言人。"
+        )
+        owned_events = list(focus_context.all_thread_events())
+        if not owned_events:
+            owned_events = [focus_event]
+        derived_blocks: list[ContextBlock] = []
+        if current_speaker_block:
+            derived_blocks.append(
+                ContextBlock.create(
+                    block_type="current_speaker_boundary",
+                    source="actor_set",
+                    provenance="derived",
+                    trusted=False,
+                    source_event_ids=(getattr(focus_event, "message_id", ""),),
+                    content=current_speaker_block,
+                    char_budget=1200,
+                )
+            )
+        if referenced_entity_block:
+            derived_blocks.append(
+                ContextBlock.create(
+                    block_type="referenced_entity_boundary",
+                    source="group_entity_resolution",
+                    provenance="derived",
+                    trusted=False,
+                    source_event_ids=(getattr(focus_event, "message_id", ""),),
+                    content=referenced_entity_block,
+                    char_budget=1800,
+                )
+            )
+        renderer_timer = ArchitectureTimer()
+        shadow_context_package = MessageRenderer.build_context_package(
+            shared_events=context_events,
+            owned_events=owned_events,
+            derived_blocks=derived_blocks,
+            turn_instruction=turn_instruction,
+        )
+        renderer_enabled = rollout_enabled(
+            self.config,
+            "context_renderer_enabled",
+            True,
+        )
+        context_package = shadow_context_package if renderer_enabled else None
+        package_stats = dict(shadow_context_package.stats)
+        package_stats["context_chars_before"] = sum(
+            len(value or "")
+            for value in (
+                focus_message_text,
+                direct_context_text,
+                related_context_text,
+                ambient_background_text,
+            )
+        )
+        event.set_extra("astrmai_context_package_stats", package_stats)
+        if focus_event is not event and hasattr(focus_event, "set_extra"):
+            focus_event.set_extra("astrmai_context_package_stats", package_stats)
+        renderer_observation = {
+            "read_enabled": renderer_enabled,
+            "package_hash": shadow_context_package.package_hash,
+            "block_count": len(shadow_context_package.blocks),
+            "context_chars": int(package_stats.get("context_chars_after", 0) or 0),
+            "untrusted_block_count": int(
+                package_stats.get("untrusted_block_count", 0) or 0
+            ),
+            "elapsed_ms": renderer_timer.elapsed_ms,
+        }
+        record_architecture_observation(
+            event,
+            "context_renderer",
+            renderer_observation,
+        )
+        if focus_event is not event:
+            record_architecture_observation(
+                focus_event,
+                "context_renderer",
+                renderer_observation,
+            )
+        record_context_block_stats(
+            event,
+            stage="planner.context_package",
+            blocks={
+                f"{index}:{block.block_type}": block.content
+                for index, block in enumerate(shadow_context_package.blocks)
+            },
+            total_chars=int(package_stats.get("context_chars_after", 0) or 0),
+            metadata={
+                "shared_event_count": int(package_stats.get("shared_event_count", 0) or 0),
+                "owned_event_count": int(package_stats.get("owned_event_count", 0) or 0),
+                "deduplicated_event_count": int(
+                    package_stats.get("deduplicated_event_count", 0) or 0
+                ),
+                "untrusted_block_count": int(
+                    package_stats.get("untrusted_block_count", 0) or 0
+                ),
+                "context_chars_before": int(
+                    package_stats.get("context_chars_before", 0) or 0
+                ),
+            },
+        )
 
         prompt_envelope = self._build_prompt_envelope(
             focus_context=focus_context,
@@ -783,6 +914,7 @@ class PlannerPromptContextMixin:
             referenced_entity_block=referenced_entity_block,
             near_context_priority=near_context_priority,
             focus_message_identity=self._render_event_line(focus_event),
+            context_package=context_package,
         )
         reply_shape_source_text = str(
             focus_event.get_extra("astrmai_rich_text", focus_event.message_str) or ""

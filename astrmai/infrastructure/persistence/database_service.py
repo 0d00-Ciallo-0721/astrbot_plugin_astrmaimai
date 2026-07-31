@@ -109,7 +109,64 @@ class DatabaseService(
                 return await asyncio.to_thread(callback, *args, **kwargs)
         return await asyncio.to_thread(callback, *args, **kwargs)
 
-    def add_message_log(self, group_id: str, sender_id: str, sender_name: str, content: str):
+    @staticmethod
+    def _conversation_event_log_fields(conversation_event: Any) -> dict[str, Any]:
+        if conversation_event is None:
+            return {}
+
+        def _value(name: str, default: Any = "") -> Any:
+            if isinstance(conversation_event, dict):
+                return conversation_event.get(name, default)
+            return getattr(conversation_event, name, default)
+
+        def _json_list(name: str) -> str:
+            values = _value(name, ()) or ()
+            if isinstance(values, str):
+                try:
+                    parsed = json.loads(values)
+                    values = parsed if isinstance(parsed, list) else [values]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    values = [values]
+            return json.dumps(
+                [str(item) for item in values if str(item or "").strip()],
+                ensure_ascii=False,
+            )
+
+        return {
+            "event_id": str(_value("event_id") or ""),
+            "event_schema_version": int(_value("schema_version", 0) or 0),
+            "platform_message_id": str(_value("platform_message_id") or ""),
+            "chat_kind": str(_value("chat_kind") or ""),
+            "role": str(_value("role") or ""),
+            "message_kind": str(_value("message_kind") or ""),
+            "is_bot": bool(_value("is_bot", False)),
+            "reply_target_event_id": str(_value("reply_target_event_id") or ""),
+            "reply_target_actor_id": str(_value("reply_target_actor_id") or ""),
+            "reply_target_actor_name": str(_value("reply_target_actor_name") or ""),
+            "quote_event_id": str(_value("quote_event_id") or ""),
+            "at_actor_ids": _json_list("at_actor_ids"),
+            "topic_epoch": max(0, int(_value("topic_epoch", 0) or 0)),
+            "causal_parent_event_id": str(_value("causal_parent_event_id") or ""),
+            "source_event_ids": _json_list("source_event_ids"),
+            "provenance": str(_value("provenance", "legacy") or "legacy"),
+            "image_refs": _json_list("image_refs"),
+            "interaction_kind": str(_value("interaction_kind") or ""),
+            "recalled": bool(_value("recalled", False)),
+            "outcome": str(_value("outcome") or ""),
+            "timestamp": float(_value("timestamp", time.time()) or time.time()),
+        }
+
+    def add_message_log(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event: Any = None,
+    ):
+        event_fields = self._conversation_event_log_fields(conversation_event)
+
         def _sync(session: Session) -> None:
             session.add(
                 MessageLog(
@@ -117,6 +174,7 @@ class DatabaseService(
                     sender_id=sender_id,
                     sender_name=sender_name,
                     content=content,
+                    **event_fields,
                 )
             )
             session.commit()
@@ -259,11 +317,43 @@ class DatabaseService(
             )
             state.last_access_time = float(row_dict.get("last_access_time") or 0.0)
             state.next_wakeup_timestamp = float(row_dict.get("next_wakeup_timestamp") or 0.0)
+            state.chat_kind = str(row_dict.get("chat_kind", "") or "")
+            state.last_real_user_activity_at = float(
+                row_dict.get("last_real_user_activity_at") or state.last_reply_time or 0.0
+            )
+            state.last_committed_bot_reply_at = float(
+                row_dict.get("last_committed_bot_reply_at") or state.last_reply_time or 0.0
+            )
+            state.next_proactive_due_at = float(
+                row_dict.get("next_proactive_due_at") or state.next_wakeup_timestamp or 0.0
+            )
+            state.proactive_generation = int(row_dict.get("proactive_generation") or 0)
+            state.unanswered_proactive_count = int(row_dict.get("unanswered_proactive_count") or 0)
+            state.last_proactive_commit_id = str(row_dict.get("last_proactive_commit_id", "") or "")
+            state.last_proactive_cancel_reason = str(row_dict.get("last_proactive_cancel_reason", "") or "")
+            state.proactive_claim_token = str(row_dict.get("proactive_claim_token", "") or "")
+            state.proactive_claimed_at = float(row_dict.get("proactive_claimed_at") or 0.0)
             state.is_dirty = bool(row_dict.get("is_dirty") or False)
             return state
 
-    async def add_message_log_async(self, group_id: str, sender_id: str, sender_name: str, content: str):
-        return await self._run_blocking(self.add_message_log, group_id, sender_id, sender_name, content, with_lock=True)
+    async def add_message_log_async(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event: Any = None,
+    ):
+        return await self._run_blocking(
+            self.add_message_log,
+            group_id,
+            sender_id,
+            sender_name,
+            content,
+            conversation_event=conversation_event,
+            with_lock=True,
+        )
 
     async def mark_logs_processed_async(self, log_ids: List[int]):
         return await self._run_blocking(self.mark_logs_processed, log_ids, with_lock=True)

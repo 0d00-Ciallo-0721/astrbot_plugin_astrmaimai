@@ -14,6 +14,7 @@ from ..infrastructure.context_economy import PromptTemplateId
 from ..memory.contracts.memory_query import MemoryQuery
 from .dispatcher import ProactiveMessageIntent
 from .rhythm import evaluate_proactive_rhythm
+from ..conversation.runtime.architecture_rollout import rollout_enabled
 
 
 def _life_config_field_names() -> tuple[str, ...]:
@@ -67,6 +68,15 @@ class WakeupService:
             return all(field_name in life for field_name in _LIFE_CONFIG_FIELD_NAMES)
         return all(hasattr(life, field_name) for field_name in _LIFE_CONFIG_FIELD_NAMES)
 
+    @staticmethod
+    def _chat_kind(state, chat_id: str) -> str:
+        stored = str(getattr(state, "chat_kind", "") or "").strip().lower()
+        if stored in {"private", "friend"}:
+            return "private"
+        if stored == "group":
+            return "group"
+        return "private" if "FriendMessage" in str(chat_id or "") else "group"
+
     async def build_signal(self, chat_id: str, now: float | None = None) -> dict:
         now = time.time() if now is None else float(now)
         state = None
@@ -97,10 +107,34 @@ class WakeupService:
         energy_threshold = life_config.wakeup_min_energy
         wakeup_cost = life_config.wakeup_cost
         wakeup_cooldown = life_config.wakeup_cooldown
-        next_wakeup_timestamp = float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0)
+        chat_kind = self._chat_kind(state, chat_id)
+        if chat_kind == "private" and not bool(getattr(life_config, "enable_private_proactive", True)):
+            return {"eligible": False, "reason": "private_proactive_disabled", "chat_id": str(chat_id or ""), "state": state}
+        if chat_kind == "group" and not bool(getattr(life_config, "enable_group_proactive", True)):
+            return {"eligible": False, "reason": "group_proactive_disabled", "chat_id": str(chat_id or ""), "state": state}
+        max_unanswered = int(getattr(life_config, "proactive_max_unanswered", 2) or 0)
+        unanswered_count = int(getattr(state, "unanswered_proactive_count", 0) or 0)
+        if unanswered_count >= max_unanswered:
+            return {
+                "eligible": False,
+                "reason": "max_unanswered_reached",
+                "chat_id": str(chat_id or ""),
+                "state": state,
+                "unanswered_proactive_count": unanswered_count,
+            }
+        next_wakeup_timestamp = float(
+            getattr(state, "next_proactive_due_at", 0.0)
+            or getattr(state, "next_wakeup_timestamp", 0.0)
+            or 0.0
+        )
         minutes_silent = 999.0
-        if getattr(state, "last_reply_time", 0) > 0:
-            minutes_silent = (now - float(getattr(state, "last_reply_time", 0) or 0.0)) / 60.0
+        last_user_activity = float(
+            getattr(state, "last_real_user_activity_at", 0.0)
+            or getattr(state, "last_reply_time", 0.0)
+            or 0.0
+        )
+        if last_user_activity > 0:
+            minutes_silent = (now - last_user_activity) / 60.0
         if minutes_silent == 999.0:
             return {
                 "eligible": False,
@@ -155,6 +189,9 @@ class WakeupService:
             "wakeup_cost": float(wakeup_cost or 0.0),
             "wakeup_cooldown": float(wakeup_cooldown or 0.0),
             "next_wakeup_timestamp": next_wakeup_timestamp,
+            "chat_kind": chat_kind,
+            "proactive_generation": int(getattr(state, "proactive_generation", 0) or 0),
+            "unanswered_proactive_count": unanswered_count,
         }
 
     async def run_for_chat(self, chat_id: str, signal: dict | None = None, now: float | None = None) -> dict:
@@ -171,11 +208,34 @@ class WakeupService:
         life_config = self._resolve_life_config()
         wakeup_cost = float(signal.get("wakeup_cost", life_config.wakeup_cost) or 0.0)
         wakeup_cooldown = float(signal.get("wakeup_cooldown", life_config.wakeup_cooldown) or 0.0)
-        intent = await self.build_wakeup_intent(state, wakeup_cost, wakeup_cooldown)
+        captured_generation = int(getattr(state, "proactive_generation", 0) or 0)
+        claim_token = ""
+        claim = getattr(self.state_engine, "claim_proactive_due", None)
+        if callable(claim):
+            claim_token = str(
+                await claim(
+                    str(chat_id or ""),
+                    expected_generation=captured_generation,
+                    now=now,
+                    lease_seconds=float(getattr(life_config, "proactive_claim_lease_sec", 300) or 300),
+                )
+                or ""
+            )
+            if not claim_token:
+                return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "claim_rejected"}
+        intent = await self.build_wakeup_intent(
+            state,
+            wakeup_cost,
+            wakeup_cooldown,
+            captured_generation=captured_generation,
+            claim_token=claim_token,
+        )
         if not intent:
+            await self._settle_failed_attempt(str(chat_id or ""), claim_token, life_config, "intent_unavailable")
             return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "intent_unavailable"}
         if not self.dispatcher:
             logger.debug("[Life] proactive wakeup skipped: dispatcher unavailable")
+            await self._settle_failed_attempt(str(chat_id or ""), claim_token, life_config, "dispatcher_unavailable")
             return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "dispatcher_unavailable"}
 
         async def _on_complete(reply_sent: bool, reply_preview: str, *, target_state=state) -> None:
@@ -185,6 +245,12 @@ class WakeupService:
                 logger.info(
                     f"[Life] proactive wakeup not sent: {getattr(target_state, 'chat_id', '')} "
                     "(blocked stage recorded in dispatch trace)"
+                )
+                await self._settle_failed_attempt(
+                    str(getattr(target_state, "chat_id", "") or ""),
+                    claim_token,
+                    life_config,
+                    "not_sent",
                 )
                 return
             next_wakeup_timestamp = time.time() + wakeup_cooldown
@@ -206,6 +272,12 @@ class WakeupService:
             decision = await self.dispatcher.dispatch(intent, on_complete=_on_complete)
             if not decision.allowed:
                 logger.debug(f"[Life] proactive wakeup blocked: {decision.blocked_reason}")
+                await self._settle_failed_attempt(
+                    str(chat_id or ""),
+                    claim_token,
+                    life_config,
+                    str(decision.blocked_reason or "dispatch_blocked"),
+                )
             return {
                 "chat_id": str(chat_id or ""),
                 "performed": bool(decision.allowed),
@@ -215,27 +287,72 @@ class WakeupService:
             }
         except Exception as exc:
             logger.error(f"[Life] proactive wakeup dispatch failed: {exc}")
+            await self._settle_failed_attempt(str(chat_id or ""), claim_token, life_config, "dispatch_failed")
             return {"chat_id": str(chat_id or ""), "performed": False, "allowed": False, "reason": "dispatch_failed"}
+
+    async def _settle_failed_attempt(self, chat_id: str, claim_token: str, life_config, reason: str) -> None:
+        settle = getattr(self.state_engine, "settle_proactive_attempt", None)
+        if not callable(settle):
+            return
+        retry_seconds = float(getattr(life_config, "proactive_failure_retry_sec", 900) or 900)
+        await settle(
+            chat_id,
+            claim_token=claim_token,
+            next_due_at=time.time() + retry_seconds,
+            cancel_reason=reason,
+        )
 
     async def run_once(self):
         active_states = self.state_engine.get_active_states()
         now = time.time()
-        for state in active_states:
-            chat_id = str(getattr(state, "chat_id", "") or "")
+        chat_ids = {
+            str(getattr(state, "chat_id", "") or "")
+            for state in active_states
+            if str(getattr(state, "chat_id", "") or "")
+        }
+        due_read_enabled = rollout_enabled(
+            self.config,
+            "proactive_due_enabled",
+            True,
+        )
+        due_loader = getattr(self.state_engine, "list_due_proactive_chat_ids", None)
+        if due_read_enabled and callable(due_loader):
+            try:
+                chat_ids.update(await due_loader(now=now, limit=200))
+            except Exception as exc:
+                logger.warning(f"[Life] persisted proactive due scan degraded: {exc}")
+        for chat_id in sorted(chat_ids):
             if not chat_id:
                 continue
             signal = await self.build_signal(chat_id, now=now)
-            if signal.get("state") is None:
-                signal["state"] = state
+            signal["persistent_due_read_enabled"] = due_read_enabled
             await self.run_for_chat(chat_id, signal=signal, now=now)
 
-    async def build_wakeup_intent(self, state, wakeup_cost: float, wakeup_cooldown: float) -> ProactiveMessageIntent | None:
+    async def build_wakeup_intent(
+        self,
+        state,
+        wakeup_cost: float,
+        wakeup_cooldown: float,
+        *,
+        captured_generation: int | None = None,
+        claim_token: str = "",
+    ) -> ProactiveMessageIntent | None:
         chat_id = str(getattr(state, "chat_id", "") or "")
         if not chat_id:
             return None
         guidance = str(await self.generate_opening_line(chat_id) or "").strip()
         if not guidance:
             return None
+        chat_kind = self._chat_kind(state, chat_id)
+        metadata = {
+            "chat_kind": chat_kind,
+            "captured_generation": int(
+                getattr(state, "proactive_generation", 0) if captured_generation is None else captured_generation
+            ),
+            "claim_token": str(claim_token or ""),
+        }
+        if chat_kind == "group":
+            metadata["group_id"] = chat_id
         return ProactiveMessageIntent(
             chat_id=chat_id,
             source="wakeup",
@@ -246,7 +363,7 @@ class WakeupService:
             urgency=0.58,
             cost=float(wakeup_cost or 0.0),
             cooldown=float(wakeup_cooldown or 0.0),
-            metadata={"group_id": chat_id},
+            metadata=metadata,
         )
 
     async def generate_opening_line(self, chat_id: str) -> str:

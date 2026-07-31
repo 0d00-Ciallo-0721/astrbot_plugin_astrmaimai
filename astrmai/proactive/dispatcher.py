@@ -97,6 +97,46 @@ class ProactiveDispatcher:
             logger.debug(f"[ProactiveDispatcher] state lookup degraded for {chat_id}: {exc}")
             return None
 
+    async def _proactive_generation_current(self, intent: ProactiveMessageIntent) -> tuple[bool, int | None]:
+        if not self.state_engine or not hasattr(self.state_engine, "is_proactive_generation_current"):
+            return True, None
+        captured = int(intent.metadata.get("captured_generation", 0) or 0)
+        try:
+            current = await self._maybe_await(
+                self.state_engine.is_proactive_generation_current(intent.chat_id, captured)
+            )
+            return bool(current), captured
+        except Exception as exc:
+            logger.warning(f"[ProactiveDispatcher] generation check failed closed for {intent.chat_id}: {exc}")
+            return False, captured
+
+    async def _scheduling_snapshot(self, chat_id: str) -> dict[str, Any]:
+        if not self.state_engine or not hasattr(self.state_engine, "get_state"):
+            return {}
+        try:
+            state = await self._maybe_await(self.state_engine.get_state(chat_id))
+        except Exception as exc:
+            logger.debug(f"[ProactiveDispatcher] scheduling snapshot degraded for {chat_id}: {exc}")
+            return {}
+        return {
+            "chat_kind": str(getattr(state, "chat_kind", "") or ""),
+            "last_real_user_activity_at": float(
+                getattr(state, "last_real_user_activity_at", 0.0) or 0.0
+            ),
+            "last_committed_bot_reply_at": float(
+                getattr(state, "last_committed_bot_reply_at", 0.0) or 0.0
+            ),
+            "next_proactive_due_at": float(
+                getattr(state, "next_proactive_due_at", 0.0) or 0.0
+            ),
+            "unanswered_proactive_count": int(
+                getattr(state, "unanswered_proactive_count", 0) or 0
+            ),
+            "last_proactive_cancel_reason": str(
+                getattr(state, "last_proactive_cancel_reason", "") or ""
+            ),
+        }
+
     async def _activity_snapshot(self, chat_id: str) -> dict[str, Any]:
         if not self.runtime_coordinator or not hasattr(self.runtime_coordinator, "get_activity_snapshot"):
             return {}
@@ -162,6 +202,8 @@ class ProactiveDispatcher:
         if cooldown_until and now >= cooldown_until:
             self._cooldowns.pop(intent.chat_id, None)
             cooldown_until = 0.0
+        generation_current, captured_generation = await self._proactive_generation_current(intent)
+        scheduling = await self._scheduling_snapshot(intent.chat_id)
         checks = {
             "has_attention_gate": bool(self.attention_gate and hasattr(self.attention_gate, "inject_external_event")),
             "chat_active": active,
@@ -182,11 +224,16 @@ class ProactiveDispatcher:
             "proactive_noise_block": noise_block,
             "latest_activity_preview": self._preview(snapshot.get("latest_activity_preview", ""), 80),
             "recent_activity_count_60s": recent_activity_count_60s,
+            "captured_generation": captured_generation,
+            "generation_current": generation_current,
+            **scheduling,
         }
         if not checks["has_attention_gate"]:
             return False, "attention_gate_unavailable", checks
         if not intent.chat_id:
             return False, "missing_chat_id", checks
+        if not generation_current:
+            return False, "proactive_generation_superseded", checks
         if intent.source in {"wakeup", "heartflow"} and rhythm.quiet_hours:
             return False, "quiet_hours", checks
         if not active:
@@ -330,7 +377,6 @@ class ProactiveDispatcher:
             "sender_id": "astrmai_proactive_candidate",
             "sender_name": "主动开口候选",
             "self_id": str(getattr(self.state_engine, "bot_id", "") or "astrmai"),
-            "group_id": str(intent.metadata.get("group_id", intent.chat_id) or ""),
             "extra": {
                 "astrmai_is_proactive_event": True,
                 "astrmai_proactive_candidate": True,
@@ -347,21 +393,20 @@ class ProactiveDispatcher:
                 "astrmai_loop_source": "proactive_dispatcher",
                 "astrmai_proactive_dispatch_decision": decision,
                 "astrmai_proactive_completion_callback": _completion,
+                "astrmai_proactive_generation": int(intent.metadata.get("captured_generation", 0) or 0),
+                "astrmai_proactive_claim_token": str(intent.metadata.get("claim_token", "") or ""),
+                "astrmai_proactive_chat_kind": str(intent.metadata.get("chat_kind", "") or ""),
             },
         }
-        async def _inject_event():
-            # ponytail: per-chat flag instead of global setattr to avoid blocking concurrent messages
-            chat_id = intent.chat_id
-            self.attention_gate._proactive_dispatching[chat_id] = True
-            try:
-                return await self.attention_gate.inject_external_event(intent.chat_id, event_data)
-            finally:
-                self.attention_gate._proactive_dispatching.pop(chat_id, None)
-                if hasattr(self.attention_gate, "drain_deferred_messages"):
-                    await self.attention_gate.drain_deferred_messages(chat_id)
+        if str(intent.metadata.get("chat_kind", "") or "") == "group":
+            event_data["group_id"] = str(intent.metadata.get("group_id", intent.chat_id) or "")
 
-        if not hasattr(self.attention_gate, "_proactive_dispatching"):
-            self.attention_gate._proactive_dispatching = {}
+        async def _inject_event():
+            generation_current, _ = await self._proactive_generation_current(intent)
+            if not generation_current:
+                return False
+            return await self.attention_gate.inject_external_event(intent.chat_id, event_data)
+
         lock_getter = getattr(self.attention_gate, "get_proactive_lock", None)
         if callable(lock_getter):
             injection_lock = lock_getter(intent.chat_id)

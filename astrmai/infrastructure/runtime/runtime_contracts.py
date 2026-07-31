@@ -19,6 +19,12 @@ from ...conversation.contracts.focus_context import (
     VisionBundle,
 )
 from ...conversation.contracts.prompt_envelope import PromptEnvelope
+from ...conversation.contracts.committed_reply import (
+    CommittedBotTurn,
+    ReplyCommitStatus,
+    ReplyPlan,
+    ReplySendReceipt,
+)
 from ...conversation.contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
 from ...conversation.contracts.turn_context import (
     AttentionSnapshot,
@@ -29,6 +35,7 @@ from ...conversation.contracts.turn_context import (
     ToolSnapshot,
     TurnContext,
 )
+from ...conversation.contracts.turn_target import ActorSet, TargetKind, TurnTarget
 
 
 class FailureKind(str, Enum):
@@ -72,6 +79,7 @@ class LLMCallResult:
 
 
 __all__ = [
+    "CommittedBotTurn",
     "FailureKind",
     "FreshnessState",
     "FocusThreadContext",
@@ -82,15 +90,21 @@ __all__ = [
     "OutboundPolicy",
     "PromptEnvelope",
     "ReplyFreshnessBudget",
+    "ReplyCommitStatus",
     "ReplyMode",
+    "ReplyPlan",
+    "ReplySendReceipt",
     "RuntimeFeatureFlags",
     "SocialTranscriptTurn",
     "AttentionSnapshot",
+    "ActorSet",
     "CognitiveSnapshot",
     "ContinuitySnapshot",
     "PerceptionSnapshot",
     "ToolDecisionTrace",
     "ToolSnapshot",
+    "TargetKind",
+    "TurnTarget",
     "TurnContext",
     "VisionBundle",
     "VisibleReplyArtifact",

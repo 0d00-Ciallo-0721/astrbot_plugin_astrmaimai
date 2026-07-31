@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
+from ..runtime.architecture_trace import build_architecture_trace_contract
 from ...infrastructure.runtime.turn_call_ledger import (
     finalize_turn_telemetry,
     observe_stage,
@@ -77,6 +78,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         visual_cortex=None,
     ):
         self.gateway = gateway
+        self.config = gateway.config
         self.context_engine = context_engine
         self.memory_engine = memory_engine
         self.evolution_manager = evolution_manager
@@ -861,6 +863,27 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         }
         item["tool_execution_trace"] = execution_items
         item["tool_lifecycle_trace"] = [dict(entry) for entry in tool_lifecycle_trace if isinstance(entry, dict)][-64:]
+        architecture_contract = build_architecture_trace_contract(
+            event=event,
+            turn_context=turn_context,
+            trace_item=item,
+            status=status,
+            config=getattr(getattr(self, "gateway", None), "config", None),
+        )
+        item["architecture_contract"] = architecture_contract
+        for field_name in (
+            "input_event_ids",
+            "canonical_event_status",
+            "turn_target",
+            "actor_whitelist",
+            "participation_decision",
+            "judge_decision",
+            "reply_plan",
+            "reply_commit",
+            "memory_actor_filter",
+            "proactive_observation",
+        ):
+            item[field_name] = architecture_contract[field_name]
         turn_id = str(item.get("turn_id", "") or "")
         existing_history = list(self.turn_trace_history)
         if turn_id:
@@ -1147,6 +1170,39 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         proactive.blocked_reason = str(self._payload_value(decision, "blocked_reason", "") or "")
         proactive.synthetic_event_queued = bool(self._payload_value(decision, "synthetic_event_queued", False))
         proactive.reply_sent = bool(self._payload_value(decision, "reply_sent", False))
+        proactive.chat_kind = str(event.get_extra("astrmai_proactive_chat_kind", "") or "")
+        proactive.captured_generation = int(
+            event.get_extra("astrmai_proactive_generation", 0) or 0
+        )
+        proactive.generation_current = not bool(
+            event.get_extra("astrmai_proactive_cancel_reason", "")
+        )
+        proactive.claim_token_present = bool(
+            event.get_extra("astrmai_proactive_claim_token", "")
+        )
+        proactive.cancel_reason = str(
+            event.get_extra("astrmai_proactive_cancel_reason", "") or ""
+        )
+        safety_checks = self._payload_value(decision, "safety_checks", {}) or {}
+        if isinstance(safety_checks, dict):
+            proactive.generation_current = bool(
+                safety_checks.get("generation_current", proactive.generation_current)
+            )
+            for attr, key in (
+                ("last_real_user_activity_at", "last_real_user_activity_at"),
+                ("last_committed_bot_reply_at", "last_committed_bot_reply_at"),
+                ("next_due_at", "next_proactive_due_at"),
+            ):
+                try:
+                    setattr(proactive, attr, float(safety_checks.get(key, 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    setattr(proactive, attr, 0.0)
+            try:
+                proactive.unanswered_count = int(
+                    safety_checks.get("unanswered_proactive_count", 0) or 0
+                )
+            except (TypeError, ValueError):
+                proactive.unanswered_count = 0
         try:
             proactive.energy_cost = float(event.get_extra("astrmai_proactive_cost", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1155,31 +1211,6 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             proactive.cooldown_seconds = float(event.get_extra("astrmai_proactive_cooldown", 0.0) or 0.0)
         except (TypeError, ValueError):
             proactive.cooldown_seconds = 0.0
-
-    async def _append_dialogue_segment(self, event: AstrMessageEvent, reply_text: str) -> None:
-        store = getattr(self, "dialogue_store", None)
-        if store is None:
-            return
-        chat_id = str(event.unified_msg_origin or "")
-        if not chat_id:
-            return
-        content = str(reply_text or "").strip()
-        if not content:
-            return
-        try:
-            await store.append_segment(
-                chat_id,
-                event_id=f"reply:{chat_id}:{int(time.time() * 1000)}",
-                speaker_id=str(getattr(self.context, "bot_id", "") or getattr(self.gateway, "bot_id", "") or ""),
-                speaker_name=str(getattr(getattr(self.gateway.config, "system1", None), "nicknames", ["Bot"])[0] if getattr(getattr(self.gateway.config, "system1", None), "nicknames", None) else "Bot"),
-                content=content,
-                role="assistant",
-                message_kind="text",
-                is_bot=True,
-                timestamp=time.time(),
-            )
-        except Exception as exc:
-            logger.debug(f"[Planner] dialogue segment append degraded: {exc}")
 
     @classmethod
     def _extract_group_social_candidates(cls, reply_text: str) -> list[tuple[str, str]]:
@@ -1248,115 +1279,40 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 confidence=0.5,
             )
 
-    async def _record_planner_dialogue_segment(self, event: AstrMessageEvent, chat_id: str, reply_text: str, *, focus_context=None) -> None:
-        store = getattr(self, "dialogue_store", None)
-        if store is None:
+    async def _record_committed_reply_side_effects(
+        self,
+        event: AstrMessageEvent,
+        chat_id: str,
+        reply_text: str,
+        *,
+        focus_context=None,
+    ) -> None:
+        committed_turn = event.get_extra("astrmai_committed_bot_turn", None)
+        if committed_turn is None:
             return
-        content = str(reply_text or "").strip()
+        content = str(
+            getattr(committed_turn, "persistable_text", "") or reply_text or ""
+        ).strip()
         if not content:
             return
-        try:
-            reply_event_id = f"reply:{chat_id}:{int(time.time() * 1000)}"
-            focus_event = getattr(focus_context, "focus_event", None) or event
-            history_policy = DialogHistoryPolicy.from_event(focus_event)
-            if not history_policy.group_id:
-                history_policy = DialogHistoryPolicy.from_event(event)
-            target_sender_id = str(history_policy.current_sender_id or "").strip()
-            if not target_sender_id:
-                try:
-                    target_sender_id = str(focus_event.get_sender_id() or "").strip()
-                except Exception:
-                    target_sender_id = ""
+        commit_id = str(getattr(committed_turn, "commit_id", "") or "").strip()
+        await self._record_group_social_candidates(
+            event,
+            chat_id,
+            content,
+            source_event_id=commit_id,
+        )
+        if self.context_compaction is not None:
             try:
-                target_sender_name = str(focus_event.get_sender_name() or "").strip()
-            except Exception:
-                target_sender_name = ""
-            message_obj = getattr(focus_event, "message_obj", None)
-            source_event_id = str(
-                getattr(message_obj, "message_id", "")
-                or getattr(focus_event, "message_id", "")
-                or ""
-            ).strip()
-            social_event = str(
-                focus_event.get_extra("astrmai_group_social_signal", "")
-                or focus_event.get_extra("astrmai_social_intent", "")
-                or event.get_extra("astrmai_group_social_signal", "")
-                or event.get_extra("astrmai_social_intent", "")
-                or ""
-            ).strip()
-            stance = str(
-                focus_event.get_extra("astrmai_stance", "")
-                or event.get_extra("astrmai_stance", "")
-                or ""
-            ).strip()
-            if social_event in {"boundary_violation", "pushback", "boundary"}:
-                stance = stance or "reject"
-            if stance in {"pushback", "boundary", "refuse", "refusal"}:
-                stance = "reject"
-            bot_id = str(
-                getattr(self.context, "bot_id", "")
-                or getattr(self.gateway, "bot_id", "")
-                or ""
-            )
-            if (
-                social_event
-                in {
-                    "boundary_violation",
-                    "insult",
-                    "conflict",
-                    "promise",
-                }
-                and target_sender_id
-                and ":GroupMessage:" in chat_id
-            ):
-                await store.observe_social_incident(
-                    chat_id,
-                    kind=social_event,
-                    actor_id=target_sender_id,
-                    actor_name=target_sender_name,
-                    target_id=bot_id,
-                    target_name="Bot",
-                    evidence_event_id=source_event_id,
-                    topic_epoch=history_policy.topic_epoch,
-                    stance=stance,
-                )
-            await store.append_segment(
-                chat_id,
-                event_id=reply_event_id,
-                speaker_id=bot_id,
-                speaker_name=str(getattr(getattr(self.gateway.config, "system1", None), "nicknames", ["Bot"])[0] if getattr(getattr(self.gateway.config, "system1", None), "nicknames", None) else "Bot"),
-                content=content,
-                role="assistant",
-                message_kind="text",
-                is_bot=True,
-                reply_target_sender_id=target_sender_id,
-                reply_target_sender_name=target_sender_name,
-                timestamp=time.time(),
-                topic_epoch=history_policy.topic_epoch,
-                causal_parent_event_id=source_event_id,
-                source_event_ids=[source_event_id] if source_event_id else [],
-                stance=stance,
-                social_event=social_event,
-            )
-            await self._record_group_social_candidates(
-                event,
-                chat_id,
-                content,
-                source_event_id=reply_event_id,
-            )
-            if self.context_compaction is not None:
-                try:
-                    safe_create_task(
-                        self.context_compaction.schedule_compaction_evaluation(
-                            chat_id,
-                            focus_context=focus_context,
-                            message_source="assistant",
-                        )
+                safe_create_task(
+                    self.context_compaction.schedule_compaction_evaluation(
+                        chat_id,
+                        focus_context=focus_context,
+                        message_source="assistant",
                     )
-                except Exception as exc:
-                    logger.debug(f"[Planner] dialogue compaction degraded: {exc}")
-        except Exception as exc:
-            logger.debug(f"[Planner] dialogue segment append degraded: {exc}")
+                )
+            except Exception as exc:
+                logger.debug(f"[Planner] dialogue compaction degraded: {exc}")
 
     async def _finalize_proactive_event(self, event: AstrMessageEvent, reply_text: str | None = None) -> None:
         if not bool(event.get_extra("astrmai_is_proactive_event", False)):
@@ -2033,7 +1989,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             await self._remember_turn_trace(chat_id, event, status=trace_status)
             return None
 
-        await self._record_planner_dialogue_segment(event, chat_id, reply_text, focus_context=focus_context)
+        await self._record_committed_reply_side_effects(
+            event,
+            chat_id,
+            reply_text,
+            focus_context=focus_context,
+        )
         await self._update_turn_trace_runtime(event, chat_id, prompt_envelope=prompt_envelope, reply_text=reply_text)
         await self._record_expression_pattern_usage(event, chat_id, reply_text)
         self._record_agency_reflection(chat_id, reply_text, event, cognitive_decision)

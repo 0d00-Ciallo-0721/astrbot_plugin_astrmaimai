@@ -585,6 +585,82 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             "force_pass",
         )
 
+    def test_router_force_passes_committed_target_short_continuation(self):
+        judge = _SequenceJudge(["IGNORE"])
+        self.gate.judge = judge
+
+        class _Store:
+            async def get_recent_bot_turns(self, chat_id, **kwargs):
+                return [
+                    SimpleNamespace(
+                        turn_id="turn-1",
+                        timestamp=100.0,
+                        target_sender_id="user-1",
+                        source_event_ids=["source-1"],
+                        topic_epoch=1,
+                    )
+                ]
+
+        self.gate.dialogue_store = _Store()
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent(
+            "user-1",
+            "Alice",
+            "继续",
+            extras={
+                "astrmai_timestamp": 120.0,
+                "astrmai_dialog_history_policy": {"topic_epoch": 1},
+            },
+        )
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                SimpleNamespace(root_reason=""),
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "PASS")
+        self.assertEqual(judge.calls, [])
+        self.assertTrue(focus.get_extra("astrmai_judge_avoided"))
+        self.assertEqual(focus.get_extra("astrmai_participation_score"), 75)
+
+    def test_router_does_not_transfer_committed_target_to_other_actor(self):
+        judge = _SequenceJudge(["IGNORE"])
+        self.gate.judge = judge
+
+        class _Store:
+            async def get_recent_bot_turns(self, chat_id, **kwargs):
+                self.requested_sender = kwargs["target_sender_id"]
+                return []
+
+        store = _Store()
+        self.gate.dialogue_store = store
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router_mod = importlib.reload(router_mod)
+        router = router_mod.AttentionDecisionRouter(self.gate)
+        focus = _FakeEvent("user-2", "Bob", "继续")
+
+        decision = asyncio.run(
+            router.evaluate(
+                "default:GroupMessage:group-1",
+                focus,
+                SimpleNamespace(root_reason=""),
+                [focus],
+                is_strong_wakeup=False,
+            )
+        )
+
+        self.assertEqual(decision.action, "IGNORE")
+        self.assertEqual(store.requested_sender, "user-2")
+        self.assertEqual(len(judge.calls), 1)
+        self.assertFalse(focus.get_extra("astrmai_judge_avoided"))
+
     def test_router_keeps_ambiguous_short_group_message_for_judge(self):
         judge = _SequenceJudge(["IGNORE"])
         self.gate.judge = judge

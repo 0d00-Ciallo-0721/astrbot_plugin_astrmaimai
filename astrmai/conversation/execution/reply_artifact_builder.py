@@ -583,17 +583,32 @@ class ReplyArtifactMixin:
                     else:
                         chain.chain.append(tts_payload)
                     if chain.chain:
-                        try:
-                            sent_result = await context.send_message(event.unified_msg_origin, chain)
-                            artifact.metadata["tts_sent"] = True
-                            artifact.sent = True
-                            if not send_text_segments:
-                                sent_segment_count = len(artifact.segments)
-                                if not event.get_extra("astrmai_reply_sent", False):
-                                    emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
-                        except Exception as exc:
+                        freshness_state, stale_reason = await self._check_reply_freshness(
+                            event,
+                            event.unified_msg_origin,
+                        )
+                        if freshness_state == FreshnessState.EXPIRED:
                             artifact.metadata["tts_sent"] = False
-                            logger.debug(f"[ReplyService] optional TTS send degraded for {chat_id}: {exc}")
+                            artifact.metadata["tts_skip_reason"] = str(
+                                stale_reason or "stale_before_tts_send"
+                            )
+                            logger.info(
+                                f"[ReplyService] skipped stale TTS reply for {event.unified_msg_origin}: {stale_reason}"
+                            )
+                            sent_result = None
+                            tts_payload = None
+                        if tts_payload:
+                            try:
+                                sent_result = await context.send_message(event.unified_msg_origin, chain)
+                                artifact.metadata["tts_sent"] = True
+                                artifact.sent = True
+                                if not send_text_segments:
+                                    sent_segment_count = len(artifact.segments)
+                                    if not event.get_extra("astrmai_reply_sent", False):
+                                        emit_legacy_reply_runtime_extras(event, artifact=artifact, reply_sent=True)
+                            except Exception as exc:
+                                artifact.metadata["tts_sent"] = False
+                                logger.debug(f"[ReplyService] optional TTS send degraded for {chat_id}: {exc}")
                 else:
                     artifact.metadata["tts_sent"] = False
                 if sent_result is not None and not isinstance(sent_result, bool):
@@ -602,11 +617,13 @@ class ReplyArtifactMixin:
             if artifact.sent:
                 artifact.metadata["send_status"] = "partial_sent"
                 artifact.metadata["sent_segment_count"] = sent_segment_count
+                artifact.metadata["send_failure_reason"] = str(exc)
                 logger.warning(
                     f"[ReplyService] segmented reply partially sent for {chat_id}: {exc}"
                 )
             else:
                 artifact.metadata["send_status"] = "failed"
+                artifact.metadata["send_failure_reason"] = str(exc)
             if (
                 not artifact.sent
                 and send_key
@@ -641,6 +658,7 @@ class ReplyArtifactMixin:
             artifact.visible_text = sent_text
             artifact.persistable_text = sent_text
         if outbound_message_ids:
+            artifact.metadata["outbound_message_ids"] = outbound_message_ids[:]
             event.set_extra("astrmai_reply_outbound_message_ids", outbound_message_ids[:])
         if send_key and runtime_coordinator is not None and hasattr(runtime_coordinator, "commit_send"):
             try:

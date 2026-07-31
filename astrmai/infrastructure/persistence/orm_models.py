@@ -59,6 +59,26 @@ class MessageLog(SQLModel, table=True):
     content: str
     timestamp: float = Field(default_factory=time.time)
     processed: bool = Field(default=False)
+    event_id: str = Field(default="")
+    event_schema_version: int = Field(default=0)
+    platform_message_id: str = Field(default="")
+    chat_kind: str = Field(default="")
+    role: str = Field(default="")
+    message_kind: str = Field(default="")
+    is_bot: bool = Field(default=False)
+    reply_target_event_id: str = Field(default="")
+    reply_target_actor_id: str = Field(default="")
+    reply_target_actor_name: str = Field(default="")
+    quote_event_id: str = Field(default="")
+    at_actor_ids: str = Field(default="[]")
+    topic_epoch: int = Field(default=0)
+    causal_parent_event_id: str = Field(default="")
+    source_event_ids: str = Field(default="[]")
+    provenance: str = Field(default="legacy")
+    image_refs: str = Field(default="[]")
+    interaction_kind: str = Field(default="")
+    recalled: bool = Field(default=False)
+    outcome: str = Field(default="")
 
 
 @dataclass
@@ -86,6 +106,16 @@ class ChatState:
     is_dirty: bool = False
     last_access_time: float = field(default_factory=time.time)
     next_wakeup_timestamp: float = 0.0
+    chat_kind: str = ""
+    last_real_user_activity_at: float = 0.0
+    last_committed_bot_reply_at: float = 0.0
+    next_proactive_due_at: float = 0.0
+    proactive_generation: int = 0
+    unanswered_proactive_count: int = 0
+    last_proactive_commit_id: str = ""
+    last_proactive_cancel_reason: str = ""
+    proactive_claim_token: str = ""
+    proactive_claimed_at: float = 0.0
 
 
 @dataclass

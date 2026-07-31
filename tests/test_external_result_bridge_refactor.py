@@ -76,7 +76,7 @@ class _FakePrivateEvent(_FakeEvent):
 
 
 class RefactoredExternalResultBridgeTests(unittest.TestCase):
-    def test_bridge_injects_attention_event_and_records_bot_reply(self):
+    def test_bridge_injects_untrusted_external_event_without_recording_as_astrmai_reply(self):
         import sys
 
         message_components_mod = types.ModuleType("astrbot.api.message_components")
@@ -104,9 +104,13 @@ class RefactoredExternalResultBridgeTests(unittest.TestCase):
             "external_result_bridge",
         )
         self.assertEqual(
-            runtime.evolution.calls,
-            [("default:GroupMessage:group-1", "bot-1", "(内置插件执行结果): 任务完成[图片]")],
+            runtime.attention_gate.calls[0][1]["extra"]["astrmai_event_provenance"],
+            "external_plugin",
         )
+        self.assertFalse(
+            runtime.attention_gate.calls[0][1]["extra"]["astrmai_is_committed_astrmai_reply"]
+        )
+        self.assertEqual(runtime.evolution.calls, [])
 
 
     def test_trusted_external_result_bypasses_self_filter_and_preserves_scope(self):

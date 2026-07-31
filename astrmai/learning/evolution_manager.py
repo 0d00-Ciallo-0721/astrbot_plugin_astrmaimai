@@ -172,22 +172,27 @@ class EvolutionManager:
         except asyncio.CancelledError:
             logger.debug(f"[Evolution Task] task cancelled: {task.get_name()}")
 
-    async def _append_message_log(self, *, group_id: str, sender_id: str, sender_name: str, content: str):
+    async def _append_message_log(
+        self,
+        *,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        conversation_event=None,
+    ):
+        kwargs = {
+            "group_id": group_id,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "content": content,
+        }
+        if conversation_event is not None:
+            kwargs["conversation_event"] = conversation_event
         if hasattr(self.db, "add_message_log_async"):
-            await self.db.add_message_log_async(
-                group_id=group_id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                content=content,
-            )
+            await self.db.add_message_log_async(**kwargs)
             return
-        await asyncio.to_thread(
-            self.db.add_message_log,
-            group_id=group_id,
-            sender_id=sender_id,
-            sender_name=sender_name,
-            content=content,
-        )
+        await asyncio.to_thread(self.db.add_message_log, **kwargs)
 
     async def _publish_learning_event(self, publisher_name: str, payload: dict) -> None:
         if not self.event_bus:
@@ -520,11 +525,13 @@ class EvolutionManager:
 
     async def record_user_message(self, event: AstrMessageEvent):
         rich_text = event.get_extra("astrmai_rich_text", event.message_str)
+        conversation_event = event.get_extra("astrmai_conversation_event", None)
         await self._append_message_log(
             group_id=event.unified_msg_origin,
             sender_id=event.get_sender_id(),
             sender_name=event.get_sender_name(),
             content=rich_text,
+            conversation_event=conversation_event,
         )
         triggered = self.recorder.record(event.unified_msg_origin)
         self._schedule_mining_if_triggered(event.unified_msg_origin, triggered)

@@ -440,10 +440,7 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(kwargs["lane_key"].task_family, "dialog")
         self.assertEqual(kwargs["base_origin"], "default:GroupMessage:group-1@@topic:1")
         self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "lane-text-reply")])
-        self.assertEqual(
-            evolution.calls,
-            [("default:GroupMessage:group-1", "bot-1", "lane-text-reply")],
-        )
+        self.assertEqual(evolution.calls, [])
 
     def test_tool_mode_yield_is_forwarded_as_terminal_content(self):
         gateway = _FakeGateway()
@@ -467,10 +464,7 @@ class RefactoredExecutorTests(unittest.TestCase):
         mode, _kwargs = gateway.calls[0]
         self.assertEqual(mode, "tool")
         self.assertEqual(reply_service.calls, [("default:GroupMessage:group-1", "tool-finished")])
-        self.assertEqual(
-            evolution.calls,
-            [("default:GroupMessage:group-1", "bot-1", "tool-finished")],
-        )
+        self.assertEqual(evolution.calls, [])
 
     def test_tool_mode_wait_signal_sets_execution_signal_without_visible_reply(self):
         gateway = _FakeGateway(tool_responses={"model-a": "[SYSTEM_WAIT_SIGNAL]"})
@@ -872,10 +866,7 @@ class RefactoredExecutorTests(unittest.TestCase):
 
         self.assertEqual(result, "second")
         self.assertEqual(reply_service.calls, ["first", "second"])
-        self.assertEqual(
-            evolution.calls,
-            [(event.unified_msg_origin, "bot-1", "second")],
-        )
+        self.assertEqual(evolution.calls, [])
 
     def test_text_mode_pool_exhausted_trace_includes_gateway_cooldown_skips(self):
         gateway = _CooldownAwareFakeGateway(

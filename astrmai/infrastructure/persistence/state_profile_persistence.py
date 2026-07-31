@@ -98,6 +98,22 @@ class StateProfilePersistenceMixin:
                 )
                 state.last_access_time = float(row_dict.get("last_access_time") or 0.0)
                 state.next_wakeup_timestamp = float(row_dict.get("next_wakeup_timestamp") or 0.0)
+                state.chat_kind = str(row_dict.get("chat_kind", "") or "")
+                state.last_real_user_activity_at = float(
+                    row_dict.get("last_real_user_activity_at") or state.last_reply_time or 0.0
+                )
+                state.last_committed_bot_reply_at = float(
+                    row_dict.get("last_committed_bot_reply_at") or state.last_reply_time or 0.0
+                )
+                state.next_proactive_due_at = float(
+                    row_dict.get("next_proactive_due_at") or state.next_wakeup_timestamp or 0.0
+                )
+                state.proactive_generation = int(row_dict.get("proactive_generation") or 0)
+                state.unanswered_proactive_count = int(row_dict.get("unanswered_proactive_count") or 0)
+                state.last_proactive_commit_id = str(row_dict.get("last_proactive_commit_id", "") or "")
+                state.last_proactive_cancel_reason = str(row_dict.get("last_proactive_cancel_reason", "") or "")
+                state.proactive_claim_token = str(row_dict.get("proactive_claim_token", "") or "")
+                state.proactive_claimed_at = float(row_dict.get("proactive_claimed_at") or 0.0)
                 state.is_dirty = bool(row_dict.get("is_dirty") or False)
                 return state
         return None
@@ -118,8 +134,8 @@ class StateProfilePersistenceMixin:
             now = time.time()
             await db.execute("""
                 INSERT INTO chat_states
-                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, last_energy_recovery_time, total_messages, judgment_mode, last_msg_info, last_access_time, next_wakeup_timestamp, is_dirty, updated_at)
-                VALUES (:chat_id, :energy, :mood, :group_config, :last_reset_date, :total_replies, :last_reply_time, :last_passive_decay_time, :last_energy_recovery_time, :total_messages, :judgment_mode, :last_msg_info, :last_access_time, :next_wakeup_timestamp, :is_dirty, :updated_at)
+                (chat_id, energy, mood, group_config, last_reset_date, total_replies, last_reply_time, last_passive_decay_time, last_energy_recovery_time, total_messages, judgment_mode, last_msg_info, last_access_time, next_wakeup_timestamp, chat_kind, last_real_user_activity_at, last_committed_bot_reply_at, next_proactive_due_at, proactive_generation, unanswered_proactive_count, last_proactive_commit_id, last_proactive_cancel_reason, proactive_claim_token, proactive_claimed_at, is_dirty, updated_at)
+                VALUES (:chat_id, :energy, :mood, :group_config, :last_reset_date, :total_replies, :last_reply_time, :last_passive_decay_time, :last_energy_recovery_time, :total_messages, :judgment_mode, :last_msg_info, :last_access_time, :next_wakeup_timestamp, :chat_kind, :last_real_user_activity_at, :last_committed_bot_reply_at, :next_proactive_due_at, :proactive_generation, :unanswered_proactive_count, :last_proactive_commit_id, :last_proactive_cancel_reason, :proactive_claim_token, :proactive_claimed_at, :is_dirty, :updated_at)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     energy = :energy,
                     mood = :mood,
@@ -134,6 +150,16 @@ class StateProfilePersistenceMixin:
                     last_msg_info = :last_msg_info,
                     last_access_time = :last_access_time,
                     next_wakeup_timestamp = :next_wakeup_timestamp,
+                    chat_kind = :chat_kind,
+                    last_real_user_activity_at = :last_real_user_activity_at,
+                    last_committed_bot_reply_at = :last_committed_bot_reply_at,
+                    next_proactive_due_at = :next_proactive_due_at,
+                    proactive_generation = :proactive_generation,
+                    unanswered_proactive_count = :unanswered_proactive_count,
+                    last_proactive_commit_id = :last_proactive_commit_id,
+                    last_proactive_cancel_reason = :last_proactive_cancel_reason,
+                    proactive_claim_token = :proactive_claim_token,
+                    proactive_claimed_at = :proactive_claimed_at,
                     is_dirty = :is_dirty,
                     updated_at = :updated_at
             """, {
@@ -151,6 +177,16 @@ class StateProfilePersistenceMixin:
                 "last_msg_info": last_msg_info_json,
                 "last_access_time": float(getattr(state, "last_access_time", 0.0) or 0.0),
                 "next_wakeup_timestamp": float(getattr(state, "next_wakeup_timestamp", 0.0) or 0.0),
+                "chat_kind": str(getattr(state, "chat_kind", "") or ""),
+                "last_real_user_activity_at": float(getattr(state, "last_real_user_activity_at", 0.0) or 0.0),
+                "last_committed_bot_reply_at": float(getattr(state, "last_committed_bot_reply_at", 0.0) or 0.0),
+                "next_proactive_due_at": float(getattr(state, "next_proactive_due_at", 0.0) or 0.0),
+                "proactive_generation": int(getattr(state, "proactive_generation", 0) or 0),
+                "unanswered_proactive_count": int(getattr(state, "unanswered_proactive_count", 0) or 0),
+                "last_proactive_commit_id": str(getattr(state, "last_proactive_commit_id", "") or ""),
+                "last_proactive_cancel_reason": str(getattr(state, "last_proactive_cancel_reason", "") or ""),
+                "proactive_claim_token": str(getattr(state, "proactive_claim_token", "") or ""),
+                "proactive_claimed_at": float(getattr(state, "proactive_claimed_at", 0.0) or 0.0),
                 "is_dirty": int(getattr(state, "is_dirty", False) or False),
                 "updated_at": now,
             })
@@ -271,6 +307,101 @@ class StateProfilePersistenceMixin:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (chat_id, sender_id, has_image, json.dumps(image_urls, ensure_ascii=False), False, time.time()))
             await db.commit()
+
+    async def list_due_chat_state_ids(
+        self,
+        *,
+        now: float,
+        limit: int = 200,
+    ) -> list[str]:
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT chat_id
+                FROM chat_states
+                WHERE next_proactive_due_at > 0
+                  AND next_proactive_due_at <= ?
+                ORDER BY next_proactive_due_at ASC
+                LIMIT ?
+                """,
+                (float(now), max(1, min(int(limit or 200), 1000))),
+            )
+            return [str(row[0]) for row in await cursor.fetchall() if row and row[0]]
+
+    async def atomic_claim_proactive_due(
+        self,
+        chat_id: str,
+        *,
+        expected_generation: int,
+        claim_token: str,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        lease_expired_at = float(now) - max(1.0, float(lease_seconds or 0.0))
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE chat_states
+                SET proactive_claim_token = ?,
+                    proactive_claimed_at = ?,
+                    last_proactive_cancel_reason = '',
+                    updated_at = ?
+                WHERE chat_id = ?
+                  AND proactive_generation = ?
+                  AND next_proactive_due_at <= ?
+                  AND (
+                        proactive_claim_token = ''
+                        OR proactive_claim_token IS NULL
+                        OR proactive_claimed_at <= ?
+                  )
+                """,
+                (
+                    str(claim_token),
+                    float(now),
+                    float(now),
+                    str(chat_id),
+                    int(expected_generation),
+                    float(now),
+                    lease_expired_at,
+                ),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0) == 1
+
+    async def atomic_settle_proactive_claim(
+        self,
+        chat_id: str,
+        *,
+        claim_token: str,
+        next_due_at: float,
+        cancel_reason: str,
+        now: float | None = None,
+    ) -> bool:
+        now = time.time() if now is None else float(now)
+        async with connect_aiosqlite(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE chat_states
+                SET proactive_claim_token = '',
+                    proactive_claimed_at = 0,
+                    next_proactive_due_at = ?,
+                    next_wakeup_timestamp = ?,
+                    last_proactive_cancel_reason = ?,
+                    updated_at = ?
+                WHERE chat_id = ?
+                  AND proactive_claim_token = ?
+                """,
+                (
+                    float(next_due_at or 0.0),
+                    float(next_due_at or 0.0),
+                    str(cancel_reason or ""),
+                    now,
+                    str(chat_id),
+                    str(claim_token or ""),
+                ),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0) == 1
 
     async def mark_last_message_vision_executed(self, chat_id: str, sender_id: str) -> None:
         """Mark the latest matching image message after the vision barrier ran."""

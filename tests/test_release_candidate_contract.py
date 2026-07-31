@@ -8,7 +8,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.build_release_candidate import build_release_candidate, validate_release_candidate
+from scripts.build_release_candidate import (
+    REQUIRED_ARCHITECTURE_FILES,
+    build_release_candidate,
+    validate_release_candidate,
+)
 
 
 class ReleaseCandidateContractTests(unittest.TestCase):
@@ -28,6 +32,11 @@ class ReleaseCandidateContractTests(unittest.TestCase):
             self.assertIn('astrbot_version: ">=4.26.4,<5"', (output / "metadata.yaml").read_text(encoding="utf-8"))
             schema = json.loads((output / "_conf_schema.json").read_text(encoding="utf-8"))
             self.assertIsInstance(schema, dict)
+            for relative in REQUIRED_ARCHITECTURE_FILES:
+                self.assertTrue(
+                    (output / Path(relative)).is_file(),
+                    f"missing architecture runtime file: {relative}",
+                )
 
             self.assertTrue(compileall.compile_dir(output, quiet=1))
 

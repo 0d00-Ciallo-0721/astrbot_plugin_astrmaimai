@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from .turn_target import ActorSet, TurnTarget
+
 
 class ReplyMode(str, Enum):
     PLAYFUL_INTERACTION = "playful_interaction"
@@ -68,6 +70,8 @@ class FocusThreadContext:
     focus_message_text: str = ""
     focus_sender_id: str = ""
     focus_sender_name: str = ""
+    turn_target: TurnTarget = field(default_factory=TurnTarget)
+    actor_set: ActorSet = field(default_factory=ActorSet)
     reply_mode: ReplyMode = ReplyMode.CASUAL_FOLLOWUP
     social_state: str = ""
     thread_signature: str = ""
@@ -94,5 +98,7 @@ __all__ = [
     "FreshnessState",
     "ReplyFreshnessBudget",
     "ReplyMode",
+    "ActorSet",
+    "TurnTarget",
     "VisionBundle",
 ]

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 from .focus_context import FreshnessState, ReplyMode
+from .context_package import ContextPackage, escape_untrusted_text
 
 
 @dataclass
@@ -26,7 +27,19 @@ class PromptEnvelope:
     @classmethod
     def sanitize_inline_text(cls, text: str) -> str:
         """Escape prompt boundary tags without adding a block wrapper."""
-        return cls._escape_injection_tags(str(text or ""))
+        return escape_untrusted_text(cls._escape_injection_tags(str(text or "")))
+
+    @staticmethod
+    def sanitize_derived_context(text: str, *, source: str = "derived") -> str:
+        if not text or not str(text).strip():
+            return str(text or "")
+        safe_source = str(source or "derived").replace('"', "").replace("\n", " ").strip()
+        safe = PromptEnvelope.sanitize_inline_text(str(text))
+        return (
+            f'<untrusted_context type="derived" source="{safe_source}" trusted="false">\n'
+            f"{safe}\n"
+            "</untrusted_context>"
+        )
 
     @staticmethod
     def sanitize_user_input(text: str) -> str:
@@ -96,6 +109,7 @@ class PromptEnvelope:
     situational_context_block: str = ""
     planner_runtime_instruction_block: str = ""
     guidance_lines: list[str] = field(default_factory=list)
+    context_package: ContextPackage | None = None
 
 
 __all__ = [

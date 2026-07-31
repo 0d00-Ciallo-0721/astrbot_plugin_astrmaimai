@@ -209,6 +209,9 @@ class MemoryGapCoverageTests(unittest.TestCase):
                 "candidate_count": 0,
                 "selected_count": 0,
                 "rendered_chars": 0,
+                "actor_whitelist_count": 0,
+                "actor_suppressed_count": 0,
+                "actor_candidate_count_before_filter": 0,
             },
         )
         turn_context = event.get_extra("astrmai_turn_context")

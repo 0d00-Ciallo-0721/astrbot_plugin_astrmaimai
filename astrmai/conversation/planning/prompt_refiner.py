@@ -148,8 +148,16 @@ class PromptRefiner:
                 speaker_name = stripped.split(":", 1)[1].strip()
         if not speaker_id and not speaker_name:
             return ""
-        display_name = speaker_name or "当前发言人"
-        display_id = speaker_id or "unknown"
+        display_name = (
+            PromptEnvelope.sanitize_inline_text(speaker_name or "当前发言人")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )[:80]
+        display_id = (
+            PromptEnvelope.sanitize_inline_text(speaker_id or "unknown")
+            .replace("\r", "")
+            .replace("\n", "")
+        )[:80]
         return (
             "---最终发言人归因锁---\n"
             f"当前唯一对话对象是 {display_name}（QQ {display_id}）。"
@@ -916,6 +924,7 @@ class PromptRefiner:
         background_window_text = prompt_envelope.ambient_background_text.strip()
         current_speaker_block = str(getattr(prompt_envelope, "current_speaker_block", "") or "").strip()
         referenced_entity_block = str(getattr(prompt_envelope, "referenced_entity_block", "") or "").strip()
+        context_package = getattr(prompt_envelope, "context_package", None)
         focus_reason = prompt_envelope.focus_reason.strip()
         focus_thread_reason = (prompt_envelope.focus_thread_reason or focus_reason).strip()
         near_context_priority = bool(prompt_envelope.near_context_priority)
@@ -1110,30 +1119,69 @@ class PromptRefiner:
                     "如果不自然，可以保持沉默。不要提到系统机制或这段指引。\n"
                     + proactive_guidance[:500]
                 )
-        if current_speaker_block:
-            sections.append(f"---当前发言人边界---\n{PromptEnvelope.sanitize_inline_text(current_speaker_block)}")
-        if referenced_entity_block:
-            sections.append(f"---本轮提及对象边界---\n{PromptEnvelope.sanitize_inline_text(referenced_entity_block)}")
-        if focus_message_text:
-            sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(PromptEnvelope.sanitize_user_input(focus_message_text))}")
-        if direct_context_text:
-            sections.append(f"---前因---\n{await self._resolve_visual_memory(direct_context_text)}")
-        if related_context_text:
-            sections.append(f"---补充---\n{await self._resolve_visual_memory(related_context_text)}")
+        if context_package is not None:
+            rendered_context_package = str(context_package.render() or "").strip()
+            if rendered_context_package:
+                sections.append(
+                    "---规范会话上下文（共享事实与本轮归属）---\n"
+                    + await self._resolve_visual_memory(rendered_context_package)
+                )
+        else:
+            if current_speaker_block:
+                sections.append(f"---当前发言人边界---\n{PromptEnvelope.sanitize_inline_text(current_speaker_block)}")
+            if referenced_entity_block:
+                sections.append(f"---本轮提及对象边界---\n{PromptEnvelope.sanitize_inline_text(referenced_entity_block)}")
+            if focus_message_text:
+                sections.append(f"---眼前正在对我说的---\n{await self._resolve_visual_memory(PromptEnvelope.sanitize_user_input(focus_message_text))}")
+            if direct_context_text:
+                sections.append(
+                    "---前因---\n"
+                    + await self._resolve_visual_memory(
+                        PromptEnvelope.sanitize_inline_text(direct_context_text)
+                    )
+                )
+            if related_context_text:
+                sections.append(
+                    "---补充---\n"
+                    + await self._resolve_visual_memory(
+                        PromptEnvelope.sanitize_inline_text(related_context_text)
+                    )
+                )
         if recent_transcript:
             recent_title = "---对话记录---"
             if recent_transcript_source:
                 recent_title = f"---对话记录（来源：{recent_transcript_source}）---"
             if recent_transcript_reason:
                 recent_title = f"{recent_title}\n[reason: {recent_transcript_reason}]"
-            sections.append(f"{recent_title}\n{await self._resolve_visual_memory(recent_transcript)}")
+            sections.append(
+                f"{recent_title}\n"
+                + await self._resolve_visual_memory(
+                    PromptEnvelope.sanitize_derived_context(
+                        recent_transcript,
+                        source=recent_transcript_source or "recent_transcript",
+                    )
+                )
+            )
         if warm_zone_transcript:
             warm_title = "---近期对话脉络---"
             if warm_zone_transcript_source:
                 warm_title = f"---近期对话脉络（来源：{warm_zone_transcript_source}）---"
-            sections.append(f"{warm_title}\n{await self._resolve_visual_memory(warm_zone_transcript)}")
-        if background_window_text:
-            sections.append(f"---旁边在聊的---\n{await self._resolve_visual_memory(background_window_text)}")
+            sections.append(
+                f"{warm_title}\n"
+                + await self._resolve_visual_memory(
+                    PromptEnvelope.sanitize_derived_context(
+                        warm_zone_transcript,
+                        source=warm_zone_transcript_source or "warm_zone",
+                    )
+                )
+            )
+        if background_window_text and context_package is None:
+            sections.append(
+                "---旁边在聊的---\n"
+                + await self._resolve_visual_memory(
+                    PromptEnvelope.sanitize_inline_text(background_window_text)
+                )
+            )
 
         memory_parts = []
         sanitized_memory = prompt_envelope.memory_block  # use sanitized wrapper
@@ -1147,7 +1195,12 @@ class PromptRefiner:
         if soft_background_block:
             sections.append(
                 "---背景理解（仅作背景，不要主动续写旧话题，不要覆盖当前用户当前问题）---\n"
-                + await self._resolve_visual_memory(soft_background_block)
+                + await self._resolve_visual_memory(
+                    PromptEnvelope.sanitize_derived_context(
+                        soft_background_block,
+                        source="soft_background",
+                    )
+                )
             )
         runtime_guidance_cluster = self._render_runtime_guidance_cluster(
             cognitive_drive_block=await self._resolve_visual_memory(cognitive_drive_block),

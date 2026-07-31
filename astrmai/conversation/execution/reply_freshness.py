@@ -132,6 +132,43 @@ class ReplyFreshnessMixin:
         return not latest_ts or latest_ts <= event_ts
 
     async def _check_reply_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
+        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            captured_generation = int(
+                event.get_extra("astrmai_proactive_generation", 0) or 0
+            )
+            generation_check = getattr(
+                getattr(self, "state_engine", None),
+                "is_proactive_generation_current",
+                None,
+            )
+            if callable(generation_check):
+                try:
+                    if not await generation_check(chat_id, captured_generation):
+                        event.set_extra(
+                            "astrmai_proactive_cancel_reason",
+                            "proactive_generation_superseded",
+                        )
+                        return self._record_freshness_observation(
+                            event,
+                            FreshnessState.EXPIRED,
+                            "proactive_generation_superseded",
+                        )
+                except Exception:
+                    logger.warning(
+                        "[ReplyService] proactive generation check failed closed for %s",
+                        chat_id,
+                        exc_info=True,
+                    )
+                    event.set_extra(
+                        "astrmai_proactive_cancel_reason",
+                        "proactive_generation_check_failed",
+                    )
+                    return self._record_freshness_observation(
+                        event,
+                        FreshnessState.EXPIRED,
+                        "proactive_generation_check_failed",
+                    )
+
         concurrency_flags = resolve_conversation_concurrency_flags(getattr(self, "config", None))
         if (
             concurrency_flags.generation_enabled

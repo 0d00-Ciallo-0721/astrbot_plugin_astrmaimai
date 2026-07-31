@@ -16,6 +16,7 @@ from ...infrastructure.runtime.turn_call_ledger import begin_stage, finish_stage
 from .memory_context_builder import MemoryContextBuilder
 from .memory_query_builder import MemoryQueryBuilder
 from .memory_retrieval_service import MemoryRetrievalService
+from .actor_memory_scope import build_actor_memory_scope
 
 
 class MemoryInjectionService:
@@ -56,6 +57,7 @@ class MemoryInjectionService:
         retrieved = trace_payload.get("retrieved")
         query_builder = trace_payload.get("query_builder")
         retrieval = trace_payload.get("retrieval")
+        actor_scope_filter = trace_payload.get("actor_scope_filter")
         search_steps = [
             {key: value for key, value in step.items() if key != "query"}
             for step in list(trace_payload.get("search_steps") or [])
@@ -74,6 +76,11 @@ class MemoryInjectionService:
             "retrieved_count": len(retrieved) if isinstance(retrieved, list) else 0,
             "query_builder": dict(query_builder) if isinstance(query_builder, dict) else {},
             "retrieval": dict(retrieval) if isinstance(retrieval, dict) else {},
+            "actor_scope_filter": (
+                dict(actor_scope_filter)
+                if isinstance(actor_scope_filter, dict)
+                else {}
+            ),
             "skip_reason": str(skip_reason or getattr(trace, "skip_reason", "") or ""),
             "error": str(trace_payload.get("error") or ""),
         }
@@ -187,7 +194,23 @@ class MemoryInjectionService:
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_memory_funnel", dict(payload))
 
+        def apply_actor_scope_decision() -> dict:
+            query_metadata = dict(getattr(query, "metadata", {}) or {})
+            trace_payload = dict(query_metadata.get("_trace") or {})
+            actor_filter_payload = dict(trace_payload.get("actor_scope_filter") or {})
+            decision.actor_whitelist = list(
+                actor_filter_payload.get("allowed_actor_ids") or []
+            )
+            decision.suppressed_candidate_ids = list(
+                actor_filter_payload.get("suppressed_ids") or []
+            )
+            decision.suppressed_candidate_count = int(
+                actor_filter_payload.get("suppressed_count", 0) or 0
+            )
+            return actor_filter_payload
+
         def skipped(reason: str) -> MemoryInjectionBundle:
+            actor_filter_payload = apply_actor_scope_decision()
             trace.skip_reason = reason
             decision.skip_reason = reason
             decision.trace_id = trace.trace_id
@@ -204,6 +227,11 @@ class MemoryInjectionService:
                 "candidate_count": 0,
                 "selected_count": 0,
                 "rendered_chars": 0,
+                "actor_whitelist_count": len(decision.actor_whitelist),
+                "actor_suppressed_count": decision.suppressed_candidate_count,
+                "actor_candidate_count_before_filter": int(
+                    actor_filter_payload.get("before_count", 0) or 0
+                ),
             }
             remember_funnel(funnel)
             finish_stage(
@@ -215,6 +243,11 @@ class MemoryInjectionService:
                     "candidate_count": 0,
                     "selected_count": 0,
                     "rendered_chars": 0,
+                    "actor_whitelist_count": funnel["actor_whitelist_count"],
+                    "actor_suppressed_count": funnel["actor_suppressed_count"],
+                    "actor_candidate_count_before_filter": funnel[
+                        "actor_candidate_count_before_filter"
+                    ],
                 },
             )
             return MemoryInjectionBundle(trace=trace, skip_reason=reason)
@@ -240,6 +273,7 @@ class MemoryInjectionService:
 
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
         persona_id = str(getattr(getattr(self.config, "persona", None), "persona_id", "") or "")
+        actor_memory_scope = build_actor_memory_scope(event)
         try:
             query = self.query_builder.build(
                 event=event,
@@ -253,7 +287,10 @@ class MemoryInjectionService:
                 think_level=think_level,
                 retrieve_keys=list(retrieve_keys),
                 allow_stale=policy == "deep" or (think_level is not None and think_level >= 3),
-                metadata={"visibility_mode": "auto"},
+                metadata={
+                    "visibility_mode": "auto",
+                    "actor_memory_scope": actor_memory_scope.as_dict(),
+                },
             )
             candidates = await self.retrieval_service.retrieve(query)
         except Exception as exc:
@@ -316,6 +353,7 @@ class MemoryInjectionService:
             event.set_extra("astrmai_memory_injection_trace", trace)
         trace_payload = dict((query.metadata or {}).get("_trace", {}) or {})
         retrieval_payload = dict(trace_payload.get("retrieval") or {})
+        apply_actor_scope_decision()
         search_steps = [
             step for step in list(trace_payload.get("search_steps") or [])
             if isinstance(step, dict)
@@ -339,6 +377,8 @@ class MemoryInjectionService:
             "rendered_chars": len(rendered or ""),
             "matched_source_count": len(matched_by),
             "degraded_component_count": len(list(trace_payload.get("degraded_components") or [])),
+            "actor_whitelist_count": len(decision.actor_whitelist),
+            "actor_suppressed_count": decision.suppressed_candidate_count,
         }
         remember_funnel(funnel)
         finish_stage(
@@ -352,6 +392,8 @@ class MemoryInjectionService:
                 "rendered_chars": funnel["rendered_chars"],
                 "matched_source_count": funnel["matched_source_count"],
                 "degraded_component_count": funnel["degraded_component_count"],
+                "actor_whitelist_count": funnel["actor_whitelist_count"],
+                "actor_suppressed_count": funnel["actor_suppressed_count"],
             },
         )
         await self._persist_trace(event=event, query=query, trace=trace, selected=selected)

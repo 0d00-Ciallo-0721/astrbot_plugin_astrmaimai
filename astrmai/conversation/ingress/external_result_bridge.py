@@ -9,7 +9,6 @@ except Exception:
     logger = logging.getLogger(__name__)
 
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
-from ...learning.logging.bot_reply_recorder import record_bot_reply
 from ...shared.helpers.plugin_helpers import build_external_reply_event, get_event_self_id
 
 Comp = import_module("astrbot.api.message_components")
@@ -73,6 +72,9 @@ async def bridge_external_plugin_result(runtime, event) -> None:
         "astrmai_loop_source": "external_result_bridge",
         "is_external_bot_reply": True,
         "astrmai_external_result_source": loop_source,
+        "astrmai_event_provenance": "external_plugin",
+        "astrmai_external_context_trusted": False,
+        "astrmai_is_committed_astrmai_reply": False,
         "astrmai_origin_sender_id": str(event.get_sender_id() or "") if hasattr(event, "get_sender_id") else "",
     }
     debug_trace(event, "ingress.external_result", preview=preview_text(reply_text, 100))
@@ -80,5 +82,3 @@ async def bridge_external_plugin_result(runtime, event) -> None:
     if runtime.attention_gate and hasattr(runtime.attention_gate, "inject_external_event"):
         await runtime.attention_gate.inject_external_event(chat_id, bot_reply_event)
         logger.debug(f"[{chat_id}] external plugin result injected into attention window.")
-
-    await record_bot_reply(runtime, chat_id, bot_id, reply_text, prefix="(内置插件执行结果): ")

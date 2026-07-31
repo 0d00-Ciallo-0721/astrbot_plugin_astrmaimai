@@ -117,6 +117,68 @@ class PluginFacadeTurnPrepareTests(unittest.TestCase):
         self.assertEqual(turn.thread_id, event.unified_msg_origin)
         self.assertEqual(event.get_extra("astrmai_group_thread_source"), "gray_switch_disabled")
 
+    def test_group_wait_info_uses_thread_scope_when_thread_wait_is_enabled(self):
+        class _Manager:
+            def __init__(self):
+                self.calls = []
+
+            def handle_incoming_message(self, _event):
+                return "OBSERVED"
+
+            def get_wait_info(self, chat_id, thread_id=""):
+                self.calls.append((chat_id, thread_id))
+                return None
+
+        class _Kernel:
+            async def record_concurrency_event(self, _name):
+                return None
+
+        manager = _Manager()
+        facade = self._facade(_Coordinator(), group_thread_wait_enabled=True)
+        facade.runtime.group_reply_wait_manager = manager
+        facade.runtime.chat_loop_kernel = _Kernel()
+        event = _Event(extras={"astrmai_turn_thread_id": "thread-a"})
+        scope = SimpleNamespace(
+            chat_id=event.unified_msg_origin,
+            is_private_chat=False,
+            sender_id="user-1",
+        )
+
+        asyncio.run(facade.handle_group_reply_wait(event, scope))
+
+        self.assertEqual(manager.calls, [(event.unified_msg_origin, "thread-a")])
+
+    def test_group_wait_info_uses_chat_scope_when_thread_wait_is_disabled(self):
+        class _Manager:
+            def __init__(self):
+                self.calls = []
+
+            def handle_incoming_message(self, _event):
+                return "OBSERVED"
+
+            def get_wait_info(self, chat_id, thread_id=""):
+                self.calls.append((chat_id, thread_id))
+                return None
+
+        class _Kernel:
+            async def record_concurrency_event(self, _name):
+                return None
+
+        manager = _Manager()
+        facade = self._facade(_Coordinator(), group_thread_wait_enabled=False)
+        facade.runtime.group_reply_wait_manager = manager
+        facade.runtime.chat_loop_kernel = _Kernel()
+        event = _Event(extras={"astrmai_turn_thread_id": "thread-a"})
+        scope = SimpleNamespace(
+            chat_id=event.unified_msg_origin,
+            is_private_chat=False,
+            sender_id="user-1",
+        )
+
+        asyncio.run(facade.handle_group_reply_wait(event, scope))
+
+        self.assertEqual(manager.calls, [(event.unified_msg_origin, "")])
+
     def test_generation_gray_switch_off_preserves_legacy_event_without_turn(self):
         coordinator = _Coordinator()
         facade = self._facade(coordinator, generation_enabled=False)

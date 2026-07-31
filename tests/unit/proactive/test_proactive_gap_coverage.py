@@ -192,7 +192,15 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         self.assertEqual(intent.source, "wakeup")
         self.assertEqual(intent.cost, 5.0)
         self.assertEqual(intent.cooldown, 90.0)
-        self.assertEqual(intent.metadata, {"group_id": "group:10001"})
+        self.assertEqual(
+            intent.metadata,
+            {
+                "chat_kind": "group",
+                "captured_generation": 0,
+                "claim_token": "",
+                "group_id": "group:10001",
+            },
+        )
 
     def test_wakeup_intent_rejects_blank_guidance(self):
         service = self.wakeup_mod.WakeupService(

@@ -36,12 +36,14 @@ from ...multimodal import MEMES_DIR, send_meme
 from ...state.relationship.affection_router import AffectionRouter
 from ..contracts.focus_context import FreshnessState, ReplyMode
 from ..contracts.reply_artifact import OutboundPolicy, VisibleReplyArtifact
+from ..contracts.committed_reply import CommittedBotTurn
 from .text_segmenter import TextSegmenter
 
 
 from .reply_artifact_builder import ReplyArtifactMixin
 from .reply_freshness import ReplyFreshnessMixin
 from .reply_post_send import ReplyPostSendMixin
+from .reply_commit_service import ReplyCommitService
 from .qq_action_dispatcher import QQActionDispatcher
 from .tts_bridge import TTSBridge
 
@@ -49,12 +51,29 @@ from .tts_bridge import TTSBridge
 class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
     """Handles visible reply sanitizing, sending, and post-send emotional settlement."""
 
-    def __init__(self, state_engine, mood_manager, config=None, runtime_coordinator=None, memory_engine=None):
+    def __init__(
+        self,
+        state_engine,
+        mood_manager,
+        config=None,
+        runtime_coordinator=None,
+        memory_engine=None,
+        dialogue_store=None,
+        evolution_manager=None,
+        reply_commit_service=None,
+    ):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
         self.config = config if config else state_engine.config
         self.runtime_coordinator = runtime_coordinator
         self.memory_engine = memory_engine
+        self.dialogue_store = dialogue_store
+        self.evolution_manager = evolution_manager
+        self.reply_commit_service = (
+            reply_commit_service
+            if reply_commit_service is not None
+            else ReplyCommitService()
+        )
         self.qq_action_dispatcher = QQActionDispatcher(
             config=self.config,
             runtime_coordinator=runtime_coordinator,
@@ -120,6 +139,11 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             metadata=artifact.metadata,
         )
         if artifact.blocked:
+            event.set_extra("astrmai_reply_delivery_status", "cancelled")
+            event.set_extra(
+                "astrmai_reply_delivery_failure_reason",
+                str(artifact.blocked_reason or "blocked"),
+            )
             logger.debug(f"[{chat_id}] trace={event.get_extra('astrmai_trace_id', '')} reply blocked: {artifact.blocked_reason}")
             await self._settle_no_send_affection(
                 event,
@@ -129,6 +153,11 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             )
             return artifact
         if freshness_state == FreshnessState.EXPIRED:
+            event.set_extra("astrmai_reply_delivery_status", "stale")
+            event.set_extra(
+                "astrmai_reply_delivery_failure_reason",
+                str(stale_reason or "reply_age_exceeded"),
+            )
             logger.info(
                 f"[ReplyService] skipped stale reply for {chat_id}: {stale_reason} | preview={preview_text(artifact.visible_text, 80)!r}"
             )
@@ -143,6 +172,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         sender_name = event.get_sender_name() or "群友"
         rich_text = event.get_extra("astrmai_rich_text", event.message_str)
         formatted_user_text = f"{sender_name}: {rich_text}"
+        reply_plan = self._build_reply_plan(event, chat_id, artifact)
         at_targets = self._merge_wait_targets(event, pending_actions)
         with observe_stage(
             event,
@@ -153,6 +183,18 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             send_stage["sent"] = bool(sent)
             send_stage["sent_segment_count"] = int(artifact.metadata.get("sent_segment_count", 0) or 0)
         if not sent:
+            event.set_extra("astrmai_reply_delivery_status", "failed")
+            event.set_extra(
+                "astrmai_reply_delivery_failure_reason",
+                str(
+                    artifact.metadata.get("send_failure_reason", "")
+                    or "send_failed"
+                ),
+            )
+            event.set_extra(
+                "astrmai_reply_sent_segment_count",
+                int(artifact.metadata.get("sent_segment_count", 0) or 0),
+            )
             record_reply_stats(
                 event,
                 segment_count=len(artifact.segments or []),
@@ -192,17 +234,53 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             )
         except Exception as exc:
             logger.warning(f"[ReplyService] optional QQ action commit degraded: {exc}")
-        await self._sync_native_history_mirror(
-            event=event,
-            chat_id=chat_id,
-            user_text=formatted_user_text,
-            assistant_text=artifact.persistable_text,
+        send_receipt = self._build_send_receipt(artifact)
+        event.set_extra("astrmai_reply_delivery_status", send_receipt.status.value)
+        event.set_extra(
+            "astrmai_reply_sent_segment_count",
+            len(send_receipt.sent_segments),
         )
-        await self._ingest_memory_turn(
+        event.set_extra(
+            "astrmai_reply_outbound_message_ids",
+            list(send_receipt.outbound_message_ids),
+        )
+        committed_turn = CommittedBotTurn.from_plan(
+            reply_plan,
+            send_receipt,
+        )
+        artifact.metadata["reply_commit_id"] = committed_turn.commit_id
+        artifact.metadata["reply_commit_status"] = committed_turn.send_status.value
+        artifact.metadata["partial_send"] = committed_turn.partial_send
+        commit_result = await self._commit_visible_reply(
             event,
-            chat_id,
-            formatted_user_text,
-            artifact.persistable_text,
+            committed_turn,
+            user_text=formatted_user_text,
+        )
+        event.set_extra("astrmai_reply_commit_id", committed_turn.commit_id)
+        record_committed_reply = getattr(
+            self.state_engine,
+            "record_committed_bot_reply",
+            None,
+        )
+        if callable(record_committed_reply):
+            try:
+                await record_committed_reply(
+                    chat_id,
+                    committed_at=committed_turn.sent_at,
+                    is_proactive=bool(
+                        event.get_extra("astrmai_is_proactive_event", False)
+                    ),
+                    commit_id=committed_turn.commit_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[ReplyService] bot reply watermark persistence degraded for {chat_id}: {exc}"
+                )
+        artifact.metadata["commit_consumer_status"] = dict(
+            commit_result.consumer_status
+        )
+        artifact.metadata["commit_repair_scheduled"] = bool(
+            commit_result.repair_scheduled
         )
 
         await self._settle_post_send(

@@ -15,9 +15,11 @@ from ..contracts.memory_query import MemoryCandidate, MemoryQuery
 from .memory_scoring import DEFAULT_MEMORY_SCORING, MemoryScoringConfig, rerank_candidates, scoring_from_config
 from .expression_pattern_retrieval_policy import ExpressionPatternRetrievalPolicy
 from .jargon_retrieval_policy import JargonRetrievalPolicy
+from .actor_memory_scope import filter_candidates_for_actor_scope
 from .v2_store import MemoryV2Store
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
+from ...conversation.runtime.architecture_rollout import ArchitectureTimer, rollout_enabled
 
 
 class MemoryRetrievalService:
@@ -469,6 +471,7 @@ class MemoryRetrievalService:
             top_k=query.top_k,
             candidate_pool_limit=candidate_limit,
         )
+        candidates = await self._prepare_actor_scoped_candidates(query, candidates)
         return await self._finalize_retrieval(query, candidates)
 
     @staticmethod
@@ -489,6 +492,7 @@ class MemoryRetrievalService:
                 top_k=query.top_k,
                 candidate_pool_limit=self._candidate_limit(query),
             )
+            candidates = await self._prepare_actor_scoped_candidates(query, candidates)
             return await self._finalize_retrieval(query, candidates)
         try:
             if self._query_rewrite_eligible(query):
@@ -506,7 +510,7 @@ class MemoryRetrievalService:
                 max(int(self.scoring.deep_temporal_candidate_pool_min or 20), 1),
             )
             candidates = await self._retrieve_queries(query, queries, top_k=candidate_pool_limit)
-            candidates = await self._hydrate_candidate_metadata(candidates)
+            candidates = await self._prepare_actor_scoped_candidates(query, candidates)
             try:
                 candidates = rerank_candidates(candidates, config=self.scoring)
             except Exception as exc:
@@ -538,7 +542,40 @@ class MemoryRetrievalService:
                 top_k=query.top_k,
                 candidate_pool_limit=self._candidate_limit(query),
             )
+            candidates = await self._prepare_actor_scoped_candidates(query, candidates)
             return await self._finalize_retrieval(query, candidates)
+
+    async def _prepare_actor_scoped_candidates(
+        self,
+        query: MemoryQuery,
+        candidates: list[MemoryCandidate],
+    ) -> list[MemoryCandidate]:
+        try:
+            candidates = await self._hydrate_candidate_metadata(candidates)
+        except Exception as exc:
+            logger.warning(
+                f"[MemoryRetrievalService] candidate metadata hydration degraded: {exc}"
+            )
+            self._mark_degraded(query, "candidate_metadata_hydration")
+        timer = ArchitectureTimer()
+        filtered = filter_candidates_for_actor_scope(query, candidates)
+        actor_filter_enabled = rollout_enabled(
+            getattr(self.engine, "config", None) if self.engine else None,
+            "memory_actor_filter_enabled",
+            True,
+        )
+        trace = self._trace_bucket(query)
+        actor_trace = dict(trace.get("actor_scope_filter") or {})
+        actor_trace.update(
+            {
+                "read_enabled": actor_filter_enabled,
+                "shadow_before_count": len(candidates),
+                "shadow_after_count": len(filtered),
+                "elapsed_ms": timer.elapsed_ms,
+            }
+        )
+        trace["actor_scope_filter"] = actor_trace
+        return filtered if actor_filter_enabled else list(candidates)
 
     async def _finalize_retrieval(
         self,

@@ -217,6 +217,7 @@ class GroupDialogueStore:
         is_reply_to_bot: bool = False,
         has_direct_vision: bool = False,
         is_image_only: bool = False,
+        is_recalled: bool = False,
         timestamp: float | None = None,
         topic_epoch: int = 0,
         causal_parent_event_id: str = "",
@@ -246,6 +247,7 @@ class GroupDialogueStore:
             is_reply_to_bot=bool(is_reply_to_bot),
             has_direct_vision=bool(has_direct_vision),
             is_image_only=bool(is_image_only),
+            is_recalled=bool(is_recalled),
             topic_epoch=max(0, int(topic_epoch or 0)),
             causal_parent_event_id=str(causal_parent_event_id or ""),
             provenance=str(provenance or "original"),
@@ -262,6 +264,10 @@ class GroupDialogueStore:
         async with self._lock:
             thread = self._get_thread(chat_key)
             async with thread.lock:
+                if segment.event_id:
+                    for existing in reversed(thread.segments):
+                        if existing.event_id == segment.event_id:
+                            return existing
                 next_sequence = int(self._sequence_by_chat.get(chat_key, 0) or 0) + 1
                 self._sequence_by_chat[chat_key] = next_sequence
                 segment.sequence = next_sequence
@@ -294,6 +300,82 @@ class GroupDialogueStore:
             if segment.is_bot:
                 self._record_bot_turn_locked(chat_key, segment)
         return segment
+
+    async def append_conversation_event(
+        self,
+        event,
+        *,
+        create_pending_direct: bool = False,
+    ) -> DialogueSegment:
+        return await self.append_segment(
+            event.chat_id,
+            **event.to_dialogue_segment_kwargs(),
+            create_pending_direct=create_pending_direct,
+        )
+
+    async def append_committed_bot_turn(
+        self,
+        committed_turn,
+        *,
+        bot_id: str,
+        bot_name: str,
+        stance: str = "",
+        social_event: str = "",
+    ) -> DialogueSegment:
+        send_status = str(
+            getattr(getattr(committed_turn, "send_status", ""), "value", "")
+            or getattr(committed_turn, "send_status", "")
+            or ""
+        ).strip()
+        if send_status not in {"sent", "partial"}:
+            raise ValueError(
+                f"only sent or partial committed turns may enter dialogue history: {send_status}"
+            )
+        target = getattr(committed_turn, "target", None)
+        target_sender_id = str(
+            getattr(target, "target_actor_id", "") or ""
+        ).strip()
+        target_sender_name = str(
+            getattr(target, "target_actor_name", "") or ""
+        ).strip()
+        return await self.append_segment(
+            str(getattr(committed_turn, "chat_id", "") or ""),
+            event_id=str(getattr(committed_turn, "commit_id", "") or ""),
+            speaker_id=str(bot_id or ""),
+            speaker_name=str(bot_name or "Bot"),
+            content=str(
+                getattr(committed_turn, "persistable_text", "")
+                or getattr(committed_turn, "visible_text", "")
+                or ""
+            ),
+            role="assistant",
+            message_kind=(
+                "mixed"
+                if getattr(committed_turn, "sent_attachment_refs", ())
+                else "text"
+            ),
+            is_bot=True,
+            reply_target_sender_id=target_sender_id,
+            reply_target_sender_name=target_sender_name,
+            timestamp=float(getattr(committed_turn, "sent_at", 0.0) or time.time()),
+            topic_epoch=max(
+                0,
+                int(getattr(committed_turn, "topic_epoch", 0) or 0),
+            ),
+            causal_parent_event_id=str(
+                getattr(target, "target_event_id", "") or ""
+            ),
+            source_event_ids=list(
+                getattr(committed_turn, "source_event_ids", ()) or ()
+            ),
+            stance=str(stance or ""),
+            social_event=str(social_event or ""),
+            provenance=str(
+                getattr(committed_turn, "provenance", "")
+                or "astrmai_send_commit_v1"
+            ),
+            outcome=send_status,
+        )
 
     @staticmethod
     def _stable_id(prefix: str, *parts: str) -> str:

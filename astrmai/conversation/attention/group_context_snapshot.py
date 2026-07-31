@@ -89,6 +89,11 @@ class GroupContextSnapshot:
     social_incident_count: int = 0
     echo_filtered_count: int = 0
     topic_bridge: bool = False
+    topic_epoch: int = 0
+    participant_actor_ids: list[str] = field(default_factory=list)
+    source_event_ids: list[str] = field(default_factory=list)
+    unresolved_actor_ids: list[str] = field(default_factory=list)
+    last_committed_target_actor_id: str = ""
     exclusion_reasons: list[str] = field(default_factory=list)
 
     def trace_payload(self) -> dict:
@@ -102,6 +107,11 @@ class GroupContextSnapshot:
             "social_incident_count": self.social_incident_count,
             "echo_filtered_count": self.echo_filtered_count,
             "topic_bridge": self.topic_bridge,
+            "topic_epoch": self.topic_epoch,
+            "topic_participant_ids": list(self.participant_actor_ids),
+            "summary_source_event_ids": list(self.source_event_ids),
+            "unresolved_actor_ids": list(self.unresolved_actor_ids),
+            "last_committed_target_actor_id": self.last_committed_target_actor_id,
             "exclusion_reasons": list(self.exclusion_reasons),
             "text_chars": len(self.text),
         }
@@ -178,6 +188,10 @@ class GroupContextSnapshotBuilder:
             return GroupContextSnapshot(
                 watermark=max(0, int(watermark or 0)),
                 echo_filtered_count=echo_filtered,
+                topic_epoch=max(0, int(topic_epoch or 0)),
+                participant_actor_ids=(
+                    [str(current_sender_id)] if str(current_sender_id or "").strip() else []
+                ),
             )
 
         actor_label = str(current_sender_name or current_sender_id or "当前发言人").strip()
@@ -240,9 +254,45 @@ class GroupContextSnapshotBuilder:
             int(turn.topic_epoch or 0) not in {0, int(topic_epoch or 0)}
             for turn in bot_turns
         )
+        participant_actor_ids: list[str] = []
+        if str(current_sender_id or "").strip():
+            participant_actor_ids.append(str(current_sender_id))
+        for incident in incidents:
+            actor_id = str(incident.actor_id or "").strip()
+            if actor_id and actor_id not in participant_actor_ids:
+                participant_actor_ids.append(actor_id)
+        source_event_ids: list[str] = []
+        for segment in visible_actor_tail:
+            event_id = str(segment.event_id or "").strip()
+            if event_id and event_id not in source_event_ids:
+                source_event_ids.append(event_id)
+        for item in pending:
+            event_id = str(item.event_id or "").strip()
+            if event_id and event_id not in source_event_ids:
+                source_event_ids.append(event_id)
+        for turn in bot_turns:
+            turn_id = str(turn.turn_id or "").strip()
+            if turn_id and turn_id not in source_event_ids:
+                source_event_ids.append(turn_id)
+        for incident in incidents:
+            for event_id in incident.evidence_event_ids:
+                normalized = str(event_id or "").strip()
+                if normalized and normalized not in source_event_ids:
+                    source_event_ids.append(normalized)
+        unresolved_actor_ids = list(
+            dict.fromkeys(
+                str(incident.actor_id or "").strip()
+                for incident in incidents
+                if str(incident.actor_id or "").strip()
+            )
+        )
+        last_committed_target_actor_id = (
+            str(bot_turns[-1].target_sender_id or "").strip() if bot_turns else ""
+        )
         lines.append(
             "- 使用规则：优先回答当前发言人的直接问题；"
-            "共享群聊历史只提供背景，不能覆盖上述人物归属、Bot 立场与未解决事件。"
+            "共享群聊历史只提供公共背景，不能把其他人物的画像、关系、称呼或态度"
+            "转移给当前发言人，也不能覆盖上述人物归属、Bot 立场与未解决事件。"
         )
         text = "\n".join(lines).strip()
         if len(text) > self.max_chars:
@@ -260,5 +310,10 @@ class GroupContextSnapshotBuilder:
             social_incident_count=len(incidents),
             echo_filtered_count=echo_filtered,
             topic_bridge=topic_bridge,
+            topic_epoch=max(0, int(topic_epoch or 0)),
+            participant_actor_ids=participant_actor_ids,
+            source_event_ids=source_event_ids,
+            unresolved_actor_ids=unresolved_actor_ids,
+            last_committed_target_actor_id=last_committed_target_actor_id,
             exclusion_reasons=exclusion_reasons,
         )

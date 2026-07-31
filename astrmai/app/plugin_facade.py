@@ -407,12 +407,12 @@ class PluginFacade(RuntimeFacadeProtocol):
             elif group_wait_result == "EXPIRED":
                 await self.runtime.chat_loop_kernel.expire_wait(scope.chat_id, "group_wait_expired")
             if self.get_conversation_concurrency_flags().group_thread_wait_enabled:
-                group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
-            else:
                 group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(
                     scope.chat_id,
                     thread_id=thread_id,
                 )
+            else:
+                group_wait_info = self.runtime.group_reply_wait_manager.get_wait_info(scope.chat_id)
             if group_wait_info:
                 await self.runtime.chat_loop_kernel.arm_group_wait(scope.chat_id, group_wait_info)
         return group_wait_result

@@ -5,11 +5,39 @@ class ChatRepository:
     def __init__(self, db_service):
         self.db = db_service
 
-    def add_message_log(self, group_id: str, sender_id: str, sender_name: str, content: str):
-        return self.db.add_message_log(group_id, sender_id, sender_name, content)
+    def add_message_log(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event=None,
+    ):
+        return self.db.add_message_log(
+            group_id,
+            sender_id,
+            sender_name,
+            content,
+            conversation_event=conversation_event,
+        )
 
-    async def add_message_log_async(self, group_id: str, sender_id: str, sender_name: str, content: str):
-        return await self.db.add_message_log_async(group_id, sender_id, sender_name, content)
+    async def add_message_log_async(
+        self,
+        group_id: str,
+        sender_id: str,
+        sender_name: str,
+        content: str,
+        *,
+        conversation_event=None,
+    ):
+        return await self.db.add_message_log_async(
+            group_id,
+            sender_id,
+            sender_name,
+            content,
+            conversation_event=conversation_event,
+        )
 
     def get_unprocessed_logs(self, group_id: str, limit: int = 50):
         return self.db.get_unprocessed_logs(group_id, limit=limit)

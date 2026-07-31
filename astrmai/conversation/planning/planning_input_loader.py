@@ -243,7 +243,9 @@ class PlanningInputLoader:
             return actor_id
         if hasattr(event, "get_extra"):
             focus_context = event.get_extra("astrmai_focus_thread_context", None)
-            actor_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+            actor_set = getattr(focus_context, "actor_set", None)
+            actor_id = str(getattr(actor_set, "current_actor_id", "") or "").strip()
+            actor_id = actor_id or str(getattr(focus_context, "focus_sender_id", "") or "").strip()
             if actor_id:
                 return actor_id
         if hasattr(event, "get_sender_id"):

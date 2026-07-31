@@ -4,6 +4,12 @@ import hashlib
 from typing import Optional
 
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyFreshnessBudget, ReplyMode, VisionBundle
+from .turn_target_resolver import resolve_legacy_turn_target, resolve_turn_target
+from ..runtime.architecture_rollout import (
+    ArchitectureTimer,
+    record_architecture_observation,
+    rollout_enabled,
+)
 
 
 def resolve_thread_root(gate, focus_candidate, normalized_events):
@@ -171,6 +177,48 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
         state=FreshnessState.FRESH,
         created_at=float(focus_candidate.timestamp or 0.0),
     )
+    focus_event = focus_candidate.event
+    bot_id = str(
+        getattr(focus_event, "get_self_id", lambda: "")()
+        or getattr(gate, "self_id", "")
+        or ""
+    )
+    target_timer = ArchitectureTimer()
+    new_turn_target, new_actor_set = resolve_turn_target(
+        focus_candidate,
+        root_candidate,
+        normalized_events,
+        bot_id=bot_id,
+    )
+    legacy_turn_target, legacy_actor_set = resolve_legacy_turn_target(
+        focus_candidate,
+        root_candidate,
+        normalized_events,
+        bot_id=bot_id,
+    )
+    target_read_enabled = rollout_enabled(
+        getattr(gate, "config", None),
+        "turn_target_read_enabled",
+        True,
+    )
+    turn_target = new_turn_target if target_read_enabled else legacy_turn_target
+    actor_set = new_actor_set if target_read_enabled else legacy_actor_set
+    record_architecture_observation(
+        focus_event,
+        "turn_target",
+        {
+            "read_enabled": target_read_enabled,
+            "new": new_turn_target.as_dict(),
+            "legacy": legacy_turn_target.as_dict(),
+            "actor_match": (
+                new_turn_target.target_actor_id == legacy_turn_target.target_actor_id
+            ),
+            "kind_match": new_turn_target.target_kind == legacy_turn_target.target_kind,
+            "elapsed_ms": target_timer.elapsed_ms,
+        },
+    )
+    compatibility_sender_id = turn_target.target_actor_id or focus_candidate.sender_id
+    compatibility_sender_name = turn_target.target_actor_name or focus_candidate.sender_name
 
     if not thread_enabled:
         for candidate in normalized_events:
@@ -186,8 +234,10 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
             focus_reason="",
             root_reason="",
             focus_message_text="",
-            focus_sender_id=focus_candidate.sender_id,
-            focus_sender_name=focus_candidate.sender_name,
+            focus_sender_id=compatibility_sender_id,
+            focus_sender_name=compatibility_sender_name,
+            turn_target=turn_target,
+            actor_set=actor_set,
             reply_mode=reply_mode,
             social_state=social_state,
             thread_signature=thread_signature,
@@ -234,8 +284,10 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
         focus_reason="",
         root_reason="",
         focus_message_text="",
-        focus_sender_id=focus_candidate.sender_id,
-        focus_sender_name=focus_candidate.sender_name,
+        focus_sender_id=compatibility_sender_id,
+        focus_sender_name=compatibility_sender_name,
+        turn_target=turn_target,
+        actor_set=actor_set,
         reply_mode=reply_mode,
         social_state=social_state,
         thread_signature=thread_signature,

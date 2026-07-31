@@ -9,7 +9,14 @@ from astrmai.conversation.attention.group_context_snapshot import (
     is_group_direct_correction,
 )
 from astrmai.conversation.attention.group_dialogue_store import GroupDialogueStore
+from astrmai.conversation.contracts.committed_reply import (
+    CommittedBotTurn,
+    ReplyCommitStatus,
+    ReplyPlan,
+    ReplySendReceipt,
+)
 from astrmai.conversation.contracts.dialog_history_policy import DialogHistoryPolicy
+from astrmai.conversation.contracts.turn_target import TargetKind, TurnTarget
 from astrmai.conversation.planning.planner import Planner
 from astrmai.conversation.planning.planner_prompt_context import PlannerPromptContextMixin
 from astrmai.infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
@@ -142,6 +149,19 @@ def test_group_snapshot_keeps_actor_bot_stance_and_filters_echoes():
     assert "飞飞宝帮忙说话" not in snapshot.text
     assert "Murmure帮忙说话" not in snapshot.text
     assert snapshot.topic_bridge is True
+    assert snapshot.topic_epoch == 5
+    assert snapshot.participant_actor_ids == ["xin"]
+    assert snapshot.source_event_ids == ["u-offense", "u-followup", "bot-reject"]
+    assert snapshot.last_committed_target_actor_id == "xin"
+    trace = snapshot.trace_payload()
+    assert trace["topic_epoch"] == 5
+    assert trace["topic_participant_ids"] == ["xin"]
+    assert trace["summary_source_event_ids"] == [
+        "u-offense",
+        "u-followup",
+        "bot-reject",
+    ]
+    assert trace["last_committed_target_actor_id"] == "xin"
 
 
 def test_apology_resolves_only_the_same_actors_incident():
@@ -461,7 +481,7 @@ def test_planner_prompt_context_injects_privacy_safe_group_causal_snapshot():
     assert "你怎么了" not in str(trace)
 
 
-def test_planner_records_bot_reply_target_source_and_stance():
+def test_committed_reply_records_bot_target_source_and_stance():
     async def run():
         chat_id = "ff:GroupMessage:552752264"
         store = GroupDialogueStore()
@@ -476,34 +496,48 @@ def test_planner_records_bot_reply_target_source_and_stance():
             topic_epoch=4,
             timestamp=1000,
         )
-        planner = Planner.__new__(Planner)
-        planner.dialogue_store = store
-        planner.context = SimpleNamespace(bot_id="bot")
-        planner.gateway = SimpleNamespace(
-            bot_id="bot",
-            config=SimpleNamespace(
-                system1=SimpleNamespace(nicknames=["妃爱"]),
+        target = TurnTarget(
+            target_kind=TargetKind.ACTOR,
+            target_actor_id="xin",
+            target_actor_name="小欣",
+            target_event_id="u-offense",
+            topic_epoch=4,
+            source_event_ids=("u-offense",),
+        )
+        plan = ReplyPlan.create(
+            turn_id="turn-offense",
+            chat_id=chat_id,
+            chat_kind="group",
+            target=target,
+            planned_text="好恶心，请你自重。",
+            planned_segments=("好恶心，请你自重。",),
+            created_at=1001,
+        )
+        committed = CommittedBotTurn.from_plan(
+            plan,
+            ReplySendReceipt(
+                status=ReplyCommitStatus.SENT,
+                sent_segments=("好恶心，请你自重。",),
+                sent_at=1001,
             ),
         )
-        planner.context_compaction = None
-
-        async def no_social_candidates(*_args, **_kwargs):
-            return None
-
-        planner._record_group_social_candidates = no_social_candidates
-        event = _Event(message_id="u-offense")
-        DialogHistoryPolicy(
-            history_mode="current_topic",
-            group_id="552752264",
-            topic_epoch=4,
-            current_sender_id="xin",
-        ).bind(event)
-        event.set_extra("astrmai_group_social_signal", "boundary_violation")
-        event.set_extra("astrmai_stance", "reject")
-        await planner._record_planner_dialogue_segment(
-            event,
+        await store.append_committed_bot_turn(
+            committed,
+            bot_id="bot",
+            bot_name="妃爱",
+            stance="reject",
+            social_event="boundary_violation",
+        )
+        await store.observe_social_incident(
             chat_id,
-            "好恶心，请你自重。",
+            kind="boundary_violation",
+            actor_id="xin",
+            actor_name="小欣",
+            target_id="bot",
+            target_name="妃爱",
+            evidence_event_id="u-offense",
+            topic_epoch=4,
+            stance="reject",
         )
         turns = await store.get_recent_bot_turns(
             chat_id,

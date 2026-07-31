@@ -328,6 +328,14 @@ class PluginLifecycleManager:
         evolution = getattr(self.runtime, "evolution", None)
         if evolution is not None and hasattr(evolution, "start_background_tasks"):
             self.track_task(evolution.start_background_tasks())
+        reply_engine = getattr(self.runtime, "reply_engine", None)
+        repair_worker = getattr(
+            reply_engine,
+            "run_reply_commit_repair_worker",
+            None,
+        )
+        if callable(repair_worker):
+            self.track_task(repair_worker())
         self.track_task(self._memory_gc_task())
         self.track_task(self._db_sync_task())
 

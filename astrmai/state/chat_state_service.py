@@ -6,6 +6,7 @@ import datetime
 import inspect
 import math
 import time
+import uuid
 from time import monotonic
 from typing import Any, Dict, List
 
@@ -235,9 +236,170 @@ class ChatStateService:
             state = await self._get_state_inner(chat_id)
             state.energy = max(0.0, float(state.energy or 0.0) - float(amount or 0.0))
             state.total_replies += 1
-            state.last_reply_time = time.time()
+            committed_at = time.time()
+            state.last_reply_time = committed_at
+            state.last_committed_bot_reply_at = committed_at
             state.next_wakeup_timestamp = float(next_wakeup_timestamp or 0.0)
+            state.next_proactive_due_at = state.next_wakeup_timestamp
+            state.proactive_claim_token = ""
+            state.proactive_claimed_at = 0.0
             state.is_dirty = True
+            await self.persistence.save_chat_state(chat_id, state)
+            state.is_dirty = False
+            return state
+
+    async def record_real_user_activity(
+        self,
+        chat_id: str,
+        *,
+        chat_kind: str = "",
+        occurred_at: float | None = None,
+    ) -> ChatState:
+        occurred_at = float(occurred_at or time.time())
+        generation = self._chat_generation(chat_id)
+        async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
+            state = await self._get_state_inner(chat_id)
+            life = getattr(self.config, "life", None)
+            silence_minutes = max(0.0, float(getattr(life, "silence_threshold", 120) or 0.0))
+            state.chat_kind = str(chat_kind or state.chat_kind or "")
+            state.last_real_user_activity_at = max(
+                float(getattr(state, "last_real_user_activity_at", 0.0) or 0.0),
+                occurred_at,
+            )
+            state.last_reply_time = state.last_real_user_activity_at
+            state.proactive_generation = int(getattr(state, "proactive_generation", 0) or 0) + 1
+            state.unanswered_proactive_count = 0
+            state.last_proactive_cancel_reason = "user_activity"
+            state.proactive_claim_token = ""
+            state.proactive_claimed_at = 0.0
+            state.next_proactive_due_at = occurred_at + silence_minutes * 60.0
+            state.next_wakeup_timestamp = state.next_proactive_due_at
+            self._mark_dirty(state)
+            await self.persistence.save_chat_state(chat_id, state)
+            state.is_dirty = False
+            return state
+
+    async def record_committed_bot_reply(
+        self,
+        chat_id: str,
+        *,
+        committed_at: float | None = None,
+        is_proactive: bool = False,
+        commit_id: str = "",
+    ) -> ChatState:
+        committed_at = float(committed_at or time.time())
+        generation = self._chat_generation(chat_id)
+        async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
+            state = await self._get_state_inner(chat_id)
+            state.last_committed_bot_reply_at = max(
+                float(getattr(state, "last_committed_bot_reply_at", 0.0) or 0.0),
+                committed_at,
+            )
+            if is_proactive:
+                state.unanswered_proactive_count = int(
+                    getattr(state, "unanswered_proactive_count", 0) or 0
+                ) + 1
+                state.last_proactive_commit_id = str(commit_id or "")
+            self._mark_dirty(state)
+            await self.persistence.save_chat_state(chat_id, state)
+            state.is_dirty = False
+            return state
+
+    async def is_proactive_generation_current(self, chat_id: str, captured_generation: int) -> bool:
+        state = await self.get_state(chat_id)
+        return int(getattr(state, "proactive_generation", 0) or 0) == int(captured_generation)
+
+    async def claim_proactive_due(
+        self,
+        chat_id: str,
+        *,
+        expected_generation: int,
+        now: float | None = None,
+        lease_seconds: float = 300.0,
+    ) -> str:
+        now = float(now or time.time())
+        generation = self._chat_generation(chat_id)
+        async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return ""
+            state = await self._get_state_inner(chat_id)
+            if int(getattr(state, "proactive_generation", 0) or 0) != int(expected_generation):
+                return ""
+            due_at = float(getattr(state, "next_proactive_due_at", 0.0) or 0.0)
+            if due_at > now:
+                return ""
+            claim_token = str(getattr(state, "proactive_claim_token", "") or "")
+            claimed_at = float(getattr(state, "proactive_claimed_at", 0.0) or 0.0)
+            if claim_token and now - claimed_at < max(1.0, float(lease_seconds or 0.0)):
+                return ""
+            claim_token = uuid.uuid4().hex
+            atomic_claim = getattr(self.persistence, "atomic_claim_proactive_due", None)
+            if callable(atomic_claim):
+                claimed = await atomic_claim(
+                    chat_id,
+                    expected_generation=int(expected_generation),
+                    claim_token=claim_token,
+                    now=now,
+                    lease_seconds=lease_seconds,
+                )
+                if not claimed:
+                    return ""
+                state.proactive_claim_token = claim_token
+                state.proactive_claimed_at = now
+                state.last_proactive_cancel_reason = ""
+                state.is_dirty = False
+                return claim_token
+            state.proactive_claim_token = claim_token
+            state.proactive_claimed_at = now
+            state.last_proactive_cancel_reason = ""
+            self._mark_dirty(state)
+            await self.persistence.save_chat_state(chat_id, state)
+            state.is_dirty = False
+            return claim_token
+
+    async def settle_proactive_attempt(
+        self,
+        chat_id: str,
+        *,
+        claim_token: str = "",
+        next_due_at: float,
+        cancel_reason: str = "",
+    ) -> ChatState:
+        generation = self._chat_generation(chat_id)
+        async with self._get_chat_lock(chat_id):
+            if not self._is_current_generation(chat_id, generation):
+                return self._create_default_state(chat_id)
+            state = await self._get_state_inner(chat_id)
+            current_claim = str(getattr(state, "proactive_claim_token", "") or "")
+            if claim_token and current_claim and current_claim != str(claim_token):
+                return state
+            atomic_settle = getattr(self.persistence, "atomic_settle_proactive_claim", None)
+            if callable(atomic_settle) and claim_token:
+                settled = await atomic_settle(
+                    chat_id,
+                    claim_token=str(claim_token),
+                    next_due_at=float(next_due_at or 0.0),
+                    cancel_reason=str(cancel_reason or ""),
+                )
+                if not settled:
+                    return state
+                state.proactive_claim_token = ""
+                state.proactive_claimed_at = 0.0
+                state.next_proactive_due_at = float(next_due_at or 0.0)
+                state.next_wakeup_timestamp = state.next_proactive_due_at
+                state.last_proactive_cancel_reason = str(cancel_reason or "")
+                state.is_dirty = False
+                return state
+            state.proactive_claim_token = ""
+            state.proactive_claimed_at = 0.0
+            state.next_proactive_due_at = float(next_due_at or 0.0)
+            state.next_wakeup_timestamp = state.next_proactive_due_at
+            state.last_proactive_cancel_reason = str(cancel_reason or "")
+            self._mark_dirty(state)
             await self.persistence.save_chat_state(chat_id, state)
             state.is_dirty = False
             return state
@@ -595,6 +757,54 @@ class StateEngine:
         if "FriendMessage" in chat_id:
             amount = 0.0
         return await self.chat_state_service.settle_wakeup(chat_id, amount, next_wakeup_timestamp)
+
+    async def record_real_user_activity(
+        self,
+        chat_id: str,
+        *,
+        chat_kind: str = "",
+        occurred_at: float | None = None,
+    ) -> ChatState:
+        return await self.chat_state_service.record_real_user_activity(
+            chat_id,
+            chat_kind=chat_kind,
+            occurred_at=occurred_at,
+        )
+
+    async def record_committed_bot_reply(
+        self,
+        chat_id: str,
+        *,
+        committed_at: float | None = None,
+        is_proactive: bool = False,
+        commit_id: str = "",
+    ) -> ChatState:
+        return await self.chat_state_service.record_committed_bot_reply(
+            chat_id,
+            committed_at=committed_at,
+            is_proactive=is_proactive,
+            commit_id=commit_id,
+        )
+
+    async def is_proactive_generation_current(self, chat_id: str, captured_generation: int) -> bool:
+        return await self.chat_state_service.is_proactive_generation_current(chat_id, captured_generation)
+
+    async def claim_proactive_due(self, chat_id: str, **kwargs) -> str:
+        return await self.chat_state_service.claim_proactive_due(chat_id, **kwargs)
+
+    async def settle_proactive_attempt(self, chat_id: str, **kwargs) -> ChatState:
+        return await self.chat_state_service.settle_proactive_attempt(chat_id, **kwargs)
+
+    async def list_due_proactive_chat_ids(
+        self,
+        *,
+        now: float,
+        limit: int = 200,
+    ) -> list[str]:
+        loader = getattr(self.persistence, "list_due_chat_state_ids", None)
+        if not callable(loader):
+            return []
+        return list(await loader(now=now, limit=limit) or [])
 
     async def get_user_profile_summary(self, user_id: str) -> UserProfileSummary:
         profile = await self.get_user_profile(user_id)

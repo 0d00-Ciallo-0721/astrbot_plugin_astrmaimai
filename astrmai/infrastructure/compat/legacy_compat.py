@@ -23,11 +23,13 @@ import warnings
 from typing import Any, Callable, Iterable, Optional
 
 from ..runtime.runtime_contracts import (
+    ActorSet,
     FocusThreadContext,
     FreshnessState,
     PromptEnvelope,
     ReplyFreshnessBudget,
     ReplyMode,
+    TurnTarget,
     VisibleReplyArtifact,
 )
 
@@ -71,6 +73,10 @@ def emit_legacy_focus_thread_extras(
     event.set_extra("astrmai_focus_message_text", focus_context.focus_message_text)
     event.set_extra("astrmai_focus_sender_id", focus_context.focus_sender_id)
     event.set_extra("astrmai_focus_sender_name", focus_context.focus_sender_name)
+    event.set_extra("astrmai_turn_target", focus_context.turn_target)
+    event.set_extra("astrmai_turn_target_data", focus_context.turn_target.as_dict())
+    event.set_extra("astrmai_actor_set", focus_context.actor_set)
+    event.set_extra("astrmai_actor_set_data", focus_context.actor_set.as_dict())
     event.set_extra("astrmai_reply_mode", focus_context.reply_mode.value)
     event.set_extra("astrmai_social_state", focus_context.social_state)
     event.set_extra("astrmai_thread_signature", focus_context.thread_signature)
@@ -126,6 +132,18 @@ def read_legacy_focus_thread_context(event: Any, *, default_event: Any = None) -
         focus_message_text=str(event.get_extra("astrmai_focus_message_text", "") or ""),
         focus_sender_id=str(event.get_extra("astrmai_focus_sender_id", "") or ""),
         focus_sender_name=str(event.get_extra("astrmai_focus_sender_name", "") or ""),
+        turn_target=TurnTarget.from_value(
+            event.get_extra(
+                "astrmai_turn_target",
+                event.get_extra("astrmai_turn_target_data", None),
+            )
+        ),
+        actor_set=ActorSet.from_value(
+            event.get_extra(
+                "astrmai_actor_set",
+                event.get_extra("astrmai_actor_set_data", None),
+            )
+        ),
         reply_mode=ReplyMode(str(event.get_extra("astrmai_reply_mode", ReplyMode.CASUAL_FOLLOWUP.value) or ReplyMode.CASUAL_FOLLOWUP.value)),
         social_state=str(event.get_extra("astrmai_social_state", "") or ""),
         thread_signature=str(event.get_extra("astrmai_thread_signature", "") or ""),

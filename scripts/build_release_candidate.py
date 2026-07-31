@@ -17,6 +17,17 @@ ROOT_FILES = (
     "README.md",
     "CHANGELOG.md",
 )
+REQUIRED_ARCHITECTURE_FILES = (
+    "astrmai/conversation/contracts/conversation_event.py",
+    "astrmai/conversation/contracts/turn_target.py",
+    "astrmai/conversation/contracts/committed_reply.py",
+    "astrmai/conversation/contracts/context_package.py",
+    "astrmai/conversation/planning/message_renderer.py",
+    "astrmai/conversation/runtime/architecture_rollout.py",
+    "astrmai/conversation/runtime/architecture_trace.py",
+    "astrmai/conversation/replay/context_architecture_harness.py",
+    "astrmai/infrastructure/persistence/architecture_migration_audit.py",
+)
 PAGE_SUFFIXES = {".html", ".css", ".js"}
 FORBIDDEN_PARTS = {
     "__pycache__",
@@ -75,6 +86,9 @@ def validate_release_candidate(output_dir: Path) -> list[str]:
     for name in ROOT_FILES:
         if not (output_dir / name).is_file():
             errors.append(f"missing required file: {name}")
+    for name in REQUIRED_ARCHITECTURE_FILES:
+        if not (output_dir / Path(name)).is_file():
+            errors.append(f"missing architecture runtime file: {name}")
 
     for path in output_dir.rglob("*"):
         if not path.is_file():

@@ -340,6 +340,25 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
             group_context_raw.get("echo_filtered_count", 0) or 0
         ),
         "topic_bridge": bool(group_context_raw.get("topic_bridge", False)),
+        "topic_epoch": int(group_context_raw.get("topic_epoch", 0) or 0),
+        "topic_participant_ids": [
+            str(item)
+            for item in list(group_context_raw.get("topic_participant_ids", []) or [])
+            if str(item)
+        ][:16],
+        "summary_source_event_ids": [
+            str(item)
+            for item in list(group_context_raw.get("summary_source_event_ids", []) or [])
+            if str(item)
+        ][:24],
+        "unresolved_actor_ids": [
+            str(item)
+            for item in list(group_context_raw.get("unresolved_actor_ids", []) or [])
+            if str(item)
+        ][:16],
+        "last_committed_target_actor_id": str(
+            group_context_raw.get("last_committed_target_actor_id", "") or ""
+        ),
         "exclusion_reasons": [
             str(item)[:80]
             for item in list(group_context_raw.get("exclusion_reasons", []) or [])

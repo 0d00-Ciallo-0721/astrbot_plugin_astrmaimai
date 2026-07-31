@@ -4,9 +4,13 @@
 
 ## 接续入口
 
+**最新上下文架构阶段从 [`NEXT-CONTEXT-ARCHITECTURE-GOALS.md`](NEXT-CONTEXT-ARCHITECTURE-GOALS.md) 开始**。该阶段基于 2026-07-31 对 AngelHeart、Group Chat Plus、Proactive Chat、MaiBot 四份专项报告与 AstrMai 当前源码的交叉核验，目标是统一群聊事件、人物目标、发送后提交、上下文边界和主动调度。总设计见 [`CONTEXT-ARCHITECTURE-ROADMAP-20260731.md`](CONTEXT-ARCHITECTURE-ROADMAP-20260731.md)。
+
 **新会话从 [`NEXT-SESSION-GOALS.md`](NEXT-SESSION-GOALS.md) 开始**——那里有现状快照、G0–G9 有序目标、验收矩阵与工作纪律，读完即可继续，不需要回溯对话历史。
 
 **当前状态（2026-07-26）：16 个 OPT 与 G1–G9 全部代码侧完成**，全量回归绿。仍挂在用户侧的只有「需真实运行数据 / 真实库」的观测类验收（各 OPT 完成记录末尾列有验收矩阵），以及默认关闭待观察的 `memory.maintenance_purge_enabled`。
+
+上面一段是 2026-07-26 阶段的历史完成状态；**2026-07-31 新增的 OPT-17～OPT-24 已完成本地代码、迁移、回放、观测契约和自动化回归，生产部署与 24 小时灰度仍待用户后续授权执行**。
 
 ## 执行顺序与状态
 
@@ -30,6 +34,21 @@
 | [OPT-16](OPT-16-interaction-polish.md) | 交互打磨（私聊话术/撤回/空态三义性） | P2 | 无 | 已完成（ID-08 于 G3 补齐） |
 
 推荐主线（历史执行顺序，现已全部完成，保留备查）：**OPT-01 → OPT-02 → OPT-03 → OPT-04 → OPT-06 → OPT-07 → OPT-08**（先止住用户正在受害的三个 P0，再修运营者手里的校准工具，然后恢复记忆读取、统一预算、削成本），OPT-13 的测试按"先补测试再改代码"纪律拆进对应 OPT 同批落地，其余按依赖穿插。
+
+## 群聊上下文架构阶段（2026-07-31）
+
+| 编号 | 工作流 | 优先级 | 依赖 | 状态 |
+|---|---|---|---|---|
+| [OPT-17](OPT-17-canonical-conversation-event.md) | 规范会话事件与持久化兼容 | P0 | 无 | 本地完成；待生产 shadow |
+| [OPT-18](OPT-18-turn-target-and-actor-attribution.md) | 单一 TurnTarget 与人物归属 | P0 | OPT-17 | 本地完成；待事故集灰度 |
+| [OPT-19](OPT-19-committed-reply-writeback.md) | 发送后提交与 Bot 输出真源 | P0 | OPT-17、18 | 本地完成；含持久化 repair outbox |
+| [OPT-20](OPT-20-participation-attention-policy.md) | 群聊参与判定与短期迟滞 | P1 | OPT-17、18 | 本地完成；高置信 DROP 保持 shadow |
+| [OPT-21](OPT-21-proactive-scheduling-consistency.md) | 主动调度一致性 | P1 | OPT-17～19 | 本地完成；待生产灰度 |
+| [OPT-22](OPT-22-context-rendering-and-plugin-bridge.md) | 上下文渲染边界与外部插件桥 | P1 | OPT-17、18 | 本地完成；待实机互操作 |
+| [OPT-23](OPT-23-group-continuity-and-memory-whitelist.md) | 群共享连续性与人物记忆白名单 | P0 | OPT-17～19、22 | 本地完成；待真实群聊灰度 |
+| [OPT-24](OPT-24-context-architecture-regression-and-rollout.md) | 回放、迁移、观测与灰度 | P0 | OPT-17～23 | 本地完成；待部署与 24h 灰度 |
+
+推荐执行顺序：**OPT-17 → OPT-18 → OPT-19 → OPT-22 → OPT-20 → OPT-23 → OPT-21 → OPT-24**。前三项先统一输入、目标和实际输出真源；在此之前不建议继续用 prompt 补丁修人物错绑。
 
 ## 执行纪律
 

@@ -13,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
+from ..contracts.conversation_event import ConversationEvent
 from ..contracts.turn_context import ensure_turn_context
 from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
@@ -563,12 +564,32 @@ class AttentionGate:
         now = time.time()
         is_anonymous_sender = str(sender_id or "").startswith("80000000")
         activity_sender_id = "" if is_anonymous_sender else sender_id
+        provenance = str(event.get_extra("astrmai_event_provenance", "original") or "original")
+        is_real_user_activity = bool(
+            activity_sender_id
+            and activity_sender_id != str(getattr(self.state_engine, "bot_id", "") or "")
+            and not str(activity_sender_id).startswith("astrmai_")
+            and not bool(event.get_extra("astrmai_is_proactive_event", False))
+            and not bool(event.get_extra("astrmai_is_external_bot_reply", False))
+            and provenance == "original"
+        )
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_timestamp", now)
             ensure_turn_context(event).perception.timestamp = now
-        if activity_sender_id and activity_sender_id != str(getattr(self.state_engine, "bot_id", "") or ""):
+        if is_real_user_activity:
             session.last_active_user_time = now
-        if self.runtime_coordinator and hasattr(self.runtime_coordinator, "mark_activity"):
+            recorder = getattr(self.state_engine, "record_real_user_activity", None)
+            if callable(recorder):
+                try:
+                    await recorder(
+                        chat_id,
+                        chat_kind="group" if bool(event.get_group_id()) else "private",
+                        occurred_at=now,
+                    )
+                    event.set_extra("astrmai_proactive_generation_invalidated", True)
+                except Exception as exc:
+                    logger.warning(f"[AttentionGate] proactive user watermark degraded for {chat_id}: {exc}")
+        if is_real_user_activity and self.runtime_coordinator and hasattr(self.runtime_coordinator, "mark_activity"):
             try:
                 # ingress 时刻 astrmai_thread_signature 尚未生成（focus 构建后才写入），
                 # 必须用 turn thread id（message_entry 已绑定）保证与 freshness 检查同一标识空间
@@ -725,7 +746,8 @@ class AttentionGate:
             return
         event.set_extra("astrmai_system2_failure_handled", True)
         reply_sent = bool(event.get_extra("astrmai_reply_sent", False))
-        if not reply_sent and hasattr(event, "send") and hasattr(event, "plain_result"):
+        is_proactive = bool(event.get_extra("astrmai_is_proactive_event", False))
+        if not reply_sent and not is_proactive and hasattr(event, "send") and hasattr(event, "plain_result"):
             fallback_text = str(
                 getattr(getattr(self.config, "reply", None), "fallback_text", "")
                 or "（陷入了短暂的沉默...）"
@@ -754,27 +776,12 @@ class AttentionGate:
         if sender_id.startswith("80000000"):
             return
         try:
-            await store.append_segment(
-                chat_id,
-                event_id=self._build_message_id(event),
-                speaker_id=sender_id,
-                speaker_name=str(getattr(event, "get_sender_name", lambda: "")() or ""),
-                content=str(getattr(event, "message_str", "") or ""),
-                role="user",
-                message_kind="image" if self._is_image_only(event) else "text",
-                is_bot=False,
-                reply_target_sender_id=self._extract_reply_target(event)[0],
-                reply_target_sender_name=self._extract_reply_target(event)[1],
-                is_at_bot=self._is_at_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
-                is_reply_to_bot=self._is_reply_to_bot_event(event, str(getattr(self.state_engine, "bot_id", "") or "")),
-                has_direct_vision=bool(
-                    event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
-                    or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
-                ),
-                is_image_only=self._is_image_only(event),
-                timestamp=float(getattr(event, "timestamp", time.time()) or time.time()),
-            )
+            canonical = self._get_or_build_conversation_event(event)
+            await store.append_conversation_event(canonical)
+            event.set_extra("astrmai_conversation_event_write_status", "stored")
         except Exception as exc:
+            event.set_extra("astrmai_conversation_event_write_status", "degraded")
+            event.set_extra("astrmai_conversation_event_write_error", type(exc).__name__)
             logger.debug(f"[AttentionGate] dialogue segment record degraded: {exc}")
 
     def _ensure_global_msg_cache(self):
@@ -783,12 +790,64 @@ class AttentionGate:
         return self._global_message_cache
 
     def _build_message_id(self, event: AstrMessageEvent):
+        canonical = event.get_extra("astrmai_conversation_event", None)
+        canonical_event_id = str(getattr(canonical, "event_id", "") or "")
+        if canonical_event_id:
+            return canonical_event_id
         message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
         if message_id:
             return message_id
         sender_id = str(event.get_sender_id() or "")
         timestamp = float(getattr(event, "timestamp", 0.0) or 0.0)
         return f"{sender_id}:{timestamp}:{preview_text(str(getattr(event, 'message_str', '') or ''), 40)}"
+
+    @staticmethod
+    def _event_topic_epoch(event: AstrMessageEvent) -> int:
+        history_policy = event.get_extra("astrmai_dialog_history_policy", None)
+        if history_policy is None:
+            return 0
+        value = (
+            history_policy.get("topic_epoch", 0)
+            if isinstance(history_policy, dict)
+            else getattr(history_policy, "topic_epoch", 0)
+        )
+        return max(0, int(value or 0))
+
+    def _get_or_build_conversation_event(self, event: AstrMessageEvent) -> ConversationEvent:
+        existing = event.get_extra("astrmai_conversation_event", None)
+        if isinstance(existing, ConversationEvent):
+            return existing
+        bot_id = str(getattr(self.state_engine, "bot_id", "") or "")
+        reply_target_id, reply_target_name = self._extract_reply_target(event)
+        direct_refs = list(
+            event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
+            or []
+        )
+        extracted_refs = list(
+            event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+            or []
+        )
+        canonical = ConversationEvent.from_astr_event(
+            event,
+            self_id=bot_id,
+            rich_text=str(event.get_extra("astrmai_rich_text", event.message_str) or ""),
+            image_refs=extracted_refs,
+            direct_image_refs=direct_refs,
+            reply_target_actor_id=reply_target_id,
+            reply_target_actor_name=reply_target_name,
+            is_at_bot=self._is_at_bot_event(event, bot_id),
+            is_reply_to_bot=self._is_reply_to_bot_event(event, bot_id),
+            is_direct_wakeup=self._is_direct_wakeup_event(event, bot_id),
+            topic_epoch=self._event_topic_epoch(event),
+            provenance=str(
+                event.get_extra("astrmai_event_provenance", "original") or "original"
+            ),
+        )
+        event.set_extra("astrmai_conversation_event", canonical)
+        event.set_extra("astrmai_conversation_event_schema_version", canonical.schema_version)
+        event.set_extra("astrmai_conversation_event_id", canonical.event_id)
+        event.set_extra("astrmai_conversation_event_id_source", canonical.event_id_source)
+        return canonical
 
     def _build_message_dedup_key(self, event: AstrMessageEvent) -> tuple[str, bool]:
         chat_id = str(getattr(event, "unified_msg_origin", "") or "")
@@ -838,18 +897,11 @@ class AttentionGate:
             return
         try:
             bot_id = str(getattr(self.state_engine, "bot_id", "") or "")
-            is_at_bot = self._is_at_bot_event(event, bot_id)
-            is_reply_to_bot = self._is_reply_to_bot_event(event, bot_id)
-            event_id = self._build_message_id(event)
-            topic_epoch = 0
-            history_policy = event.get_extra("astrmai_dialog_history_policy", None)
-            if history_policy is not None:
-                topic_epoch = int(
-                    getattr(history_policy, "topic_epoch", 0)
-                    if not isinstance(history_policy, dict)
-                    else history_policy.get("topic_epoch", 0)
-                    or 0
-                )
+            canonical = self._get_or_build_conversation_event(event)
+            is_at_bot = canonical.is_at_bot
+            is_reply_to_bot = canonical.is_reply_to_bot
+            event_id = canonical.event_id
+            topic_epoch = canonical.topic_epoch
             create_pending_direct = bool(
                 is_at_bot
                 or is_reply_to_bot
@@ -870,25 +922,11 @@ class AttentionGate:
                     "astrmai_group_pending_superseded_count",
                     int(superseded_count or 0),
                 )
-            await store.append_segment(
-                chat_id,
-                event_id=event_id,
-                speaker_id=sender_id,
-                speaker_name=str(event.get_sender_name() or ""),
-                content=content,
-                role="user",
-                message_kind="image" if bool(event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls"))) and not content else ("mixed" if bool(event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls"))) else "text"),
-                is_bot=False,
-                reply_target_sender_id=self._extract_reply_target(event)[0],
-                reply_target_sender_name=self._extract_reply_target(event)[1],
-                is_at_bot=is_at_bot,
-                is_reply_to_bot=is_reply_to_bot,
-                has_direct_vision=bool(event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls")) or []),
-                is_image_only=self._is_image_only(event),
-                timestamp=float(getattr(event, "timestamp", 0.0) or time.time()),
-                topic_epoch=topic_epoch,
+            await store.append_conversation_event(
+                canonical,
                 create_pending_direct=create_pending_direct,
             )
+            event.set_extra("astrmai_conversation_event_write_status", "stored")
             if ":GroupMessage:" in chat_id:
                 social_signal = classify_group_social_signal(content)
                 is_direct_to_bot = bool(
@@ -916,6 +954,8 @@ class AttentionGate:
                     )
                 event.set_extra("astrmai_group_social_signal", social_signal)
         except Exception as exc:
+            event.set_extra("astrmai_conversation_event_write_status", "degraded")
+            event.set_extra("astrmai_conversation_event_write_error", type(exc).__name__)
             logger.debug(f"[AttentionGate] dialogue segment append degraded: {exc}")
 
     def _compute_debounce_delay(self, session: SessionContext, is_private: bool, is_strong_wakeup: bool) -> float:
@@ -1185,13 +1225,16 @@ class AttentionGate:
         turn_context = ensure_turn_context(event)
 
         _chat_id = getattr(event, "unified_msg_origin", "") or ""
-        if self._proactive_dispatching.get(_chat_id, False) and not event.get_extra("astrmai_is_proactive_event", False):
-            # ponytail: R12 — queue deferred message instead of silently dropping
+        if self._proactive_dispatching.get(_chat_id, False) and not event.get_extra(
+            "astrmai_is_proactive_event",
+            False,
+        ):
             queue = self._deferred_messages.setdefault(_chat_id, [])
             if len(queue) < 5:
                 queue.append(event)
             logger.warning(
-                f"[AttentionGate] proactive dispatching in progress; queued message for {_chat_id} (queue={len(queue)})"
+                f"[AttentionGate] proactive dispatching in progress; queued message for {_chat_id} "
+                f"(queue={len(queue)})"
             )
             return "PROACTIVE_BLOCKED"
 
@@ -1585,6 +1628,8 @@ class AttentionGate:
                     turn_context = ensure_turn_context(focus_event)
                     turn_context.attention.window_events = list(events)
                     turn_context.attention.focus_thread = focus_thread
+                    turn_context.attention.turn_target = focus_thread.turn_target
+                    turn_context.attention.actor_set = focus_thread.actor_set
                     turn_context.attention.retrieve_keys = list(retrieve_keys)
                     turn_context.attention.is_fast_mode = False
                     turn_context.attention.focus_reason = focus_thread.focus_reason

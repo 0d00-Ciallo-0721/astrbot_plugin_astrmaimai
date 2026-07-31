@@ -13,6 +13,7 @@ from ..conversation.attention.group_dialogue_store import GroupDialogueStore
 from ..conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 from ..conversation.decision.judge import Judge
 from ..conversation.execution.reply_service import ReplyService
+from ..conversation.execution.reply_commit_service import ReplyCommitService
 from ..conversation.execution.system2_runner import System2Runner
 from ..conversation.loop import ChatLoopKernel
 from ..conversation.planning.context_engine import ContextEngine
@@ -21,6 +22,7 @@ from ..conversation.planning.prompt_refiner import PromptRefiner
 from ..infrastructure.gateway.model_gateway import GlobalModelGateway
 from ..infrastructure.persistence.database_service import DatabaseService
 from ..infrastructure.persistence.persistence_manager import PersistenceManager
+from ..infrastructure.persistence.reply_commit_outbox import ReplyCommitOutboxStore
 from ..infrastructure.runtime.chat_runtime_coordinator import ChatRuntimeCoordinator
 from ..infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoffStore
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
@@ -313,13 +315,18 @@ class PluginBootstrap:
         return WorkModeServices()
 
     def _build_cognition_stack(self, runtime: PluginRuntimeContext) -> CognitionServices:
+        evolution = EvolutionManager(runtime.db_service, runtime.gateway, event_bus=runtime.event_bus)
         reply_engine = ReplyService(
             runtime.state_engine,
             runtime.state_engine.mood_manager,
             runtime_coordinator=runtime.runtime_coordinator,
             memory_engine=runtime.memory_engine,
+            dialogue_store=runtime.dialogue_store,
+            evolution_manager=evolution,
+            reply_commit_service=ReplyCommitService(
+                ReplyCommitOutboxStore(runtime.db_service.db_path)
+            ),
         )
-        evolution = EvolutionManager(runtime.db_service, runtime.gateway, event_bus=runtime.event_bus)
         persona_summarizer = PersonaSummarizer(runtime.persistence, runtime.gateway, memory_engine=runtime.memory_engine)
         context_engine = ContextEngine(runtime.db_service, persona_summarizer)
         react_retriever = ReActRetriever(

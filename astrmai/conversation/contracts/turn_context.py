@@ -39,6 +39,8 @@ class PerceptionSnapshot:
 class AttentionSnapshot:
     window_events: list[Any] = field(default_factory=list)
     focus_thread: Any = None
+    turn_target: Any = None
+    actor_set: Any = None
     judge_action: str = ""
     prefilter_action: str = ""
     prefilter_reason: str = ""
@@ -185,6 +187,9 @@ class MemoryInjectionDecision:
     injected: bool = False
     skip_reason: str = ""
     summary_preview: str = ""
+    actor_whitelist: list[str] = field(default_factory=list)
+    suppressed_candidate_ids: list[str] = field(default_factory=list)
+    suppressed_candidate_count: int = 0
 
 
 @dataclass
@@ -226,6 +231,15 @@ class ProactiveSnapshot:
     reply_sent: bool = False
     energy_cost: float = 0.0
     cooldown_seconds: float = 0.0
+    chat_kind: str = ""
+    captured_generation: int = 0
+    generation_current: bool = True
+    claim_token_present: bool = False
+    last_real_user_activity_at: float = 0.0
+    last_committed_bot_reply_at: float = 0.0
+    next_due_at: float = 0.0
+    unanswered_count: int = 0
+    cancel_reason: str = ""
 
 
 @dataclass
@@ -395,6 +409,20 @@ def build_turn_trace_summary(
             "is_lightweight_event": bool(attention.is_lightweight_event),
             "focus_reason": attention.focus_reason,
             "root_reason": attention.root_reason,
+            "turn_target": (
+                attention.turn_target.as_dict()
+                if hasattr(attention.turn_target, "as_dict")
+                else dict(attention.turn_target or {})
+                if isinstance(attention.turn_target, dict)
+                else {}
+            ),
+            "actor_set": (
+                attention.actor_set.as_dict()
+                if hasattr(attention.actor_set, "as_dict")
+                else dict(attention.actor_set or {})
+                if isinstance(attention.actor_set, dict)
+                else {}
+            ),
             "window_event_count": len(attention.window_events or []),
             "focus_preview": focus_preview,
             "warm_transcript_preview": _preview_text(getattr(attention, "warm_transcript_preview", ""), 180),
@@ -571,6 +599,9 @@ def build_turn_trace_summary(
             "injected": bool(memory.injected),
             "skip_reason": memory.skip_reason,
             "summary_preview": _preview_text(memory.summary_preview, 160),
+            "actor_whitelist": list(memory.actor_whitelist or []),
+            "suppressed_candidate_ids": list(memory.suppressed_candidate_ids or []),
+            "suppressed_candidate_count": int(memory.suppressed_candidate_count or 0),
         },
         "expression_patterns": {
             "source": turn_context.expression_patterns.source,

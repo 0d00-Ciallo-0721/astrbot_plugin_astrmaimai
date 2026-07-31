@@ -441,6 +441,54 @@
       }
     }
   },
+  "architecture_rollout": {
+    "type": "object",
+    "description": "上下文架构灰度与回退",
+    "items": {
+      "shadow_enabled": {
+        "description": "记录新旧架构差异",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会同时计算新旧结果并记录唯一标识、状态、计数和耗时，不保存聊天原文，也不会改变当前回复。"
+      },
+      "canonical_read_enabled": {
+        "description": "读取规范化事件",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后下游回退旧事件字段，但仍会写入规范化事件供排查和重新启用。"
+      },
+      "turn_target_read_enabled": {
+        "description": "读取新人物目标",
+        "type": "bool",
+        "default": true,
+        "hint": "控制本轮人物归属是否使用新人物目标与参与者集合。关闭后回退旧目标推断。"
+      },
+      "committed_history_enabled": {
+        "description": "只承接已发送回复",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，注意力承接只读取真正发送成功的机器人回复，避免草稿污染历史。"
+      },
+      "context_renderer_enabled": {
+        "description": "启用类型化上下文渲染",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后按可信边界和人物归属构造类型化上下文包；关闭后回退旧提示词字段。"
+      },
+      "memory_actor_filter_enabled": {
+        "description": "启用群聊人物记忆隔离",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后只注入当前群友及明确提及人物的敏感记忆；关闭时仍记录过滤差异。"
+      },
+      "proactive_due_enabled": {
+        "description": "启用持久化主动任务到期队列",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后插件重载仍能恢复主动任务；关闭后只扫描当前进程内的活跃会话。"
+      }
+    }
+  },
   "reply": {
     "type": "object",
     "description": "回复风格与发送行为",
@@ -709,6 +757,32 @@
         "type": "int",
         "default": 150,
         "hint": "每被忽略一轮扣多少焦点分值。数值越大，被忽略过的消息越难再次成为回复目标；填 0 等同关闭降权。范围 0-1000。"
+      },
+      "participation_policy_enabled": {
+        "description": "启用群聊参与评分",
+        "type": "bool",
+        "default": true,
+        "hint": "根据明确@、回复、戳一戳、上一轮实际回复对象和当前话题，判断机器人是否正在参与这段对话。"
+      },
+      "participation_force_pass_enabled": {
+        "description": "明确互动直接进入回复",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，明确@机器人、回复机器人以及同一话题中紧接机器人回复的短句会跳过注意力模型，减少等待。"
+      },
+      "participation_drop_enabled": {
+        "description": "无关消息直接过滤",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，高置信无关回执和回声会直接过滤，不再调用注意力模型。建议先保持关闭，让系统只记录影子判断，确认没有误判后再开启。"
+      },
+      "participation_hysteresis_ttl_sec": {
+        "description": "群聊短期承接时间（秒）",
+        "type": "int",
+        "default": 180,
+        "minimum": 10,
+        "maximum": 1800,
+        "hint": "机器人刚回复过某人后，在同一话题内保留自然承接的时间。话题切换或超时会立即失效。"
       }
     }
   },
@@ -1056,6 +1130,18 @@
         "default": true,
         "hint": "关闭后，机器人不会主动打破沉默；开启后，机器人可能根据上下文主动发起话题。"
       },
+      "enable_private_proactive": {
+        "description": "允许私聊主动发言",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，机器人不会在私聊中主动开口；不影响用户发消息后的正常回复。"
+      },
+      "enable_group_proactive": {
+        "description": "允许群聊主动发言",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，机器人不会在群聊中主动加入话题；不影响群友明确唤醒后的正常回复。"
+      },
       "dream_interval_min": {
         "description": "梦境整理触发间隔（分钟）",
         "type": "int",
@@ -1135,6 +1221,24 @@
         "type": "int",
         "default": 28800,
         "hint": "两次主动开口之间至少间隔多久。"
+      },
+      "proactive_max_unanswered": {
+        "description": "连续未回应主动消息上限",
+        "type": "int",
+        "default": 2,
+        "hint": "机器人连续主动开口后，如果一直没有收到用户新消息，达到此数量便停止继续主动发言；设为 0 表示不允许连续追发。"
+      },
+      "proactive_failure_retry_sec": {
+        "description": "主动发言失败重试间隔（秒）",
+        "type": "int",
+        "default": 900,
+        "hint": "模型失败、调度冲突或发送失败后，至少等待多久才再次尝试。失败只记录日志，不向聊天发送报错。"
+      },
+      "proactive_claim_lease_sec": {
+        "description": "主动任务领取保护时间（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "防止插件重载或多个后台循环同时领取同一条主动任务。超过该时间后，未完成的旧任务才允许被重新领取。"
       },
       "profiling_msg_threshold": {
         "description": "生成用户画像所需消息数",

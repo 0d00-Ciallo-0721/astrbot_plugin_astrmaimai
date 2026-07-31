@@ -164,6 +164,37 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(getattr(text_chain[0], "text", ""), "你好呀")
         self.assertEqual(voice_chain, ["voice"])
 
+    def test_private_tts_rechecks_freshness_immediately_before_voice_send(self):
+        service = self._service()
+        self._enable_tts(service, send_text_with_audio=True)
+        plugin = SimpleNamespace(hiy_tts_from_text=AsyncMock(return_value=["voice"]))
+        self._install_tts_plugin(service, plugin)
+        event = FakeEvent("user-1", "Alice", "hello")
+        event.unified_msg_origin = "default:FriendMessage:user-1"
+        service._check_reply_freshness = AsyncMock(
+            side_effect=[
+                (self.reply_mod.FreshnessState.FRESH, ""),
+                (self.reply_mod.FreshnessState.FRESH, ""),
+                (
+                    self.reply_mod.FreshnessState.EXPIRED,
+                    "proactive_generation_superseded",
+                ),
+            ]
+        )
+
+        artifact = asyncio.run(
+            service.handle_reply(event, "你好呀", event.unified_msg_origin)
+        )
+
+        self.assertTrue(artifact.sent)
+        self.assertFalse(artifact.metadata["tts_sent"])
+        self.assertEqual(
+            artifact.metadata["tts_skip_reason"],
+            "proactive_generation_superseded",
+        )
+        self.assertEqual(len(service.state_engine.gateway.context.sent), 1)
+        self.assertEqual(service._check_reply_freshness.await_count, 3)
+
     def test_group_tts_requires_direct_trigger(self):
         service = self._service()
         self._enable_tts(service, enable_group=True, group_probability=100, group_require_direct_trigger=True)
@@ -823,6 +854,109 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertFalse(artifact.sent)
         self.assertEqual(artifact.blocked_reason, "send_failed")
 
+    def test_successful_send_commits_group_dialogue_after_delivery(self):
+        from astrmai.conversation.attention.group_dialogue_store import (
+            GroupDialogueStore,
+        )
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        store = GroupDialogueStore()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            dialogue_store=store,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "question")
+
+        async def _run():
+            artifact = await service.handle_reply(
+                event,
+                "delivered reply",
+                event.unified_msg_origin,
+            )
+            turns = await store.get_recent_bot_turns(
+                event.unified_msg_origin,
+                target_sender_id="user-1",
+            )
+            return artifact, turns
+
+        artifact, turns = asyncio.run(_run())
+
+        self.assertTrue(artifact.sent)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].reply_text, "delivered reply")
+        self.assertEqual(turns[0].target_sender_id, "user-1")
+        self.assertEqual(
+            event.get_extra("astrmai_reply_commit_id"),
+            turns[0].turn_id,
+        )
+
+    def test_successful_proactive_reply_updates_bot_watermark_after_commit(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        state_engine.record_committed_bot_reply = AsyncMock()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "proactive")
+        event.set_extra("astrmai_is_proactive_event", True)
+
+        artifact = asyncio.run(
+            service.handle_reply(
+                event,
+                "主动问候",
+                event.unified_msg_origin,
+            )
+        )
+
+        self.assertTrue(artifact.sent)
+        commit_id = event.get_extra("astrmai_reply_commit_id")
+        self.assertTrue(commit_id)
+        state_engine.record_committed_bot_reply.assert_awaited_once()
+        call = state_engine.record_committed_bot_reply.await_args
+        self.assertEqual(call.args[0], event.unified_msg_origin)
+        self.assertTrue(call.kwargs["is_proactive"])
+        self.assertEqual(call.kwargs["commit_id"], commit_id)
+
+    def test_failed_send_never_commits_group_dialogue(self):
+        from astrmai.conversation.attention.group_dialogue_store import (
+            GroupDialogueStore,
+        )
+
+        state_engine = FakeStateEngine()
+        store = GroupDialogueStore()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            dialogue_store=store,
+        )
+
+        async def _send_fail(*args, **kwargs):
+            return False
+
+        service._send_segments = _send_fail
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "question")
+
+        async def _run():
+            artifact = await service.handle_reply(
+                event,
+                "undelivered draft",
+                event.unified_msg_origin,
+            )
+            counts = await store.snapshot_counts(event.unified_msg_origin)
+            return artifact, counts
+
+        artifact, counts = asyncio.run(_run())
+
+        self.assertFalse(artifact.sent)
+        self.assertEqual(counts["segments"], 0)
+        self.assertIsNone(event.get_extra("astrmai_reply_commit_id"))
+
     def test_partial_segment_send_is_committed_and_does_not_trigger_model_retry(self):
         from astrmai.conversation.contracts.turn_identity import TurnIdentity
 
@@ -865,6 +999,57 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(len(coordinator.commits), 1)
         self.assertEqual(coordinator.commits[0][2], ["msg-1"])
+
+    def test_partial_segment_send_commits_only_delivered_group_text(self):
+        from astrmai.conversation.attention.group_dialogue_store import (
+            GroupDialogueStore,
+        )
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        store = GroupDialogueStore()
+        calls = 0
+
+        async def _partial_send(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("second segment failed")
+            return "msg-1"
+
+        state_engine.gateway.context.send_message = _partial_send
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            dialogue_store=store,
+        )
+        service._settle_post_send = _noop_post_send
+        event = FakeEvent("user-1", "Alice", "question")
+        artifact = service._build_visible_reply_artifact(
+            "first\n\nsecond",
+            event=event,
+        )
+        service._build_visible_reply_artifact = lambda *args, **kwargs: artifact
+
+        async def _run():
+            result = await service.handle_reply(
+                event,
+                "first\n\nsecond",
+                event.unified_msg_origin,
+            )
+            turns = await store.get_recent_bot_turns(
+                event.unified_msg_origin,
+                target_sender_id="user-1",
+            )
+            return result, turns
+
+        result, turns = asyncio.run(_run())
+
+        self.assertTrue(result.sent)
+        self.assertEqual(result.metadata["send_status"], "partial_sent")
+        self.assertEqual(result.persistable_text, "first")
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].reply_text, "first")
 
     def test_stale_during_segmented_send_persists_only_delivered_text(self):
         state_engine = FakeStateEngine()

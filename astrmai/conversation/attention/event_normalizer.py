@@ -7,6 +7,13 @@ from typing import Any, List, Set
 
 from astrbot.api.event import AstrMessageEvent
 
+from ..contracts.conversation_event import ConversationEvent
+from ..runtime.architecture_rollout import (
+    ArchitectureTimer,
+    record_architecture_observation,
+    rollout_enabled,
+)
+
 
 @dataclass
 class SessionContext:
@@ -47,11 +54,25 @@ class NormalizedEvent:
     is_image_only: bool = False
     token_set: Set[str] = field(default_factory=set)
     index: int = 0
+    canonical_event: ConversationEvent | None = None
+
+
+def _topic_epoch(event: AstrMessageEvent) -> int:
+    history_policy = event.get_extra('astrmai_dialog_history_policy', None)
+    if history_policy is None:
+        return 0
+    value = (
+        history_policy.get('topic_epoch', 0)
+        if isinstance(history_policy, dict)
+        else getattr(history_policy, 'topic_epoch', 0)
+    )
+    return max(0, int(value or 0))
 
 
 def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]:
     normalized_events: list[NormalizedEvent] = []
     for index, event in enumerate(events):
+        timer = ArchitectureTimer()
         sender_id = str(event.get_sender_id())
         sender_name = event.get_sender_name() or '??/??'
         rich_text = str(event.get_extra('astrmai_rich_text', event.message_str) or '')
@@ -62,6 +83,46 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
         token_set = gate._tokenize_text(rich_text or text)
         reply_target_sender_id, reply_target_sender_name = gate._extract_reply_target(event)
         is_at_bot = gate._is_at_bot_event(event, self_id)
+        is_reply_to_bot = gate._is_reply_to_bot_event(event, self_id)
+        is_direct_wakeup = gate._is_direct_wakeup_event(event, self_id)
+        canonical_event = ConversationEvent.from_astr_event(
+            event,
+            self_id=self_id,
+            rich_text=rich_text,
+            image_refs=extracted_refs,
+            direct_image_refs=direct_refs,
+            reply_target_actor_id=reply_target_sender_id,
+            reply_target_actor_name=reply_target_sender_name,
+            is_at_bot=is_at_bot,
+            is_reply_to_bot=is_reply_to_bot,
+            is_direct_wakeup=is_direct_wakeup,
+            topic_epoch=_topic_epoch(event),
+            provenance=str(
+                event.get_extra("astrmai_event_provenance", "original") or "original"
+            ),
+        )
+        event.set_extra('astrmai_conversation_event', canonical_event)
+        event.set_extra('astrmai_conversation_event_schema_version', canonical_event.schema_version)
+        event.set_extra('astrmai_conversation_event_id', canonical_event.event_id)
+        event.set_extra('astrmai_conversation_event_id_source', canonical_event.event_id_source)
+        canonical_read_enabled = rollout_enabled(
+            getattr(gate, "config", None),
+            "canonical_read_enabled",
+            True,
+        )
+        record_architecture_observation(
+            event,
+            "canonical_event",
+            {
+                "schema_version": canonical_event.schema_version,
+                "event_id": canonical_event.event_id,
+                "event_id_source": canonical_event.event_id_source,
+                "actor_id": canonical_event.actor_id,
+                "read_enabled": canonical_read_enabled,
+                "legacy_actor_match": canonical_event.actor_id == sender_id,
+                "elapsed_ms": timer.elapsed_ms,
+            },
+        )
 
         normalized_events.append(
             NormalizedEvent(
@@ -72,9 +133,9 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
                 rich_text=rich_text,
                 timestamp=float(event.get_extra('astrmai_timestamp', getattr(event, 'timestamp', 0.0)) or 0.0),
                 is_self=sender_id == str(self_id),
-                is_reply_to_bot=gate._is_reply_to_bot_event(event, self_id),
+                is_reply_to_bot=is_reply_to_bot,
                 is_at_bot=is_at_bot,
-                is_direct_wakeup=gate._is_direct_wakeup_event(event, self_id),
+                is_direct_wakeup=is_direct_wakeup,
                 is_near_context_query=gate._is_near_context_query_text(text or rich_text),
                 reply_target_sender_id=reply_target_sender_id,
                 reply_target_sender_name=reply_target_sender_name,
@@ -83,6 +144,7 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
                 is_image_only=bool(image_urls and not token_set),
                 token_set=token_set,
                 index=index,
+                canonical_event=canonical_event if canonical_read_enabled else None,
             )
         )
     return normalized_events
