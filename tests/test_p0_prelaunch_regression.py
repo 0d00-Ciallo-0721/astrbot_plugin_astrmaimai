@@ -116,6 +116,51 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(faiss.calls, 0)
         self.assertEqual(second_observation["status"], "circuit_open")
 
+    def test_vector_store_default_timeout_is_twenty_seconds(self):
+        from astrmai.memory.retrieval import vector_store
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            async def retrieve(self, **_kwargs):
+                return []
+
+        observation = {}
+
+        async def _timeout(awaitable, *args, **kwargs):
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with patch.object(vector_store.asyncio, "wait_for", new=_timeout):
+            results = asyncio.run(VectorRetriever(_Faiss()).search("hello", observation=observation))
+
+        self.assertEqual(results, [])
+        self.assertEqual(observation["status"], "timeout")
+        self.assertEqual(observation["timeout_sec"], 20.0)
+
+    def test_vector_store_timeout_is_clamped_to_shared_turn_budget(self):
+        from astrmai.memory.retrieval import vector_store
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            async def retrieve(self, **_kwargs):
+                return []
+
+        captured = {}
+
+        async def _wait_for(awaitable, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout", args[0] if args else None)
+            return await awaitable
+
+        with patch.object(
+            vector_store,
+            "clamp_timeout_to_turn_budget",
+            return_value=1.25,
+        ), patch.object(vector_store.asyncio, "wait_for", new=_wait_for):
+            results = asyncio.run(VectorRetriever(_Faiss()).search("hello"))
+
+        self.assertEqual(results, [])
+        self.assertEqual(captured["timeout"], 1.25)
+
     def test_hybrid_retriever_reports_bm25_fallback_when_vector_is_unhealthy(self):
         from astrmai.memory.retrieval.hybrid_retriever import HybridRetriever
         from astrmai.memory.utils import SearchResult

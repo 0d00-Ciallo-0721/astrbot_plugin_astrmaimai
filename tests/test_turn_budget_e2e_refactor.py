@@ -127,6 +127,12 @@ class VisionSidePathBudgetTests(unittest.TestCase):
     def test_vision_timeout_uses_configured_without_scope(self):
         self.assertAlmostEqual(self._executor()._vision_side_path_timeout_override(), 25.0, places=3)
 
+    def test_vision_timeout_uses_slow_model_default_without_config(self):
+        executor = ConcurrentExecutor.__new__(ConcurrentExecutor)
+        executor.config = SimpleNamespace(timing=SimpleNamespace())
+
+        self.assertAlmostEqual(executor._vision_side_path_timeout_override(), 90.0, places=3)
+
     def test_vision_timeout_zero_when_budget_exhausted(self):
         executor = self._executor()
         event = _Event(created_at_offset_sec=-400.0)

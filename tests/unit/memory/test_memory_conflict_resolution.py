@@ -96,6 +96,61 @@ class MemoryConflictResolutionTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), [])
 
+    def test_llm_claim_extraction_uses_explicit_chat_lane(self):
+        captured = {}
+
+        class _Templates:
+            def render_template(self, *_args, **_kwargs):
+                return SimpleNamespace(prompt="extract", system_prompt="system")
+
+        class _Gateway:
+            context_economy = SimpleNamespace(templates=_Templates())
+
+            async def call_data_process_task(self, **kwargs):
+                captured.update(kwargs)
+                return {"claims": []}
+
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor(_Gateway())
+            return await extractor.extract(
+                user_text="plain group conversation",
+                turn_id="turn-group-1",
+                lane_scope_id="ff:GroupMessage:123",
+                lane_scope_kind="chat",
+            )
+
+        self.assertEqual(asyncio.run(run()), [])
+        lane_key = captured["lane_key"]
+        self.assertEqual(lane_key.scope_id, "ff:GroupMessage:123")
+        self.assertEqual(lane_key.scope_kind, "chat")
+
+    def test_llm_claim_extraction_falls_back_to_subject_lane(self):
+        captured = {}
+
+        class _Templates:
+            def render_template(self, *_args, **_kwargs):
+                return SimpleNamespace(prompt="extract", system_prompt="system")
+
+        class _Gateway:
+            context_economy = SimpleNamespace(templates=_Templates())
+
+            async def call_data_process_task(self, **kwargs):
+                captured.update(kwargs)
+                return {"claims": []}
+
+        async def run():
+            extractor = self.claim_mod.MemoryClaimExtractor(_Gateway())
+            return await extractor.extract(
+                user_text="plain private conversation",
+                subject_id="user-42",
+                turn_id="turn-private-1",
+            )
+
+        self.assertEqual(asyncio.run(run()), [])
+        lane_key = captured["lane_key"]
+        self.assertEqual(lane_key.scope_id, "subject:user-42")
+        self.assertEqual(lane_key.scope_kind, "user")
+
 
 if __name__ == "__main__":
     unittest.main()

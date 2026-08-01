@@ -472,9 +472,9 @@ class ConcurrentExecutor:
         # OPT-07/RT-05: 单图超时 = min(配置的图片分析超时, turn 剩余预算[留主回复保留额])
         timing = getattr(self.config, "timing", None)
         try:
-            configured = float(getattr(timing, "image_analysis_timeout_sec", 30.0) or 30.0)
+            configured = float(getattr(timing, "image_analysis_timeout_sec", 90.0) or 90.0)
         except (TypeError, ValueError):
-            configured = 30.0
+            configured = 90.0
         return clamp_timeout_to_turn_budget(None, max(1.0, configured), reserve_for_reply=True)
 
     async def _evaluate_execution_freshness(self, event: AstrMessageEvent, chat_id: str) -> tuple[FreshnessState, str]:
@@ -728,6 +728,7 @@ class ConcurrentExecutor:
 
         started_at = monotonic()
         policy = self._vision_reply_policy()
+        event.set_extra("astrmai_vision_owner", "direct")
         logger.info(f"[{chat_id}] vision direct path triggered in executor")
         self._mark_vision_direct_state(event, invoked=True, outcome="skipped")
         vision_descriptions: list[str] = []
@@ -996,9 +997,31 @@ class ConcurrentExecutor:
                 event.set_extra("astrmai_vision_required_failed", True)
                 fallback_reason = "required_analysis_failed"
             else:
-                model_prompt += "\n\n" + "\n".join("[图片]" for _ in range(failed_count))
-                prompt_injected = True
-                fallback_reason = "placeholder"
+                if vision_bundle.is_image_only:
+                    model_prompt += "\n\n[图片]"
+                    prompt_injected = True
+                    fallback_reason = "image_only_placeholder"
+                else:
+                    fallback_reason = "text_only_continue"
+                system_prompt += (
+                    "\n\n[媒体状态约束] 当前图片内容不可用。它不是新的聊天话题；"
+                    "不要反复说明图片加载、转圈或看不清，也不要猜测图片内容。"
+                    "若用户同时发送了文字，只回答文字；只有问题必须依赖图片时，简短说明无法确认。"
+                )
+                if not vision_descriptions:
+                    media_only_failure = bool(vision_bundle.is_image_only)
+                    event.set_extra("astrmai_media_status_nonsemantic", True)
+                    event.set_extra("astrmai_media_only_failure", media_only_failure)
+                    event.set_extra(
+                        "astrmai_media_status",
+                        {
+                            "status": "unavailable",
+                            "owner": "direct",
+                            "reason": fallback_reason,
+                            "image_count": len(vision_bundle.direct_image_urls),
+                            "image_only": media_only_failure,
+                        },
+                    )
 
         elapsed_ms = int((monotonic() - started_at) * 1000)
         if failed_count and policy == "require_analysis":

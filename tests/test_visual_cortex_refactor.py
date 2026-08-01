@@ -263,6 +263,78 @@ class VisualCortexRefactorTests(unittest.TestCase):
             first["_singleflight_join"] or second["_singleflight_join"]
         )
 
+    def test_failed_image_enters_cooldown_and_does_not_repeat_model_call(self):
+        class _Gateway:
+            def __init__(self):
+                self.calls = 0
+
+            async def call_vision_task(self, **kwargs):
+                self.calls += 1
+                raise RuntimeError("vision unavailable")
+
+        path = os.path.join(self.temp_dir.name, "failed.png")
+        Image.new("RGB", (6, 6), color="black").save(path, format="PNG")
+        gateway = _Gateway()
+        cortex = self.visual_mod.VisualCortex(
+            gateway,
+            db_service=None,
+            config=SimpleNamespace(
+                vision=SimpleNamespace(
+                    enable_visual_result_cache=True,
+                    store_visual_asset_files=False,
+                    visual_prompt_version="v1",
+                    visual_failure_cooldown_sec=120,
+                )
+            ),
+        )
+
+        async def _run():
+            with self.assertRaises(RuntimeError):
+                await cortex.analyze_image_path("first", path, scope_id="chat")
+            await asyncio.sleep(0)
+            with self.assertRaises(self.visual_mod.VisionAnalysisCoolingDown):
+                await cortex.analyze_image_path("second", path, scope_id="chat")
+
+        asyncio.run(_run())
+        self.assertEqual(gateway.calls, 1)
+        self.assertEqual(cortex.describe_status()["failure_cooldown_count"], 1)
+
+    def test_empty_image_result_also_enters_failure_cooldown(self):
+        class _Gateway:
+            def __init__(self):
+                self.calls = 0
+
+            async def call_vision_task(self, **kwargs):
+                self.calls += 1
+                return None
+
+        path = os.path.join(self.temp_dir.name, "empty.png")
+        Image.new("RGB", (6, 6), color="white").save(path, format="PNG")
+        gateway = _Gateway()
+        cortex = self.visual_mod.VisualCortex(
+            gateway,
+            db_service=None,
+            config=SimpleNamespace(
+                vision=SimpleNamespace(
+                    enable_visual_result_cache=True,
+                    store_visual_asset_files=False,
+                    visual_prompt_version="v1",
+                    visual_failure_cooldown_sec=120,
+                )
+            ),
+        )
+
+        async def _run():
+            self.assertIsNone(
+                await cortex.analyze_image_path("first", path, scope_id="chat")
+            )
+            await asyncio.sleep(0)
+            with self.assertRaises(self.visual_mod.VisionAnalysisCoolingDown):
+                await cortex.analyze_image_path("second", path, scope_id="chat")
+
+        asyncio.run(_run())
+        self.assertEqual(gateway.calls, 1)
+
     def test_prompt_version_change_does_not_reuse_legacy_transcription(self):
         from astrmai.infrastructure.persistence.orm_models import VisualAsset
 

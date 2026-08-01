@@ -191,6 +191,55 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_current_turn_vision_owner_suppresses_lookup_tool(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="你看")
+        event.set_extra("astrmai_vision_barrier_complete", True)
+        event.set_extra("astrmai_vision_owner", "barrier")
+        tools = [
+            _NamedTool("vision_message_analyze_tool"),
+            _NamedTool("qq_friend_lookup"),
+        ]
+        focus_context = SimpleNamespace(
+            vision_bundle=SimpleNamespace(
+                direct_image_urls=["resolved.jpg"],
+                image_urls=["resolved.jpg"],
+            )
+        )
+
+        filtered = planner._arbitrate_current_turn_vision_tool(
+            event,
+            focus_context,
+            tools,
+        )
+
+        self.assertEqual([tool.name for tool in filtered], ["qq_friend_lookup"])
+        self.assertTrue(event.get_extra("astrmai_vision_tool_suppressed"))
+        self.assertIn(
+            "current_image_owned_by_barrier",
+            event.get_extra("astrmai_turn_context").tools.filter_reasons,
+        )
+
+    def test_historical_vision_lookup_tool_remains_available_without_current_image(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="查一下之前那张图")
+        tools = [
+            _NamedTool("vision_message_analyze_tool"),
+            _NamedTool("qq_friend_lookup"),
+        ]
+        focus_context = SimpleNamespace(
+            vision_bundle=SimpleNamespace(direct_image_urls=[], image_urls=[])
+        )
+
+        filtered = planner._arbitrate_current_turn_vision_tool(
+            event,
+            focus_context,
+            tools,
+        )
+
+        self.assertIs(filtered, tools)
+        self.assertFalse(event.get_extra("astrmai_vision_tool_suppressed", False))
+
     def _make_planner(self, decision, *, sys3_router=None, memory_engine=None):
         planner = self.planner_mod.Planner(
             context=SimpleNamespace(),

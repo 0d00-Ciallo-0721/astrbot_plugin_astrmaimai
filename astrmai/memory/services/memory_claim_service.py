@@ -43,6 +43,45 @@ class MemoryClaimExtractor:
         self.gateway = gateway
         self.prompt_registry = getattr(getattr(gateway, "context_economy", None), "templates", None) if gateway else None
 
+    @staticmethod
+    def _lane_key(
+        *,
+        lane_scope_id: str,
+        lane_scope_kind: str,
+        subject_id: str,
+        turn_id: str,
+    ) -> LaneKey:
+        explicit_scope = str(lane_scope_id or "").strip()
+        if explicit_scope:
+            return LaneKey(
+                subsystem="bg",
+                task_family="memory",
+                scope_id=explicit_scope,
+                scope_kind=str(lane_scope_kind or "chat").strip() or "chat",
+            )
+        subject_scope = str(subject_id or "").strip()
+        if subject_scope:
+            return LaneKey(
+                subsystem="bg",
+                task_family="memory",
+                scope_id=f"subject:{subject_scope}",
+                scope_kind="user",
+            )
+        turn_scope = str(turn_id or "").strip()
+        if turn_scope:
+            return LaneKey(
+                subsystem="bg",
+                task_family="memory",
+                scope_id=f"turn:{turn_scope}",
+                scope_kind="turn",
+            )
+        return LaneKey(
+            subsystem="bg",
+            task_family="memory",
+            scope_id="global",
+            scope_kind="global",
+        )
+
     def _rule_extract(self, *, user_text: str, subject_id: str, turn_id: str) -> list[MemoryClaim]:
         text = str(user_text or "").strip()
         if not text:
@@ -134,6 +173,8 @@ class MemoryClaimExtractor:
         turn_id: str = "",
         context_hint: str = "",
         allow_llm: bool = True,
+        lane_scope_id: str = "",
+        lane_scope_kind: str = "",
     ) -> list[MemoryClaim]:
         claims = self._rule_extract(user_text=user_text, subject_id=subject_id, turn_id=turn_id)
         # OPT-06/ML-06: allow_llm=False 时只做规则抽取——发送后内联路径不得同步等
@@ -155,7 +196,12 @@ class MemoryClaimExtractor:
                 prompt=envelope.prompt,
                 system_prompt=envelope.system_prompt,
                 is_json=True,
-                lane_key=LaneKey(subsystem="bg", task_family="memory", scope_id=subject_id or "global", scope_kind="chat"),
+                lane_key=self._lane_key(
+                    lane_scope_id=lane_scope_id,
+                    lane_scope_kind=lane_scope_kind,
+                    subject_id=subject_id,
+                    turn_id=turn_id,
+                ),
                 base_origin="",
                 template_envelope=envelope,
             )

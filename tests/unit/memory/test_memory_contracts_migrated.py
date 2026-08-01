@@ -138,6 +138,7 @@ class MemoryContractMigratedTests(unittest.TestCase):
 
     def test_group_summary_uses_stable_identity_without_claiming_session_as_sender(self):
         requests = []
+        claim_requests = []
 
         async def _write(request):
             requests.append(request)
@@ -164,9 +165,11 @@ class MemoryContractMigratedTests(unittest.TestCase):
                 },
             )
         )
-        summarizer.claim_extractor = SimpleNamespace(
-            extract=lambda **_kwargs: asyncio.sleep(0, result=[])
-        )
+        async def _extract(**kwargs):
+            claim_requests.append(kwargs)
+            return []
+
+        summarizer.claim_extractor = SimpleNamespace(extract=_extract)
         messages = [
             {
                 "message_id": 11,
@@ -197,6 +200,10 @@ class MemoryContractMigratedTests(unittest.TestCase):
         self.assertEqual(requests[0].sender_id, "")
         self.assertEqual(requests[0].kind, "memory")
         self.assertEqual(requests[0].metadata["evidence_message_ids"], [11])
+        self.assertEqual(len(claim_requests), 2)
+        self.assertEqual(claim_requests[0]["lane_scope_id"], "ff:GroupMessage:123")
+        self.assertEqual(claim_requests[0]["lane_scope_kind"], "chat")
+        self.assertEqual(claim_requests[0]["subject_id"], "")
 
     def test_compat_summarizer_module_still_reexports_chat_history_summarizer(self):
         sys.modules.pop("astrmai.memory.services.summarizer", None)

@@ -1446,10 +1446,10 @@
       "faiss_timeout_sec": {
         "description": "向量检索最长等待时间（秒）",
         "type": "float",
-        "default": 4.0,
+        "default": 20.0,
         "minimum": 0.5,
         "maximum": 60,
-        "hint": "向量检索超时后立即使用文字检索，不会阻塞本轮聊天。"
+        "hint": "向量检索默认最多等待 20 秒；超时后立即使用文字检索，不会中断本轮聊天。"
       },
       "faiss_failure_threshold": {
         "description": "向量检索连续失败次数",
@@ -1526,7 +1526,7 @@
       "image_analysis_timeout_sec": {
         "description": "图片识别等待超时（秒）",
         "type": "float",
-        "default": 45.0,
+        "default": 90.0,
         "minimum": 1,
         "maximum": 1200,
         "hint": "单次视觉模型调用的最长等待时间。最终等待还会受到“整轮图片识别总时限”限制。"
@@ -1534,10 +1534,10 @@
       "vision_barrier_total_timeout_sec": {
         "description": "整轮图片识别总时限（秒）",
         "type": "float",
-        "default": 180.0,
+        "default": 300.0,
         "minimum": 1,
         "maximum": 3600,
-        "hint": "从读取图片文件开始，到所有图片识别和重试结束的总等待上限。图片数量和重试次数不会把这个时间继续放大。慢模型可设置为 180 至 300。"
+        "hint": "从读取图片文件开始，到所有图片识别和重试结束的总等待上限。图片数量和重试次数不会把这个时间继续放大；默认 300 秒适配响应较慢的视觉模型。"
       }
     }
   },
@@ -1628,6 +1628,14 @@
         "minimum": 1,
         "maximum": 5,
         "hint": "只在整轮图片识别总时限内重试。达到总时限后会立即按上面的回复方式处理，不会继续等待。"
+      },
+      "visual_failure_cooldown_sec": {
+        "description": "相同图片识别失败后的重试冷却时间（秒）",
+        "type": "int",
+        "default": 120,
+        "minimum": 0,
+        "maximum": 1800,
+        "hint": "视觉模型或网络异常时，同一张图片在冷却期内不会重复消耗整套模型池；设为 0 可关闭。"
       },
       "use_native_main_reply_vision": {
         "description": "主回复原生识图直通开关",

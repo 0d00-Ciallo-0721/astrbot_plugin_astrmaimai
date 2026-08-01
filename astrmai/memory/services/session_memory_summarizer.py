@@ -197,6 +197,8 @@ class SessionMemorySummarizer:
                 subject_id=subject_id,
                 turn_id=event_id,
                 context_hint="session_memory_summarizer",
+                lane_scope_id=session_id,
+                lane_scope_kind="chat",
             )
             decision = self.conflict_resolver.resolve(claims)
             metadata = {

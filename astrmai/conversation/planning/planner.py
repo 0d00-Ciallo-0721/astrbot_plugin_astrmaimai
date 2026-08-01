@@ -699,6 +699,45 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         }
         self.tool_trace_history = [*self.tool_trace_history, item][-300:]
 
+    def _arbitrate_current_turn_vision_tool(
+        self,
+        event: AstrMessageEvent,
+        focus_context,
+        tools,
+    ):
+        bundle = getattr(focus_context, "vision_bundle", None)
+        image_refs = list(getattr(bundle, "direct_image_urls", []) or []) or list(
+            getattr(bundle, "image_urls", []) or []
+        )
+        barrier_complete = bool(event.get_extra("astrmai_vision_barrier_complete", False))
+        records = list(event.get_extra("astrmai_vision_records", []) or [])
+        if not (image_refs or barrier_complete or records):
+            return tools
+        owner = str(event.get_extra("astrmai_vision_owner", "") or "").strip()
+        if not owner:
+            owner = "barrier" if barrier_complete else "direct"
+            event.set_extra("astrmai_vision_owner", owner)
+        filtered = [
+            tool
+            for tool in list(tools or [])
+            if str(getattr(tool, "name", "") or "") != "vision_message_analyze_tool"
+        ]
+        if len(filtered) == len(list(tools or [])):
+            return tools
+        event.set_extra("astrmai_vision_tool_suppressed", True)
+        turn_tools = ensure_turn_context(event).tools
+        before = self._tool_names(tools)
+        after = self._tool_names(filtered)
+        turn_tools.filtered_tools = list(after)
+        turn_tools.filter_reasons.append(f"current_image_owned_by_{owner}")
+        turn_tools.record_step(
+            "planner.current_turn_vision_owner",
+            before,
+            after,
+            f"current_image_owned_by_{owner}",
+        )
+        return filtered
+
     async def _remember_turn_trace(
         self,
         chat_id: str,
@@ -1143,7 +1182,13 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             action_taken=action_taken,
             reply_preview=str(reply_text or "")[:120],
             reply_need=reply_need,
-            lightweight_event=is_lightweight_event,
+            lightweight_event=(
+                is_lightweight_event
+                or bool(
+                    event is not None
+                    and event.get_extra("astrmai_media_status_nonsemantic", False)
+                )
+            ),
             sender_id=sender_id,
             source_event_id=source_event_id,
             topic_epoch=history_policy.topic_epoch if history_policy.group_id else None,
@@ -1502,6 +1547,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             is_tool_call_mode=is_tool_call_mode,
             tool_state=side_inputs.get("tool_state"),
         )
+        tools = self._arbitrate_current_turn_vision_tool(event, focus_context, tools)
         self._remember_tool_trace(chat_id, tools, event)
         self._append_tool_guidance(prompt_envelope, tools, event)
         if cognitive_decision and not (is_all_mode or is_fast_mode or is_tool_call_mode):

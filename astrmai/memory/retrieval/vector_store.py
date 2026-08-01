@@ -4,6 +4,7 @@ import time
 from typing import List, Dict, Any, Optional
 from astrbot.api import logger
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
+from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ..utils import SearchResult, TextProcessor
 
 class VectorRetriever:
@@ -121,7 +122,13 @@ class VectorRetriever:
     ) -> List[SearchResult]:
         """执行向量相似度搜索"""
         started_at = time.monotonic()
-        timeout_sec = max(0.5, self._timing_value("faiss_timeout_sec", 4.0))
+        configured_timeout_sec = max(0.5, self._timing_value("faiss_timeout_sec", 20.0))
+        timeout_sec = clamp_timeout_to_turn_budget(
+            None,
+            configured_timeout_sec,
+            reserve_for_reply=True,
+        )
+        timeout_sec = max(0.1, float(timeout_sec or 0.0))
         if not query or not query.strip():
             self._record_observation(
                 observation,

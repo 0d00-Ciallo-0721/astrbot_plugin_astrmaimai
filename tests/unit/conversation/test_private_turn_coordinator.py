@@ -114,6 +114,20 @@ class _Persistence:
 
 
 class PrivateTurnCoordinatorTests(unittest.TestCase):
+    def test_vision_timeout_defaults_match_slow_model_profile(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(),
+            timing=SimpleNamespace(),
+            vision=SimpleNamespace(),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+
+        self.assertEqual(coordinator._vision_resolve_timeout(), 15.0)
+        self.assertEqual(coordinator._vision_analysis_timeout(), 90.0)
+        self.assertEqual(coordinator._vision_total_timeout(), 300.0)
+
     def test_wait_for_input_stability_resets_after_new_activity(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 
@@ -468,6 +482,58 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
         self.assertEqual(event.get_extra("astrmai_rich_text").count("[图片]"), 1)
+
+    def test_image_only_fallback_is_marked_nonsemantic(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(input_settle_sec=0.0),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        event = _Event("obj_len_301 [图片]")
+
+        coordinator._apply_failed_policy(
+            event,
+            image_count=1,
+            failed_count=1,
+            timeout_count=1,
+            elapsed_ms=10,
+            outcome="timeout",
+        )
+
+        self.assertTrue(event.get_extra("astrmai_media_status_nonsemantic"))
+        self.assertTrue(event.get_extra("astrmai_media_only_failure"))
+        self.assertTrue(event.get_extra("astrmai_media_status")["image_only"])
+
+    def test_text_with_image_fallback_remains_semantically_persistable(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(input_settle_sec=0.0),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(config=config, image_resolver=None, visual_cortex=None)
+        event = _Event("你看这张图 [图片]")
+
+        coordinator._apply_failed_policy(
+            event,
+            image_count=1,
+            failed_count=1,
+            timeout_count=1,
+            elapsed_ms=10,
+            outcome="timeout",
+        )
+
+        self.assertTrue(event.get_extra("astrmai_media_status_nonsemantic"))
+        self.assertFalse(event.get_extra("astrmai_media_only_failure"))
+        self.assertFalse(event.get_extra("astrmai_media_status")["image_only"])
 
     def test_outcome_summary_uses_real_scope_and_excludes_image_content(self):
         from astrmai.conversation.attention.private_turn_coordinator import (

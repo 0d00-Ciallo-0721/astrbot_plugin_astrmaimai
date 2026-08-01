@@ -506,6 +506,12 @@ class VisionConfig(BaseModel):
         description="图片识别超时后的回复策略",
     )
     image_analysis_retries: int = Field(default=2, ge=1, le=5, description="图片识别失败重试次数")
+    visual_failure_cooldown_sec: int = Field(
+        default=120,
+        ge=0,
+        le=1800,
+        description="相同图片识别失败后的重试冷却时间(秒)",
+    )
     use_native_main_reply_vision: bool = Field(
         default=False,
         description="主回复原生识图直通开关，仅当当前主回复模型支持原生图片输入时再开启；插件不会自动判断模型能力。",
@@ -531,7 +537,7 @@ class PrivateChatConfig(BaseModel):
     wait_timeout_sec: int = Field(default=300, ge=1, description="单次私聊等待反馈强制休眠阈值(秒)")
     input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0, description="私聊连续输入聚合等待时间(秒)")
     image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0, description="私聊图片文件解析超时时间(秒)")
-    image_barrier_timeout_sec: float = Field(default=45.0, ge=1.0, le=1200.0, description="私聊单张图片识别超时时间(秒)")
+    image_barrier_timeout_sec: float = Field(default=90.0, ge=1.0, le=1200.0, description="私聊单张图片识别超时时间(秒)")
     image_analysis_retries: int = Field(default=2, ge=1, le=5, description="私聊图片识别失败重试次数")
     topic_continuity_enabled: bool = Field(default=True, description="启用私聊话题承接；关闭后恢复原有连续对话行为")
     topic_active_ttl_sec: int = Field(default=900, ge=600, le=1200, description="私聊话题保持强承接的时间，默认15分钟")
@@ -562,7 +568,7 @@ class TimingConfig(BaseModel):
     memory_compress_timeout_sec: float = Field(default=4.0, ge=0.5, le=30.0)
     compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
     embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
-    faiss_timeout_sec: float = Field(default=4.0, ge=0.5, le=60.0)
+    faiss_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
     faiss_failure_threshold: int = Field(default=3, ge=1, le=10)
     faiss_circuit_breaker_cooldown_sec: float = Field(default=180.0, ge=5.0, le=600.0)
     projection_retry_interval_sec: float = Field(default=60.0, ge=5.0, le=3600.0)
@@ -572,8 +578,8 @@ class TimingConfig(BaseModel):
     private_wait_timeout_sec: int = Field(default=300, ge=1, le=7200)
     private_input_settle_sec: float = Field(default=1.5, ge=0.0, le=30.0)
     image_resolve_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
-    image_analysis_timeout_sec: float = Field(default=45.0, ge=1.0, le=1200.0)
-    vision_barrier_total_timeout_sec: float = Field(default=180.0, ge=1.0, le=3600.0)
+    image_analysis_timeout_sec: float = Field(default=90.0, ge=1.0, le=1200.0)
+    vision_barrier_total_timeout_sec: float = Field(default=300.0, ge=1.0, le=3600.0)
 
 
 class AstrMaiConfig(BaseModel):

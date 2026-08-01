@@ -109,12 +109,12 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         )
         return executor, gateway
 
-    def _vision_bundle(self, image_path):
+    def _vision_bundle(self, image_path, *, is_image_only=True):
         return self.executor_mod.VisionBundle(
             image_urls=[image_path],
             direct_image_urls=[image_path],
             is_direct_request=True,
-            is_image_only=True,
+            is_image_only=is_image_only,
             source="event_extra",
         )
 
@@ -144,7 +144,8 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
                 pass
 
         self.assertEqual(model_prompt, "prompt\n\n[图片]")
-        self.assertEqual(system_prompt, "system")
+        self.assertTrue(system_prompt.startswith("system"))
+        self.assertIn("不要反复说明图片加载", system_prompt)
         self.assertTrue(event.get_extra("vision_direct_invoked"))
         self.assertEqual(event.get_extra("vision_direct_outcome"), "invalid_output")
         self.assertTrue(event.get_extra("astrmai_vision_observability")["vision_fallback"])
@@ -275,7 +276,43 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         observation = event.get_extra("astrmai_vision_observability")
         self.assertEqual(observation["outcome"], "fallback")
         self.assertTrue(observation["vision_fallback"])
-        self.assertEqual(observation["fallback_reason"], "placeholder")
+        self.assertEqual(observation["fallback_reason"], "image_only_placeholder")
+        self.assertTrue(event.get_extra("astrmai_media_status_nonsemantic"))
+        self.assertTrue(event.get_extra("astrmai_media_only_failure"))
+        self.assertTrue(event.get_extra("astrmai_media_status")["image_only"])
+
+    def test_direct_vision_text_message_continues_without_image_failure_topic(self):
+        visual_cortex = _FakeVisualCortex(asyncio.TimeoutError())
+        executor, _gateway = self._executor({}, visual_cortex=visual_cortex)
+        event = _FakeEvent()
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        try:
+            model_prompt, system_prompt = asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    "用户同时发送的文字",
+                    "system",
+                    self._vision_bundle(temp_image.name, is_image_only=False),
+                )
+            )
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(model_prompt, "用户同时发送的文字")
+        self.assertIn("媒体状态约束", system_prompt)
+        self.assertIn("不要反复说明图片加载", system_prompt)
+        self.assertTrue(event.get_extra("astrmai_media_status_nonsemantic"))
+        self.assertFalse(event.get_extra("astrmai_media_only_failure"))
+        self.assertFalse(event.get_extra("astrmai_media_status")["image_only"])
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["fallback_reason"], "text_only_continue")
+        self.assertFalse(observation["prompt_injected"])
 
     def test_direct_vision_strict_policy_stops_placeholder_fallback(self):
         visual_cortex = _FakeVisualCortex(RuntimeError("vision unavailable"))
@@ -370,7 +407,8 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
                 pass
 
         self.assertEqual(model_prompt, "prompt\n\n[图片]")
-        self.assertEqual(system_prompt, "system")
+        self.assertTrue(system_prompt.startswith("system"))
+        self.assertIn("不要反复说明图片加载", system_prompt)
         self.assertEqual(event.get_extra("vision_direct_outcome"), "exception")
         self.assertEqual(event.get_extra("vision_direct_attempted_models"), ["vision-a", "vision-b"])
         self.assertEqual(event.get_extra("vision_direct_failure_reason"), "empty_description")
@@ -399,7 +437,8 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         model_prompt, system_prompt = asyncio.run(_run())
 
         self.assertEqual(model_prompt, "prompt\n\n[图片]")
-        self.assertEqual(system_prompt, "system")
+        self.assertTrue(system_prompt.startswith("system"))
+        self.assertIn("不要反复说明图片加载", system_prompt)
         self.assertEqual(event.get_extra("vision_direct_outcome"), "exception")
         observation = event.get_extra("astrmai_vision_observability")
         self.assertEqual(observation["resolved_count"], 0)

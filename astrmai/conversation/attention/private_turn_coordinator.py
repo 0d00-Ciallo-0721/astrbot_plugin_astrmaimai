@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -80,8 +81,8 @@ class PrivateTurnCoordinator:
         return max(
             0.1,
             float(
-                getattr(self._timing_config(), "vision_barrier_total_timeout_sec", 180.0)
-                or 180.0
+                getattr(self._timing_config(), "vision_barrier_total_timeout_sec", 300.0)
+                or 300.0
             ),
         )
 
@@ -92,9 +93,9 @@ class PrivateTurnCoordinator:
                 getattr(
                     self._timing_config(),
                     "image_analysis_timeout_sec",
-                    getattr(self._private_config(), "image_barrier_timeout_sec", 45.0),
+                    getattr(self._private_config(), "image_barrier_timeout_sec", 90.0),
                 )
-                or 45.0
+                or 90.0
             ),
         )
 
@@ -466,6 +467,8 @@ class PrivateTurnCoordinator:
     async def prepare_direct_event(self, event: Any, chat_id: str) -> VisionBarrierOutcome:
         """Resolve a directly addressed image before group decision/dispatch."""
         event.set_extra("astrmai_vision_image_sources", self._image_source_categories(event))
+        if self._event_image_count(event):
+            event.set_extra("astrmai_vision_owner", "barrier")
         if not bool(getattr(getattr(self.config, "vision", None), "enable_vision", True)):
             outcome = VisionBarrierOutcome(
                 policy=self._vision_policy(),
@@ -758,6 +761,20 @@ class PrivateTurnCoordinator:
         else:
             self._clear_raw_image_refs(event)
             self._append_vision_context(event, records, failed_count)
+            if not records:
+                media_only_failure = self._is_media_only_event(event)
+                event.set_extra("astrmai_media_status_nonsemantic", True)
+                event.set_extra("astrmai_media_only_failure", media_only_failure)
+                event.set_extra(
+                    "astrmai_media_status",
+                    {
+                        "status": "unavailable",
+                        "owner": "barrier",
+                        "reason": str(outcome or "analysis_failed"),
+                        "image_count": max(image_count, failed_count),
+                        "image_only": media_only_failure,
+                    },
+                )
             downstream_action = "continue_with_placeholder"
         barrier_outcome = VisionBarrierOutcome(
             policy=policy,
@@ -774,6 +791,18 @@ class PrivateTurnCoordinator:
         )
         self._record_outcome(event, barrier_outcome, "")
         return barrier_outcome
+
+    @staticmethod
+    def _is_media_only_event(event: Any) -> bool:
+        text = str(getattr(event, "message_str", "") or "").strip()
+        text = re.sub(r"obj_len_\d+", "", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"\[(?:图片|图像|表情包?|image)(?:[^\]]*)\]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return not text.strip()
 
     @staticmethod
     def _clear_raw_image_refs(event: Any) -> None:
@@ -1013,8 +1042,8 @@ class PrivateTurnCoordinator:
         lines = [base_text] if base_text else []
         lines.extend(line for record in records if (line := render_vision_record(record)))
         if failed_count:
-            missing_placeholders = max(0, failed_count - base_text.count("[图片]"))
-            lines.extend("[图片]" for _ in range(missing_placeholders))
+            if "[图片]" not in base_text:
+                lines.append("[图片]")
         event.set_extra("astrmai_rich_text", "\n".join(lines).strip())
 
     @classmethod

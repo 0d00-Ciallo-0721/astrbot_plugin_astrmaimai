@@ -596,7 +596,7 @@ class ContextEngine:
         picids = re.findall(r"\[picid:([a-fA-F0-9]{32})\]", prompt)
         with self.db.get_session() as session:
             for picid in set(picids):
-                replacement = "[一张尚未识别清楚的图片]"
+                replacement = "[图片]"
                 try:
                     memory = session.get(VisualMemory, picid)
                     if memory and memory.description:

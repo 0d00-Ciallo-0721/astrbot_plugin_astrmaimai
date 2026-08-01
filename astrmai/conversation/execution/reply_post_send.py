@@ -188,6 +188,9 @@ class ReplyPostSendMixin:
             ),
             "think_level": self._resolve_memory_turn_think_level(event),
             "persona_id": self._resolve_memory_turn_persona_id(),
+            "skip_semantic_persistence": bool(
+                event.get_extra("astrmai_media_only_failure", False)
+            ),
         }
 
     async def _commit_group_dialogue_turn_from_context(
@@ -241,13 +244,20 @@ class ReplyPostSendMixin:
         context: Mapping[str, Any],
         event: AstrMessageEvent | None = None,
     ):
+        def should_skip_semantic_persistence() -> bool:
+            return bool(context.get("skip_semantic_persistence", False))
+
         async def group_dialogue(turn: CommittedBotTurn) -> str:
+            if should_skip_semantic_persistence():
+                return "skipped_nonsemantic_media"
             return await self._commit_group_dialogue_turn_from_context(
                 turn,
                 context,
             )
 
         async def native_history(turn: CommittedBotTurn) -> str:
+            if should_skip_semantic_persistence():
+                return "skipped_nonsemantic_media"
             await self._sync_native_history_mirror(
                 event=event,
                 chat_id=turn.chat_id,
@@ -257,6 +267,8 @@ class ReplyPostSendMixin:
             return "committed"
 
         async def memory(turn: CommittedBotTurn) -> str:
+            if should_skip_semantic_persistence():
+                return "skipped_nonsemantic_media"
             return await self._ingest_memory_turn_from_context(
                 chat_id=turn.chat_id,
                 assistant_text=turn.persistable_text,
@@ -265,6 +277,8 @@ class ReplyPostSendMixin:
             )
 
         async def learning(turn: CommittedBotTurn) -> str:
+            if should_skip_semantic_persistence():
+                return "skipped_nonsemantic_media"
             manager = getattr(self, "evolution_manager", None)
             if manager is None or not hasattr(manager, "process_bot_reply"):
                 return "skipped_unavailable"

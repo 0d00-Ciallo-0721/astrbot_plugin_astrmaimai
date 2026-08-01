@@ -26,6 +26,12 @@ from .visual_asset_identity import (
 from .vision_prompt import VISION_SYSTEM_PROMPT, VISION_USER_PROMPT, normalize_vision_result
 
 
+class VisionAnalysisCoolingDown(RuntimeError):
+    def __init__(self, retry_after_sec: float):
+        self.retry_after_sec = max(0.0, float(retry_after_sec or 0.0))
+        super().__init__(f"vision_analysis_cooling_down:{self.retry_after_sec:.1f}s")
+
+
 class VisualCortex:
     """Refactoring-side multimodal worker owning image queue and vision analysis."""
 
@@ -38,6 +44,7 @@ class VisualCortex:
         self._worker_task = None
         self._inflight_lock = asyncio.Lock()
         self._inflight: dict[str, asyncio.Task] = {}
+        self._failure_cooldowns: dict[str, tuple[float, str]] = {}
         self._last_cleanup_at = 0.0
 
     def _default_asset_dir(self) -> Path:
@@ -66,6 +73,12 @@ class VisualCortex:
     def _file_storage_enabled(self) -> bool:
         return bool(getattr(self._vision_config(), "store_visual_asset_files", False))
 
+    def _failure_cooldown_sec(self) -> float:
+        return max(
+            0.0,
+            float(getattr(self._vision_config(), "visual_failure_cooldown_sec", 120) or 0),
+        )
+
     def start(self):
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = safe_create_task(self._worker())
@@ -78,6 +91,7 @@ class VisualCortex:
         for task in tuple(self._inflight.values()):
             task.cancel()
         self._inflight.clear()
+        self._failure_cooldowns.clear()
         discarded = self._discard_pending_tasks()
         if discarded:
             logger.info(
@@ -111,6 +125,7 @@ class VisualCortex:
             "content_cache_enabled": self._cache_enabled(),
             "asset_file_storage_enabled": self._file_storage_enabled(),
             "inflight_count": len(self._inflight),
+            "failure_cooldown_count": len(self._failure_cooldowns),
         }
 
     async def _worker(self):
@@ -404,11 +419,36 @@ class VisualCortex:
             error = task.exception()
         except Exception:
             return
-        if error is not None:
+        failure_kind = type(error).__name__ if error is not None else ""
+        if error is None:
+            try:
+                if task.result() is None:
+                    failure_kind = "EmptyVisionResult"
+            except Exception as exc:
+                error = exc
+                failure_kind = type(exc).__name__
+        if failure_kind:
+            cooldown_sec = self._failure_cooldown_sec()
+            if cooldown_sec > 0:
+                self._failure_cooldowns[asset_id] = (
+                    time.monotonic() + cooldown_sec,
+                    failure_kind,
+                )
             logger.warning(
                 "[AstrMai-Vision] in-flight analysis failed "
-                f"asset={asset_id[:12]} error={type(error).__name__}"
+                f"asset={asset_id[:12]} error={failure_kind}"
             )
+
+    def _failure_cooldown_remaining(self, asset_id: str) -> float:
+        entry = self._failure_cooldowns.get(asset_id)
+        if entry is None:
+            return 0.0
+        retry_at, _reason = entry
+        remaining = retry_at - time.monotonic()
+        if remaining <= 0:
+            self._failure_cooldowns.pop(asset_id, None)
+            return 0.0
+        return remaining
 
     async def _run_vision_analysis(
         self,
@@ -607,6 +647,13 @@ class VisualCortex:
                 )
 
         if payload is None:
+            cooldown_remaining = self._failure_cooldown_remaining(identity.asset_id)
+            if cooldown_remaining > 0:
+                logger.info(
+                    "[AstrMai-Vision] repeated failed image suppressed "
+                    f"asset={identity.asset_id[:12]} retry_after_sec={cooldown_remaining:.1f}"
+                )
+                raise VisionAnalysisCoolingDown(cooldown_remaining)
             joined = False
             async with self._inflight_lock:
                 task = self._inflight.get(identity.asset_id)
@@ -638,6 +685,7 @@ class VisualCortex:
             payload = await asyncio.shield(task)
             if payload is None:
                 return None
+            self._failure_cooldowns.pop(identity.asset_id, None)
             payload = dict(payload)
             if joined:
                 payload["_cache_kind"] = "singleflight"

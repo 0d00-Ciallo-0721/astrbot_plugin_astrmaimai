@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
 from astrmai.infrastructure.runtime.turn_call_ledger import (
@@ -283,6 +284,24 @@ def test_snapshot_is_versioned_and_contains_no_prompt_text():
     assert snapshot["total_elapsed_ms"] >= 0
     assert "隐私问题" not in str(snapshot)
     assert "隐私回答" not in str(snapshot)
+
+
+def test_snapshot_reports_instrumented_and_unattributed_timing_coverage():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        with observe_stage(None, "planner.context"):
+            time.sleep(0.002)
+        snapshot = turn_telemetry_snapshot(event)
+
+    coverage = snapshot["timing_coverage"]
+    assert coverage["instrumented_ms"] >= 0
+    assert coverage["unattributed_ms"] >= 0
+    assert 0.0 <= coverage["coverage_ratio"] <= 1.0
+    assert coverage["first_observed_delay_ms"] >= 0
+    assert coverage["post_last_observed_delay_ms"] >= 0
+    assert coverage["max_unattributed_gap_ms"] >= 0
+    assert coverage["interval_count"] >= 1
 
 
 def test_dialog_history_policy_summary_contains_ids_but_not_conversation_text():

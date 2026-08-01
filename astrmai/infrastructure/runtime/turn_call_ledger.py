@@ -19,7 +19,7 @@ BACKGROUND_TASK_LEDGER_KEY = "astrmai_background_task_ledger"
 VISION_OBSERVATION_KEY = "astrmai_vision_observation"
 TELEMETRY_CONTEXT_KEY = "astrmai_turn_telemetry"
 TRACE_SCHEMA_VERSION = 2
-INSTRUMENTATION_VERSION = "2026.07.25-v2"
+INSTRUMENTATION_VERSION = "2026.08.01-v3"
 _MAX_ENTRIES = 128
 _MAX_BLOCKS = 64
 _CURRENT_TELEMETRY: ContextVar["TurnTelemetryContext | None"] = ContextVar(
@@ -264,6 +264,45 @@ def rebind_turn_telemetry(event: Any) -> TurnTelemetryContext:
     return context
 
 
+def _timing_coverage_summary(context: TurnTelemetryContext, captured_at: float) -> dict[str, Any]:
+    turn_start = float(context.started_at or captured_at)
+    turn_end = max(turn_start, float(captured_at or turn_start))
+    intervals: list[tuple[float, float]] = []
+    for entries in (context.calls, context.stages, context.background_tasks):
+        for entry in entries:
+            try:
+                started_at = max(turn_start, float(entry.get("started_at", 0.0) or 0.0))
+                finished_at = min(turn_end, float(entry.get("finished_at", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if finished_at > started_at:
+                intervals.append((started_at, finished_at))
+    intervals.sort()
+    merged: list[list[float]] = []
+    for started_at, finished_at in intervals:
+        if not merged or started_at > merged[-1][1]:
+            merged.append([started_at, finished_at])
+        else:
+            merged[-1][1] = max(merged[-1][1], finished_at)
+    instrumented_sec = sum(end - start for start, end in merged)
+    total_sec = max(0.0, turn_end - turn_start)
+    gaps: list[float] = []
+    cursor = turn_start
+    for started_at, finished_at in merged:
+        gaps.append(max(0.0, started_at - cursor))
+        cursor = max(cursor, finished_at)
+    gaps.append(max(0.0, turn_end - cursor))
+    return {
+        "instrumented_ms": round(instrumented_sec * 1000.0, 1),
+        "unattributed_ms": round(max(0.0, total_sec - instrumented_sec) * 1000.0, 1),
+        "coverage_ratio": round(instrumented_sec / total_sec, 4) if total_sec else 0.0,
+        "first_observed_delay_ms": round((merged[0][0] - turn_start) * 1000.0, 1) if merged else round(total_sec * 1000.0, 1),
+        "post_last_observed_delay_ms": round((turn_end - merged[-1][1]) * 1000.0, 1) if merged else round(total_sec * 1000.0, 1),
+        "max_unattributed_gap_ms": round(max(gaps, default=0.0) * 1000.0, 1),
+        "interval_count": len(merged),
+    }
+
+
 def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
     context = current_turn_telemetry(event)
     if context is None:
@@ -399,6 +438,7 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
             "remaining_ms": round(max(0.0, float(remaining or 0.0)) * 1000, 1),
             "exhausted": remaining is not None and remaining <= 0.0,
         },
+        "timing_coverage": _timing_coverage_summary(context, captured_at),
         "llm_call_ledger": copy.deepcopy(context.calls[-_MAX_ENTRIES:]),
         "context_block_stats": copy.deepcopy(context.context_blocks[-16:]),
         "stage_ledger": copy.deepcopy(context.stages[-_MAX_ENTRIES:]),

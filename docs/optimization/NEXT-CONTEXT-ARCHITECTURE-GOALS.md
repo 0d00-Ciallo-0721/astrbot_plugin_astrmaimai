@@ -9,7 +9,7 @@
 1. 本文件。
 2. 总路线图。
 3. 即将实施的对应 `OPT-17`～`OPT-24` 文档。
-4. `C:/Users/zlj/.codex/skills/astrbot-plugin-dev/SKILL.md`。
+4. `$CODEX_HOME/skills/astrbot-plugin-dev/SKILL.md`。
 
 仓库源码和测试是事实源；四份外部报告仅用于解释设计来源，不能替代当前代码核验。
 

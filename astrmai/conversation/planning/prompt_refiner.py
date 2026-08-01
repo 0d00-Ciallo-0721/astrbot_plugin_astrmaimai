@@ -849,7 +849,7 @@ class PromptRefiner:
         with self.db_service.get_session() as session:
             from ...infrastructure.persistence import VisualMemory
             for picid in picids:
-                resolved_text = "[一张尚未看清的图片]"
+                resolved_text = "[图片]"
                 try:
                     mem = session.get(VisualMemory, picid)
                     if mem and mem.description:

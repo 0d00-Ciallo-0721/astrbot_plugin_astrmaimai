@@ -24,6 +24,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.vision.visual_asset_max_disk_mb, 512)
         self.assertEqual(config.vision.visual_asset_max_edge_px, 1600)
         self.assertEqual(config.vision.visual_prompt_version, "v1")
+        self.assertEqual(config.vision.visual_failure_cooldown_sec, 120)
         self.assertTrue(hasattr(config, "conversation"))
         self.assertEqual(config.conversation.compaction_trigger_segments, 40)
         self.assertEqual(config.conversation.compaction_keep_recent_segments, 16)
@@ -37,7 +38,11 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.timing.model_request_timeout_sec, 15.0)
         self.assertEqual(config.timing.fast_mode_execution_timeout_sec, 15)
         self.assertEqual(config.timing.reply_max_age_sec, 0.0)
-        self.assertEqual(config.timing.vision_barrier_total_timeout_sec, 180.0)
+        self.assertEqual(config.timing.faiss_timeout_sec, 20.0)
+        self.assertEqual(config.timing.image_resolve_timeout_sec, 15.0)
+        self.assertEqual(config.timing.image_analysis_timeout_sec, 90.0)
+        self.assertEqual(config.timing.vision_barrier_total_timeout_sec, 300.0)
+        self.assertEqual(config.private_chat.image_barrier_timeout_sec, 90.0)
         self.assertEqual(config.evolution.jargon_min_count, 2)
         self.assertEqual(config.evolution.expression_min_count, 2)
 
@@ -46,17 +51,22 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
             infra={"api_timeout": 240.0},
             agent={"timeout": 600},
             attention={"judge_timeout": 120.0},
-            private_chat={"image_resolve_timeout_sec": 150.0},
+            private_chat={
+                "image_resolve_timeout_sec": 150.0,
+                "image_barrier_timeout_sec": 210.0,
+            },
         )
 
         self.assertEqual(config.timing.model_request_timeout_sec, 240.0)
         self.assertEqual(config.timing.agent_execution_timeout_sec, 600)
         self.assertEqual(config.timing.attention_judge_timeout_sec, 120.0)
         self.assertEqual(config.timing.image_resolve_timeout_sec, 150.0)
+        self.assertEqual(config.timing.image_analysis_timeout_sec, 210.0)
         self.assertEqual(config.infra.api_timeout, 240.0)
         self.assertEqual(config.agent.timeout, 600)
         self.assertEqual(config.attention.judge_timeout, 120.0)
         self.assertEqual(config.private_chat.image_resolve_timeout_sec, 150.0)
+        self.assertEqual(config.private_chat.image_barrier_timeout_sec, 210.0)
 
     def test_central_timing_fields_override_legacy_locations(self):
         config = AstrMaiConfig(
@@ -169,6 +179,8 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(vision_items["visual_asset_max_disk_mb"]["default"], 512)
         self.assertEqual(vision_items["visual_asset_max_edge_px"]["default"], 1600)
         self.assertEqual(vision_items["visual_prompt_version"]["default"], "v1")
+        self.assertEqual(vision_items["visual_failure_cooldown_sec"]["default"], 120)
+        self.assertEqual(vision_items["visual_failure_cooldown_sec"]["maximum"], 1800)
         self.assertNotIn("image_analysis_retries", schema["private_chat"]["items"])
         self.assertIn("jargon_min_count", evolution_items)
         self.assertIn("expression_min_count", evolution_items)
@@ -195,8 +207,10 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(timing_items["fast_mode_execution_timeout_sec"]["default"], 15)
         self.assertEqual(timing_items["workmode_execution_timeout_sec"]["default"], 120)
         self.assertEqual(timing_items["workmode_execution_timeout_sec"]["maximum"], 86400)
+        self.assertEqual(timing_items["faiss_timeout_sec"]["default"], 20.0)
         self.assertEqual(timing_items["image_resolve_timeout_sec"]["maximum"], 600)
-        self.assertEqual(timing_items["vision_barrier_total_timeout_sec"]["default"], 180.0)
+        self.assertEqual(timing_items["image_analysis_timeout_sec"]["default"], 90.0)
+        self.assertEqual(timing_items["vision_barrier_total_timeout_sec"]["default"], 300.0)
         self.assertEqual(timing_items["vision_barrier_total_timeout_sec"]["maximum"], 3600)
         self.assertNotIn("judge_timeout", schema["attention"]["items"])
         self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)

@@ -101,15 +101,14 @@ class ReplyCommitService:
             )
             last_error = ""
             for name, consumer in consumers.items():
-                if statuses.get(name) in {"committed", "skipped"}:
+                current_status = str(statuses.get(name, "") or "")
+                if current_status == "committed" or current_status.startswith("skipped"):
                     continue
                 try:
                     outcome = str(
                         await consumer(committed_turn) or "committed"
                     ).strip().lower()
-                    statuses[name] = (
-                        "skipped" if outcome.startswith("skipped") else "committed"
-                    )
+                    statuses[name] = outcome if outcome.startswith("skipped") else "committed"
                 except Exception as exc:
                     statuses[name] = "failed"
                     last_error = f"{name}:{exc}"

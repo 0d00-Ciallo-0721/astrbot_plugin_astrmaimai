@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 import time
@@ -2028,6 +2029,25 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         event = _get_current_event(context)
+
+        def result_payload(status: str, **payload: Any) -> str:
+            return json.dumps(
+                {"status": status, **payload},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        owner = str(event.get_extra("astrmai_vision_owner", "") or "").strip()
+        if owner in {"barrier", "direct"} and bool(
+            event.get_extra("astrmai_vision_tool_suppressed", False)
+        ):
+            _record_tool_execution(event, self.name)
+            return result_payload(
+                "handled_by_runtime",
+                owner=owner,
+                retryable=False,
+                description="",
+            )
         message_id = str(kwargs.get("message_id", "") or "").strip()
         try:
             image_index = max(1, min(int(kwargs.get("image_index", 1) or 1), 8))
@@ -2040,7 +2060,12 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
             img_type = str(selected.get("type") or "image").strip()
             tags = selected.get("emotion_tags") or selected.get("tags") or []
             _record_tool_execution(event, self.name)
-            return f"视觉转述结果：type={img_type}；tags={tags}；description={_truncate_text(desc, 600)}"
+            return result_payload(
+                "success",
+                type=img_type,
+                tags=tags,
+                description=_truncate_text(desc, 600),
+            )
         if not message_id:
             message_obj = getattr(event, "message_obj", None)
             message_id = str(
@@ -2073,19 +2098,17 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                 if asset is not None and str(asset.description or "").strip():
                     tags = []
                     try:
-                        import json
-
                         parsed_tags = json.loads(str(asset.emotion_tags or "[]"))
                         if isinstance(parsed_tags, list):
                             tags = parsed_tags
                     except (TypeError, ValueError):
                         tags = []
                     _record_tool_execution(event, self.name)
-                    return (
-                        "视觉转述结果："
-                        f"type={str(asset.type or 'image')}；"
-                        f"tags={tags}；"
-                        f"description={_truncate_text(str(asset.description or ''), 600)}"
+                    return result_payload(
+                        "success",
+                        type=str(asset.type or "image"),
+                        tags=tags,
+                        description=_truncate_text(str(asset.description or ""), 600),
                     )
             except Exception as exc:
                 logger.debug(
@@ -2094,7 +2117,11 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
         binding_error = _message_id_binding_error(event, message_id)
         if binding_error:
             _record_tool_execution(event, self.name, status="failed")
-            return binding_error
+            return result_payload(
+                "invalid_message_id",
+                retryable=False,
+                reason=_truncate_text(binding_error, 240),
+            )
         payload: Any = None
         api = getattr(getattr(event, "bot", None), "api", None)
         if message_id and api is not None:
@@ -2102,7 +2129,11 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                 payload = await api.call_action("get_msg", message_id=_coerce_api_id(message_id))
             except Exception as exc:
                 _record_tool_execution(event, self.name, status="failed")
-                return f"视觉转述查询失败：读取图片消息 {message_id} 时出错：{exc}"
+                return result_payload(
+                    "lookup_failed",
+                    retryable=True,
+                    error_type=type(exc).__name__,
+                )
         else:
             # OPT-12/TL-03: 执行事件被 sanitize 成 Plain 占位，优先读保留的原始组件
             preserved_segments = (
@@ -2119,13 +2150,19 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
         candidates = _extract_image_candidates(_payload_data(payload))
         if not candidates:
             _record_tool_execution(event, self.name)
-            return "视觉转述结果：当前没有发现可分析的图片或表情包片段。"
+            return result_payload(
+                "no_image",
+                retryable=False,
+                description="",
+            )
         image = candidates[min(image_index - 1, len(candidates) - 1)]
         _record_tool_execution(event, self.name)
-        return (
-            "视觉转述结果：图片分析还没有完成；已看到图片片段。"
-            f"type={image.get('type')} file={_truncate_text(image.get('file'), 120)} url={_truncate_text(image.get('url'), 120)}。"
-            "请不要臆测图片内容，可提示用户稍后再问或根据已完成的视觉转述作答。"
+        return result_payload(
+            "pending",
+            retryable=True,
+            type=str(image.get("type") or "image"),
+            image_index=image_index,
+            description="",
         )
 
 

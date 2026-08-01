@@ -893,6 +893,58 @@ class RefactoredReplyServiceTests(unittest.TestCase):
             turns[0].turn_id,
         )
 
+    def test_image_only_vision_failure_skips_semantic_persistence_consumers(self):
+        from astrmai.conversation.attention.group_dialogue_store import (
+            GroupDialogueStore,
+        )
+
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.typing_speed_factor = 0.0
+        store = GroupDialogueStore()
+        memory_engine = self._build_memory_engine_runtime(threshold=2)
+        evolution_manager = SimpleNamespace(process_bot_reply=AsyncMock())
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+            dialogue_store=store,
+            memory_engine=memory_engine,
+            evolution_manager=evolution_manager,
+        )
+        service._settle_post_send = _noop_post_send
+        service._sync_native_history_mirror = AsyncMock()
+        event = FakeEvent("user-1", "Alice", "[图片]")
+        event.set_extra("astrmai_media_status_nonsemantic", True)
+        event.set_extra("astrmai_media_only_failure", True)
+
+        async def _run():
+            artifact = await service.handle_reply(
+                event,
+                "暂时无法确认图片内容",
+                event.unified_msg_origin,
+            )
+            counts = await store.snapshot_counts(event.unified_msg_origin)
+            return artifact, counts
+
+        artifact, counts = asyncio.run(_run())
+
+        self.assertTrue(artifact.sent)
+        self.assertEqual(counts["segments"], 0)
+        self.assertNotIn(
+            event.unified_msg_origin,
+            memory_engine.memory_pipeline._session_history_buffer,
+        )
+        service._sync_native_history_mirror.assert_not_awaited()
+        evolution_manager.process_bot_reply.assert_not_awaited()
+        self.assertEqual(
+            artifact.metadata["commit_consumer_status"],
+            {
+                "group_dialogue": "skipped_nonsemantic_media",
+                "native_history": "skipped_nonsemantic_media",
+                "memory": "skipped_nonsemantic_media",
+                "learning": "skipped_nonsemantic_media",
+            },
+        )
+
     def test_successful_proactive_reply_updates_bot_watermark_after_commit(self):
         state_engine = FakeStateEngine()
         state_engine.config.reply.typing_speed_factor = 0.0

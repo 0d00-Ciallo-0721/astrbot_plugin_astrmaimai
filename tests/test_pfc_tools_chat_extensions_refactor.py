@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import sys
 import tempfile
 import unittest
@@ -440,6 +441,40 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("熊猫头低着头", result)
         self.assertIn("emoji", result)
         self.assertIn("无奈", result)
+
+    def test_04bb_vision_message_pending_is_structured_and_does_not_leak_source(self):
+        event = _FakeEvent(group_id="777")
+        event.message_obj.message = [
+            {
+                "type": "image",
+                "data": {
+                    "file": "private-image-file.jpg",
+                    "url": "https://private.example/image.jpg",
+                },
+            }
+        ]
+
+        result = asyncio.run(self.mod.VisionMessageAnalyzeTool().call(_wrap_event(event)))
+        payload = json.loads(result)
+
+        self.assertEqual(payload["status"], "pending")
+        self.assertTrue(payload["retryable"])
+        self.assertNotIn("private-image-file", result)
+        self.assertNotIn("private.example", result)
+        self.assertNotIn("加载", result)
+        self.assertNotIn("稍后", result)
+
+    def test_04bc_vision_message_reports_runtime_owner_without_duplicate_lookup(self):
+        event = _FakeEvent(group_id="777")
+        event.set_extra("astrmai_vision_owner", "barrier")
+        event.set_extra("astrmai_vision_tool_suppressed", True)
+
+        result = asyncio.run(self.mod.VisionMessageAnalyzeTool().call(_wrap_event(event)))
+        payload = json.loads(result)
+
+        self.assertEqual(payload["status"], "handled_by_runtime")
+        self.assertEqual(payload["owner"], "barrier")
+        self.assertFalse(payload["retryable"])
 
     def test_04c_vision_message_rejects_qq_number_as_message_id(self):
         event = _FakeEvent(
