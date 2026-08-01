@@ -50,7 +50,7 @@ async def submit_review(id: str, req: ReviewActionRequest, user: str = Depends(g
 @router.post("/batch")
 async def batch_review(req: BatchReviewRequest, user: str = Depends(get_current_user)):
     service = ReviewUiService(PluginApiAdapter(), get_db)
-    return await service.batch_review(req.ids, req.action)
+    return await service.batch_review(req.ids, req.action, kind=req.kind)
 
 @router.post("")
 async def create_review(data: Dict[str, Any], user: str = Depends(get_current_user)):

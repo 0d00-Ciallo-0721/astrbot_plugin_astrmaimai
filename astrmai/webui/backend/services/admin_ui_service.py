@@ -612,14 +612,48 @@ class AdminUiService:
     async def tools_status(self) -> dict[str, Any]:
         from ....conversation.planning.planner_side_inputs import PlannerSideInputMixin
 
+        planner = self.plugin_api.get_planner()
+        chat_tier = set(getattr(planner, "CHAT_TOOL_NAMES", set()) or PlannerSideInputMixin.CHAT_TOOL_NAMES)
+        guarded_chat_tier = set(
+            getattr(planner, "GUARDED_CHAT_TOOL_NAMES", set()) or PlannerSideInputMixin.GUARDED_CHAT_TOOL_NAMES
+        )
+        full_only = set(getattr(planner, "FULL_ONLY_TOOL_NAMES", set()) or PlannerSideInputMixin.FULL_ONLY_TOOL_NAMES)
+        families = getattr(planner, "TOOL_FAMILIES", None) or PlannerSideInputMixin.TOOL_FAMILIES
         return {
             "status": "ok",
             "data": {
-                "chat_tier": sorted(PlannerSideInputMixin.CHAT_TOOL_NAMES),
-                "guarded_chat_tier": sorted(PlannerSideInputMixin.GUARDED_CHAT_TOOL_NAMES),
-                "full_only": sorted(PlannerSideInputMixin.FULL_ONLY_TOOL_NAMES),
-                "families": {key: sorted(value) for key, value in PlannerSideInputMixin.TOOL_FAMILIES.items()},
+                "chat_tier": sorted(chat_tier),
+                "guarded_chat_tier": sorted(guarded_chat_tier),
+                "full_only": sorted(full_only),
+                "families": {key: sorted(value) for key, value in families.items()},
+                "tool_count": len(chat_tier | guarded_chat_tier | full_only),
             },
+            "runtime_bound": planner is not None,
+        }
+
+    async def tools_catalog(self) -> dict[str, Any]:
+        status = await self.tools_status()
+        data = status.get("data", {})
+        tier_by_tool: dict[str, str] = {}
+        for tier, key in (("chat", "chat_tier"), ("guarded_chat", "guarded_chat_tier"), ("full_only", "full_only")):
+            for name in list(data.get(key, []) or []):
+                tier_by_tool[str(name)] = tier
+        families_by_tool: dict[str, list[str]] = {}
+        for family, names in (data.get("families", {}) or {}).items():
+            for name in list(names or []):
+                families_by_tool.setdefault(str(name), []).append(str(family))
+        items = [
+            {
+                "name": name,
+                "tier": tier_by_tool.get(name, "unknown"),
+                "families": sorted(families_by_tool.get(name, [])),
+            }
+            for name in sorted(tier_by_tool)
+        ]
+        return {
+            "status": "ok",
+            "data": {"items": items, "total": len(items), "families": data.get("families", {})},
+            "runtime_bound": status.get("runtime_bound", False),
         }
 
     async def recent_tool_traces(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:

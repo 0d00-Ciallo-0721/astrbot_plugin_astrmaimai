@@ -165,6 +165,21 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertTrue(result.terminal)
         self.assertEqual(result.items[0]["review_status"], "pending_human")
 
+    def test_strict_fallback_does_not_persist_topic_like_sentence_pattern(self):
+        gateway = _Gateway(RuntimeError("offline"))
+        candidate = {
+            **_candidate("expr-topic-1", count=3),
+            "expression": "OpenAI",
+            "habit_type": "sentence_pattern",
+            "content_kind": "expression",
+        }
+
+        result = asyncio.run(ExpressionPatternEnricher(gateway).enrich("chat-1", [candidate]))
+
+        self.assertEqual(result.items, [])
+        self.assertEqual(result.missing_candidate_ids, ["expr-topic-1"])
+        self.assertTrue(result.retryable)
+
     def test_pattern_retry_does_not_inflate_count_or_weight(self):
         store = _Store()
         writer = _WriteService(store)
@@ -184,6 +199,36 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(len(writer.calls), 1)
         self.assertEqual(stored.metadata["count"], 3)
         self.assertEqual(stored.metadata["weight"], 0.8)
+
+    def test_pattern_write_preserves_speaker_and_habit_metadata(self):
+        store = _Store()
+        writer = _WriteService(store)
+        service = ExpressionPatternService(store, writer)
+        payload = {
+            **_candidate("expr-style-1", count=3),
+            "habit_type": "ending",
+            "content_kind": "expression",
+            "normalized_pattern": "呀",
+            "speaker_id": "10001",
+            "speaker_name": "测试用户",
+            "scope_kind": "speaker",
+            "shared_scope": "chat-1:user:10001",
+            "distinct_turn_count": 3,
+            "distinct_day_count": 2,
+        }
+
+        asyncio.run(service.write_pattern("chat-1", payload))
+        stored = next(iter(store.by_key.values()))
+
+        self.assertEqual(stored.metadata["habit_type"], "ending")
+        self.assertEqual(stored.metadata["content_kind"], "expression")
+        self.assertEqual(stored.metadata["normalized_pattern"], "呀")
+        self.assertEqual(stored.metadata["speaker_id"], "10001")
+        self.assertEqual(stored.metadata["speaker_name"], "测试用户")
+        self.assertEqual(stored.metadata["scope_kind"], "speaker")
+        self.assertEqual(stored.metadata["shared_scope"], "chat-1:user:10001")
+        self.assertEqual(stored.metadata["distinct_turn_count"], 3)
+        self.assertEqual(stored.metadata["distinct_day_count"], 2)
 
     def test_backfill_dry_run_never_changes_processed_flags(self):
         logs = [SimpleNamespace(id=index, content="唉嘿嘿", sender_name="user") for index in range(1, 4)]

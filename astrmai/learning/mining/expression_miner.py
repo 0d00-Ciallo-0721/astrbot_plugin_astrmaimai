@@ -25,6 +25,10 @@ class ExpressionMiner:
         self.candidate_extractor = ExpressionCandidateExtractor(
             min_count=getattr(evolution_config, "expression_min_count", 2)
         )
+        self.expression_min_distinct_turns = max(
+            int(getattr(evolution_config, "expression_min_distinct_turns", 3) or 3),
+            int(getattr(evolution_config, "expression_min_count", 2) or 2),
+        )
         self.enricher = ExpressionPatternEnricher(gateway, config=self.config)
         self.last_report: dict[str, Any] = {}
         self.last_result = ExpressionEnrichmentResult(status="completed", reason="not_run")
@@ -36,7 +40,11 @@ class ExpressionMiner:
             if message is None:
                 continue
             sender = str(getattr(message, "sender_name", "") or "")
-            if sender == "SELF":
+            sender_id = str(getattr(message, "sender_id", "") or "")
+            role = str(getattr(message, "role", "") or "").lower()
+            if sender == "SELF" or sender_id.upper() in {"SELF", "BOT", "SELF_BOT"}:
+                continue
+            if bool(getattr(message, "is_bot", False)) or role in {"assistant", "bot", "self"}:
                 continue
             content = str(getattr(message, "content", "") or "").strip()
             if not content or content.startswith("[") or len(content) > 100:
@@ -44,7 +52,7 @@ class ExpressionMiner:
             normalized.append(message)
         return normalized
 
-    async def _existing_patterns(self, group_id: str) -> set[str]:
+    async def _existing_patterns(self, group_id: str) -> set[tuple[str, str]]:
         service = getattr(self.memory_engine, "expression_pattern_service", None) if self.memory_engine else None
         if not service or not hasattr(service, "list_patterns"):
             return set()
@@ -56,7 +64,14 @@ class ExpressionMiner:
                 include_rejected=True,
                 statuses=["active", "review_pending", "rejected", "stale"],
             )
-            return {service.normalize_text(getattr(item, "expression", "")) for item in rows if getattr(item, "expression", "")}
+            return {
+                (
+                    str(getattr(item, "shared_scope", "") or group_id),
+                    service.normalize_text(getattr(item, "expression", "")),
+                )
+                for item in rows
+                if getattr(item, "expression", "")
+            }
         except Exception as exc:
             logger.debug(f"[ExpressionMiner] canonical preload degraded: {exc}")
             return set()
@@ -98,6 +113,31 @@ class ExpressionMiner:
                 "existing_patterns": len(existing),
                 **dict(self.candidate_extractor.last_report or {}),
                 "enriched_count": 0,
+            }
+            return []
+        min_distinct_turns = self.expression_min_distinct_turns
+        candidates = [
+            item
+            for item in candidates
+            if (
+                "distinct_turn_count" not in item
+                and "evidence_message_ids" not in item
+            )
+            or int(item.get("distinct_turn_count") or len(item.get("evidence_message_ids") or []) or 0) >= min_distinct_turns
+        ]
+        if not candidates:
+            self.last_result = ExpressionEnrichmentResult(
+                status="completed",
+                reason="insufficient_distinct_expression_evidence",
+            )
+            self.last_report = {
+                "group_id": group_id,
+                "input_messages": len(messages or []),
+                "normalized_messages": len(normalized),
+                "min_distinct_turns": min_distinct_turns,
+                "candidate_count": 0,
+                "enriched_count": 0,
+                "reason": "insufficient_distinct_expression_evidence",
             }
             return []
         enrichment = await self.enricher.enrich(group_id, candidates)

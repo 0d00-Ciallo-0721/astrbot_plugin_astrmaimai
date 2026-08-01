@@ -9,18 +9,14 @@ class ToolsService:
         self.plugin_api = plugin_api
 
     async def tools_status(self) -> dict[str, Any]:
-        planner = self.plugin_api.get_planner()
-        families = getattr(planner, "TOOL_FAMILIES", None)
-        data = {
-            "chat_tier": sorted(getattr(planner, "CHAT_TOOL_NAMES", set())),
-            "guarded_chat_tier": sorted(getattr(planner, "GUARDED_CHAT_TOOL_NAMES", set())),
-            "full_only": sorted(getattr(planner, "FULL_ONLY_TOOL_NAMES", set())),
-            "families": {k: sorted(v) for k, v in (families or {}).items()} if families else {},
-            "tool_count": len(getattr(planner, "CHAT_TOOL_NAMES", set())
-                | getattr(planner, "GUARDED_CHAT_TOOL_NAMES", set())
-                | getattr(planner, "FULL_ONLY_TOOL_NAMES", set())),
-        }
-        return {"status": "ok", "data": data, "runtime_bound": planner is not None}
+        from .admin_ui_service import AdminUiService
+
+        return await AdminUiService(self.plugin_api).tools_status()
+
+    async def tools_catalog(self) -> dict[str, Any]:
+        from .admin_ui_service import AdminUiService
+
+        return await AdminUiService(self.plugin_api).tools_catalog()
 
     async def tools_policy(self) -> dict[str, Any]:
         planner = self.plugin_api.get_planner()
@@ -30,6 +26,10 @@ class ToolsService:
     async def recent_tool_traces(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
         from .admin_ui_service import AdminUiService
         return await AdminUiService(self.plugin_api).recent_tool_traces(chat_id=chat_id, limit=limit)
+
+    async def recent_tool_executions(self, chat_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        from .admin_ui_service import AdminUiService
+        return await AdminUiService(self.plugin_api).recent_tool_executions(chat_id=chat_id, limit=limit)
 
     @staticmethod
     def _as_dict(value: Any) -> dict[str, Any]:

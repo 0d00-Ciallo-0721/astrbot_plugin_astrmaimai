@@ -165,15 +165,16 @@ class ReviewUiService:
 
     async def list_pending(self):
         facade_items = await self.plugin_api.list_pending_reviews()
-        if self._runtime_bound():
+        if facade_items:
             return facade_items
-        result = await self._list_canonical_reviews(status="pending", page=1, page_size=200)
+        result = await self._list_canonical_reviews(status=None, page=1, page_size=200)
         pending = [
             item
             for item in result["items"]
-            if str(item.get("review_status") or "").strip().lower() in {"pending", "revision_needed", "pending_human"}
+            if str(item.get("review_status") or item.get("status") or "").strip().lower()
+            in {"pending", "review_pending", "revision_needed", "pending_human"}
         ]
-        return pending
+        return pending or facade_items
 
     async def list_reviews(self, status=None, group_id=None, keyword=None, page: int = 1, page_size: int = 20):
         try:
@@ -313,17 +314,37 @@ class ReviewUiService:
                 return {"status": "ok", "data": self._normalize_item(data)}
         return {"status": "degraded", "message": "canonical review runtime unavailable", "readonly": True}
 
-    async def batch_review(self, ids: list[str], action: str):
-        if not ids:
+    async def batch_review(self, ids: list[str], action: str, *, kind: str = "expression"):
+        normalized_kind = str(kind or "expression").strip().lower()
+        if normalized_kind not in {"expression", "jargon"}:
+            return {"status": "error", "message": f"Unknown review kind: {kind!r}", "updated": 0}
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action not in {"approve", "reject"}:
+            return {"status": "error", "message": f"Unknown review action: {action!r}", "updated": 0}
+        normalized_ids = list(dict.fromkeys(str(review_id).strip() for review_id in ids if str(review_id).strip()))[:300]
+        if not normalized_ids:
             return {"status": "ok", "updated": 0}
         updated = 0
-        for review_id in ids:
-            result = await self.submit_review(str(review_id), action)
-            if result.get("status") == "ok":
-                updated += 1
+        if normalized_kind == "jargon":
+            from .memory_ui_service import MemoryUiService
+
+            jargon_service = MemoryUiService(self.db_factory, self.plugin_api)
+            for review_id in normalized_ids:
+                result = (
+                    await jargon_service.approve_jargon(review_id)
+                    if normalized_action == "approve"
+                    else await jargon_service.reject_jargon(review_id)
+                )
+                if result.get("status") == "ok":
+                    updated += 1
+        else:
+            for review_id in normalized_ids:
+                result = await self.submit_review(review_id, normalized_action)
+                if result.get("status") == "ok":
+                    updated += 1
         if updated:
-            return {"status": "ok", "updated": updated}
-        return {"status": "degraded", "updated": 0, "readonly": True}
+            return {"status": "ok", "updated": updated, "requested": len(normalized_ids), "kind": normalized_kind}
+        return {"status": "degraded", "updated": 0, "requested": len(normalized_ids), "kind": normalized_kind, "readonly": True}
 
     async def create_review(self, data: dict) -> dict[str, object]:
         service = self._pattern_service()

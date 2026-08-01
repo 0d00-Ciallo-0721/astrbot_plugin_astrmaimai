@@ -589,6 +589,56 @@ function findReviewItem(kind, id) {
   return groups.flat().find((item) => String(item.id || item.review_id || "") === String(id)) || null;
 }
 
+function reviewSelectionKey(kind, id) {
+  return `${kind}:${String(id || "")}`;
+}
+
+function clearReviewSelection() {
+  state.selectedReviews.clear();
+}
+
+function selectedReviewIds(kind) {
+  const prefix = `${kind}:`;
+  return Array.from(state.selectedReviews)
+    .filter((key) => key.startsWith(prefix))
+    .map((key) => key.slice(prefix.length))
+    .filter(Boolean);
+}
+
+function syncReviewSelectionControls(kind, items) {
+  const pageIds = items
+    .map((item) => String(item.id || item.review_id || ""))
+    .filter(Boolean);
+  const selected = selectedReviewIds(kind).filter((id) => pageIds.includes(id));
+  const count = $('[data-review-selection-count]');
+  if (count) count.textContent = `已选 ${selected.length} 条`;
+  $$('[data-review-batch-action]').forEach((button) => {
+    button.disabled = selected.length === 0;
+  });
+  const selectAll = $('[data-review-select-all]');
+  if (selectAll) {
+    selectAll.checked = pageIds.length > 0 && selected.length === pageIds.length;
+    selectAll.indeterminate = selected.length > 0 && selected.length < pageIds.length;
+  }
+}
+
+async function runBatchReviewAction(kind, action) {
+  const ids = selectedReviewIds(kind);
+  if (!ids.length) return toast("请先选择要处理的候选");
+  const actionLabel = action === "approve" ? "通过" : "拒绝";
+  if (!await confirmAction(`确认批量${actionLabel} ${ids.length} 条${kind === "jargon" ? "黑话" : "表达"}候选？`)) return;
+  const result = await api.post("/reviews/batch", { kind, action, ids });
+  clearDataCache("reviews:");
+  clearDataCache("learning:status");
+  clearReviewSelection();
+  if (result?.status === "degraded") {
+    toast(`批量${actionLabel}未完成：后端审核数据源不可用`);
+  } else {
+    toast(`已${actionLabel} ${result?.updated ?? ids.length} 条候选`);
+  }
+  loadReviews();
+}
+
 function findMemoryItem(tab, id) {
   const source = state.cache.memories[tab];
   const items = Array.isArray(source) ? source : (source?.items || []);
@@ -798,12 +848,13 @@ function dashboardShell(body) {
 async function renderDashboardOverview() {
   const request = beginViewRequest();
   const cached = getDashboardCache("overview");
-  const [snapshot, health, capabilities, models, observabilityOverview] = cached || setDashboardCache("overview", await Promise.all([
+  const [snapshot, health, capabilities, models, observabilityOverview, runtimeStatus] = cached || setDashboardCache("overview", await Promise.all([
     safeFetch(() => api.get("/dashboard"), {}),
     safeFetch(() => api.get("/runtime/health"), {}),
     safeFetch(() => api.get("/runtime/capabilities"), {}),
     safeFetch(() => api.get("/runtime/models"), {}),
     safeFetch(() => api.get("/cognition/observability/overview"), {}),
+    safeFetch(() => api.get("/runtime/status"), {}),
   ]));
   if (!isCurrentView(request)) return;
   state.observabilityOverview = observabilityOverview;
@@ -811,6 +862,10 @@ async function renderDashboardOverview() {
   const running = Boolean(healthData.running);
   const obs = observabilityOverview || {};
   const obsSnapshot = obs.snapshot || {};
+  const components = runtimeStatus?.components || {};
+  const featureFlags = runtimeStatus?.infrastructure?.features || {};
+  const capabilityState = (value) => value === true ? "ok" : value === false ? "danger" : "muted";
+  const capabilityLabel = (label, value) => `${label} ${value === true ? "ready" : value === false ? "offline" : "unknown"}`;
   dashboardShell(`
     <div class="health-strip ${running ? "ok" : "warn"}">
       <span class="status-dot ${running ? "ok" : "warn"}"></span>
@@ -829,11 +884,11 @@ async function renderDashboardOverview() {
     <div class="grid two">
       ${section("能力状态", "只显示关键能力；完整信息按需展开。", `
         <div class="chip-row">
-          ${statusChip(`Gateway ${capabilities.gateway ? "ready" : "unknown"}`, capabilities.gateway ? "ok" : "muted")}
-          ${statusChip(`Memory ${capabilities.memory ? "ready" : "unknown"}`, capabilities.memory ? "ok" : "muted")}
-          ${statusChip(`Heartflow ${capabilities.heartflow ? "ready" : "unknown"}`, capabilities.heartflow ? "ok" : "muted")}
+          ${statusChip(capabilityLabel("Gateway", components.gateway), capabilityState(components.gateway))}
+          ${statusChip(capabilityLabel("Memory", components.memory_engine), capabilityState(components.memory_engine))}
+          ${statusChip(capabilityLabel("Heartflow", components.proactive_task ?? featureFlags.proactive_enabled), capabilityState(components.proactive_task ?? featureFlags.proactive_enabled))}
         </div>
-        ${detailsJson("查看完整能力矩阵", capabilities)}
+        ${detailsJson("查看完整能力矩阵", { components, feature_flags: featureFlags, capabilities })}
       `)}
       ${section("模型健康", "当前模型池与降级组件摘要。", `
         <div class="grid compact-grid">
@@ -1297,9 +1352,20 @@ async function renderDashboardTools() {
     safeFetch(() => api.get("/tools/policy"), {}),
   ]), [{}, {}]);
   const [status, policy] = Array.isArray(common) ? common : [{}, {}];
-  const path = state.toolsTab === "executions" ? "/tools/executions?limit=50" : "/tools/recent-calls?limit=50";
+  const isCatalog = state.toolsTab === "catalog";
+  const path = isCatalog
+    ? "/tools/catalog"
+    : (state.toolsTab === "executions" ? "/tools/executions?limit=50" : "/tools/recent-calls?limit=50");
   const calls = await cachedFetch(`tools:${state.toolsTab}`, () => api.get(path), { items: [] }, 60000);
   if (!isCurrentView(request)) return;
+  const catalogRows = asItems(calls).map((item, index) => `
+    <tr>
+      <td>${escapeHtml(item.name || "-")}</td>
+      <td>${statusChip(item.tier || "unknown", item.tier === "full_only" ? "warn" : "ok")}</td>
+      <td>${escapeHtml(Array.isArray(item.families) ? item.families.join(", ") : "-")}</td>
+      <td><button class="ghost-button" data-tool-detail="${index}" type="button">详情</button></td>
+    </tr>
+  `);
   const rows = asItems(calls).map((item, index) => `
     <tr>
       <td>${formatTime(item.created_at || item.timestamp)}</td>
@@ -1310,6 +1376,15 @@ async function renderDashboardTools() {
       <td><button class="ghost-button" data-tool-detail="${index}" type="button">详情</button></td>
     </tr>
   `);
+  const renderedRows = isCatalog ? catalogRows : rows;
+  const renderedHeaders = isCatalog ? ["工具", "层级", "能力族", "操作"] : ["时间", "Chat", "工具", "Tier", "状态", "操作"];
+  const viewLabel = state.toolsTab === "executions" ? "真实执行" : (isCatalog ? "能力目录" : "策略披露");
+  const viewDescription = state.toolsTab === "executions"
+    ? "工具实际被调用后的生命周期轨迹。"
+    : (isCatalog ? "当前运行时注册的工具、所属层级和能力族。" : "模型可见工具、过滤结果和层级披露，不等同于实际执行。");
+  const emptyText = state.toolsTab === "executions"
+    ? "暂无真实工具执行记录。仅有策略披露不代表工具已调用。"
+    : (isCatalog ? "当前没有可展示的工具目录。" : "暂无工具策略披露记录。");
   dashboardShell(`
     ${subTabs(state.toolsTab, [
       { id: "executions", label: "真实执行" },
@@ -1320,13 +1395,13 @@ async function renderDashboardTools() {
       ${section("工具运行摘要", "真实执行与模型可见性分开统计。", `
         <div class="grid compact-grid">
           ${metric("记录数", calls.total ?? asItems(calls).length)}
-          ${metric("当前视图", state.toolsTab === "executions" ? "真实执行" : "策略披露")}
+          ${metric("当前视图", viewLabel)}
         </div>
         ${detailsJson("查看工具层级", status)}
       `)}
       ${section("工具策略", "按需展开完整策略，不在首页铺开大 JSON。", detailsJson("查看策略详情", policy))}
     </div>
-    ${section("工具链观测 Tools", state.toolsTab === "executions" ? "工具实际被调用后的生命周期轨迹。" : "模型可见工具、过滤结果和层级披露，不等同于实际执行。", table(["时间", "Chat", "工具", "Tier", "状态", "操作"], rows, state.toolsTab === "executions" ? "暂无真实工具执行记录。仅有策略披露不代表工具已调用。" : "暂无工具策略披露记录。"))}
+    ${section("工具链观测 Tools", viewDescription, table(renderedHeaders, renderedRows, emptyText))}
   `);
   $$('[data-tools-tab]').forEach((button) => button.addEventListener("click", () => {
     if (state.toolsTab === button.dataset.toolsTab) return;
@@ -1532,15 +1607,20 @@ async function loadReviews() {
   }
   if (!isCurrentView(request)) return;
   const reviewMode = state.reviewTab.startsWith("jargon") ? "jargon" : "expression";
+  const batchEnabled = state.reviewTab === "jargon_pending" || state.reviewTab === "expression_pending";
   const keyword = String(state.cache.reviews.filters.keyword || "").trim().toLowerCase();
   const activeItems = asItems(activePage).filter((item) => !keyword || json(item).toLowerCase().includes(keyword));
   const rows = activeItems.map((item) => {
     const id = item.id || item.review_id || "";
+    const selection = batchEnabled
+      ? `<td><input type="checkbox" data-review-select data-review-kind="${attr(reviewMode)}" data-review-id="${attr(id)}" ${state.selectedReviews.has(reviewSelectionKey(reviewMode, id)) ? "checked" : ""}></td>`
+      : "";
     const contentText = reviewMode === "jargon"
       ? `${item.content || "-"}${item.meaning ? `\n含义：${item.meaning}` : ""}${item.scene ? `\n场景：${item.scene}` : ""}`
       : (item.expression || item.text || item.pattern || item.content || "-");
     return `
       <tr>
+        ${selection}
         <td>${escapeHtml(id || "-")}</td>
         <td><div class="content-preview">${escapeHtml(previewText(contentText, 180))}</div></td>
         <td>${statusChip(item.review_status || item.status || "pending", item.status === "rejected" ? "danger" : "")}</td>
@@ -1570,6 +1650,16 @@ async function loadReviews() {
   const emptyText = state.reviewTab.startsWith("jargon")
     ? "当前黑话分类暂无数据。若 Dashboard 显示黑话待审核，请确认正在查看“黑话待审”。"
     : "当前表达习惯暂无数据。黑话审核在同页的“黑话待审/黑话全量”中查看。";
+  const batchToolbar = batchEnabled ? `
+    <div class="filter-bar review-batch-toolbar">
+      <label class="inline-label"><input type="checkbox" data-review-select-all> 全选当前页</label>
+      <span class="muted" data-review-selection-count>已选 0 条</span>
+      <button class="primary-button" data-review-batch-action="approve" type="button" disabled>批量通过</button>
+      <button class="danger-button" data-review-batch-action="reject" type="button" disabled>批量拒绝</button>
+      <button class="ghost-button" data-review-clear-selection type="button">清空选择</button>
+    </div>
+  ` : "";
+  const reviewHeaders = batchEnabled ? ["选择", "ID", "内容", "状态", "权重/置信度", "操作"] : ["ID", "内容", "状态", "权重/置信度", "操作"];
   content().innerHTML = `
     ${pageHeader("表达与黑话审核 Reviews", "待审队列和全量库查阅按当前分类加载；候选可先查看证据，再编辑、通过或驳回。")}
     ${totals}
@@ -1580,7 +1670,7 @@ async function loadReviews() {
       { id: "expression_pending", label: "表达待审" },
       { id: "expression_all", label: "表达全量" },
     ], "review-tab")}
-    ${section(title, "批准、驳回或查看 AI 提取的表达/黑话候选。", `${table(["ID", "内容", "状态", "权重/置信度", "操作"], rows, emptyText)}${state.reviewTab === "expression_all" ? `
+    ${section(title, "批准、驳回或查看 AI 提取的表达/黑话候选。", `${batchToolbar}${table(reviewHeaders, rows, emptyText)}${state.reviewTab === "expression_all" ? `
       <div class="row-actions">
         <button class="ghost-button" data-review-page="${state.cache.reviews.expressionAll.page - 1}" type="button" ${state.cache.reviews.expressionAll.page <= 1 ? "disabled" : ""}>上一页</button>
         <span>第 ${state.cache.reviews.expressionAll.page} / ${Math.max(1, Math.ceil(state.cache.reviews.expressionAll.total / state.cache.reviews.expressionAll.page_size))} 页，共 ${state.cache.reviews.expressionAll.total} 条</span>
@@ -1588,14 +1678,17 @@ async function loadReviews() {
       </div>` : state.reviewTab.startsWith("jargon") ? renderOffsetPager(state.reviewTab === "jargon_pending" ? "jargon-pending" : "jargon-all", activePage) : ""}`)}
   `;
   $$('[data-review-tab]').forEach((button) => button.addEventListener("click", () => {
+    clearReviewSelection();
     state.reviewTab = button.dataset.reviewTab;
     loadReviews();
   }));
   $$('[data-review-page]').forEach((button) => button.addEventListener("click", () => {
+    clearReviewSelection();
     state.cache.reviews.expressionAll.page = Math.max(1, Number(button.dataset.reviewPage || 1));
     loadReviews();
   }));
   $('[data-review-search]')?.addEventListener("change", (event) => {
+    clearReviewSelection();
     state.cache.reviews.filters.keyword = event.target.value.trim();
     state.cache.reviews.jargonPending.offset = 0;
     state.cache.reviews.jargonAll.offset = 0;
@@ -1603,10 +1696,12 @@ async function loadReviews() {
     loadReviews();
   });
   $$('[data-jargon-pending-page]').forEach((button) => button.addEventListener("click", () => {
+    clearReviewSelection();
     state.cache.reviews.jargonPending.offset = Math.max(0, Number(button.dataset.jargonPendingPage || 0));
     loadReviews();
   }));
   $$('[data-jargon-all-page]').forEach((button) => button.addEventListener("click", () => {
+    clearReviewSelection();
     state.cache.reviews.jargonAll.offset = Math.max(0, Number(button.dataset.jargonAllPage || 0));
     loadReviews();
   }));
@@ -1615,6 +1710,34 @@ async function loadReviews() {
     openModal("候选详情与证据", `<pre>${escapeHtml(json(item || {}))}</pre>`);
   }));
   $('[data-jargon-noise-preview]')?.addEventListener("click", openJargonNoisePreview);
+  if (batchEnabled) {
+    $$('[data-review-select]').forEach((checkbox) => checkbox.addEventListener("change", () => {
+      const key = reviewSelectionKey(checkbox.dataset.reviewKind, checkbox.dataset.reviewId);
+      if (checkbox.checked) state.selectedReviews.add(key);
+      else state.selectedReviews.delete(key);
+      syncReviewSelectionControls(reviewMode, activeItems);
+    }));
+    $('[data-review-select-all]')?.addEventListener("change", (event) => {
+      activeItems.forEach((item) => {
+        const id = String(item.id || item.review_id || "");
+        if (!id) return;
+        const key = reviewSelectionKey(reviewMode, id);
+        if (event.target.checked) state.selectedReviews.add(key);
+        else state.selectedReviews.delete(key);
+      });
+      $$('[data-review-select]').forEach((checkbox) => { checkbox.checked = event.target.checked; });
+      syncReviewSelectionControls(reviewMode, activeItems);
+    });
+    $('[data-review-clear-selection]')?.addEventListener("click", () => {
+      clearReviewSelection();
+      $$('[data-review-select]').forEach((checkbox) => { checkbox.checked = false; });
+      syncReviewSelectionControls(reviewMode, activeItems);
+    });
+    $$('[data-review-batch-action]').forEach((button) => button.addEventListener("click", () => {
+      runBatchReviewAction(reviewMode, button.dataset.reviewBatchAction);
+    }));
+    syncReviewSelectionControls(reviewMode, activeItems);
+  }
   bindReviewActions();
 }
 

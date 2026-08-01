@@ -159,6 +159,9 @@ class AstrMaiAdminPageApi:
     async def tools_status(self, request: Any) -> dict[str, Any]:
         return await self._admin().tools_status()
 
+    async def tools_catalog(self, request: Any) -> dict[str, Any]:
+        return await self._admin().tools_catalog()
+
     async def tools_policy(self, request: Any) -> dict[str, Any]:
         return await self._admin().tools_policy()
 
@@ -412,7 +415,11 @@ class AstrMaiAdminPageApi:
     async def batch_review(self, request: Any) -> dict[str, Any]:
         body = await self._body(request)
         ids = self._strings(body.get("ids"))
-        return await self._reviews().batch_review(ids, str(body.get("action", "")))
+        action = str(body.get("action", ""))
+        kind = str(body.get("kind", "") or "").strip()
+        if kind:
+            return await self._reviews().batch_review(ids, action, kind=kind)
+        return await self._reviews().batch_review(ids, action)
 
     async def create_review(self, request: Any) -> dict[str, Any]:
         return await self._reviews().create_review(await self._body(request))
@@ -686,6 +693,7 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("GET", "/runtime/models", api.runtime_models, "AstrMai runtime models"),
         ("GET", "/runtime/health", api.runtime_health, "AstrMai runtime health"),
         ("GET", "/tools/status", api.tools_status, "AstrMai tools status"),
+        ("GET", "/tools/catalog", api.tools_catalog, "AstrMai tools catalog"),
         ("GET", "/tools/policy", api.tools_policy, "AstrMai tools policy"),
         ("GET", "/tools/recent-calls", api.recent_tool_calls, "AstrMai recent tool calls"),
         ("GET", "/tools/executions", api.recent_tool_executions, "AstrMai recent tool executions"),

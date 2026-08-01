@@ -71,6 +71,42 @@ class WebUiGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(calls, [(["mem-review-1", "2"], "approve")])
 
+    def test_admin_api_forwards_batch_review_kind(self):
+        from astrmai.webui.plugin_pages import AstrMaiAdminPageApi
+
+        calls = []
+
+        class _Reviews:
+            async def batch_review(self, ids, action, *, kind):
+                calls.append((ids, action, kind))
+                return {"status": "ok", "updated": 2}
+
+        api = AstrMaiAdminPageApi(SimpleNamespace(runtime=None))
+        api._reviews = lambda: _Reviews()
+        request = SimpleNamespace(
+            path_params={},
+            query_params={},
+            json=lambda: {"ids": ["jargon-1", "jargon-2"], "action": "reject", "kind": "jargon"},
+        )
+
+        asyncio.run(api.batch_review(request))
+
+        self.assertEqual(calls, [(["jargon-1", "jargon-2"], "reject", "jargon")])
+
+    def test_tools_catalog_falls_back_to_static_catalog_without_runtime_planner(self):
+        from astrmai.webui.backend.services.admin_ui_service import AdminUiService
+
+        class _PluginApi:
+            def get_planner(self):
+                return None
+
+        catalog = asyncio.run(AdminUiService(_PluginApi()).tools_catalog())
+
+        self.assertEqual(catalog["status"], "ok")
+        self.assertFalse(catalog["runtime_bound"])
+        self.assertGreater(catalog["data"]["total"], 0)
+        self.assertTrue(all("name" in item and "tier" in item for item in catalog["data"]["items"]))
+
     def test_admin_api_treats_string_migration_source_as_one_source(self):
         from astrmai.webui.plugin_pages import AstrMaiAdminPageApi
 

@@ -1064,6 +1064,13 @@
         "default": 2,
         "hint": "同一表达至少出现多少次，才会送入模型整理。提高此值可减少偶然口语进入待审。"
       },
+      "expression_min_distinct_turns": {
+        "description": "表达候选最少不同消息证据数",
+        "type": "int",
+        "default": 3,
+        "minimum": 2,
+        "hint": "同一位群友的表达至少在不同消息中重复出现到此次数，才会进入表达学习，避免把一次话题内容误学成口癖。"
+      },
       "jargon_min_count": {
         "description": "黑话进入审核的最小证据次数",
         "type": "int",

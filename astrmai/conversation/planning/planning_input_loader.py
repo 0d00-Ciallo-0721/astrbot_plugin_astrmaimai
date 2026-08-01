@@ -308,19 +308,29 @@ class PlanningInputLoader:
             return ""
         recent_text = self.planner._planner_side_input_text(prompt_envelope, window_lines, recent_only=True)
         expression_think_level = 1 if think_level >= 1 and (len(recent_text) >= 40 or len(window_lines) >= 2) else 0
+        sender_id = ""
+        get_sender_id = getattr(event, "get_sender_id", None)
+        if callable(get_sender_id):
+            try:
+                sender_id = str(get_sender_id() or "").strip()
+            except Exception:
+                sender_id = ""
+        if not sender_id:
+            sender_id = str(getattr(getattr(event, "message_obj", None), "user_id", "") or "").strip()
+        expression_scope = f"{chat_id}:user:{sender_id}" if sender_id else chat_id
         if hasattr(selector, "select_with_trace"):
             text, selected = await selector.select_with_trace(
                 chat_id=chat_id,
                 context_text=recent_text,
                 think_level=expression_think_level,
-                shared_scope=chat_id,
+                shared_scope=expression_scope,
             )
         else:
             text = await selector.select(
                 chat_id=chat_id,
                 context_text=recent_text,
                 think_level=expression_think_level,
-                shared_scope=chat_id,
+                shared_scope=expression_scope,
             )
             selected = []
         decision = ensure_turn_context(event).expression_patterns

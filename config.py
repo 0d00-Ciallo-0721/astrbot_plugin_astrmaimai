@@ -205,6 +205,7 @@ class EvolutionConfig(BaseModel):
     review_batch_size: int = Field(default=10, ge=1, description="每轮自动审核表达条目的最大数量")
     review_min_count: int = Field(default=2, ge=1, description="表达进入自动审核前所需的最少命中次数")
     expression_min_count: int = Field(default=2, ge=1, description="表达候选进入模型增强前所需的最少独立证据次数")
+    expression_min_distinct_turns: int = Field(default=3, ge=2, description="同一群友表达进入学习前所需的最少不同消息证据数")
     enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
     jargon_min_count: int = Field(default=2, ge=1, description="黑话进入自动审核前所需的最少证据次数")
     review_runner_interval_sec: int = Field(default=60, ge=30, le=600)

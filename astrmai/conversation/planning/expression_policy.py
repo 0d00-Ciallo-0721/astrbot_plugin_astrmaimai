@@ -686,9 +686,26 @@ class ExpressionSelector:
     def _format_habits(patterns: List[ExpressionPattern]) -> str:
         if not patterns:
             return ''
+        habit_labels = {
+            'catchphrase': '口癖',
+            'particle': '语气词',
+            'sentence_pattern': '句式习惯',
+            'ending': '句末习惯',
+            'symbol': '颜文字/符号习惯',
+            'rhythm': '回复节奏',
+        }
         lines = ['在回复时，你可以参考以下语气/节奏，不要原句复读，也不要把它当固定台词：']
         for pattern in patterns:
-            lines.append(f'类似「{pattern.situation}」的场景，可借用这种感觉：{pattern.expression}')
+            metadata = dict(getattr(pattern, 'metadata', {}) or {})
+            habit_type = str(metadata.get('habit_type') or '').strip()
+            style = str(getattr(pattern, 'style', '') or metadata.get('style') or '').strip()
+            habit_label = habit_labels.get(habit_type, habit_type)
+            features = '；'.join(item for item in (habit_label, style) if item)
+            feature_text = f'（特征：{features}）' if features else ''
+            if habit_type == 'rhythm':
+                lines.append(f'回复节奏可参考{feature_text}：{pattern.expression}；只模仿节奏，不要把这段说明写进回复。')
+            else:
+                lines.append(f'类似「{pattern.situation}」的场景，可借用这种感觉{feature_text}：{pattern.expression}')
         return '\n'.join(lines)
 
 

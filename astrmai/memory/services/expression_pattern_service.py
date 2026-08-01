@@ -189,8 +189,13 @@ class ExpressionPatternService:
                 continue
             if not include_rejected and record.rejected:
                 continue
-            if shared_scope is not None and record.shared_scope and record.shared_scope != shared_scope:
-                continue
+            if shared_scope is not None:
+                requested_scope = str(shared_scope or "").strip()
+                # New records are speaker-scoped; legacy group-scoped records remain
+                # readable as a compatibility fallback for the same chat only.
+                allowed_scopes = {requested_scope, str(group_id or "").strip()}
+                if record.shared_scope not in allowed_scopes:
+                    continue
             if think_level is not None and int(record.think_level or 0) > int(think_level or 0):
                 continue
             if review_status and str(record.review_status or "").strip().lower() != str(review_status).strip().lower():
@@ -217,7 +222,7 @@ class ExpressionPatternService:
         return [
             item
             for item in rows
-            if str(item.review_status or "").strip().lower() in {"pending", "revision_needed"}
+            if str(item.review_status or "").strip().lower() in {"pending", "pending_human", "revision_needed"}
         ][: max(int(limit or 20), 1)]
 
     async def list_governance_groups(self, *, limit: int = 500) -> list[str]:
@@ -500,6 +505,20 @@ class ExpressionPatternService:
             **existing_metadata,
             "situation": situation,
             "style": str(payload.get("style") or existing_metadata.get("style") or "").strip(),
+            "habit_type": str(payload.get("habit_type") or existing_metadata.get("habit_type") or "sentence_pattern").strip(),
+            "content_kind": str(payload.get("content_kind") or existing_metadata.get("content_kind") or "expression").strip(),
+            "normalized_pattern": str(payload.get("normalized_pattern") or existing_metadata.get("normalized_pattern") or "").strip(),
+            "speaker_id": str(payload.get("speaker_id") or existing_metadata.get("speaker_id") or "").strip(),
+            "speaker_name": str(payload.get("speaker_name") or existing_metadata.get("speaker_name") or "").strip(),
+            "scope_kind": str(payload.get("scope_kind") or existing_metadata.get("scope_kind") or "group").strip(),
+            "distinct_turn_count": max(
+                int(existing_metadata.get("distinct_turn_count") or 0),
+                int(payload.get("distinct_turn_count") or len(incoming_evidence_ids) or 0),
+            ),
+            "distinct_day_count": max(
+                int(existing_metadata.get("distinct_day_count") or 0),
+                int(payload.get("distinct_day_count") or 0),
+            ),
             "content_samples": merged_samples,
             "shared_scope": shared_scope,
             "think_level": int(payload.get("think_level") or existing_metadata.get("think_level") or 0),

@@ -35,6 +35,11 @@ class ExpressionPatternEnricher:
         evidence_ids = {str(item) for item in candidate.get("evidence_message_ids", []) if str(item).strip()}
         if candidate.get("candidate_type") != "exact" or int(candidate.get("count") or 0) < 3:
             return False
+        if str(candidate.get("content_kind") or "expression").strip().lower() != "expression":
+            return False
+        habit_type = str(candidate.get("habit_type") or "").strip().lower()
+        if habit_type and habit_type not in {"catchphrase", "particle", "ending", "symbol", "rhythm"}:
+            return False
         if len(evidence_ids) < 2 or not (2 <= len(expression) <= 40):
             return False
         lowered = expression.lower()
@@ -74,15 +79,26 @@ class ExpressionPatternEnricher:
                     "expression": str(item.get("expression") or ""),
                     "situation": str(item.get("situation") or ""),
                     "style": str(item.get("style") or ""),
+                    "habit_type": str(item.get("habit_type") or ""),
+                    "content_kind": str(item.get("content_kind") or "expression"),
+                    "candidate_origin": str(item.get("candidate_origin") or "message_text"),
+                    "speaker_id": str(item.get("speaker_id") or ""),
+                    "speaker_name": str(item.get("speaker_name") or ""),
+                    "shared_scope": str(item.get("shared_scope") or ""),
+                    "distinct_turn_count": int(item.get("distinct_turn_count") or len(item.get("evidence_message_ids") or [])),
                     "count": int(item.get("count") or 1),
                     "samples": list(item.get("content_samples") or [])[:4],
                 }
             )
         prompt = (
-            "Enhance these conversation expression-pattern candidates. "
-            "Keep the same expression unless a very small cleanup is needed. "
+            "你是群聊表达习惯审核器。你的任务是识别某一位群友稳定的说话方式，而不是总结聊天主题。"
+            "表达习惯只包括：口癖、语气词、句式习惯、句末习惯、颜文字/符号习惯、回复节奏。"
+            "领域词、物品名、作品名、人名、群名、事件事实、技术术语、单次话题内容必须 reject，"
+            "这些内容由黑话/领域词学习器处理。不要把候选改写成机器人自己的台词，也不要跨发言者合并。"
+            "必须保留候选原文 expression，不得扩写或替换，只能在 summary/style 中说明其语言特征。"
             "Return exactly one decision for every candidate. Return JSON only: "
             "{\"items\":[{\"candidate_id\":\"...\",\"index\":1,\"decision\":\"keep|reject\","
+            "\"content_kind\":\"expression|topic_content\",\"habit_type\":\"catchphrase|particle|sentence_pattern|ending|symbol|rhythm\","
             "\"summary\":\"...\",\"situation\":\"...\","
             "\"style\":\"...\",\"confidence\":0.0,\"review_status\":\"pending|pending_human|rejected\","
             "\"review_reason\":\"...\",\"content_samples\":[\"...\"]}]}\n"
@@ -117,20 +133,26 @@ class ExpressionPatternEnricher:
     def _enrich_payload(self, item: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any] | None:
         decision = str(extra.get("decision") or "").strip().lower()
         review_status = self._normalize_review_status(extra.get("review_status"))
-        if decision == "reject" or review_status == "rejected":
+        content_kind = str(extra.get("content_kind") or item.get("content_kind") or "expression").strip().lower()
+        if decision == "reject" or review_status == "rejected" or content_kind in {"topic", "topic_content", "jargon", "fact"}:
             return None
         payload = dict(item)
         try:
             confidence = float(extra.get("confidence") or payload.get("activation_score") or 0.6)
         except (TypeError, ValueError):
             confidence = float(payload.get("activation_score") or 0.6)
-        payload["expression"] = str(extra.get("expression") or payload.get("expression") or "").strip()
+        # The model may classify and describe a candidate, but never invent a new habit string.
+        payload["expression"] = str(payload.get("expression") or "").strip()
         payload["summary"] = str(extra.get("summary") or payload.get("expression") or "").strip()
         payload["situation"] = str(extra.get("situation") or payload.get("situation") or "").strip()
         payload["style"] = str(extra.get("style") or payload.get("style") or "").strip()
         payload["confidence"] = max(0.0, min(confidence, 1.0))
         payload["review_status"] = review_status
         payload["review_reason"] = str(extra.get("review_reason") or "").strip()
+        payload["content_kind"] = "expression"
+        habit_type = str(extra.get("habit_type") or payload.get("habit_type") or "sentence_pattern").strip().lower()
+        allowed_habit_types = {"catchphrase", "particle", "sentence_pattern", "ending", "symbol", "rhythm"}
+        payload["habit_type"] = habit_type if habit_type in allowed_habit_types else "sentence_pattern"
         model_samples = [str(sample).strip() for sample in extra.get("content_samples", []) if str(sample).strip()]
         payload["content_samples"] = list(dict.fromkeys([*(payload.get("content_samples") or []), *model_samples]))[:6]
         return payload if payload["expression"] and payload["summary"] else None

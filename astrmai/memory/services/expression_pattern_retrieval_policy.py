@@ -70,8 +70,12 @@ class ExpressionPatternRetrievalPolicy:
             pattern_think_level = int(metadata.get("think_level") or 0)
             if review_status not in {"approved", "active"}:
                 continue
-            if shared_scope and pattern_scope and pattern_scope != shared_scope:
-                continue
+            if shared_scope:
+                # Prefer the current speaker's scope, while allowing legacy records
+                # written at chat scope. Never admit another speaker's scope.
+                allowed_scopes = {str(shared_scope).strip(), str(session_id or "").strip()}
+                if pattern_scope not in allowed_scopes:
+                    continue
             if think_level is not None and pattern_think_level > int(think_level or 0):
                 continue
             score = self._match_score(item, tokens)

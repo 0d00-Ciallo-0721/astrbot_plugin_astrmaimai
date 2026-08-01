@@ -37,6 +37,7 @@ class ReviewActionRequest(BaseModel):
 class BatchReviewRequest(BaseModel):
     ids: list[str] = Field(default_factory=list)
     action: str
+    kind: str = "expression"
 
 
 class PagedResponse(BaseModel, Generic[T]):
