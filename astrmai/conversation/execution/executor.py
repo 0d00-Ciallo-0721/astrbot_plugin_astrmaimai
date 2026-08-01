@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 import re
 import time
 from time import monotonic
@@ -41,7 +42,11 @@ from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..planning.tool_contracts import record_tool_lifecycle
-from ..planning.tool_disclosure import normalize_requested_packages, select_tools_by_packages
+from ..planning.tool_disclosure import (
+    FAMILY_TO_PACKAGES,
+    normalize_requested_packages,
+    select_tools_by_packages,
+)
 from .group_actor_consistency import GroupActorConsistencyGuard
 from .reply_freshness import ReplyFreshnessMixin, is_stale_reply_reason, resolve_reply_max_age_seconds
 from ...infrastructure.runtime.turn_call_ledger import (
@@ -146,7 +151,13 @@ class ConcurrentExecutor:
             "astrmai_post_hook_system_hash",
             "astrmai_tool_execution_trace",
             "astrmai_tool_lifecycle_trace",
+            "astrmai_tool_intent_contracts",
             "astrmai_tool_invocation_plans",
+            "astrmai_tool_contract_outcomes",
+            "astrmai_tool_contract_unsatisfied",
+            "astrmai_tool_correction_pass_used",
+            "astrmai_tool_correction_packages",
+            "astrmai_tool_correction_reason",
             "astrmai_required_tools",
             "astrmai_prepared_required_tools",
             "astrmai_requested_tool_packages",
@@ -168,18 +179,28 @@ class ConcurrentExecutor:
 
     @staticmethod
     def _record_required_tool_outcomes(event: AstrMessageEvent) -> list[str]:
-        required = {
-            str(name or "").strip()
-            for name in event.get_extra("astrmai_required_tools", []) or []
-            if str(name or "").strip()
-        }
-        if not required:
+        raw_plans = event.get_extra("astrmai_tool_invocation_plans", []) or []
+        plans = [dict(item) for item in raw_plans if isinstance(item, dict) and item.get("required", True)]
+        if not plans:
+            plans = [
+                {
+                    "tool_name": str(name or "").strip(),
+                    "family": "",
+                    "required": True,
+                    "acceptable_statuses": ["success"],
+                    "acceptable_source_domains": [],
+                    "operation": "",
+                }
+                for name in event.get_extra("astrmai_required_tools", []) or []
+                if str(name or "").strip()
+            ]
+        if not plans:
             return []
-        executed = {
-            str(item.get("tool_name") or "").strip()
+        execution_trace = [
+            dict(item)
             for item in event.get_extra("astrmai_tool_execution_trace", []) or []
-            if isinstance(item, dict) and str(item.get("status", "success")) == "success"
-        }
+            if isinstance(item, dict)
+        ]
         queued = {
             str(item.get("tool") or "").strip()
             for item in event.get_extra("astrmai_tool_lifecycle_trace", []) or []
@@ -189,7 +210,7 @@ class ConcurrentExecutor:
             str(name or "").strip()
             for name in event.get_extra("astrmai_prepared_required_tools", []) or []
         }
-        satisfied = executed | queued | prepared
+        satisfied = queued | prepared
         current_group_id = ""
         if hasattr(event, "get_group_id"):
             try:
@@ -206,10 +227,51 @@ class ConcurrentExecutor:
             for item in event.get_extra("astrmai_pending_actions", []) or []
         )
         missing: list[str] = []
-        for tool_name in sorted(required):
-            is_satisfied = tool_name in satisfied
+        outcomes: list[dict[str, Any]] = []
+        for plan in plans:
+            tool_name = str(plan.get("tool_name") or "").strip()
+            if not tool_name:
+                continue
+            family = str(plan.get("family") or "").strip()
+            acceptable_statuses = {
+                str(status or "").strip()
+                for status in plan.get("acceptable_statuses", ["success"]) or ["success"]
+                if str(status or "").strip()
+            }
+            acceptable_domains = {
+                str(domain or "").strip()
+                for domain in plan.get("acceptable_source_domains", []) or []
+                if str(domain or "").strip()
+            }
+            expected_operation = str(plan.get("operation") or "").strip()
+            matching = [
+                item
+                for item in execution_trace
+                if str(item.get("tool_name") or "").strip() == tool_name
+            ]
+            accepted_execution = None
+            mismatch_reason = "model_did_not_call_required_tool"
+            for item in reversed(matching):
+                status = str(item.get("status", "success") or "success").strip()
+                source_domain = str(item.get("source_domain") or "").strip()
+                operation = str(item.get("operation") or "").strip()
+                if status not in acceptable_statuses:
+                    mismatch_reason = f"tool_status_{status or 'unknown'}"
+                    continue
+                if acceptable_domains and source_domain not in acceptable_domains:
+                    mismatch_reason = "tool_source_domain_mismatch"
+                    continue
+                if expected_operation and operation != expected_operation:
+                    mismatch_reason = "tool_operation_mismatch"
+                    continue
+                accepted_execution = item
+                break
+
+            is_satisfied = accepted_execution is not None or tool_name in satisfied
             if tool_name == "construct_at_event":
                 is_satisfied = bool(verified_at_action)
+                if not is_satisfied:
+                    mismatch_reason = "at_action_not_verified_in_current_group"
             if is_satisfied:
                 record_tool_lifecycle(
                     event,
@@ -217,28 +279,107 @@ class ConcurrentExecutor:
                     "required_tool_outcome",
                     status="satisfied",
                 )
+                outcome = "satisfied"
+                reason = "accepted_tool_result" if accepted_execution is not None else "deterministic_fallback_ready"
             else:
-                missing.append(tool_name)
+                if tool_name not in missing:
+                    missing.append(tool_name)
                 record_tool_lifecycle(
                     event,
                     tool_name,
                     "required_tool_outcome",
                     source="model_tool_call",
                     status="missing",
-                    reason="model_did_not_call_required_tool",
+                    reason=mismatch_reason,
                 )
+                outcome = "unsatisfied"
+                reason = mismatch_reason
+            observed = accepted_execution or (matching[-1] if matching else {})
+            outcomes.append(
+                {
+                    "tool_name": tool_name,
+                    "family": family,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "expected_source_domains": sorted(acceptable_domains),
+                    "expected_operation": expected_operation,
+                    "acceptable_statuses": sorted(acceptable_statuses),
+                    "observed_status": str(observed.get("status") or ""),
+                    "observed_source_domain": str(observed.get("source_domain") or ""),
+                    "observed_operation": str(observed.get("operation") or ""),
+                }
+            )
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_required_tool_missing", list(missing))
+            event.set_extra("astrmai_tool_contract_outcomes", outcomes)
+            event.set_extra("astrmai_tool_contract_unsatisfied", list(missing))
+        turn_context = event.get_extra("astrmai_turn_context", None)
+        tools_state = getattr(turn_context, "tools", None)
+        if tools_state is not None:
+            tools_state.contract_outcomes = list(outcomes)
+            tools_state.contract_unsatisfied = list(missing)
         return missing
 
     @staticmethod
-    def _required_tool_retry_prompt(api_prompt: str, missing_tools: list[str]) -> str:
+    def _request_contract_correction_packages(event: AstrMessageEvent, missing_tools: list[str]) -> list[str]:
+        missing = {str(name or "").strip() for name in missing_tools if str(name or "").strip()}
+        if not missing:
+            return []
+        plans = [
+            dict(item)
+            for item in event.get_extra("astrmai_tool_invocation_plans", []) or []
+            if isinstance(item, dict) and str(item.get("tool_name") or "").strip() in missing
+        ]
+        packages: list[str] = []
+        for plan in plans:
+            for package in FAMILY_TO_PACKAGES.get(str(plan.get("family") or "").strip(), ()):
+                if package not in packages:
+                    packages.append(package)
+        if not packages:
+            return []
+        existing = list(event.get_extra("astrmai_requested_tool_packages", []) or [])
+        merged = list(normalize_requested_packages([*existing, *packages]))
+        event.set_extra("astrmai_requested_tool_packages", merged)
+        return packages
+
+    @staticmethod
+    def _required_tool_retry_prompt(
+        api_prompt: str,
+        missing_tools: list[str],
+        expanded_packages: Optional[list[str]] = None,
+        invocation_plans: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         tool_list = "、".join(missing_tools)
+        disclosure_line = ""
+        if expanded_packages:
+            disclosure_line = "系统已追加工具包：" + "、".join(expanded_packages) + "。"
+        missing_set = {str(name or "").strip() for name in missing_tools if str(name or "").strip()}
+        contract_lines: list[str] = []
+        for plan in invocation_plans or []:
+            if not isinstance(plan, dict):
+                continue
+            tool_name = str(plan.get("tool_name") or "").strip()
+            if not tool_name or tool_name not in missing_set:
+                continue
+            contract = {
+                "tool": tool_name,
+                "entity_domain": str(plan.get("entity_domain") or "").strip(),
+                "operation": str(plan.get("operation") or "").strip(),
+                "target": str(plan.get("target") or "").strip(),
+                "arguments": dict(plan.get("prepared_arguments") or {}),
+            }
+            contract_lines.append(json.dumps(contract, ensure_ascii=False, separators=(",", ":")))
+        contract_block = ""
+        if contract_lines:
+            contract_block = "本轮未满足的结构化调用契约：\n" + "\n".join(contract_lines) + "\n"
         return (
             f"{api_prompt}\n\n"
             "[SYSTEM TOOL ENFORCEMENT]\n"
-            f"用户本轮明确要求的工具尚未执行：{tool_list}。"
-            "如果工具参数已经足够，你必须先各调用一次当前提供的工具，再依据真实工具结果回答原始请求。"
+            "[SYSTEM TOOL CORRECTION]\n"
+            f"{disclosure_line}用户本轮意图尚未被对应工具族满足：{tool_list or '上一轮申请的能力'}。"
+            f"{contract_block}"
+            "工具调用成功不等于任务完成；必须使用与实体域和操作匹配的工具，并依据真实结果回答。"
+            "如果工具参数已经足够，请先调用匹配工具；工具返回 not_found 时要如实传达未找到。"
             "如果无法可靠构造工具参数，不要猜测、不要伪造、不要声称已查询或已执行；"
             "请直接向用户追问缺少的目标、内容或上下文。"
         )
@@ -257,12 +398,18 @@ class ConcurrentExecutor:
             "proactive_meme": "发表情包",
             "qq_custom_face_send_tool": "发自定义表情",
             "message_reaction_action": "互动回应",
+            "qq_friend_lookup": "读取机器人 QQ 好友事实",
+            "self_lore_query": "查询角色设定人物",
         }
         tool_labels = [labels.get(name, name) for name in missing_tools]
         if "space_transition_action" in missing_tools:
             return "我还没能确认要发给谁、具体转达什么，所以没有发送。你把目标和要说的话都告诉我，我再帮你传达。"
         if "construct_at_event" in missing_tools:
             return "我还没能在当前群确认你要叫的人，所以没有发送假 @。请给我对方当前群昵称或 QQ 号。"
+        if "qq_friend_lookup" in missing_tools:
+            return "我还没能读取机器人自己的 QQ 好友列表，所以不能猜谁是好友。你可以稍后再试，或给我准确 QQ 号让我重新核对。"
+        if "self_lore_query" in missing_tools:
+            return "我还没能从当前角色设定里查到这个人物，所以不会拿现实好友或聊天记忆来冒充答案。请补充人物名或设定出处。"
         return "我还没能确认这次要执行的具体信息，所以没有操作。你再补充一下：" + "、".join(tool_labels)
 
     async def _handle_required_tool_missing(
@@ -1311,71 +1458,74 @@ class ConcurrentExecutor:
                     raw_user_text=runtime["raw_user_text"],
                 )
                 self._sync_execution_event_trace(execution_event, event)
+                missing_required = self._record_required_tool_outcomes(event)
+                auto_packages = self._request_contract_correction_packages(event, missing_required)
                 expanded_tools, expanded_packages = self._expand_tools_for_disclosure_request(event, tools)
-                if expanded_packages:
-                    tools = expanded_tools
-                    tool_set = ToolSet(tools)
+                correction_packages = list(dict.fromkeys([*auto_packages, *expanded_packages]))
+                needs_correction = bool(missing_required or expanded_packages)
+                if needs_correction:
+                    tools = expanded_tools if expanded_packages else tools
+                    missing_set = set(missing_required)
+                    correction_tools = list(tools)
+                    if missing_set:
+                        correction_tools = [
+                            tool
+                            for tool in tools
+                            if self._tool_name(tool) in missing_set | {"bot_capability_lookup"}
+                        ]
+                    if not correction_tools:
+                        correction_tools = list(tools)
+                    for tool_name in missing_required:
+                        record_tool_lifecycle(
+                            event,
+                            tool_name,
+                            "required_tool_retry",
+                            source="executor_contract_correction",
+                            status="started",
+                        )
+                    correction_reason = (
+                        "unsatisfied_tool_contracts(" + ",".join(missing_required) + ")"
+                        if missing_required
+                        else "model_requested_disclosure"
+                    )
+                    event.set_extra("astrmai_tool_correction_pass_used", True)
+                    event.set_extra("astrmai_tool_correction_packages", correction_packages)
+                    event.set_extra("astrmai_tool_correction_reason", correction_reason)
+                    turn_context = event.get_extra("astrmai_turn_context", None)
+                    tools_state = getattr(turn_context, "tools", None)
+                    if tools_state is not None:
+                        tools_state.correction_pass_used = True
+                        tools_state.correction_packages = list(correction_packages)
+                        tools_state.correction_reason = correction_reason
                     result = await self.gateway.tool_chat_in_lane_result(
                         lane_key=runtime["dialog_lane_key"],
                         base_origin=runtime["dialog_base_origin"],
                         event=execution_event,
-                        prompt=(
-                            f"{api_prompt}\n\n"
-                            "[SYSTEM TOOL DISCLOSURE]\n"
-                            "系统已按上一轮工具能力自检追加工具包："
-                            + "、".join(expanded_packages)
-                            + "。请先使用新增工具获取事实，再给出最终回复。"
+                        prompt=self._required_tool_retry_prompt(
+                            api_prompt,
+                            missing_required,
+                            correction_packages,
+                            list(event.get_extra("astrmai_tool_invocation_plans", []) or []),
                         ),
                         system_prompt=system_prompt,
-                        tools=tool_set,
+                        tools=ToolSet(correction_tools),
                         models=[provider_id],
-                        max_steps=runtime["max_steps"],
+                        max_steps=max(2, runtime["max_steps"]),
                         timeout=runtime["timeout"],
                         image_urls=image_urls,
                         prefix_hash=runtime["prefix_hash"],
                         raw_user_text=runtime["raw_user_text"],
                     )
                     self._sync_execution_event_trace(execution_event, event)
-                missing_required = self._record_required_tool_outcomes(event)
+                    missing_required = self._record_required_tool_outcomes(event)
                 if missing_required:
-                    retry_tools = [
-                        tool
-                        for tool in tools
-                        if str(getattr(tool, "name", "") or "").strip() in set(missing_required)
-                    ]
-                    if retry_tools:
-                        for tool_name in missing_required:
-                            record_tool_lifecycle(
-                                event,
-                                tool_name,
-                                "required_tool_retry",
-                                source="executor_enforcement",
-                                status="started",
-                            )
-                        result = await self.gateway.tool_chat_in_lane_result(
-                            lane_key=runtime["dialog_lane_key"],
-                            base_origin=runtime["dialog_base_origin"],
-                            event=execution_event,
-                            prompt=self._required_tool_retry_prompt(api_prompt, missing_required),
-                            system_prompt=system_prompt,
-                            tools=ToolSet(retry_tools),
-                            models=[provider_id],
-                            max_steps=max(2, runtime["max_steps"]),
-                            timeout=runtime["timeout"],
-                            image_urls=image_urls,
-                            prefix_hash=runtime["prefix_hash"],
-                            raw_user_text=runtime["raw_user_text"],
-                        )
-                        self._sync_execution_event_trace(execution_event, event)
-                        missing_required = self._record_required_tool_outcomes(event)
-                    if missing_required:
-                        return await self._handle_required_tool_missing(
-                            event,
-                            chat_id,
-                            runtime["bot_id"],
-                            sorted(missing_required),
-                            model=provider_id,
-                        )
+                    return await self._handle_required_tool_missing(
+                        event,
+                        chat_id,
+                        runtime["bot_id"],
+                        sorted(missing_required),
+                        model=provider_id,
+                    )
                 reply_text = result.text
                 if not reply_text:
                     raise ValueError("empty tool reply")

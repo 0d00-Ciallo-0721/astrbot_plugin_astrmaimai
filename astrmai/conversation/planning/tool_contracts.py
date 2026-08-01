@@ -26,6 +26,12 @@ class ToolInvocationPlan:
     required: bool
     deterministic_fallback: bool
     reason: str
+    entity_domain: str = ""
+    operation: str = ""
+    target: str = ""
+    prepared_arguments: dict[str, Any] | None = None
+    acceptable_statuses: tuple[str, ...] = ("success",)
+    acceptable_source_domains: tuple[str, ...] = ()
 
 
 TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
@@ -156,17 +162,25 @@ def filter_tools_for_context(
 def build_explicit_invocation_plans(
     families: Iterable[str],
     available_tool_names: Iterable[str],
+    *,
+    intent_contracts: Iterable[Any] | None = None,
 ) -> list[ToolInvocationPlan]:
     available = {str(name or "").strip() for name in available_tool_names}
     requested = {str(item or "").strip() for item in families}
     ordered_families = [family for family in FAMILY_TO_TOOL if family in requested]
     ordered_families.extend(family for family in requested if family and family not in FAMILY_TO_TOOL)
+    contracts_by_family = {
+        str(getattr(contract, "family", "") or ""): contract
+        for contract in intent_contracts or []
+        if str(getattr(contract, "family", "") or "")
+    }
     plans: list[ToolInvocationPlan] = []
     for family in ordered_families:
         tool_name = FAMILY_TO_TOOL.get(family)
         spec = TOOL_CAPABILITIES.get(tool_name or "")
         if not spec or tool_name not in available:
             continue
+        contract = contracts_by_family.get(family)
         plans.append(
             ToolInvocationPlan(
                 tool_name=tool_name,
@@ -174,7 +188,17 @@ def build_explicit_invocation_plans(
                 source="explicit_user_request",
                 required=True,
                 deterministic_fallback=spec.deterministic_fallback,
-                reason=f"explicit_{family}_intent",
+                reason=str(getattr(contract, "reason", "") or f"explicit_{family}_intent"),
+                entity_domain=str(getattr(contract, "entity_domain", "") or ""),
+                operation=str(getattr(contract, "operation", "") or ""),
+                target=str(getattr(contract, "target", "") or ""),
+                prepared_arguments=dict(getattr(contract, "prepared_arguments", {}) or {}),
+                acceptable_statuses=tuple(
+                    getattr(contract, "acceptable_statuses", ("success",)) or ("success",)
+                ),
+                acceptable_source_domains=tuple(
+                    getattr(contract, "acceptable_source_domains", ()) or ()
+                ),
             )
         )
     return plans

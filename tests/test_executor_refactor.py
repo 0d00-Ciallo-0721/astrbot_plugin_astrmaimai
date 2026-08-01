@@ -363,6 +363,255 @@ class RefactoredExecutorTests(unittest.TestCase):
         lifecycle = event.get_extra("astrmai_tool_lifecycle_trace", [])
         self.assertTrue(any(item["phase"] == "required_tool_retry" for item in lifecycle))
 
+    def test_tool_mode_corrects_irrelevant_success_with_exact_domain_tool(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            execution_event = kwargs["event"]
+            if calls == 1:
+                execution_event.set_extra(
+                    "astrmai_tool_execution_trace",
+                    [{"tool_name": "omni_perception_query", "status": "success"}],
+                )
+                return "我从记忆里看到了一些人"
+            execution_event.set_extra(
+                "astrmai_tool_execution_trace",
+                [
+                    {
+                        "tool_name": "qq_friend_lookup",
+                        "family": "friend_fact",
+                        "status": "success",
+                        "source_domain": "platform_friend",
+                        "operation": "list",
+                    }
+                ],
+            )
+            return "好友列表已经查到了"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(text="看看你的好友列表")
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "qq_friend_lookup",
+                    "family": "friend_fact",
+                    "required": True,
+                    "entity_domain": "platform_friend",
+                    "operation": "list",
+                    "target": "",
+                    "prepared_arguments": {"mode": "list", "target": ""},
+                    "acceptable_statuses": ["success"],
+                    "acceptable_source_domains": ["platform_friend"],
+                }
+            ],
+        )
+        tools = [
+            SimpleNamespace(name="omni_perception_query"),
+            SimpleNamespace(name="qq_friend_lookup"),
+            SimpleNamespace(name="bot_capability_lookup"),
+        ]
+
+        result = asyncio.run(executor.execute(event, "prompt", "system", tools=tools))
+
+        self.assertEqual(result, "好友列表已经查到了")
+        self.assertEqual(calls, 2)
+        self.assertTrue(event.get_extra("astrmai_tool_correction_pass_used"))
+        self.assertIn("identity", event.get_extra("astrmai_tool_correction_packages"))
+        self.assertEqual(event.get_extra("astrmai_tool_contract_unsatisfied"), [])
+        second_prompt = gateway.calls[1][1]["prompt"]
+        self.assertIn("SYSTEM TOOL CORRECTION", second_prompt)
+        self.assertIn('"entity_domain":"platform_friend"', second_prompt)
+        self.assertIn('"operation":"list"', second_prompt)
+        self.assertIn('"arguments":{"mode":"list","target":""}', second_prompt)
+
+    def test_tool_mode_retries_exact_tool_when_source_domain_is_wrong(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            execution_event = kwargs["event"]
+            source_domain = "conversation_memory" if calls == 1 else "persona_lore"
+            execution_event.set_extra(
+                "astrmai_tool_execution_trace",
+                [
+                    {
+                        "tool_name": "self_lore_query",
+                        "family": "self_lore",
+                        "status": "success",
+                        "source_domain": source_domain,
+                        "operation": "describe",
+                    }
+                ],
+            )
+            return "亚托莉是角色设定中的朋友"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(text="人设中的亚托莉是谁")
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "self_lore_query",
+                    "family": "self_lore",
+                    "required": True,
+                    "entity_domain": "persona_lore",
+                    "operation": "describe",
+                    "acceptable_statuses": ["success", "not_found"],
+                    "acceptable_source_domains": ["persona_lore"],
+                }
+            ],
+        )
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="self_lore_query")],
+            )
+        )
+
+        self.assertEqual(result, "亚托莉是角色设定中的朋友")
+        self.assertEqual(calls, 2)
+        outcomes = event.get_extra("astrmai_tool_contract_outcomes")
+        self.assertEqual(outcomes[0]["outcome"], "satisfied")
+
+    def test_tool_mode_accepts_truthful_not_found_as_terminal_result(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["event"].set_extra(
+                "astrmai_tool_execution_trace",
+                [
+                    {
+                        "tool_name": "qq_friend_lookup",
+                        "family": "friend_fact",
+                        "status": "not_found",
+                        "source_domain": "platform_friend",
+                        "operation": "match",
+                    }
+                ],
+            )
+            return "好友列表里没有找到这个人"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(text="萤是不是你的好友")
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "qq_friend_lookup",
+                    "family": "friend_fact",
+                    "required": True,
+                    "entity_domain": "platform_friend",
+                    "operation": "match",
+                    "acceptable_statuses": ["success", "not_found"],
+                    "acceptable_source_domains": ["platform_friend"],
+                }
+            ],
+        )
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="qq_friend_lookup")],
+            )
+        )
+
+        self.assertEqual(result, "好友列表里没有找到这个人")
+        self.assertEqual(calls, 1)
+        self.assertFalse(event.get_extra("astrmai_tool_correction_pass_used", False))
+
+    def test_tool_mode_stops_after_one_failed_contract_correction(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["event"].set_extra(
+                "astrmai_tool_execution_trace",
+                [
+                    {
+                        "tool_name": "qq_friend_lookup",
+                        "family": "friend_fact",
+                        "status": "failed",
+                        "source_domain": "platform_friend",
+                        "operation": "list",
+                        "reason": "friend_api_unavailable",
+                    }
+                ],
+            )
+            return "接口暂时不可用"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(text="看看你的好友列表")
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "qq_friend_lookup",
+                    "family": "friend_fact",
+                    "required": True,
+                    "entity_domain": "platform_friend",
+                    "operation": "list",
+                    "acceptable_statuses": ["success"],
+                    "acceptable_source_domains": ["platform_friend"],
+                }
+            ],
+        )
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="qq_friend_lookup")],
+            )
+        )
+
+        self.assertEqual(calls, 2)
+        self.assertIn("好友列表", result)
+        self.assertIn("不能猜", result)
+        self.assertEqual(len([call for call in gateway.calls if call[0] == "tool"]), 2)
+        self.assertEqual(event.get_extra("astrmai_tool_contract_unsatisfied"), ["qq_friend_lookup"])
+
     def test_tool_mode_missing_required_tool_sends_clarification_without_alert(self):
         gateway = _FakeGateway(tool_responses={"model-a": "未调用工具的普通回答"})
         reply_service = _FakeReplyService()

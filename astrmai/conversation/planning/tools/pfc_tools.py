@@ -48,10 +48,32 @@ def _set_pending_actions(event, pending_actions: list[dict[str, Any]]) -> None:
     event.set_extra("astrmai_pending_actions", pending_actions)
 
 
-def _record_tool_execution(event, tool_name: str, *, status: str = "success") -> None:
+def _record_tool_execution(
+    event,
+    tool_name: str,
+    *,
+    status: str = "success",
+    source_domain: str = "",
+    operation: str = "",
+    reason: str = "",
+) -> None:
     trace = event.get_extra("astrmai_tool_execution_trace", [])
     trace = list(trace) if isinstance(trace, list) else []
-    trace.append({"tool_name": str(tool_name or ""), "status": str(status or "success")})
+    spec = TOOL_CAPABILITIES.get(str(tool_name or ""))
+    item = {
+        "tool_name": str(tool_name or ""),
+        "status": str(status or "success"),
+    }
+    if source_domain or operation or reason:
+        item.update(
+            {
+                "family": str(getattr(spec, "family", "") or ""),
+                "source_domain": str(source_domain or ""),
+                "operation": str(operation or ""),
+                "reason": str(reason or "")[:160],
+            }
+        )
+    trace.append(item)
     event.set_extra("astrmai_tool_execution_trace", trace[-32:])
     record_tool_lifecycle(
         event,
@@ -59,6 +81,7 @@ def _record_tool_execution(event, tool_name: str, *, status: str = "success") ->
         "tool_completed",
         source="model_tool_call",
         status=status,
+        reason=reason,
     )
 
 
@@ -1344,6 +1367,7 @@ class QQFriendLookupTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "只读查询机器人自己的 QQ 好友事实。"
         "当用户问某 QQ/昵称是不是机器人好友，或跨会话传话前需要确认收件人时调用；"
+        "它只查询平台好友关系，不查询聊天记忆或角色设定人物。"
         "工具查不到时只能回答未知，不能猜测对方身份。"
     )
     parameters: dict = Field(
@@ -1359,17 +1383,44 @@ class QQFriendLookupTool(FunctionTool[AstrAgentContext]):
                     "type": "boolean",
                     "description": "是否返回少量好友预览。默认 false；只有用户明确询问好友列表时才设为 true。",
                 },
+                "mode": {
+                    "type": "string",
+                    "description": "查询方式：list 列表、count 数量、match 匹配、describe 详情；默认自动判断。",
+                    "enum": ["auto", "list", "count", "match", "describe"],
+                },
+                "offset": {"type": "integer", "description": "列表起始位置，默认 0。", "minimum": 0},
+                "limit": {"type": "integer", "description": "列表最多返回多少项，默认 20，最大 50。", "minimum": 1, "maximum": 50},
             },
         }
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
+        target = str(kwargs.get("target", "") or "").strip()
+        mode = str(kwargs.get("mode", "auto") or "auto").strip().lower()
+        if mode not in {"auto", "list", "count", "match", "describe"}:
+            mode = "auto"
+        if mode == "auto":
+            mode = "match" if target else ("list" if bool(kwargs.get("include_preview", False)) else "count")
+        try:
+            offset = max(0, int(kwargs.get("offset", 0) or 0))
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = max(1, min(50, int(kwargs.get("limit", 20) or 20)))
+        except (TypeError, ValueError):
+            limit = 20
         api = getattr(getattr(current_event, "bot", None), "api", None)
         if api is None:
-            _record_tool_execution(current_event, self.name, status="failed")
+            _record_tool_execution(
+                current_event,
+                self.name,
+                status="failed",
+                source_domain="platform_friend",
+                operation=mode,
+                reason="napcat_friend_api_unavailable",
+            )
             return "好友查询失败：NapCat 好友接口不可用。"
-        target = str(kwargs.get("target", "") or "").strip()
         include_preview = bool(kwargs.get("include_preview", False))
         try:
             payload = await api.call_action("get_friend_list")
@@ -1378,7 +1429,14 @@ class QQFriendLookupTool(FunctionTool[AstrAgentContext]):
                 payload = await api.call_action("get_friends_with_category")
                 friends = _friend_entries(payload)
         except Exception as exc:
-            _record_tool_execution(current_event, self.name, status="failed")
+            _record_tool_execution(
+                current_event,
+                self.name,
+                status="failed",
+                source_domain="platform_friend",
+                operation=mode,
+                reason="friend_list_api_error",
+            )
             return f"好友查询失败：读取机器人好友列表时出错：{exc}"
 
         if target:
@@ -1389,7 +1447,14 @@ class QQFriendLookupTool(FunctionTool[AstrAgentContext]):
                 name_getter=_friend_name,
             )
             if not matches:
-                _record_tool_execution(current_event, self.name)
+                _record_tool_execution(
+                    current_event,
+                    self.name,
+                    status="not_found",
+                    source_domain="platform_friend",
+                    operation=mode,
+                    reason="target_not_in_friend_list",
+                )
                 return f"好友查询结果：机器人好友列表中没有找到“{target}”。不能声称已经联系到这个人。"
             lines = []
             for item in matches[:5]:
@@ -1402,13 +1467,25 @@ class QQFriendLookupTool(FunctionTool[AstrAgentContext]):
                 lines.append(f"- QQ {friend_id}: {display}{extra}")
             if len(matches) > 5:
                 lines.append(f"- 另有 {len(matches) - 5} 个候选，请让用户提供准确 QQ 号。")
-            _record_tool_execution(current_event, self.name)
+            _record_tool_execution(
+                current_event,
+                self.name,
+                source_domain="platform_friend",
+                operation=mode,
+            )
             return "好友查询结果：找到匹配好友。\n" + "\n".join(lines)
 
-        _record_tool_execution(current_event, self.name)
-        if include_preview:
-            preview = [f"- QQ {_friend_id(item)}: {_friend_name(item)}" for item in friends[:12]]
-            suffix = f"\n另有 {len(friends) - 12} 位未展示。" if len(friends) > 12 else ""
+        _record_tool_execution(
+            current_event,
+            self.name,
+            source_domain="platform_friend",
+            operation=mode,
+        )
+        if mode == "list" or include_preview:
+            page = friends[offset : offset + limit]
+            preview = [f"- QQ {_friend_id(item)}: {_friend_name(item)}" for item in page]
+            remaining = max(0, len(friends) - offset - len(page))
+            suffix = f"\n另有 {remaining} 位未展示。" if remaining else ""
             return f"好友查询结果：机器人好友共 {len(friends)} 位。\n" + "\n".join(preview) + suffix
         return f"好友查询结果：机器人好友共 {len(friends)} 位。需要具体判断时请提供 QQ 号、备注或昵称。"
 
@@ -1706,6 +1783,7 @@ class CrossChatMemoryQueryTool(FunctionTool[AstrAgentContext]):
     description: str = (
         "查询 AstrMai 自己跨群、跨私聊、跨会话的内部记忆和自述资料。"
         "用于确认“我是不是在别的群见过你”“你自己有没有相关记忆/设定/授权记录”；"
+        "它查询的是 conversation_memory，不可用于证明 QQ 好友关系。"
         "查不到时必须回答没有明确记录，不能把未知说成事实。"
     )
     memory_engine: Optional[Any] = Field(default=None, exclude=True)
@@ -2493,7 +2571,12 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
             lines.append("过滤后工具：" + ", ".join(sorted(str(item) for item in filtered)[:40]))
         if required:
             lines.append("显式要求工具：" + ", ".join(str(item) for item in required))
-        _record_tool_execution(event, self.name)
+        _record_tool_execution(
+            event,
+            self.name,
+            source_domain="system_capability",
+            operation="disclose",
+        )
         return "\n".join(lines)
 
 
@@ -3008,7 +3091,10 @@ class ProactiveLikeTool(FunctionTool[AstrAgentContext]):
 @dataclass
 class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
     name: str = "self_lore_query"
-    description: str = "查询当前 persona 的自我设定、世界观或既有自述。"
+    description: str = (
+        "只查询当前 persona 的角色设定、世界观、经历和设定人物。"
+        "它不查询现实 QQ 好友、群成员或聊天对象。"
+    )
     memory_engine: Optional[Any] = Field(default=None, exclude=True)
     memory_tool_service: Optional[Any] = Field(default=None, exclude=True)
     persona_id: str = Field(default="", exclude=True)
@@ -3023,12 +3109,28 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
     )
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        current_event = _get_current_event(context)
         query = str(kwargs.get("query", "") or "").strip()
         if not query:
+            _record_tool_execution(
+                current_event,
+                self.name,
+                status="failed",
+                source_domain="persona_lore",
+                operation="describe",
+                reason="query_empty",
+            )
             return "执行失败：query 不能为空。"
         if not self.memory_engine and not self.memory_tool_service:
+            _record_tool_execution(
+                current_event,
+                self.name,
+                status="failed",
+                source_domain="persona_lore",
+                operation="describe",
+                reason="self_lore_service_unavailable",
+            )
             return "系统提示：当前没有可用的自我设定记忆引擎。"
-        current_event = _get_current_event(context)
         try:
             tool_service = self.memory_tool_service or getattr(self.memory_engine, "tool_service", None)
             if tool_service and hasattr(tool_service, "self_lore_query"):
@@ -3042,11 +3144,31 @@ class SelfLoreQueryTool(FunctionTool[AstrAgentContext]):
                 result = None
         except Exception as exc:
             logger.debug(f"[SelfLoreQueryTool] recall failed: {exc}")
-            _record_tool_execution(current_event, self.name, status="failed")
+            _record_tool_execution(
+                current_event,
+                self.name,
+                status="failed",
+                source_domain="persona_lore",
+                operation="describe",
+                reason="self_lore_query_error",
+            )
             return "系统提示：自我设定查询暂时失败。"
-        _record_tool_execution(current_event, self.name)
         if not result:
+            _record_tool_execution(
+                current_event,
+                self.name,
+                status="not_found",
+                source_domain="persona_lore",
+                operation="describe",
+                reason="self_lore_not_found",
+            )
             return "系统提示：当前没有检索到相关自我设定。"
+        _record_tool_execution(
+            current_event,
+            self.name,
+            source_domain="persona_lore",
+            operation="describe",
+        )
         return str(result)
 
 

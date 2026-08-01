@@ -118,6 +118,16 @@ def test_turn_trace_summary_hides_inner_monologue_and_prompt_text():
     context.tools.removed_by_energy = ["full_tier"]
     context.tools.removed_by_cooldown = ["proactive_meme"]
     context.tools.removed_by_stance = ["construct_at_event"]
+    context.tools.intent_contracts = [
+        {"family": "friend_fact", "entity_domain": "platform_friend", "operation": "list"}
+    ]
+    context.tools.contract_outcomes = [
+        {"tool_name": "qq_friend_lookup", "outcome": "satisfied"}
+    ]
+    context.tools.contract_unsatisfied = []
+    context.tools.correction_pass_used = True
+    context.tools.correction_packages = ["identity"]
+    context.tools.correction_reason = "unsatisfied_tool_contracts(qq_friend_lookup)"
     context.prompt_envelope = SimpleNamespace(
         focus_message_text="Alice: hello there",
         system_prompt="secret system prompt",
@@ -156,6 +166,10 @@ def test_turn_trace_summary_hides_inner_monologue_and_prompt_text():
     assert summary["tools"]["removed_by_energy"] == ["full_tier"]
     assert summary["tools"]["removed_by_cooldown"] == ["proactive_meme"]
     assert summary["tools"]["removed_by_stance"] == ["construct_at_event"]
+    assert summary["tools"]["intent_contracts"][0]["entity_domain"] == "platform_friend"
+    assert summary["tools"]["contract_outcomes"][0]["outcome"] == "satisfied"
+    assert summary["tools"]["correction_pass_used"] is True
+    assert summary["tools"]["correction_packages"] == ["identity"]
     assert "secret private thought" not in rendered
     assert "secret system prompt" not in rendered
     assert "secret user prompt" not in rendered

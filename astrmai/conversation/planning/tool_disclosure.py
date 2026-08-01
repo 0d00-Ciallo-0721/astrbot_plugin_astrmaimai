@@ -447,7 +447,7 @@ class ToolDisclosurePlanner:
         max_tools = max_task_tools if task_like else max_chat_tools
         selected_tool_names = _ordered_unique([*tool_names_for_packages(packages), *exact_tool_names])
         if max_tools and max_tools > 0:
-            protected = _ordered_unique(exact_tool_names)
+            protected = _ordered_unique([*exact_tool_names, "bot_capability_lookup"])
             selected_tool_names = _ordered_unique(
                 [*selected_tool_names[:max_tools], *protected]
             )

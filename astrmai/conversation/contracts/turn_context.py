@@ -256,6 +256,12 @@ class ToolDecisionTrace:
     invocation_mode: str = "auto"
     required_tools: list[str] = field(default_factory=list)
     invocation_plans: list[dict[str, Any]] = field(default_factory=list)
+    intent_contracts: list[dict[str, Any]] = field(default_factory=list)
+    contract_outcomes: list[dict[str, Any]] = field(default_factory=list)
+    contract_unsatisfied: list[str] = field(default_factory=list)
+    correction_pass_used: bool = False
+    correction_packages: list[str] = field(default_factory=list)
+    correction_reason: str = ""
     social_intent: str = ""
     allowed_families: list[str] = field(default_factory=list)
     initial_tools: list[str] = field(default_factory=list)
@@ -649,6 +655,12 @@ def build_turn_trace_summary(
             "invocation_mode": tools.invocation_mode,
             "required_tools": list(tools.required_tools or []),
             "invocation_plans": list(tools.invocation_plans or []),
+            "intent_contracts": list(tools.intent_contracts or []),
+            "contract_outcomes": list(tools.contract_outcomes or []),
+            "contract_unsatisfied": list(tools.contract_unsatisfied or []),
+            "correction_pass_used": bool(tools.correction_pass_used),
+            "correction_packages": list(tools.correction_packages or []),
+            "correction_reason": tools.correction_reason,
             "social_intent": tools.social_intent,
             "allowed_families": list(tools.allowed_families or []),
             "initial_tools": list(tools.initial_tools or []),

@@ -5,6 +5,7 @@ import json
 import random
 import re
 import time
+from dataclasses import asdict
 from typing import List, Optional
 
 from astrbot.api import logger
@@ -23,6 +24,11 @@ from .tool_contracts import (
 from .tool_disclosure import (
     ToolDisclosurePlanner,
     select_tools_by_names,
+)
+from .entity_domain_resolution import (
+    EntityDomain,
+    build_tool_intent_contracts,
+    resolve_entity_domain,
 )
 from .tool_intent_resolution import (
     clarification_resolutions,
@@ -254,7 +260,7 @@ class PlannerSideInputMixin:
     TOOL_FAMILIES = {
         "wait_and_listen": {"wait"},
         "omni_perception_query": {"query"},
-        "self_lore_query": {"query"},
+        "self_lore_query": {"self_lore", "query"},
         "qq_friend_lookup": {"friend_fact", "query"},
         "qq_group_member_lookup": {"group_member", "query"},
         "qq_user_identity_lookup": {"user_identity", "query"},
@@ -698,6 +704,28 @@ class PlannerSideInputMixin:
                 items.append(text)
         return items
 
+    def _persona_entity_catalog_text(self) -> str:
+        summarizer = getattr(self.context_engine, "summarizer", None)
+        cache = getattr(summarizer, "cache", {})
+        if not isinstance(cache, dict):
+            return ""
+        parts: list[str] = []
+        for payload in cache.values():
+            if not isinstance(payload, dict):
+                continue
+            for key in ("summary", "first_person_rewrite", "style", "raw_persona"):
+                value = str(payload.get(key, "") or "").strip()
+                if value:
+                    parts.append(value)
+            shards = payload.get("shards", {})
+            if isinstance(shards, dict):
+                parts.extend(
+                    str(value or "").strip()
+                    for value in shards.values()
+                    if str(value or "").strip()
+                )
+        return "\n".join(parts)[:40000]
+
     def _families_for_social_intent(self, event: AstrMessageEvent, social_intent: str) -> set[str] | None:
         if not social_intent:
             return None
@@ -817,8 +845,22 @@ class PlannerSideInputMixin:
 
         explicit_qq_families = self._explicit_qq_action_families(event)
         explicit_tool_families = self._explicit_tool_families(event)
+        persona_catalog_text = self._persona_entity_catalog_text()
+        entity_domain, _, _, entity_reason = resolve_entity_domain(
+            str(getattr(event, "message_str", "") or ""),
+            explicit_families=explicit_tool_families,
+            persona_text=persona_catalog_text,
+        )
+        if entity_domain == EntityDomain.PERSONA_LORE:
+            explicit_tool_families.discard("friend_fact")
+            explicit_tool_families.discard("query")
+            explicit_tool_families.add("self_lore")
+        elif entity_domain == EntityDomain.PLATFORM_FRIEND:
+            explicit_tool_families.discard("self_lore")
+            explicit_tool_families.discard("query")
+            explicit_tool_families.add("friend_fact")
         explicit_override_enabled = self._conversation_flag("qq_explicit_intent_override_enabled", True)
-        explicit_tool_intent = self._has_tool_intent(event)
+        explicit_tool_intent = bool(explicit_tool_families) or self._has_tool_intent(event)
         requested_tier = str(event.get_extra("astrmai_action_tier", "") if hasattr(event, "get_extra") else "").strip().lower()
         social_intent = str(event.get_extra("astrmai_social_intent", "") if hasattr(event, "get_extra") else "").strip().lower()
         stance = str(event.get_extra("astrmai_stance", "") if hasattr(event, "get_extra") else "").strip().lower()
@@ -847,6 +889,20 @@ class PlannerSideInputMixin:
         turn_tools.disclosure_reasons = []
         turn_tools.disclosure_second_pass_packages = []
         turn_tools.disclosure_expanded_packages = []
+        turn_tools.intent_contracts = []
+        turn_tools.contract_outcomes = []
+        turn_tools.contract_unsatisfied = []
+        turn_tools.correction_pass_used = False
+        turn_tools.correction_packages = []
+        turn_tools.correction_reason = ""
+        if entity_domain != EntityDomain.UNKNOWN:
+            turn_tools.record_step(
+                "planner.entity_domain_resolution",
+                [],
+                [entity_domain.value],
+                entity_reason,
+                category="tool_domain",
+            )
         if bool(event.get_extra("astrmai_is_proactive_event", False)):
             if requested_tier in {"full", "sys3"} or explicit_tool_intent:
                 turn_tools.record_step(
@@ -865,10 +921,7 @@ class PlannerSideInputMixin:
         intent_families = self._families_for_social_intent(event, social_intent)
         if intent_families is not None:
             allowed_families = (allowed_families & intent_families) if allowed_families else intent_families
-        explicit_filter_families = {
-            "query" if family == "self_lore" else family
-            for family in explicit_tool_families
-        }
+        explicit_filter_families = set(explicit_tool_families)
         if explicit_override_enabled and explicit_filter_families:
             allowed_families.update(explicit_filter_families)
         turn_tools.allowed_families = sorted(allowed_families if allowed_families else (intent_families or set()))
@@ -1096,6 +1149,27 @@ class PlannerSideInputMixin:
             cooldown_tags=event.get_extra("astrmai_agency_cooldown_tags", []) if hasattr(event, "get_extra") else [],
             trace=turn_tools,
         )
+        incompatible_domain_tools: set[str] = set()
+        if entity_domain == EntityDomain.PLATFORM_FRIEND:
+            incompatible_domain_tools.add("self_lore_query")
+        elif entity_domain == EntityDomain.PERSONA_LORE:
+            incompatible_domain_tools.add("qq_friend_lookup")
+        if incompatible_domain_tools:
+            before_names = [self._canonical_tool_name(tool) for tool in tools or []]
+            tools = [
+                tool
+                for tool in tools or []
+                if self._canonical_tool_name(tool) not in incompatible_domain_tools
+            ]
+            after_names = [self._canonical_tool_name(tool) for tool in tools]
+            if before_names != after_names:
+                turn_tools.record_step(
+                    "planner.entity_domain_tool_guard",
+                    before_names,
+                    after_names,
+                    f"entity_domain({entity_domain.value})",
+                    category="tool_domain",
+                )
         if explicit_override_enabled and explicit_filter_families:
             filtered_names = {self._canonical_tool_name(tool) for tool in tools or []}
             protected_names = {
@@ -1117,6 +1191,19 @@ class PlannerSideInputMixin:
                     "explicit_user_tool_request",
                     category="social_intent",
                 )
+        if requested_tier != "none" and not any(
+            self._canonical_tool_name(tool) == "bot_capability_lookup"
+            for tool in tools or []
+        ):
+            before_names = [self._canonical_tool_name(tool) for tool in tools or []]
+            tools = [*(tools or []), BotCapabilityLookupTool()]
+            turn_tools.record_step(
+                "planner.capability_fallback_restore",
+                before_names,
+                [self._canonical_tool_name(tool) for tool in tools],
+                "global_progressive_disclosure_fallback",
+                category="tool_disclosure",
+            )
         tools = normalize_tool_schemas(tools)
         turn_tools.filtered_tools = [
             self._canonical_tool_name(tool)
@@ -1158,25 +1245,32 @@ class PlannerSideInputMixin:
             event.set_extra("astrmai_tool_clarification_prompt", "")
             event.set_extra("astrmai_tool_clarification_missing_slots", [])
         executable_families = ready_families(intent_resolutions) if reliable_explicit_enabled else set()
+        intent_contracts = (
+            build_tool_intent_contracts(
+                executable_families,
+                message=str(getattr(event, "message_str", "") or ""),
+                available_tool_names=turn_tools.filtered_tools,
+                persona_text=persona_catalog_text,
+            )
+            if reliable_explicit_enabled
+            else []
+        )
+        serialized_contracts = [asdict(contract) for contract in intent_contracts]
+        event.set_extra("astrmai_tool_intent_contracts", serialized_contracts)
+        turn_tools.intent_contracts = serialized_contracts
         plans = (
-            build_explicit_invocation_plans(executable_families, turn_tools.filtered_tools)
+            build_explicit_invocation_plans(
+                executable_families,
+                turn_tools.filtered_tools,
+                intent_contracts=intent_contracts,
+            )
             if reliable_explicit_enabled
             else []
         )
         publish_invocation_plans(event, plans)
         turn_tools.invocation_mode = "required" if plans else "auto"
         turn_tools.required_tools = [plan.tool_name for plan in plans if plan.required]
-        turn_tools.invocation_plans = [
-            {
-                "tool_name": plan.tool_name,
-                "family": plan.family,
-                "source": plan.source,
-                "required": plan.required,
-                "deterministic_fallback": plan.deterministic_fallback,
-                "reason": plan.reason,
-            }
-            for plan in plans
-        ]
+        turn_tools.invocation_plans = [asdict(plan) for plan in plans]
         if plans:
             prepared_tools = await prepare_explicit_tool_fallbacks(
                 event,

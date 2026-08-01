@@ -279,6 +279,58 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("1481314186", result)
         self.assertEqual(event.bot.api.calls, [("get_friend_list", {})])
 
+    def test_qq_friend_lookup_lists_real_platform_friends_and_records_domain(self):
+        event = _FakeEvent(group_id="12345")
+        event.bot.api = _FakeApi(
+            result={
+                "data": [
+                    {"user_id": "1481314186", "nickname": "Ying", "remark": "萤"},
+                    {"user_id": "516779421", "nickname": "恸", "remark": ""},
+                ]
+            }
+        )
+
+        result = asyncio.run(
+            self.mod.QQFriendLookupTool().call(
+                _wrap_event(event),
+                mode="list",
+                limit=20,
+            )
+        )
+
+        self.assertIn("机器人好友共 2 位", result)
+        self.assertIn("QQ 1481314186: 萤", result)
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace")[-1],
+            {
+                "tool_name": "qq_friend_lookup",
+                "status": "success",
+                "family": "friend_fact",
+                "source_domain": "platform_friend",
+                "operation": "list",
+                "reason": "",
+            },
+        )
+
+    def test_qq_friend_lookup_records_not_found_as_platform_fact(self):
+        event = _FakeEvent(group_id="12345")
+        event.bot.api = _FakeApi(result={"data": []})
+
+        result = asyncio.run(
+            self.mod.QQFriendLookupTool().call(
+                _wrap_event(event),
+                target="不存在的人",
+                mode="match",
+            )
+        )
+
+        self.assertIn("没有找到", result)
+        self.assertEqual(event.get_extra("astrmai_tool_execution_trace")[-1]["status"], "not_found")
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace")[-1]["source_domain"],
+            "platform_friend",
+        )
+
     def test_qq_group_presence_lookup_confirms_current_group_shared(self):
         event = _FakeEvent(group_id="777", sender_id="123")
         event.bot.api = _FakeApi(result={"data": [{"group_id": "777", "group_name": "测试群"}]})

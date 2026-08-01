@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import random
 import re
 import time
@@ -46,6 +47,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
     TOOL_HINT_LABELS = {
         "omni_perception_query": "查询记忆/画像",
         "self_lore_query": "查询自我设定",
+        "qq_friend_lookup": "查询机器人 QQ 好友",
         "wait_and_listen": "等待",
         "construct_at_event": "@某人",
         "proactive_poke": "戳一戳",
@@ -524,6 +526,30 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     + "、".join(labels)
                     + "。这些不是可选建议；必须各调用一次对应工具，并根据工具结果生成最终回复。"
                 )
+                pending_set = set(pending_required)
+                invocation_plans = [
+                    item
+                    for item in event.get_extra("astrmai_tool_invocation_plans", []) or []
+                    if isinstance(item, dict)
+                    and str(item.get("tool_name") or "").strip() in pending_set
+                ]
+                if invocation_plans:
+                    rendered_contracts = []
+                    for plan in invocation_plans:
+                        contract = {
+                            "tool": str(plan.get("tool_name") or "").strip(),
+                            "entity_domain": str(plan.get("entity_domain") or "").strip(),
+                            "operation": str(plan.get("operation") or "").strip(),
+                            "target": str(plan.get("target") or "").strip(),
+                            "arguments": dict(plan.get("prepared_arguments") or {}),
+                        }
+                        rendered_contracts.append(
+                            json.dumps(contract, ensure_ascii=False, separators=(",", ":"))
+                        )
+                    guidance_lines.append(
+                        "请严格按以下结构化调用契约选择工具和填写参数；调用其他工具不能替代任务完成："
+                        + "；".join(rendered_contracts)
+                    )
             prepared_required = [name for name in required_tools if name in prepared_tools]
             if prepared_required:
                 labels = [self.TOOL_HINT_LABELS.get(name, name) for name in prepared_required]
@@ -546,6 +572,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             if label and label not in labels:
                 labels.append(label)
         if not labels:
+            prompt_envelope.guidance_lines = self._dedupe_guidance_lines(guidance_lines)
             return
         guidance = (
             f"本轮可用动作：{'、'.join(labels)}。只有确实合适时才使用，普通闲聊直接回复。"
@@ -776,7 +803,11 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     ),
                     "chat_id": str(chat_id or ""),
                     "tool_name": tool_name,
+                    "family": str(execution.get("family", "") or ""),
                     "status": str(execution.get("status", "success") or "success"),
+                    "source_domain": str(execution.get("source_domain", "") or ""),
+                    "operation": str(execution.get("operation", "") or ""),
+                    "reason": str(execution.get("reason", "") or ""),
                     "lifecycle": matching_lifecycle[-8:],
                 }
             )

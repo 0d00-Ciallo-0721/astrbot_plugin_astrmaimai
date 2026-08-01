@@ -850,6 +850,96 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertEqual(english_event.get_extra("astrmai_tool_tier"), "full")
         self.assertTrue(english_event.get_extra("astrmai_turn_context").tools.explicit_tool_intent)
 
+    def test_friend_list_request_builds_platform_friend_contract(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="看看你的好友列表", group_id=None)
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        tool_names = _normalized_tool_names(tools)
+        self.assertIn("qq_friend_lookup", tool_names)
+        self.assertIn("bot_capability_lookup", tool_names)
+        self.assertNotIn("self_lore_query", tool_names)
+        self.assertEqual(event.get_extra("astrmai_required_tools"), ["qq_friend_lookup"])
+        plans = event.get_extra("astrmai_tool_invocation_plans")
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["entity_domain"], "platform_friend")
+        self.assertEqual(plans[0]["operation"], "list")
+        self.assertEqual(plans[0]["target"], "")
+        self.assertEqual(plans[0]["prepared_arguments"], {"mode": "list", "target": ""})
+
+    def test_explicit_persona_character_request_uses_self_lore_contract(self):
+        mixin = self._prepare_tool_mixin()
+        event = _FakeEvent(message="人设中的亚托莉是谁", group_id=None)
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        tool_names = _normalized_tool_names(tools)
+        self.assertIn("self_lore_query", tool_names)
+        self.assertIn("bot_capability_lookup", tool_names)
+        self.assertNotIn("qq_friend_lookup", tool_names)
+        self.assertEqual(event.get_extra("astrmai_required_tools"), ["self_lore_query"])
+        plans = event.get_extra("astrmai_tool_invocation_plans")
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["entity_domain"], "persona_lore")
+        self.assertEqual(plans[0]["operation"], "describe")
+        self.assertEqual(plans[0]["target"], "亚托莉")
+
+    def test_known_persona_name_disambiguates_natural_acquaintance_question(self):
+        mixin = self._prepare_tool_mixin()
+        mixin.context_engine.summarizer = SimpleNamespace(
+            cache={
+                "persona-1": {
+                    "summary": "我是和泉妃爱。",
+                    "shards": {"relations": "亚托莉是机器人朋友。"},
+                }
+            }
+        )
+        event = _FakeEvent(message="你认识亚托莉吗", group_id=None)
+
+        tools = asyncio.run(
+            mixin._build_execution_tools(
+                "default:FriendMessage:user-1",
+                event,
+                "user-1",
+                "Alice",
+                SimpleNamespace(shared_dict={}),
+                is_all_mode=True,
+                is_fast_mode=False,
+                is_tool_call_mode=False,
+            )
+        )
+
+        tool_names = _normalized_tool_names(tools)
+        self.assertIn("self_lore_query", tool_names)
+        self.assertNotIn("qq_friend_lookup", tool_names)
+        self.assertEqual(event.get_extra("astrmai_required_tools"), ["self_lore_query"])
+        plans = event.get_extra("astrmai_tool_invocation_plans")
+        self.assertEqual(plans[0]["entity_domain"], "persona_lore")
+        self.assertEqual(plans[0]["target"], "亚托莉")
+
     def test_low_energy_downgrades_requested_full_tier_without_explicit_tool_intent(self):
         mixin = self._prepare_tool_mixin()
         mixin.state_engine = _FakeStateEngine(energy=0.2)
@@ -1085,7 +1175,10 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"qq_friend_lookup", "space_transition_action"})
+        self.assertEqual(
+            _normalized_tool_names(tools),
+            {"bot_capability_lookup", "qq_friend_lookup", "space_transition_action"},
+        )
         self.assertEqual(
             event.get_extra("astrmai_required_tools"),
             ["qq_friend_lookup", "space_transition_action"],
@@ -1109,7 +1202,7 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(_normalized_tool_names(tools), {"proactive_poke"})
+        self.assertEqual(_normalized_tool_names(tools), {"bot_capability_lookup", "proactive_poke"})
         trace = event.get_extra("astrmai_turn_context").tools
         self.assertTrue(any(step["stage"] == "planner.explicit_qq_action_restore" for step in trace.filter_steps))
         self.assertEqual(trace.invocation_mode, "required")

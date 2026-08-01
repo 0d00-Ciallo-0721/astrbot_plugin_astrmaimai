@@ -996,6 +996,39 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertIn("必须各调用一次对应工具", guidance)
         self.assertIn("查询记忆/画像", guidance)
 
+    def test_planner_injects_structured_contract_for_required_friend_list(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="看看你的好友列表")
+        event.set_extra("astrmai_required_tools", ["qq_friend_lookup"])
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "qq_friend_lookup",
+                    "entity_domain": "platform_friend",
+                    "operation": "list",
+                    "target": "",
+                    "prepared_arguments": {"mode": "list", "target": ""},
+                }
+            ],
+        )
+        envelope = SimpleNamespace(guidance_lines=[])
+
+        planner._append_tool_guidance(
+            envelope,
+            [
+                _NamedTool("qq_friend_lookup"),
+                _NamedTool("bot_capability_lookup"),
+            ],
+            event,
+        )
+
+        guidance = "\n".join(envelope.guidance_lines)
+        self.assertIn("结构化调用契约", guidance)
+        self.assertIn('"entity_domain":"platform_friend"', guidance)
+        self.assertIn('"operation":"list"', guidance)
+        self.assertIn('"arguments":{"mode":"list","target":""}', guidance)
+
     def test_planner_injects_chat_tier_tool_guidance(self):
         decision = self.planner_mod.CognitiveDecision(
             action="reply",
