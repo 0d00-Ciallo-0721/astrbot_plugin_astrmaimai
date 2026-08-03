@@ -158,6 +158,9 @@ class ConcurrentExecutor:
             "astrmai_tool_correction_pass_used",
             "astrmai_tool_correction_packages",
             "astrmai_tool_correction_reason",
+            "astrmai_tool_second_pass_resolution",
+            "astrmai_tool_second_pass_selected_tools",
+            "astrmai_tool_second_pass_reason",
             "astrmai_required_tools",
             "astrmai_prepared_required_tools",
             "astrmai_requested_tool_packages",
@@ -319,6 +322,55 @@ class ConcurrentExecutor:
             tools_state.contract_outcomes = list(outcomes)
             tools_state.contract_unsatisfied = list(missing)
         return missing
+
+    @staticmethod
+    def _record_tool_second_pass_resolution(
+        event: AstrMessageEvent,
+        resolution: str,
+        *,
+        reason: str = "",
+        selected_tools: list[str] | None = None,
+    ) -> None:
+        selected = list(
+            dict.fromkeys(
+                str(name or "").strip()
+                for name in (selected_tools or [])
+                if str(name or "").strip()
+            )
+        )
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_tool_second_pass_resolution", str(resolution or ""))
+            event.set_extra("astrmai_tool_second_pass_selected_tools", selected)
+            event.set_extra("astrmai_tool_second_pass_reason", str(reason or "")[:160])
+        turn_context = event.get_extra("astrmai_turn_context", None)
+        tools_state = getattr(turn_context, "tools", None)
+        if tools_state is not None:
+            tools_state.second_pass_resolution = str(resolution or "")
+            tools_state.second_pass_selected_tools = selected
+            tools_state.second_pass_reason = str(reason or "")[:160]
+
+    @staticmethod
+    def _executed_tool_names(event: AstrMessageEvent) -> list[str]:
+        return list(
+            dict.fromkeys(
+                str(item.get("tool_name") or "").strip()
+                for item in event.get_extra("astrmai_tool_execution_trace", []) or []
+                if isinstance(item, dict) and str(item.get("tool_name") or "").strip()
+            )
+        )
+
+    @staticmethod
+    def _missing_tool_resolution(event: AstrMessageEvent, missing_tools: list[str]) -> str:
+        missing = {str(name or "").strip() for name in missing_tools if str(name or "").strip()}
+        terminal_failures = {"failed", "not_found", "insufficient", "unavailable", "error", "timeout"}
+        for item in event.get_extra("astrmai_tool_execution_trace", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("tool_name") or "").strip() not in missing:
+                continue
+            if str(item.get("status") or "").strip().lower() in terminal_failures:
+                return "degraded"
+        return "unresolved"
 
     @staticmethod
     def _request_contract_correction_packages(event: AstrMessageEvent, missing_tools: list[str]) -> list[str]:
@@ -1497,6 +1549,12 @@ class ConcurrentExecutor:
                         tools_state.correction_pass_used = True
                         tools_state.correction_packages = list(correction_packages)
                         tools_state.correction_reason = correction_reason
+                    self._record_tool_second_pass_resolution(
+                        event,
+                        "unresolved",
+                        reason="correction_started",
+                        selected_tools=self._executed_tool_names(event),
+                    )
                     result = await self.gateway.tool_chat_in_lane_result(
                         lane_key=runtime["dialog_lane_key"],
                         base_origin=runtime["dialog_base_origin"],
@@ -1519,6 +1577,12 @@ class ConcurrentExecutor:
                     self._sync_execution_event_trace(execution_event, event)
                     missing_required = self._record_required_tool_outcomes(event)
                 if missing_required:
+                    self._record_tool_second_pass_resolution(
+                        event,
+                        self._missing_tool_resolution(event, missing_required),
+                        reason="required_tool_contract_still_unsatisfied",
+                        selected_tools=self._executed_tool_names(event),
+                    )
                     return await self._handle_required_tool_missing(
                         event,
                         chat_id,
@@ -1526,6 +1590,14 @@ class ConcurrentExecutor:
                         sorted(missing_required),
                         model=provider_id,
                     )
+                invocation_plans = list(event.get_extra("astrmai_tool_invocation_plans", []) or [])
+                resolution = "satisfied" if needs_correction or invocation_plans else "not_needed"
+                self._record_tool_second_pass_resolution(
+                    event,
+                    resolution,
+                    reason=("correction_completed" if needs_correction else "no_second_pass_required"),
+                    selected_tools=self._executed_tool_names(event),
+                )
                 reply_text = result.text
                 if not reply_text:
                     raise ValueError("empty tool reply")

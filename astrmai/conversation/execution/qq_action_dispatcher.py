@@ -6,7 +6,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..contracts.qq_action import PendingQQAction
-from ..planning.tool_contracts import record_tool_lifecycle
+from ..planning.tool_contracts import TOOL_CAPABILITIES, record_tool_lifecycle
 
 
 class QQActionDispatcher:
@@ -107,7 +107,17 @@ class QQActionDispatcher:
             return
         trace = event.get_extra("astrmai_tool_execution_trace", [])
         trace = list(trace) if isinstance(trace, list) else []
-        trace.append({"tool_name": tool_name, "status": "success"})
+        spec = TOOL_CAPABILITIES.get(tool_name)
+        trace.append(
+            {
+                "tool_name": tool_name,
+                "family": str(getattr(spec, "family", "") or ""),
+                "status": "success",
+                "source_domain": "qq_runtime",
+                "operation": str(action_type or ""),
+                "reason": "",
+            }
+        )
         event.set_extra("astrmai_tool_execution_trace", trace[-32:])
         record_tool_lifecycle(
             event,

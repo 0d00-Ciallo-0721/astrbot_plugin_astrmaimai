@@ -854,6 +854,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "stage_ledger": telemetry["stage_ledger"],
                     "reply_stats": telemetry["reply_stats"],
                     "budget": telemetry["budget"],
+                    "tool_ledger_summary": telemetry["tool_ledger_summary"],
                 }
             )
             item["actual_reply_chars"] = int(

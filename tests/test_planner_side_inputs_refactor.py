@@ -96,9 +96,7 @@ FACT_TOOL_NAMES = {
 CORE_TOOL_NAMES = {
     "wait_and_listen",
     "omni_perception_query",
-    "self_lore_query",
     "cross_chat_memory_query",
-    "persona_fact_check_tool",
     "bot_capability_lookup",
 }
 

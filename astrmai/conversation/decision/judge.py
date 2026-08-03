@@ -519,8 +519,39 @@ class Judge:
                 return plan
             
             except Exception as e:
-                logger.exception(f"[{chat_id}] Judge LLM failed, defaulting to REPLY: {e}")
-                plan.action = "REPLY" 
+                interaction_kind = ""
+                group_direct_wakeup = False
+                virtual_poke = False
+                if focus_event is not None and hasattr(focus_event, "get_extra"):
+                    interaction_kind = str(
+                        focus_event.get_extra("astrmai_interaction_kind", "") or ""
+                    ).strip().lower()
+                    group_direct_wakeup = bool(
+                        focus_event.get_extra("astrmai_group_direct_wakeup", False)
+                    )
+                    virtual_poke = bool(focus_event.get_extra("is_virtual_poke", False))
+                is_private = "FriendMessage" in chat_id
+                must_reply = bool(
+                    is_private
+                    or is_force_wakeup
+                    or is_keyword_wakeup
+                    or group_direct_wakeup
+                    or virtual_poke
+                    or interaction_kind == "poke"
+                )
+                plan.action = "REPLY" if must_reply else "IGNORE"
+                fallback_reason = (
+                    "private_or_direct_wakeup_fail_open"
+                    if must_reply
+                    else "ambient_group_judge_failure_fail_closed"
+                )
+                logger.exception(
+                    f"[{chat_id}] Judge LLM failed; deterministic fallback={plan.action} "
+                    f"reason={fallback_reason}: {e}"
+                )
+                if focus_event is not None and hasattr(focus_event, "set_extra"):
+                    focus_event.set_extra("astrmai_judge_outcome", f"fallback_{plan.action.lower()}")
+                    focus_event.set_extra("astrmai_judge_fallback_reason", fallback_reason)
                 plan.meta["retrieve_keys"] = []
                 return plan
             

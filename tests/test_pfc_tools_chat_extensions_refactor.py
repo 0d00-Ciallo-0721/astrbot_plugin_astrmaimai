@@ -149,7 +149,16 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertEqual(result, "[SYSTEM_WAIT_SIGNAL]")
         self.assertEqual(
             event.get_extra("astrmai_tool_execution_trace"),
-            [{"tool_name": "wait_and_listen", "status": "success"}],
+            [
+                {
+                    "tool_name": "wait_and_listen",
+                    "status": "success",
+                    "family": "wait",
+                    "source_domain": "",
+                    "operation": "",
+                    "reason": "",
+                }
+            ],
         )
 
     def test_group_sign_tool_blocks_private_chat(self):

@@ -11,10 +11,12 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
     "core": (
         "wait_and_listen",
         "omni_perception_query",
-        "self_lore_query",
         "cross_chat_memory_query",
-        "persona_fact_check_tool",
         "bot_capability_lookup",
+    ),
+    "persona_lore": (
+        "self_lore_query",
+        "persona_fact_check_tool",
     ),
     "identity": (
         "qq_user_identity_lookup",
@@ -71,6 +73,7 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
 
 PACKAGE_ORDER: tuple[str, ...] = (
     "core",
+    "persona_lore",
     "identity",
     "relationship",
     "artifact",
@@ -85,7 +88,7 @@ PACKAGE_ORDER: tuple[str, ...] = (
 FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "wait": ("conversation_control",),
     "query": ("core",),
-    "self_lore": ("core",),
+    "self_lore": ("persona_lore",),
     "friend_fact": ("identity", "relationship"),
     "group_member": ("identity",),
     "user_identity": ("identity",),
@@ -103,7 +106,7 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "capability": ("core",),
     "memory_correction": ("memory_governance",),
     "unverified_report": ("memory_governance",),
-    "persona_fact": ("core",),
+    "persona_fact": ("persona_lore",),
     "group_activity": ("relationship",),
     "route_suggest": ("relationship", "cross_session"),
     "cross_memory": ("core",),
@@ -123,6 +126,7 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
 
 
 SECOND_PASS_ALLOWED_PACKAGES: tuple[str, ...] = (
+    "persona_lore",
     "identity",
     "relationship",
     "artifact",

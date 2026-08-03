@@ -129,6 +129,22 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     memory_candidates = 0
     memory_selected = 0
     memory_rendered_chars = 0
+    tool_trace_present_count = 0
+    tool_summary_present_count = 0
+    tool_field_presence_counts: Counter[str] = Counter()
+    tool_field_nonempty_counts: Counter[str] = Counter()
+    tool_tier_counts: Counter[str] = Counter()
+    tool_package_counts: Counter[str] = Counter()
+    tool_resolution_counts: Counter[str] = Counter()
+    tool_execution_name_counts: Counter[str] = Counter()
+    tool_execution_status_counts: Counter[str] = Counter()
+    tool_execution_family_counts: Counter[str] = Counter()
+    tool_execution_domain_counts: Counter[str] = Counter()
+    tool_execution_operation_counts: Counter[str] = Counter()
+    tool_execution_missing_structure: Counter[str] = Counter()
+    tool_contract_count = 0
+    tool_contract_unsatisfied_count = 0
+    tool_correction_pass_count = 0
     missing = Counter()
 
     for trace in items:
@@ -241,6 +257,72 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
         else:
             missing["memory_funnel"] += 1
 
+        tools = trace.get("tools")
+        if isinstance(tools, dict):
+            tool_trace_present_count += 1
+            for field in (
+                "requested_tier",
+                "final_tier",
+                "disclosure_enabled",
+                "disclosure_tier",
+                "disclosure_packages",
+                "disclosure_second_pass_packages",
+                "disclosure_expanded_packages",
+                "explicit_tool_intent",
+                "intent_contracts",
+                "contract_outcomes",
+                "contract_unsatisfied",
+                "correction_pass_used",
+                "correction_packages",
+                "second_pass_resolution",
+                "second_pass_selected_tools",
+            ):
+                if field in tools:
+                    tool_field_presence_counts[field] += 1
+                    if tools.get(field) not in (None, "", False, [], {}):
+                        tool_field_nonempty_counts[field] += 1
+            tier = str(tools.get("disclosure_tier") or tools.get("final_tier") or "").strip()
+            if tier:
+                tool_tier_counts[tier] += 1
+            for package in list(tools.get("disclosure_packages") or []):
+                tool_package_counts[str(package or "unknown")] += 1
+            resolution = str(tools.get("second_pass_resolution") or "").strip()
+            if resolution:
+                tool_resolution_counts[resolution] += 1
+            tool_contract_count += len(list(tools.get("intent_contracts") or []))
+            tool_contract_unsatisfied_count += len(list(tools.get("contract_unsatisfied") or []))
+            if bool(tools.get("correction_pass_used")):
+                tool_correction_pass_count += 1
+        else:
+            missing["tools"] += 1
+
+        tool_summary = trace.get("tool_ledger_summary")
+        if isinstance(tool_summary, dict):
+            tool_summary_present_count += 1
+        else:
+            missing["tool_ledger_summary"] += 1
+
+        for execution in _safe_list(trace.get("tool_execution_trace")):
+            name = str(execution.get("tool_name") or "unknown").strip() or "unknown"
+            status_name = str(execution.get("status") or "unknown").strip() or "unknown"
+            family = str(execution.get("family") or "").strip()
+            domain = str(execution.get("source_domain") or "").strip()
+            operation = str(execution.get("operation") or "").strip()
+            tool_execution_name_counts[name] += 1
+            tool_execution_status_counts[status_name] += 1
+            if family:
+                tool_execution_family_counts[family] += 1
+            else:
+                tool_execution_missing_structure["family"] += 1
+            if domain:
+                tool_execution_domain_counts[domain] += 1
+            else:
+                tool_execution_missing_structure["source_domain"] += 1
+            if operation:
+                tool_execution_operation_counts[operation] += 1
+            else:
+                tool_execution_missing_structure["operation"] += 1
+
     trace_count = len(items)
     reply_count = sum(status_counts[status] for status in status_counts if "replied" in status or status == "completed")
     if not reply_count:
@@ -329,6 +411,24 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "rendered_chars": memory_rendered_chars,
             "selection_rate": round(memory_selected / memory_candidates, 4) if memory_candidates else 0.0,
         },
+        "tools": {
+            "trace_present_count": tool_trace_present_count,
+            "ledger_summary_present_count": tool_summary_present_count,
+            "field_presence_counts": dict(tool_field_presence_counts.most_common()),
+            "field_nonempty_counts": dict(tool_field_nonempty_counts.most_common()),
+            "tier_counts": dict(tool_tier_counts.most_common()),
+            "package_counts": dict(tool_package_counts.most_common()),
+            "second_pass_resolution_counts": dict(tool_resolution_counts.most_common()),
+            "contract_count": tool_contract_count,
+            "contract_unsatisfied_count": tool_contract_unsatisfied_count,
+            "correction_pass_count": tool_correction_pass_count,
+            "execution_name_counts": dict(tool_execution_name_counts.most_common()),
+            "execution_status_counts": dict(tool_execution_status_counts.most_common()),
+            "execution_family_counts": dict(tool_execution_family_counts.most_common()),
+            "execution_domain_counts": dict(tool_execution_domain_counts.most_common()),
+            "execution_operation_counts": dict(tool_execution_operation_counts.most_common()),
+            "execution_missing_structure": dict(tool_execution_missing_structure.most_common()),
+        },
         "missing_fields": dict(missing.most_common()),
     }
 
@@ -341,6 +441,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     decision = _safe_dict(report.get("decision"))
     budget = _safe_dict(report.get("budget"))
     rewrite = _safe_dict(report.get("query_rewrite"))
+    tools = _safe_dict(report.get("tools"))
     lines = [
         "# AstrMai Turn Ledger Analysis",
         "",
@@ -378,6 +479,17 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- `{key}`: {value}")
     else:
         lines.append("- No observed rewrite traces")
+    lines.extend(["", "## Tool Disclosure"])
+    lines.append(f"- Tool trace present: {int(tools.get('trace_present_count', 0) or 0)}")
+    lines.append(f"- Tool ledger summary present: {int(tools.get('ledger_summary_present_count', 0) or 0)}")
+    lines.append(f"- Contracts/unsatisfied: {int(tools.get('contract_count', 0) or 0)} / {int(tools.get('contract_unsatisfied_count', 0) or 0)}")
+    lines.append(f"- Correction passes: {int(tools.get('correction_pass_count', 0) or 0)}")
+    for key, value in _safe_dict(tools.get("second_pass_resolution_counts")).items():
+        lines.append(f"- `resolution:{key}`: {value}")
+    for key, value in _safe_dict(tools.get("execution_status_counts")).items():
+        lines.append(f"- `execution:{key}`: {value}")
+    for key, value in _safe_dict(tools.get("execution_missing_structure")).items():
+        lines.append(f"- `execution_missing:{key}`: {value}")
     lines.extend(["", "## Coverage Gaps"])
     missing = _safe_dict(report.get("missing_fields"))
     if missing:

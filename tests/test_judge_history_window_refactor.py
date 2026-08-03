@@ -398,10 +398,43 @@ class JudgeHistoryWindowRefactorTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(first.action, "REPLY")
-        self.assertEqual(second.action, "REPLY")
+        self.assertEqual(first.action, "IGNORE")
+        self.assertEqual(second.action, "IGNORE")
         self.assertNotIn("default:GroupMessage:group-1", judge.active_sys1_groups)
         self.assertEqual(len(gateway.prompts), 2)
+
+    def test_judge_gateway_failure_keeps_private_and_direct_wakeup_replies(self):
+        class _FailingGateway(_FakeGateway):
+            async def chat_in_lane_result(self, **kwargs):
+                raise RuntimeError("gateway down")
+
+        gateway = _FailingGateway()
+        judge = self.mod.Judge(gateway, _FakeStateEngine(_LegacyHistoryPersistence()), config=gateway.config)
+        self.mod.logger.exception = lambda *args, **kwargs: None
+
+        private = asyncio.run(
+            judge.evaluate(
+                chat_id="default:FriendMessage:user-1",
+                message="你好",
+                is_force_wakeup=False,
+                persona_summary="persona summary",
+            )
+        )
+        focus_event = _FakeWindowEvent("FocusUser", "@bot 你好", time.time())
+        focus_event.set_extra("astrmai_group_direct_wakeup", True)
+        direct = asyncio.run(
+            judge.evaluate(
+                chat_id="default:GroupMessage:group-1",
+                message="@bot 你好",
+                is_force_wakeup=False,
+                persona_summary="persona summary",
+                focus_event=focus_event,
+            )
+        )
+
+        self.assertEqual(private.action, "REPLY")
+        self.assertEqual(direct.action, "REPLY")
+        self.assertEqual(focus_event.get_extra("astrmai_judge_outcome"), "fallback_reply")
 
 
 if __name__ == "__main__":

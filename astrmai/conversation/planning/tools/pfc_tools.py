@@ -63,16 +63,11 @@ def _record_tool_execution(
     item = {
         "tool_name": str(tool_name or ""),
         "status": str(status or "success"),
+        "family": str(getattr(spec, "family", "") or ""),
+        "source_domain": str(source_domain or ""),
+        "operation": str(operation or ""),
+        "reason": str(reason or "")[:160],
     }
-    if source_domain or operation or reason:
-        item.update(
-            {
-                "family": str(getattr(spec, "family", "") or ""),
-                "source_domain": str(source_domain or ""),
-                "operation": str(operation or ""),
-                "reason": str(reason or "")[:160],
-            }
-        )
     trace.append(item)
     event.set_extra("astrmai_tool_execution_trace", trace[-32:])
     record_tool_lifecycle(

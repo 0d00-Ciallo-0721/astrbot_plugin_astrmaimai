@@ -153,3 +153,54 @@ def test_analyzer_never_renders_trace_content():
     assert "PRIVATE_REPLY" not in rendered
     assert "PRIVATE_QUERY" not in rendered
     assert "wait_for_more_context" in rendered
+
+
+def test_analyzer_reads_nested_tool_disclosure_and_execution_fields():
+    report = analyze_traces(
+        [
+            {
+                "turn_id": "tool-turn",
+                "chat_id": "chat-1",
+                "status": "executed",
+                "tools": {
+                    "requested_tier": "chat",
+                    "final_tier": "task",
+                    "disclosure_enabled": True,
+                    "disclosure_tier": "task",
+                    "disclosure_packages": ["core", "identity"],
+                    "disclosure_second_pass_packages": ["persona_lore"],
+                    "disclosure_expanded_packages": ["identity"],
+                    "explicit_tool_intent": True,
+                    "intent_contracts": [{"tool_name": "qq_friend_lookup"}],
+                    "contract_outcomes": [{"outcome": "satisfied"}],
+                    "contract_unsatisfied": [],
+                    "correction_pass_used": True,
+                    "correction_packages": ["identity"],
+                    "second_pass_resolution": "satisfied",
+                    "second_pass_selected_tools": ["qq_friend_lookup"],
+                },
+                "tool_ledger_summary": {
+                    "tool_disclosure_tier": "task",
+                    "tool_call_count": 1,
+                },
+                "tool_execution_trace": [
+                    {
+                        "tool_name": "qq_friend_lookup",
+                        "family": "friend_fact",
+                        "status": "success",
+                        "source_domain": "platform_friend",
+                        "operation": "list",
+                    }
+                ],
+            }
+        ]
+    )
+
+    tools = report["tools"]
+    assert tools["trace_present_count"] == 1
+    assert tools["ledger_summary_present_count"] == 1
+    assert tools["field_presence_counts"]["intent_contracts"] == 1
+    assert tools["second_pass_resolution_counts"] == {"satisfied": 1}
+    assert tools["execution_name_counts"] == {"qq_friend_lookup": 1}
+    assert tools["execution_missing_structure"] == {}
+    assert "## Tool Disclosure" in render_markdown(report)

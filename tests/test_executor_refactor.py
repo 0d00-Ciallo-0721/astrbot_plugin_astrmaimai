@@ -428,6 +428,8 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertTrue(event.get_extra("astrmai_tool_correction_pass_used"))
         self.assertIn("identity", event.get_extra("astrmai_tool_correction_packages"))
         self.assertEqual(event.get_extra("astrmai_tool_contract_unsatisfied"), [])
+        self.assertEqual(event.get_extra("astrmai_tool_second_pass_resolution"), "satisfied")
+        self.assertIn("qq_friend_lookup", event.get_extra("astrmai_tool_second_pass_selected_tools"))
         second_prompt = gateway.calls[1][1]["prompt"]
         self.assertIn("SYSTEM TOOL CORRECTION", second_prompt)
         self.assertIn('"entity_domain":"platform_friend"', second_prompt)
@@ -550,6 +552,7 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(result, "好友列表里没有找到这个人")
         self.assertEqual(calls, 1)
         self.assertFalse(event.get_extra("astrmai_tool_correction_pass_used", False))
+        self.assertEqual(event.get_extra("astrmai_tool_second_pass_resolution"), "satisfied")
 
     def test_tool_mode_stops_after_one_failed_contract_correction(self):
         calls = 0
@@ -611,6 +614,7 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertIn("不能猜", result)
         self.assertEqual(len([call for call in gateway.calls if call[0] == "tool"]), 2)
         self.assertEqual(event.get_extra("astrmai_tool_contract_unsatisfied"), ["qq_friend_lookup"])
+        self.assertEqual(event.get_extra("astrmai_tool_second_pass_resolution"), "degraded")
 
     def test_tool_mode_missing_required_tool_sends_clarification_without_alert(self):
         gateway = _FakeGateway(tool_responses={"model-a": "未调用工具的普通回答"})
