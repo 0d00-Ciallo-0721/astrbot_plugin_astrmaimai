@@ -86,6 +86,21 @@ class _Db:
 class _RetrievalService:
     def __init__(self, calls):
         self.calls = calls
+        self.jargon_policy = self
+
+    async def search(self, **kwargs):
+        query = str(kwargs.get("query") or "")
+        self.calls.append(("global_jargon", query, kwargs.get("session_id"), kwargs.get("top_k")))
+        if "bigbird" not in query:
+            return []
+        return [
+            SimpleNamespace(
+                id="mem-jargon-1",
+                content="bigbird",
+                summary="a raid boss nickname",
+                metadata={"meaning": "a raid boss nickname", "scene": "raid call"},
+            )
+        ]
 
     async def retrieve(self, query):
         self.calls.append(("canonical_jargon", query.query, list(query.layers or []), query.intent))
@@ -209,12 +224,12 @@ def test_budgeted_prompt_inputs_respect_think_level(tmp_path):
     level_zero = asyncio.run(
         loader.load_prompt_inputs(level_zero_event, "chat-1", None, ["hello"], 0, user_id="user-1")
     )
-    assert level_zero["stable_expression_habits"] == ""
+    assert level_zero["stable_expression_habits"] == "expression habits"
     assert level_zero["situational_style_cues"] == ""
     assert level_zero["stable_jargon_explanation"] == ""
-    assert level_zero["expression_habits"] == ""  # compatibility mirror
-    assert planner.calls == []
-    assert level_zero_event.get_extra("astrmai_side_input_timings")[0]["skipped_reason"] == "think_level_0"
+    assert level_zero["expression_habits"] == "expression habits"  # compatibility mirror
+    assert any(call[0] == "expression" for call in planner.calls)
+    assert any(item.get("skipped_reason") == "think_level_0" for item in level_zero_event.get_extra("astrmai_side_input_timings"))
 
     level_one_event = _Event()
     level_one = asyncio.run(
@@ -234,23 +249,51 @@ def test_budgeted_prompt_inputs_respect_think_level(tmp_path):
     assert level_two["stable_jargon_explanation"] == ""
     assert level_two["slang_context"] == ""  # compatibility mirror
     assert level_two["jargon_explanation"] == ""  # compatibility mirror
-    assert ("jargon", "chat-1", 8) not in planner.calls
+    assert any(call[0] == "global_jargon" for call in planner.calls)
     assert level_two["planner_reasoning"] == "keep current topic"
     assert level_two["goals_context"] == "goal context"
 
 
-def test_jargon_loader_returns_empty_instead_of_legacy_fallback(tmp_path):
+def test_jargon_loader_routes_known_term_through_global_dictionary(tmp_path):
     module = _load_loader_module(tmp_path)
     planner = _Planner()
     loader = module.PlanningInputLoader(planner)
 
     query_text = "please check whether bigbird slang is still active"
+    event = _Event()
+    result = asyncio.run(loader._load_jargon_explanation(event, "chat-1", None, [query_text]))
+
+    assert "bigbird -> a raid boss nickname" in result
+    assert ("global_jargon", query_text, "", 5) in planner.calls
+    trace = event.get_extra("astrmai_jargon_route_trace")
+    assert trace["source"] == "canonical_global_jargon"
+    assert trace["selected_ids"] == ["mem-jargon-1"]
+
+
+def test_jargon_loader_only_matches_current_message_not_background(tmp_path):
+    module = _load_loader_module(tmp_path)
+    planner = _Planner()
+    loader = module.PlanningInputLoader(planner)
+    event = _Event()
+    event.message_str = "ordinary current reply"
+    envelope = module.PromptEnvelope(
+        raw_user_text="ordinary current reply",
+        focus_message_text="ordinary current reply",
+        direct_context_text="the previous speaker mentioned bigbird",
+    )
+
     result = asyncio.run(
-        loader._load_jargon_explanation(_Event(), "chat-1", None, [query_text])
+        loader._load_jargon_explanation(
+            event,
+            "chat-1",
+            envelope,
+            ["the previous speaker mentioned bigbird", "ordinary current reply"],
+        )
     )
 
     assert result == ""
-    assert ("jargon", "chat-1", 8) not in planner.calls
+    assert ("global_jargon", "ordinary current reply", "", 5) in planner.calls
+    assert event.get_extra("astrmai_jargon_route_trace")["skip_reason"] == "no_exact_global_jargon_match"
 
 
 def test_expression_habit_loader_writes_canonical_trace(tmp_path):

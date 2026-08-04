@@ -292,6 +292,15 @@ class MemoryInjectionService:
                     "actor_memory_scope": actor_memory_scope.as_dict(),
                 },
             )
+            query.exclude_kinds = list(
+                dict.fromkeys(
+                    [
+                        *(query.exclude_kinds or []),
+                        "expression_pattern",
+                        "jargon",
+                    ]
+                )
+            )
             candidates = await self.retrieval_service.retrieve(query)
         except Exception as exc:
             remember_funnel(

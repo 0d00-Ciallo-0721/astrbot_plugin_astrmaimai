@@ -32,9 +32,11 @@ class _Gateway:
     def __init__(self, *results):
         self.results = list(results)
         self.calls = 0
+        self.requests = []
 
     async def call_data_process_task(self, **kwargs):
         self.calls += 1
+        self.requests.append(dict(kwargs))
         result = self.results[min(self.calls - 1, len(self.results) - 1)]
         if isinstance(result, BaseException):
             raise result
@@ -85,7 +87,7 @@ class _BackfillDB:
 
 
 class ExpressionEnrichmentPipelineTests(unittest.TestCase):
-    def test_candidates_have_stable_ids_and_evidence_ids(self):
+    def test_candidates_have_stable_ids_without_personal_evidence(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         messages = [
             SimpleNamespace(id=11, content="唉嘿嘿"),
@@ -96,7 +98,8 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         second = asyncio.run(extractor.extract("chat-1", messages))
 
         self.assertEqual(first[0]["candidate_id"], second[0]["candidate_id"])
-        self.assertEqual(first[0]["evidence_message_ids"], ["11", "12"])
+        self.assertNotIn("evidence_message_ids", first[0])
+        self.assertNotIn("speaker_id", first[0])
 
     def test_enricher_returns_completed_result_for_full_response(self):
         gateway = _Gateway(
@@ -118,6 +121,29 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertTrue(result.terminal)
         self.assertEqual(result.items[0]["summary"], "轻松地笑")
+
+    def test_enricher_prompt_describes_group_style_without_personal_evidence(self):
+        gateway = _Gateway(
+            {
+                "items": [
+                    {
+                        "candidate_id": "expr-1",
+                        "decision": "keep",
+                        "summary": "群内常用笑声",
+                        "review_status": "pending",
+                    }
+                ]
+            }
+        )
+        candidate = {**_candidate("expr-1"), "speaker_id": "10001", "speaker_name": "Alice"}
+
+        asyncio.run(ExpressionPatternEnricher(gateway).enrich("chat-1", [candidate]))
+
+        prompt = gateway.requests[0]["prompt"]
+        self.assertIn("当前群聊中反复出现", prompt)
+        self.assertNotIn("某一位群友", prompt)
+        self.assertNotIn('"speaker_id"', prompt)
+        self.assertNotIn('"speaker_name"', prompt)
 
     def test_enricher_distinguishes_all_rejected_from_failure(self):
         gateway = _Gateway(
@@ -200,7 +226,36 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(stored.metadata["count"], 3)
         self.assertEqual(stored.metadata["weight"], 0.8)
 
-    def test_pattern_write_preserves_speaker_and_habit_metadata(self):
+    def test_automatic_duplicate_does_not_downgrade_human_approval(self):
+        store = _Store()
+        writer = _WriteService(store)
+        service = ExpressionPatternService(store, writer)
+        payload = {
+            **_candidate("expr-approved", count=3),
+            "habit_type": "catchphrase",
+            "review_status": "pending_human",
+        }
+        dedup_key = service.build_dedup_key(
+            "chat-1",
+            payload["situation"],
+            payload["expression"],
+            "chat-1",
+            payload["habit_type"],
+        )
+        store.by_key[dedup_key] = SimpleNamespace(
+            id="mem-approved",
+            content=payload["expression"],
+            metadata={"review_status": "approved", "count": 4, "weight": 1.2},
+        )
+
+        asyncio.run(service.write_pattern("chat-1", payload))
+        request = writer.calls[-1]
+
+        self.assertEqual(request.status, "active")
+        self.assertEqual(request.visibility, "auto_and_tool")
+        self.assertEqual(request.metadata["review_status"], "approved")
+
+    def test_pattern_write_discards_personal_evidence_and_preserves_habit_metadata(self):
         store = _Store()
         writer = _WriteService(store)
         service = ExpressionPatternService(store, writer)
@@ -223,10 +278,10 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(stored.metadata["habit_type"], "ending")
         self.assertEqual(stored.metadata["content_kind"], "expression")
         self.assertEqual(stored.metadata["normalized_pattern"], "呀")
-        self.assertEqual(stored.metadata["speaker_id"], "10001")
-        self.assertEqual(stored.metadata["speaker_name"], "测试用户")
-        self.assertEqual(stored.metadata["scope_kind"], "speaker")
-        self.assertEqual(stored.metadata["shared_scope"], "chat-1:user:10001")
+        self.assertNotIn("speaker_id", stored.metadata)
+        self.assertNotIn("speaker_name", stored.metadata)
+        self.assertEqual(stored.metadata["scope_kind"], "group")
+        self.assertEqual(stored.metadata["shared_scope"], "chat-1")
         self.assertEqual(stored.metadata["distinct_turn_count"], 3)
         self.assertEqual(stored.metadata["distinct_day_count"], 2)
 

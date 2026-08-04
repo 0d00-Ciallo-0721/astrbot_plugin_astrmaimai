@@ -5,6 +5,7 @@ import re
 import time
 
 from ....learning.mining.jargon_candidate_extractor import JargonCandidateExtractor
+from ....learning.dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint
 from ....memory.contracts.memory_query import MemoryWriteRequest
 
 from ..adapters.plugin_api import PluginApiAdapter
@@ -146,6 +147,24 @@ class MemoryUiService:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _merge_jargon_metadata(primary: dict, secondary: dict) -> dict:
+        merged = {**dict(primary or {}), **dict(secondary or {})}
+        for key, limit in (("examples", 12), ("aliases", 12), ("source_groups", 64)):
+            values = [
+                str(item).strip()
+                for item in [*(primary.get(key) or []), *(secondary.get(key) or [])]
+                if str(item or "").strip()
+            ]
+            merged[key] = list(dict.fromkeys(values))[:limit]
+        try:
+            merged["count"] = int(primary.get("count") or 0) + int(secondary.get("count") or 0)
+        except (TypeError, ValueError):
+            merged["count"] = 1
+        for key in ("speaker_id", "speaker_name", "evidence_message_ids"):
+            merged.pop(key, None)
+        return merged
 
     async def _insert(self, db, table: str, values: dict):
         columns = await self._columns(db, table)
@@ -658,7 +677,7 @@ class MemoryUiService:
                 result = await store.list_canonical(
                     kind="jargon",
                     status=status,
-                    session_id=group_id,
+                    session_id="",
                     limit=page_limit,
                     offset=page_offset,
                 )
@@ -681,7 +700,7 @@ class MemoryUiService:
                 chunk = await store.list_canonical(
                     kind="jargon",
                     status=status,
-                    session_id=group_id,
+                    session_id="",
                     limit=scan_chunk,
                     offset=scan_offset,
                 )
@@ -711,9 +730,6 @@ class MemoryUiService:
                 if status:
                     where.append("status = ?")
                     params.append(status)
-                if group_id:
-                    where.append("session_id = ?")
-                    params.append(group_id)
                 async with db.execute(
                     f"SELECT COUNT(*) FROM canonical_memories WHERE {' AND '.join(where)}",
                     tuple(params),
@@ -1053,7 +1069,7 @@ class MemoryUiService:
         now = time.time()
         content = str(data.get("content", "") or "").strip()
         meaning = str(data.get("meaning", "") or "").strip()
-        group_id = str(data.get("group_id", "GLOBAL") or "GLOBAL")
+        group_id = GLOBAL_JARGON_SESSION_ID
         is_jargon = bool(int(data.get("is_jargon", 1) or 0))
         is_complete = bool(int(data.get("is_complete", 1) or 0))
         confidence = float(data.get("confidence", 0.9 if is_jargon and meaning else 0.55) or 0.55)
@@ -1082,8 +1098,8 @@ class MemoryUiService:
             importance=float(data.get("importance", 0.7) or 0.7),
             confidence=confidence,
             metadata=metadata,
-            dedup_key=f"jargon:{group_id}:{content.lower()}",
-            source_ref=f"webui_jargon:{group_id}:{content.lower()}",
+            dedup_key=jargon_fingerprint(content),
+            source_ref=f"webui_jargon:{jargon_fingerprint(content)}",
             visibility="auto_and_tool" if status == "active" else "maintenance_only",
             status=status,
         )
@@ -1125,7 +1141,7 @@ class MemoryUiService:
             await db.commit()
             return {"status": "ok", "id": canonical_id, "canonical_id": canonical_id, "legacy": False}
 
-    async def update_jargon(self, jargon_id: str, data: dict) -> dict[str, str]:
+    async def update_jargon(self, jargon_id: str, data: dict) -> dict[str, object]:
         now = time.time()
         engine = self._memory_engine()
         store = self.plugin_api.get_v2_store() if self.plugin_api else None
@@ -1147,7 +1163,9 @@ class MemoryUiService:
                                     "_CurrentJargon",
                                     (),
                                     {
+                                        "content": current_row.get("content", ""),
                                         "summary": current_row.get("summary", ""),
+                                        "dedup_key": current_row.get("dedup_key", ""),
                                         "metadata": metadata,
                                     },
                                 )()
@@ -1193,9 +1211,7 @@ class MemoryUiService:
             metadata["review_reason"] = str(data.get("review_reason") or "")
         if "review_suggestion" in data:
             metadata["review_suggestion"] = str(data.get("review_suggestion") or "")
-        group_id = None
-        if "group_id" in data:
-            group_id = str(data.get("group_id") or "GLOBAL").strip() or "GLOBAL"
+        group_id = GLOBAL_JARGON_SESSION_ID
         metadata = self._append_manual_revision(
             metadata,
             action=str(data.get("manual_action") or ("approve" if next_status == "active" else ("reject" if next_status == "rejected" else "save"))),
@@ -1203,8 +1219,44 @@ class MemoryUiService:
         )
         summary = str(metadata.get("meaning") or data.get("summary") or getattr(current, "summary", "") or "").strip()
         content = data.get("content")
+        effective_content = str(content if content is not None else getattr(current, "content", "") or "").strip()
+        next_dedup_key = jargon_fingerprint(effective_content)
         visibility = "auto_and_tool" if next_status == "active" else "maintenance_only"
         if store and hasattr(store, "update_memory"):
+            conflict = (
+                await store.get_by_dedup_key(next_dedup_key, include_inactive=True)
+                if hasattr(store, "get_by_dedup_key")
+                else None
+            )
+            if conflict is not None and str(getattr(conflict, "id", "") or "") != str(jargon_id):
+                target_id = str(conflict.id)
+                merged_metadata = self._merge_jargon_metadata(
+                    dict(getattr(conflict, "metadata", {}) or {}),
+                    metadata,
+                )
+                merged_metadata["review_status"] = metadata.get("review_status", "review_pending")
+                await store.update_memory(
+                    target_id,
+                    content=effective_content,
+                    summary=summary or str(getattr(conflict, "summary", "") or "") or None,
+                    importance=self._optional_float(data.get("importance")),
+                    confidence=self._optional_float(data.get("confidence")),
+                    status=next_status,
+                    metadata=merged_metadata,
+                    visibility=visibility,
+                    session_id=GLOBAL_JARGON_SESSION_ID,
+                    dedup_key=next_dedup_key,
+                    source_ref=f"webui_jargon:{next_dedup_key}",
+                )
+                if hasattr(store, "hard_delete"):
+                    await store.hard_delete(str(jargon_id), kind="jargon")
+                if projector:
+                    await projector.cleanup_deleted([str(jargon_id)])
+                    if next_status == "active":
+                        await projector.project(target_id)
+                    else:
+                        await projector.cleanup_deleted([target_id])
+                return {"status": "ok", "id": target_id, "merged": True}
             changed = await store.update_memory(
                 str(jargon_id),
                 content=str(content) if content is not None else None,
@@ -1214,7 +1266,9 @@ class MemoryUiService:
                 status=next_status,
                 metadata=metadata,
                 visibility=visibility,
-                session_id=group_id,
+                session_id=GLOBAL_JARGON_SESSION_ID,
+                dedup_key=next_dedup_key,
+                source_ref=f"webui_jargon:{next_dedup_key}",
             )
             if changed and projector:
                 if next_status == "active":
@@ -1232,9 +1286,41 @@ class MemoryUiService:
             "visibility": visibility,
             "update_time": data.get("updated_at", now),
         }
-        if group_id is not None:
-            update_values["session_id"] = group_id
+        update_values["session_id"] = GLOBAL_JARGON_SESSION_ID
+        update_values["dedup_key"] = next_dedup_key
+        update_values["source_ref"] = f"webui_jargon:{next_dedup_key}"
         async with self.db_factory() as db:
+            try:
+                async with db.execute(
+                    "SELECT * FROM canonical_memories WHERE dedup_key = ? AND id <> ? LIMIT 1",
+                    (next_dedup_key, jargon_id),
+                ) as cursor:
+                    conflict_row = await cursor.fetchone()
+            except Exception:
+                conflict_row = None
+            if conflict_row:
+                conflict = self._canonical_row(conflict_row)
+                merged_metadata = self._merge_jargon_metadata(
+                    dict(conflict.get("metadata") or {}),
+                    metadata,
+                )
+                merged_metadata["review_status"] = metadata.get("review_status", "review_pending")
+                target_id = str(conflict.get("id") or "")
+                await self._update(
+                    db,
+                    "canonical_memories",
+                    "id",
+                    target_id,
+                    {
+                        **update_values,
+                        "content": effective_content,
+                        "summary": summary or conflict.get("summary") or None,
+                        "metadata": merged_metadata,
+                    },
+                )
+                await db.execute("DELETE FROM canonical_memories WHERE id = ?", (jargon_id,))
+                await db.commit()
+                return {"status": "ok", "id": target_id, "merged": True}
             await self._update(
                 db,
                 "canonical_memories",

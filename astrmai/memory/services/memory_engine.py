@@ -10,6 +10,11 @@ from typing import Any, List
 
 from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from ...learning.dedup import (
+    GLOBAL_JARGON_SESSION_ID,
+    expression_fingerprint,
+    jargon_fingerprint,
+)
 
 try:
     from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
@@ -264,11 +269,151 @@ class MemoryEngine:
         await self.import_legacy_memory_events()
         await self.import_legacy_jargons()
         await self.import_legacy_expression_patterns()
+        await self._migrate_learning_scope_v3()
         await self.migrate_legacy_cognitive_feedback()
         await self._cleanup_cognitive_feedback_records(force=True)
         self.bm25_retriever = BM25Retriever(self.db_path)
         await self.bm25_retriever.initialize()
         logger.info("[AstrMai] memory skeleton initialized; vector store will be lazy-loaded.")
+
+    @staticmethod
+    def _merge_learning_metadata(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+        merged = {**secondary, **primary}
+        for key, limit in (("examples", 12), ("aliases", 12), ("content_samples", 8), ("source_groups", 64)):
+            values = [
+                str(item).strip()
+                for item in [*(secondary.get(key) or []), *(primary.get(key) or [])]
+                if str(item or "").strip()
+            ]
+            merged[key] = list(dict.fromkeys(values))[:limit]
+        try:
+            merged["count"] = int(primary.get("count") or 0) + int(secondary.get("count") or 0)
+        except (TypeError, ValueError):
+            merged["count"] = 1
+        try:
+            merged["weight"] = max(float(primary.get("weight") or 0.0), float(secondary.get("weight") or 0.0))
+        except (TypeError, ValueError):
+            merged["weight"] = 1.0
+        for key in ("speaker_id", "speaker_name", "evidence_message_ids"):
+            merged.pop(key, None)
+        return merged
+
+    @staticmethod
+    def _merge_learning_status(*statuses: str) -> tuple[str, str, str]:
+        normalized = {str(item or "").strip().lower() for item in statuses}
+        if "active" in normalized:
+            return "active", "approved", "auto_and_tool"
+        if "rejected" in normalized:
+            return "rejected", "rejected", "maintenance_only"
+        if "review_pending" in normalized:
+            return "review_pending", "review_pending", "maintenance_only"
+        if "stale" in normalized:
+            return "stale", "stale", "maintenance_only"
+        return "rejected", "rejected", "maintenance_only"
+
+    async def _migrate_learning_scope_v3(self) -> None:
+        version = "3_learning_scope_unification"
+        if await self.v2_store.migration_applied(version):
+            return
+        changed_ids: set[str] = set()
+        removed_ids: list[str] = []
+        try:
+            jargons = await self.v2_store.list_candidates(
+                kinds=["jargon"],
+                statuses=["active", "review_pending", "rejected", "stale"],
+                limit=10000,
+                include_inactive=True,
+            )
+            for item in jargons:
+                target_key = jargon_fingerprint(item.content)
+                metadata = dict(item.metadata or {})
+                metadata["source_groups"] = list(
+                    dict.fromkeys(
+                        [
+                            *[str(value) for value in (metadata.get("source_groups") or []) if str(value)],
+                            *([str(item.session_id)] if str(item.session_id or "") not in {"", GLOBAL_JARGON_SESSION_ID} else []),
+                        ]
+                    )
+                )[-64:]
+                target = await self.v2_store.get_by_dedup_key(target_key, include_inactive=True)
+                if target and str(target.id) != str(item.id):
+                    target_metadata = self._merge_learning_metadata(dict(target.metadata or {}), metadata)
+                    status, review_status, visibility = self._merge_learning_status(target.status, item.status)
+                    target_metadata["review_status"] = review_status
+                    await self.v2_store.update_memory(
+                        str(target.id),
+                        metadata=target_metadata,
+                        status=status,
+                        visibility=visibility,
+                        session_id=GLOBAL_JARGON_SESSION_ID,
+                    )
+                    await self.v2_store.hard_delete(str(item.id), kind="jargon")
+                    changed_ids.add(str(target.id))
+                    removed_ids.append(str(item.id))
+                    continue
+                await self.v2_store.update_memory(
+                    str(item.id),
+                    session_id=GLOBAL_JARGON_SESSION_ID,
+                    dedup_key=target_key,
+                    metadata=metadata,
+                )
+                changed_ids.add(str(item.id))
+
+            patterns = await self.v2_store.list_candidates(
+                kinds=["expression_pattern"],
+                statuses=["active", "review_pending", "rejected", "stale"],
+                limit=10000,
+                include_inactive=True,
+            )
+            for item in patterns:
+                metadata = dict(item.metadata or {})
+                group_id = str(item.session_id or metadata.get("group_id") or "")
+                situation = str(metadata.get("situation") or "日常回应")
+                habit_type = str(metadata.get("habit_type") or "sentence_pattern")
+                target_key = expression_fingerprint(group_id, habit_type, item.content, situation)
+                metadata["shared_scope"] = group_id
+                metadata["scope_kind"] = "group"
+                for key in ("speaker_id", "speaker_name", "evidence_message_ids"):
+                    metadata.pop(key, None)
+                target = await self.v2_store.get_by_dedup_key(target_key, include_inactive=True)
+                if target and str(target.id) != str(item.id):
+                    target_metadata = self._merge_learning_metadata(dict(target.metadata or {}), metadata)
+                    status, review_status, visibility = self._merge_learning_status(target.status, item.status)
+                    target_metadata["review_status"] = review_status
+                    await self.v2_store.update_memory(
+                        str(target.id),
+                        metadata=target_metadata,
+                        status=status,
+                        visibility=visibility,
+                        session_id=group_id,
+                    )
+                    await self.v2_store.hard_delete(str(item.id), kind="expression_pattern")
+                    changed_ids.add(str(target.id))
+                    removed_ids.append(str(item.id))
+                    continue
+                await self.v2_store.update_memory(
+                    str(item.id),
+                    session_id=group_id,
+                    dedup_key=target_key,
+                    metadata=metadata,
+                )
+                changed_ids.add(str(item.id))
+
+            if self.index_projector:
+                for memory_id in changed_ids:
+                    candidate = await self.v2_store.get_canonical(memory_id, include_inactive=True)
+                    if candidate and candidate.status == "active":
+                        await self.index_projector.project(memory_id)
+                if removed_ids:
+                    await self.index_projector.cleanup_deleted(removed_ids)
+            await self.v2_store.record_migration(
+                version,
+                status="applied",
+                detail=f"changed={len(changed_ids)},removed={len(removed_ids)}",
+            )
+        except Exception as exc:
+            await self.v2_store.record_migration(version, status="failed", detail=str(exc)[:500])
+            logger.warning(f"[MemoryV2] learning scope migration degraded: {exc}")
 
     async def _ensure_faiss_initialized(self):
         if self._is_ready:
@@ -1058,8 +1203,8 @@ class MemoryEngine:
                     if not content:
                         continue
                     meaning = str(getattr(item, "meaning", "") or "").strip()
-                    group_id = str(getattr(item, "group_id", "") or "GLOBAL")
-                    dedup_key = f"jargon:{group_id}:{content.lower()}"
+                    group_id = str(getattr(item, "group_id", "") or "")
+                    dedup_key = jargon_fingerprint(content)
                     existing = await self.v2_store.get_by_dedup_key(dedup_key, include_inactive=True)
                     if existing is not None:
                         continue
@@ -1068,7 +1213,7 @@ class MemoryEngine:
                         MemoryWriteRequest(
                             source="legacy_jargon",
                             kind="jargon",
-                            session_id=group_id,
+                            session_id=GLOBAL_JARGON_SESSION_ID,
                             content=content,
                             summary=meaning or content,
                             importance=0.65,
@@ -1079,6 +1224,7 @@ class MemoryEngine:
                                 "meaning": meaning,
                                 "count": int(getattr(item, "count", 1) or 1),
                                 "review_status": status,
+                                "source_groups": [group_id] if group_id else [],
                             },
                             dedup_key=dedup_key,
                             source_ref=f"Jargon:{getattr(item, 'id', '')}",
@@ -1130,7 +1276,7 @@ class MemoryEngine:
                     if not expression or not situation:
                         continue
                     group_id = str(getattr(item, "group_id", "") or "")
-                    shared_scope = str(getattr(item, "shared_scope", "") or "")
+                    shared_scope = group_id
                     dedup_key = service.build_dedup_key(group_id, situation, expression, shared_scope)
                     existing = await self.v2_store.get_by_dedup_key(dedup_key, include_inactive=True)
                     if existing is not None:

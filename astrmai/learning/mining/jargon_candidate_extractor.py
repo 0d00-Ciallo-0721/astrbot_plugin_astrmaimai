@@ -4,6 +4,8 @@ import re
 from collections import defaultdict
 from typing import Any
 
+from ..dedup import normalize_jargon_term
+
 
 class JargonCandidateExtractor:
     NOISE_TOKENS = {
@@ -63,7 +65,7 @@ class JargonCandidateExtractor:
 
     @staticmethod
     def _normalize_token(token: str) -> str:
-        return str(token or "").strip().lower()
+        return normalize_jargon_term(token)
 
     @classmethod
     def _tokens(cls, text: str) -> list[str]:

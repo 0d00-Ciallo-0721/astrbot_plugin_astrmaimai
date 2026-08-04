@@ -219,8 +219,8 @@ class JargonPipelineMigratedTests(unittest.TestCase):
                 )
             )
             policy = self.policy_mod.JargonRetrievalPolicy(store)
-            by_scene = await policy.search(query="raid call", session_id="group-1", top_k=3)
-            by_example = await policy.search(query="bigbird is here", session_id="group-1", top_k=3)
+            by_scene = await policy.search(query="raid call", session_id="another-group", top_k=3)
+            by_example = await policy.search(query="bigbird is here", session_id="another-group", top_k=3)
             excluded = await policy.search(
                 query="bigbird",
                 session_id="group-1",
@@ -230,6 +230,41 @@ class JargonPipelineMigratedTests(unittest.TestCase):
             self.assertEqual(by_scene[0].content, "bigbird")
             self.assertEqual(by_example[0].content, "bigbird")
             self.assertEqual(excluded, [])
+
+        asyncio.run(run())
+
+    def test_jargon_retrieval_policy_exact_route_does_not_fuzzy_inject(self):
+        async def run():
+            store = self.store_mod.MemoryV2Store(self.db_path, data_path=self.temp_dir.name)
+            writer = self.write_mod.MemoryWriteService(store)
+            await writer.write(
+                self.contracts.MemoryWriteRequest(
+                    source="learning_jargon",
+                    kind="jargon",
+                    session_id="__global_jargon__",
+                    content="bigbird",
+                    summary="raid boss nickname",
+                    confidence=0.9,
+                    metadata={
+                        "meaning": "raid boss nickname",
+                        "scene": "raid call",
+                        "aliases": ["大鸟"],
+                        "review_status": "approved",
+                    },
+                    dedup_key="jargon:global:bigbird",
+                    status="active",
+                    visibility="auto_and_tool",
+                )
+            )
+            policy = self.policy_mod.JargonRetrievalPolicy(store)
+
+            fuzzy = await policy.search(query="raid call", top_k=3)
+            exact_miss = await policy.search(query="raid call", top_k=3, exact_only=True)
+            exact_alias = await policy.search(query="今天大鸟又来了", top_k=3, exact_only=True)
+
+            self.assertEqual(fuzzy[0].content, "bigbird")
+            self.assertEqual(exact_miss, [])
+            self.assertEqual(exact_alias[0].content, "bigbird")
 
         asyncio.run(run())
 

@@ -202,6 +202,15 @@ class ExpressionPatternDecision:
 
 
 @dataclass
+class JargonDecision:
+    source: str = ""
+    selected_ids: list[str] = field(default_factory=list)
+    injected: bool = False
+    skip_reason: str = ""
+    summary_preview: str = ""
+
+
+@dataclass
 class FollowUpSnapshot:
     eligible: bool = False
     skipped_reason: str = ""
@@ -332,6 +341,7 @@ class TurnContext:
     continuity: ContinuitySnapshot = field(default_factory=ContinuitySnapshot)
     memory: MemoryInjectionDecision = field(default_factory=MemoryInjectionDecision)
     expression_patterns: ExpressionPatternDecision = field(default_factory=ExpressionPatternDecision)
+    jargon: JargonDecision = field(default_factory=JargonDecision)
     follow_up: FollowUpSnapshot = field(default_factory=FollowUpSnapshot)
     side_inputs: SideInputSnapshot = field(default_factory=SideInputSnapshot)
     proactive: ProactiveSnapshot = field(default_factory=ProactiveSnapshot)
@@ -618,6 +628,13 @@ def build_turn_trace_summary(
             "injected": bool(turn_context.expression_patterns.injected),
             "skip_reason": turn_context.expression_patterns.skip_reason,
             "summary_preview": _preview_text(turn_context.expression_patterns.summary_preview, 160),
+        },
+        "jargon": {
+            "source": turn_context.jargon.source,
+            "selected_ids": list(turn_context.jargon.selected_ids or []),
+            "injected": bool(turn_context.jargon.injected),
+            "skip_reason": turn_context.jargon.skip_reason,
+            "summary_preview": _preview_text(turn_context.jargon.summary_preview, 160),
         },
         "follow_up": {
             "eligible": bool(follow_up.eligible),

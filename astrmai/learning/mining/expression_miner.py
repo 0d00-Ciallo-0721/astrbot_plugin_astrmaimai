@@ -5,6 +5,7 @@ from typing import Any, List
 from astrbot.api import logger
 
 from ...infrastructure.persistence import MessageLog
+from ..dedup import GLOBAL_CANDIDATE_REGISTRY, expression_fingerprint
 from .expression_candidate_extractor import ExpressionCandidateExtractor
 from .expression_pattern_enricher import ExpressionPatternEnricher
 from .expression_results import ExpressionEnrichmentResult
@@ -52,23 +53,20 @@ class ExpressionMiner:
             normalized.append(message)
         return normalized
 
-    async def _existing_patterns(self, group_id: str) -> set[tuple[str, str]]:
+    async def _existing_patterns(self, group_id: str) -> set[str]:
         service = getattr(self.memory_engine, "expression_pattern_service", None) if self.memory_engine else None
         if not service or not hasattr(service, "list_patterns"):
             return set()
         try:
             rows = await service.list_patterns(
                 group_id,
-                limit=200,
+                limit=2000,
                 only_checked=False,
                 include_rejected=True,
                 statuses=["active", "review_pending", "rejected", "stale"],
             )
             return {
-                (
-                    str(getattr(item, "shared_scope", "") or group_id),
-                    service.normalize_text(getattr(item, "expression", "")),
-                )
+                service.normalize_text(getattr(item, "expression", ""))
                 for item in rows
                 if getattr(item, "expression", "")
             }
@@ -140,7 +138,40 @@ class ExpressionMiner:
                 "reason": "insufficient_distinct_expression_evidence",
             }
             return []
-        enrichment = await self.enricher.enrich(group_id, candidates)
+        candidate_fingerprints = {
+            expression_fingerprint(
+                group_id,
+                str(item.get("habit_type") or "sentence_pattern"),
+                str(item.get("normalized_expression") or item.get("expression") or ""),
+                str(item.get("situation") or "日常回应"),
+            ): item
+            for item in candidates
+        }
+        claimed, in_flight = GLOBAL_CANDIDATE_REGISTRY.claim(candidate_fingerprints)
+        candidates = [
+            item
+            for item in candidates
+            if expression_fingerprint(
+                group_id,
+                str(item.get("habit_type") or "sentence_pattern"),
+                str(item.get("normalized_expression") or item.get("expression") or ""),
+                str(item.get("situation") or "日常回应"),
+            ) in claimed
+        ]
+        if not candidates:
+            self.last_result = ExpressionEnrichmentResult(status="completed", reason="all_candidates_in_flight")
+            self.last_report = {
+                "group_id": group_id,
+                "candidate_count": 0,
+                "skipped_in_flight": len(in_flight),
+                "enriched_count": 0,
+                "reason": "all_candidates_in_flight",
+            }
+            return []
+        try:
+            enrichment = await self.enricher.enrich(group_id, candidates)
+        finally:
+            GLOBAL_CANDIDATE_REGISTRY.release(claimed)
         if isinstance(enrichment, ExpressionEnrichmentResult):
             self.last_result = enrichment
             enriched = list(enrichment.items)
@@ -161,6 +192,7 @@ class ExpressionMiner:
             "normalized_messages": len(normalized),
             "min_context": min_context,
             "existing_patterns": len(existing),
+            "skipped_in_flight": len(in_flight),
             **dict(self.candidate_extractor.last_report or {}),
             "enriched_count": len(enriched),
             "reason": self.last_result.reason,

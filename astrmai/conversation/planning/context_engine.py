@@ -136,16 +136,16 @@ class ContextEngine:
         stable_expression_block = self._wrap_optional_block(
             "语言习惯参考",
             stable_expression_habits,
-            enabled=not is_fast_mode and not near_context_priority,
+            enabled=True,
         )
         stable_slang_block, dynamic_slang_block = self._build_slang_blocks(
             situational_style_cues,
             enabled=not is_fast_mode and not near_context_priority,
         )
         stable_jargon_block = self._wrap_optional_block(
-            "群内黑话参考",
+            "全局黑话参考",
             stable_jargon_explanation,
-            enabled=not is_fast_mode and not near_context_priority,
+            enabled=True,
         )
         dynamic_expression_block = ""
         dynamic_jargon_block = ""
@@ -566,7 +566,12 @@ class ContextEngine:
         try:
             retrieval = getattr(memory_engine, "retrieval_service", None)
             if retrieval and hasattr(retrieval, "retrieve"):
-                memory_query = MemoryQuery(query=last_msg, session_id=str(chat_id or ""), top_k=3)
+                memory_query = MemoryQuery(
+                    query=last_msg,
+                    session_id=str(chat_id or ""),
+                    top_k=3,
+                    exclude_kinds=["expression_pattern", "jargon"],
+                )
                 candidates = await retrieval.retrieve(memory_query)
                 recall_result = retrieval.render_recall(memory_query, candidates) if hasattr(retrieval, "render_recall") else "\n".join(
                     str(getattr(item, "summary", "") or getattr(item, "content", "")) for item in candidates

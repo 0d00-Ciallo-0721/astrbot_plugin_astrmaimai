@@ -32,7 +32,11 @@ class ExpressionPatternEnricher:
     @staticmethod
     def _strict_fallback_candidate(candidate: dict[str, Any]) -> bool:
         expression = str(candidate.get("expression") or "").strip()
-        evidence_ids = {str(item) for item in candidate.get("evidence_message_ids", []) if str(item).strip()}
+        distinct_turn_count = int(
+            candidate.get("distinct_turn_count")
+            or len(candidate.get("evidence_message_ids") or [])
+            or 0
+        )
         if candidate.get("candidate_type") != "exact" or int(candidate.get("count") or 0) < 3:
             return False
         if str(candidate.get("content_kind") or "expression").strip().lower() != "expression":
@@ -40,7 +44,7 @@ class ExpressionPatternEnricher:
         habit_type = str(candidate.get("habit_type") or "").strip().lower()
         if habit_type and habit_type not in {"catchphrase", "particle", "ending", "symbol", "rhythm"}:
             return False
-        if len(evidence_ids) < 2 or not (2 <= len(expression) <= 40):
+        if distinct_turn_count < 2 or not (2 <= len(expression) <= 40):
             return False
         lowered = expression.lower()
         if any(token in lowered for token in ("http://", "https://", "[图片", "[pic", "cq:")):
@@ -82,8 +86,6 @@ class ExpressionPatternEnricher:
                     "habit_type": str(item.get("habit_type") or ""),
                     "content_kind": str(item.get("content_kind") or "expression"),
                     "candidate_origin": str(item.get("candidate_origin") or "message_text"),
-                    "speaker_id": str(item.get("speaker_id") or ""),
-                    "speaker_name": str(item.get("speaker_name") or ""),
                     "shared_scope": str(item.get("shared_scope") or ""),
                     "distinct_turn_count": int(item.get("distinct_turn_count") or len(item.get("evidence_message_ids") or [])),
                     "count": int(item.get("count") or 1),
@@ -91,10 +93,11 @@ class ExpressionPatternEnricher:
                 }
             )
         prompt = (
-            "你是群聊表达习惯审核器。你的任务是识别某一位群友稳定的说话方式，而不是总结聊天主题。"
+            "你是群聊表达习惯审核器。你的任务是识别当前群聊中反复出现、适合机器人在该群模仿的共同说话方式，"
+            "而不是分析某个群友或总结聊天主题。"
             "表达习惯只包括：口癖、语气词、句式习惯、句末习惯、颜文字/符号习惯、回复节奏。"
             "领域词、物品名、作品名、人名、群名、事件事实、技术术语、单次话题内容必须 reject，"
-            "这些内容由黑话/领域词学习器处理。不要把候选改写成机器人自己的台词，也不要跨发言者合并。"
+            "这些内容由黑话/领域词学习器处理。不要把候选改写成机器人自己的台词，不要输出或推断个人身份。"
             "必须保留候选原文 expression，不得扩写或替换，只能在 summary/style 中说明其语言特征。"
             "Return exactly one decision for every candidate. Return JSON only: "
             "{\"items\":[{\"candidate_id\":\"...\",\"index\":1,\"decision\":\"keep|reject\","

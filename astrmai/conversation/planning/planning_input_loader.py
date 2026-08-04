@@ -168,10 +168,6 @@ class PlanningInputLoader:
             "goals_context": "",
             "tool_state": ToolStateInputs(),
         }
-        if level <= 0:
-            self._record_skip(event, "budgeted_prompt_inputs", "think_level_0")
-            return result
-
         tasks = [
             self._run_timed(
                 event,
@@ -181,21 +177,24 @@ class PlanningInputLoader:
             ),
             self._run_timed(
                 event,
-                "tool_state",
-                lambda: self._load_tool_state(chat_id, user_id),
-                ToolStateInputs(),
+                "jargon_explanation",
+                lambda: self._load_jargon_explanation(event, chat_id, prompt_envelope, window_lines),
+                "",
             ),
         ]
+        if level >= 1:
+            tasks.append(
+                self._run_timed(
+                    event,
+                    "tool_state",
+                    lambda: self._load_tool_state(chat_id, user_id),
+                    ToolStateInputs(),
+                )
+            )
         if level >= 2:
             tasks.extend(
                 [
                     self._run_timed(event, "slang_context", lambda: self._load_slang_context(chat_id), ""),
-                    self._run_timed(
-                        event,
-                        "jargon_explanation",
-                        lambda: self._load_jargon_explanation(event, chat_id, prompt_envelope, window_lines),
-                        "",
-                    ),
                 ]
             )
         loaded_items = await asyncio.gather(*tasks, return_exceptions=True)
@@ -232,7 +231,6 @@ class PlanningInputLoader:
         else:
             self._record_skip(event, "goal_update", f"think_level_{level}")
             self._record_skip(event, "slang_context", f"think_level_{level}")
-            self._record_skip(event, "jargon_explanation", f"think_level_{level}")
         return result
 
     @staticmethod
@@ -308,29 +306,19 @@ class PlanningInputLoader:
             return ""
         recent_text = self.planner._planner_side_input_text(prompt_envelope, window_lines, recent_only=True)
         expression_think_level = 1 if think_level >= 1 and (len(recent_text) >= 40 or len(window_lines) >= 2) else 0
-        sender_id = ""
-        get_sender_id = getattr(event, "get_sender_id", None)
-        if callable(get_sender_id):
-            try:
-                sender_id = str(get_sender_id() or "").strip()
-            except Exception:
-                sender_id = ""
-        if not sender_id:
-            sender_id = str(getattr(getattr(event, "message_obj", None), "user_id", "") or "").strip()
-        expression_scope = f"{chat_id}:user:{sender_id}" if sender_id else chat_id
         if hasattr(selector, "select_with_trace"):
             text, selected = await selector.select_with_trace(
                 chat_id=chat_id,
                 context_text=recent_text,
                 think_level=expression_think_level,
-                shared_scope=expression_scope,
+                shared_scope=chat_id,
             )
         else:
             text = await selector.select(
                 chat_id=chat_id,
                 context_text=recent_text,
                 think_level=expression_think_level,
-                shared_scope=expression_scope,
+                shared_scope=chat_id,
             )
             selected = []
         decision = ensure_turn_context(event).expression_patterns
@@ -382,7 +370,61 @@ class PlanningInputLoader:
         return lines
 
     async def _load_jargon_explanation(self, event, chat_id: str, prompt_envelope: PromptEnvelope, window_lines: list[str]) -> str:
-        return ""
+        memory_engine = getattr(self.planner, "memory_engine", None)
+        retrieval_service = getattr(memory_engine, "retrieval_service", None) if memory_engine else None
+        policy = getattr(retrieval_service, "jargon_policy", None) if retrieval_service else None
+        if not policy:
+            return ""
+        current_text = str(
+            getattr(event, "message_str", "")
+            or (
+                getattr(prompt_envelope, "raw_user_text", "")
+                if isinstance(prompt_envelope, PromptEnvelope)
+                else ""
+            )
+            or (
+                getattr(prompt_envelope, "focus_message_text", "")
+                if isinstance(prompt_envelope, PromptEnvelope)
+                else ""
+            )
+            or (window_lines[-1] if window_lines else "")
+        ).strip()
+        if not current_text:
+            return ""
+        trace: dict[str, Any] = {}
+        items = await policy.search(
+            query=current_text,
+            session_id="",
+            top_k=5,
+            visibility_mode="auto",
+            trace=trace,
+            exact_only=True,
+        )
+        lines = self._render_jargon_lines(items)
+        decision = ensure_turn_context(event).jargon
+        decision.source = "canonical_global_jargon"
+        decision.selected_ids = [
+            str(getattr(item, "id", "") or "")
+            for item in items
+            if str(getattr(item, "id", "") or "").strip()
+        ]
+        decision.injected = bool(lines)
+        decision.skip_reason = "" if lines else "no_exact_global_jargon_match"
+        decision.summary_preview = "\n".join(lines)[:180]
+        if hasattr(event, "set_extra"):
+            event.set_extra(
+                "astrmai_jargon_route_trace",
+                {
+                    "source": decision.source,
+                    "selected_ids": list(decision.selected_ids),
+                    "matched_terms": list(trace.get("matched_terms", []) or []),
+                    "injected": decision.injected,
+                    "skip_reason": decision.skip_reason,
+                },
+            )
+        if not lines:
+            return ""
+        return "以下词义来自全局黑话词典，仅在当前消息实际出现时使用：\n" + "\n".join(lines)
 
     async def _load_goal_update(self, chat_id: str, prompt_envelope: PromptEnvelope, window_lines: list[str]) -> str:
         manager = getattr(self.planner, "goal_manager", None)

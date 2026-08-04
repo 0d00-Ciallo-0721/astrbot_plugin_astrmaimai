@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from astrbot.api import logger
 
+from ..dedup import GLOBAL_CANDIDATE_REGISTRY, jargon_fingerprint, normalize_jargon_term
 from .jargon_candidate_extractor import JargonCandidateExtractor
 from .jargon_enricher import JargonEnricher
 from typing import Any, Iterable, List, Sequence
@@ -55,12 +56,17 @@ class JargonMiner:
         if callable(store):
             try:
                 rows = await self.memory_engine.v2_store.list_candidates(
-                    session_id=group_id,
+                    session_id="",
                     kinds=["jargon"],
                     statuses=["active", "review_pending", "rejected", "stale"],
-                    limit=200,
+                    limit=10000,
                 )
-                existing_terms = {str(item.content or "").strip().lower() for item in rows if str(item.content or "").strip()}
+                existing_terms = {
+                    normalize_jargon_term(term)
+                    for item in rows
+                    for term in [item.content, *(dict(item.metadata or {}).get("aliases", []) or [])]
+                    if normalize_jargon_term(term)
+                }
             except Exception as exc:
                 logger.debug(f"[JargonMiner] canonical jargon preload degraded: {exc}")
         candidates = await self.candidate_extractor.extract(group_id, normalized, existing_terms=existing_terms)
@@ -82,7 +88,29 @@ class JargonMiner:
                 "reason": "completed_without_enricher",
             }
             return candidates
-        enrichment_result = await self.enricher.enrich(group_id, candidates)
+        candidate_fingerprints = {
+            jargon_fingerprint(str(item.get("content") or "")): item
+            for item in candidates
+        }
+        claimed, in_flight = GLOBAL_CANDIDATE_REGISTRY.claim(candidate_fingerprints)
+        candidates = [
+            item
+            for item in candidates
+            if jargon_fingerprint(str(item.get("content") or "")) in claimed
+        ]
+        if not candidates:
+            self.last_report = {
+                "group_id": group_id,
+                "existing_terms": len(existing_terms),
+                "candidate_count": 0,
+                "skipped_in_flight": len(in_flight),
+                "reason": "all_candidates_in_flight",
+            }
+            return []
+        try:
+            enrichment_result = await self.enricher.enrich(group_id, candidates)
+        finally:
+            GLOBAL_CANDIDATE_REGISTRY.release(claimed)
         if isinstance(enrichment_result, list):
             enriched = list(enrichment_result)
             enrichment_report = {
@@ -102,6 +130,7 @@ class JargonMiner:
             "group_id": group_id,
             "normalized_messages": len(normalized),
             "existing_terms": len(existing_terms),
+            "skipped_in_flight": len(in_flight),
             **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
             "enriched_count": len(enriched),
             "reason": enrichment_reason,

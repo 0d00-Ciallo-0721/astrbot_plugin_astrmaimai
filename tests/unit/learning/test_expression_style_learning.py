@@ -12,7 +12,7 @@ from astrmai.memory.services.expression_pattern_service import ExpressionPattern
 
 
 class ExpressionStyleLearningTests(unittest.TestCase):
-    def test_candidates_are_scoped_per_speaker_and_topic_words_are_not_expression(self):
+    def test_candidates_are_scoped_per_group_and_topic_words_are_not_expression(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         messages = [
             SimpleNamespace(id=1, sender_id="alice", sender_name="Alice", content="唉嘿嘿～"),
@@ -29,16 +29,19 @@ class ExpressionStyleLearningTests(unittest.TestCase):
 
         result = asyncio.run(extractor.extract("group-1", messages))
 
-        alice = [item for item in result if item.get("speaker_id") == "alice" and item.get("expression") == "唉嘿嘿～"]
-        self.assertEqual(len(alice), 1)
-        self.assertEqual(alice[0]["shared_scope"], "group-1:user:alice")
-        self.assertEqual(alice[0]["distinct_turn_count"], 2)
-        self.assertEqual(alice[0]["content_kind"], "expression")
+        matches = [item for item in result if item.get("expression") == "唉嘿嘿～"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["shared_scope"], "group-1")
+        self.assertEqual(matches[0]["scope_kind"], "group")
+        self.assertEqual(matches[0]["distinct_turn_count"], 2)
+        self.assertEqual(matches[0]["content_kind"], "expression")
+        self.assertNotIn("speaker_id", matches[0])
+        self.assertNotIn("speaker_name", matches[0])
         self.assertFalse(any("充电宝" in str(item.get("expression")) for item in result))
         self.assertFalse(any("openai" in str(item.get("expression", "")).lower() for item in result))
-        self.assertFalse(any(item.get("speaker_id") == "bot" for item in result))
+        self.assertEqual(matches[0]["distinct_contributor_count"], 1)
 
-    def test_same_habit_from_two_speakers_does_not_merge(self):
+    def test_same_habit_from_two_speakers_merges_at_group_scope(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         messages = [
             SimpleNamespace(id=1, sender_id="alice", content="嘿嘿"),
@@ -50,9 +53,10 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         result = asyncio.run(extractor.extract("group-1", messages))
         matches = [item for item in result if item.get("expression") == "嘿嘿" and item.get("candidate_type") == "exact"]
 
-        self.assertEqual({item["speaker_id"] for item in matches}, {"alice", "bob"})
-        self.assertEqual({item["shared_scope"] for item in matches}, {"group-1:user:alice", "group-1:user:bob"})
-        self.assertEqual(len({item["candidate_id"] for item in matches}), 2)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["shared_scope"], "group-1")
+        self.assertEqual(matches[0]["distinct_contributor_count"], 2)
+        self.assertEqual(matches[0]["count"], 4)
 
     def test_unknown_sender_uses_group_compatibility_scope_and_unix_days_are_real_days(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
@@ -69,7 +73,7 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         self.assertEqual(candidate["shared_scope"], "group-1")
         self.assertEqual(candidate["distinct_day_count"], 2)
 
-    def test_existing_pattern_dedup_isolated_by_speaker(self):
+    def test_existing_pattern_suppresses_group_wide_reextraction(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         messages = [
             SimpleNamespace(id=1, sender_id="alice", content="嘿嘿"),
@@ -82,12 +86,12 @@ class ExpressionStyleLearningTests(unittest.TestCase):
             extractor.extract(
                 "group-1",
                 messages,
-                existing_patterns={("group-1:user:alice", "嘿嘿")},
+                existing_patterns={("group-1", "嘿嘿")},
             )
         )
 
         matches = [item for item in result if item.get("expression") == "嘿嘿"]
-        self.assertEqual({item["speaker_id"] for item in matches}, {"bob"})
+        self.assertEqual(matches, [])
 
     def test_ending_symbol_and_reply_rhythm_are_distinct_habit_types(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
@@ -162,7 +166,7 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         self.assertIn("领域词", gateway.prompt)
         self.assertIn("habit_type", gateway.prompt)
 
-    def test_retrieval_does_not_cross_speaker_scope(self):
+    def test_retrieval_uses_only_current_group_scope(self):
         class Store:
             async def list_candidates(self, **kwargs):
                 return [
@@ -208,10 +212,10 @@ class ExpressionStyleLearningTests(unittest.TestCase):
             ExpressionPatternRetrievalPolicy(Store()).search(
                 query="嘿嘿",
                 session_id="group-1",
-                shared_scope="group-1:user:alice",
+                shared_scope="group-1",
             )
         )
-        self.assertEqual({item.id for item in result}, {"alice", "legacy-group"})
+        self.assertEqual({item.id for item in result}, {"legacy-group"})
 
     def test_pattern_service_scope_filter_matches_retrieval_policy(self):
         class Store:
@@ -253,11 +257,11 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         result = asyncio.run(
             service.list_patterns(
                 "group-1",
-                shared_scope="group-1:user:alice",
+                shared_scope="group-1",
                 review_status="approved",
             )
         )
-        self.assertEqual([item.id for item in result], ["alice"])
+        self.assertEqual([item.id for item in result], ["unscoped"])
 
     def test_prompt_formats_habit_type_as_style_not_fixed_line(self):
         text = ExpressionSelector._format_habits(

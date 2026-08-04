@@ -510,6 +510,9 @@ class CognitiveFeedbackRefactorTests(unittest.TestCase):
             async def initialize(self):
                 calls.append("store.initialize")
 
+            async def migration_applied(self, _version):
+                return True
+
             async def import_legacy_documents(self):
                 calls.append("legacy.documents")
 

@@ -94,15 +94,6 @@ class ExpressionCandidateExtractor:
         return identity, speaker_id, speaker_name
 
     @staticmethod
-    def _speaker_scope(group_id: str, speaker_id: str) -> str:
-        # A nickname is not a stable identity. Without a sender id, keep the
-        # legacy group scope instead of accidentally assigning one user's style
-        # to another user who later reuses the same nickname.
-        if speaker_id:
-            return f"{group_id}:user:{speaker_id}"
-        return str(group_id or "")
-
-    @staticmethod
     def _message_day(message: Any, *, fallback_index: int) -> str:
         raw_timestamp = getattr(message, "timestamp", None)
         if raw_timestamp is not None and str(raw_timestamp).strip():
@@ -250,30 +241,28 @@ class ExpressionCandidateExtractor:
         *,
         existing_patterns: set[Any] | None = None,
     ) -> list[dict[str, Any]]:
-        counts: dict[tuple[str, str], int] = defaultdict(int)
-        samples: dict[tuple[str, str], list[str]] = defaultdict(list)
-        situations: dict[tuple[str, str], str] = {}
-        styles: dict[tuple[str, str], str] = {}
-        evidence_ids: dict[tuple[str, str], list[str]] = defaultdict(list)
-        speaker_names: dict[str, str] = {}
-        speaker_ids: dict[str, str] = {}
-        speaker_days: dict[str, set[str]] = defaultdict(set)
-        speaker_messages: dict[str, list[tuple[int, str, str, float | None]]] = defaultdict(list)
-        existing_global: set[str] = set()
-        existing_by_scope: dict[str, set[str]] = defaultdict(set)
+        counts: dict[str, int] = defaultdict(int)
+        samples: dict[str, list[str]] = defaultdict(list)
+        situations: dict[str, str] = {}
+        styles: dict[str, str] = {}
+        turn_keys: dict[str, set[str]] = defaultdict(set)
+        day_keys: dict[str, set[str]] = defaultdict(set)
+        contributor_keys: dict[str, set[str]] = defaultdict(set)
+        existing: set[str] = set()
         for raw_item in existing_patterns or set():
             if isinstance(raw_item, tuple) and len(raw_item) == 2:
-                raw_scope, raw_expression = raw_item
-                normalized_existing = self._normalize_text(str(raw_expression or ""))
-                if normalized_existing:
-                    existing_by_scope[str(raw_scope or "")].add(normalized_existing)
-                continue
+                raw_item = raw_item[1]
             normalized_existing = self._normalize_text(str(raw_item or ""))
             if normalized_existing:
-                existing_global.add(normalized_existing)
-        phrase_counts: dict[tuple[str, str], int] = defaultdict(int)
-        phrase_samples: dict[tuple[str, str], list[str]] = defaultdict(list)
-        phrase_evidence_ids: dict[tuple[str, str], list[str]] = defaultdict(list)
+                existing.add(normalized_existing)
+        phrase_counts: dict[str, int] = defaultdict(int)
+        phrase_samples: dict[str, list[str]] = defaultdict(list)
+        phrase_turn_keys: dict[str, set[str]] = defaultdict(set)
+        phrase_day_keys: dict[str, set[str]] = defaultdict(set)
+        phrase_contributors: dict[str, set[str]] = defaultdict(set)
+        group_messages: list[tuple[int, str, str, float | None]] = []
+        group_days: set[str] = set()
+        group_contributors: set[str] = set()
         accepted_messages = 0
         skipped_noise = 0
         skipped_existing = 0
@@ -286,105 +275,88 @@ class ExpressionCandidateExtractor:
             if bool(getattr(message, "is_bot", False)) or str(getattr(message, "role", "") or "").lower() in {"assistant", "bot", "self"}:
                 skipped_noise += 1
                 continue
-            speaker_identity, speaker_id, speaker_name = self._speaker_info(message)
-            scope_id = self._speaker_scope(group_id, speaker_id)
-            scoped_existing = (
-                existing_global
-                | existing_by_scope.get(str(group_id or ""), set())
-                | existing_by_scope.get(scope_id, set())
-            )
-            if self._near_duplicate(content, scoped_existing):
+            if self._near_duplicate(content, existing):
                 skipped_existing += 1
                 continue
             normalized = self._normalize_text(content)
-            speaker_ids[scope_id] = speaker_id
-            speaker_names[scope_id] = speaker_name or speaker_identity
-            speaker_days[scope_id].add(self._message_day(message, fallback_index=message_index))
+            speaker_identity, _, _ = self._speaker_info(message)
+            message_day = self._message_day(message, fallback_index=message_index)
             accepted_messages += 1
             evidence_id = self._message_evidence_id(message, fallback_index=message_index)
-            speaker_messages[scope_id].append(
-                (message_index, content, evidence_id, self._message_timestamp(message))
-            )
-            exact_key = (scope_id, normalized)
+            group_messages.append((message_index, content, evidence_id, self._message_timestamp(message)))
+            group_days.add(message_day)
+            group_contributors.add(speaker_identity)
             if self._is_expression_candidate(content, exact=True):
-                counts[exact_key] += 1
-                if evidence_id not in evidence_ids[exact_key]:
-                    evidence_ids[exact_key].append(evidence_id)
-                if len(samples[exact_key]) < 4:
-                    samples[exact_key].append(content[:160])
-                situations.setdefault(exact_key, self._infer_situation(content))
-                styles.setdefault(exact_key, self._infer_style(content))
+                counts[normalized] += 1
+                turn_keys[normalized].add(evidence_id)
+                day_keys[normalized].add(message_day)
+                contributor_keys[normalized].add(speaker_identity)
+                if len(samples[normalized]) < 4:
+                    samples[normalized].append(content[:160])
+                situations.setdefault(normalized, self._infer_situation(content))
+                styles.setdefault(normalized, self._infer_style(content))
             for phrase in self._phrase_fragments(content):
                 normalized_phrase = self._normalize_text(phrase)
-                if self._near_duplicate(normalized_phrase, scoped_existing):
+                if self._near_duplicate(normalized_phrase, existing):
                     continue
-                phrase_key = (scope_id, normalized_phrase)
-                phrase_counts[phrase_key] += 1
-                if evidence_id not in phrase_evidence_ids[phrase_key]:
-                    phrase_evidence_ids[phrase_key].append(evidence_id)
-                if len(phrase_samples[phrase_key]) < 4:
-                    phrase_samples[phrase_key].append(content[:160])
+                phrase_counts[normalized_phrase] += 1
+                phrase_turn_keys[normalized_phrase].add(evidence_id)
+                phrase_day_keys[normalized_phrase].add(message_day)
+                phrase_contributors[normalized_phrase].add(speaker_identity)
+                if len(phrase_samples[normalized_phrase]) < 4:
+                    phrase_samples[normalized_phrase].append(content[:160])
 
         candidates: list[dict[str, Any]] = []
         qualifying_exact: list[tuple[str, int]] = []
-        for (scope_id, normalized), count in sorted(counts.items(), key=lambda item: (-item[1], item[0][0], item[0][1])):
+        for normalized, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             if count < self.min_count:
                 continue
-            qualifying_exact.append((f"{scope_id}:{normalized}", count))
-            content_samples = list(samples.get((scope_id, normalized), []))
+            qualifying_exact.append((normalized, count))
+            content_samples = list(samples.get(normalized, []))
             expression = content_samples[0] if content_samples else normalized
             activation_score = min(1.0, 0.4 + count * 0.18)
             candidates.append(
                 {
                     "group_id": group_id,
-                    "speaker_id": speaker_ids.get(scope_id, ""),
-                    "speaker_name": speaker_names.get(scope_id, ""),
-                    "shared_scope": scope_id,
-                    "scope_kind": "user" if ":user:" in scope_id else "group",
+                    "shared_scope": group_id,
+                    "scope_kind": "group",
                     "expression": expression,
                     "normalized_expression": normalized,
                     "habit_type": self._infer_habit_type(expression, candidate_type="exact"),
                     "content_kind": "expression",
-                    "situation": situations.get((scope_id, normalized), "日常回应"),
-                    "style": styles.get((scope_id, normalized), "自然"),
+                    "situation": situations.get(normalized, "日常回应"),
+                    "style": styles.get(normalized, "自然"),
                     "content_samples": content_samples,
                     "count": count,
-                    "distinct_turn_count": len(evidence_ids.get((scope_id, normalized), [])),
-                    "distinct_day_count": len(speaker_days.get(scope_id, set())),
+                    "distinct_turn_count": len(turn_keys.get(normalized, set())),
+                    "distinct_day_count": len(day_keys.get(normalized, set())),
+                    "distinct_contributor_count": len(contributor_keys.get(normalized, set())),
                     "activation_score": activation_score,
                     "think_level": 1 if len(expression) >= 10 else 0,
                     "candidate_type": "exact",
-                    "candidate_id": self._candidate_id(group_id, "exact", normalized, scope_id),
-                    "evidence_message_ids": list(evidence_ids.get((scope_id, normalized), [])),
+                    "candidate_id": self._candidate_id(group_id, "exact", normalized),
                 }
             )
-            existing_by_scope[scope_id].add(normalized)
+            existing.add(normalized)
 
-        selected_phrases: list[tuple[str, str, int]] = []
-        for (scope_id, phrase), count in sorted(phrase_counts.items(), key=lambda item: (-item[1], -len(item[0][1]), item[0][0], item[0][1])):
+        selected_phrases: list[tuple[str, int]] = []
+        for phrase, count in sorted(phrase_counts.items(), key=lambda item: (-item[1], -len(item[0]), item[0])):
             if count < self.min_count:
                 continue
-            if any(phrase == selected and selected_scope == scope_id and selected_count == count for selected_scope, selected, selected_count in selected_phrases):
+            if any(phrase == selected and selected_count == count for selected, selected_count in selected_phrases):
                 continue
-            selected_phrases.append((scope_id, phrase, count))
-            scoped_existing = (
-                existing_global
-                | existing_by_scope.get(str(group_id or ""), set())
-                | existing_by_scope.get(scope_id, set())
-            )
-            if phrase in scoped_existing:
+            selected_phrases.append((phrase, count))
+            if phrase in existing:
                 continue
-            if any(f"{scope_id}:{phrase}" == exact and exact_count == count for exact, exact_count in qualifying_exact):
+            if any(phrase == exact and exact_count == count for exact, exact_count in qualifying_exact):
                 continue
-            content_samples = list(phrase_samples.get((scope_id, phrase), []))
+            content_samples = list(phrase_samples.get(phrase, []))
             expression = phrase
             candidates.append(
                 {
                     "group_id": group_id,
-                    "speaker_id": speaker_ids.get(scope_id, ""),
-                    "speaker_name": speaker_names.get(scope_id, ""),
-                    "shared_scope": scope_id,
-                    "scope_kind": "user" if ":user:" in scope_id else "group",
+                    "shared_scope": group_id,
+                    "scope_kind": "group",
                     "expression": expression,
                     "normalized_expression": phrase,
                     "habit_type": self._infer_habit_type(expression, candidate_type="phrase"),
@@ -393,23 +365,19 @@ class ExpressionCandidateExtractor:
                     "style": self._infer_style(content_samples[0] if content_samples else phrase),
                     "content_samples": content_samples,
                     "count": count,
-                    "distinct_turn_count": len(phrase_evidence_ids.get((scope_id, phrase), [])),
-                    "distinct_day_count": len(speaker_days.get(scope_id, set())),
+                    "distinct_turn_count": len(phrase_turn_keys.get(phrase, set())),
+                    "distinct_day_count": len(phrase_day_keys.get(phrase, set())),
+                    "distinct_contributor_count": len(phrase_contributors.get(phrase, set())),
                     "activation_score": min(1.0, 0.35 + count * 0.16),
                     "think_level": 0,
                     "candidate_type": "phrase",
-                    "candidate_id": self._candidate_id(group_id, "phrase", phrase, scope_id),
-                    "evidence_message_ids": list(phrase_evidence_ids.get((scope_id, phrase), [])),
+                    "candidate_id": self._candidate_id(group_id, "phrase", phrase),
                 }
             )
-            existing_by_scope[scope_id].add(phrase)
+            existing.add(phrase)
 
         rhythm_candidates = 0
-        for scope_id, entries in sorted(speaker_messages.items()):
-            # Rhythm must belong to a stable user. Group-scoped fallback messages
-            # may contain multiple unidentified speakers and must never be merged.
-            if not speaker_ids.get(scope_id):
-                continue
+        for entries in ([group_messages] if group_messages else []):
             evidence = list(dict.fromkeys(item[2] for item in entries if item[2]))
             if len(evidence) < max(self.min_count, 3):
                 continue
@@ -438,10 +406,8 @@ class ExpressionCandidateExtractor:
             candidates.append(
                 {
                     "group_id": group_id,
-                    "speaker_id": speaker_ids.get(scope_id, ""),
-                    "speaker_name": speaker_names.get(scope_id, ""),
-                    "shared_scope": scope_id,
-                    "scope_kind": "user",
+                    "shared_scope": group_id,
+                    "scope_kind": "group",
                     "expression": expression,
                     "normalized_expression": normalized_rhythm,
                     "habit_type": "rhythm",
@@ -452,17 +418,12 @@ class ExpressionCandidateExtractor:
                     "content_samples": [item[1][:160] for item in entries[:4]],
                     "count": len(evidence),
                     "distinct_turn_count": len(evidence),
-                    "distinct_day_count": len(speaker_days.get(scope_id, set())),
+                    "distinct_day_count": len(group_days),
+                    "distinct_contributor_count": len(group_contributors),
                     "activation_score": min(1.0, 0.35 + len(evidence) * 0.08),
                     "think_level": 0,
                     "candidate_type": "rhythm",
-                    "candidate_id": self._candidate_id(
-                        group_id,
-                        "rhythm",
-                        normalized_rhythm,
-                        scope_id,
-                    ),
-                    "evidence_message_ids": evidence[:12],
+                    "candidate_id": self._candidate_id(group_id, "rhythm", normalized_rhythm),
                 }
             )
             rhythm_candidates += 1
@@ -476,7 +437,7 @@ class ExpressionCandidateExtractor:
             "exact_candidates": len(qualifying_exact),
             "phrase_candidates": sum(1 for item in candidates if item.get("candidate_type") == "phrase"),
             "rhythm_candidates": rhythm_candidates,
-            "speaker_scopes": len(speaker_names),
+            "contributor_count": len(group_contributors),
             "candidate_count": len(candidates),
             "reason": "candidates_ready" if candidates else "no_repeated_expression",
         }

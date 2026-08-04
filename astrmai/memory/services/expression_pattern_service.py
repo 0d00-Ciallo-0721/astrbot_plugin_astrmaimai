@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from ...learning.dedup import expression_fingerprint, normalize_expression_text
 from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
 from .v2_store import MemoryV2Store
 
@@ -44,15 +45,22 @@ class ExpressionPatternService:
 
     @staticmethod
     def normalize_text(value: str) -> str:
-        return re.sub(r"\s+", "", str(value or "").strip().lower())
+        return normalize_expression_text(value)
 
     @classmethod
-    def build_dedup_key(cls, group_id: str, situation: str, expression: str, shared_scope: str = "") -> str:
-        return "expression_pattern:{group}:{scope}:{situation}:{expression}".format(
-            group=str(group_id or ""),
-            scope=cls.normalize_text(shared_scope or ""),
-            situation=cls.normalize_text(situation or ""),
-            expression=cls.normalize_text(expression or ""),
+    def build_dedup_key(
+        cls,
+        group_id: str,
+        situation: str,
+        expression: str,
+        shared_scope: str = "",
+        habit_type: str = "sentence_pattern",
+    ) -> str:
+        return expression_fingerprint(
+            str(group_id or shared_scope or ""),
+            habit_type,
+            expression,
+            situation,
         )
 
     @staticmethod
@@ -74,9 +82,12 @@ class ExpressionPatternService:
     def _merge_review_status(existing: str, incoming: str) -> str:
         old = str(existing or "").strip().lower()
         new = str(incoming or "").strip().lower()
+        # Automatic mining never downgrades an explicit human decision.
+        if old in {"approved", "rejected"}:
+            return old
         if new in {"approved", "rejected", "pending_human", "revision_needed"}:
             return new
-        if old in {"approved", "rejected", "pending_human", "revision_needed"}:
+        if old in {"pending_human", "revision_needed", "stale"}:
             return old
         return new or old or "pending"
 
@@ -124,7 +135,7 @@ class ExpressionPatternService:
                 value = [value]
         if not isinstance(value, list):
             value = []
-        return [str(item).strip() for item in value if str(item).strip()][:12]
+        return [str(item).strip() for item in value if str(item).strip()][:4]
 
     @staticmethod
     def _candidate_to_record(candidate: MemoryCandidate) -> ExpressionPatternRecord:
@@ -190,11 +201,7 @@ class ExpressionPatternService:
             if not include_rejected and record.rejected:
                 continue
             if shared_scope is not None:
-                requested_scope = str(shared_scope or "").strip()
-                # New records are speaker-scoped; legacy group-scoped records remain
-                # readable as a compatibility fallback for the same chat only.
-                allowed_scopes = {requested_scope, str(group_id or "").strip()}
-                if record.shared_scope not in allowed_scopes:
+                if record.shared_scope not in {"", str(group_id or "").strip()}:
                     continue
             if think_level is not None and int(record.think_level or 0) > int(think_level or 0):
                 continue
@@ -273,8 +280,13 @@ class ExpressionPatternService:
         requested_shared_scope = shared_scope
         expression = str(current.expression or "")
         situation = str(current.situation or "")
-        shared_scope = str(current.shared_scope or "")
-        old_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope)
+        shared_scope = str(current.group_id or "")
+        habit_type = str(metadata.get("habit_type") or "sentence_pattern")
+        metadata["shared_scope"] = shared_scope
+        metadata["scope_kind"] = "group"
+        for legacy_key in ("speaker_id", "speaker_name", "evidence_message_ids"):
+            metadata.pop(legacy_key, None)
+        old_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope, habit_type)
         replacement_applied = False
         identity_changed = False
         if replacement_expression and apply_replacement:
@@ -289,11 +301,11 @@ class ExpressionPatternService:
                 metadata["situation"] = situation
                 identity_changed = True
         if requested_shared_scope is not None:
-            next_shared_scope = str(requested_shared_scope or "").strip()
-            if next_shared_scope and next_shared_scope != shared_scope:
+            next_shared_scope = str(current.group_id or "").strip()
+            if next_shared_scope != shared_scope:
                 shared_scope = next_shared_scope
-                metadata["shared_scope"] = shared_scope
                 identity_changed = True
+            metadata["shared_scope"] = shared_scope
         if style is not None:
             metadata["style"] = str(style or "").strip()
         if modified_by is not None:
@@ -345,7 +357,7 @@ class ExpressionPatternService:
         metadata["content_samples"] = self._sample_list(metadata.get("content_samples") or current.content_list)
         summary = str(metadata.get("summary") or expression[:240])
         if replacement_applied or identity_changed:
-            new_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope)
+            new_dedup_key = self.build_dedup_key(current.group_id, situation, expression, shared_scope, habit_type)
             conflict = await self.store.get_by_dedup_key(new_dedup_key, include_inactive=True)
             if conflict and str(conflict.id) != str(pattern_id):
                 conflict_metadata = dict(conflict.metadata or {})
@@ -445,8 +457,9 @@ class ExpressionPatternService:
         situation = str(payload.get("situation") or "").strip()
         if not expression or not situation:
             return ""
-        shared_scope = str(payload.get("shared_scope") or group_id or "").strip()
-        dedup_key = self.build_dedup_key(group_id, situation, expression, shared_scope)
+        shared_scope = str(group_id or "").strip()
+        habit_type = str(payload.get("habit_type") or "sentence_pattern").strip()
+        dedup_key = self.build_dedup_key(group_id, situation, expression, shared_scope, habit_type)
         existing = await self.store.get_by_dedup_key(dedup_key, include_inactive=True)
         resolver = getattr(self.store, "resolve_dedup_key", None)
         resolved_dedup_key = await resolver(dedup_key) if callable(resolver) else dedup_key
@@ -456,33 +469,19 @@ class ExpressionPatternService:
         incoming_samples = self._sample_list(payload.get("content_samples", []))
         now = time.time()
         existing_metadata = dict(existing.metadata or {}) if existing else {}
-        incoming_evidence_ids = [
-            str(item)
-            for item in (payload.get("evidence_message_ids") or [])
-            if str(item or "").strip()
-        ]
-        existing_evidence_ids = [
-            str(item)
-            for item in (existing_metadata.get("evidence_message_ids") or [])
-            if str(item or "").strip()
-        ]
-        existing_evidence_set = set(existing_evidence_ids)
-        unseen_evidence_ids = [item for item in incoming_evidence_ids if item not in existing_evidence_set]
         mining_batch_id = str(payload.get("mining_batch_id") or "").strip()
         applied_batch_ids = [
             str(item)
             for item in (existing_metadata.get("applied_mining_batch_ids") or [])
             if str(item or "").strip()
         ]
-        if existing and mining_batch_id and mining_batch_id in applied_batch_ids and not unseen_evidence_ids:
+        if existing and mining_batch_id and mining_batch_id in applied_batch_ids:
             return str(existing.id)
         incoming_review_status = self._normalize_incoming_review_status(payload.get("review_status", "pending"), source=source)
         review_status = self._merge_review_status(existing_metadata.get("review_status", ""), incoming_review_status)
         merged_samples = self._sample_list([*self._sample_list(existing_metadata.get("content_samples", [])), *incoming_samples])
         incoming_count = max(int(payload.get("count") or 1), 1)
-        if existing and incoming_evidence_ids:
-            count_increment = len(unseen_evidence_ids)
-        elif existing and mining_batch_id in applied_batch_ids:
+        if existing and mining_batch_id in applied_batch_ids:
             count_increment = 0
         else:
             count_increment = incoming_count
@@ -505,19 +504,21 @@ class ExpressionPatternService:
             **existing_metadata,
             "situation": situation,
             "style": str(payload.get("style") or existing_metadata.get("style") or "").strip(),
-            "habit_type": str(payload.get("habit_type") or existing_metadata.get("habit_type") or "sentence_pattern").strip(),
+            "habit_type": habit_type,
             "content_kind": str(payload.get("content_kind") or existing_metadata.get("content_kind") or "expression").strip(),
             "normalized_pattern": str(payload.get("normalized_pattern") or existing_metadata.get("normalized_pattern") or "").strip(),
-            "speaker_id": str(payload.get("speaker_id") or existing_metadata.get("speaker_id") or "").strip(),
-            "speaker_name": str(payload.get("speaker_name") or existing_metadata.get("speaker_name") or "").strip(),
-            "scope_kind": str(payload.get("scope_kind") or existing_metadata.get("scope_kind") or "group").strip(),
+            "scope_kind": "group",
             "distinct_turn_count": max(
                 int(existing_metadata.get("distinct_turn_count") or 0),
-                int(payload.get("distinct_turn_count") or len(incoming_evidence_ids) or 0),
+                int(payload.get("distinct_turn_count") or 0),
             ),
             "distinct_day_count": max(
                 int(existing_metadata.get("distinct_day_count") or 0),
                 int(payload.get("distinct_day_count") or 0),
+            ),
+            "distinct_contributor_count": max(
+                int(existing_metadata.get("distinct_contributor_count") or 0),
+                int(payload.get("distinct_contributor_count") or 0),
             ),
             "content_samples": merged_samples,
             "shared_scope": shared_scope,
@@ -531,11 +532,12 @@ class ExpressionPatternService:
             "confidence": confidence,
             "summary": summary,
             "candidate_id": str(payload.get("candidate_id") or existing_metadata.get("candidate_id") or ""),
-            "evidence_message_ids": list(dict.fromkeys([*existing_evidence_ids, *incoming_evidence_ids]))[-256:],
             "applied_mining_batch_ids": list(
                 dict.fromkeys([*applied_batch_ids, *([mining_batch_id] if mining_batch_id else [])])
             )[-128:],
         }
+        for legacy_key in ("speaker_id", "speaker_name", "evidence_message_ids"):
+            metadata.pop(legacy_key, None)
         if payload.get("legacy_pattern_id"):
             metadata["legacy_pattern_id"] = payload.get("legacy_pattern_id")
         memory_id = await self.write_service.write(

@@ -121,6 +121,107 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_learning_scope_migration_merges_global_jargon_and_group_style_duplicates(self):
+        async def run():
+            from astrmai.learning.dedup import GLOBAL_JARGON_SESSION_ID
+
+            memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+            store, *_rest = self._services()
+            await store.initialize()
+            for index, (session_id, status) in enumerate(
+                (("ff:GroupMessage:1", "review_pending"), ("ff:GroupMessage:2", "active"))
+            ):
+                await store.upsert(
+                    self.contracts.MemoryWriteRequest(
+                        source="learning_jargon",
+                        kind="jargon",
+                        session_id=session_id,
+                        content="ＨＩＹＯＨＩＹＯ" if index == 0 else "hiyohiyo",
+                        summary="招呼语",
+                        metadata={
+                            "meaning": "招呼语",
+                            "count": index + 1,
+                            "examples": [f"例句{index}"],
+                        },
+                        status=status,
+                        dedup_key=f"legacy:jargon:{index}",
+                    )
+                )
+            for index, status in enumerate(("rejected", "active")):
+                await store.upsert(
+                    self.contracts.MemoryWriteRequest(
+                        source="learning_expression",
+                        kind="expression_pattern",
+                        session_id="ff:GroupMessage:1",
+                        content="句尾喜欢加捏",
+                        summary="句尾喜欢加捏",
+                        metadata={
+                            "habit_type": "sentence_ending",
+                            "situation": f"场景{index}",
+                            "count": index + 1,
+                            "speaker_id": str(index),
+                            "evidence_message_ids": [f"msg-{index}"],
+                        },
+                        status=status,
+                        dedup_key=f"legacy:expression:{index}",
+                    )
+                )
+
+            projected = []
+
+            class _Projector:
+                async def project(self, memory_id):
+                    projected.append(("project", memory_id))
+
+                async def cleanup_deleted(self, memory_ids):
+                    projected.append(("cleanup", tuple(memory_ids)))
+
+            engine = object.__new__(memory_engine_mod.MemoryEngine)
+            engine.v2_store = store
+            engine.index_projector = _Projector()
+            await engine._migrate_learning_scope_v3()
+
+            jargons = await store.list_candidates(
+                kinds=["jargon"],
+                statuses=["active", "review_pending", "rejected", "stale"],
+                include_inactive=True,
+                limit=20,
+            )
+            patterns = await store.list_candidates(
+                kinds=["expression_pattern"],
+                statuses=["active", "review_pending", "rejected", "stale"],
+                include_inactive=True,
+                limit=20,
+            )
+
+            self.assertEqual(len(jargons), 1)
+            self.assertEqual(jargons[0].session_id, GLOBAL_JARGON_SESSION_ID)
+            self.assertEqual(jargons[0].status, "active")
+            self.assertEqual(jargons[0].metadata["count"], 3)
+            self.assertEqual(set(jargons[0].metadata["source_groups"]), {"ff:GroupMessage:1", "ff:GroupMessage:2"})
+            self.assertEqual(len(patterns), 1)
+            self.assertEqual(patterns[0].session_id, "ff:GroupMessage:1")
+            self.assertEqual(patterns[0].status, "active")
+            self.assertEqual(patterns[0].metadata["count"], 3)
+            self.assertNotIn("speaker_id", patterns[0].metadata)
+            self.assertNotIn("evidence_message_ids", patterns[0].metadata)
+            self.assertTrue(any(action == "cleanup" for action, _value in projected))
+            self.assertTrue(await store.migration_applied("3_learning_scope_unification"))
+
+        asyncio.run(run())
+
+    def test_learning_scope_status_merge_preserves_human_rejection_over_pending(self):
+        memory_engine_mod = importlib.import_module("astrmai.memory.services.memory_engine")
+
+        self.assertEqual(
+            memory_engine_mod.MemoryEngine._merge_learning_status("rejected", "review_pending"),
+            ("rejected", "rejected", "maintenance_only"),
+        )
+        self.assertEqual(
+            memory_engine_mod.MemoryEngine._merge_learning_status("rejected", "active"),
+            ("active", "approved", "auto_and_tool"),
+        )
+
     def test_quality_audit_quarantines_legacy_question_facts_and_duplicate_feedback(self):
         async def run():
             store, _retrieval, _writer, _injection, _tools, maintenance = self._services()
@@ -533,7 +634,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_jargon_auto_injection_flows_through_main_memory_bundle(self):
+    def test_jargon_is_excluded_from_generic_memory_bundle_but_available_to_explicit_tool(self):
         async def run():
             _store, _retrieval, writer, injection, tools, _maintenance = self._services()
             jargon_id = await writer.write(
@@ -557,11 +658,10 @@ class MemoryV2ServiceTests(unittest.TestCase):
             event = _FakeEvent("remember bigbird")
             event.set_extra("astrmai_think_level", 2)
             bundle = await injection.build_bundle(event=event, prompt="bigbird")
-            self.assertIn("[jargon]", bundle.rendered_prompt_block)
-            self.assertIn("bigbird -> a raid boss nickname (scene: raid call)", bundle.rendered_prompt_block)
+            self.assertNotIn("[jargon]", bundle.rendered_prompt_block)
             trace = event.get_extra("astrmai_memory_injection_trace")
-            self.assertIn("jargon", trace.layers)
-            self.assertIn(jargon_id, trace.selected_ids)
+            self.assertNotIn("jargon", trace.layers)
+            self.assertNotIn(jargon_id, trace.selected_ids)
 
             result = await tools.search_memory(
                 query="bigbird",
@@ -570,7 +670,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
                 event=event,
             )
             self.assertEqual(result.already_injected_ids, trace.selected_ids)
-            self.assertEqual(result.items, [])
+            self.assertEqual([item.id for item in result.items], [jargon_id])
 
         asyncio.run(run())
 

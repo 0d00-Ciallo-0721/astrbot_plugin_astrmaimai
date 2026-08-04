@@ -9,6 +9,7 @@ import aiosqlite
 
 from astrbot.api import logger
 
+from ...learning.dedup import GLOBAL_JARGON_SESSION_ID, expression_fingerprint, jargon_fingerprint
 from ..contracts.memory_query import MemoryWriteRequest
 from .memory_index_projector import MemoryIndexProjector
 from .v2_store import MemoryV2Store
@@ -505,14 +506,14 @@ class MemoryMigrationService:
                 if not content:
                     continue
                 meaning = str(item.get("meaning") or "").strip()
-                group_id = str(item.get("group_id") or "GLOBAL")
+                source_group_id = str(item.get("group_id") or "")
                 status = "active" if bool(item.get("is_jargon")) and bool(item.get("is_complete")) and meaning else "review_pending"
                 review_status = "approved" if status == "active" else "review_pending"
                 memory_id = await self.store.upsert(
                     MemoryWriteRequest(
                         source="migration_jargon",
                         kind="jargon",
-                        session_id=group_id,
+                        session_id=GLOBAL_JARGON_SESSION_ID,
                         content=content,
                         summary=meaning or content,
                         importance=0.65,
@@ -522,9 +523,10 @@ class MemoryMigrationService:
                             "raw_content": str(item.get("raw_content") or content),
                             "meaning": meaning,
                             "count": int(item.get("count") or 1),
+                            "source_groups": [source_group_id] if source_group_id else [],
                             "review_status": review_status,
                         },
-                        dedup_key=f"jargon:{group_id}:{content.lower()}",
+                        dedup_key=jargon_fingerprint(content),
                         source_ref=f"Jargon:{item.get('id')}",
                         visibility="auto_and_tool" if status == "active" else "maintenance_only",
                         status=status,
@@ -564,11 +566,13 @@ class MemoryMigrationService:
                     continue
                 review_status = str(item.get("review_status") or ("approved" if item.get("checked") else "pending")).strip().lower()
                 status = "active" if review_status == "approved" else ("rejected" if review_status == "rejected" else "review_pending")
+                group_id = str(item.get("group_id") or "")
+                habit_type = str(item.get("habit_type") or "sentence_pattern")
                 await self.store.upsert(
                     MemoryWriteRequest(
                         source="migration_expression_pattern",
                         kind="expression_pattern",
-                        session_id=str(item.get("group_id") or ""),
+                        session_id=group_id,
                         content=expression,
                         summary=str(item.get("summary") or expression)[:240],
                         importance=min(1.0, max(0.2, float(item.get("weight") or 1.0) / 3.0)),
@@ -578,7 +582,9 @@ class MemoryMigrationService:
                             "situation": situation,
                             "style": str(item.get("style") or ""),
                             "content_samples": self._json_list(item.get("content_list")),
-                            "shared_scope": str(item.get("shared_scope") or ""),
+                            "shared_scope": group_id,
+                            "scope_kind": "group",
+                            "habit_type": habit_type,
                             "think_level": int(item.get("think_level") or 0),
                             "review_status": review_status,
                             "review_reason": str(item.get("review_reason") or ""),
@@ -587,7 +593,7 @@ class MemoryMigrationService:
                             "count": int(item.get("count") or 1),
                             "last_active_time": float(item.get("last_active_time") or 0.0),
                         },
-                        dedup_key=f"expression_pattern:{item.get('group_id') or ''}:{str(item.get('shared_scope') or '').lower()}:{situation.lower()}:{expression.lower()}",
+                        dedup_key=expression_fingerprint(group_id, habit_type, expression, situation),
                         source_ref=f"ExpressionPattern:{item.get('id')}",
                         visibility="auto_and_tool" if status == "active" else "maintenance_only",
                         status=status,

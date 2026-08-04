@@ -19,6 +19,7 @@ from .contracts.learning_events import (
 )
 from .logging.bot_reply_recorder import BotReplyRecorder
 from .logging.message_recorder import MessageRecorder
+from .dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint, normalize_jargon_term
 from .mining.expression_miner import ExpressionMiner
 from .mining.expression_results import PatternSaveReport
 from .mining.jargon_miner import JargonMiner
@@ -401,10 +402,11 @@ class EvolutionManager:
             group_id = str(self._field(pattern, "group_id", "") or "")
             expression = str(self._field(pattern, "expression", "") or "")
             situation = str(self._field(pattern, "situation", "") or "")
-            shared_scope = str(self._field(pattern, "shared_scope", "") or group_id)
+            shared_scope = group_id
             existing = None
             try:
-                dedup_key = service.build_dedup_key(group_id, situation, expression, shared_scope)
+                habit_type = str(self._field(pattern, "habit_type", "sentence_pattern") or "sentence_pattern")
+                dedup_key = service.build_dedup_key(group_id, situation, expression, shared_scope, habit_type)
                 existing = await service.store.get_by_dedup_key(dedup_key, include_inactive=True)
                 memory_id = await service.write_pattern(
                     group_id,
@@ -415,11 +417,10 @@ class EvolutionManager:
                         "habit_type": self._field(pattern, "habit_type", "sentence_pattern"),
                         "content_kind": self._field(pattern, "content_kind", "expression"),
                         "normalized_pattern": self._field(pattern, "normalized_expression", ""),
-                        "speaker_id": self._field(pattern, "speaker_id", ""),
-                        "speaker_name": self._field(pattern, "speaker_name", ""),
-                        "scope_kind": self._field(pattern, "scope_kind", "group"),
+                        "scope_kind": "group",
                         "distinct_turn_count": int(self._field(pattern, "distinct_turn_count", len(self._field(pattern, "evidence_message_ids", []) or [])) or 0),
                         "distinct_day_count": int(self._field(pattern, "distinct_day_count", 0) or 0),
+                        "distinct_contributor_count": int(self._field(pattern, "distinct_contributor_count", 0) or 0),
                         "content_samples": list(self._field(pattern, "content_samples", []) or []),
                         "count": int(self._field(pattern, "count", 1) or 1),
                         "think_level": int(self._field(pattern, "think_level", 0) or 0),
@@ -432,7 +433,6 @@ class EvolutionManager:
                         "confidence": float(self._field(pattern, "confidence", self._field(pattern, "activation_score", 0.65)) or 0.65),
                         "activation_score": float(self._field(pattern, "activation_score", 0.65) or 0.65),
                         "candidate_id": self._field(pattern, "candidate_id", ""),
-                        "evidence_message_ids": list(self._field(pattern, "evidence_message_ids", []) or []),
                         "mining_batch_id": mining_batch_id,
                         "source_ref": f"{source}:{mining_batch_id}:{self._field(pattern, 'candidate_id', '')}",
                     },
@@ -451,16 +451,20 @@ class EvolutionManager:
                 logger.warning(f"[Evolution-Expression] persistence failed: {exc}")
         return report
 
-    async def _save_jargons(self, group_id: str, jargons) -> int:
+    async def _save_jargons(
+        self,
+        group_id: str,
+        jargons,
+        *,
+        mining_batch_id: str = "",
+    ) -> int:
         memory_engine = getattr(self.db, "memory_engine", None)
         writer = getattr(memory_engine, "write_service", None) if memory_engine else None
         if not writer or not hasattr(writer, "write"):
             return 0
 
-        def _normalized_key(value: str) -> str:
-            return "".join(str(value or "").strip().lower().split())
-
         requests: list[MemoryWriteRequest] = []
+        store = getattr(memory_engine, "v2_store", None)
         for jargon in jargons:
             content = str(self._field(jargon, "content", "") or "").strip()
             if not content:
@@ -475,28 +479,78 @@ class EvolutionManager:
             review_status = self._normalize_jargon_review_status(self._field(jargon, "review_status", "review_pending"))
             status = "rejected" if review_status == "rejected" else "review_pending"
             visibility = "maintenance_only"
+            dedup_key = jargon_fingerprint(content)
+            existing = await store.get_by_dedup_key(dedup_key, include_inactive=True) if store else None
+            existing_metadata = dict(getattr(existing, "metadata", {}) or {})
+            existing_status = str(getattr(existing, "status", "") or "").strip().lower()
+            if existing_status == "active":
+                status = "active"
+                review_status = "approved"
+                visibility = "auto_and_tool"
+            elif existing_status == "rejected":
+                status = "rejected"
+                review_status = "rejected"
+            elif existing_status == "stale":
+                status = "stale"
+            applied_batches = [
+                str(item)
+                for item in (existing_metadata.get("applied_mining_batch_ids") or [])
+                if str(item or "").strip()
+            ]
+            if mining_batch_id and mining_batch_id in applied_batches:
+                continue
+            aliases = [
+                str(item).strip()
+                for item in [
+                    *(existing_metadata.get("aliases") or []),
+                    raw_content,
+                    content,
+                ]
+                if str(item or "").strip()
+            ]
+            merged_examples = list(
+                dict.fromkeys(
+                    [
+                        *[str(item).strip() for item in (existing_metadata.get("examples") or []) if str(item).strip()],
+                        *examples,
+                    ]
+                )
+            )[:12]
+            incoming_count = int(self._field(jargon, "count", 1) or 1)
             requests.append(
                 MemoryWriteRequest(
                     source="learning_jargon",
                     kind="jargon",
-                    session_id=str(group_id or ""),
-                    content=content,
-                    summary=meaning or content,
+                    session_id=GLOBAL_JARGON_SESSION_ID,
+                    content=str(getattr(existing, "content", "") or content),
+                    summary=meaning or str(getattr(existing, "summary", "") or content),
                     tags=["jargon", "learning"],
                     importance=min(1.0, max(0.35, activation_score)),
                     confidence=max(0.1, min(confidence or activation_score or 0.55, 1.0)),
                     metadata={
                         "raw_content": raw_content,
-                        "meaning": meaning,
-                        "confidence": confidence,
-                        "activation_score": activation_score,
-                        "examples": examples,
-                        "scene": scene,
+                        "meaning": meaning or str(existing_metadata.get("meaning") or ""),
+                        "confidence": max(confidence, float(existing_metadata.get("confidence") or 0.0)),
+                        "activation_score": max(activation_score, float(existing_metadata.get("activation_score") or 0.0)),
+                        "examples": merged_examples,
+                        "aliases": list(dict.fromkeys(aliases))[:12],
+                        "scene": scene or str(existing_metadata.get("scene") or ""),
                         "review_status": review_status,
-                        "count": int(self._field(jargon, "count", 1) or 1),
+                        "count": int(existing_metadata.get("count") or 0) + incoming_count,
+                        "source_groups": list(
+                            dict.fromkeys(
+                                [
+                                    *[str(item) for item in (existing_metadata.get("source_groups") or []) if str(item)],
+                                    str(group_id or ""),
+                                ]
+                            )
+                        )[-64:],
+                        "applied_mining_batch_ids": list(
+                            dict.fromkeys([*applied_batches, *([mining_batch_id] if mining_batch_id else [])])
+                        )[-128:],
                     },
-                    dedup_key=f"jargon:{group_id}:{_normalized_key(content)}",
-                    source_ref=f"learning_jargon:{group_id}:{_normalized_key(content)}",
+                    dedup_key=dedup_key,
+                    source_ref=f"learning_jargon:{normalize_jargon_term(content)}",
                     visibility=visibility,
                     status=status,
                 )
@@ -630,7 +684,11 @@ class EvolutionManager:
                         retryable=jargon_retryable,
                     )
                     raise RuntimeError("jargon enrichment failed closed")
-                jargon_count = await self._save_jargons(group_id, jargons)
+                jargon_count = await self._save_jargons(
+                    group_id,
+                    jargons,
+                    mining_batch_id=batch_id,
+                )
 
             evolution = self._evolution_config()
             min_context = max(1, int(getattr(evolution, "min_mining_context", 10) or 10))

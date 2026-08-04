@@ -43,8 +43,8 @@ class _FakeMemoryEngine:
         return None
 
     @staticmethod
-    def _build_pattern_key(group_id, situation, expression, shared_scope=""):
-        return f"{group_id}:{shared_scope}:{situation}:{expression}"
+    def _build_pattern_key(group_id, situation, expression, shared_scope="", habit_type="sentence_pattern"):
+        return f"{group_id}:{shared_scope}:{habit_type}:{situation}:{expression}"
 
     async def _write_pattern(self, group_id, payload, source=""):
         self.pattern_writes.append((group_id, payload, source))

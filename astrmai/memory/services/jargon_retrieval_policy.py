@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from ...learning.dedup import normalize_jargon_term
 from ..contracts.memory_query import MemoryCandidate
 
 
@@ -87,6 +88,7 @@ class JargonRetrievalPolicy:
         allow_stale: bool = False,
         visibility_mode: str = "",
         trace: dict | None = None,
+        exact_only: bool = False,
     ) -> list[MemoryCandidate]:
         query_text = str(query or "").strip()
         if not query_text:
@@ -95,18 +97,41 @@ class JargonRetrievalPolicy:
         if allow_stale:
             statuses.append("stale")
         candidates = await self.store.list_candidates(
-            session_id=session_id,
+            session_id="",
             persona_id=persona_id,
             kinds=["jargon"],
             statuses=statuses,
-            limit=max(int(top_k or 3) * 8, 32),
+            # Exact global routing must inspect the whole practical dictionary;
+            # an arbitrary first page can otherwise hide a known term.
+            limit=max(int(top_k or 3) * 8, 2000),
             visibility_mode=visibility_mode,
         )
         excluded = {str(item) for item in exclude_ids or [] if str(item).strip()}
         terms = self._query_terms(query_text)
+        exact_matches: list[str] = []
         ranked: list[tuple[float, MemoryCandidate]] = []
         for candidate in candidates:
             if candidate.id in excluded:
+                continue
+            metadata = dict(candidate.metadata or {})
+            aliases = metadata.get("aliases", [])
+            if not isinstance(aliases, list):
+                aliases = []
+            normalized_query = normalize_jargon_term(query_text)
+            normalized_forms = {
+                normalize_jargon_term(candidate.content),
+                *(normalize_jargon_term(alias) for alias in aliases),
+            }
+            matched_forms = sorted(
+                form for form in normalized_forms
+                if normalized_query and form and form in normalized_query
+            )
+            if matched_forms:
+                exact_matches.extend(matched_forms)
+                candidate.relevance_score = max(candidate.relevance_score, 1.0)
+                ranked.append((4.0, candidate))
+                continue
+            if exact_only:
                 continue
             score = self._score(candidate, query_text, terms)
             if score <= 0:
@@ -116,7 +141,10 @@ class JargonRetrievalPolicy:
         ranked.sort(key=lambda item: item[0], reverse=True)
         selected = [candidate for _, candidate in ranked[: max(int(top_k or 3), 1)]]
         if trace is not None:
-            trace.setdefault("matched_terms", list(terms))
+            trace.setdefault(
+                "matched_terms",
+                list(dict.fromkeys(exact_matches if exact_only else terms)),
+            )
             trace.setdefault("top_k_scores", [
                 {"id": str(getattr(c, "id", "") or ""), "score": round(s, 4)}
                 for s, c in ranked[:max(int(top_k or 3), 1)]

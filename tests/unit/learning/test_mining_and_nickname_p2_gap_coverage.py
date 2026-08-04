@@ -64,7 +64,7 @@ class MiningAndNicknameP2GapCoverageTests(unittest.TestCase):
             memory_engine=SimpleNamespace(expression_pattern_service=_PatternService()),
         )
 
-        self.assertEqual(asyncio.run(miner._existing_patterns("group-1")), {("group-1", "hello")})
+        self.assertEqual(asyncio.run(miner._existing_patterns("group-1")), {"hello"})
 
         async def _broken(*args, **kwargs):
             raise RuntimeError("db locked")

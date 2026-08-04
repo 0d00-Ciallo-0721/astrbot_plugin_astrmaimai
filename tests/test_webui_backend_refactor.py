@@ -734,7 +734,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertEqual(len(active["items"]), 1)
         self.assertEqual(active["items"][0]["status"], "active")
         self.assertEqual(active["items"][0]["content"], "big bird")
-        self.assertEqual(active["items"][0]["group_id"], "group-2")
+        self.assertEqual(active["items"][0]["group_id"], "__global_jargon__")
         self.assertEqual(active["items"][0]["meaning"], "人工校准后的团本黑话")
         self.assertEqual(active["items"][0]["scene"], "团本集合")
         self.assertEqual(active["items"][0]["review_reason"], "人工确认")
@@ -746,6 +746,94 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIsNone(final_detail["data"])
         self.assertEqual(legacy_count, 0)
         self.assertEqual(remaining["total"], 0)
+
+    def test_runtime_jargon_update_merges_duplicate_global_term(self):
+        from astrmai.learning.dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        calls = []
+        target = SimpleNamespace(
+            id="mem-existing",
+            kind="jargon",
+            content="hiyohiyo",
+            status="review_pending",
+            summary="旧释义",
+            session_id=GLOBAL_JARGON_SESSION_ID,
+            metadata={"meaning": "旧释义", "count": 2, "examples": ["旧例句"]},
+        )
+        current = SimpleNamespace(
+            id="mem-edited",
+            kind="jargon",
+            content="另一个词",
+            status="review_pending",
+            summary="待修改",
+            session_id="ff:GroupMessage:1",
+            metadata={
+                "meaning": "待修改",
+                "count": 3,
+                "examples": ["新例句"],
+                "speaker_id": "123",
+            },
+        )
+
+        class _Store:
+            async def get_canonical(self, memory_id, include_inactive=False):
+                return current if memory_id == current.id else target
+
+            async def get_by_dedup_key(self, dedup_key, include_inactive=False):
+                self.last_dedup_key = dedup_key
+                return target
+
+            async def update_memory(self, memory_id, **kwargs):
+                calls.append(("update", memory_id, kwargs))
+                return 1
+
+            async def hard_delete(self, memory_id, kind=""):
+                calls.append(("delete", memory_id, kind))
+                return 1
+
+        class _Projector:
+            async def cleanup_deleted(self, memory_ids):
+                calls.append(("cleanup", list(memory_ids)))
+                return 1
+
+            async def project(self, memory_id):
+                calls.append(("project", memory_id))
+                return 1
+
+        store = _Store()
+
+        class _PluginApi:
+            def get_v2_store(self):
+                return store
+
+            def get_index_projector(self):
+                return _Projector()
+
+            def get_memory_engine(self):
+                return None
+
+        result = asyncio.run(
+            MemoryUiService(None, _PluginApi()).update_jargon(
+                current.id,
+                {
+                    "content": "ＨＩＹＯＨＩＹＯ",
+                    "meaning": "新释义",
+                    "status": "active",
+                    "examples": ["新例句"],
+                },
+            )
+        )
+
+        self.assertEqual(result, {"status": "ok", "id": target.id, "merged": True})
+        self.assertEqual(store.last_dedup_key, jargon_fingerprint("hiyohiyo"))
+        self.assertEqual(calls[0][0:2], ("update", target.id))
+        updated = calls[0][2]
+        self.assertEqual(updated["session_id"], GLOBAL_JARGON_SESSION_ID)
+        self.assertEqual(updated["metadata"]["count"], 5)
+        self.assertEqual(updated["metadata"]["examples"], ["旧例句", "新例句"])
+        self.assertNotIn("speaker_id", updated["metadata"])
+        self.assertEqual(calls[1:], [("delete", current.id, "jargon"), ("cleanup", [current.id]), ("project", target.id)])
 
     def test_runtime_jargon_reject_tombstones_and_cleans_projection(self):
         # OPT-04/WU-07: runtime 态驳回改软墓碑（status=rejected），不再物理删除——

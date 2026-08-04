@@ -71,8 +71,8 @@ class ExpressionPatternRetrievalPolicy:
             if review_status not in {"approved", "active"}:
                 continue
             if shared_scope:
-                # Prefer the current speaker's scope, while allowing legacy records
-                # written at chat scope. Never admit another speaker's scope.
+                # Expression habits are group-scoped; legacy empty/chat scopes remain
+                # readable during migration, but another group's habits never enter.
                 allowed_scopes = {str(shared_scope).strip(), str(session_id or "").strip()}
                 if pattern_scope not in allowed_scopes:
                     continue
