@@ -1061,6 +1061,8 @@ class AdminUiService:
     async def learning_status(self) -> dict[str, Any]:
         evolution = self.plugin_api.get_evolution()
         diagnostics = evolution.describe_learning_runtime() if evolution and hasattr(evolution, "describe_learning_runtime") else {}
+        if evolution and hasattr(evolution, "learning_pipeline_diagnostics"):
+            diagnostics["pipelines"] = await evolution.learning_pipeline_diagnostics(limit=100)
         backlog = await evolution.backlog_overview() if evolution and hasattr(evolution, "backlog_overview") else {}
         expression_stats = await self._expression_pattern_stats()
         jargon_stats = await self._jargon_stats()
@@ -1084,6 +1086,29 @@ class AdminUiService:
             "status": "ok",
             "data": stats,
         }
+
+    async def learning_pipeline_diagnostics(
+        self,
+        *,
+        pipeline: str = "",
+        chat_id: str = "",
+        status: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        return await self._learning.pipeline_diagnostics(
+            pipeline=pipeline,
+            chat_id=chat_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def retry_learning_pipeline(self, pipeline: str, chat_id: str) -> dict[str, Any]:
+        return await self._learning.retry_pipeline(pipeline, chat_id)
+
+    async def purge_learning_pipeline_runs(self) -> dict[str, Any]:
+        return await self._learning.purge_pipeline_runs()
 
     async def expression_cooldowns(self) -> dict[str, Any]:
         planner = self.plugin_api.get_planner()

@@ -14,6 +14,8 @@ class LearningService:
     async def learning_status(self) -> dict[str, Any]:
         evolution = self.plugin_api.get_evolution()
         diagnostics = evolution.describe_learning_runtime() if evolution and hasattr(evolution, "describe_learning_runtime") else {}
+        if evolution and hasattr(evolution, "learning_pipeline_diagnostics"):
+            diagnostics["pipelines"] = await evolution.learning_pipeline_diagnostics(limit=100)
         backlog = await evolution.backlog_overview() if evolution and hasattr(evolution, "backlog_overview") else {}
         return {
             "status": "ok",
@@ -72,6 +74,41 @@ class LearningService:
             max_age_seconds=max_age_seconds,
             dry_run=dry_run,
         )
+
+    async def pipeline_diagnostics(
+        self,
+        *,
+        pipeline: str = "",
+        chat_id: str = "",
+        status: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        if not evolution or not hasattr(evolution, "learning_pipeline_diagnostics"):
+            return {"status": "error", "message": "学习管线运行时未绑定"}
+        diagnostics = await evolution.learning_pipeline_diagnostics(
+            pipeline=pipeline,
+            chat_id=chat_id,
+            status=status,
+            limit=max(1, min(int(limit or 20), 100)),
+            offset=max(0, int(offset or 0)),
+        )
+        return {"status": "ok", "data": diagnostics}
+
+    async def retry_pipeline(self, pipeline: str, chat_id: str) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        if not evolution or not hasattr(evolution, "retry_learning_pipeline"):
+            return {"status": "error", "message": "学习管线运行时未绑定"}
+        checkpoint = await evolution.retry_learning_pipeline(pipeline, chat_id)
+        return {"status": "ok", "data": checkpoint}
+
+    async def purge_pipeline_runs(self) -> dict[str, Any]:
+        evolution = self.plugin_api.get_evolution()
+        if not evolution or not hasattr(evolution, "purge_learning_run_history"):
+            return {"status": "error", "message": "学习管线运行时未绑定"}
+        report = await evolution.purge_learning_run_history()
+        return {"status": "ok", "data": report}
 
     async def _expression_pattern_stats(self) -> dict[str, Any]:
         return await canonical_kind_review_stats(

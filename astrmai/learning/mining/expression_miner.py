@@ -35,7 +35,7 @@ class ExpressionMiner:
         self.last_result = ExpressionEnrichmentResult(status="completed", reason="not_run")
 
     @staticmethod
-    def _normalize_messages(messages: List[MessageLog]) -> list[MessageLog]:
+    def normalize_messages(messages: List[MessageLog]) -> list[MessageLog]:
         normalized: list[MessageLog] = []
         for message in messages or []:
             if message is None:
@@ -52,6 +52,8 @@ class ExpressionMiner:
                 continue
             normalized.append(message)
         return normalized
+
+    _normalize_messages = normalize_messages
 
     async def _existing_patterns(self, group_id: str) -> set[str]:
         service = getattr(self.memory_engine, "expression_pattern_service", None) if self.memory_engine else None
@@ -75,8 +77,18 @@ class ExpressionMiner:
             return set()
 
     async def mine(self, group_id: str, messages: List[MessageLog]) -> list[dict[str, Any]]:
-        min_context = getattr(self.config.evolution, "min_mining_context", 10)
-        normalized = self._normalize_messages(messages)
+        min_context = max(
+            1,
+            int(
+                getattr(
+                    self.config.evolution,
+                    "expression_min_valid_messages",
+                    getattr(self.config.evolution, "min_mining_context", 10),
+                )
+                or 30
+            ),
+        )
+        normalized = self.normalize_messages(messages)
         if len(normalized) < min_context:
             self.last_result = ExpressionEnrichmentResult(
                 status="completed",

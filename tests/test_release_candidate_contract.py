@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from scripts.build_release_candidate import (
+    RELEASE_SCRIPTS,
     REQUIRED_ARCHITECTURE_FILES,
     build_release_candidate,
     validate_release_candidate,
@@ -37,6 +38,8 @@ class ReleaseCandidateContractTests(unittest.TestCase):
                     (output / Path(relative)).is_file(),
                     f"missing architecture runtime file: {relative}",
                 )
+            for name in RELEASE_SCRIPTS:
+                self.assertTrue((output / "scripts" / name).is_file())
 
             self.assertTrue(compileall.compile_dir(output, quiet=1))
 

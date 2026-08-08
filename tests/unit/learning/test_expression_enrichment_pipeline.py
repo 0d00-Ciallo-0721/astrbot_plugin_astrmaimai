@@ -87,6 +87,51 @@ class _BackfillDB:
 
 
 class ExpressionEnrichmentPipelineTests(unittest.TestCase):
+    def test_extractor_rejects_topic_terms_and_plain_long_sentences(self):
+        extractor = ExpressionCandidateExtractor(min_count=2)
+        messages = [
+            SimpleNamespace(id=1, content="原生家庭", sender_id="1"),
+            SimpleNamespace(id=2, content="原生家庭", sender_id="2"),
+            SimpleNamespace(id=3, content="锂电池", sender_id="1"),
+            SimpleNamespace(id=4, content="锂电池", sender_id="2"),
+            SimpleNamespace(id=5, content="这个问题我们明天再继续认真讨论呀", sender_id="1"),
+            SimpleNamespace(id=6, content="这个问题我们明天再继续认真讨论呀", sender_id="2"),
+            SimpleNamespace(id=7, content="唉嘿嘿", sender_id="1"),
+            SimpleNamespace(id=8, content="唉嘿嘿", sender_id="2"),
+        ]
+
+        candidates = asyncio.run(extractor.extract("chat-1", messages))
+
+        expressions = {item["expression"] for item in candidates}
+        self.assertIn("唉嘿嘿", expressions)
+        self.assertNotIn("原生家庭", expressions)
+        self.assertNotIn("锂电池", expressions)
+        self.assertNotIn("这个问题我们明天再继续认真讨论呀", expressions)
+        self.assertEqual(extractor.last_report["quality_filtered"], 2)
+        self.assertEqual(
+            extractor.last_report["quality_filter_reasons"],
+            {"plain_sentence_with_terminal_particle": 2},
+        )
+
+    def test_render_active_patterns_requests_approved_group_patterns_only(self):
+        store = _Store()
+        service = ExpressionPatternService(store, _WriteService(store))
+        captured = {}
+
+        async def _list_patterns(group_id, **kwargs):
+            captured.update({"group_id": group_id, **kwargs})
+            return [SimpleNamespace(situation="接话", expression="唉嘿嘿")]
+
+        service.list_patterns = _list_patterns
+        rendered = asyncio.run(service.render_active_patterns("chat-1"))
+
+        self.assertIn("唉嘿嘿", rendered)
+        self.assertEqual(captured["group_id"], "chat-1")
+        self.assertTrue(captured["only_checked"])
+        self.assertEqual(captured["review_status"], "approved")
+        self.assertEqual(captured["statuses"], ["active"])
+        self.assertFalse(captured["include_rejected"])
+
     def test_candidates_have_stable_ids_without_personal_evidence(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         messages = [
@@ -376,9 +421,9 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
 
         manager.expression_miner.mine = _mine
 
-        with self.assertRaisesRegex(RuntimeError, "durable terminal state"):
-            asyncio.run(manager.process_logs_and_mine("chat-1", logs))
+        outcomes = asyncio.run(manager.process_logs_and_mine("chat-1", logs))
         self.assertEqual(db.marked, [])
+        self.assertEqual(outcomes["expression"]["status"], "failed")
         self.assertTrue(manager._last_mining_outcomes["chat-1"]["retryable"])
 
     def test_jargon_all_rejected_is_terminal_and_consumes_logs(self):
@@ -448,10 +493,11 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         manager.expression_miner.mine = _mine_expressions
         manager.jargon_miner.mine = _mine_jargons
 
-        with self.assertRaisesRegex(RuntimeError, "jargon enrichment failed closed"):
-            asyncio.run(manager.process_logs_and_mine("chat-1", logs))
+        outcomes = asyncio.run(manager.process_logs_and_mine("chat-1", logs))
 
         self.assertEqual(db.marked, [])
+        self.assertEqual(outcomes["expression"]["status"], "completed")
+        self.assertEqual(outcomes["jargon"]["status"], "failed")
         outcome = manager._last_mining_outcomes["chat-1"]
         self.assertTrue(outcome["retryable"])
         self.assertEqual(outcome["jargon"]["enrichment"]["status"], "provider_failure")
@@ -486,9 +532,9 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
 
         manager.expression_miner.mine = _mine
 
-        with self.assertRaisesRegex(RuntimeError, "durable terminal state"):
-            asyncio.run(manager.process_logs_and_mine("chat-1", logs))
+        outcomes = asyncio.run(manager.process_logs_and_mine("chat-1", logs))
         self.assertEqual(db.marked, [])
+        self.assertEqual(outcomes["expression"]["status"], "failed")
         self.assertEqual(manager._last_mining_outcomes["chat-1"]["persistence"]["failed"], 1)
 
 

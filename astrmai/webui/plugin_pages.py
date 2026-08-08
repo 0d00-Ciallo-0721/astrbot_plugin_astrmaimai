@@ -318,6 +318,26 @@ class AstrMaiAdminPageApi:
     async def expression_stats(self, request: Any) -> dict[str, Any]:
         return await self._admin().expression_stats()
 
+    async def learning_pipeline_diagnostics(self, request: Any) -> dict[str, Any]:
+        query = self._query(request)
+        return await self._admin().learning_pipeline_diagnostics(
+            pipeline=str(query.get("pipeline") or ""),
+            chat_id=str(query.get("chat_id") or ""),
+            status=str(query.get("status") or ""),
+            limit=self._int(query.get("limit"), 20),
+            offset=self._int(query.get("offset"), 0),
+        )
+
+    async def retry_learning_pipeline(self, request: Any) -> dict[str, Any]:
+        body = await self._body(request)
+        return await self._admin().retry_learning_pipeline(
+            str(body.get("pipeline") or ""),
+            str(body.get("chat_id") or ""),
+        )
+
+    async def purge_learning_pipeline_runs(self, request: Any) -> dict[str, Any]:
+        return await self._admin().purge_learning_pipeline_runs()
+
     async def expression_cooldowns(self, request: Any) -> dict[str, Any]:
         return await self._admin().expression_cooldowns()
 
@@ -719,9 +739,12 @@ def register_astrmai_admin_pages(context: Any, facade: Any) -> None:
         ("POST", "/heartflow/chats/{chat_id}/cooldowns/clear", api.clear_heartflow_cooldowns, "AstrMai clear heartflow cooldowns"),
         ("GET", "/learning/status", api.learning_status, "AstrMai learning status"),
         ("GET", "/learning/expression-stats", api.expression_stats, "AstrMai expression stats"),
+        ("GET", "/learning/pipeline-diagnostics", api.learning_pipeline_diagnostics, "AstrMai learning pipeline diagnostics"),
         ("GET", "/learning/cooldowns", api.expression_cooldowns, "AstrMai expression cooldowns"),
         ("POST", "/learning/reflect/run-once", api.run_reflect_once, "AstrMai run reflect once"),
         ("POST", "/learning/expression-backfill", api.run_expression_backfill, "AstrMai expression history backfill"),
+        ("POST", "/learning/pipeline/retry-now", api.retry_learning_pipeline, "AstrMai retry learning pipeline"),
+        ("POST", "/learning/pipeline/runs/purge", api.purge_learning_pipeline_runs, "AstrMai purge learning pipeline runs"),
         ("GET", "/proactive/status", api.proactive_status, "AstrMai proactive status"),
         ("GET", "/proactive/intents", api.proactive_intents, "AstrMai proactive intents"),
         ("GET", "/proactive/dream/status", api.dream_status, "AstrMai dream status"),

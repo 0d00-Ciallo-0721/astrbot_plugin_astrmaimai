@@ -59,12 +59,14 @@ class EvolutionManager:
         self._mining_tasks: Dict[str, asyncio.Task] = {}
         self._backlog_task: asyncio.Task | None = None
         self._backlog_failure_until: dict[str, float] = {}
-        # OPT-15/ML-09: 按群连续失败计数——毒丸批次 3 次后跳过，不再每 30min 原样
-        # 重试永久卡死该群学习
+        # Runtime cache mirrors persisted checkpoint failures; evidence is retained on failure.
         self._backlog_failure_counts: dict[str, int] = {}
         self._last_backlog_report: dict[str, Any] = {}
         self._last_expression_backfill: dict[str, Any] = {}
         self._last_mining_outcomes: dict[str, dict[str, Any]] = {}
+        self._pipeline_failure_counts: dict[str, int] = {}
+        self._last_learning_run_purge_at = 0.0
+        self._last_learning_run_purge: dict[str, Any] = {}
 
     def refresh_config(self, config):
         self.config = config
@@ -97,6 +99,7 @@ class EvolutionManager:
             int(getattr(evolution, "jargon_min_count", 2) or 2),
             1,
         )
+        self.jargon_miner.min_messages = self._pipeline_threshold("jargon")
         if self.jargon_miner.enricher is not None:
             self.jargon_miner.enricher.config = config
         if not self._backlog_enabled() and self._backlog_task is not None:
@@ -107,10 +110,7 @@ class EvolutionManager:
 
     def _backlog_enabled(self) -> bool:
         evolution = self._evolution_config()
-        return bool(
-            getattr(evolution, "enable_expression_mining", True)
-            and getattr(evolution, "enable_backlog_mining", True)
-        )
+        return bool(getattr(evolution, "enable_backlog_mining", True))
 
     def _backlog_threshold(self) -> int:
         evolution = self._evolution_config()
@@ -135,6 +135,25 @@ class EvolutionManager:
     def _backlog_failure_cooldown(self) -> int:
         evolution = self._evolution_config()
         return max(60, int(getattr(evolution, "backlog_failure_cooldown_sec", 1800) or 1800))
+
+    def _learning_run_retention_days(self) -> int:
+        return max(
+            1,
+            int(getattr(self._evolution_config(), "learning_run_retention_days", 30) or 30),
+        )
+
+    def _learning_run_max_per_pipeline_chat(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(
+                    self._evolution_config(),
+                    "learning_run_max_per_pipeline_chat",
+                    500,
+                )
+                or 500
+            ),
+        )
 
     async def _get_mining_lock(self, group_id: str) -> asyncio.Lock:
         async with self._lock_mutex:
@@ -242,13 +261,284 @@ class EvolutionManager:
             return
         self.db.mark_logs_processed(log_ids)
 
+    def _pipeline_threshold(self, pipeline: str) -> int:
+        evolution = self._evolution_config()
+        if pipeline == "expression":
+            return max(
+                1,
+                int(
+                    getattr(
+                        evolution,
+                        "expression_min_valid_messages",
+                        getattr(evolution, "min_mining_context", 10),
+                    )
+                    or 30
+                ),
+            )
+        return max(
+            2,
+            int(
+                getattr(
+                    evolution,
+                    "jargon_min_valid_messages",
+                    getattr(evolution, "min_mining_context", 10),
+                )
+                or 20
+            ),
+        )
+
+    def _pipeline_overlap(self, pipeline: str) -> int:
+        evolution = self._evolution_config()
+        attribute = "expression_overlap_messages" if pipeline == "expression" else "jargon_overlap_messages"
+        default = 30 if pipeline == "expression" else 10
+        return max(0, int(getattr(evolution, attribute, default) or 0))
+
+    def _pipeline_replay_recent(self, pipeline: str) -> int:
+        if pipeline != "expression":
+            return 0
+        evolution = self._evolution_config()
+        return max(0, int(getattr(evolution, "expression_evidence_replay_messages", 300) or 0))
+
+    def _pipeline_enabled(self, pipeline: str) -> bool:
+        if pipeline == "expression":
+            return bool(getattr(self._evolution_config(), "enable_expression_mining", True))
+        return True
+
+    @staticmethod
+    def _is_group_learning_scope(group_id: str, logs: List["MessageLog"]) -> bool:
+        origin = str(group_id or "").lower()
+        if "friendmessage" in origin or origin.startswith("private:"):
+            return False
+        if "groupmessage" in origin or origin.startswith("group:"):
+            return True
+        kinds = {
+            str(EvolutionManager._field(item, "chat_kind", "") or "").strip().lower()
+            for item in logs or []
+        }
+        if kinds & {"private", "friend", "direct", "dm"}:
+            return False
+        return True
+
+    def _supports_pipeline_checkpoints(self) -> bool:
+        return hasattr(self.db, "get_learning_logs_async") or hasattr(self.db, "get_learning_logs")
+
+    async def _load_pipeline_logs(self, pipeline: str, group_id: str, limit: int):
+        replay_recent = self._pipeline_replay_recent(pipeline)
+        if hasattr(self.db, "get_learning_logs_async"):
+            return await self.db.get_learning_logs_async(
+                pipeline,
+                group_id,
+                limit=limit,
+                replay_recent=replay_recent,
+            )
+        if hasattr(self.db, "get_learning_logs"):
+            return await asyncio.to_thread(
+                self.db.get_learning_logs,
+                pipeline,
+                group_id,
+                limit,
+                replay_recent=replay_recent,
+            )
+        return await self._load_unprocessed_logs(group_id, limit=limit)
+
+    async def _list_pipeline_log_groups(
+        self,
+        pipeline: str,
+        *,
+        min_count: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        replay_recent = self._pipeline_replay_recent(pipeline)
+        if hasattr(self.db, "list_learning_log_groups_async"):
+            return list(
+                await self.db.list_learning_log_groups_async(
+                    pipeline,
+                    min_count=min_count,
+                    limit=limit,
+                    replay_recent=replay_recent,
+                )
+                or []
+            )
+        if hasattr(self.db, "list_learning_log_groups"):
+            return list(
+                await asyncio.to_thread(
+                    self.db.list_learning_log_groups,
+                    pipeline,
+                    min_count=min_count,
+                    limit=limit,
+                    replay_recent=replay_recent,
+                )
+                or []
+            )
+        return await self._list_unprocessed_log_groups(min_count=min_count, limit=limit)
+
+    async def _advance_pipeline_checkpoint(
+        self,
+        pipeline: str,
+        group_id: str,
+        cursor_log_id: int,
+        **kwargs,
+    ) -> None:
+        if hasattr(self.db, "advance_learning_checkpoint_async"):
+            await self.db.advance_learning_checkpoint_async(
+                pipeline,
+                group_id,
+                cursor_log_id,
+                **kwargs,
+            )
+            return
+        if hasattr(self.db, "advance_learning_checkpoint"):
+            await asyncio.to_thread(
+                self.db.advance_learning_checkpoint,
+                pipeline,
+                group_id,
+                cursor_log_id,
+                **kwargs,
+            )
+
+    async def _get_pipeline_checkpoint(
+        self,
+        pipeline: str,
+        group_id: str,
+    ) -> dict[str, Any]:
+        replay_recent = self._pipeline_replay_recent(pipeline)
+        if hasattr(self.db, "ensure_learning_checkpoint_async"):
+            return dict(
+                await self.db.ensure_learning_checkpoint_async(
+                    pipeline,
+                    group_id,
+                    replay_recent=replay_recent,
+                )
+                or {}
+            )
+        if hasattr(self.db, "ensure_learning_checkpoint"):
+            return dict(
+                await asyncio.to_thread(
+                    self.db.ensure_learning_checkpoint,
+                    pipeline,
+                    group_id,
+                    replay_recent=replay_recent,
+                )
+                or {}
+            )
+        return {}
+
+    async def _cleanup_legacy_processed_flags(self, group_id: str) -> None:
+        if hasattr(self.db, "mark_logs_processed_through_learning_checkpoints_async"):
+            await self.db.mark_logs_processed_through_learning_checkpoints_async(group_id)
+        elif hasattr(self.db, "mark_logs_processed_through_learning_checkpoints"):
+            await asyncio.to_thread(
+                self.db.mark_logs_processed_through_learning_checkpoints,
+                group_id,
+            )
+
+    def _next_pipeline_cursor(self, logs: List["MessageLog"], pipeline: str) -> tuple[int, int]:
+        if not logs:
+            return 0, 0
+        if self._supports_pipeline_checkpoints():
+            configured_overlap = self._pipeline_overlap(pipeline)
+        else:
+            min_context = max(
+                1,
+                int(getattr(self._evolution_config(), "min_mining_context", 10) or 10),
+            )
+            configured_overlap = max(2, min(10, min_context // 2))
+        overlap = min(configured_overlap, max(0, len(logs) - 1))
+        index = len(logs) - overlap - 1
+        cursor = int(self._field(logs[index], "id", 0) or 0)
+        return cursor, overlap
+
+    async def _record_pipeline_run(self, payload: dict[str, Any]) -> None:
+        if hasattr(self.db, "record_learning_mining_run_async"):
+            await self.db.record_learning_mining_run_async(payload)
+        elif hasattr(self.db, "record_learning_mining_run"):
+            await asyncio.to_thread(self.db.record_learning_mining_run, payload)
+
+    async def _list_pipeline_checkpoints(self, **kwargs) -> list[dict[str, Any]]:
+        if hasattr(self.db, "list_learning_checkpoints_async"):
+            return list(await self.db.list_learning_checkpoints_async(**kwargs) or [])
+        if hasattr(self.db, "list_learning_checkpoints"):
+            return list(await asyncio.to_thread(self.db.list_learning_checkpoints, **kwargs) or [])
+        return []
+
+    async def _list_pipeline_runs(self, **kwargs) -> list[dict[str, Any]]:
+        if hasattr(self.db, "list_learning_mining_runs_async"):
+            return list(await self.db.list_learning_mining_runs_async(**kwargs) or [])
+        if hasattr(self.db, "list_learning_mining_runs"):
+            return list(await asyncio.to_thread(self.db.list_learning_mining_runs, **kwargs) or [])
+        return []
+
+    async def _count_pipeline_checkpoints(self, **kwargs) -> int:
+        if hasattr(self.db, "count_learning_checkpoints_async"):
+            return int(await self.db.count_learning_checkpoints_async(**kwargs) or 0)
+        if hasattr(self.db, "count_learning_checkpoints"):
+            return int(await asyncio.to_thread(self.db.count_learning_checkpoints, **kwargs) or 0)
+        return len(await self._list_pipeline_checkpoints(limit=1000, **kwargs))
+
+    async def _count_pipeline_runs(self, **kwargs) -> int:
+        if hasattr(self.db, "count_learning_mining_runs_async"):
+            return int(await self.db.count_learning_mining_runs_async(**kwargs) or 0)
+        if hasattr(self.db, "count_learning_mining_runs"):
+            return int(await asyncio.to_thread(self.db.count_learning_mining_runs, **kwargs) or 0)
+        return len(await self._list_pipeline_runs(limit=1000, **kwargs))
+
+    async def _purge_learning_runs(self) -> dict[str, Any]:
+        kwargs = {
+            "retention_days": self._learning_run_retention_days(),
+            "max_per_pipeline_chat": self._learning_run_max_per_pipeline_chat(),
+        }
+        if hasattr(self.db, "purge_learning_mining_runs_async"):
+            return dict(await self.db.purge_learning_mining_runs_async(**kwargs) or {})
+        if hasattr(self.db, "purge_learning_mining_runs"):
+            return dict(await asyncio.to_thread(self.db.purge_learning_mining_runs, **kwargs) or {})
+        return {"unsupported": True, **kwargs}
+
+    async def _maybe_purge_learning_runs(self, *, force: bool = False) -> dict[str, Any]:
+        now = time.time()
+        if not force and now - self._last_learning_run_purge_at < 86400:
+            return dict(self._last_learning_run_purge or {})
+        report = await self._purge_learning_runs()
+        self._last_learning_run_purge_at = now
+        self._last_learning_run_purge = {**report, "purged_at": now}
+        return dict(self._last_learning_run_purge)
+
+    async def retry_learning_pipeline(self, pipeline: str, chat_id: str) -> dict[str, Any]:
+        if hasattr(self.db, "reset_learning_checkpoint_async"):
+            return dict(await self.db.reset_learning_checkpoint_async(pipeline, chat_id) or {})
+        if hasattr(self.db, "reset_learning_checkpoint"):
+            return dict(await asyncio.to_thread(self.db.reset_learning_checkpoint, pipeline, chat_id) or {})
+        raise RuntimeError("learning checkpoint reset is unavailable")
+
+    async def purge_learning_run_history(self) -> dict[str, Any]:
+        return await self._maybe_purge_learning_runs(force=True)
+
     async def backlog_overview(self) -> dict[str, Any]:
         threshold = self._backlog_threshold()
         try:
-            groups = await self._list_unprocessed_log_groups(min_count=1, limit=10)
+            pipeline_groups = {
+                pipeline: await self._list_pipeline_log_groups(pipeline, min_count=1, limit=10)
+                for pipeline in ("expression", "jargon")
+                if self._pipeline_enabled(pipeline)
+            }
+            aggregate: dict[str, dict[str, Any]] = {}
+            for pipeline, items in pipeline_groups.items():
+                for item in items:
+                    chat_id = str(item.get("group_id", "") or "")
+                    if not chat_id:
+                        continue
+                    merged = aggregate.setdefault(
+                        chat_id,
+                        {"group_id": chat_id, "count": 0, "pipelines": {}},
+                    )
+                    merged["count"] = max(int(merged["count"]), int(item.get("count", 0) or 0))
+                    merged["oldest_timestamp"] = item.get("oldest_timestamp")
+                    merged["latest_timestamp"] = item.get("latest_timestamp")
+                    merged["pipelines"][pipeline] = int(item.get("count", 0) or 0)
+            groups = list(aggregate.values())[:10]
             degraded = ""
         except Exception as exc:
             groups = []
+            pipeline_groups = {}
             degraded = str(exc)
         eligible = [item for item in groups if int(item.get("count", 0) or 0) >= threshold]
         return {
@@ -259,11 +549,71 @@ class EvolutionManager:
             "scan_interval_sec": self._backlog_scan_interval(),
             "failure_cooldown_sec": self._backlog_failure_cooldown(),
             "top_unprocessed_groups": groups,
+            "pipeline_groups": pipeline_groups,
             "eligible_groups": eligible,
             "last_report": dict(self._last_backlog_report or {}),
             "worker_running": bool(self._backlog_task is not None and not self._backlog_task.done()),
             "degraded": bool(degraded),
             "degraded_reason": degraded,
+        }
+
+    async def learning_pipeline_diagnostics(
+        self,
+        *,
+        pipeline: str = "",
+        chat_id: str = "",
+        status: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        filters = {
+            "pipeline": pipeline,
+            "chat_id": chat_id,
+            "status": status,
+        }
+        checkpoints, runs, checkpoint_total, run_total = await asyncio.gather(
+            self._list_pipeline_checkpoints(limit=limit, offset=offset, **filters),
+            self._list_pipeline_runs(limit=limit, offset=offset, **filters),
+            self._count_pipeline_checkpoints(**filters),
+            self._count_pipeline_runs(**filters),
+        )
+        now = time.time()
+        pipeline_stats: dict[str, dict[str, Any]] = {}
+        for pipeline in ("expression", "jargon"):
+            pipeline_checkpoints = [item for item in checkpoints if item.get("pipeline") == pipeline]
+            pipeline_runs = [item for item in runs if item.get("pipeline") == pipeline]
+            status_counts: dict[str, int] = {}
+            for item in pipeline_runs:
+                status = str(item.get("status") or "unknown")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            pipeline_stats[pipeline] = {
+                "enabled": self._pipeline_enabled(pipeline),
+                "required_valid_messages": self._pipeline_threshold(pipeline),
+                "overlap_messages": self._pipeline_overlap(pipeline),
+                "checkpoint_count": len(pipeline_checkpoints),
+                "quarantined_count": sum(
+                    1 for item in pipeline_checkpoints if float(item.get("retry_at", 0.0) or 0.0) > now
+                ),
+                "status_counts": status_counts,
+                "latest_run": pipeline_runs[0] if pipeline_runs else {},
+            }
+        return {
+            "pipelines": pipeline_stats,
+            "checkpoints": checkpoints,
+            "recent_runs": runs,
+            "pagination": {
+                "limit": max(1, int(limit or 100)),
+                "offset": max(0, int(offset or 0)),
+                "checkpoint_total": checkpoint_total,
+                "run_total": run_total,
+            },
+            "filters": filters,
+            "retention": {
+                "days": self._learning_run_retention_days(),
+                "max_per_pipeline_chat": self._learning_run_max_per_pipeline_chat(),
+                "last_purge": dict(self._last_learning_run_purge or {}),
+            },
+            "generated_at": now,
         }
 
     def describe_learning_runtime(self) -> dict[str, Any]:
@@ -288,6 +638,11 @@ class EvolutionManager:
                 "expression": dict(getattr(self.expression_miner, "last_report", {}) or {}),
                 "jargon": dict(getattr(self.jargon_miner, "last_report", {}) or {}),
                 "last_outcomes": dict(self._last_mining_outcomes),
+            },
+            "run_retention": {
+                "days": self._learning_run_retention_days(),
+                "max_per_pipeline_chat": self._learning_run_max_per_pipeline_chat(),
+                "last_purge": dict(self._last_learning_run_purge or {}),
             },
         }
 
@@ -605,119 +960,387 @@ class EvolutionManager:
         ).to_payload()
         await self._publish_learning_event("publish_learning_message_recorded", payload)
 
+    async def _record_pipeline_state(
+        self,
+        *,
+        pipeline: str,
+        group_id: str,
+        logs: List["MessageLog"],
+        batch_id: str,
+        status: str,
+        reason: str,
+        cursor_before: int,
+        cursor_after: int,
+        retained_count: int,
+        report: dict[str, Any],
+        saved_count: int = 0,
+        deduplicated_count: int = 0,
+        retryable: bool = False,
+        error_type: str = "",
+        duration_ms: float = 0.0,
+    ) -> dict[str, Any]:
+        outcome = {
+            "pipeline": pipeline,
+            "group_id": str(group_id),
+            "batch_id": batch_id,
+            "status": status,
+            "reason": reason,
+            "input_count": len(logs),
+            "normalized_count": int(report.get("normalized_messages", 0) or 0),
+            "required_count": self._pipeline_threshold(pipeline),
+            "candidate_count": int(report.get("candidate_count", 0) or 0),
+            "saved_count": int(saved_count or 0),
+            "deduplicated_count": int(deduplicated_count or 0),
+            "cursor_before": int(cursor_before or 0),
+            "cursor_after": int(cursor_after or 0),
+            "retained_count": int(retained_count or 0),
+            "retryable": bool(retryable),
+            "error_type": str(error_type or ""),
+            "duration_ms": float(duration_ms or 0.0),
+            "report": dict(report or {}),
+            "recorded_at": time.time(),
+        }
+        key = f"{pipeline}:{group_id}"
+        self._last_mining_outcomes[key] = outcome
+        if len(self._last_mining_outcomes) > 40:
+            self._last_mining_outcomes.pop(next(iter(self._last_mining_outcomes)), None)
+        await self._record_pipeline_run(
+            {
+                "pipeline": pipeline,
+                "chat_id": group_id,
+                "batch_id": batch_id,
+                "raw_count": len(logs),
+                "normalized_count": outcome["normalized_count"],
+                "required_count": outcome["required_count"],
+                "candidate_count": outcome["candidate_count"],
+                "saved_count": saved_count,
+                "deduplicated_count": deduplicated_count,
+                "cursor_before": cursor_before,
+                "cursor_after": cursor_after,
+                "retained_count": retained_count,
+                "status": status,
+                "reason": reason,
+                "duration_ms": duration_ms,
+                "retryable": retryable,
+                "error_type": error_type,
+                "details": report,
+            }
+        )
+        memory_engine = getattr(self.db, "memory_engine", None)
+        store = getattr(memory_engine, "v2_store", None)
+        setter = getattr(store, "set_meta", None)
+        if callable(setter):
+            digest = hashlib.sha256(str(group_id).encode("utf-8")).hexdigest()[:24]
+            await setter(
+                f"learning_mining_ledger:{pipeline}:{digest}",
+                json.dumps(outcome, ensure_ascii=False),
+            )
+        return outcome
+
+    async def _skip_non_group_pipeline(
+        self,
+        pipeline: str,
+        group_id: str,
+        logs: List["MessageLog"],
+    ) -> dict[str, Any]:
+        cursor_before = max(0, int(self._field(logs[0], "id", 1) or 1) - 1) if logs else 0
+        cursor_after = int(self._field(logs[-1], "id", cursor_before) or cursor_before) if logs else cursor_before
+        batch_id = self._mining_batch_id(group_id, logs, prefix=pipeline)
+        await self._advance_pipeline_checkpoint(
+            pipeline,
+            group_id,
+            cursor_after,
+            batch_id=batch_id,
+            status="skipped_non_group",
+        )
+        return await self._record_pipeline_state(
+            pipeline=pipeline,
+            group_id=group_id,
+            logs=logs,
+            batch_id=batch_id,
+            status="skipped",
+            reason="non_group_scope",
+            cursor_before=cursor_before,
+            cursor_after=cursor_after,
+            retained_count=0,
+            report={"chat_scope": "private", "reason": "non_group_scope"},
+        )
+
+    async def _run_learning_pipeline(
+        self,
+        pipeline: str,
+        group_id: str,
+        logs: List["MessageLog"],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        cursor_before = max(0, int(self._field(logs[0], "id", 1) or 1) - 1) if logs else 0
+        batch_id = self._mining_batch_id(group_id, logs, prefix=pipeline)
+        failure_key = f"{pipeline}:{group_id}"
+        checkpoint = await self._get_pipeline_checkpoint(pipeline, group_id)
+        failure_report: dict[str, Any] = {}
+        try:
+            if pipeline == "expression":
+                items = await self.expression_miner.mine(group_id, logs)
+                report = dict(getattr(self.expression_miner, "last_report", {}) or {})
+                enrichment = report.get("enrichment")
+                terminal = not isinstance(enrichment, dict) or bool(enrichment.get("terminal"))
+                retryable = isinstance(enrichment, dict) and bool(enrichment.get("retryable"))
+                reason = str(report.get("reason") or "completed")
+                if reason == "insufficient_context":
+                    await self._advance_pipeline_checkpoint(
+                        pipeline,
+                        group_id,
+                        cursor_before,
+                        batch_id=batch_id,
+                        status="waiting_for_evidence",
+                    )
+                    return await self._record_pipeline_state(
+                        pipeline=pipeline,
+                        group_id=group_id,
+                        logs=logs,
+                        batch_id=batch_id,
+                        status="waiting",
+                        reason=reason,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_before,
+                        retained_count=len(logs),
+                        report=report,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                    )
+                if reason == "all_candidates_in_flight":
+                    terminal = False
+                    retryable = True
+                persistence = await self._save_patterns(items, mining_batch_id=batch_id)
+                failure_report = {**report, "persistence": persistence.to_report()}
+                if not terminal or not persistence.complete:
+                    raise RuntimeError(
+                        "expression_enrichment_incomplete"
+                        if not terminal
+                        else "expression_persistence_incomplete"
+                    )
+                saved_count = persistence.saved
+                deduplicated_count = persistence.deduplicated
+                extra_report = failure_report
+            else:
+                if not getattr(getattr(self.db, "memory_engine", None), "write_service", None):
+                    raise RuntimeError("jargon_write_service_unavailable")
+                items = await self.jargon_miner.mine(group_id, logs)
+                report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
+                reason = str(report.get("reason") or "completed")
+                if reason == "insufficient_context":
+                    await self._advance_pipeline_checkpoint(
+                        pipeline,
+                        group_id,
+                        cursor_before,
+                        batch_id=batch_id,
+                        status="waiting_for_evidence",
+                    )
+                    return await self._record_pipeline_state(
+                        pipeline=pipeline,
+                        group_id=group_id,
+                        logs=logs,
+                        batch_id=batch_id,
+                        status="waiting",
+                        reason=reason,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_before,
+                        retained_count=len(logs),
+                        report=report,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                    )
+                enrichment = report.get("enrichment")
+                failure_report = report
+                terminal = not isinstance(enrichment, dict) or bool(enrichment.get("terminal"))
+                if reason == "all_candidates_in_flight":
+                    terminal = False
+                if not terminal:
+                    raise RuntimeError("jargon_enrichment_failed_closed")
+                saved_count = await self._save_jargons(group_id, items, mining_batch_id=batch_id)
+                deduplicated_count = max(0, len(items) - saved_count)
+                extra_report = report
+
+            cursor_after, retained_count = self._next_pipeline_cursor(logs, pipeline)
+            await self._advance_pipeline_checkpoint(
+                pipeline,
+                group_id,
+                cursor_after,
+                batch_id=batch_id,
+                status="completed",
+                failure_count=0,
+                retry_at=0.0,
+                last_error="",
+            )
+            self._pipeline_failure_counts.pop(failure_key, None)
+            return await self._record_pipeline_state(
+                pipeline=pipeline,
+                group_id=group_id,
+                logs=logs,
+                batch_id=batch_id,
+                status="completed",
+                reason="candidates_saved" if saved_count or deduplicated_count else "no_candidates",
+                cursor_before=cursor_before,
+                cursor_after=cursor_after,
+                retained_count=retained_count,
+                report=extra_report,
+                saved_count=saved_count,
+                deduplicated_count=deduplicated_count,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        except Exception as exc:
+            persisted_failures = int(checkpoint.get("failure_count", 0) or 0)
+            failures = max(
+                persisted_failures,
+                int(self._pipeline_failure_counts.get(failure_key, 0) or 0),
+            ) + 1
+            self._pipeline_failure_counts[failure_key] = failures
+            max_failures = max(
+                1,
+                int(getattr(self._evolution_config(), "learning_pipeline_max_failures", 3) or 3),
+            )
+            retry_at = 0.0
+            status = "failed"
+            if failures >= max_failures:
+                retry_at = time.time() + max(
+                    60,
+                    int(getattr(self._evolution_config(), "learning_pipeline_quarantine_sec", 3600) or 3600),
+                )
+                status = "quarantined"
+            await self._advance_pipeline_checkpoint(
+                pipeline,
+                group_id,
+                cursor_before,
+                batch_id=batch_id,
+                status=status,
+                failure_count=failures,
+                retry_at=retry_at,
+                last_error=str(exc),
+            )
+            logger.warning(
+                f"[Evolution-{pipeline}] mining {status} for {group_id}: {exc}"
+            )
+            return await self._record_pipeline_state(
+                pipeline=pipeline,
+                group_id=group_id,
+                logs=logs,
+                batch_id=batch_id,
+                status=status,
+                reason=str(exc),
+                cursor_before=cursor_before,
+                cursor_after=cursor_before,
+                retained_count=len(logs),
+                report={
+                    **failure_report,
+                    "reason": str(exc),
+                    "failure_count": failures,
+                    "retry_at": retry_at,
+                },
+                retryable=True,
+                error_type=type(exc).__name__,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+
     async def process_logs_and_mine(self, group_id: str, logs: List["MessageLog"]):
         if not logs:
-            return
+            return {}
         group_lock = await self._get_mining_lock(group_id)
         async with group_lock:
-            current_unprocessed = await self._load_unprocessed_logs(group_id, limit=999)
-            requested_ids = {
-                self._field(log, "id")
-                for log in logs
-                if self._field(log, "id") is not None
-            }
-            logs = [
-                log
-                for log in current_unprocessed
-                if self._field(log, "id") in requested_ids
+            enabled_thresholds = [
+                self._pipeline_threshold(pipeline)
+                for pipeline in ("expression", "jargon")
+                if self._pipeline_enabled(pipeline)
             ]
-            if not logs:
-                return
-
-            batch_id = self._mining_batch_id(group_id, logs)
-            patterns = await self.expression_miner.mine(group_id, logs)
-            expression_report = dict(getattr(self.expression_miner, "last_report", {}) or {})
-            enrichment_report = expression_report.get("enrichment")
-            enrichment_terminal = True
-            enrichment_retryable = False
-            if isinstance(enrichment_report, dict):
-                enrichment_terminal = bool(enrichment_report.get("terminal"))
-                enrichment_retryable = bool(enrichment_report.get("retryable"))
-            elif expression_report.get("reason") == "enrichment_empty" and int(
-                expression_report.get("candidate_count", 0) or 0
-            ) > 0:
-                enrichment_terminal = False
-                enrichment_retryable = True
-
-            pattern_save_report = await self._save_patterns(patterns, mining_batch_id=batch_id)
-            if not enrichment_terminal or not pattern_save_report.complete:
-                await self._record_mining_outcome(
-                    group_id,
-                    logs,
-                    status="degraded",
-                    reason=(
-                        "expression_enrichment_incomplete"
-                        if not enrichment_terminal
-                        else "expression_persistence_incomplete"
-                    ),
-                    pattern_count=pattern_save_report.saved + pattern_save_report.deduplicated,
-                    expression_report=expression_report,
-                    persistence_report=pattern_save_report.to_report(),
-                    retryable=enrichment_retryable or not pattern_save_report.complete,
-                )
-                raise RuntimeError("expression mining did not reach a durable terminal state")
-
+            limit = max(self._backlog_batch_size(), len(logs), *enabled_thresholds)
+            outcomes: dict[str, dict[str, Any]] = {}
+            pattern_count = 0
             jargon_count = 0
-            jargon_report: dict[str, Any] = {}
-            if getattr(getattr(self.db, "memory_engine", None), "write_service", None):
-                jargons = await self.jargon_miner.mine(group_id, logs)
-                jargon_report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
-                jargon_enrichment = jargon_report.get("enrichment")
-                jargon_terminal = True
-                jargon_retryable = False
-                if isinstance(jargon_enrichment, dict):
-                    jargon_terminal = bool(jargon_enrichment.get("terminal"))
-                    jargon_retryable = bool(jargon_enrichment.get("retryable"))
-                elif jargon_report.get("reason") == "enrichment_empty" and int(
-                    jargon_report.get("candidate_count", 0) or 0
-                ) > 0:
-                    jargon_terminal = False
-                    jargon_retryable = True
-                if not jargon_terminal:
-                    await self._record_mining_outcome(
-                        group_id,
-                        logs,
-                        status="degraded",
-                        reason="jargon_enrichment_failed_closed",
-                        expression_report=expression_report,
-                        jargon_report=jargon_report,
-                        retryable=jargon_retryable,
+            for pipeline in ("expression", "jargon"):
+                if not self._pipeline_enabled(pipeline):
+                    continue
+                if (
+                    pipeline == "jargon"
+                    and not self._supports_pipeline_checkpoints()
+                    and not getattr(getattr(self.db, "memory_engine", None), "write_service", None)
+                ):
+                    continue
+                pipeline_logs = list(await self._load_pipeline_logs(pipeline, group_id, limit=limit) or [])
+                if not pipeline_logs:
+                    continue
+                if not self._is_group_learning_scope(group_id, pipeline_logs):
+                    outcome = await self._skip_non_group_pipeline(pipeline, group_id, pipeline_logs)
+                else:
+                    outcome = await self._run_learning_pipeline(pipeline, group_id, pipeline_logs)
+                outcomes[pipeline] = outcome
+                if pipeline == "expression":
+                    pattern_count = int(outcome.get("saved_count", 0) or 0) + int(
+                        outcome.get("deduplicated_count", 0) or 0
                     )
-                    raise RuntimeError("jargon enrichment failed closed")
-                jargon_count = await self._save_jargons(
-                    group_id,
-                    jargons,
-                    mining_batch_id=batch_id,
-                )
+                else:
+                    jargon_count = int(outcome.get("saved_count", 0) or 0)
 
-            evolution = self._evolution_config()
-            min_context = max(1, int(getattr(evolution, "min_mining_context", 10) or 10))
-            overlap = max(2, min(10, min_context // 2)) if len(logs) >= min_context else 0
-            processable = logs[:-overlap] if overlap and len(logs) > overlap else logs
-            processed_ids = [self._field(log, "id") for log in processable if self._field(log, "id") is not None]
-            if processed_ids:
-                await self._mark_logs_processed(processed_ids)
-            await self._record_mining_outcome(
-                group_id,
-                logs,
-                status="completed",
-                reason="candidates_saved" if patterns or jargon_count else "no_candidates_rolling_overlap",
-                pattern_count=pattern_save_report.saved + pattern_save_report.deduplicated,
-                jargon_count=jargon_count,
-                processed_count=len(processed_ids),
-                retained_overlap=len(logs) - len(processed_ids),
-                expression_report=expression_report,
-                jargon_report=jargon_report,
-                persistence_report=pattern_save_report.to_report(),
-            )
+            if self._supports_pipeline_checkpoints():
+                await self._cleanup_legacy_processed_flags(group_id)
+            else:
+                terminal_statuses = {"completed", "skipped"}
+                completed_cursors = []
+                if outcomes and all(item.get("status") in terminal_statuses for item in outcomes.values()):
+                    completed_cursors = [
+                        int(item.get("cursor_after", 0) or 0)
+                        for item in outcomes.values()
+                    ]
+                if completed_cursors:
+                    legacy_cursor = min(completed_cursors)
+                    processed_ids = [
+                        self._field(item, "id")
+                        for item in logs
+                        if int(self._field(item, "id", 0) or 0) <= legacy_cursor
+                    ]
+                    if processed_ids:
+                        await self._mark_logs_processed(processed_ids)
+
             payload = MiningCompletedEvent(
                 group_id=str(group_id),
-                pattern_count=pattern_save_report.saved + pattern_save_report.deduplicated,
+                pattern_count=pattern_count,
                 jargon_count=jargon_count,
             ).to_payload()
             await self._publish_learning_event("publish_learning_mining_completed", payload)
             if self.event_bus and jargon_count > 0:
                 self.event_bus.trigger_knowledge_update()
+            terminal_statuses = {"completed", "skipped"}
+            aggregate_status = (
+                "completed"
+                if outcomes and all(item.get("status") in terminal_statuses for item in outcomes.values())
+                else "degraded"
+            )
+            aggregate = {
+                "group_id": str(group_id),
+                "status": aggregate_status,
+                "reason": "pipelines_completed" if aggregate_status == "completed" else "pipeline_incomplete",
+                "input_count": len(logs),
+                "processed_count": sum(
+                    max(0, int(item.get("cursor_after", 0) or 0) - int(item.get("cursor_before", 0) or 0))
+                    for item in outcomes.values()
+                ),
+                "retained_overlap": max(
+                    (
+                        int(item.get("retained_count", 0) or 0)
+                        for item in outcomes.values()
+                        if item.get("status") in terminal_statuses
+                    ),
+                    default=0,
+                ),
+                "retryable": any(bool(item.get("retryable")) for item in outcomes.values()),
+                "pattern_count": pattern_count,
+                "jargon_count": jargon_count,
+                "expression": dict(outcomes.get("expression", {}).get("report", {}) or {}),
+                "jargon": dict(outcomes.get("jargon", {}).get("report", {}) or {}),
+                "persistence": dict(
+                    outcomes.get("expression", {}).get("report", {}).get("persistence", {}) or {}
+                ),
+                "pipelines": outcomes,
+                "recorded_at": time.time(),
+            }
+            self._last_mining_outcomes[str(group_id)] = aggregate
+            return outcomes
 
     async def _record_mining_outcome(
         self,
@@ -820,17 +1443,25 @@ class EvolutionManager:
     get_active_patterns = get_active_patterns_canonical
 
     async def _try_trigger_mining(self, group_id: str):
-        unprocessed_logs = await self._load_unprocessed_logs(group_id, limit=100)
-        evolution = self._evolution_config()
-        threshold = max(int(self.recorder.min_messages or 0), int(getattr(evolution, "min_mining_context", 10) or 10))
-        if len(unprocessed_logs) >= threshold:
-            await self.process_logs_and_mine(group_id, unprocessed_logs)
+        limit = max(100, self._backlog_batch_size())
+        seed_logs: List["MessageLog"] = []
+        for pipeline in ("expression", "jargon"):
+            if not self._pipeline_enabled(pipeline):
+                continue
+            logs = list(await self._load_pipeline_logs(pipeline, group_id, limit=limit) or [])
+            threshold = max(int(self.recorder.min_messages or 0), self._pipeline_threshold(pipeline))
+            if len(logs) >= threshold and (not seed_logs or len(logs) > len(seed_logs)):
+                seed_logs = logs
+        if seed_logs:
+            await self.process_logs_and_mine(group_id, seed_logs)
 
     async def run_backlog_mining_once(self) -> dict[str, Any]:
+        purge_report = await self._maybe_purge_learning_runs()
         if not self._backlog_enabled():
             report = {
                 "enabled": False,
                 "checked_at": time.time(),
+                "run_retention": purge_report,
                 "processed_groups": [],
                 "skipped_groups": [],
                 "errors": [],
@@ -842,7 +1473,37 @@ class EvolutionManager:
         threshold = self._backlog_threshold()
         group_limit = self._backlog_group_limit()
         batch_size = self._backlog_batch_size()
-        groups = await self._list_unprocessed_log_groups(min_count=threshold, limit=group_limit * 3)
+        group_map: dict[str, dict[str, Any]] = {}
+        for pipeline in ("expression", "jargon"):
+            if not self._pipeline_enabled(pipeline):
+                continue
+            pipeline_groups = await self._list_pipeline_log_groups(
+                pipeline,
+                min_count=threshold,
+                limit=group_limit * 3,
+            )
+            for item in pipeline_groups:
+                group_id = str(item.get("group_id", "") or "")
+                if not group_id:
+                    continue
+                merged = group_map.setdefault(
+                    group_id,
+                    {
+                        "group_id": group_id,
+                        "count": 0,
+                        "oldest_timestamp": item.get("oldest_timestamp"),
+                        "latest_timestamp": item.get("latest_timestamp"),
+                        "pipelines": [],
+                    },
+                )
+                merged["count"] = max(int(merged.get("count", 0) or 0), int(item.get("count", 0) or 0))
+                merged["pipelines"].append(
+                    {"pipeline": pipeline, "count": int(item.get("count", 0) or 0)}
+                )
+        groups = sorted(
+            group_map.values(),
+            key=lambda item: (-int(item.get("count", 0) or 0), str(item.get("group_id", ""))),
+        )
         report: dict[str, Any] = {
             "enabled": True,
             "checked_at": now,
@@ -853,6 +1514,7 @@ class EvolutionManager:
             "processed_groups": [],
             "skipped_groups": [],
             "errors": [],
+            "run_retention": purge_report,
         }
 
         processed_count = 0
@@ -871,47 +1533,47 @@ class EvolutionManager:
                     {"group_id": group_id, "reason": "failure_cooldown", "retry_after": failure_until}
                 )
                 continue
-            logs = await self._load_unprocessed_logs(group_id, limit=batch_size)
+            eligible_pipelines = list(group.get("pipelines", []) or [])
+            seed_pipeline = str(eligible_pipelines[0].get("pipeline", "expression")) if eligible_pipelines else "expression"
+            logs = list(await self._load_pipeline_logs(seed_pipeline, group_id, limit=batch_size) or [])
             if len(logs) < threshold:
                 report["skipped_groups"].append(
-                    {"group_id": group_id, "reason": "below_threshold", "count": len(logs)}
+                    {
+                        "group_id": group_id,
+                        "reason": "below_threshold",
+                        "count": len(logs),
+                        "pipeline": seed_pipeline,
+                    }
                 )
                 continue
             try:
-                await self.process_logs_and_mine(group_id, logs)
+                outcomes = await self.process_logs_and_mine(group_id, logs)
                 processed_count += 1
-                report["processed_groups"].append({"group_id": group_id, "log_count": len(logs)})
+                report["processed_groups"].append(
+                    {
+                        "group_id": group_id,
+                        "log_count": len(logs),
+                        "pipelines": {
+                            name: {
+                                "status": outcome.get("status"),
+                                "reason": outcome.get("reason"),
+                            }
+                            for name, outcome in outcomes.items()
+                        },
+                    }
+                )
                 self._backlog_failure_until.pop(group_id, None)
                 self._backlog_failure_counts.pop(group_id, None)
-                # OPT-15/ML-09: 成功路径此前零日志，16.6h 观测窗无法区分"没跑"与"没失败"
+                outcome_summary = ",".join(
+                    f"{name}:{item.get('status')}" for name, item in outcomes.items()
+                )
                 logger.info(
                     f"[Evolution-Backlog] mined group={group_id} logs={len(logs)} "
-                    f"processed_total={processed_count}"
+                    f"processed_total={processed_count} outcomes={outcome_summary}"
                 )
             except Exception as exc:
                 failure_count = int(self._backlog_failure_counts.get(group_id, 0) or 0) + 1
                 self._backlog_failure_counts[group_id] = failure_count
-                if failure_count >= 3:
-                    # OPT-15/ML-09: 毒丸跳过——把坏批次记为已消费（fail-closed 防丢数据
-                    # 的初衷保留：只在连续三败后放行，且跳过量以本批为界）
-                    try:
-                        await self._record_mining_outcome(
-                            group_id,
-                            logs,
-                            status="skipped",
-                            reason="poison_pill_after_3_failures",
-                            retryable=False,
-                        )
-                    except Exception:
-                        logger.debug("[Evolution-Backlog] poison outcome record degraded", exc_info=True)
-                    self._backlog_failure_counts.pop(group_id, None)
-                    self._backlog_failure_until.pop(group_id, None)
-                    logger.error(
-                        f"[Evolution-Backlog] poison batch skipped for {group_id} "
-                        f"after {failure_count} consecutive failures: {exc}"
-                    )
-                    report["errors"].append({"group_id": group_id, "error": f"poison_skipped: {exc}"})
-                    continue
                 self._backlog_failure_until[group_id] = time.time() + self._backlog_failure_cooldown()
                 logger.warning(f"[Evolution-Backlog] mining failed for {group_id}: {exc}")
                 report["errors"].append({"group_id": group_id, "error": str(exc)})
@@ -933,8 +1595,6 @@ class EvolutionManager:
             raise
 
     async def start_background_tasks(self) -> None:
-        if not self._backlog_enabled():
-            return
         if self._backlog_task is not None and not self._backlog_task.done():
             return
         self._backlog_task = self._fire_background_task(self._backlog_mining_loop())

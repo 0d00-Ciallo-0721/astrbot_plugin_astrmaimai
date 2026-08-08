@@ -1008,13 +1008,13 @@
         "description": "启用表达习惯学习",
         "type": "bool",
         "default": true,
-        "hint": "开启后，机器人会从群聊里学习大家常用的表达方式、梗和语气。"
+        "hint": "开启后，机器人会按群聊学习口癖、语气词、句式、结尾、符号和回复节奏；群内术语由黑话学习单独处理。"
       },
       "min_mining_context": {
-        "description": "学习所需最小上下文量",
+        "description": "旧版学习触发消息阈值",
         "type": "int",
         "default": 10,
-        "hint": "上下文太少时不进行学习，避免误学。"
+        "hint": "仅作为兼容旧配置的原始消息触发阈值；表达与黑话的有效消息量由各自配置控制。"
       },
       "batch_size": {
         "description": "单次学习批大小",
@@ -1069,13 +1069,85 @@
         "type": "int",
         "default": 3,
         "minimum": 2,
-        "hint": "同一位群友的表达至少在不同消息中重复出现到此次数，才会进入表达学习，避免把一次话题内容误学成口癖。"
+        "hint": "同一表达至少在群聊的不同消息中重复出现到此次数，才会进入表达学习；不保存个人证据层。"
+      },
+      "expression_min_valid_messages": {
+        "description": "表达学习最少有效消息数",
+        "type": "int",
+        "default": 30,
+        "minimum": 3,
+        "maximum": 500,
+        "hint": "过滤机器人消息、卡片和过长文本后，至少保留多少条群聊消息才运行表达提取。证据不足时不会消费表达游标。"
+      },
+      "expression_evidence_replay_messages": {
+        "description": "表达独立游标首次回放数量",
+        "type": "int",
+        "default": 300,
+        "minimum": 0,
+        "maximum": 5000,
+        "hint": "升级后首次创建表达游标时，从每个群回放最近多少条消息，用于恢复曾被旧共享游标跳过的表达证据。"
+      },
+      "expression_overlap_messages": {
+        "description": "表达跨批保留消息数",
+        "type": "int",
+        "default": 30,
+        "minimum": 0,
+        "maximum": 500,
+        "hint": "表达挖掘完成后保留最近消息，使跨批次重复口癖仍可被识别。"
       },
       "jargon_min_count": {
         "description": "黑话进入审核的最小证据次数",
         "type": "int",
         "default": 2,
         "hint": "只有同一黑话在群内累计出现到这个次数后，才会进入自动审核。"
+      },
+      "jargon_min_valid_messages": {
+        "description": "黑话学习最少有效消息数",
+        "type": "int",
+        "default": 20,
+        "minimum": 2,
+        "maximum": 500,
+        "hint": "单轮黑话候选提取所需的最少非空消息数。黑话最终存入全局知识库。"
+      },
+      "jargon_overlap_messages": {
+        "description": "黑话跨批保留消息数",
+        "type": "int",
+        "default": 10,
+        "minimum": 0,
+        "maximum": 200,
+        "hint": "黑话挖掘完成后保留最近消息，用于跨批证据和全局去重。"
+      },
+      "learning_pipeline_max_failures": {
+        "description": "学习管线最大连续失败次数",
+        "type": "int",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 20,
+        "hint": "某条学习管线连续失败达到该次数后，只隔离该管线，不阻塞另一条学习管线。"
+      },
+      "learning_pipeline_quarantine_sec": {
+        "description": "学习管线失败隔离时间（秒）",
+        "type": "int",
+        "default": 3600,
+        "minimum": 60,
+        "maximum": 86400,
+        "hint": "隔离期间保留证据和游标，不丢弃失败批次；到期后自动重试。"
+      },
+      "learning_run_retention_days": {
+        "description": "学习运行记录保留天数",
+        "type": "int",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 365,
+        "hint": "仅清理学习诊断流水，不影响表达、黑话、消息证据或学习游标。"
+      },
+      "learning_run_max_per_pipeline_chat": {
+        "description": "单管线单会话运行记录上限",
+        "type": "int",
+        "default": 500,
+        "minimum": 10,
+        "maximum": 10000,
+        "hint": "超过上限时保留最新记录，用于避免长期运行后诊断表无限增长。"
       },
       "review_runner_interval_sec": {
         "description": "表达审核运行间隔（秒）",

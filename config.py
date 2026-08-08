@@ -196,7 +196,7 @@ class MoodConfig(BaseModel):
 
 
 class EvolutionConfig(BaseModel):
-    min_mining_context: int = Field(default=10, ge=1)
+    min_mining_context: int = Field(default=10, ge=1, description="兼容旧版的学习触发原始消息阈值")
     batch_size: int = Field(default=50, ge=1)
     mining_trigger: int = Field(default=20, ge=1)
     mining_window_sec: int = Field(default=60, ge=0, description="学习触发的时间窗长度(秒)")
@@ -205,9 +205,18 @@ class EvolutionConfig(BaseModel):
     review_batch_size: int = Field(default=10, ge=1, description="每轮自动审核表达条目的最大数量")
     review_min_count: int = Field(default=2, ge=1, description="表达进入自动审核前所需的最少命中次数")
     expression_min_count: int = Field(default=2, ge=1, description="表达候选进入模型增强前所需的最少独立证据次数")
-    expression_min_distinct_turns: int = Field(default=3, ge=2, description="同一群友表达进入学习前所需的最少不同消息证据数")
+    expression_min_distinct_turns: int = Field(default=3, ge=2, description="群聊表达进入学习前所需的最少不同消息证据数")
+    expression_min_valid_messages: int = Field(default=30, ge=3, le=500, description="表达管线每轮所需的最少有效群聊消息数")
+    expression_evidence_replay_messages: int = Field(default=300, ge=0, le=5000, description="首次启用独立表达游标时回放的最近群聊消息数")
+    expression_overlap_messages: int = Field(default=30, ge=0, le=500, description="表达管线成功后保留用于跨批识别的消息数")
     enable_expression_mining: bool = Field(default=True, description="启动表达习惯的挖掘反思与模仿")
     jargon_min_count: int = Field(default=2, ge=1, description="黑话进入自动审核前所需的最少证据次数")
+    jargon_min_valid_messages: int = Field(default=20, ge=2, le=500, description="黑话管线每轮所需的最少有效消息数")
+    jargon_overlap_messages: int = Field(default=10, ge=0, le=200, description="黑话管线成功后保留用于跨批去重的消息数")
+    learning_pipeline_max_failures: int = Field(default=3, ge=1, le=20, description="单条学习管线连续失败后进入隔离的次数")
+    learning_pipeline_quarantine_sec: int = Field(default=3600, ge=60, le=86400, description="学习管线连续失败后的隔离时间")
+    learning_run_retention_days: int = Field(default=30, ge=1, le=365, description="学习运行诊断记录的保留天数")
+    learning_run_max_per_pipeline_chat: int = Field(default=500, ge=10, le=10000, description="每条学习管线每个会话最多保留的运行诊断记录数")
     review_runner_interval_sec: int = Field(default=60, ge=30, le=600)
     review_runner_min_interval_sec: int = Field(default=45, ge=15)
     enable_backlog_mining: bool = Field(default=True, description="启用低频积压消息学习扫描")

@@ -97,6 +97,45 @@ _MIGRATIONS: list[tuple[int, str]] = [
         updated_at REAL NOT NULL DEFAULT 0
     )"""),
     (73, "CREATE INDEX IF NOT EXISTS ix_reply_commit_outbox_next_retry_at ON reply_commit_outbox(next_retry_at)"),
+    (74, """CREATE TABLE IF NOT EXISTS learning_pipeline_checkpoint (
+        pipeline TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        cursor_log_id INTEGER NOT NULL DEFAULT 0,
+        last_batch_id TEXT NOT NULL DEFAULT '',
+        last_status TEXT NOT NULL DEFAULT '',
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        retry_at REAL NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (pipeline, chat_id)
+    )"""),
+    (75, "CREATE INDEX IF NOT EXISTS ix_learning_pipeline_checkpoint_retry ON learning_pipeline_checkpoint(pipeline, retry_at)"),
+    (76, """CREATE TABLE IF NOT EXISTS learning_mining_run (
+        run_id TEXT PRIMARY KEY,
+        pipeline TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL DEFAULT '',
+        raw_count INTEGER NOT NULL DEFAULT 0,
+        normalized_count INTEGER NOT NULL DEFAULT 0,
+        required_count INTEGER NOT NULL DEFAULT 0,
+        candidate_count INTEGER NOT NULL DEFAULT 0,
+        saved_count INTEGER NOT NULL DEFAULT 0,
+        deduplicated_count INTEGER NOT NULL DEFAULT 0,
+        cursor_before INTEGER NOT NULL DEFAULT 0,
+        cursor_after INTEGER NOT NULL DEFAULT 0,
+        retained_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        duration_ms REAL NOT NULL DEFAULT 0,
+        model_id TEXT NOT NULL DEFAULT '',
+        retryable INTEGER NOT NULL DEFAULT 0,
+        error_type TEXT NOT NULL DEFAULT '',
+        details_json TEXT NOT NULL DEFAULT '{}',
+        created_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (77, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_pipeline_chat_created ON learning_mining_run(pipeline, chat_id, created_at)"),
+    (78, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_created_at ON learning_mining_run(created_at)"),
 ]
 
 

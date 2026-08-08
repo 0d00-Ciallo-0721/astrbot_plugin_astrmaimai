@@ -17,6 +17,9 @@ ROOT_FILES = (
     "README.md",
     "CHANGELOG.md",
 )
+RELEASE_SCRIPTS = (
+    "audit_learning_data.py",
+)
 REQUIRED_ARCHITECTURE_FILES = (
     "astrmai/conversation/contracts/conversation_event.py",
     "astrmai/conversation/contracts/turn_target.py",
@@ -65,6 +68,7 @@ FORBIDDEN_TEXT_PATTERNS = (
 
 def _runtime_sources() -> list[Path]:
     sources = [PROJECT_ROOT / name for name in ROOT_FILES]
+    sources.extend(PROJECT_ROOT / "scripts" / name for name in RELEASE_SCRIPTS)
     sources.extend(
         path
         for path in (PROJECT_ROOT / "astrmai").rglob("*.py")

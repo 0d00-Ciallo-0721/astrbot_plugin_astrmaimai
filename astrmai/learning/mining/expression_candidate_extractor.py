@@ -134,6 +134,33 @@ class ExpressionCandidateExtractor:
         return False
 
     @classmethod
+    def _candidate_quality_rejection_reason(cls, text: str, *, exact: bool = False) -> str:
+        cleaned = cls._clean_text(text)
+        lowered = cleaned.lower()
+        if any(token in lowered for token in ("http://", "https://", "[图片", "[pic", "cq:")):
+            return "transport_or_media_placeholder"
+        if cleaned.startswith(("/", "!")):
+            return "command_text"
+        if not exact:
+            return ""
+
+        compact = cls._normalize_text(cleaned)
+        has_marker = any(marker in lowered for marker in cls.EXPRESSION_MARKERS)
+        has_symbol = bool(re.search(r"[~～♡☆♪ヾヽﾉ╥；;（）()<>《》]", cleaned))
+        has_repetition = bool(re.search(r"(.)\1{1,}", compact))
+        has_emphatic_punctuation = bool(re.search(r"[!?！？]{2,}", cleaned))
+        english_words = re.findall(r"[A-Za-z']+", cleaned)
+        has_english_catchphrase = len(english_words) >= 2
+        terminal_particle_only = bool(
+            re.search(r"(?:啦|呀|呢|哦|嘛|哒|捏|呐|喵|诶)[!?！？。.]*$", cleaned)
+        ) and not any(
+            (has_marker, has_symbol, has_repetition, has_emphatic_punctuation, has_english_catchphrase)
+        )
+        if terminal_particle_only and len(compact) > 12:
+            return "plain_sentence_with_terminal_particle"
+        return ""
+
+    @classmethod
     def _infer_habit_type(cls, text: str, *, candidate_type: str = "exact") -> str:
         cleaned = cls._clean_text(text)
         compact = cls._normalize_text(cleaned)
@@ -266,6 +293,8 @@ class ExpressionCandidateExtractor:
         accepted_messages = 0
         skipped_noise = 0
         skipped_existing = 0
+        quality_filtered = 0
+        quality_filter_reasons: dict[str, int] = defaultdict(int)
 
         for message_index, message in enumerate(messages or []):
             content = self._clean_text(getattr(message, "content", ""))
@@ -287,14 +316,19 @@ class ExpressionCandidateExtractor:
             group_days.add(message_day)
             group_contributors.add(speaker_identity)
             if self._is_expression_candidate(content, exact=True):
-                counts[normalized] += 1
-                turn_keys[normalized].add(evidence_id)
-                day_keys[normalized].add(message_day)
-                contributor_keys[normalized].add(speaker_identity)
-                if len(samples[normalized]) < 4:
-                    samples[normalized].append(content[:160])
-                situations.setdefault(normalized, self._infer_situation(content))
-                styles.setdefault(normalized, self._infer_style(content))
+                quality_reason = self._candidate_quality_rejection_reason(content, exact=True)
+                if quality_reason:
+                    quality_filtered += 1
+                    quality_filter_reasons[quality_reason] += 1
+                else:
+                    counts[normalized] += 1
+                    turn_keys[normalized].add(evidence_id)
+                    day_keys[normalized].add(message_day)
+                    contributor_keys[normalized].add(speaker_identity)
+                    if len(samples[normalized]) < 4:
+                        samples[normalized].append(content[:160])
+                    situations.setdefault(normalized, self._infer_situation(content))
+                    styles.setdefault(normalized, self._infer_style(content))
             for phrase in self._phrase_fragments(content):
                 normalized_phrase = self._normalize_text(phrase)
                 if self._near_duplicate(normalized_phrase, existing):
@@ -434,6 +468,8 @@ class ExpressionCandidateExtractor:
             "accepted_messages": accepted_messages,
             "skipped_noise": skipped_noise,
             "skipped_existing": skipped_existing,
+            "quality_filtered": quality_filtered,
+            "quality_filter_reasons": dict(sorted(quality_filter_reasons.items())),
             "exact_candidates": len(qualifying_exact),
             "phrase_candidates": sum(1 for item in candidates if item.get("candidate_type") == "phrase"),
             "rhythm_candidates": rhythm_candidates,

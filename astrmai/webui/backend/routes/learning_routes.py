@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from ..adapters.plugin_api import PluginApiAdapter
@@ -21,6 +21,11 @@ class ExpressionBackfillPayload(BaseModel):
     dry_run: bool = True
 
 
+class LearningPipelineRetryPayload(BaseModel):
+    pipeline: str
+    chat_id: str
+
+
 def _service() -> LearningService:
     return LearningService(PluginApiAdapter())
 
@@ -33,6 +38,27 @@ async def get_learning_status(user: str = Depends(get_current_user)):
 @router.get("/expression-stats")
 async def get_expression_stats(user: str = Depends(get_current_user)):
     return await _service().expression_stats()
+
+
+@router.get("/pipeline-diagnostics")
+async def get_pipeline_diagnostics(
+    pipeline: str = Query(default=""),
+    chat_id: str = Query(default=""),
+    status: str = Query(default=""),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: str = Depends(get_current_user),
+):
+    normalized_pipeline = str(pipeline or "").strip().lower()
+    if normalized_pipeline and normalized_pipeline not in {"expression", "jargon"}:
+        raise HTTPException(status_code=422, detail="pipeline must be expression or jargon")
+    return await _service().pipeline_diagnostics(
+        pipeline=normalized_pipeline,
+        chat_id=str(chat_id or "").strip(),
+        status=str(status or "").strip(),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/cooldowns")
@@ -68,4 +94,29 @@ async def run_expression_backfill(
     )
     if result.get("status") == "error":
         raise HTTPException(status_code=409, detail=result.get("message", "Expression backfill unavailable"))
+    return result
+
+
+@router.post("/pipeline/retry-now")
+async def retry_pipeline_now(
+    payload: Annotated[LearningPipelineRetryPayload, Body()],
+    user: str = Depends(get_current_user),
+):
+    pipeline = str(payload.pipeline or "").strip().lower()
+    chat_id = str(payload.chat_id or "").strip()
+    if pipeline not in {"expression", "jargon"}:
+        raise HTTPException(status_code=422, detail="pipeline must be expression or jargon")
+    if not chat_id:
+        raise HTTPException(status_code=422, detail="chat_id is required")
+    result = await _service().retry_pipeline(pipeline, chat_id)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=409, detail=result.get("message", "Learning pipeline unavailable"))
+    return result
+
+
+@router.post("/pipeline/runs/purge")
+async def purge_pipeline_runs(user: str = Depends(get_current_user)):
+    result = await _service().purge_pipeline_runs()
+    if result.get("status") == "error":
+        raise HTTPException(status_code=409, detail=result.get("message", "Learning pipeline unavailable"))
     return result

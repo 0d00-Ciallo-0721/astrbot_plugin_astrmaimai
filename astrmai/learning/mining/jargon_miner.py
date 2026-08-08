@@ -21,7 +21,7 @@ class JargonMiner:
         self.enricher = JargonEnricher(gateway, config=config) if gateway is not None else None
         self.last_report: dict[str, Any] = {}
 
-    def _normalize_messages(self, messages: Iterable | None) -> List:
+    def normalize_messages(self, messages: Iterable | None) -> List:
         if not messages:
             return []
         normalized = []
@@ -36,11 +36,13 @@ class JargonMiner:
                 normalized.append(message)
         return normalized
 
+    _normalize_messages = normalize_messages
+
     async def mine(self, group_id: str, messages: Sequence | None):
         if not group_id or self.expression_miner is None:
             self.last_report = {"group_id": group_id, "candidate_count": 0, "reason": "miner_unavailable"}
             return []
-        normalized = self._normalize_messages(messages)
+        normalized = self.normalize_messages(messages)
         if len(normalized) < self.min_messages:
             self.last_report = {
                 "group_id": group_id,

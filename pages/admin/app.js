@@ -87,6 +87,12 @@ const state = {
     personaSlicesError: null,
     turns: [],
     learningFeedback: { items: [], total: 0, limit: REVIEW_PAGE_SIZE, offset: 0 },
+    learningPipelines: {
+      checkpoints: [],
+      recent_runs: [],
+      pagination: { checkpoint_total: 0, run_total: 0, limit: 20, offset: 0 },
+      filters: { pipeline: "", chat_id: "", status: "" },
+    },
   },
 };
 
@@ -1450,6 +1456,37 @@ async function loadLearning() {
     `);
     const expressionReport = diagnostics.mining?.expression || diagnostics.expression || {};
     const jargonReport = diagnostics.mining?.jargon || diagnostics.jargon || {};
+    const pipelineCache = state.cache.learningPipelines;
+    const pipelineFilters = pipelineCache.filters;
+    const pipelineQuery = new URLSearchParams({
+      pipeline: pipelineFilters.pipeline,
+      chat_id: pipelineFilters.chat_id,
+      status: pipelineFilters.status,
+      limit: String(pipelineCache.pagination.limit || 20),
+      offset: String(pipelineCache.pagination.offset || 0),
+    });
+    const pipelineDiagnostics = await cachedFetch(
+      `${cacheKey}:pipelines:${pipelineQuery.toString()}`,
+      () => api.get(`/learning/pipeline-diagnostics?${pipelineQuery.toString()}`),
+      diagnostics.pipelines || pipelineCache,
+    );
+    state.cache.learningPipelines = {
+      ...pipelineCache,
+      ...pipelineDiagnostics,
+      filters: pipelineFilters,
+      pagination: { ...pipelineCache.pagination, ...(pipelineDiagnostics.pagination || {}) },
+    };
+    const pipelineStats = pipelineDiagnostics.pipelines || {};
+    const pipelinePage = state.cache.learningPipelines;
+    const checkpointRows = asItems(pipelinePage.checkpoints).map((item) => `
+      <tr><td>${escapeHtml(item.pipeline || "-")}</td><td>${escapeHtml(item.chat_id || "-")}</td><td>${item.cursor_log_id ?? 0}</td><td>${statusChip(item.last_status || "未运行", Number(item.retry_at || 0) * 1000 > Date.now() ? "warn" : "ok")}</td><td>${item.failure_count ?? 0}</td><td>${formatTime(item.updated_at)}</td><td><button class="ghost-button" data-learning-retry-pipeline="${attr(item.pipeline || "")}" data-learning-retry-chat="${attr(item.chat_id || "")}" type="button">重试/解除隔离</button></td></tr>
+    `);
+    const runRows = asItems(pipelinePage.recent_runs).map((item) => `
+      <tr><td>${formatTime(item.created_at)}</td><td>${escapeHtml(item.pipeline || "-")}</td><td>${escapeHtml(item.chat_id || "-")}</td><td>${item.raw_count ?? 0} / ${item.normalized_count ?? 0} / ${item.required_count ?? 0}</td><td>${statusChip(item.status || "unknown", item.status === "completed" ? "ok" : "warn")}</td><td>${escapeHtml(item.reason || "-")}</td></tr>
+    `);
+    const pipelineOffset = Number(pipelinePage.pagination.offset || 0);
+    const pipelineLimit = Number(pipelinePage.pagination.limit || 20);
+    const pipelineTotal = Math.max(Number(pipelinePage.pagination.checkpoint_total || 0), Number(pipelinePage.pagination.run_total || 0));
     body = `
       <div class="grid">
         ${metric("表达习惯", expressionStats.total ?? 0, `${expressionStats.pending ?? 0} 待审核`)}
@@ -1464,6 +1501,22 @@ async function loadLearning() {
         </div>
         ${table(["Chat", "未处理消息", "最早", "最新"], topBacklogRows, "当前没有达到学习阈值的会话。")}
         ${detailsJson("后台扫描完整报告", backlog.last_report || diagnostics.backlog?.last_report || {})}
+      `)}
+      ${section("双学习管线", "表达和黑话使用独立游标、阈值与失败隔离；等待证据不会再被另一条管线提前消费。", `
+        <div class="grid two">
+          ${metric("表达有效证据阈值", pipelineStats.expression?.required_valid_messages ?? "—", `保留 ${pipelineStats.expression?.overlap_messages ?? "—"} 条重叠`)}
+          ${metric("黑话有效证据阈值", pipelineStats.jargon?.required_valid_messages ?? "—", `保留 ${pipelineStats.jargon?.overlap_messages ?? "—"} 条重叠`)}
+        </div>
+        <div class="form-grid">
+          <label>管线<select id="learning-pipeline-filter"><option value="">全部</option><option value="expression" ${pipelineFilters.pipeline === "expression" ? "selected" : ""}>表达</option><option value="jargon" ${pipelineFilters.pipeline === "jargon" ? "selected" : ""}>黑话</option></select></label>
+          <label>会话 ID<input id="learning-pipeline-chat-filter" type="text" value="${attr(pipelineFilters.chat_id)}" placeholder="精确 chat_id"></label>
+          <label>状态<input id="learning-pipeline-status-filter" type="text" value="${attr(pipelineFilters.status)}" placeholder="例如 failed"></label>
+        </div>
+        <div class="row-actions"><button class="primary-button" data-learning-pipeline-filter type="button">应用筛选</button><button class="ghost-button" data-learning-pipeline-filter-reset type="button">重置</button><button class="danger-button" data-learning-pipeline-purge type="button">清理过期运行记录</button></div>
+        ${table(["管线", "Chat", "游标", "状态", "连续失败", "更新时间", "操作"], checkpointRows, "尚未创建学习游标；收到满足条件的群聊消息后会自动出现。")}
+        ${table(["时间", "管线", "Chat", "原始/有效/要求", "状态", "原因"], runRows, "尚无学习运行记录。")}
+        <div class="pager"><button class="ghost-button" data-learning-pipeline-page="${Math.max(0, pipelineOffset - pipelineLimit)}" type="button" ${pipelineOffset <= 0 ? "disabled" : ""}>上一页</button><span>第 ${Math.floor(pipelineOffset / pipelineLimit) + 1} 页，共 ${pipelineTotal} 条</span><button class="ghost-button" data-learning-pipeline-page="${pipelineOffset + pipelineLimit}" type="button" ${pipelineOffset + pipelineLimit >= pipelineTotal ? "disabled" : ""}>下一页</button></div>
+        ${detailsJson("保留策略", pipelinePage.retention || {})}
       `)}
       ${section("表达历史回填", "只重新分析指定会话的历史消息，不重跑黑话，也不会改变消息的已处理状态。建议先预检，再确认写入。", `
         <div class="form-grid">
@@ -1527,6 +1580,43 @@ async function loadLearning() {
 }
 
 function bindLearningActions() {
+  $('[data-learning-pipeline-filter]')?.addEventListener("click", () => {
+    state.cache.learningPipelines.filters = {
+      pipeline: String($("#learning-pipeline-filter")?.value || ""),
+      chat_id: String($("#learning-pipeline-chat-filter")?.value || "").trim(),
+      status: String($("#learning-pipeline-status-filter")?.value || "").trim(),
+    };
+    state.cache.learningPipelines.pagination.offset = 0;
+    clearDataCache("learning:overview:pipelines:");
+    loadLearning();
+  });
+  $('[data-learning-pipeline-filter-reset]')?.addEventListener("click", () => {
+    state.cache.learningPipelines.filters = { pipeline: "", chat_id: "", status: "" };
+    state.cache.learningPipelines.pagination.offset = 0;
+    clearDataCache("learning:overview:pipelines:");
+    loadLearning();
+  });
+  $$('[data-learning-pipeline-page]').forEach((button) => button.addEventListener("click", () => {
+    state.cache.learningPipelines.pagination.offset = Math.max(0, Number(button.dataset.learningPipelinePage || 0));
+    loadLearning();
+  }));
+  $$('[data-learning-retry-pipeline]').forEach((button) => button.addEventListener("click", async () => {
+    const pipeline = button.dataset.learningRetryPipeline;
+    const chatId = button.dataset.learningRetryChat;
+    if (!pipeline || !chatId) return;
+    if (!await confirmAction(`解除 ${chatId} 的 ${pipeline} 学习隔离并允许下轮立即重试？游标不会回退。`)) return;
+    await api.post("/learning/pipeline/retry-now", { pipeline, chat_id: chatId });
+    toast("学习管线已解除隔离");
+    clearDataCache("learning:");
+    loadLearning();
+  }));
+  $('[data-learning-pipeline-purge]')?.addEventListener("click", async () => {
+    if (!await confirmAction("按当前保留策略清理过期学习运行记录？检查点和学习结果不会删除。")) return;
+    const result = await api.post("/learning/pipeline/runs/purge", {});
+    openModal("学习运行记录清理结果", `<pre>${escapeHtml(json(result))}</pre>`);
+    clearDataCache("learning:");
+    loadLearning();
+  });
   const runExpressionBackfill = async (dryRun) => {
     const chatId = String($("#expression-backfill-chat")?.value || "").trim();
     if (!chatId) return toast("请先填写会话 ID");

@@ -2239,7 +2239,73 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn("/memory-feedback", paths)
         self.assertIn("/proactive/status", paths)
         self.assertIn("/learning/status", paths)
+        self.assertIn("/learning/pipeline-diagnostics", paths)
+        self.assertIn("/learning/pipeline/retry-now", paths)
+        self.assertIn("/learning/pipeline/runs/purge", paths)
         self.assertIn("/chats/active", paths)
+
+    def test_learning_service_exposes_filtered_pipeline_operations(self):
+        adapter_mod = importlib.import_module("astrmai.webui.backend.adapters.plugin_api")
+        service_mod = importlib.import_module("astrmai.webui.backend.services.learningservice")
+
+        class _Evolution:
+            def __init__(self):
+                self.calls = []
+
+            async def learning_pipeline_diagnostics(self, **kwargs):
+                self.calls.append(("diagnostics", kwargs))
+                return {"checkpoints": [], "recent_runs": [], "pagination": kwargs}
+
+            async def retry_learning_pipeline(self, pipeline, chat_id):
+                self.calls.append(("retry", pipeline, chat_id))
+                return {"pipeline": pipeline, "chat_id": chat_id, "cursor_log_id": 42}
+
+            async def purge_learning_run_history(self):
+                self.calls.append(("purge",))
+                return {"deleted": 3}
+
+        evolution = _Evolution()
+
+        class _Facade:
+            def get_evolution(self):
+                return evolution
+
+        service = service_mod.LearningService(adapter_mod.PluginApiAdapter(facade=_Facade()))
+
+        async def _run():
+            diagnostics = await service.pipeline_diagnostics(
+                pipeline="expression",
+                chat_id="chat-1",
+                status="failed",
+                limit=25,
+                offset=50,
+            )
+            retried = await service.retry_pipeline("expression", "chat-1")
+            purged = await service.purge_pipeline_runs()
+            return diagnostics, retried, purged
+
+        diagnostics, retried, purged = asyncio.run(_run())
+        self.assertEqual(diagnostics["status"], "ok")
+        self.assertEqual(diagnostics["data"]["pagination"]["offset"], 50)
+        self.assertEqual(retried["data"]["cursor_log_id"], 42)
+        self.assertEqual(purged["data"]["deleted"], 3)
+        self.assertEqual(
+            evolution.calls,
+            [
+                (
+                    "diagnostics",
+                    {
+                        "pipeline": "expression",
+                        "chat_id": "chat-1",
+                        "status": "failed",
+                        "limit": 25,
+                        "offset": 50,
+                    },
+                ),
+                ("retry", "expression", "chat-1"),
+                ("purge",),
+            ],
+        )
 
     def test_backend_route_service_factories_only_pass_plugin_api(self):
         route_cases = [

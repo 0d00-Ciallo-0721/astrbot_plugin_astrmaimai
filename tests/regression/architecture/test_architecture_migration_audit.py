@@ -76,6 +76,7 @@ def _create_current_schema(db: sqlite3.Connection) -> None:
         PRAGMA user_version = 73;
         """
     )
+    _run_migrations(db)
 
 
 def _insert_message(
@@ -194,6 +195,7 @@ def test_migration_audit_reports_legacy_schema_without_mutating_it():
         "ix_messagelog_event_id",
         "ix_chat_states_next_proactive_due_at",
         "ix_reply_commit_outbox_next_retry_at",
+        "ix_learning_mining_run_created_at",
     }
     assert report.table_row_counts == {"messagelog": 1, "chat_states": 0}
     assert db.total_changes == before

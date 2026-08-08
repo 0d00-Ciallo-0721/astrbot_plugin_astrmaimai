@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 73
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 78
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -50,6 +50,7 @@ REQUIRED_INDEXES = (
     "ix_messagelog_event_id",
     "ix_chat_states_next_proactive_due_at",
     "ix_reply_commit_outbox_next_retry_at",
+    "ix_learning_mining_run_created_at",
 )
 
 
