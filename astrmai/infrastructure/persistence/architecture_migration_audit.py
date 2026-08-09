@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 78
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 80
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -51,6 +51,7 @@ REQUIRED_INDEXES = (
     "ix_chat_states_next_proactive_due_at",
     "ix_reply_commit_outbox_next_retry_at",
     "ix_learning_mining_run_created_at",
+    "ix_memory_turn_checkpoint_updated_at",
 )
 
 
@@ -160,7 +161,12 @@ def inspect_architecture_migration(
 
     schema_version = _scalar(db, "PRAGMA user_version")
     tables = _table_names(db)
-    required_tables = ("messagelog", "chat_states", "reply_commit_outbox")
+    required_tables = (
+        "messagelog",
+        "chat_states",
+        "reply_commit_outbox",
+        "memory_turn_checkpoint",
+    )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {
         name: _scalar(db, f'SELECT COUNT(*) FROM "{name}"')

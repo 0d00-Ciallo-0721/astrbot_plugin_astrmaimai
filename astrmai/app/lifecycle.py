@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from typing import Any
 
@@ -20,6 +21,9 @@ class PluginLifecycleManager:
         self._startup_task: asyncio.Task[Any] | None = None
         self._shutdown_requested = False
         self._terminated = False
+        self._terminate_lock = asyncio.Lock()
+        self._termination_complete = False
+        self._isolated_shutdown_tasks: set[asyncio.Task[Any]] = set()
         self.runtime.lifecycle.manager = self
 
     def track_task(self, coro: Any) -> asyncio.Task[Any]:
@@ -68,6 +72,7 @@ class PluginLifecycleManager:
             logger.info("[AstrMai] runtime re-initialized after terminate; resetting shutdown latch")
             await self._prepare_reinitialize()
             self._terminated = False
+            self._termination_complete = False
         if self.runtime.status.is_running and self.runtime.status.lifecycle_started:
             logger.debug("[AstrMai] runtime startup skipped reason=already_running")
             return
@@ -76,6 +81,11 @@ class PluginLifecycleManager:
             return
         logger.info("[AstrMai] Starting system initialization from refactoring workspace...")
         self._shutdown_requested = False
+        event_bus = getattr(self.runtime, "event_bus", None)
+        reset_abort = getattr(event_bus, "reset_abort", None)
+        if callable(reset_abort):
+            reset_abort()
+        self.runtime.status.accepting_events = False
         self.runtime.status.is_running = False
         self.runtime.status.lifecycle_started = False
         self.runtime.status.persona_state = "pending"
@@ -83,6 +93,11 @@ class PluginLifecycleManager:
         self._startup_task = self.track_task(self._complete_startup())
 
     async def _prepare_reinitialize(self) -> None:
+        event_bus = getattr(self.runtime, "event_bus", None)
+        reset_abort = getattr(event_bus, "reset_abort", None)
+        if callable(reset_abort):
+            reset_abort()
+
         coordinator = getattr(self.runtime, "runtime_coordinator", None)
         reopen_coordinator = getattr(coordinator, "reopen", None)
         if callable(reopen_coordinator):
@@ -182,6 +197,7 @@ class PluginLifecycleManager:
         logger.info("[AstrMai] boot phase: workmode guard started")
 
         self.runtime.status.lifecycle_started = True
+        self.runtime.status.accepting_events = True
         self.runtime.set_boot_phase("runtime.running")
         logger.info("[AstrMai] boot complete — runtime running")
 
@@ -393,38 +409,214 @@ class PluginLifecycleManager:
             except Exception as exc:
                 logger.error(f"[AstrMai-GC] 内存 GC 任务异常: {exc}")
 
-    async def terminate(self) -> None:
-        logger.info("[AstrMai] 正在终止进程并卸载资源...")
+    def begin_shutdown(self) -> None:
+        """Fence new ingress synchronously before asynchronous cleanup."""
+        if self._shutdown_requested:
+            return
         self._terminated = True
         self._shutdown_requested = True
+        self.runtime.status.accepting_events = False
+        self.runtime.status.is_running = False
+        self.runtime.status.shutdown_generation = int(
+            getattr(self.runtime.status, "shutdown_generation", 0) or 0
+        ) + 1
         self.runtime.set_boot_phase("shutdown.start")
+        event_bus = getattr(self.runtime, "event_bus", None)
+        trigger_abort = getattr(event_bus, "trigger_abort", None)
+        if callable(trigger_abort):
+            trigger_abort()
 
-        # G4/PL-09: 先落盘上下文快照，再 cancel 在飞任务——顺序关键，
-        # coordinator.shutdown 会清空运行态
-        await self._persist_dialogue_snapshot()
+    def _shutdown_timing(self, name: str, default: float) -> float:
+        timing = getattr(self.runtime.config, "timing", None)
+        try:
+            return max(0.0, float(getattr(timing, name, default) or default))
+        except (TypeError, ValueError):
+            return default
+
+    def _consume_isolated_shutdown_task(self, task: asyncio.Task[Any]) -> None:
+        self._isolated_shutdown_tasks.discard(task)
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _schedule_forced_shutdown_cleanup(self, name: str, operation: Any) -> None:
+        """Schedule best-effort tail cleanup without extending the reload wait."""
+        try:
+            result = operation() if callable(operation) else operation
+            if not inspect.isawaitable(result):
+                return
+            task = asyncio.create_task(result, name=f"astrmai:shutdown:forced:{name}")
+            self._isolated_shutdown_tasks.add(task)
+            task.add_done_callback(self._consume_isolated_shutdown_task)
+        except Exception as exc:
+            logger.warning(f"[AstrMai] forced shutdown cleanup degraded name={name}: {exc}")
+
+    def _force_shutdown_tail(self) -> None:
+        """Release critical tail resources after a bounded sequence is isolated."""
+        started = time.monotonic()
+        errors: list[str] = []
+        try:
+            self.stop_visual_services()
+        except Exception as exc:
+            errors.append(f"visual:{exc}")
 
         try:
-            coordinator = getattr(self.runtime, "runtime_coordinator", None)
-            shutdown = getattr(coordinator, "shutdown", None)
-            if callable(shutdown):
-                try:
-                    await shutdown()
-                except Exception as exc:
-                    logger.warning(f"[AstrMai] Runtime coordinator shutdown degraded: {exc}")
-            await self._terminate_impl()
-        finally:
-            coordinator = getattr(self.runtime, "runtime_coordinator", None)
-            if coordinator and hasattr(coordinator, "_states"):
-                coordinator._states.clear()
-            handoff_store = getattr(self.runtime, "cross_session_handoff_store", None)
-            clear_handoffs = getattr(handoff_store, "clear", None)
-            if callable(clear_handoffs):
-                try:
-                    await clear_handoffs()
-                except Exception as exc:
-                    logger.warning(f"[AstrMai] Cross-session handoff cleanup degraded: {exc}")
-            self._reset_runtime_status_flags()
-            self.runtime.set_boot_phase("shutdown.complete")
+            tasks = collect_background_tasks(*self.runtime.iter_task_owners())
+            for task in dict.fromkeys(task for task in tasks if task is not None):
+                if not task.done():
+                    task.cancel()
+        except Exception as exc:
+            errors.append(f"tasks:{exc}")
+
+        event_bus = getattr(self.runtime, "event_bus", None)
+        stop_event_bus = getattr(event_bus, "stop", None)
+        if callable(stop_event_bus):
+            self._schedule_forced_shutdown_cleanup("event_bus", stop_event_bus)
+
+        persistence = getattr(self.runtime, "persistence", None)
+        dispose = getattr(persistence, "dispose", None)
+        if callable(dispose):
+            try:
+                dispose()
+            except Exception as exc:
+                errors.append(f"persistence:{exc}")
+
+        elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        self.runtime.status.shutdown_stage_stats["forced_tail"] = {
+            "status": "degraded" if errors else "completed",
+            "elapsed_ms": elapsed_ms,
+            "errors": errors,
+        }
+
+    async def _run_bounded_shutdown_stage(
+        self,
+        name: str,
+        operation: Any,
+        *,
+        deadline: float,
+        timeout_sec: float | None = None,
+    ) -> bool:
+        started = time.monotonic()
+        remaining = max(0.0, deadline - started)
+        limit = timeout_sec if timeout_sec is not None else self._shutdown_timing("shutdown_component_timeout_sec", 1.5)
+        stage_timeout = min(remaining, max(0.0, limit))
+        if stage_timeout <= 0:
+            self.runtime.status.shutdown_stage_stats[name] = {
+                "status": "skipped_budget_exhausted",
+                "elapsed_ms": 0.0,
+            }
+            return False
+        try:
+            result = operation() if callable(operation) else operation
+            if not inspect.isawaitable(result):
+                self.runtime.status.shutdown_stage_stats[name] = {
+                    "status": "completed",
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                }
+                return True
+            task = asyncio.create_task(result, name=f"astrmai:shutdown:{name}")
+            done, pending = await asyncio.wait({task}, timeout=stage_timeout)
+            if pending:
+                task.cancel()
+                self._isolated_shutdown_tasks.add(task)
+                task.add_done_callback(self._consume_isolated_shutdown_task)
+                self.runtime.status.shutdown_isolated_tasks += 1
+                self.runtime.status.shutdown_stage_stats[name] = {
+                    "status": "isolated_timeout",
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                }
+                logger.warning(f"[AstrMai] shutdown stage isolated name={name} timeout_sec={stage_timeout:.3f}")
+                return False
+            task.result()
+            self.runtime.status.shutdown_stage_stats[name] = {
+                "status": "completed",
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+            }
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.runtime.status.shutdown_stage_stats[name] = {
+                "status": "failed",
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                "error": str(exc),
+            }
+            logger.warning(f"[AstrMai] shutdown stage degraded name={name}: {exc}")
+            return False
+
+    async def terminate(self) -> None:
+        async with self._terminate_lock:
+            if self._termination_complete:
+                return
+            logger.info("[AstrMai] 正在终止进程并卸载资源...")
+            started = time.monotonic()
+            self.begin_shutdown()
+            self.runtime.status.shutdown_started_at = time.time()
+            self.runtime.status.shutdown_stage_stats = {}
+            self.runtime.status.shutdown_isolated_tasks = 0
+            deadline = started + self._shutdown_timing("hot_reload_shutdown_budget_sec", 5.0)
+
+            try:
+                await self._run_bounded_shutdown_stage(
+                    "dialogue_snapshot",
+                    self._persist_dialogue_snapshot,
+                    deadline=deadline,
+                    timeout_sec=self._shutdown_timing("shutdown_snapshot_timeout_sec", 0.5),
+                )
+                coordinator = getattr(self.runtime, "runtime_coordinator", None)
+                shutdown_coordinator = getattr(coordinator, "shutdown", None)
+                if callable(shutdown_coordinator):
+                    async def _shutdown_runtime_coordinator() -> None:
+                        try:
+                            await shutdown_coordinator(
+                                timeout_sec=self._shutdown_timing("shutdown_cancel_grace_sec", 1.0)
+                            )
+                        except TypeError:
+                            await shutdown_coordinator()
+
+                    await self._run_bounded_shutdown_stage(
+                        "runtime_coordinator",
+                        _shutdown_runtime_coordinator,
+                        deadline=deadline,
+                    )
+                shutdown_completed = await self._run_bounded_shutdown_stage(
+                    "shutdown_sequence",
+                    self._terminate_impl,
+                    deadline=deadline,
+                    timeout_sec=max(0.0, deadline - time.monotonic()),
+                )
+                if not shutdown_completed:
+                    self._force_shutdown_tail()
+            finally:
+                coordinator = getattr(self.runtime, "runtime_coordinator", None)
+                if coordinator and hasattr(coordinator, "_states"):
+                    coordinator._states.clear()
+                handoff_store = getattr(self.runtime, "cross_session_handoff_store", None)
+                clear_handoffs = getattr(handoff_store, "clear", None)
+                if callable(clear_handoffs):
+                    await self._run_bounded_shutdown_stage(
+                        "cross_session_handoffs",
+                        clear_handoffs,
+                        deadline=deadline,
+                    )
+                self._reset_runtime_status_flags()
+                elapsed_ms = (time.monotonic() - started) * 1000
+                self.runtime.status.shutdown_completed_at = time.time()
+                self.runtime.status.last_shutdown_elapsed_ms = round(elapsed_ms, 3)
+                stage_stats = self.runtime.status.shutdown_stage_stats
+                self.runtime.status.last_shutdown_slowest_stage = max(
+                    stage_stats,
+                    key=lambda key: float(stage_stats[key].get("elapsed_ms", 0.0) or 0.0),
+                    default="",
+                )
+                self.runtime.set_boot_phase("shutdown.complete")
+                self._termination_complete = True
+                logger.info(
+                    f"[AstrMai] shutdown complete elapsed_ms={elapsed_ms:.1f} "
+                    f"isolated={self.runtime.status.shutdown_isolated_tasks} "
+                    f"slowest={self.runtime.status.last_shutdown_slowest_stage or 'none'}"
+                )
 
     async def _terminate_impl(self) -> None:
         try:
@@ -531,6 +723,7 @@ class PluginLifecycleManager:
         """
         # Runtime lifecycle flags
         self.runtime.status.is_running = False
+        self.runtime.status.accepting_events = False
         self.runtime.status.lifecycle_started = False
         # Bootstrap / startup flags
         self.runtime.status.bootstrap_completed = False

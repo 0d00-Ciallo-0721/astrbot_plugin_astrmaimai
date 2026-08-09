@@ -47,6 +47,7 @@ from .memory_tool_service import MemoryToolService
 from .memory_write_service import MemoryWriteService
 from .session_memory_summarizer import SessionMemorySummarizer
 from .v2_store import MemoryV2Store
+from ...infrastructure.persistence.memory_turn_checkpoint import MemoryTurnCheckpointStore
 
 
 @dataclass(slots=True)
@@ -1051,6 +1052,11 @@ class MemoryEngine:
         )
         self.session_summarizer = SessionMemorySummarizer(self.context, self.gateway, self, config=self.config)
         self.instant_gate = InstantMemoryGate(self.gateway, self, config=self.config)
+        checkpoint_store = None
+        persistence = getattr(getattr(self, "db_service", None), "persistence", None)
+        checkpoint_db_path = getattr(persistence, "db_path", None)
+        if checkpoint_db_path:
+            checkpoint_store = MemoryTurnCheckpointStore(checkpoint_db_path)
         self.memory_pipeline = MemoryTurnPipeline(
             context=self.context,
             gateway=self.gateway,
@@ -1060,6 +1066,7 @@ class MemoryEngine:
             event_bus=getattr(getattr(self, "db_service", None), "event_bus", None) or getattr(self.gateway, "event_bus", None),
             config=self.config,
             observer=self.memory_observer,
+            checkpoint_store=checkpoint_store,
         )
         await self.memory_pipeline.start()
 

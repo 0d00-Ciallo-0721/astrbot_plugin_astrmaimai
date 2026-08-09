@@ -1394,6 +1394,38 @@
         "default": true,
         "hint": "开启后，用户连续发送的多句话和图片会作为同一轮理解，避免机器人只注意最后一句。"
       },
+      "hot_reload_shutdown_budget_sec": {
+        "description": "插件热重载关闭总预算（秒）",
+        "type": "float",
+        "default": 5.0,
+        "minimum": 1,
+        "maximum": 30,
+        "hint": "保存必须重载的配置时，旧实例最多占用这段时间完成全部关闭工作。超时组件会被隔离，新实例不会继续等待。"
+      },
+      "shutdown_component_timeout_sec": {
+        "description": "单个关闭步骤最长等待（秒）",
+        "type": "float",
+        "default": 1.5,
+        "minimum": 0.1,
+        "maximum": 10,
+        "hint": "记忆、主动服务、事件总线等单个组件的优雅关闭上限，任何组件都不能独占整个热重载过程。"
+      },
+      "shutdown_cancel_grace_sec": {
+        "description": "后台任务取消宽限（秒）",
+        "type": "float",
+        "default": 1.0,
+        "minimum": 0,
+        "maximum": 10,
+        "hint": "向后台任务发出取消信号后等待其自行收尾的时间。超过后任务会被隔离。"
+      },
+      "shutdown_snapshot_timeout_sec": {
+        "description": "关闭快照最长等待（秒）",
+        "type": "float",
+        "default": 0.5,
+        "minimum": 0.1,
+        "maximum": 5,
+        "hint": "群聊上下文和待处理状态落盘的单步上限。失败只记录降级，不阻止新实例启动。"
+      },
       "model_request_timeout_sec": {
         "description": "单次模型请求超时（秒）",
         "type": "float",

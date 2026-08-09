@@ -27,6 +27,7 @@ class MemoryTurnPipeline:
         event_bus: EventBus | None = None,
         config: Any = None,
         observer: Any = None,
+        checkpoint_store: Any = None,
     ) -> None:
         self.context = context
         self.gateway = gateway
@@ -36,7 +37,9 @@ class MemoryTurnPipeline:
         self.event_bus = event_bus or EventBus()
         self.config = config if config is not None else getattr(gateway, "config", None)
         self.observer = observer
+        self.checkpoint_store = checkpoint_store
         self._session_history_buffer: dict[str, dict[str, Any]] = {}
+        self._inflight_maintenance: dict[str, list[Any]] = {}
         self._memory_locks: dict[str, asyncio.Lock] = {}
         self._worker_tasks: dict[str, asyncio.Task[Any]] = {}
         self._worker_queues: dict[str, asyncio.Queue[CommittedMemoryTurn]] = {}
@@ -57,6 +60,7 @@ class MemoryTurnPipeline:
     async def start(self) -> None:
         if self._running:
             return
+        await self._restore_checkpoints()
         self._running = True
         self.event_bus.subscribe(self.event_bus.TOPIC_MEMORY_TURN_COMMITTED, self.on_turn_committed)
         self._sweep_task = asyncio.create_task(self._sweep_loop())
@@ -66,19 +70,38 @@ class MemoryTurnPipeline:
 
     async def stop(self) -> None:
         self.event_bus.unsubscribe(self.event_bus.TOPIC_MEMORY_TURN_COMMITTED, self.on_turn_committed)
-        await self.flush_pending_sessions()
         self._running = False
+        await self._persist_all_checkpoints()
         tasks = [task for task in [self._sweep_task, *self._worker_tasks.values()] if task is not None]
         for task in tasks:
             if not task.done():
                 task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            grace = self._timing_value("shutdown_cancel_grace_sec", 1.0)
+            done, pending = await asyncio.wait(tasks, timeout=grace)
+            for task in done:
+                self._consume_stopped_task(task)
+            for task in pending:
+                task.add_done_callback(self._consume_stopped_task)
         self._worker_tasks.clear()
         self._worker_queues.clear()
         self._background_tasks.clear()
         self._sweep_task = None
         await self._observe_global("memory_pipeline", "pipeline_stopped", level="warning", summary="Memory pipeline stopped")
+
+    def _timing_value(self, name: str, default: float) -> float:
+        timing = getattr(self.config, "timing", None)
+        try:
+            return max(0.0, float(getattr(timing, name, default) or default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _consume_stopped_task(task: asyncio.Task[Any]) -> None:
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def flush_pending_sessions(self) -> dict[str, dict[str, Any]]:
         chat_ids = [
@@ -94,6 +117,74 @@ class MemoryTurnPipeline:
                 logger.warning(f"[MemoryTurnPipeline] shutdown flush degraded for {chat_id}: {exc}")
                 results[chat_id] = {"performed": False, "reason": "flush_failed", "error": str(exc)}
         return results
+
+    def _checkpoint_session(self, chat_id: str) -> dict[str, Any] | None:
+        session_data = dict(self._session_history_buffer.get(chat_id) or {})
+        in_flight = list(self._inflight_maintenance.get(chat_id) or [])
+        buffered = list(session_data.get("buffer", []) or [])
+        combined = [*in_flight, *buffered]
+        if not combined:
+            return None
+        return {
+            "buffer": combined,
+            "last_update": float(session_data.get("last_update", time.time()) or time.time()),
+            "cooldown_until": float(session_data.get("cooldown_until", 0.0) or 0.0),
+            "failures": int(session_data.get("failures", 0) or 0),
+            "last_run_at": float(session_data.get("last_run_at", 0.0) or 0.0),
+        }
+
+    async def _restore_checkpoints(self) -> None:
+        store = self.checkpoint_store
+        if store is None:
+            return
+        try:
+            restored = await store.load_all()
+        except Exception as exc:
+            logger.warning(f"[MemoryTurnPipeline] checkpoint restore degraded: {exc}")
+            return
+        for chat_id, session_data in restored.items():
+            if not list((session_data or {}).get("buffer", []) or []):
+                continue
+            self._session_history_buffer[str(chat_id)] = dict(session_data)
+        if restored:
+            await self._observe_global(
+                "memory_pipeline",
+                "checkpoint_restored",
+                summary=f"restored_chats={len(restored)}",
+                payload={"restored_chats": len(restored)},
+            )
+
+    async def _persist_checkpoint(self, chat_id: str) -> None:
+        store = self.checkpoint_store
+        if store is None:
+            return
+        snapshot = self._checkpoint_session(chat_id)
+        try:
+            if snapshot is None:
+                await store.delete(chat_id)
+            else:
+                await store.upsert(chat_id, snapshot)
+        except Exception as exc:
+            logger.warning(f"[MemoryTurnPipeline] checkpoint persist degraded for {chat_id}: {exc}")
+
+    async def _persist_all_checkpoints(self) -> None:
+        store = self.checkpoint_store
+        if store is None:
+            return
+        snapshots = {
+            str(chat_id): snapshot
+            for chat_id in set(self._session_history_buffer) | set(self._inflight_maintenance)
+            if (snapshot := self._checkpoint_session(str(chat_id))) is not None
+        }
+        try:
+            timeout = self._timing_value("shutdown_snapshot_timeout_sec", 0.5)
+            await asyncio.wait_for(store.save_many(snapshots), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[MemoryTurnPipeline] checkpoint snapshot timed out after {timeout:.3f}s; shutdown will continue"
+            )
+        except Exception as exc:
+            logger.warning(f"[MemoryTurnPipeline] checkpoint snapshot degraded: {exc}")
 
     def build_turn(
         self,
@@ -151,6 +242,7 @@ class MemoryTurnPipeline:
             summary=f"pending_messages={pending_messages}",
             payload={"pending_messages": pending_messages},
         )
+        await self._persist_checkpoint(turn.chat_id)
         return {"performed": True, "reason": "recorded", "pending_messages": pending_messages}
 
     async def process_instant_gate(self, turn: CommittedMemoryTurn) -> InstantGateResult:
@@ -281,6 +373,9 @@ class MemoryTurnPipeline:
                 }
             messages_to_process = buffer.copy()
             session_data["buffer"] = []
+            self._inflight_maintenance[chat_id] = messages_to_process
+
+        await self._persist_checkpoint(chat_id)
 
         history_text = "\n".join(
             self._render_buffer_line(index + 1, item) for index, item in enumerate(messages_to_process)
@@ -303,6 +398,8 @@ class MemoryTurnPipeline:
                 current_data["cooldown_until"] = 0.0
                 current_data["last_run_at"] = completed_at
                 current_data["last_update"] = completed_at
+                self._inflight_maintenance.pop(chat_id, None)
+            await self._persist_checkpoint(chat_id)
             await self._observe_chat(
                 chat_id,
                 "memory_pipeline",
@@ -323,6 +420,8 @@ class MemoryTurnPipeline:
                 )
                 current_data["buffer"] = messages_to_process + list(current_data.get("buffer", []) or [])
                 current_data["last_update"] = time.time()
+                self._inflight_maintenance.pop(chat_id, None)
+            await self._persist_checkpoint(chat_id)
             await self._observe_chat(chat_id, "memory_pipeline", "maintenance_cancelled", level="warning", reason="cancelled")
             raise
         except Exception as exc:
@@ -342,6 +441,8 @@ class MemoryTurnPipeline:
                 current_data["last_update"] = time.time()
                 current_data["failures"] = failures
                 current_data["cooldown_until"] = cooldown_until
+                self._inflight_maintenance.pop(chat_id, None)
+            await self._persist_checkpoint(chat_id)
             await self._observe_chat(
                 chat_id,
                 "memory_pipeline",
@@ -434,6 +535,7 @@ class MemoryTurnPipeline:
                     buf = self._session_history_buffer.get(chat_id)
                     last_update = buf.get("last_update", 0) if isinstance(buf, dict) else 0
                     if last_update < stale_cutoff:
+                        await self._persist_checkpoint(chat_id)
                         self._session_history_buffer.pop(chat_id, None)
                         self._memory_locks.pop(chat_id, None)
                         stale_task = self._worker_tasks.pop(chat_id, None)

@@ -68,6 +68,7 @@ class LifecycleServices:
 class RuntimeStatus:
     boot_phase: str = "created"
     is_running: bool = False
+    accepting_events: bool = False
     boot_logged: bool = False
     bootstrap_completed: bool = False
     lifecycle_started: bool = False
@@ -83,6 +84,13 @@ class RuntimeStatus:
     proactive_started: bool = False
     visual_started: bool = False
     cron_guard_started: bool = False
+    shutdown_generation: int = 0
+    shutdown_started_at: float = 0.0
+    shutdown_completed_at: float = 0.0
+    last_shutdown_elapsed_ms: float = 0.0
+    last_shutdown_slowest_stage: str = ""
+    shutdown_stage_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    shutdown_isolated_tasks: int = 0
     degraded_components: dict[str, str] = field(default_factory=dict)
     # ponytail: threading.Lock is safe here (sync-only during bootstrap, not held across await)
     _degraded_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -98,6 +106,7 @@ class RuntimeStatus:
         return {
             "boot_phase": self.boot_phase,
             "is_running": self.is_running,
+            "accepting_events": self.accepting_events,
             "boot_logged": self.boot_logged,
             "bootstrap_completed": self.bootstrap_completed,
             "lifecycle_started": self.lifecycle_started,
@@ -113,6 +122,13 @@ class RuntimeStatus:
             "proactive_started": self.proactive_started,
             "visual_started": self.visual_started,
             "cron_guard_started": self.cron_guard_started,
+            "shutdown_generation": self.shutdown_generation,
+            "shutdown_started_at": self.shutdown_started_at,
+            "shutdown_completed_at": self.shutdown_completed_at,
+            "last_shutdown_elapsed_ms": self.last_shutdown_elapsed_ms,
+            "last_shutdown_slowest_stage": self.last_shutdown_slowest_stage,
+            "shutdown_stage_stats": dict(self.shutdown_stage_stats),
+            "shutdown_isolated_tasks": self.shutdown_isolated_tasks,
             "degraded_components": self._snapshot_degraded(),
         }
 

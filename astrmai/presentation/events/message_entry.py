@@ -167,6 +167,10 @@ def _configure_turn_budget(facade: RuntimeFacadeProtocol, event) -> None:
 
 
 async def handle_global_message(facade: RuntimeFacadeProtocol, event):
+    is_accepting_events = getattr(facade, "is_accepting_events", None)
+    if callable(is_accepting_events) and not is_accepting_events():
+        debug_trace(event, "ingress.shutdown_rejected")
+        return
     event_route, notice_payload = _classify_event_route(event)
     if event_route == "recall_notice":
         # G3/ID-08: 给热区里对应消息打墓碑（内容替换为 [已撤回]，speaker 与时序保留），

@@ -25,6 +25,7 @@ APPLY_STATUS: dict[str, Any] = {
     "status": "idle",
     "runtime_bound": False,
     "reload_required": False,
+    "apply_mode": "IDLE",
     "error": "",
 }
 # ponytail: global lock for apply_config serialization — acceptable
@@ -41,6 +42,9 @@ def set_active_facade(facade: Any) -> None:
             previous,
         )
         try:
+            begin_shutdown = getattr(previous, "begin_shutdown", None)
+            if callable(begin_shutdown):
+                begin_shutdown()
             term = getattr(previous, "terminate", None)
             if callable(term):
                 import asyncio as _asyncio
@@ -52,7 +56,17 @@ def set_active_facade(facade: Any) -> None:
                 if loop is not None and loop.is_running():
                     safe_create_task(term())
                 else:
-                    _asyncio.run(term())
+                    def _terminate_previous() -> None:
+                        try:
+                            _asyncio.run(term())
+                        except Exception as thread_exc:
+                            _logger.warning("Failed to terminate previous ACTIVE_FACADE: %s", thread_exc)
+
+                    threading.Thread(
+                        target=_terminate_previous,
+                        name="astrmai-old-facade-shutdown",
+                        daemon=True,
+                    ).start()
         except Exception as exc:
             _logger.warning("Failed to terminate previous ACTIVE_FACADE: %s", exc)
     ACTIVE_FACADE = facade
@@ -419,13 +433,8 @@ class PluginApiAdapter:
     @staticmethod
     def _requires_reload(changed_keys: set[str]) -> bool:
         reload_prefixes = (
-            "provider.",
-            "vision.",
-            "sys3.",
-            "life.",
             "persona.",
             "performance.summary_threshold",
-            "memory.embedding_models",
         )
         return any(any(key.startswith(prefix) for prefix in reload_prefixes) for key in changed_keys)
 
@@ -466,12 +475,28 @@ class PluginApiAdapter:
                     "status": "error",
                     "runtime_bound": self._current_facade() is not None,
                     "reload_required": False,
+                    "apply_mode": "REJECTED",
                     "error": str(exc),
                 }
             return {"status": "error", "errors": [{"path": "config", "message": str(exc)}], **APPLY_STATUS}
 
-        reload_required = self._requires_reload(changed_keys or set())
-        runtime_bound = self._apply_hot_config(config_data, parsed_config)
+        facade_bound = self._current_facade() is not None
+        try:
+            runtime_bound = self._apply_hot_config(config_data, parsed_config)
+        except Exception as exc:
+            with _apply_lock:
+                APPLY_STATUS = {
+                    "applied_at": time.time(),
+                    "status": "error",
+                    "runtime_bound": facade_bound,
+                    "reload_required": False,
+                    "apply_mode": "REJECTED",
+                    "error": str(exc),
+                }
+            return {"status": "error", "errors": [{"path": "config", "message": str(exc)}], **APPLY_STATUS}
+
+        reload_required = not runtime_bound
+        apply_mode = "HOT_APPLY" if runtime_bound else "FULL_RELOAD"
 
         with _apply_lock:
             APPLY_STATUS = {
@@ -479,9 +504,15 @@ class PluginApiAdapter:
                 "status": "ok",
                 "runtime_bound": runtime_bound,
                 "reload_required": reload_required,
+                "apply_mode": apply_mode,
                 "error": "",
             }
-        return {"status": "ok", "runtime_bound": runtime_bound, "reload_required": reload_required}
+        return {
+            "status": "ok",
+            "runtime_bound": runtime_bound,
+            "reload_required": reload_required,
+            "apply_mode": apply_mode,
+        }
 
     async def get_apply_status(self) -> dict[str, Any]:
         with _apply_lock:

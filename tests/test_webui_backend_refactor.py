@@ -1321,6 +1321,8 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             result = asyncio.run(adapter.apply_config({"reply": {"base_frequency": 0.2}}, {"reply.base_frequency"}))
             self.assertEqual(result["status"], "ok")
             self.assertTrue(result["runtime_bound"])
+            self.assertFalse(result["reload_required"])
+            self.assertEqual(result["apply_mode"], "HOT_APPLY")
             self.assertIsNotNone(applied)
             self.assertEqual(applied[0]["reply"]["base_frequency"], 0.2)
 

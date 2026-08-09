@@ -232,21 +232,38 @@ class EventBus:
             )
 
     # ponytail: graceful shutdown — cancels all workers and health check
-    async def stop(self):
+    async def stop(self, *, timeout_sec: float = 1.0):
+        self.trigger_abort()
+        self._generation += 1
         for task in list(self._background_tasks):
             task.cancel()
         if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(
+                list(self._background_tasks),
+                timeout=max(0.0, float(timeout_sec)),
+            )
+            for task in done:
+                try:
+                    task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for task in pending:
+                task.add_done_callback(self._consume_stopped_task)
         self._background_tasks.clear()
         self._worker_tasks.clear()
         self._workers_started = False
-        self._generation += 1
         self._event_queue = asyncio.Queue(maxsize=1000)
         self.subscribers = {}
-        self.abort_signal.clear()
         self.response_sent.clear()
         self.affection_changed.clear()
         self.knowledge_updated.clear()
+
+    @staticmethod
+    def _consume_stopped_task(task: asyncio.Task[Any]) -> None:
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
     
     def get_dropped_count(self) -> int:
         """Return the number of events dropped due to queue full (R9)."""

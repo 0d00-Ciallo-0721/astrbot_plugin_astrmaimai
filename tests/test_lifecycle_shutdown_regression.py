@@ -329,6 +329,54 @@ class PluginLifecycleShutdownRegressionTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_terminate_is_bounded_when_component_ignores_cancellation(self):
+        async def _run():
+            from astrmai.app.lifecycle import PluginLifecycleManager
+
+            calls = []
+            runtime = self._build_runtime(calls)
+            runtime.config = SimpleNamespace(
+                timing=SimpleNamespace(
+                    hot_reload_shutdown_budget_sec=0.05,
+                    shutdown_component_timeout_sec=0.02,
+                    shutdown_cancel_grace_sec=0.01,
+                    shutdown_snapshot_timeout_sec=0.01,
+                )
+            )
+            release = asyncio.Event()
+
+            async def _stubborn_stop():
+                calls.append("memory_pipeline.stop")
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    await release.wait()
+
+            runtime.memory_engine.memory_pipeline.stop = _stubborn_stop
+            manager = PluginLifecycleManager(runtime)
+
+            started = asyncio.get_running_loop().time()
+            await manager.terminate()
+            elapsed = asyncio.get_running_loop().time() - started
+
+            self.assertLess(elapsed, 0.3)
+            self.assertGreaterEqual(runtime.status.shutdown_isolated_tasks, 1)
+            self.assertEqual(
+                runtime.status.shutdown_stage_stats["shutdown_sequence"]["status"],
+                "isolated_timeout",
+            )
+            self.assertEqual(
+                runtime.status.shutdown_stage_stats["forced_tail"]["status"],
+                "completed",
+            )
+            await asyncio.sleep(0)
+            self.assertIn("event_bus.stop", calls)
+            self.assertIn("persistence.dispose", calls)
+            release.set()
+            await asyncio.sleep(0.05)
+
+        asyncio.run(_run())
+
     def test_shutdown_task_collection_includes_attention_session_workers(self):
         from astrmai.shared.helpers.plugin_helpers import collect_background_tasks
 

@@ -25,6 +25,14 @@ class RuntimeFacadeProtocol(Protocol):
 
     # ── lifecycle ──
 
+    def is_accepting_events(self) -> bool:
+        """Whether the runtime currently accepts new chat events."""
+        ...
+
+    def begin_shutdown(self) -> None:
+        """Close ingress synchronously before asynchronous cleanup starts."""
+        ...
+
     async def on_program_start(self, *, source: str = "") -> None:
         """Hook invoked once after the plugin boots.
 

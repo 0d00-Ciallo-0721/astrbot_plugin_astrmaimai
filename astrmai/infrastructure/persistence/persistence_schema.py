@@ -136,6 +136,12 @@ _MIGRATIONS: list[tuple[int, str]] = [
     )"""),
     (77, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_pipeline_chat_created ON learning_mining_run(pipeline, chat_id, created_at)"),
     (78, "CREATE INDEX IF NOT EXISTS ix_learning_mining_run_created_at ON learning_mining_run(created_at)"),
+    (79, """CREATE TABLE IF NOT EXISTS memory_turn_checkpoint (
+        chat_id TEXT PRIMARY KEY,
+        session_json TEXT NOT NULL DEFAULT '{}',
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (80, "CREATE INDEX IF NOT EXISTS ix_memory_turn_checkpoint_updated_at ON memory_turn_checkpoint(updated_at)"),
 ]
 
 

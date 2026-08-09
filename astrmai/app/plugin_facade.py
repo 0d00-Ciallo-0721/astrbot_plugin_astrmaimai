@@ -72,6 +72,13 @@ class PluginFacade(RuntimeFacadeProtocol):
     async def on_program_start(self, *, source: str = "") -> None:
         await run_startup_hook(self.runtime, self.lifecycle_manager, source=source)
 
+    def is_accepting_events(self) -> bool:
+        status = self.runtime.status
+        return bool(getattr(status, "accepting_events", getattr(status, "is_running", False)))
+
+    def begin_shutdown(self) -> None:
+        self.lifecycle_manager.begin_shutdown()
+
     async def on_global_message(self, event):
         async for result in handle_global_message(self, event):
             yield result
@@ -177,10 +184,6 @@ class PluginFacade(RuntimeFacadeProtocol):
 
     async def terminate(self) -> None:
         await self.lifecycle_manager.terminate()
-        if getattr(self.runtime, "persistence", None):
-            self.runtime.persistence.dispose()
-        if getattr(self.runtime, "runtime_coordinator", None):
-            await self.runtime.runtime_coordinator.prune_inactive()
 
     async def update_user_stats(self, user_id: str) -> None:
         try:

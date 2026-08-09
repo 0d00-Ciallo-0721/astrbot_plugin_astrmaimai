@@ -435,7 +435,7 @@ class ChatRuntimeCoordinator:
                 task.cancel()
         return state is not None
 
-    async def shutdown(self) -> int:
+    async def shutdown(self, *, timeout_sec: float = 1.0) -> int:
         current_task = asyncio.current_task()
         async with self._lock:
             if self._shutdown:
@@ -451,8 +451,22 @@ class ChatRuntimeCoordinator:
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            done, pending = await asyncio.wait(tasks, timeout=max(0.0, float(timeout_sec)))
+            for task in done:
+                try:
+                    task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for task in pending:
+                task.add_done_callback(self._consume_shutdown_task)
         return len(tasks)
+
+    @staticmethod
+    def _consume_shutdown_task(task: asyncio.Task[Any]) -> None:
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def reopen(self) -> None:
         """Re-enable the coordinator after an explicit plugin reinitialize."""

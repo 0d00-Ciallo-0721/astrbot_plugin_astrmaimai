@@ -562,6 +562,10 @@ class TimingConfig(BaseModel):
     # 而消费方读 private_chat.turn_merge_enabled——旧模型无此字段被 extra-ignore 静默
     # 丢弃，UI 关闭无效。None=未设置（回退 private_chat 侧）。
     turn_merge_enabled: bool | None = Field(default=None, repr=False)
+    hot_reload_shutdown_budget_sec: float = Field(default=5.0, ge=1.0, le=30.0)
+    shutdown_component_timeout_sec: float = Field(default=1.5, ge=0.1, le=10.0)
+    shutdown_cancel_grace_sec: float = Field(default=1.0, ge=0.0, le=10.0)
+    shutdown_snapshot_timeout_sec: float = Field(default=0.5, ge=0.1, le=5.0)
     model_request_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
     turn_total_budget_sec: float = Field(default=360.0, ge=30.0, le=7200.0)
     main_reply_reserve_sec: float = Field(default=90.0, ge=0.0, le=1800.0)

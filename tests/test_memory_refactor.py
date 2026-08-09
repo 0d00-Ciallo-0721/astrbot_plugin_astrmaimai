@@ -437,14 +437,22 @@ class MemoryRefactorTests(unittest.TestCase):
         self.assertEqual(session["failures"], 1)
         self.assertGreater(session["cooldown_until"], 0.0)
 
-    def test_memory_turn_pipeline_stop_flushes_below_threshold_buffer(self):
+    def test_memory_turn_pipeline_stop_checkpoints_without_summarizing(self):
         pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
         pipeline_mod = importlib.reload(pipeline_mod)
         summaries = []
+        saved = {}
 
         class _SessionSummarizer:
             async def summarize_session(self, session_id, chat_history_text, persona_id=None, messages=None):
                 summaries.append((session_id, chat_history_text))
+
+        class _CheckpointStore:
+            async def save_many(self, sessions):
+                saved.update(sessions)
+
+            async def delete(self, chat_id):
+                saved.pop(chat_id, None)
 
         pipeline = pipeline_mod.MemoryTurnPipeline(
             context=SimpleNamespace(),
@@ -453,6 +461,7 @@ class MemoryRefactorTests(unittest.TestCase):
             session_summarizer=_SessionSummarizer(),
             instant_gate=SimpleNamespace(),
             config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10, cleanup_interval=3600)),
+            checkpoint_store=_CheckpointStore(),
         )
         pipeline._session_history_buffer["short-chat"] = {
             "buffer": ["用户/旁白：短会话", "Bot：收到"],
@@ -464,8 +473,47 @@ class MemoryRefactorTests(unittest.TestCase):
 
         asyncio.run(pipeline.stop())
 
-        self.assertEqual(summaries, [("short-chat", "用户/旁白：短会话\nBot：收到")])
-        self.assertEqual(pipeline._session_history_buffer["short-chat"]["buffer"], [])
+        self.assertEqual(summaries, [])
+        self.assertEqual(saved["short-chat"]["buffer"], ["用户/旁白：短会话", "Bot：收到"])
+        self.assertEqual(pipeline._session_history_buffer["short-chat"]["buffer"], ["用户/旁白：短会话", "Bot：收到"])
+
+    def test_memory_turn_pipeline_restores_checkpoint_before_start(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline_mod = importlib.reload(pipeline_mod)
+
+        class _CheckpointStore:
+            async def load_all(self):
+                return {
+                    "restored-chat": {
+                        "buffer": [{"sender": "user-1", "text": "还没总结"}, {"sender": "Bot", "text": "收到"}],
+                        "last_update": 123.0,
+                        "cooldown_until": 0.0,
+                        "failures": 0,
+                        "last_run_at": 0.0,
+                    }
+                }
+
+            async def save_many(self, sessions):
+                return None
+
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(summary_threshold=10))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(),
+            instant_gate=SimpleNamespace(),
+            checkpoint_store=_CheckpointStore(),
+        )
+
+        async def _run():
+            await pipeline.start()
+            self.assertEqual(
+                pipeline._session_history_buffer["restored-chat"]["buffer"][0]["text"],
+                "还没总结",
+            )
+            await pipeline.stop()
+
+        asyncio.run(_run())
 
     def test_compat_summarizer_still_reexports_chat_history_summarizer(self):
         sys.modules.pop("astrmai.memory.services.summarizer", None)

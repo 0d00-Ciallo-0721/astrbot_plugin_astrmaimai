@@ -262,17 +262,18 @@ class Round8ConfigStatePersistenceTests(unittest.TestCase):
             bus.trigger_abort()
             bus.response_sent.set()
             await bus.stop()
-            signals_cleared = not bus.abort_signal.is_set() and not bus.response_sent.is_set()
+            shutdown_fence_held = bus.abort_signal.is_set() and not bus.response_sent.is_set()
+            bus.reset_abort()
             bus.subscribe("topic", lambda payload: new_seen.append(payload))
             await bus.publish("topic", {"new": True})
             await asyncio.sleep(0.05)
             await bus.stop()
-            return old_seen, new_seen, signals_cleared
+            return old_seen, new_seen, shutdown_fence_held
 
-        old_seen, new_seen, signals_cleared = asyncio.run(_run())
+        old_seen, new_seen, shutdown_fence_held = asyncio.run(_run())
         self.assertEqual(old_seen, [])
         self.assertEqual(new_seen, [{"new": True}])
-        self.assertTrue(signals_cleared)
+        self.assertTrue(shutdown_fence_held)
 
     def test_group_clear_keeps_lock_identity_and_invalidates_inflight_mood_write(self):
         from astrmai.state.chat_state_service import StateEngine
