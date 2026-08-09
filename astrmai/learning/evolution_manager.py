@@ -788,6 +788,11 @@ class EvolutionManager:
                         "confidence": float(self._field(pattern, "confidence", self._field(pattern, "activation_score", 0.65)) or 0.65),
                         "activation_score": float(self._field(pattern, "activation_score", 0.65) or 0.65),
                         "candidate_id": self._field(pattern, "candidate_id", ""),
+                        "candidate_origin": self._field(pattern, "candidate_origin", "expression_miner"),
+                        "classification": self._field(pattern, "classification", "expression"),
+                        "classification_reason": self._field(pattern, "classification_reason", ""),
+                        "quality_tier": self._field(pattern, "quality_tier", "review"),
+                        "quality_flags": list(self._field(pattern, "quality_flags", []) or []),
                         "mining_batch_id": mining_batch_id,
                         "source_ref": f"{source}:{mining_batch_id}:{self._field(pattern, 'candidate_id', '')}",
                     },
@@ -891,6 +896,13 @@ class EvolutionManager:
                         "aliases": list(dict.fromkeys(aliases))[:12],
                         "scene": scene or str(existing_metadata.get("scene") or ""),
                         "review_status": review_status,
+                        "candidate_origin": self._field(jargon, "candidate_origin", "jargon_miner"),
+                        "classification": self._field(jargon, "classification", "jargon"),
+                        "classification_reason": self._field(jargon, "classification_reason", ""),
+                        "quality_tier": self._field(jargon, "quality_tier", "review"),
+                        "quality_flags": list(self._field(jargon, "quality_flags", []) or []),
+                        "term_type": self._field(jargon, "term_type", "jargon"),
+                        "semantic_novelty": bool(self._field(jargon, "semantic_novelty", True)),
                         "count": int(existing_metadata.get("count") or 0) + incoming_count,
                         "source_groups": list(
                             dict.fromkeys(
@@ -936,6 +948,17 @@ class EvolutionManager:
             sender_id=str(bot_id),
             sender_name="SELF",
             content=processed_content,
+            conversation_event={
+                "chat_kind": (
+                    "group"
+                    if "groupmessage" in str(event.unified_msg_origin or "").lower()
+                    else "private"
+                ),
+                "role": "assistant",
+                "message_kind": "text",
+                "is_bot": True,
+                "provenance": "bot_echo",
+            },
         )
         triggered = self.recorder.record(event.unified_msg_origin)
         self._schedule_mining_if_triggered(event.unified_msg_origin, triggered)
@@ -1073,6 +1096,22 @@ class EvolutionManager:
         logs: List["MessageLog"],
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        timeout_sec = max(
+            0.01,
+            float(getattr(self._evolution_config(), "learning_pipeline_timeout_sec", 60.0) or 60.0),
+        )
+
+        async def _within_budget(awaitable):
+            remaining = timeout_sec - (time.perf_counter() - started)
+            if remaining <= 0:
+                if hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise TimeoutError(f"learning_pipeline_timeout:{timeout_sec:g}s")
+            try:
+                return await asyncio.wait_for(awaitable, timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"learning_pipeline_timeout:{timeout_sec:g}s") from exc
+
         cursor_before = max(0, int(self._field(logs[0], "id", 1) or 1) - 1) if logs else 0
         batch_id = self._mining_batch_id(group_id, logs, prefix=pipeline)
         failure_key = f"{pipeline}:{group_id}"
@@ -1080,7 +1119,7 @@ class EvolutionManager:
         failure_report: dict[str, Any] = {}
         try:
             if pipeline == "expression":
-                items = await self.expression_miner.mine(group_id, logs)
+                items = await _within_budget(self.expression_miner.mine(group_id, logs))
                 report = dict(getattr(self.expression_miner, "last_report", {}) or {})
                 enrichment = report.get("enrichment")
                 terminal = not isinstance(enrichment, dict) or bool(enrichment.get("terminal"))
@@ -1110,7 +1149,7 @@ class EvolutionManager:
                 if reason == "all_candidates_in_flight":
                     terminal = False
                     retryable = True
-                persistence = await self._save_patterns(items, mining_batch_id=batch_id)
+                persistence = await _within_budget(self._save_patterns(items, mining_batch_id=batch_id))
                 failure_report = {**report, "persistence": persistence.to_report()}
                 if not terminal or not persistence.complete:
                     raise RuntimeError(
@@ -1124,7 +1163,7 @@ class EvolutionManager:
             else:
                 if not getattr(getattr(self.db, "memory_engine", None), "write_service", None):
                     raise RuntimeError("jargon_write_service_unavailable")
-                items = await self.jargon_miner.mine(group_id, logs)
+                items = await _within_budget(self.jargon_miner.mine(group_id, logs))
                 report = dict(getattr(self.jargon_miner, "last_report", {}) or {})
                 reason = str(report.get("reason") or "completed")
                 if reason == "insufficient_context":
@@ -1155,7 +1194,7 @@ class EvolutionManager:
                     terminal = False
                 if not terminal:
                     raise RuntimeError("jargon_enrichment_failed_closed")
-                saved_count = await self._save_jargons(group_id, items, mining_batch_id=batch_id)
+                saved_count = await _within_budget(self._save_jargons(group_id, items, mining_batch_id=batch_id))
                 deduplicated_count = max(0, len(items) - saved_count)
                 extra_report = report
 
@@ -1231,6 +1270,7 @@ class EvolutionManager:
                 report={
                     **failure_report,
                     "reason": str(exc),
+                    "pipeline_timeout_sec": timeout_sec,
                     "failure_count": failures,
                     "retry_at": retry_at,
                 },

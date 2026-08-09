@@ -37,6 +37,7 @@ class JargonPipelineMigratedTests(unittest.TestCase):
                 sys.modules.pop(name, None)
         self.extractor_mod = importlib.import_module("astrmai.learning.mining.jargon_candidate_extractor")
         self.enricher_mod = importlib.import_module("astrmai.learning.mining.jargon_enricher")
+        self.miner_mod = importlib.import_module("astrmai.learning.mining.jargon_miner")
         self.policy_mod = importlib.import_module("astrmai.memory.services.jargon_retrieval_policy")
         self.store_mod = importlib.import_module("astrmai.memory.services.v2_store")
         self.write_mod = importlib.import_module("astrmai.memory.services.memory_write_service")
@@ -65,6 +66,21 @@ class JargonPipelineMigratedTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_candidate_extractor_routes_speaking_habits_away_from_jargon(self):
+        async def run():
+            extractor = self.extractor_mod.JargonCandidateExtractor(min_count=2)
+            messages = [
+                _Message("今天也可以的说"),
+                _Message("确实如此的说"),
+                _Message("bigbird is coming"),
+                _Message("bigbird appears again"),
+            ]
+
+            candidates = await extractor.extract("group-1", messages)
+
+            self.assertEqual([item["content"] for item in candidates], ["bigbird"])
+            self.assertGreaterEqual(extractor.last_report["routed_to_expression"], 1)
+
     def test_enricher_fails_closed_when_llm_fails(self):
         async def run():
             gateway = _Gateway(error=RuntimeError("llm offline"))
@@ -86,6 +102,22 @@ class JargonPipelineMigratedTests(unittest.TestCase):
             self.assertTrue(result.retryable)
             self.assertFalse(result.terminal)
             self.assertEqual(result.error_type, "RuntimeError")
+
+        asyncio.run(run())
+
+    def test_jargon_miner_preloads_expression_terms_for_cross_pool_dedup(self):
+        async def run():
+            class _ExpressionService:
+                async def list_patterns(self, *_args, **_kwargs):
+                    return [SimpleNamespace(expression="的说")]
+
+            expression_miner = SimpleNamespace(gateway=None, config=SimpleNamespace(evolution=SimpleNamespace()))
+            memory_engine = SimpleNamespace(expression_pattern_service=_ExpressionService())
+            miner = self.miner_mod.JargonMiner(expression_miner, memory_engine=memory_engine)
+
+            terms = await miner._existing_expression_terms("group-1")
+
+            self.assertEqual(terms, {"的说"})
 
         asyncio.run(run())
 
@@ -120,6 +152,8 @@ class JargonPipelineMigratedTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "completed")
             self.assertEqual(result.items[0]["review_status"], "review_pending")
+            self.assertIn("口癖", gateway.calls[0]["prompt"])
+            self.assertIn("专有名词", gateway.calls[0]["prompt"])
 
         asyncio.run(run())
 

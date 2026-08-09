@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 from ..dedup import normalize_jargon_term
+from .candidate_router import LearningCandidateRouter
 
 
 class JargonCandidateExtractor:
@@ -129,6 +130,9 @@ class JargonCandidateExtractor:
                 sender_tokens.update(self._tokens(sender_name))
         accepted_tokens = 0
         skipped_noise = 0
+        routed_to_expression = 0
+        quality_filtered = 0
+        route_reasons: dict[str, int] = defaultdict(int)
         for message_index, message in enumerate(messages or []):
             content = self._clean_text(getattr(message, "content", ""))
             if not content:
@@ -138,6 +142,14 @@ class JargonCandidateExtractor:
             for token in set(self._tokens(content)):
                 if self._looks_noise(token, sender_tokens) or self._near_duplicate(token, existing):
                     skipped_noise += 1
+                    continue
+                route = LearningCandidateRouter.classify(token)
+                route_reasons[route.reason] += 1
+                if route.target == "expression":
+                    routed_to_expression += 1
+                    continue
+                if route.target != "jargon":
+                    quality_filtered += 1
                     continue
                 accepted_tokens += 1
                 counts[token] += 1
@@ -164,6 +176,10 @@ class JargonCandidateExtractor:
                     "activation_score": activation,
                     "examples": list(examples),
                     "group_id": group_id,
+                    "candidate_origin": "human_group_text",
+                    "classification": "jargon",
+                    "classification_reason": "semantic_candidate",
+                    "quality_tier": "high" if count >= 3 and len(sender_keys[token]) >= 2 else "medium",
                 }
             )
             existing.add(token)
@@ -171,6 +187,9 @@ class JargonCandidateExtractor:
             "input_messages": len(messages or []),
             "accepted_tokens": accepted_tokens,
             "skipped_noise": skipped_noise,
+            "routed_to_expression": routed_to_expression,
+            "quality_filtered": quality_filtered,
+            "route_reasons": dict(sorted(route_reasons.items())),
             "candidate_count": len(candidates),
             "reason": "candidates_ready" if candidates else "no_repeated_jargon",
         }

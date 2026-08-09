@@ -5,6 +5,7 @@ from astrbot.api import logger
 from ..dedup import GLOBAL_CANDIDATE_REGISTRY, jargon_fingerprint, normalize_jargon_term
 from .jargon_candidate_extractor import JargonCandidateExtractor
 from .jargon_enricher import JargonEnricher
+from .learning_input_policy import LearningInputPolicy
 from typing import Any, Iterable, List, Sequence
 
 
@@ -19,30 +20,43 @@ class JargonMiner:
             min_count=getattr(getattr(config, "evolution", None), "jargon_min_count", 2)
         )
         self.enricher = JargonEnricher(gateway, config=config) if gateway is not None else None
+        self.input_policy = LearningInputPolicy()
         self.last_report: dict[str, Any] = {}
 
     def normalize_messages(self, messages: Iterable | None) -> List:
         if not messages:
             return []
-        normalized = []
-        for message in messages:
-            if message is None:
-                continue
-            content = getattr(message, 'content', None)
-            if content is None:
-                normalized.append(message)
-                continue
-            if str(content).strip():
-                normalized.append(message)
-        return normalized
+        return list(LearningInputPolicy().normalize(messages))
 
     _normalize_messages = normalize_messages
+
+    async def _existing_expression_terms(self, group_id: str) -> set[str]:
+        service = getattr(self.memory_engine, "expression_pattern_service", None) if self.memory_engine else None
+        if not service or not hasattr(service, "list_patterns"):
+            return set()
+        try:
+            rows = await service.list_patterns(
+                group_id,
+                limit=2000,
+                only_checked=False,
+                include_rejected=True,
+                statuses=["active", "review_pending", "rejected", "stale"],
+            )
+            return {
+                normalized
+                for item in rows
+                for normalized in [normalize_jargon_term(getattr(item, "expression", ""))]
+                if normalized
+            }
+        except Exception as exc:
+            logger.debug(f"[JargonMiner] expression preload degraded: {exc}")
+            return set()
 
     async def mine(self, group_id: str, messages: Sequence | None):
         if not group_id or self.expression_miner is None:
             self.last_report = {"group_id": group_id, "candidate_count": 0, "reason": "miner_unavailable"}
             return []
-        normalized = self.normalize_messages(messages)
+        normalized = self.input_policy.normalize(messages)
         if len(normalized) < self.min_messages:
             self.last_report = {
                 "group_id": group_id,
@@ -51,6 +65,7 @@ class JargonMiner:
                 "min_messages": self.min_messages,
                 "candidate_count": 0,
                 "reason": "insufficient_context",
+                "input_policy": dict(self.input_policy.last_report),
             }
             return []
         existing_terms = set()
@@ -71,13 +86,17 @@ class JargonMiner:
                 }
             except Exception as exc:
                 logger.debug(f"[JargonMiner] canonical jargon preload degraded: {exc}")
+        expression_terms = await self._existing_expression_terms(group_id)
+        existing_terms.update(expression_terms)
         candidates = await self.candidate_extractor.extract(group_id, normalized, existing_terms=existing_terms)
         if not candidates:
             self.last_report = {
                 "group_id": group_id,
                 "normalized_messages": len(normalized),
                 "existing_terms": len(existing_terms),
+                "expression_terms": len(expression_terms),
                 **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
+                "input_policy": dict(self.input_policy.last_report),
             }
             return []
         if not self.enricher:
@@ -85,9 +104,11 @@ class JargonMiner:
                 "group_id": group_id,
                 "normalized_messages": len(normalized),
                 "existing_terms": len(existing_terms),
+                "expression_terms": len(expression_terms),
                 **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
                 "enriched_count": len(candidates),
                 "reason": "completed_without_enricher",
+                "input_policy": dict(self.input_policy.last_report),
             }
             return candidates
         candidate_fingerprints = {
@@ -107,6 +128,7 @@ class JargonMiner:
                 "candidate_count": 0,
                 "skipped_in_flight": len(in_flight),
                 "reason": "all_candidates_in_flight",
+                "input_policy": dict(self.input_policy.last_report),
             }
             return []
         try:
@@ -132,8 +154,10 @@ class JargonMiner:
             "group_id": group_id,
             "normalized_messages": len(normalized),
             "existing_terms": len(existing_terms),
+            "expression_terms": len(expression_terms),
             "skipped_in_flight": len(in_flight),
             **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
+            "input_policy": dict(self.input_policy.last_report),
             "enriched_count": len(enriched),
             "reason": enrichment_reason,
             "enrichment": enrichment_report,

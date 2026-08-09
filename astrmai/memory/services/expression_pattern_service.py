@@ -532,6 +532,11 @@ class ExpressionPatternService:
             "confidence": confidence,
             "summary": summary,
             "candidate_id": str(payload.get("candidate_id") or existing_metadata.get("candidate_id") or ""),
+            "candidate_origin": str(payload.get("candidate_origin") or existing_metadata.get("candidate_origin") or "expression_miner"),
+            "classification": str(payload.get("classification") or existing_metadata.get("classification") or "expression"),
+            "classification_reason": str(payload.get("classification_reason") or existing_metadata.get("classification_reason") or ""),
+            "quality_tier": str(payload.get("quality_tier") or existing_metadata.get("quality_tier") or "review"),
+            "quality_flags": list(payload.get("quality_flags") or existing_metadata.get("quality_flags") or []),
             "applied_mining_batch_ids": list(
                 dict.fromkeys([*applied_batch_ids, *([mining_batch_id] if mining_batch_id else [])])
             )[-128:],

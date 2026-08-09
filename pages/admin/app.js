@@ -1708,11 +1708,21 @@ async function loadReviews() {
     const contentText = reviewMode === "jargon"
       ? `${item.content || "-"}${item.meaning ? `\n含义：${item.meaning}` : ""}${item.scene ? `\n场景：${item.scene}` : ""}`
       : (item.expression || item.text || item.pattern || item.content || "-");
+    const evidenceCount = reviewMode === "jargon"
+      ? asItems(item.examples).length
+      : asItems(item.content_samples).length;
+    const evidenceText = [
+      item.classification ? `分类：${item.classification}` : "",
+      item.habit_type ? `类型：${item.habit_type}` : "",
+      item.term_type ? `词类：${item.term_type}` : "",
+      item.quality_tier ? `质量：${item.quality_tier}` : "",
+      evidenceCount ? `证据：${evidenceCount}` : "",
+    ].filter(Boolean).join(" · ");
     return `
       <tr>
         ${selection}
         <td>${escapeHtml(id || "-")}</td>
-        <td><div class="content-preview">${escapeHtml(previewText(contentText, 180))}</div></td>
+        <td><div class="content-preview">${escapeHtml(previewText(contentText, 180))}</div>${evidenceText ? `<div class="muted">${escapeHtml(evidenceText)}</div>` : ""}${item.classification_reason ? `<div class="muted">${escapeHtml(item.classification_reason)}</div>` : ""}</td>
         <td>${statusChip(item.review_status || item.status || "pending", item.status === "rejected" ? "danger" : "")}</td>
         <td>${formatScore(item.weight ?? item.confidence)}</td>
         <td class="row-actions">

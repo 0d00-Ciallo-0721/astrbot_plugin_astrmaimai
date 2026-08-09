@@ -48,6 +48,7 @@ class ExpressionCandidateExtractor:
         "离谱",
         "牛哇",
         "卧槽",
+        "的说",
     )
     ENDING_PARTICLES = ("啦", "呀", "呢", "哦", "嘛", "哒", "捏", "呐", "喵", "诶")
 
@@ -368,6 +369,10 @@ class ExpressionCandidateExtractor:
                     "activation_score": activation_score,
                     "think_level": 1 if len(expression) >= 10 else 0,
                     "candidate_type": "exact",
+                    "candidate_origin": "human_group_text",
+                    "classification": "expression",
+                    "classification_reason": "deterministic_style_signal",
+                    "quality_tier": "high" if count >= 3 else "medium",
                     "candidate_id": self._candidate_id(group_id, "exact", normalized),
                 }
             )
@@ -405,6 +410,10 @@ class ExpressionCandidateExtractor:
                     "activation_score": min(1.0, 0.35 + count * 0.16),
                     "think_level": 0,
                     "candidate_type": "phrase",
+                    "candidate_origin": "human_group_text",
+                    "classification": "expression",
+                    "classification_reason": "repeated_style_fragment",
+                    "quality_tier": "high" if count >= 3 else "medium",
                     "candidate_id": self._candidate_id(group_id, "phrase", phrase),
                 }
             )
@@ -457,6 +466,9 @@ class ExpressionCandidateExtractor:
                     "activation_score": min(1.0, 0.35 + len(evidence) * 0.08),
                     "think_level": 0,
                     "candidate_type": "rhythm",
+                    "classification": "expression",
+                    "classification_reason": "derived_group_reply_rhythm",
+                    "quality_tier": "medium",
                     "candidate_id": self._candidate_id(group_id, "rhythm", normalized_rhythm),
                 }
             )

@@ -29,6 +29,7 @@ class TurnTraceSampleStore:
         self.max_global = max(self.max_per_chat, int(max_global or 2000))
         self._lock = asyncio.Lock()
         self._line_count: int | None = None
+        self._snapshot_seq_by_turn: dict[str, int] = {}
 
     def _read_sync(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -118,8 +119,33 @@ class TurnTraceSampleStore:
                 handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     @staticmethod
-    def _dedupe_by_turn(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """后写覆盖先写；无 turn_id 的样本全部保留。"""
+    def _has_sent_reply(sample: dict[str, Any]) -> bool:
+        status = str(sample.get("status", "") or "")
+        if status in {"executed", "executed_topic_confirmation"}:
+            return True
+        reply_stats = dict(sample.get("reply_stats") or {})
+        return any(
+            int(reply_stats.get(key, 0) or 0) > 0
+            for key in ("actual_send_count", "message_count", "sent_segments")
+        )
+
+    @classmethod
+    def _merge_turn_snapshots(cls, previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        merged = {**previous, **current}
+        latest_status = str(current.get("status", "") or "")
+        if cls._has_sent_reply(previous) and not cls._has_sent_reply(current):
+            merged["latest_snapshot_status"] = latest_status
+            merged["status"] = str(previous.get("status") or "executed")
+            merged["turn_final_status"] = merged["status"]
+            if previous.get("reply_stats"):
+                merged["reply_stats"] = previous["reply_stats"]
+            return merged
+        merged["turn_final_status"] = str(merged.get("status", "") or "")
+        return merged
+
+    @classmethod
+    def _dedupe_by_turn(cls, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """按 turn 合并快照，并保留已经成功发送的最终语义状态。"""
         by_turn: dict[str, int] = {}
         result: list[dict[str, Any]] = []
         for item in samples:
@@ -130,7 +156,8 @@ class TurnTraceSampleStore:
                 result.append(item)
                 continue
             if turn_id in by_turn:
-                result[by_turn[turn_id]] = item
+                index = by_turn[turn_id]
+                result[index] = cls._merge_turn_snapshots(result[index], item)
                 continue
             by_turn[turn_id] = len(result)
             result.append(item)
@@ -229,6 +256,14 @@ class TurnTraceSampleStore:
         if not chat_id:
             return
         normalized_sample = dict(sample)
+
+        turn_id = str(normalized_sample.get("turn_id", "") or "")
+        if turn_id:
+            snapshot_seq = self._snapshot_seq_by_turn.get(turn_id, 0) + 1
+            self._snapshot_seq_by_turn[turn_id] = snapshot_seq
+            normalized_sample.setdefault("snapshot_seq", snapshot_seq)
+            normalized_sample.setdefault("snapshot_kind", str(normalized_sample.get("status") or "update"))
+            normalized_sample.setdefault("snapshot_created_at", time.time())
 
         def _write() -> None:
             self._append_line_sync(normalized_sample)

@@ -49,6 +49,27 @@ class LearningRefactorTests(unittest.TestCase):
         asyncio.run(manager.process_bot_reply("chat-1", "bot-1", "Traceback: fail"))
         self.assertEqual(manager.db.logged, [])
 
+    def test_process_bot_reply_persists_non_human_provenance(self):
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(mining_window_sec=60, mining_window_min_messages=2, mining_cooldown_sec=60, mining_trigger=20),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.mod.EvolutionManager(_FakeDB(), SimpleNamespace(config=config), config=config)
+
+        asyncio.run(
+            manager.process_bot_reply(
+                "ff:GroupMessage:123",
+                "bot-1",
+                "唉嘿嘿～这是机器人自己的回复。",
+            )
+        )
+
+        event = manager.db.logged[0]["conversation_event"]
+        self.assertEqual(event["chat_kind"], "group")
+        self.assertEqual(event["role"], "assistant")
+        self.assertTrue(event["is_bot"])
+        self.assertEqual(event["provenance"], "bot_echo")
+
     def test_get_active_patterns_canonical_async_works_inside_running_loop(self):
         config = SimpleNamespace(
             evolution=SimpleNamespace(mining_window_sec=60, mining_window_min_messages=2, mining_cooldown_sec=60, mining_trigger=20),

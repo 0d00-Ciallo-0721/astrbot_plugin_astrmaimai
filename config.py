@@ -215,6 +215,7 @@ class EvolutionConfig(BaseModel):
     jargon_overlap_messages: int = Field(default=10, ge=0, le=200, description="黑话管线成功后保留用于跨批去重的消息数")
     learning_pipeline_max_failures: int = Field(default=3, ge=1, le=20, description="单条学习管线连续失败后进入隔离的次数")
     learning_pipeline_quarantine_sec: int = Field(default=3600, ge=60, le=86400, description="学习管线连续失败后的隔离时间")
+    learning_pipeline_timeout_sec: float = Field(default=60.0, ge=10.0, le=300.0, description="单轮表达或黑话学习管线的共享总时间预算")
     learning_run_retention_days: int = Field(default=30, ge=1, le=365, description="学习运行诊断记录的保留天数")
     learning_run_max_per_pipeline_chat: int = Field(default=500, ge=10, le=10000, description="每条学习管线每个会话最多保留的运行诊断记录数")
     review_runner_interval_sec: int = Field(default=60, ge=30, le=600)

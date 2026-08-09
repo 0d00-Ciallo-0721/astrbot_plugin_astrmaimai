@@ -96,3 +96,37 @@ def test_append_replaces_existing_turn_id_instead_of_duplicating(tmp_path):
     ]
     assert len(compacted) == 1
     assert compacted[0]["status"] == "executed"
+
+
+def test_late_duplicate_snapshot_does_not_erase_sent_reply(tmp_path):
+    store = TurnTraceSampleStore(tmp_path, max_per_chat=5, max_global=10)
+
+    async def run():
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 1.0,
+                "turn_id": "turn-sent",
+                "status": "executed",
+                "reply_stats": {"actual_send_count": 1},
+            }
+        )
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 2.0,
+                "turn_id": "turn-sent",
+                "status": "duplicate_blocked",
+                "reply_stats": {},
+            }
+        )
+        return await store.recent(chat_id="chat-a", limit=5)
+
+    items = asyncio.run(run())
+
+    assert len(items) == 1
+    assert items[0]["status"] == "executed"
+    assert items[0]["turn_final_status"] == "executed"
+    assert items[0]["latest_snapshot_status"] == "duplicate_blocked"
+    assert items[0]["reply_stats"]["actual_send_count"] == 1
+    assert items[0]["snapshot_seq"] == 2

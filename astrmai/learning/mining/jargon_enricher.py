@@ -42,12 +42,14 @@ class JargonEnricher:
                 }
             )
         prompt = (
-            "Analyze whether each candidate is likely a group-specific jargon term. "
-            "LLM should only enhance meaning and confidence; do not invent unrelated slang. "
-            "Return JSON only: {\"items\": [{\"index\":1,\"meaning\":\"...\",\"scene\":\"...\","
-            "\"confidence\":0.0,\"is_jargon\":true,\"review_status\":\"review_pending|pending_human|rejected\","
+            "判断每个候选是否是真正的聊天黑话：同一个词在群体中具有稳定、可解释、区别于字面义的特殊含义。"
+            "只允许增强已有证据，不得发明含义。口癖、语气词、句尾习惯、颜文字、回复节奏属于表达学习，必须拒绝；"
+            "人名/昵称、作品名等专有名词，普通词汇，命令名，机器人或插件输出也必须拒绝。"
+            "返回 JSON：{\"items\":[{\"index\":1,\"meaning\":\"...\",\"scene\":\"...\","
+            "\"confidence\":0.0,\"is_jargon\":true,\"term_type\":\"jargon|expression_style|proper_name|common_word|plugin_output\","
+            "\"semantic_novelty\":true,\"review_status\":\"review_pending|pending_human|rejected\","
             "\"aliases\":[\"...\"],\"examples\":[\"...\"]}]}\n"
-            f"Candidates: {json.dumps(prompt_items, ensure_ascii=False)}"
+            f"候选：{json.dumps(prompt_items, ensure_ascii=False)}"
         )
         try:
             result = await self.gateway.call_data_process_task(
@@ -120,11 +122,18 @@ class JargonEnricher:
             payload["scene"] = str(extra.get("scene") or "").strip()
             payload["confidence"] = max(0.0, min(confidence, 1.0))
             payload["is_jargon"] = bool(extra.get("is_jargon", False))
+            payload["term_type"] = str(extra.get("term_type") or ("jargon" if payload["is_jargon"] else "common_word")).strip()
+            payload["semantic_novelty"] = bool(extra.get("semantic_novelty", payload["is_jargon"]))
             payload["aliases"] = [str(alias).strip() for alias in extra.get("aliases", []) if str(alias).strip()][:5]
             model_examples = [str(example).strip() for example in extra.get("examples", []) if str(example).strip()]
             payload["examples"] = list(dict.fromkeys([*payload.get("examples", []), *model_examples]))[:5]
             payload["review_status"] = self._normalize_review_status(extra.get("review_status") or "")
-            if payload["is_jargon"] and payload["meaning"]:
+            if (
+                payload["is_jargon"]
+                and payload["meaning"]
+                and payload["term_type"] == "jargon"
+                and payload["semantic_novelty"]
+            ):
                 enriched.append(payload)
             else:
                 rejected_count += 1

@@ -1133,6 +1133,14 @@
         "maximum": 86400,
         "hint": "隔离期间保留证据和游标，不丢弃失败批次；到期后自动重试。"
       },
+      "learning_pipeline_timeout_sec": {
+        "description": "学习管线共享总时间预算（秒）",
+        "type": "float",
+        "default": 60.0,
+        "minimum": 10.0,
+        "maximum": 300.0,
+        "hint": "表达或黑话单轮从提取、增强到持久化共用该预算；超时不推进游标，等待后续重试。"
+      },
       "learning_run_retention_days": {
         "description": "学习运行记录保留天数",
         "type": "int",

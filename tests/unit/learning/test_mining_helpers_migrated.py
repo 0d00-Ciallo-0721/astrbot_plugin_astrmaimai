@@ -95,11 +95,13 @@ class MiningHelpersMigratedTests(unittest.TestCase):
         result = asyncio.run(extractor.extract("group-1", messages))
         contents = {item["content"] for item in result}
 
-        self.assertIn("hiyohiyo", contents)
+        self.assertNotIn("hiyohiyo", contents)
         self.assertNotIn("at_type", contents)
         self.assertNotIn("at_tinyid", contents)
         self.assertNotIn("astrbot", contents)
         self.assertNotIn("萤", contents)
+        self.assertGreaterEqual(extractor.last_report["routed_to_expression"], 1)
+        self.assertIn("speaking_habit_marker", extractor.last_report["route_reasons"])
 
     def test_expression_pattern_enricher_fails_closed_without_model_evidence(self):
         class _Gateway:

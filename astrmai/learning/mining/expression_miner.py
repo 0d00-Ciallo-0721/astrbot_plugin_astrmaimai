@@ -9,6 +9,7 @@ from ..dedup import GLOBAL_CANDIDATE_REGISTRY, expression_fingerprint
 from .expression_candidate_extractor import ExpressionCandidateExtractor
 from .expression_pattern_enricher import ExpressionPatternEnricher
 from .expression_results import ExpressionEnrichmentResult
+from .learning_input_policy import LearningInputPolicy
 
 
 class ExpressionMiner:
@@ -31,27 +32,13 @@ class ExpressionMiner:
             int(getattr(evolution_config, "expression_min_count", 2) or 2),
         )
         self.enricher = ExpressionPatternEnricher(gateway, config=self.config)
+        self.input_policy = LearningInputPolicy()
         self.last_report: dict[str, Any] = {}
         self.last_result = ExpressionEnrichmentResult(status="completed", reason="not_run")
 
     @staticmethod
     def normalize_messages(messages: List[MessageLog]) -> list[MessageLog]:
-        normalized: list[MessageLog] = []
-        for message in messages or []:
-            if message is None:
-                continue
-            sender = str(getattr(message, "sender_name", "") or "")
-            sender_id = str(getattr(message, "sender_id", "") or "")
-            role = str(getattr(message, "role", "") or "").lower()
-            if sender == "SELF" or sender_id.upper() in {"SELF", "BOT", "SELF_BOT"}:
-                continue
-            if bool(getattr(message, "is_bot", False)) or role in {"assistant", "bot", "self"}:
-                continue
-            content = str(getattr(message, "content", "") or "").strip()
-            if not content or content.startswith("[") or len(content) > 100:
-                continue
-            normalized.append(message)
-        return normalized
+        return list(LearningInputPolicy().normalize(messages))
 
     _normalize_messages = normalize_messages
 
@@ -88,7 +75,7 @@ class ExpressionMiner:
                 or 30
             ),
         )
-        normalized = self.normalize_messages(messages)
+        normalized = self.input_policy.normalize(messages)
         if len(normalized) < min_context:
             self.last_result = ExpressionEnrichmentResult(
                 status="completed",
@@ -102,6 +89,7 @@ class ExpressionMiner:
                 "candidate_count": 0,
                 "enriched_count": 0,
                 "reason": "insufficient_context",
+                "input_policy": dict(self.input_policy.last_report),
             }
             return []
         existing = await self._existing_patterns(group_id)
@@ -122,6 +110,7 @@ class ExpressionMiner:
                 "min_context": min_context,
                 "existing_patterns": len(existing),
                 **dict(self.candidate_extractor.last_report or {}),
+                "input_policy": dict(self.input_policy.last_report),
                 "enriched_count": 0,
             }
             return []
@@ -148,6 +137,7 @@ class ExpressionMiner:
                 "candidate_count": 0,
                 "enriched_count": 0,
                 "reason": "insufficient_distinct_expression_evidence",
+                "input_policy": dict(self.input_policy.last_report),
             }
             return []
         candidate_fingerprints = {
@@ -178,6 +168,7 @@ class ExpressionMiner:
                 "skipped_in_flight": len(in_flight),
                 "enriched_count": 0,
                 "reason": "all_candidates_in_flight",
+                "input_policy": dict(self.input_policy.last_report),
             }
             return []
         try:
@@ -206,6 +197,7 @@ class ExpressionMiner:
             "existing_patterns": len(existing),
             "skipped_in_flight": len(in_flight),
             **dict(self.candidate_extractor.last_report or {}),
+            "input_policy": dict(self.input_policy.last_report),
             "enriched_count": len(enriched),
             "reason": self.last_result.reason,
             "enrichment": self.last_result.to_report(),

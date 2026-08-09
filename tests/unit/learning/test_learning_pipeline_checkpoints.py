@@ -230,6 +230,44 @@ def test_pipeline_failure_count_survives_manager_restart_and_quarantines(tmp_pat
     ) == []
 
 
+def test_learning_pipeline_shared_timeout_keeps_cursor_for_retry(tmp_path):
+    service = _database_service(tmp_path)
+    _add_logs(service, "ff:GroupMessage:timeout", 4)
+    config = AstrMaiConfig(
+        evolution={
+            "learning_pipeline_max_failures": 3,
+            "learning_pipeline_quarantine_sec": 600,
+        }
+    )
+    config.evolution.learning_pipeline_timeout_sec = 0.02
+    manager = EvolutionManager(service, SimpleNamespace(config=config), config=config)
+
+    async def _slow_mine(_group_id, _logs):
+        await asyncio.sleep(0.2)
+        return []
+
+    manager.expression_miner.mine = _slow_mine
+    logs = service.get_learning_logs(
+        "expression",
+        "ff:GroupMessage:timeout",
+        limit=10,
+    )
+
+    result = asyncio.run(
+        manager._run_learning_pipeline(
+            "expression",
+            "ff:GroupMessage:timeout",
+            logs,
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "learning_pipeline_timeout:0.02s"
+    assert result["error_type"] == "TimeoutError"
+    assert result["cursor_after"] == result["cursor_before"]
+    assert len(service.get_learning_logs("expression", "ff:GroupMessage:timeout", limit=10)) == 4
+
+
 def test_batch_checkpoint_initialization_preserves_pipeline_cursor_rules(tmp_path):
     service = _database_service(tmp_path)
     _add_logs(service, "ff:GroupMessage:8", 8, processed_until=5)

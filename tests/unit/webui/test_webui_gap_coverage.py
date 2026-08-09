@@ -144,6 +144,33 @@ class WebUiGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(item["weight"], 0.0)
 
+    def test_review_item_exposes_learning_classification_and_evidence(self):
+        from astrmai.webui.backend.services.review_ui_service import ReviewUiService
+
+        item = ReviewUiService._canonical_to_review_item(
+            {
+                "id": "mem-review-evidence",
+                "session_id": "chat-1",
+                "content": "的说",
+                "status": "review_pending",
+                "metadata": {
+                    "review_status": "review_pending",
+                    "habit_type": "ending",
+                    "classification": "expression",
+                    "classification_reason": "deterministic_style_signal",
+                    "quality_tier": "high",
+                    "content_samples": ["可以的说", "没问题的说"],
+                    "distinct_turn_count": 2,
+                },
+            }
+        )
+
+        self.assertEqual(item["classification"], "expression")
+        self.assertEqual(item["habit_type"], "ending")
+        self.assertEqual(item["quality_tier"], "high")
+        self.assertEqual(item["content_samples"], ["可以的说", "没问题的说"])
+        self.assertEqual(item["distinct_turn_count"], 2)
+
     def test_review_list_clamps_invalid_pagination(self):
         from astrmai.webui.backend.services.review_ui_service import ReviewUiService
 

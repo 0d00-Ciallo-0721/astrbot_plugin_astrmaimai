@@ -20,12 +20,22 @@ class BotReplyRecorder:
     async def record(self, chat_id: str, bot_id: str, reply_text: str) -> bool:
         if self.should_skip(reply_text):
             return False
+        chat_id = str(chat_id or "")
+        normalized_chat_id = chat_id.lower()
+        conversation_event = {
+            "chat_kind": "group" if "groupmessage" in normalized_chat_id else "private",
+            "role": "assistant",
+            "message_kind": "text",
+            "is_bot": True,
+            "provenance": "bot_echo",
+        }
         if hasattr(self.db, "add_message_log_async"):
             await self.db.add_message_log_async(
                 group_id=chat_id,
                 sender_id=str(bot_id),
                 sender_name="SELF",
                 content=reply_text,
+                conversation_event=conversation_event,
             )
             return True
         self.db.add_message_log(
@@ -33,6 +43,7 @@ class BotReplyRecorder:
             sender_id=str(bot_id),
             sender_name="SELF",
             content=reply_text,
+            conversation_event=conversation_event,
         )
         return True
 
