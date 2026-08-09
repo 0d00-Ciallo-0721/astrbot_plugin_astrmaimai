@@ -8,6 +8,7 @@ __all__ = [
     "ProactiveTask",
     "ProactiveRhythm",
     "ReviewDispatcher",
+    "ScheduledScenarioService",
     "WakeupService",
     "describe_proactive_capabilities",
     "evaluate_proactive_rhythm",
@@ -48,6 +49,7 @@ def __getattr__(name):
         "ProactiveTask": ".proactive_task",
         "ProactiveRhythm": ".rhythm",
         "ReviewDispatcher": ".review_dispatcher",
+        "ScheduledScenarioService": ".scheduled_scenario_service",
         "WakeupService": ".wakeup_service",
         "evaluate_proactive_rhythm": ".rhythm",
     }

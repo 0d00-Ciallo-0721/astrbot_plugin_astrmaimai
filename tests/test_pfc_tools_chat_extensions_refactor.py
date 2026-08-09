@@ -625,6 +625,39 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("近期消息", result)
         self.assertIn("开心呀", result)
 
+    def test_05b_cross_session_reply_lookup_delegates_bounded_count(self):
+        event = _FakeEvent(group_id="777")
+        event.bot.api = _MapApi(
+            {
+                "get_friend_list": {
+                    "data": [{"user_id": "1481314186", "nickname": "Ying", "remark": "萤"}]
+                }
+            }
+        )
+
+        class _HistoryService:
+            def __init__(self):
+                self.calls = []
+
+            async def read_napcat_history(self, **kwargs):
+                self.calls.append(kwargs)
+                return []
+
+            def render(self, records, *, heading):
+                return f"delegated:{heading}:{len(records)}"
+
+        history_service = _HistoryService()
+        result = asyncio.run(
+            self.mod.CrossSessionReplyLookupTool(history_service=history_service).call(
+                _wrap_event(event),
+                target_name="萤",
+                count=99,
+            )
+        )
+
+        self.assertIn("delegated:", result)
+        self.assertEqual(history_service.calls[0]["count"], 20)
+
     def test_06_custom_face_send_queues_selected_face(self):
         event = _FakeEvent(group_id="777")
         event.bot.api = _MapApi({"fetch_custom_face": {"data": [{"id": "face-1", "name": "开心猫"}]}})

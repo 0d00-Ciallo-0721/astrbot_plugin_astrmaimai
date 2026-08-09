@@ -7,6 +7,7 @@ from astrbot.api import logger
 from astrbot.api.star import Context
 
 from ..conversation.ingress.sensors import PreFilters
+from ..conversation.history import ConversationHistoryService
 from ..conversation.attention.context_compaction import ContextCompactionEngine
 from ..conversation.attention.gate import AttentionGate
 from ..conversation.attention.group_dialogue_store import GroupDialogueStore
@@ -73,13 +74,16 @@ class PluginBootstrap:
             config=self.config,
             runtime_coordinator=ChatRuntimeCoordinator(),
             host_bridge=HostBridge(),
-            cross_session_handoff_store=CrossSessionHandoffStore(),
             infrastructure_settings=build_infrastructure_settings(self.config),
         )
         runtime.set_boot_phase("bootstrap.logging")
         self._log_boot_status(runtime)
         runtime.set_boot_phase("bootstrap.core")
         runtime.core = self._build_core_services(runtime)
+        db_service = getattr(runtime.core, "db_service", None)
+        db_path = getattr(db_service, "db_path", None)
+        runtime.cross_session_handoff_store = CrossSessionHandoffStore(db_path)
+        runtime.conversation_history_service = ConversationHistoryService(self.context, runtime.config)
         runtime.set_boot_phase("bootstrap.workmode")
         runtime.workmode = self._build_work_mode(runtime)
         runtime.set_boot_phase("bootstrap.cognition")
@@ -353,6 +357,7 @@ class PluginBootstrap:
             sys3_router=runtime.sys3_router,
             runtime_coordinator=runtime.runtime_coordinator,
             cross_session_handoff_store=runtime.cross_session_handoff_store,
+            conversation_history_service=runtime.conversation_history_service,
             visual_cortex=runtime.visual_cortex,
         )
         system2_runner = System2Runner(runtime)

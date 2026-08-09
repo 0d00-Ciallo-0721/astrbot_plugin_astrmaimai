@@ -2247,6 +2247,7 @@ class CrossSessionReplyLookupTool(FunctionTool[AstrAgentContext]):
         "不会主动发送消息。"
     )
     db_service: Any = Field(default=None, exclude=True)
+    history_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -2281,6 +2282,18 @@ class CrossSessionReplyLookupTool(FunctionTool[AstrAgentContext]):
             count = max(1, min(int(kwargs.get("count", 8) or 8), 20))
         except (TypeError, ValueError):
             count = 8
+        if self.history_service is not None:
+            records = await self.history_service.read_napcat_history(
+                event=event,
+                chat_type="private",
+                target_id=target_id,
+                count=count,
+            )
+            _record_tool_execution(event, self.name)
+            return self.history_service.render(
+                records,
+                heading=f"跨会话回复查询结果：{display}({target_id})",
+            )
         try:
             payload = await api.call_action(
                 "get_friend_msg_history",
@@ -2472,6 +2485,7 @@ class TopicThreadLookupTool(FunctionTool[AstrAgentContext]):
         "只读查看当前会话的近期话题线索、focus 上下文和消息窗口。"
         "用于分辨“那个”“刚才说的”“这件事”指的是什么，避免串话题。"
     )
+    history_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -2507,6 +2521,18 @@ class TopicThreadLookupTool(FunctionTool[AstrAgentContext]):
                     text = item if isinstance(item, str) else _message_text_preview(item, 160) if isinstance(item, dict) else str(item)
                     if text and (not topic or topic.casefold() in text.casefold()):
                         lines.append(f"近期线索: {_truncate_text(text, 180)}")
+        if not lines and self.history_service is not None:
+            group_id = str(event.get_group_id() or "").strip()
+            if group_id:
+                records = await self.history_service.read_napcat_history(
+                    event=event,
+                    chat_type="group",
+                    target_id=group_id,
+                    count=recent_count,
+                )
+                for record in records:
+                    if not topic or topic.casefold() in record.text.casefold():
+                        lines.append(f"近期线索: {record.sender_name}({record.sender_id}): {_truncate_text(record.text, 180)}")
         if not lines:
             lines.append("话题线索查询结果：当前事件没有暴露可用的 focus/thread 上下文。")
         _record_tool_execution(event, self.name)
@@ -2730,6 +2756,7 @@ class GroupActivitySnapshotTool(FunctionTool[AstrAgentContext]):
         "只读获取当前群近期活跃快照：谁在说话、最近话题、消息数量。"
         "用于群聊里判断是否该插话、谁刚刚参与了话题。"
     )
+    history_service: Any = Field(default=None, exclude=True)
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
@@ -2754,6 +2781,28 @@ class GroupActivitySnapshotTool(FunctionTool[AstrAgentContext]):
             count = max(1, min(int(kwargs.get("count", 20) or 20), 50))
         except (TypeError, ValueError):
             count = 20
+        if self.history_service is not None:
+            records = await self.history_service.read_napcat_history(
+                event=event,
+                chat_type="group",
+                target_id=group_id,
+                count=count,
+            )
+            if not records:
+                _record_tool_execution(event, self.name)
+                return f"群活跃快照：群 {group_id} 没有读取到近期消息。"
+            senders: dict[str, int] = {}
+            for record in records:
+                key = record.sender_name or record.sender_id or "unknown"
+                senders[key] = senders.get(key, 0) + 1
+            ranked = sorted(senders.items(), key=lambda item: item[1], reverse=True)[:6]
+            lines = [f"群活跃快照：群 {group_id} 最近 {len(records)} 条消息。"]
+            lines.append("活跃成员：" + "，".join(f"{name}({num})" for name, num in ranked))
+            lines.append("最近消息：")
+            for index, record in enumerate(records[-6:], start=1):
+                lines.append(f"{index}. {record.sender_name}({record.sender_id}): {_truncate_text(record.text, 180)}")
+            _record_tool_execution(event, self.name)
+            return "\n".join(lines)
         try:
             payload = await api.call_action("get_group_msg_history", group_id=_coerce_api_id(group_id), message_seq=0, count=count)
         except Exception as exc:

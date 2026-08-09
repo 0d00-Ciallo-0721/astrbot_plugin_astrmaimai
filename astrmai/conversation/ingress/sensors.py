@@ -8,6 +8,12 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.core.star.command_management import list_commands
 
+from ...shared.helpers.plugin_helpers import (
+    event_mentions_actor,
+    get_event_self_id,
+    is_at_message_component,
+    resolve_at_target_id,
+)
 from .poke_play import PokePlaybook
 
 class PreFilters:
@@ -155,10 +161,9 @@ class PreFilters:
         # ==========================================
         has_at_bot = False
         reply_image_urls = []
-        bot_id = str(event.get_self_id())
+        bot_id = get_event_self_id(event)
         # 判断私聊环境 (如果不存在 group_id 则为私聊)
         is_private = not bool(event.get_group_id())
-        at_cls = getattr(Comp, "At", None)
         reply_cls = getattr(Comp, "Reply", None)
         plain_cls = getattr(Comp, "Plain", None)
         image_cls = getattr(Comp, "Image", None)
@@ -210,7 +215,8 @@ class PreFilters:
         if event.message_obj and event.message_obj.message:
             for seg in event.message_obj.message:
                 # 探针：检测消息体内是否 @ 了 Bot
-                if at_cls is not None and isinstance(seg, at_cls) and str(seg.qq) == bot_id:
+                at_target_id = resolve_at_target_id(seg)
+                if at_target_id == bot_id:
                     has_at_bot = True
                     
                 # 探针：检测引用组件，并递归挖掘被引用消息中的图片
@@ -223,7 +229,7 @@ class PreFilters:
                     continue # 忽略引用组件对纯文本的干扰
                     
                 # 忽略艾特对纯文本的干扰
-                if at_cls is not None and isinstance(seg, at_cls):
+                if is_at_message_component(seg):
                     continue 
                 
                 # 提取纯文本
@@ -296,6 +302,10 @@ class PreFilters:
             "astrmai_is_passive_image_share",
             bool(image_urls) and not selected_direct and not is_private and not has_at_bot,
         )
+        if has_at_bot:
+            event.set_extra("astrmai_at_bot_wakeup", True)
+            if not is_private:
+                event.set_extra("astrmai_group_direct_wakeup", True)
         # ==========================================
 
         clean_text = " ".join(clean_text_parts).strip().lower()
@@ -319,7 +329,7 @@ class PreFilters:
 
         # 4. 空消息兜底检查
         # 【关键】：如果是一张纯图片，clean_text 为空，但 has_payload 为 True，消息将被安全放行！
-        if not clean_text and not has_payload:
+        if not clean_text and not has_payload and not has_at_bot:
             return False
 
         # 5. 昵称点名提权
@@ -339,20 +349,7 @@ class PreFilters:
         if event.get_extra("astrmai_is_command"):
             return False
 
-        if not event.message_obj or not event.message_obj.message:
-            return False
-            
-        try:
-            for component in event.message_obj.message:
-                component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
-                at_cls = getattr(Comp, "At", None)
-                if ((at_cls is not None and isinstance(component, at_cls)) or component_type == "at"):
-                    if str(component.qq) == str(bot_self_id):
-                        return True
-        except Exception:
-            pass
-            
-        return False
+        return event_mentions_actor(event, bot_self_id)
 
     async def is_command(self, text: str) -> bool:
         """

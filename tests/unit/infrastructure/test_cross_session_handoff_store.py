@@ -1,5 +1,6 @@
 import asyncio
 import time
+import sqlite3
 
 from astrmai.infrastructure.runtime.cross_session_handoff_store import (
     CrossSessionHandoff,
@@ -67,3 +68,51 @@ def test_complete_for_recipient_removes_only_latest_handoff():
 
     assert completed is True
     assert remaining is not None
+
+
+def test_handoff_is_restored_after_store_recreation(tmp_path):
+    db_path = tmp_path / "handoff.db"
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            """CREATE TABLE cross_session_handoff (
+                handoff_id TEXT PRIMARY KEY, platform_id TEXT, source_umo TEXT,
+                source_sender_id TEXT, source_sender_name TEXT, target_umo TEXT,
+                target_id TEXT, target_name TEXT, outbound_message TEXT,
+                context_summary TEXT, delivery_mode TEXT, observed_turns INTEGER,
+                status TEXT, created_at REAL, expires_at REAL, updated_at REAL
+            )"""
+        )
+
+    async def _run():
+        first = CrossSessionHandoffStore(db_path)
+        handoff = _handoff()
+        await first.put(handoff)
+        restored = await CrossSessionHandoffStore(db_path).peek_for_recipient("default", "recipient")
+        return handoff, restored
+
+    handoff, restored = asyncio.run(_run())
+    assert restored is not None
+    assert restored.handoff_id == handoff.handoff_id
+    assert restored.context_summary == handoff.context_summary
+
+
+def test_completed_handoff_is_not_restored(tmp_path):
+    db_path = tmp_path / "handoff.db"
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            """CREATE TABLE cross_session_handoff (
+                handoff_id TEXT PRIMARY KEY, platform_id TEXT, source_umo TEXT,
+                source_sender_id TEXT, source_sender_name TEXT, target_umo TEXT,
+                target_id TEXT, target_name TEXT, outbound_message TEXT,
+                context_summary TEXT, delivery_mode TEXT, observed_turns INTEGER,
+                status TEXT, created_at REAL, expires_at REAL, updated_at REAL
+            )"""
+        )
+
+    async def _run():
+        store = CrossSessionHandoffStore(db_path)
+        await store.put(_handoff())
+        assert await store.complete_for_recipient("default", "recipient") is True
+        return await CrossSessionHandoffStore(db_path).peek_for_recipient("default", "recipient")
+
+    assert asyncio.run(_run()) is None

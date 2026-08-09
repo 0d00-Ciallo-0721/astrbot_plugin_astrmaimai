@@ -23,6 +23,7 @@ from .dispatcher import ProactiveDispatcher
 from .group_signin_service import GroupSigninService
 from .heartflow import HeartflowManager, HeartflowTopicDigestService
 from .review_dispatcher import ReviewDispatcher
+from .scheduled_scenario_service import ScheduledScenarioService
 from .wakeup_service import WakeupService
 
 
@@ -105,6 +106,14 @@ class ProactiveTask:
             state_engine=state_engine,
             config=self.config,
         )
+        self.scheduled_scenario_service = ScheduledScenarioService(
+            state_engine=state_engine,
+            dispatcher=self.proactive_dispatcher,
+            config=self.config,
+            db_path=getattr(persistence, "db_path", None),
+            call_background_lane=self._call_background_lane,
+            task_launcher=self._fire_background_task,
+        )
 
         self.wakeup_service = WakeupService(
             context=context,
@@ -160,6 +169,7 @@ class ProactiveTask:
             self.gateway.config = self.config
         for service_name in (
             "proactive_dispatcher",
+            "scheduled_scenario_service",
             "wakeup_service",
             "group_signin_service",
             "decay_service",
@@ -847,6 +857,7 @@ class ProactiveTask:
                 await asyncio.sleep(self._scheduler_poll_interval_seconds)
                 await self._run_chat_heartbeat_pass()
                 now = time.time()
+                await self.scheduled_scenario_service.tick(now=now)
                 # ponytail: M1 — only skip maintenance block, not profiling/reflection/diary
                 run_maintenance = (now - self._last_global_maintenance_run) >= self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS
 
@@ -903,6 +914,7 @@ class ProactiveTask:
             "heartflow": self.heartflow_manager.describe_status(),
             "heartflow_topic_digest": self.heartflow_topic_digest_service.describe_status(),
             "proactive_dispatcher": self.proactive_dispatcher.describe_status(),
+            "scheduled_scenarios": self.scheduled_scenario_service.describe_status(),
             "group_signin": self.group_signin_service.describe_status(),
             "review_dispatcher_ready": self.review_dispatcher.reflect_tracker is not None,
             "chat_loop_kernel_bound": self.chat_loop_kernel is not None,

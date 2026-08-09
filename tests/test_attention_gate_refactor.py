@@ -266,6 +266,22 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertTrue(gate._is_direct_wakeup_event(direct, "bot-1"))
         self.assertTrue(gate._is_direct_wakeup_event(bonus, "bot-1"))
 
+    def test_at_target_id_adapter_shape_is_detected_and_retained_when_text_is_empty(self):
+        component = SimpleNamespace(type="at", target_id="bot-1")
+        event = _FakeEvent("user-1", "Alice", "", components=[component])
+
+        self.assertTrue(self.gate._is_at_bot_event(event, "bot-1"))
+        retained = asyncio.run(self.gate._format_and_filter_messages([event]))
+        self.assertEqual(retained, [event])
+
+    def test_at_all_is_not_detected_or_retained_as_bot_wakeup(self):
+        component = SimpleNamespace(type="at", target_id="all")
+        event = _FakeEvent("user-1", "Alice", "", components=[component])
+
+        self.assertFalse(self.gate._is_at_bot_event(event, "bot-1"))
+        retained = asyncio.run(self.gate._format_and_filter_messages([event]))
+        self.assertEqual(retained, [])
+
 
 
     def test_process_event_fast_mode_engages_on_direct_wakeup(self):

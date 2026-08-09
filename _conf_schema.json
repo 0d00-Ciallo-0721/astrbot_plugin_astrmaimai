@@ -391,6 +391,36 @@
         "default": true,
         "hint": "开启后，模型先用能力查询工具判断缺少哪类只读工具包，系统可安全追加一次身份、关系、图片消息或记忆治理工具包，再让模型继续多步工具调用。"
       },
+      "history_lookup_enabled": {
+        "description": "启用显式会话历史查询",
+        "type": "bool",
+        "default": true,
+        "hint": "仅在用户明确要求查看近期聊天时开放只读查询；不会把好友私聊自动注入其他会话。"
+      },
+      "history_lookup_private_enabled": {
+        "description": "允许查询好友私聊历史",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，模型不能通过会话历史工具读取机器人与好友的私聊记录。"
+      },
+      "history_lookup_group_enabled": {
+        "description": "允许查询群聊历史",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，模型不能通过会话历史工具补查群聊记录。"
+      },
+      "history_lookup_max_messages": {
+        "description": "单次历史查询消息上限",
+        "type": "int",
+        "default": 20,
+        "hint": "限制一次工具调用返回的消息数量，避免大量聊天记录挤占上下文。"
+      },
+      "history_lookup_max_chars": {
+        "description": "单次历史查询字符上限",
+        "type": "int",
+        "default": 4000,
+        "hint": "达到上限后会保留较新的结构化消息并截断输出。"
+      },
       "hot_zone_ttl_seconds": {
         "description": "热区保留时长（秒）",
         "type": "float",
@@ -1326,6 +1356,94 @@
         "type": "int",
         "default": 300,
         "hint": "防止插件重载或多个后台循环同时领取同一条主动任务。超过该时间后，未完成的旧任务才允许被重新领取。"
+      },
+      "scheduled_scenarios_enabled": {
+        "description": "启用生活化定时场景",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后生成七时段日程，并在早安、晚安和节日窗口提出主动开口候选；候选仍需通过插件注意力和正常回复链。"
+      },
+      "scheduled_scenarios_allow_inactive_chat": {
+        "description": "允许向不活跃会话提出定时候选",
+        "type": "bool",
+        "default": false,
+        "hint": "默认只对近期活跃会话生效。开启后定时候选可进入不活跃会话的注意力判决，但仍受安静时段、冷却和未回应上限约束。"
+      },
+      "daily_schedule_enabled": {
+        "description": "启用角色每日日程",
+        "type": "bool",
+        "default": true,
+        "hint": "每天生成并保存早上、上午、午饭、下午、晚饭、晚上和深夜七个时段的角色安排。"
+      },
+      "daily_schedule_ai_enabled": {
+        "description": "使用模型生成每日日程",
+        "type": "bool",
+        "default": true,
+        "hint": "生成失败或超时时自动使用内置日程，不会阻塞聊天。"
+      },
+      "morning_greeting_enabled": {
+        "description": "启用早安候选",
+        "type": "bool",
+        "default": true
+      },
+      "morning_greeting_time": {
+        "description": "早安候选开始时间",
+        "type": "string",
+        "default": "08:00",
+        "hint": "使用二十四小时制的时和分，例如八点填写 08:00；采用服务器本地时区。"
+      },
+      "morning_greeting_window_min": {
+        "description": "早安候选窗口（分钟）",
+        "type": "int",
+        "default": 90
+      },
+      "night_greeting_enabled": {
+        "description": "启用晚安候选",
+        "type": "bool",
+        "default": true
+      },
+      "night_greeting_time": {
+        "description": "晚安候选开始时间",
+        "type": "string",
+        "default": "22:30",
+        "hint": "使用二十四小时制的时和分，例如二十二点半填写 22:30；采用服务器本地时区。"
+      },
+      "night_greeting_window_min": {
+        "description": "晚安候选窗口（分钟）",
+        "type": "int",
+        "default": 90
+      },
+      "festival_greeting_enabled": {
+        "description": "问候中加入节日信息",
+        "type": "bool",
+        "default": true,
+        "hint": "覆盖常见公历、农历和按星期计算的节日；只提供客观节日上下文，不强制模型发送节日祝福。"
+      },
+      "weather_context_enabled": {
+        "description": "问候中加入天气信息",
+        "type": "bool",
+        "default": false,
+        "hint": "天气获取失败时静默降级，不影响问候和聊天。"
+      },
+      "weather_api_key": {
+        "description": "心知天气接口密钥",
+        "type": "string",
+        "default": ""
+      },
+      "weather_location": {
+        "description": "天气查询地点",
+        "type": "string",
+        "default": "beijing"
+      },
+      "weather_timeout_sec": {
+        "description": "天气查询硬超时（秒）",
+        "type": "float",
+        "default": 5.0
+      },
+      "weather_cache_ttl_sec": {
+        "description": "天气缓存时长（秒）",
+        "type": "int",
+        "default": 1800
       },
       "profiling_msg_threshold": {
         "description": "生成用户画像所需消息数",

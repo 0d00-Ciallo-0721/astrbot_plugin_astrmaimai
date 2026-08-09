@@ -20,6 +20,7 @@ from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
 from ...infrastructure.runtime.turn_call_ledger import attach_background_task_trace, rebind_turn_telemetry
+from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id
 from .decision_router import AttentionDecisionRouter
 from .event_normalizer import SessionContext, build_normalized_events
 from .focus_selector import score_focus_candidate, select_focus_event
@@ -288,15 +289,10 @@ class AttentionGate:
             return False
 
     def _is_at_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
-        message = getattr(getattr(event, "message_obj", None), "message", None) or []
-        for component in message:
-            component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
-            if component_type != "at":
-                continue
-            target = str(getattr(component, "qq", "") or getattr(component, "target", "") or "")
-            if target == str(self_id):
-                return True
-        return False
+        if event.get_extra("astrmai_at_bot_wakeup", False):
+            return True
+        resolved_self_id = str(self_id or "").strip() or get_event_self_id(event)
+        return event_mentions_actor(event, resolved_self_id)
 
     def _is_reply_to_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
         message = getattr(getattr(event, "message_obj", None), "message", None) or []
@@ -1215,7 +1211,9 @@ class AttentionGate:
             if not event:
                 continue
             text = str(getattr(event, "message_str", "") or "").strip()
-            if text or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls")):
+            self_id = get_event_self_id(event)
+            is_wakeup = any(self._resolve_wakeup_flags(event, self_id, text))
+            if text or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls")) or event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls")) or is_wakeup:
                 filtered.append(event)
         return filtered
 

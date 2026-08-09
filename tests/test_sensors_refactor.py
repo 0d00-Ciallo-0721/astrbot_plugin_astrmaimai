@@ -197,6 +197,48 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertEqual(event.get_extra("direct_vision_urls"), ["inline.jpg"])
         self.assertEqual(event.get_extra("extracted_image_urls"), ["inline.jpg"])
 
+    def test_pure_at_bot_message_is_not_filtered_as_empty(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[self._at_component("bot-1")],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertTrue(filters.is_wakeup_signal(event, "bot-1"))
+        self.assertTrue(event.get_extra("astrmai_at_bot_wakeup"))
+        self.assertTrue(event.get_extra("astrmai_group_direct_wakeup"))
+
+    def test_at_target_id_adapter_shape_is_recognized(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[SimpleNamespace(type="at", target_id="bot-1")],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertTrue(filters.is_wakeup_signal(event, "bot-1"))
+
+    def test_pure_at_all_is_not_treated_as_bot_wakeup(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[SimpleNamespace(type="at", target_id="all")],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertFalse(result)
+        self.assertFalse(filters.is_wakeup_signal(event, "bot-1"))
+        self.assertFalse(event.get_extra("astrmai_at_bot_wakeup", False))
+
     def test_passive_group_image_keeps_original_non_direct_behavior(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
         filters._commands_loaded = True

@@ -250,6 +250,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("expression_governance_runner", getattr(self.runtime, "expression_governance_runner", None)),
             ("memory_engine", getattr(self.runtime, "memory_engine", None)),
             ("judge", getattr(self.runtime, "judge", None)),
+            ("conversation_history_service", getattr(self.runtime, "conversation_history_service", None)),
             ("proactive_task", getattr(self.runtime, "proactive_task", None)),
         ]
 

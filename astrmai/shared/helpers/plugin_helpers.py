@@ -122,10 +122,22 @@ def resolve_event_scope(event: Any) -> Tuple[str, str, str]:
 
 
 def get_event_self_id(event: Any) -> str:
-    if hasattr(event, "message_obj") and hasattr(event.message_obj, "self_id"):
-        return str(event.message_obj.self_id)
-    if hasattr(event, "bot") and hasattr(event.bot, "self_id"):
-        return str(event.bot.self_id)
+    getter = getattr(event, "get_self_id", None)
+    if callable(getter):
+        try:
+            value = getter()
+            if value is not None and str(value).strip():
+                return str(value)
+        except Exception:
+            pass
+    message_obj = getattr(event, "message_obj", None)
+    value = getattr(message_obj, "self_id", None)
+    if value is not None and str(value).strip():
+        return str(value)
+    bot = getattr(event, "bot", None)
+    value = getattr(bot, "self_id", None)
+    if value is not None and str(value).strip():
+        return str(value)
     return "unknown"
 
 
@@ -133,25 +145,50 @@ def _message_component_class(name: str):
     return getattr(_get_comp(), name, None)
 
 
+def is_at_message_component(component: Any) -> bool:
+    if component is None:
+        return False
+    at_component = _message_component_class("At")
+    component_name = component.__class__.__name__.lstrip("_").lower()
+    component_type = str(
+        component.get("type", "")
+        if isinstance(component, dict)
+        else getattr(component, "type", "")
+    ).lstrip("_").lower()
+    return bool(
+        (isinstance(component, at_component) if at_component else False)
+        or component_name == "at"
+        or component_type == "at"
+    )
+
+
+def resolve_at_target_id(component: Any) -> str:
+    if not is_at_message_component(component):
+        return ""
+    for field_name in ("qq", "target", "target_id", "user_id"):
+        value = (
+            component.get(field_name)
+            if isinstance(component, dict)
+            else getattr(component, field_name, None)
+        )
+        if value is not None and str(value).strip():
+            return str(value)
+    return ""
+
+
+def event_mentions_actor(event: Any, actor_id: Any) -> bool:
+    expected = str(actor_id or "").strip()
+    if not expected or expected == "unknown":
+        return False
+    message = getattr(getattr(event, "message_obj", None), "message", None) or []
+    return any(resolve_at_target_id(component) == expected for component in message)
+
+
 def is_direct_call_event(event: Any) -> bool:
     if not event.get_group_id():
         return True
 
-    bot_id = str(event.get_self_id()) if hasattr(event, "get_self_id") else ""
-    if not event.message_obj or not event.message_obj.message:
-        return False
-
-    at_component = _message_component_class("At")
-    for component in event.message_obj.message:
-        component_name = component.__class__.__name__.lstrip("_")
-        is_at = (
-            (isinstance(component, at_component) if at_component else False)
-            or component_name == "At"
-            or str(getattr(component, "type", "")).lower() == "at"
-        )
-        if is_at and str(getattr(component, "qq", "")) == bot_id:
-            return True
-    return False
+    return event_mentions_actor(event, get_event_self_id(event))
 
 
 def build_external_reply_event(reply_text: str) -> dict[str, Any]:

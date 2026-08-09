@@ -10,3 +10,4 @@ sqlmodel
 pydantic
 Pillow
 jieba
+lunardate>=0.2.0

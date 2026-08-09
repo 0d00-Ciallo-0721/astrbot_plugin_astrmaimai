@@ -176,7 +176,17 @@ class ProactiveDispatcher:
         except (TypeError, ValueError):
             latest_ts = 0.0
         active_age = max(0.0, now - latest_ts) if latest_ts > 0 else 0.0
-        active = intent.source == "wakeup" or (latest_ts > 0 and active_age <= 1800.0)
+        life = getattr(self.config, "life", None)
+        scheduled_inactive_allowed = (
+            intent.source == "scheduled_scenario"
+            and bool(intent.metadata.get("allow_inactive_chat", False))
+            and bool(getattr(life, "scheduled_scenarios_allow_inactive_chat", False))
+        )
+        active = (
+            intent.source == "wakeup"
+            or scheduled_inactive_allowed
+            or (latest_ts > 0 and active_age <= 1800.0)
+        )
         raw_wait_targets = snapshot.get("wait_targets", []) or []
         if not isinstance(raw_wait_targets, (list, tuple, set)):
             raw_wait_targets = [raw_wait_targets]
@@ -207,6 +217,7 @@ class ProactiveDispatcher:
         checks = {
             "has_attention_gate": bool(self.attention_gate and hasattr(self.attention_gate, "inject_external_event")),
             "chat_active": active,
+            "scheduled_inactive_allowed": scheduled_inactive_allowed,
             "active_age_seconds": round(active_age, 2),
             "wait_targets_empty": not wait_targets,
             "executor_idle": executor_pending <= 0,
@@ -234,7 +245,7 @@ class ProactiveDispatcher:
             return False, "missing_chat_id", checks
         if not generation_current:
             return False, "proactive_generation_superseded", checks
-        if intent.source in {"wakeup", "heartflow"} and rhythm.quiet_hours:
+        if intent.source in {"wakeup", "heartflow", "scheduled_scenario"} and rhythm.quiet_hours:
             return False, "quiet_hours", checks
         if not active:
             return False, "chat_inactive", checks
@@ -246,6 +257,11 @@ class ProactiveDispatcher:
             return False, "cooldown", checks
         if energy is not None and min_energy > 0 and energy < min_energy:
             return False, "low_energy", checks
+        if intent.source == "scheduled_scenario":
+            unanswered = int(scheduling.get("unanswered_proactive_count", 0) or 0)
+            max_unanswered = int(getattr(life, "proactive_max_unanswered", 2) or 0)
+            if max_unanswered >= 0 and unanswered >= max_unanswered:
+                return False, "max_unanswered", checks
         if intent.source == "heartflow" and talk_value is not None and talk_value < 0.25:
             return False, "low_talk_willingness", checks
         return True, "", checks
@@ -396,6 +412,12 @@ class ProactiveDispatcher:
                 "astrmai_proactive_generation": int(intent.metadata.get("captured_generation", 0) or 0),
                 "astrmai_proactive_claim_token": str(intent.metadata.get("claim_token", "") or ""),
                 "astrmai_proactive_chat_kind": str(intent.metadata.get("chat_kind", "") or ""),
+                "astrmai_scheduled_scenario": str(intent.metadata.get("scenario", "") or ""),
+                "astrmai_scheduled_delivery_key": str(intent.metadata.get("delivery_key", "") or ""),
+                "astrmai_daily_schedule_slot": str(intent.metadata.get("schedule_slot", "") or ""),
+                "astrmai_daily_schedule_source": str(intent.metadata.get("schedule_source", "") or ""),
+                "astrmai_scheduled_festival": str(intent.metadata.get("festival", "") or ""),
+                "astrmai_scheduled_weather_available": bool(intent.metadata.get("weather_available", False)),
             },
         }
         if str(intent.metadata.get("chat_kind", "") or "") == "group":

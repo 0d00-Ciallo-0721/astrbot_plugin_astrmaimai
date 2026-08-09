@@ -142,6 +142,45 @@ _MIGRATIONS: list[tuple[int, str]] = [
         updated_at REAL NOT NULL DEFAULT 0
     )"""),
     (80, "CREATE INDEX IF NOT EXISTS ix_memory_turn_checkpoint_updated_at ON memory_turn_checkpoint(updated_at)"),
+    (81, """CREATE TABLE IF NOT EXISTS cross_session_handoff (
+        handoff_id TEXT PRIMARY KEY,
+        platform_id TEXT NOT NULL,
+        source_umo TEXT NOT NULL DEFAULT '',
+        source_sender_id TEXT NOT NULL DEFAULT '',
+        source_sender_name TEXT NOT NULL DEFAULT '',
+        target_umo TEXT NOT NULL DEFAULT '',
+        target_id TEXT NOT NULL,
+        target_name TEXT NOT NULL DEFAULT '',
+        outbound_message TEXT NOT NULL DEFAULT '',
+        context_summary TEXT NOT NULL DEFAULT '',
+        delivery_mode TEXT NOT NULL DEFAULT 'relay',
+        observed_turns INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at REAL NOT NULL DEFAULT 0,
+        expires_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (82, "CREATE INDEX IF NOT EXISTS ix_cross_session_handoff_target_active ON cross_session_handoff(platform_id, target_id, status, expires_at)"),
+    (83, """CREATE TABLE IF NOT EXISTS proactive_daily_plan (
+        plan_date TEXT PRIMARY KEY,
+        plan_json TEXT NOT NULL DEFAULT '{}',
+        source TEXT NOT NULL DEFAULT 'fallback',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (84, """CREATE TABLE IF NOT EXISTS proactive_scenario_delivery (
+        delivery_key TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        scenario TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'claimed',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at REAL NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (85, "CREATE INDEX IF NOT EXISTS ix_proactive_scenario_delivery_retry ON proactive_scenario_delivery(status, next_retry_at)"),
 ]
 
 
