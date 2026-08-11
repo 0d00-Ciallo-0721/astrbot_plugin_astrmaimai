@@ -980,6 +980,15 @@ def record_vision_observation(
         "analysis_prompt_version",
         "asset_storage_status",
         "final_status",
+        "candidate_count",
+        "autonomous_inspection_enabled",
+        "autonomous_inspection_disclosed",
+        "autonomous_inspection_called",
+        "autonomous_inspection_status",
+        "autonomous_inspection_dependency",
+        "autonomous_inspection_elapsed_ms",
+        "autonomous_inspection_cache_hit",
+        "autonomous_inspection_fallback",
     }
     normalized: dict[str, Any] = {}
     for key in allowed:
@@ -997,7 +1006,6 @@ def record_vision_observation(
             normalized[key] = max(0, round(float(value), 1))
         elif value is not None:
             normalized[key] = str(value)[:120]
-    context.vision_observation.clear()
     context.vision_observation.update(normalized)
     if event is not None and hasattr(event, "set_extra"):
         event.set_extra(VISION_OBSERVATION_KEY, context.vision_observation)

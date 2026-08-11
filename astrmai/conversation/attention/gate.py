@@ -18,6 +18,7 @@ from ..contracts.turn_context import ensure_turn_context
 from ..contracts.turn_identity import TurnIdentity, build_p0_thread_id
 from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
+from ...infrastructure.gateway.output_guard import validate_visible_output_text
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
 from ...infrastructure.runtime.turn_call_ledger import attach_background_task_trace, rebind_turn_telemetry
 from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id
@@ -1460,10 +1461,28 @@ class AttentionGate:
     ) -> bool:
         if not confirmation_text or not hasattr(event, "send") or not hasattr(event, "plain_result"):
             return False
+        safe_text, failure_kind = validate_visible_output_text(confirmation_text)
+        if not safe_text:
+            safe_text = "这个话题已经隔了一会儿了，还要继续聊吗？回复“继续”就好～"
+            event.set_extra("astrmai_topic_confirmation_safe_fallback", True)
+            event.set_extra("astrmai_topic_confirmation_guard_reason", failure_kind)
+            event.set_extra(
+                "astrmai_internal_context_leak_blocked",
+                failure_kind == "internal_event_envelope",
+            )
+            debug_trace(
+                event,
+                "topic_confirmation_output_guard",
+                failure_kind=failure_kind,
+                internal_context_leak_blocked=failure_kind == "internal_event_envelope",
+            )
+        else:
+            event.set_extra("astrmai_topic_confirmation_safe_fallback", False)
         try:
-            await event.send(event.plain_result(confirmation_text))
+            await event.send(event.plain_result(safe_text))
             event.set_extra("astrmai_reply_sent", True)
             event.set_extra("astrmai_topic_confirmation_sent", True)
+            event.set_extra("astrmai_topic_confirmation_sent_text", safe_text)
             return True
         except Exception as exc:
             logger.warning(f"[AttentionGate] private topic confirmation send failed: {exc}")
@@ -1660,6 +1679,10 @@ class AttentionGate:
                             topic_confirmation_required = bool(topic_decision.get("requires_confirmation", False))
                             if topic_confirmation_required:
                                 focus_event.set_extra(
+                                    "astrmai_topic_confirmation_trigger",
+                                    str(topic_decision.get("status", "") or ""),
+                                )
+                                focus_event.set_extra(
                                     "astrmai_private_topic_confirmation_text",
                                     str(topic_decision.get("confirmation_text", "") or ""),
                                 )
@@ -1749,7 +1772,17 @@ class AttentionGate:
                             focus_event,
                             chat_id,
                             status="executed_topic_confirmation",
-                            reply_text=confirmation_text if confirmation_sent else None,
+                            reply_text=(
+                                str(
+                                    focus_event.get_extra(
+                                        "astrmai_topic_confirmation_sent_text",
+                                        confirmation_text,
+                                    )
+                                    or ""
+                                )
+                                if confirmation_sent
+                                else None
+                            ),
                         )
                     elif judge_action == "WAIT":
                         if bool(focus_event.get_extra("astrmai_is_proactive_event", False)):

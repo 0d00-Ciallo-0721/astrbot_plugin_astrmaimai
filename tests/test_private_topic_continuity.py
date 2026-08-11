@@ -64,6 +64,48 @@ def test_private_topic_after_30_minutes_requires_confirmation_before_reply():
     assert "继续这个话题" in decision["confirmation_text"] or "接着聊" in decision["confirmation_text"]
 
 
+def test_private_stale_topic_ignores_punctuation_and_emoji_only_inputs():
+    store = _store()
+    _record_topic(store)
+
+    for text in (".", "。", "？", "...", "🥺"):
+        decision = store.evaluate_private_message("private-1", text, now=1000.0 + 1801)
+        assert decision["action"] == "new"
+        assert decision["requires_confirmation"] is False
+
+
+def test_private_stale_topic_still_confirms_explicit_old_topic_reference():
+    store = _store()
+    _record_topic(store)
+
+    decision = store.evaluate_private_message("private-1", "刚才那个温泉计划呢", now=1000.0 + 1801)
+
+    assert decision["action"] == "confirm"
+    assert decision["requires_confirmation"] is True
+
+
+def test_internal_event_envelope_is_never_committed_as_private_topic():
+    store = _store()
+    internal = (
+        "[事件=1727617753 | 发言人=恸（ID:516779421） | 角色=成员 | "
+        "类型=image | 来源=original | 媒体=图片:1]\n"
+        "内容：[表情包转述：一个金发双马尾女孩]"
+    )
+
+    store.record(
+        chat_id="private-1",
+        focus_preview=internal,
+        goal_summary="回应图片",
+        social_intent="answer",
+        action_taken="reply",
+        now=1000.0,
+    )
+
+    snapshot = store.snapshot("private-1", now=1001.0)
+    assert snapshot["current_topic"] == ""
+    assert snapshot["last_goal_update_ts"] == 0.0
+
+
 def test_private_confirmation_yes_resumes_old_topic_and_no_starts_new_topic():
     store = _store()
     _record_topic(store)

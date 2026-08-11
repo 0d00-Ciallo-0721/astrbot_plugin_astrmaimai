@@ -117,6 +117,11 @@ SAFETY_JSON_RE = re.compile(
 )
 JSON_FRAGMENT_RE = re.compile(r"^[\[\{].*[\}\]]$", re.DOTALL)
 SINGLE_LATIN_FRAGMENT_RE = re.compile(r"^[A-Za-z]$")
+INTERNAL_EVENT_ENVELOPE_RE = re.compile(
+    r"\[事件=[^\]\n]{0,240}\|\s*发言人=[^\]\n]{0,240}\|\s*角色=[^\]\n]{0,80}"
+    r"\|\s*类型=[^\]\n]{0,80}\|\s*来源=",
+    re.IGNORECASE,
+)
 
 
 def normalize_guard_text(text: str) -> str:
@@ -227,6 +232,13 @@ def looks_like_tool_protocol_text(text: str) -> bool:
     return any(marker in lowered for marker in TOOL_PROTOCOL_MARKERS)
 
 
+def looks_like_internal_event_envelope(text: str) -> bool:
+    normalized = normalize_guard_text(text)
+    if not normalized:
+        return False
+    return bool(INTERNAL_EVENT_ENVELOPE_RE.search(normalized))
+
+
 def is_noise_line(line: str) -> bool:
     stripped = normalize_guard_text(line)
     if not stripped:
@@ -259,7 +271,11 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "", speaker_name
     normalized = normalize_guard_text(text)
     if not normalized:
         return ""
-    if looks_like_provider_failure_text(normalized) or looks_like_tool_protocol_text(normalized):
+    if (
+        looks_like_provider_failure_text(normalized)
+        or looks_like_tool_protocol_text(normalized)
+        or looks_like_internal_event_envelope(normalized)
+    ):
         return fallback_text.strip()
 
     lines: List[str] = []
@@ -293,6 +309,8 @@ def validate_visible_output_text(
         return "", "empty_response"
     if looks_like_provider_failure_text(normalized):
         return "", "provider_failure_text"
+    if looks_like_internal_event_envelope(normalized):
+        return "", "internal_event_envelope"
 
     sanitized = sanitize_visible_reply_text(normalized, fallback_text="", speaker_names=speaker_names)
     if sanitized:

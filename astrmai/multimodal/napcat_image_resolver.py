@@ -55,6 +55,22 @@ class NapCatImageResolver:
 
     async def resolve_event_images(self, event: Any) -> ImageResolutionBatch:
         references = self._extract_image_references(event)
+        return await self._resolve_references(event, references)
+
+    async def resolve_message_payload(
+        self,
+        event: Any,
+        payload: Any,
+    ) -> ImageResolutionBatch:
+        """Resolve images from a historical OneBot ``get_msg`` payload."""
+        references = self._extract_payload_image_references(payload)
+        return await self._resolve_references(event, references)
+
+    async def _resolve_references(
+        self,
+        event: Any,
+        references: list[list[str]],
+    ) -> ImageResolutionBatch:
         result = ImageResolutionBatch(had_images=bool(references))
         for index, candidates in enumerate(references):
             resolved = await self._resolve_candidates(event, index, candidates)
@@ -63,6 +79,47 @@ class NapCatImageResolver:
             else:
                 result.images.append(resolved)
         return result
+
+    def _extract_payload_image_references(self, payload: Any) -> list[list[str]]:
+        data = payload
+        if isinstance(data, dict) and isinstance(data.get("data"), (dict, list)):
+            data = data["data"]
+        if isinstance(data, dict):
+            segments = data.get("message")
+            if not isinstance(segments, list):
+                segments = data.get("raw_message")
+        else:
+            segments = data
+        if not isinstance(segments, list):
+            return []
+
+        references: list[list[str]] = []
+        for segment in segments:
+            if isinstance(segment, dict):
+                if str(segment.get("type", "")).lower() != "image":
+                    continue
+                values = segment.get("data") if isinstance(segment.get("data"), dict) else segment
+                candidates = self._unique_refs(
+                    values.get(key)
+                    for key in (
+                        "local_path",
+                        "path",
+                        "file",
+                        "file_id",
+                        "url",
+                        "file_unique",
+                    )
+                )
+            elif segment.__class__.__name__.lower() == "image":
+                candidates = self._unique_refs(
+                    getattr(segment, key, None)
+                    for key in ("path", "file", "url", "image_url", "src")
+                )
+            else:
+                continue
+            if candidates:
+                references.append(candidates)
+        return references
 
     def _extract_image_references(self, event: Any) -> list[list[str]]:
         raw_event = getattr(getattr(event, "message_obj", None), "raw_message", None)

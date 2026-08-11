@@ -141,6 +141,34 @@ def test_vision_observation_keeps_diagnostics_without_source_or_description():
     assert "私密文字" not in str(payload)
 
 
+def test_vision_observation_merges_disclosure_and_execution_stages():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        record_vision_observation(
+            event,
+            {
+                "candidate_count": 2,
+                "autonomous_inspection_enabled": True,
+                "autonomous_inspection_disclosed": True,
+            },
+        )
+        record_vision_observation(
+            event,
+            {
+                "autonomous_inspection_called": True,
+                "autonomous_inspection_status": "success",
+                "autonomous_inspection_cache_hit": False,
+            },
+        )
+
+    payload = event.get_extra("astrmai_vision_observation")
+    assert payload["candidate_count"] == 2
+    assert payload["autonomous_inspection_disclosed"] is True
+    assert payload["autonomous_inspection_called"] is True
+    assert payload["autonomous_inspection_status"] == "success"
+
+
 def test_tool_ledger_summary_exposes_execution_without_prompt_content():
     event = _Event()
     event.set_extra(

@@ -13,6 +13,7 @@ def _event(
     actor_id: str,
     actor_name: str,
     text: str,
+    rich_text: str | None = None,
     reply_target_event_id: str = "",
     reply_target_actor_id: str = "",
     at_actor_ids: tuple[str, ...] = (),
@@ -27,7 +28,7 @@ def _event(
         actor_id=actor_id,
         actor_name=actor_name,
         visible_text=text,
-        rich_text=text,
+        rich_text=text if rich_text is None else rich_text,
         message_kind="mixed" if image_refs else "text",
         role="user",
         reply_target_event_id=reply_target_event_id,
@@ -108,6 +109,56 @@ class ContextRenderingBoundaryTests(unittest.TestCase):
         self.assertEqual(package.stats["shared_event_count"], 2)
         self.assertEqual(package.stats["owned_event_count"], 1)
         self.assertEqual(package.stats["deduplicated_event_count"], 1)
+
+    def test_topic_projection_uses_compact_image_description_without_internal_envelope(self):
+        event = _event(
+            "evt-image",
+            actor_id="516779421",
+            actor_name="恸",
+            text="",
+            rich_text="[表情包转述：一个金发双马尾女孩举着‘V我50’的碗]",
+            image_refs=("pic-1",),
+        )
+
+        projection = MessageRenderer.project_topic_preview(event)
+
+        self.assertIn("V我50", projection.text)
+        self.assertIn("表情包", projection.text)
+        self.assertNotIn("事件=", projection.text)
+        self.assertNotIn("516779421", projection.text)
+        self.assertTrue(projection.safe)
+
+    def test_topic_projection_prefers_user_text_for_mixed_message(self):
+        event = _event(
+            "evt-mixed",
+            actor_id="516779421",
+            actor_name="恸",
+            text="我是你哥哥",
+            rich_text="我是你哥哥\n[表情包转述：一个生气的女孩]",
+            image_refs=("pic-1",),
+        )
+
+        projection = MessageRenderer.project_topic_preview(event)
+
+        self.assertEqual(projection.text, "我是你哥哥")
+        self.assertEqual(projection.source, "user_text")
+        self.assertTrue(projection.focus_superseded_by_text)
+
+    def test_topic_projection_rejects_unresolved_image_as_semantic_topic(self):
+        event = _event(
+            "evt-image-pending",
+            actor_id="516779421",
+            actor_name="恸",
+            text="",
+            image_refs=("pic-1",),
+        )
+
+        projection = MessageRenderer.project_topic_preview(event)
+
+        self.assertEqual(projection.text, "")
+        self.assertEqual(projection.source, "image_placeholder")
+        self.assertFalse(projection.safe)
+        self.assertEqual(projection.rejected_reason, "unresolved_image_has_no_semantic_topic")
 
 
 if __name__ == "__main__":

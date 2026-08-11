@@ -462,6 +462,54 @@ class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_warm_context_omits_unresolved_image_placeholder(self):
+        async def run():
+            store = GroupDialogueStore()
+            await store.append_segment(
+                "chat-1",
+                event_id="image-pending",
+                speaker_id="u1",
+                speaker_name="Alice",
+                content="[图片]",
+                role="user",
+                message_kind="image",
+                is_at_bot=True,
+                has_direct_vision=True,
+                is_image_only=True,
+            )
+
+            bundle = await store.get_warm_context_bundle("chat-1")
+
+            self.assertEqual(bundle.summary_text, "")
+            self.assertEqual(bundle.quote_text, "")
+            self.assertEqual(bundle.topic_preview, "")
+
+        asyncio.run(run())
+
+    def test_warm_context_keeps_completed_visual_description(self):
+        async def run():
+            store = GroupDialogueStore()
+            await store.append_segment(
+                "chat-1",
+                event_id="image-complete",
+                speaker_id="u1",
+                speaker_name="Alice",
+                content="[图片转述：一张写着系统错误码的截图]",
+                role="user",
+                message_kind="image",
+                is_at_bot=True,
+                has_direct_vision=True,
+                is_image_only=True,
+            )
+
+            bundle = await store.get_warm_context_bundle("chat-1")
+
+            self.assertIn("系统错误码", bundle.quote_text)
+            self.assertIn("图片", bundle.quote_text)
+            self.assertIn("visual_context:", bundle.topic_preview)
+
+        asyncio.run(run())
+
     def test_compaction_times_out_provider_and_tries_next_candidate(self):
         class FakeContext:
             async def get_current_chat_provider_id(self, _chat_id):

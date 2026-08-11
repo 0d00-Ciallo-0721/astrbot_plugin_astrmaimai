@@ -249,6 +249,115 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(context["extracted_images"], ["reply.jpg"])
         self.assertFalse(context["is_private"])
 
+    def test_focus_thread_exposes_recent_same_sender_image_as_safe_tool_candidate(self):
+        image_event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "",
+            extras={"extracted_image_urls": ["https://private.example/image.jpg"]},
+            message_id="image-message-1",
+        )
+        image_event.timestamp = 100.0
+        focus_event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "中文区是什么猎奇区吗？",
+            message_id="text-message-1",
+        )
+        focus_event.timestamp = 120.0
+
+        normalized = self.gate._build_normalized_events(
+            [image_event, focus_event],
+            self_id="bot-1",
+        )
+        root_candidate, _ = self.gate._resolve_thread_root(normalized[1], normalized)
+        focus_thread = self.gate._build_focus_thread(
+            normalized[1],
+            root_candidate,
+            normalized,
+        )
+
+        self.assertEqual(len(focus_thread.recent_media_candidates), 1)
+        candidate = focus_thread.recent_media_candidates[0]
+        self.assertEqual(candidate.message_id, "image-message-1")
+        self.assertEqual(candidate.relation, "same_sender_recent")
+        safe_candidates = focus_event.get_extra("astrmai_recent_media_candidates")
+        self.assertEqual(safe_candidates[0]["message_id"], "image-message-1")
+        self.assertNotIn("url", safe_candidates[0])
+        self.assertNotIn("https://private.example/image.jpg", str(safe_candidates))
+        self.assertIn(
+            "image-message-1",
+            focus_event.get_extra("astrmai_bound_message_ids"),
+        )
+
+    def test_focus_thread_does_not_attach_other_sender_image_without_reference(self):
+        image_event = _FakeEvent(
+            "user-2",
+            "Bob",
+            "",
+            extras={"extracted_image_urls": ["opaque-image-reference"]},
+            message_id="image-message-2",
+        )
+        image_event.timestamp = 100.0
+        focus_event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "今天要吃什么？",
+            message_id="text-message-2",
+        )
+        focus_event.timestamp = 110.0
+
+        normalized = self.gate._build_normalized_events(
+            [image_event, focus_event],
+            self_id="bot-1",
+        )
+        root_candidate, _ = self.gate._resolve_thread_root(normalized[1], normalized)
+        focus_thread = self.gate._build_focus_thread(
+            normalized[1],
+            root_candidate,
+            normalized,
+        )
+
+        self.assertEqual(focus_thread.recent_media_candidates, [])
+        self.assertEqual(
+            focus_event.get_extra("astrmai_recent_media_candidates", []),
+            [],
+        )
+
+    def test_focus_thread_attaches_other_sender_image_on_explicit_reference(self):
+        image_event = _FakeEvent(
+            "user-2",
+            "Bob",
+            "",
+            extras={"extracted_image_urls": ["opaque-image-reference"]},
+            message_id="image-message-3",
+        )
+        image_event.timestamp = 100.0
+        focus_event = _FakeEvent(
+            "user-1",
+            "Alice",
+            "刚才那张图是什么？",
+            message_id="text-message-3",
+        )
+        focus_event.timestamp = 110.0
+
+        normalized = self.gate._build_normalized_events(
+            [image_event, focus_event],
+            self_id="bot-1",
+        )
+        root_candidate, _ = self.gate._resolve_thread_root(normalized[1], normalized)
+        focus_thread = self.gate._build_focus_thread(
+            normalized[1],
+            root_candidate,
+            normalized,
+        )
+
+        self.assertEqual(len(focus_thread.recent_media_candidates), 1)
+        self.assertEqual(
+            focus_thread.recent_media_candidates[0].relation,
+            "explicit_recent_reference",
+        )
+
 
     def test_is_direct_wakeup_event_handles_missing_sensors_without_losing_fast_paths(self):
         gate = self.gate_mod.AttentionGate(
@@ -1366,6 +1475,33 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertIs(traced[0][1], event)
         self.assertEqual(traced[0][2], "executed_topic_confirmation")
         self.assertEqual(traced[0][3], sent[0])
+
+    def test_private_topic_confirmation_direct_send_blocks_internal_event_envelope(self):
+        event = _FakePrivateEvent("user-1", "Alice", ".")
+        sent = []
+
+        async def send(result):
+            sent.append(result)
+
+        event.send = send
+        event.plain_result = lambda text: text
+        leaked = (
+            "我们之前在聊“[事件=1727617753 | 发言人=恸（ID:516779421） | "
+            "角色=成员 | 类型=image | 来源=original | 媒体=图片:1]”，还要继续吗？"
+        )
+
+        sent_ok = asyncio.run(self.gate._send_private_topic_confirmation(event, leaked))
+
+        self.assertTrue(sent_ok)
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("事件=", sent[0])
+        self.assertNotIn("516779421", sent[0])
+        self.assertTrue(event.get_extra("astrmai_topic_confirmation_safe_fallback"))
+        self.assertTrue(event.get_extra("astrmai_internal_context_leak_blocked"))
+        self.assertEqual(
+            event.get_extra("astrmai_topic_confirmation_guard_reason"),
+            "internal_event_envelope",
+        )
 
     def test_group_direct_image_waits_for_visual_context_before_fast_dispatch(self):
         class _GroupVisionBarrier:

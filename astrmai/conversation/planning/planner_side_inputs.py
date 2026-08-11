@@ -566,7 +566,11 @@ class PlannerSideInputMixin:
             QQGroupPresenceLookupTool(),
             QQRecentContactLookupTool(),
             QQMessageArtifactLookupTool(),
-            VisionMessageAnalyzeTool(db_service=self.context_engine.db),
+            VisionMessageAnalyzeTool(
+                db_service=self.context_engine.db,
+                visual_cortex=getattr(self, "visual_cortex", None),
+                image_resolver=getattr(self, "image_resolver", None),
+            ),
             CrossSessionReplyLookupTool(
                 db_service=self.context_engine.db,
                 history_service=getattr(self, "conversation_history_service", None),
@@ -635,7 +639,11 @@ class PlannerSideInputMixin:
                 QQGroupPresenceLookupTool(),
                 QQRecentContactLookupTool(),
                 QQMessageArtifactLookupTool(),
-                VisionMessageAnalyzeTool(db_service=self.context_engine.db),
+                VisionMessageAnalyzeTool(
+                    db_service=self.context_engine.db,
+                    visual_cortex=getattr(self, "visual_cortex", None),
+                    image_resolver=getattr(self, "image_resolver", None),
+                ),
                 CrossSessionReplyLookupTool(
                     db_service=self.context_engine.db,
                     history_service=getattr(self, "conversation_history_service", None),
@@ -1020,6 +1028,10 @@ class PlannerSideInputMixin:
             has_image = bool(
                 event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
                 or event.get_extra("extracted_image_refs", event.get_extra("extracted_image_urls", []))
+                or (
+                    self._conversation_flag("autonomous_vision_tool_enabled", True)
+                    and event.get_extra("astrmai_recent_media_candidates", [])
+                )
             ) or self._event_has_component_hint(event, ("image",))
             has_forward = self._event_has_component_hint(event, ("forward", "node"))
             has_reply = self._event_has_component_hint(event, ("reply",))

@@ -25,6 +25,7 @@ class CoreServices:
     judge: Any = None
     sensors: Any = None
     visual_cortex: Any = None
+    image_resolver: Any = None
 
 
 @dataclass(slots=True)
@@ -239,6 +240,10 @@ class PluginRuntimeContext:
     @property
     def visual_cortex(self) -> Any:
         return self.core.visual_cortex
+
+    @property
+    def image_resolver(self) -> Any:
+        return self.core.image_resolver
 
     @property
     def dialogue_store(self) -> Any:

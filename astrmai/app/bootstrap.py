@@ -133,7 +133,7 @@ class PluginBootstrap:
             db_service,
             state_engine,
         )
-        judge, sensors, visual_cortex = self._build_judge_sensor_vision_services(
+        judge, sensors, visual_cortex, image_resolver = self._build_judge_sensor_vision_services(
             runtime,
             gateway,
             state_engine,
@@ -153,6 +153,7 @@ class PluginBootstrap:
             judge=judge,
             sensors=sensors,
             visual_cortex=visual_cortex,
+            image_resolver=image_resolver,
         )
 
     def _build_persistence_services(self) -> tuple[PersistenceManager, DatabaseService]:
@@ -269,16 +270,27 @@ class PluginBootstrap:
         gateway: GlobalModelGateway,
         state_engine: StateEngine,
         db_service: DatabaseService,
-    ) -> tuple[Judge, PreFilters, VisualCortex | None]:
+    ) -> tuple[Judge, PreFilters, VisualCortex | None, NapCatImageResolver | None]:
         judge = Judge(gateway, state_engine)
         sensors = PreFilters(runtime.config)
         visual_cortex = None
+        vision_cache_dir = Path(
+            getattr(
+                db_service.persistence,
+                "cache_dir",
+                Path("data") / "plugin_data" / "astrmai" / "cache",
+            )
+        ) / "vision"
+        image_resolver = NapCatImageResolver(
+            vision_cache_dir,
+            config=runtime.config,
+        )
         if runtime.feature_flags.vision_enabled:
             try:
                 visual_asset_dir = (
                     Path(
                         getattr(
-                            runtime.persistence,
+                            db_service.persistence,
                             "cache_dir",
                             Path("data") / "plugin_data" / "astrmai" / "cache",
                         )
@@ -294,7 +306,7 @@ class PluginBootstrap:
             except Exception as exc:
                 self._record_optional_failure(runtime, "multimodal.visual_cortex", exc)
                 logger.warning(f"[AstrMai] VisualCortex init failed, vision disabled: {exc}", exc_info=True)
-        return judge, sensors, visual_cortex
+        return judge, sensors, visual_cortex, image_resolver
 
     def _build_work_mode(self, runtime: PluginRuntimeContext) -> WorkModeServices:
         enabled = runtime.feature_flags.work_mode_enabled
@@ -359,6 +371,7 @@ class PluginBootstrap:
             cross_session_handoff_store=runtime.cross_session_handoff_store,
             conversation_history_service=runtime.conversation_history_service,
             visual_cortex=runtime.visual_cortex,
+            image_resolver=runtime.image_resolver,
         )
         system2_runner = System2Runner(runtime)
         self._bind_learning_collaboration(runtime, evolution)
@@ -376,10 +389,9 @@ class PluginBootstrap:
     def _build_interaction_stack(self, runtime: PluginRuntimeContext) -> InteractionServices:
         frequency_controller = FrequencyController(config=runtime.config)
         private_chat_manager = PrivateChatManager(config=runtime.config)
-        vision_cache_dir = Path(getattr(runtime.persistence, "cache_dir", Path("data") / "plugin_data" / "astrmai" / "cache")) / "vision"
         private_turn_coordinator = PrivateTurnCoordinator(
             config=runtime.config,
-            image_resolver=NapCatImageResolver(vision_cache_dir, config=runtime.config),
+            image_resolver=runtime.image_resolver,
             visual_cortex=runtime.visual_cortex,
             persistence=runtime.persistence,
         )

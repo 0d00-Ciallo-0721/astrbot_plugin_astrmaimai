@@ -1265,6 +1265,10 @@ class GroupDialogueStore:
                 return list(drained)
 
     def _format_segment_line(self, segment: DialogueSegment, *, include_identity: bool = False) -> str:
+        semantic_visual = self._has_semantic_visual_context(segment)
+        content = self._normalize_message_text(segment.content)
+        if not semantic_visual and content in {"", "[图片]", "[表情包]", "图片", "表情包"}:
+            return ""
         speaker = segment.speaker_name or segment.speaker_id or ("Bot" if segment.is_bot else "User")
         if include_identity and segment.speaker_id and not segment.is_bot:
             speaker = f"{speaker}（QQ: {segment.speaker_id}）"
@@ -1277,9 +1281,9 @@ class GroupDialogueStore:
             prefix_bits.append(f"回复 {target}")
         if segment.is_at_bot:
             prefix_bits.append("@我")
-        if segment.message_kind == "image" or segment.is_image_only or segment.has_direct_vision:
+        if semantic_visual and (segment.message_kind == "image" or segment.is_image_only or segment.has_direct_vision):
             prefix_bits.append("图片")
-        if segment.message_kind == "mixed":
+        if semantic_visual and segment.message_kind == "mixed":
             prefix_bits.append("图文")
         prefix = f"({'，'.join(prefix_bits)}) " if prefix_bits else ""
         return f"{speaker} {prefix}: {segment.content}".replace("  ", " ").strip().replace(" :", ":")
@@ -1301,6 +1305,21 @@ class GroupDialogueStore:
     @classmethod
     def _standardized_length(cls, text: str) -> int:
         return len(cls._normalize_message_text(text))
+
+    @classmethod
+    def _has_semantic_visual_context(cls, segment: DialogueSegment) -> bool:
+        text = cls._normalize_message_text(segment.content)
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "[图片转述：",
+                "[表情包转述：",
+                "[图片：",
+                "[表情包：",
+            )
+        )
 
     @classmethod
     def _message_load(cls, text: str) -> float:
@@ -1332,7 +1351,7 @@ class GroupDialogueStore:
             score += 3.0
         if segment.role == "assistant" or segment.is_bot:
             score += 3.5
-        if segment.has_direct_vision or segment.is_image_only:
+        if cls._has_semantic_visual_context(segment):
             score += 2.0
         if segment.message_kind == "mixed":
             score += 1.0
@@ -1390,7 +1409,7 @@ class GroupDialogueStore:
         visual_segments = [
             segment
             for segment in recent
-            if segment.has_direct_vision or segment.is_image_only or segment.message_kind in {"image", "mixed"}
+            if self._has_semantic_visual_context(segment)
         ]
         latest_assistant = next((segment for segment in reversed(recent) if segment.role == "assistant" or segment.is_bot), None)
         question_segments = [segment for segment in reversed(recent) if self._is_question_like(segment.content)]
@@ -1534,7 +1553,7 @@ class GroupDialogueStore:
         visuals = sum(
             1
             for segment in segments
-            if segment.has_direct_vision or segment.is_image_only or segment.message_kind in {"image", "mixed"}
+            if self._has_semantic_visual_context(segment)
         )
         latest_speakers: list[str] = []
         for segment in reversed(segments):

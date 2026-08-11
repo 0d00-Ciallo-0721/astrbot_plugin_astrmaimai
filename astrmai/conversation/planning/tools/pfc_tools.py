@@ -19,6 +19,8 @@ from sqlmodel import select
 
 from ....infrastructure.persistence.orm_models import VisualAsset, VisualMessageBinding
 from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionHandoff
+from ....infrastructure.runtime.turn_call_ledger import record_vision_observation
+from ....multimodal.visual_cortex import VisionAnalysisCoolingDown
 from ....presentation.dto.message_scope import MessageScope
 from ...contracts.qq_action import PendingQQAction
 from ..tool_contracts import TOOL_CAPABILITIES, record_tool_lifecycle
@@ -312,6 +314,25 @@ def _payload_data(payload: Any) -> Any:
     if isinstance(payload, dict) and "data" in payload:
         return payload.get("data")
     return payload
+
+
+def _payload_sender_id(payload: Any) -> str:
+    data = _payload_data(payload)
+    if not isinstance(data, dict):
+        return ""
+    sender = data.get("sender")
+    if isinstance(sender, dict):
+        sender_id = str(sender.get("user_id") or sender.get("uin") or "").strip()
+        if sender_id:
+            return sender_id
+    return str(data.get("user_id") or data.get("sender_id") or "").strip()
+
+
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        return
 
 
 def _list_entries(payload: Any, *keys: str) -> list[dict[str, Any]]:
@@ -2077,7 +2098,9 @@ class QQForwardMessageLookupTool(FunctionTool[AstrAgentContext]):
 
 @dataclass
 class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
-    db_service: Any = None
+    db_service: Any = Field(default=None, exclude=True)
+    visual_cortex: Any = Field(default=None, exclude=True)
+    image_resolver: Any = Field(default=None, exclude=True)
     name: str = "vision_message_analyze_tool"
     description: str = (
         "查询当前/指定图片消息的视觉转述结果；如果已由 VisualCortex 分析，会返回图片描述、类型和情绪标签。"
@@ -2132,6 +2155,15 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
             desc = str(selected.get("description") or selected.get("summary") or selected.get("text") or "").strip()
             img_type = str(selected.get("type") or "image").strip()
             tags = selected.get("emotion_tags") or selected.get("tags") or []
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_called": True,
+                    "autonomous_inspection_status": "cache_hit",
+                    "autonomous_inspection_cache_hit": True,
+                    "vision_path": "tool",
+                },
+            )
             _record_tool_execution(event, self.name)
             return result_payload(
                 "success",
@@ -2146,6 +2178,14 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                 or getattr(message_obj, "id", "")
                 or ""
             ).strip()
+        binding_error = _message_id_binding_error(event, message_id)
+        if binding_error:
+            _record_tool_execution(event, self.name, status="failed")
+            return result_payload(
+                "invalid_message_id",
+                retryable=False,
+                reason=_truncate_text(binding_error, 240),
+            )
         if message_id and self.db_service is not None:
             try:
                 chat_id = str(
@@ -2176,6 +2216,16 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                             tags = parsed_tags
                     except (TypeError, ValueError):
                         tags = []
+                    record_vision_observation(
+                        event,
+                        {
+                            "autonomous_inspection_called": True,
+                            "autonomous_inspection_status": "cache_hit",
+                            "autonomous_inspection_cache_hit": True,
+                            "vision_path": "tool",
+                            "asset_ids": [str(asset.asset_id or "")],
+                        },
+                    )
                     _record_tool_execution(event, self.name)
                     return result_payload(
                         "success",
@@ -2187,14 +2237,6 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                 logger.debug(
                     f"[VisionMessageAnalyzeTool] visual asset lookup degraded: {exc}"
                 )
-        binding_error = _message_id_binding_error(event, message_id)
-        if binding_error:
-            _record_tool_execution(event, self.name, status="failed")
-            return result_payload(
-                "invalid_message_id",
-                retryable=False,
-                reason=_truncate_text(binding_error, 240),
-            )
         payload: Any = None
         api = getattr(getattr(event, "bot", None), "api", None)
         if message_id and api is not None:
@@ -2228,14 +2270,205 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                 retryable=False,
                 description="",
             )
-        image = candidates[min(image_index - 1, len(candidates) - 1)]
+        if image_index > len(candidates):
+            _record_tool_execution(event, self.name, status="failed")
+            return result_payload(
+                "no_image_index",
+                retryable=False,
+                image_count=len(candidates),
+                description="",
+            )
+        if self.visual_cortex is None or self.image_resolver is None:
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_called": True,
+                    "autonomous_inspection_status": "runtime_unavailable",
+                    "autonomous_inspection_fallback": "text_only",
+                    "vision_path": "tool",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed")
+            return result_payload(
+                "unavailable",
+                retryable=False,
+                description="",
+            )
+
+        started = time.monotonic()
+        record_vision_observation(
+            event,
+            {
+                "autonomous_inspection_called": True,
+                "autonomous_inspection_status": "resolving",
+                "autonomous_inspection_dependency": "image_required",
+                "vision_path": "tool",
+                "image_count": len(candidates),
+            },
+        )
+        try:
+            resolved = await self.image_resolver.resolve_message_payload(event, payload)
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_status": "resolve_failed",
+                    "autonomous_inspection_elapsed_ms": elapsed_ms,
+                    "autonomous_inspection_fallback": "text_only",
+                    "failure_stage": "resolve",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed", reason=type(exc).__name__)
+            return result_payload(
+                "resolve_failed",
+                retryable=True,
+                error_type=type(exc).__name__,
+                description="",
+            )
+        resolved_by_index = {int(item.index): item for item in resolved.images}
+        selected_image = resolved_by_index.get(image_index - 1)
+        if selected_image is None:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_status": "resolve_failed",
+                    "autonomous_inspection_elapsed_ms": elapsed_ms,
+                    "autonomous_inspection_fallback": "text_only",
+                    "resolved_count": len(resolved.images),
+                    "failed_count": len(resolved.failures),
+                    "failure_stage": "resolve",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed", reason="image_not_resolved")
+            return result_payload(
+                "resolve_failed",
+                retryable=True,
+                image_count=len(candidates),
+                resolved_count=len(resolved.images),
+                description="",
+            )
+
+        timing = getattr(getattr(self.visual_cortex, "config", None), "timing", None)
+        try:
+            timeout_sec = max(1.0, float(getattr(timing, "image_analysis_timeout_sec", 90.0) or 90.0))
+        except (TypeError, ValueError):
+            timeout_sec = 90.0
+        chat_id = str(
+            getattr(event, "unified_msg_origin", "")
+            or getattr(event, "session_id", "")
+            or "global"
+        )
+        analysis_task = asyncio.create_task(
+            self.visual_cortex.analyze_image_path(
+                f"tool:{message_id}:{image_index - 1}",
+                selected_image.local_path,
+                scope_id=chat_id,
+                timeout_override=timeout_sec,
+                binding_context={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "sender_id": _payload_sender_id(payload),
+                    "image_index": image_index - 1,
+                    "source_ref": selected_image.source_ref,
+                },
+            )
+        )
+        try:
+            analysis = await asyncio.wait_for(
+                asyncio.shield(analysis_task),
+                timeout=timeout_sec + 1.0,
+            )
+        except asyncio.TimeoutError:
+            analysis_task.add_done_callback(_consume_background_task_result)
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_status": "timeout",
+                    "autonomous_inspection_elapsed_ms": elapsed_ms,
+                    "autonomous_inspection_fallback": "text_only",
+                    "vision_timeout_ms": timeout_sec * 1000,
+                    "failure_stage": "analysis",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed", reason="vision_timeout")
+            return result_payload("timeout", retryable=True, description="")
+        except VisionAnalysisCoolingDown as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_status": "cooling_down",
+                    "autonomous_inspection_elapsed_ms": elapsed_ms,
+                    "autonomous_inspection_fallback": "text_only",
+                    "failure_stage": "analysis",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed", reason="vision_cooling_down")
+            return result_payload(
+                "cooling_down",
+                retryable=True,
+                retry_after_sec=round(exc.retry_after_sec, 1),
+                description="",
+            )
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_status": "analysis_failed",
+                    "autonomous_inspection_elapsed_ms": elapsed_ms,
+                    "autonomous_inspection_fallback": "text_only",
+                    "failure_stage": "analysis",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed", reason=type(exc).__name__)
+            return result_payload(
+                "analysis_failed",
+                retryable=True,
+                error_type=type(exc).__name__,
+                description="",
+            )
+
+        description = str((analysis or {}).get("description") or "").strip()
+        if not description:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            record_vision_observation(
+                event,
+                {
+                    "autonomous_inspection_status": "empty_result",
+                    "autonomous_inspection_elapsed_ms": elapsed_ms,
+                    "autonomous_inspection_fallback": "text_only",
+                    "failure_stage": "analysis",
+                },
+            )
+            _record_tool_execution(event, self.name, status="failed", reason="empty_result")
+            return result_payload("empty_result", retryable=True, description="")
+
+        elapsed_ms = (time.monotonic() - started) * 1000
+        record_vision_observation(
+            event,
+            {
+                "autonomous_inspection_status": "success",
+                "autonomous_inspection_elapsed_ms": elapsed_ms,
+                "autonomous_inspection_cache_hit": bool((analysis or {}).get("_cache_hit", False)),
+                "vision_call_status": "success",
+                "visual_memory_write_status": str((analysis or {}).get("_binding_status") or ""),
+                "visual_memory_id": str((analysis or {}).get("_visual_memory_id") or ""),
+                "asset_ids": [str((analysis or {}).get("_asset_id") or "")],
+                "resolved_count": len(resolved.images),
+                "analyzed_count": 1,
+            },
+        )
         _record_tool_execution(event, self.name)
         return result_payload(
-            "pending",
-            retryable=True,
-            type=str(image.get("type") or "image"),
-            image_index=image_index,
-            description="",
+            "success",
+            type=str((analysis or {}).get("type") or "image"),
+            tags=(analysis or {}).get("emotion_tags") or [],
+            description=_truncate_text(description, 600),
+            cache_hit=bool((analysis or {}).get("_cache_hit", False)),
         )
 
 

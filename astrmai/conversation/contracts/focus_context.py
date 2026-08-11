@@ -48,6 +48,28 @@ class VisionBundle:
         self.direct_image_urls = list(values or [])
 
 
+@dataclass(frozen=True, slots=True)
+class MediaCandidate:
+    message_id: str
+    event_id: str = ""
+    sender_id: str = ""
+    sender_name: str = ""
+    age_seconds: float = 0.0
+    relation: str = "recent"
+    image_count: int = 1
+
+    def as_safe_dict(self) -> dict[str, Any]:
+        return {
+            "message_id": self.message_id,
+            "event_id": self.event_id,
+            "sender_id": self.sender_id,
+            "sender_name": self.sender_name,
+            "age_seconds": round(max(0.0, float(self.age_seconds)), 1),
+            "relation": self.relation,
+            "image_count": max(1, int(self.image_count)),
+        }
+
+
 @dataclass
 class ReplyFreshnessBudget:
     state: FreshnessState = FreshnessState.FRESH
@@ -77,6 +99,7 @@ class FocusThreadContext:
     thread_signature: str = ""
     freshness_budget: ReplyFreshnessBudget = field(default_factory=ReplyFreshnessBudget)
     vision_bundle: VisionBundle = field(default_factory=VisionBundle)
+    recent_media_candidates: list[MediaCandidate] = field(default_factory=list)
 
     def all_thread_events(self) -> list[Any]:
         merged: list[Any] = []
@@ -95,6 +118,7 @@ class FocusThreadContext:
 
 __all__ = [
     "FocusThreadContext",
+    "MediaCandidate",
     "FreshnessState",
     "ReplyFreshnessBudget",
     "ReplyMode",

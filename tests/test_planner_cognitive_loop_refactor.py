@@ -1029,6 +1029,38 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         self.assertIn('"operation":"list"', guidance)
         self.assertIn('"arguments":{"mode":"list","target":""}', guidance)
 
+    def test_planner_discloses_recent_image_as_optional_not_mandatory_context(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="中文区是什么猎奇区吗？")
+        event.set_extra(
+            "astrmai_recent_media_candidates",
+            [
+                {
+                    "message_id": "image-message-1",
+                    "sender_id": "user-1",
+                    "sender_name": "Alice",
+                    "age_seconds": 12,
+                    "relation": "same_sender_recent",
+                    "image_count": 1,
+                }
+            ],
+        )
+        envelope = SimpleNamespace(guidance_lines=[])
+
+        planner._append_tool_guidance(
+            envelope,
+            [_NamedTool("vision_message_analyze_tool")],
+            event,
+        )
+
+        guidance = "\n".join(envelope.guidance_lines)
+        self.assertIn("只有当前问题的答案确实依赖图片内容时", guidance)
+        self.assertIn("当前文字本身足够回答，就忽略图片候选", guidance)
+        self.assertIn("vision_message_analyze_tool", guidance)
+        self.assertIn("image-message-1", guidance)
+        self.assertNotIn("http", guidance)
+        self.assertIn("禁止仅因候选图片尚未分析而说‘看不到图片’", guidance)
+
     def test_planner_injects_chat_tier_tool_guidance(self):
         decision = self.planner_mod.CognitiveDecision(
             action="reply",

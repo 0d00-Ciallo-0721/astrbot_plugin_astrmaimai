@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sqlalchemy import MetaData
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine
 
@@ -503,7 +504,7 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("emoji", result)
         self.assertIn("无奈", result)
 
-    def test_04bb_vision_message_pending_is_structured_and_does_not_leak_source(self):
+    def test_04bb_vision_message_unavailable_is_structured_and_does_not_leak_source(self):
         event = _FakeEvent(group_id="777")
         event.message_obj.message = [
             {
@@ -518,12 +519,74 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         result = asyncio.run(self.mod.VisionMessageAnalyzeTool().call(_wrap_event(event)))
         payload = json.loads(result)
 
-        self.assertEqual(payload["status"], "pending")
-        self.assertTrue(payload["retryable"])
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertFalse(payload["retryable"])
         self.assertNotIn("private-image-file", result)
         self.assertNotIn("private.example", result)
         self.assertNotIn("加载", result)
         self.assertNotIn("稍后", result)
+
+    def test_04bbb_vision_message_resolves_and_analyzes_bound_image(self):
+        event = _FakeEvent(group_id="777", message_id="msg-image")
+        event.message_obj.message = [
+            {"type": "image", "data": {"file": "opaque-image-reference"}}
+        ]
+
+        class _Resolver:
+            def __init__(self):
+                self.calls = []
+
+            async def resolve_message_payload(self, resolved_event, payload):
+                self.calls.append((resolved_event, payload))
+                return SimpleNamespace(
+                    images=[
+                        SimpleNamespace(
+                            index=0,
+                            local_path="C:/private/cache/image.jpg",
+                            source_ref="opaque-image-reference",
+                        )
+                    ],
+                    failures=[],
+                )
+
+        class _VisualCortex:
+            def __init__(self):
+                self.config = SimpleNamespace(
+                    timing=SimpleNamespace(image_analysis_timeout_sec=2.0)
+                )
+                self.calls = []
+
+            async def analyze_image_path(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return {
+                    "type": "emoji",
+                    "description": "一只猫正在挥手",
+                    "emotion_tags": ["开心"],
+                    "_cache_hit": False,
+                    "_asset_id": "asset-1",
+                    "_visual_memory_id": "memory-1",
+                    "_binding_status": "persisted",
+                }
+
+        resolver = _Resolver()
+        cortex = _VisualCortex()
+        result = asyncio.run(
+            self.mod.VisionMessageAnalyzeTool(
+                visual_cortex=cortex,
+                image_resolver=resolver,
+            ).call(_wrap_event(event), message_id="msg-image")
+        )
+        payload = json.loads(result)
+
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["type"], "emoji")
+        self.assertEqual(payload["description"], "一只猫正在挥手")
+        self.assertEqual(payload["tags"], ["开心"])
+        self.assertEqual(len(resolver.calls), 1)
+        self.assertEqual(cortex.calls[0][1]["binding_context"]["message_id"], "msg-image")
+        self.assertEqual(cortex.calls[0][1]["binding_context"]["image_index"], 0)
+        self.assertNotIn("private/cache", result)
+        self.assertNotIn("opaque-image-reference", result)
 
     def test_04bc_vision_message_reports_runtime_owner_without_duplicate_lookup(self):
         event = _FakeEvent(group_id="777")
@@ -569,7 +632,16 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        SQLModel.metadata.create_all(engine)
+        metadata = MetaData()
+        for source_table in (VisualAsset.__table__, VisualMessageBinding.__table__):
+            table = source_table.to_metadata(metadata)
+            seen_index_names = set()
+            for index in list(table.indexes):
+                if index.name in seen_index_names:
+                    table.indexes.discard(index)
+                    continue
+                seen_index_names.add(index.name)
+        metadata.create_all(engine)
         event = _FakeEvent(group_id="777", message_id="msg-stored")
         with Session(engine) as session:
             session.add(

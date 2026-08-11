@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Iterable
 
 from astrbot.api.event import AstrMessageEvent
@@ -9,10 +10,30 @@ from ..contracts.context_package import ContextBlock, ContextPackage, escape_unt
 from ..contracts.conversation_event import ConversationEvent
 
 
+@dataclass(frozen=True, slots=True)
+class TopicPreviewProjection:
+    text: str
+    source: str
+    message_kind: str
+    safe: bool
+    rejected_reason: str = ""
+    vision_state: str = ""
+    focus_superseded_by_text: bool = False
+
+
 class MessageRenderer:
     """Single entry point for converting conversation messages into prompt text."""
 
     LEGACY_MESSAGE_RE = re.compile(r'^<message\s+speaker="([^"]+)">(.*)</message>$', re.IGNORECASE | re.DOTALL)
+    VISION_DESCRIPTION_RE = re.compile(
+        r"\[(表情包|图片)转述\s*[：:]\s*(.*?)(?:，传达情绪\s*[：:].*?)?\]",
+        re.DOTALL,
+    )
+    INTERNAL_EVENT_RE = re.compile(
+        r"\[事件=.*?\|\s*发言人=.*?\|\s*角色=.*?\|\s*类型=.*?\|\s*来源=",
+        re.DOTALL,
+    )
+    MEDIA_PLACEHOLDERS = frozenset({"[图片]", "[表情包]", "图片", "表情包"})
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -85,6 +106,125 @@ class MessageRenderer:
             if isinstance(value, ConversationEvent):
                 return value
         return None
+
+    @classmethod
+    def _compact_topic_text(cls, text: str, max_chars: int) -> str:
+        normalized = " ".join(str(text or "").strip().split())
+        normalized = normalized.replace("[", "（").replace("]", "）")
+        return normalized[: max(1, int(max_chars or 1))].strip()
+
+    @classmethod
+    def _meaningful_visible_text(cls, text: str) -> str:
+        normalized = cls._normalize_text(text)
+        if not normalized or normalized in cls.MEDIA_PLACEHOLDERS:
+            return ""
+        if re.fullmatch(r"obj_len_\d+", normalized, re.IGNORECASE):
+            return ""
+        if cls.VISION_DESCRIPTION_RE.fullmatch(normalized):
+            return ""
+        if cls.INTERNAL_EVENT_RE.search(normalized):
+            return ""
+        return normalized
+
+    @classmethod
+    def project_topic_preview(
+        cls,
+        candidate: ConversationEvent | AstrMessageEvent,
+        *,
+        max_chars: int = 120,
+    ) -> TopicPreviewProjection:
+        """Project an internal message into a compact, user-safe topic label."""
+        canonical = cls._canonical_event(candidate)
+        getter = getattr(candidate, "get_extra", None)
+        visible_text = str(getattr(canonical, "visible_text", "") or "")
+        rich_text = str(getattr(canonical, "rich_text", "") or "")
+        message_kind = str(getattr(canonical, "message_kind", "") or "text")
+        has_image = bool(
+            getattr(canonical, "image_refs", ())
+            or getattr(canonical, "direct_image_refs", ())
+        )
+        vision_state = ""
+        records: list[dict] = []
+        if callable(getter):
+            visible_text = str(getattr(candidate, "message_str", "") or visible_text)
+            rich_text = str(getter("astrmai_rich_text", rich_text or visible_text) or "")
+            records = [
+                dict(item)
+                for item in list(getter("astrmai_vision_records", []) or [])
+                if isinstance(item, dict)
+            ]
+            has_image = bool(
+                has_image
+                or getter("extracted_image_refs", getter("extracted_image_urls", []))
+                or getter("direct_image_refs", getter("direct_vision_urls", []))
+            )
+            if bool(getter("astrmai_vision_barrier_failed", False)):
+                vision_state = "failed"
+            elif bool(getter("astrmai_vision_barrier_complete", False)):
+                vision_state = "complete"
+            elif has_image:
+                vision_state = "pending_or_unknown"
+
+        user_text = cls._meaningful_visible_text(visible_text)
+        if user_text:
+            return TopicPreviewProjection(
+                text=cls._compact_topic_text(user_text, max_chars),
+                source="user_text",
+                message_kind=message_kind,
+                safe=True,
+                vision_state=vision_state,
+                focus_superseded_by_text=has_image,
+            )
+
+        vision_type = ""
+        vision_description = ""
+        if records:
+            first = records[0]
+            vision_type = str(first.get("type", "") or "").strip().lower()
+            vision_description = str(first.get("description", "") or "").strip()
+        if not vision_description:
+            match = cls.VISION_DESCRIPTION_RE.search(rich_text)
+            if match:
+                vision_type = "emoji" if match.group(1) == "表情包" else "image"
+                vision_description = match.group(2).strip()
+        if vision_description:
+            label = "刚才那张表情包" if vision_type == "emoji" else "刚才发送的图片"
+            remaining = max(1, int(max_chars or 1) - len(label) - 1)
+            description = cls._compact_topic_text(vision_description, remaining)
+            return TopicPreviewProjection(
+                text=f"{label}：{description}" if description else label,
+                source="vision_description",
+                message_kind=message_kind,
+                safe=True,
+                vision_state=vision_state or "complete",
+            )
+
+        if has_image:
+            return TopicPreviewProjection(
+                text="",
+                source="image_placeholder",
+                message_kind=message_kind,
+                safe=False,
+                vision_state=vision_state or "pending_or_unknown",
+                rejected_reason="unresolved_image_has_no_semantic_topic",
+            )
+
+        fallback = cls._meaningful_visible_text(rich_text)
+        if fallback:
+            return TopicPreviewProjection(
+                text=cls._compact_topic_text(fallback, max_chars),
+                source="rich_text",
+                message_kind=message_kind,
+                safe=True,
+            )
+        return TopicPreviewProjection(
+            text="",
+            source="none",
+            message_kind=message_kind,
+            safe=False,
+            rejected_reason="no_safe_topic_text",
+            vision_state=vision_state,
+        )
 
     @classmethod
     def build_context_package(
@@ -200,4 +340,4 @@ class MessageRenderer:
         return f"[{normalized[:180]}]"
 
 
-__all__ = ["MessageRenderer"]
+__all__ = ["MessageRenderer", "TopicPreviewProjection"]

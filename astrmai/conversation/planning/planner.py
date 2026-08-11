@@ -18,6 +18,7 @@ from ...infrastructure.runtime.turn_call_ledger import (
     finalize_turn_telemetry,
     observe_stage,
     record_context_block_stats,
+    record_vision_observation,
     turn_telemetry_snapshot,
 )
 from ...infrastructure.runtime.trace_runtime import debug_trace, preview_text
@@ -30,6 +31,7 @@ from .conversation_continuity import ConversationContinuityStore
 from ..execution.executor import ConcurrentExecutor
 from .expression_policy import ActionModifier, ExpressionSelector
 from .goal_service import GoalManager
+from .message_renderer import MessageRenderer
 from .planning_input_loader import PlanningInputLoader
 from .planner_prompt_context import PlannerPromptContextMixin
 from .planner_side_inputs import PlannerSideInputMixin
@@ -61,6 +63,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         "proactive_like_action": "表达好感",
         "custom_face_catalog_query": "查自定义表情",
         "group_sign_action": "群签到",
+        "vision_message_analyze_tool": "按需查看图片内容",
     }
 
     def __init__(
@@ -79,6 +82,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         conversation_history_service=None,
         cognitive_loop=None,
         visual_cortex=None,
+        image_resolver=None,
     ):
         self.gateway = gateway
         self.config = gateway.config
@@ -93,6 +97,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.runtime_coordinator = runtime_coordinator
         self.cross_session_handoff_store = cross_session_handoff_store
         self.conversation_history_service = conversation_history_service
+        self.visual_cortex = visual_cortex
+        self.image_resolver = image_resolver
         self.agency_runtime = AgencyRuntimeStore()
         self.agency_reflection_bridge = AgencyReflectionBridge(memory_engine)
         self.conversation_continuity = ConversationContinuityStore()
@@ -162,6 +168,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             self.action_modifier,
             self.expression_selector,
             self.executor,
+            self.image_resolver,
         )
         for component in owned_components:
             if component is None:
@@ -510,6 +517,36 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             guidance_lines.append(
                 "如果当前工具不足以查证事实，可先调用 bot_capability_lookup(needed_package=...) 申请追加工具包，系统会带新工具重跑本轮再回答。"
             )
+        if event is not None and "vision_message_analyze_tool" in tool_names:
+            candidates = event.get_extra("astrmai_recent_media_candidates", []) or []
+            safe_candidates = [item for item in candidates if isinstance(item, dict)][:4]
+            if safe_candidates:
+                rendered = []
+                for item in safe_candidates:
+                    rendered.append(
+                        "message_id={message_id}, sender={sender}, age={age}s, relation={relation}".format(
+                            message_id=str(item.get("message_id") or "")[:80],
+                            sender=str(item.get("sender_name") or item.get("sender_id") or "未知")[:40],
+                            age=max(0, int(float(item.get("age_seconds") or 0))),
+                            relation=str(item.get("relation") or "recent")[:32],
+                        )
+                    )
+                guidance_lines.append(
+                    "系统发现可按需查看的近期图片候选："
+                    + "；".join(rendered)
+                    + "。只有当前问题的答案确实依赖图片内容时，才调用 vision_message_analyze_tool；"
+                    "如果当前文字本身足够回答，就忽略图片候选并直接回答。"
+                    "禁止仅因候选图片尚未分析而说‘看不到图片’、‘图片还在加载’或要求用户复述。"
+                    "工具失败时，只有图片内容不可替代才简短说明无法确认；否则继续回答文字部分。"
+                )
+                record_vision_observation(
+                    event,
+                    {
+                        "candidate_count": len(safe_candidates),
+                        "autonomous_inspection_enabled": True,
+                        "autonomous_inspection_disclosed": True,
+                    },
+                )
         if event is not None and hasattr(event, "get_extra"):
             required_tools = [
                 str(name or "").strip()
@@ -889,6 +926,37 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             memory_funnel = event.get_extra("astrmai_memory_funnel", {})
             if isinstance(memory_funnel, dict):
                 item["memory_funnel"] = dict(memory_funnel)
+            topic_observation = {
+                "preview_source": str(event.get_extra("astrmai_topic_preview_source", "") or ""),
+                "preview_kind": str(event.get_extra("astrmai_topic_preview_kind", "") or ""),
+                "preview_safe": bool(event.get_extra("astrmai_topic_preview_safe", False)),
+                "preview_committed": bool(
+                    event.get_extra("astrmai_topic_preview_committed", False)
+                ),
+                "preview_rejected_reason": str(
+                    event.get_extra("astrmai_topic_preview_rejected_reason", "") or ""
+                ),
+                "vision_state_at_commit": str(
+                    event.get_extra("astrmai_vision_state_at_topic_commit", "") or ""
+                ),
+                "focus_superseded_by_text": bool(
+                    event.get_extra("astrmai_focus_superseded_by_text", False)
+                ),
+                "confirmation_trigger": str(
+                    event.get_extra("astrmai_topic_confirmation_trigger", "") or ""
+                ),
+                "confirmation_safe_fallback": bool(
+                    event.get_extra("astrmai_topic_confirmation_safe_fallback", False)
+                ),
+                "confirmation_guard_reason": str(
+                    event.get_extra("astrmai_topic_confirmation_guard_reason", "") or ""
+                ),
+                "internal_context_leak_blocked": bool(
+                    event.get_extra("astrmai_internal_context_leak_blocked", False)
+                ),
+            }
+            if any(value not in ("", False, None) for value in topic_observation.values()):
+                item["topic_observation"] = topic_observation
         item["decision_observation"] = {
             "status": str(status or ""),
             "skip_reason": (
@@ -1180,7 +1248,32 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         event: AstrMessageEvent | None = None,
     ) -> None:
         focus_preview = ""
-        if prompt_envelope is not None:
+        topic_preview_updates_continuity = True
+        if event is not None:
+            projection = MessageRenderer.project_topic_preview(event, max_chars=120)
+            focus_preview = projection.text if projection.safe else ""
+            topic_preview_updates_continuity = bool(
+                projection.safe
+                and not (
+                    projection.source == "image_placeholder"
+                    and projection.vision_state in {"failed", "pending_or_unknown"}
+                )
+            )
+            event.set_extra("astrmai_topic_preview", focus_preview)
+            event.set_extra("astrmai_topic_preview_source", projection.source)
+            event.set_extra("astrmai_topic_preview_kind", projection.message_kind)
+            event.set_extra("astrmai_topic_preview_safe", projection.safe)
+            event.set_extra(
+                "astrmai_topic_preview_committed",
+                topic_preview_updates_continuity,
+            )
+            event.set_extra("astrmai_topic_preview_rejected_reason", projection.rejected_reason)
+            event.set_extra("astrmai_vision_state_at_topic_commit", projection.vision_state)
+            event.set_extra(
+                "astrmai_focus_superseded_by_text",
+                projection.focus_superseded_by_text,
+            )
+        elif prompt_envelope is not None:
             focus_preview = str(
                 getattr(prompt_envelope, "focus_message_text", "")
                 or getattr(prompt_envelope, "raw_user_text", "")
@@ -1218,6 +1311,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             reply_need=reply_need,
             lightweight_event=(
                 is_lightweight_event
+                or not topic_preview_updates_continuity
                 or bool(
                     event is not None
                     and event.get_extra("astrmai_media_status_nonsemantic", False)

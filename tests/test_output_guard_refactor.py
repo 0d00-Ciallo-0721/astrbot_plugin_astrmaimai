@@ -64,6 +64,22 @@ class OutputGuardRefactorTests(unittest.TestCase):
         self.assertEqual(safe_text, "")
         self.assertEqual(failure_kind, "tool_protocol_text")
 
+    def test_validate_visible_output_text_blocks_internal_event_envelope(self):
+        leaked = (
+            "我们之前在聊“[事件=1727617753 | 发言人=恸（ID:516779421） | "
+            "角色=成员 | 类型=image | 来源=original | 媒体=图片:1] "
+            "内容：[表情包转述：一个金发双马尾女孩]”，还要继续吗？"
+        )
+
+        safe_text, failure_kind = self.guard_mod.validate_visible_output_text(leaked)
+
+        self.assertEqual(safe_text, "")
+        self.assertEqual(failure_kind, "internal_event_envelope")
+        self.assertEqual(
+            self.guard_mod.sanitize_visible_reply_text(leaked, fallback_text="要继续刚才的话题吗？"),
+            "要继续刚才的话题吗？",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

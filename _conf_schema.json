@@ -367,6 +367,28 @@
         "default": true,
         "hint": "开启后，机器人可以结合语境、情绪、关系和冷却状态，自主使用表情包、消息表情、互动语气或戳一戳等工具丰富聊天；关闭后仍会响应用户明确提出的工具要求。"
       },
+      "autonomous_vision_tool_enabled": {
+        "description": "允许机器人按需主动看图",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，模型只在当前问题确实依赖图片内容时主动调用视觉工具；普通文字问题不会因为附近有未识别图片而被图片带偏。"
+      },
+      "recent_image_candidate_window_sec": {
+        "description": "近期图片候选时间窗口（秒）",
+        "type": "int",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 300,
+        "hint": "只在这个时间窗口内关联同一发送者的近期图片；明确说“这张图”时也可关联窗口内其他人的图片。"
+      },
+      "recent_image_candidate_max_count": {
+        "description": "单轮近期图片候选上限",
+        "type": "int",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 4,
+        "hint": "限制一次回复可考虑的近期图片数量。只披露消息编号、发送者和时间等安全元数据，不把图片路径或地址写入提示词。"
+      },
       "tool_progressive_disclosure_enabled": {
         "description": "启用工具渐进式披露",
         "type": "bool",

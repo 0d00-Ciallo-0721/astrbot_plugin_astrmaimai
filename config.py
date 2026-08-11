@@ -391,6 +391,22 @@ class ConversationConfig(BaseModel):
     qq_explicit_intent_override_enabled: bool = Field(default=True, repr=False)
     explicit_tool_execution_enabled: bool = Field(default=True, repr=False)
     autonomous_chat_tools_enabled: bool = Field(default=True, repr=False)
+    autonomous_vision_tool_enabled: bool = Field(
+        default=True,
+        description="允许模型在当前语义确实依赖图片时主动调用视觉工具",
+    )
+    recent_image_candidate_window_sec: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="普通群聊可供模型按需查看的近期图片时间窗口（秒）",
+    )
+    recent_image_candidate_max_count: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="单轮最多向模型披露多少个近期图片候选",
+    )
     tool_progressive_disclosure_enabled: bool = Field(default=True, repr=False)
     tool_disclosure_max_tools_chat: int = Field(default=8, ge=1, repr=False)
     tool_disclosure_max_tools_task: int = Field(default=16, ge=1, repr=False)

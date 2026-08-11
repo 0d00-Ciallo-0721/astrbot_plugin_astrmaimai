@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Optional
 
-from ..contracts.focus_context import FocusThreadContext, FreshnessState, ReplyFreshnessBudget, ReplyMode, VisionBundle
+from ..contracts.focus_context import FocusThreadContext, FreshnessState, MediaCandidate, ReplyFreshnessBudget, ReplyMode, VisionBundle
 from .turn_target_resolver import resolve_legacy_turn_target, resolve_turn_target
 from ..runtime.architecture_rollout import (
     ArchitectureTimer,
@@ -139,6 +140,81 @@ def _build_thread_signature(focus_candidate, root_candidate, reply_mode: ReplyMo
     return basis
 
 
+_EXPLICIT_IMAGE_REFERENCE_RE = re.compile(
+    r"(?:这|那|刚才|上面|前面|上一)[^\n]{0,5}(?:张|个)?(?:图|图片|表情包)|"
+    r"(?:图|图片|表情包)(?:里|中|上|呢|是什么|怎么)|看(?:看|清|一下)?(?:这|那|刚才|上面)?(?:张|个)?(?:图|图片|表情包)"
+)
+
+
+def _event_message_id(event) -> str:
+    message_obj = getattr(event, "message_obj", None)
+    return str(
+        getattr(message_obj, "message_id", "")
+        or getattr(message_obj, "id", "")
+        or ""
+    ).strip()
+
+
+def _collect_recent_media_candidates(
+    gate,
+    focus_candidate,
+    root_candidate,
+    normalized_events,
+) -> list[MediaCandidate]:
+    conversation = getattr(getattr(gate, "config", None), "conversation", None)
+    if not bool(getattr(conversation, "autonomous_vision_tool_enabled", True)):
+        return []
+    window_sec = max(
+        5.0,
+        float(getattr(conversation, "recent_image_candidate_window_sec", 30.0) or 30.0),
+    )
+    max_count = max(
+        1,
+        min(4, int(getattr(conversation, "recent_image_candidate_max_count", 2) or 2)),
+    )
+    focus_text = str(focus_candidate.rich_text or focus_candidate.text or "")
+    explicitly_references_image = bool(_EXPLICIT_IMAGE_REFERENCE_RE.search(focus_text))
+    focus_ts = float(focus_candidate.timestamp or 0.0)
+    collected: list[MediaCandidate] = []
+    seen_ids: set[str] = set()
+
+    for candidate in reversed(normalized_events):
+        if not candidate.image_urls or candidate.index > focus_candidate.index:
+            continue
+        message_id = _event_message_id(candidate.event)
+        if not message_id or message_id in seen_ids:
+            continue
+        age = max(0.0, focus_ts - float(candidate.timestamp or focus_ts))
+        relation = ""
+        if candidate.event is focus_candidate.event:
+            relation = "current"
+        elif root_candidate is not None and candidate.event is root_candidate.event:
+            relation = "reply_target"
+        elif age <= window_sec and candidate.sender_id == focus_candidate.sender_id:
+            relation = "same_sender_recent"
+        elif age <= window_sec and explicitly_references_image:
+            relation = "explicit_recent_reference"
+        if not relation:
+            continue
+        canonical = getattr(candidate, "canonical_event", None)
+        collected.append(
+            MediaCandidate(
+                message_id=message_id,
+                event_id=str(getattr(canonical, "event_id", "") or ""),
+                sender_id=str(candidate.sender_id or ""),
+                sender_name=str(candidate.sender_name or ""),
+                age_seconds=age,
+                relation=relation,
+                image_count=max(1, len(candidate.image_urls)),
+            )
+        )
+        seen_ids.add(message_id)
+        if len(collected) >= max_count:
+            break
+    collected.reverse()
+    return collected
+
+
 def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events):
     core_events: list = []
     related_events: list = []
@@ -219,6 +295,21 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
     )
     compatibility_sender_id = turn_target.target_actor_id or focus_candidate.sender_id
     compatibility_sender_name = turn_target.target_actor_name or focus_candidate.sender_name
+    recent_media_candidates = _collect_recent_media_candidates(
+        gate,
+        focus_candidate,
+        root_candidate,
+        normalized_events,
+    )
+    if recent_media_candidates:
+        safe_candidates = [candidate.as_safe_dict() for candidate in recent_media_candidates]
+        focus_event.set_extra("astrmai_recent_media_candidates", safe_candidates)
+        existing_bound = focus_event.get_extra("astrmai_bound_message_ids", []) or []
+        bound_ids = [str(item or "").strip() for item in existing_bound if str(item or "").strip()]
+        for candidate in recent_media_candidates:
+            if candidate.message_id not in bound_ids:
+                bound_ids.append(candidate.message_id)
+        focus_event.set_extra("astrmai_bound_message_ids", bound_ids)
 
     if not thread_enabled:
         for candidate in normalized_events:
@@ -249,6 +340,7 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
                 is_image_only=focus_candidate.is_image_only,
                 source="focus_thread",
             ),
+            recent_media_candidates=recent_media_candidates,
         )
 
     scored_candidates = []
@@ -299,6 +391,7 @@ def build_focus_thread(gate, focus_candidate, root_candidate, normalized_events)
             is_image_only=focus_candidate.is_image_only,
             source="focus_thread",
         ),
+        recent_media_candidates=recent_media_candidates,
     )
 
 

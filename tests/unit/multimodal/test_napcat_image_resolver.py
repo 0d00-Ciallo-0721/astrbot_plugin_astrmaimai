@@ -77,6 +77,34 @@ class NapCatImageResolverTests(unittest.TestCase):
             self.assertEqual(len(result.images), 1)
             self.assertEqual(api.calls, [])
 
+    def test_historical_message_payload_resolves_nested_local_image(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "historical.png"
+            source.write_bytes(b"image-bytes")
+            api = _Api({})
+            event = _Event({"type": "text", "data": {"text": "current"}}, api)
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(
+                resolver.resolve_message_payload(
+                    event,
+                    {
+                        "data": {
+                            "message": [
+                                {"type": "image", "data": {"path": str(source)}}
+                            ]
+                        }
+                    },
+                )
+            )
+
+            self.assertTrue(result.had_images)
+            self.assertEqual(len(result.images), 1)
+            self.assertEqual(result.images[0].index, 0)
+            self.assertEqual(api.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

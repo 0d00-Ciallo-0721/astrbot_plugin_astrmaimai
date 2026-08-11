@@ -52,6 +52,11 @@ class ConversationContinuityStore:
     SOFT_DECAY_SECONDS = 10 * 60
     TOPIC_SIMILARITY_THRESHOLD = 0.28
     WEAK_TOPIC_SIMILARITY_THRESHOLD = 0.45
+    INTERNAL_TOPIC_ENVELOPE_RE = re.compile(
+        r"\[事件=.*?\|\s*发言人=.*?\|\s*角色=.*?\|\s*类型=.*?\|\s*来源=",
+        re.DOTALL,
+    )
+    NONSEMANTIC_TOPIC_RE = re.compile(r"^[\W_]+$", re.UNICODE)
 
     def __init__(self):
         self._states: dict[str, ConversationContinuityState] = {}
@@ -175,9 +180,25 @@ class ConversationContinuityStore:
         return " ".join(str(text or "").strip().split())
 
     @classmethod
+    def _sanitize_topic_preview(cls, text: str) -> str:
+        normalized = cls._topic_message_text(text)
+        if not normalized or cls.INTERNAL_TOPIC_ENVELOPE_RE.search(normalized):
+            return ""
+        return normalized
+
+    @classmethod
+    def _is_nonsemantic_short_input(cls, text: str) -> bool:
+        normalized = cls._topic_message_text(text)
+        if not normalized:
+            return True
+        if normalized in {"[图片]", "[表情包]", "图片", "表情包"}:
+            return True
+        return bool(cls.NONSEMANTIC_TOPIC_RE.fullmatch(normalized))
+
+    @classmethod
     def _is_short_topic_followup(cls, text: str) -> bool:
         normalized = cls._normalize_topic_text(text)
-        if not normalized:
+        if not normalized or cls._is_nonsemantic_short_input(text):
             return False
         if len(normalized) <= 4:
             return True
@@ -201,6 +222,28 @@ class ConversationContinuityStore:
                 "why",
                 "what about",
                 "then",
+            )
+        )
+
+    @classmethod
+    def _has_explicit_topic_reference(cls, text: str) -> bool:
+        normalized = cls._normalize_topic_text(text)
+        if not normalized or cls._is_nonsemantic_short_input(text):
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "上面",
+                "刚才",
+                "前面",
+                "那个",
+                "这件事",
+                "继续",
+                "接着",
+                "然后",
+                "后来",
+                "还记得",
+                "之前",
             )
         )
 
@@ -463,6 +506,8 @@ class ConversationContinuityStore:
             elif self._is_confirmation_no(current_text) or self._is_explicit_topic_switch(current_text):
                 state.topic_confirmation_requested_at = 0.0
                 return base
+            elif self._is_nonsemantic_short_input(current_text):
+                return base
             else:
                 base.update(
                     action="confirm",
@@ -486,15 +531,15 @@ class ConversationContinuityStore:
             if age_seconds <= self._topic_active_ttl_seconds
             else self.WEAK_TOPIC_SIMILARITY_THRESHOLD,
         )
-        followup_like = self._is_short_topic_followup(current_text) or any(
-            marker in self._normalize_topic_text(current_text)
-            for marker in ("上面", "刚才", "前面", "那个", "这件事", "还")
+        followup_like = self._is_short_topic_followup(current_text) or self._has_explicit_topic_reference(
+            current_text
         )
+        stale_followup_like = same_topic or self._has_explicit_topic_reference(current_text)
 
         if (
             age_seconds > self._topic_confirm_after_seconds
             and not explicit_switch
-            and (same_topic or followup_like)
+            and stale_followup_like
         ):
             state.topic_confirmation_requested_at = now
             return {
@@ -652,10 +697,13 @@ class ConversationContinuityStore:
         now = time.time() if now is None else now
         state = self._state(chat_id)
         self.recent(chat_id, now=now)
+        raw_focus_preview = str(focus_preview or "")
+        safe_focus_preview = self._sanitize_topic_preview(raw_focus_preview)
+        rejected_internal_focus = bool(raw_focus_preview.strip() and not safe_focus_preview)
         item = ConversationTurnRecord(
             timestamp=now,
             chat_id=chat_id,
-            focus_preview=str(focus_preview or "")[:160],
+            focus_preview=safe_focus_preview[:160],
             goal_summary=str(goal_summary or "")[:220],
             social_intent=str(social_intent or ""),
             action_tier=str(action_tier or ""),
@@ -670,7 +718,7 @@ class ConversationContinuityStore:
         # 不应推进对话主题/目标状态机。仅记录轮次，不更新 state.current_topic、
         # state.current_goal、state.goal_status、continuity_weight 等。
         # 此行为是有意设计，非 bug（参见 TECHNICAL-DEBT-INVENTORY D22）。
-        if lightweight_event or item.reply_need in {"wait", "ignore"}:
+        if lightweight_event or rejected_internal_focus or item.reply_need in {"wait", "ignore"}:
             state.turns = [*self.recent(chat_id, now=now), item][-self.MAX_TURNS_PER_CHAT :]
             return item
 
