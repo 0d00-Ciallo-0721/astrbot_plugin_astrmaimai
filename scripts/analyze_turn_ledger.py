@@ -36,6 +36,47 @@ def _safe_list(value: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in list(value or []) if isinstance(item, dict)]
 
 
+def _is_nonempty(value: Any) -> bool:
+    if value in (None, "", False):
+        return False
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _has_sent_reply(trace: dict[str, Any]) -> bool:
+    status = str(trace.get("status", "") or "")
+    if status in {"executed", "executed_topic_confirmation", "replied", "completed"}:
+        return True
+    reply_stats = _safe_dict(trace.get("reply_stats"))
+    return any(
+        int(_number(reply_stats.get(key))) > 0
+        for key in ("actual_send_count", "message_count", "sent_segments", "sent_segment_count")
+    )
+
+
+def _merge_trace_snapshots(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    merged = {**previous, **current}
+    for key in (
+        "vision_observation",
+        "memory_funnel",
+        "tool_ledger_summary",
+        "reply_stats",
+        "context_block_stats",
+        "stage_ledger",
+        "llm_call_ledger",
+    ):
+        if _is_nonempty(previous.get(key)) and not _is_nonempty(current.get(key)):
+            merged[key] = previous[key]
+    if _has_sent_reply(previous) and not _has_sent_reply(current):
+        merged["latest_snapshot_status"] = str(current.get("status", "") or "")
+        merged["status"] = str(previous.get("status") or "executed")
+        merged["turn_final_status"] = merged["status"]
+    else:
+        merged["turn_final_status"] = str(merged.get("status", "") or "")
+    return merged
+
+
 def load_traces(
     path: str | Path,
     *,
@@ -73,7 +114,7 @@ def load_traces(
         source = []
 
     filtered: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    index_by_key: dict[str, int] = {}
     for index, trace in enumerate(source):
         if instrumentation_version and str(trace.get("instrumentation_version", "")) != instrumentation_version:
             continue
@@ -90,9 +131,11 @@ def load_traces(
                     str(index),
                 ]
             )
-        if stable_key in seen:
+        if stable_key in index_by_key:
+            existing_index = index_by_key[stable_key]
+            filtered[existing_index] = _merge_trace_snapshots(filtered[existing_index], trace)
             continue
-        seen.add(stable_key)
+        index_by_key[stable_key] = len(filtered)
         filtered.append(trace)
     filtered.sort(key=lambda item: _number(item.get("created_at") or item.get("started_at")))
     return filtered
@@ -146,6 +189,16 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     tool_contract_unsatisfied_count = 0
     tool_correction_pass_count = 0
     missing = Counter()
+    vision_trace_count = 0
+    vision_status_counts: Counter[str] = Counter()
+    vision_path_counts: Counter[str] = Counter()
+    vision_call_status_counts: Counter[str] = Counter()
+    vision_fallback_counts: Counter[str] = Counter()
+    vision_image_count = 0
+    vision_analyzed_count = 0
+    vision_failed_count = 0
+    vision_timeout_count = 0
+    vision_wait_ms: list[float] = []
 
     for trace in items:
         status = str(trace.get("status", "unknown") or "unknown")
@@ -256,6 +309,36 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             memory_rendered_chars += int(_number(memory.get("rendered_chars")))
         else:
             missing["memory_funnel"] += 1
+
+        vision = _safe_dict(trace.get("vision_observation"))
+        if vision:
+            vision_trace_count += 1
+            path = str(vision.get("vision_path") or trace.get("vision_path") or "").strip()
+            status_name = str(
+                vision.get("final_status")
+                or vision.get("vision_call_status")
+                or vision.get("vision_barrier_status")
+                or "observed"
+            ).strip()
+            call_status = str(vision.get("vision_call_status") or "").strip()
+            fallback = str(vision.get("vision_fallback") or vision.get("fallback_reason") or "").strip()
+            if path:
+                vision_path_counts[path] += 1
+            if status_name:
+                vision_status_counts[status_name] += 1
+            if call_status:
+                vision_call_status_counts[call_status] += 1
+            if fallback:
+                vision_fallback_counts[fallback] += 1
+            vision_image_count += int(_number(vision.get("image_count")))
+            vision_analyzed_count += int(_number(vision.get("analyzed_count")))
+            vision_failed_count += int(_number(vision.get("failed_count")))
+            vision_timeout_count += int(_number(vision.get("timeout_count")))
+            wait = vision.get("vision_wait_ms")
+            if wait is not None:
+                vision_wait_ms.append(_number(wait))
+        else:
+            missing["vision_observation"] += 1
 
         tools = trace.get("tools")
         if isinstance(tools, dict):
@@ -411,6 +494,19 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "rendered_chars": memory_rendered_chars,
             "selection_rate": round(memory_selected / memory_candidates, 4) if memory_candidates else 0.0,
         },
+        "vision": {
+            "trace_count": vision_trace_count,
+            "status_counts": dict(vision_status_counts.most_common()),
+            "path_counts": dict(vision_path_counts.most_common()),
+            "call_status_counts": dict(vision_call_status_counts.most_common()),
+            "fallback_counts": dict(vision_fallback_counts.most_common()),
+            "image_count": vision_image_count,
+            "analyzed_count": vision_analyzed_count,
+            "failed_count": vision_failed_count,
+            "timeout_count": vision_timeout_count,
+            "wait_ms_p50": _percentile(vision_wait_ms, 0.50),
+            "wait_ms_p95": _percentile(vision_wait_ms, 0.95),
+        },
         "tools": {
             "trace_present_count": tool_trace_present_count,
             "ledger_summary_present_count": tool_summary_present_count,
@@ -442,6 +538,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     budget = _safe_dict(report.get("budget"))
     rewrite = _safe_dict(report.get("query_rewrite"))
     tools = _safe_dict(report.get("tools"))
+    vision = _safe_dict(report.get("vision"))
     lines = [
         "# AstrMai Turn Ledger Analysis",
         "",
@@ -479,6 +576,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- `{key}`: {value}")
     else:
         lines.append("- No observed rewrite traces")
+    lines.extend(["", "## Vision"])
+    lines.append(f"- Vision traces: {int(vision.get('trace_count', 0) or 0)}")
+    lines.append(
+        f"- Images analyzed/failed/timeout: {int(vision.get('analyzed_count', 0) or 0)} / "
+        f"{int(vision.get('failed_count', 0) or 0)} / {int(vision.get('timeout_count', 0) or 0)}"
+    )
+    lines.append(f"- Vision wait P50/P95 ms: {vision.get('wait_ms_p50', 0)} / {vision.get('wait_ms_p95', 0)}")
+    for key, value in _safe_dict(vision.get("path_counts")).items():
+        lines.append(f"- `path:{key}`: {value}")
+    for key, value in _safe_dict(vision.get("call_status_counts")).items():
+        lines.append(f"- `call:{key}`: {value}")
+    for key, value in _safe_dict(vision.get("fallback_counts")).items():
+        lines.append(f"- `fallback:{key}`: {value}")
     lines.extend(["", "## Tool Disclosure"])
     lines.append(f"- Tool trace present: {int(tools.get('trace_present_count', 0) or 0)}")
     lines.append(f"- Tool ledger summary present: {int(tools.get('ledger_summary_present_count', 0) or 0)}")

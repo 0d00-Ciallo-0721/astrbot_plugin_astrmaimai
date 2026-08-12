@@ -132,6 +132,17 @@ class TurnTraceSampleStore:
     @classmethod
     def _merge_turn_snapshots(cls, previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
         merged = {**previous, **current}
+        for key in (
+            "vision_observation",
+            "memory_funnel",
+            "tool_ledger_summary",
+            "reply_stats",
+            "context_block_stats",
+            "stage_ledger",
+            "llm_call_ledger",
+        ):
+            if cls._is_nonempty(previous.get(key)) and not cls._is_nonempty(current.get(key)):
+                merged[key] = previous[key]
         latest_status = str(current.get("status", "") or "")
         if cls._has_sent_reply(previous) and not cls._has_sent_reply(current):
             merged["latest_snapshot_status"] = latest_status
@@ -142,6 +153,14 @@ class TurnTraceSampleStore:
             return merged
         merged["turn_final_status"] = str(merged.get("status", "") or "")
         return merged
+
+    @staticmethod
+    def _is_nonempty(value: Any) -> bool:
+        if value in (None, "", False):
+            return False
+        if isinstance(value, (dict, list, tuple, set)):
+            return bool(value)
+        return True
 
     @classmethod
     def _dedupe_by_turn(cls, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:

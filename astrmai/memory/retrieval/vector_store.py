@@ -92,18 +92,37 @@ class VectorRetriever:
         status: str,
         started_at: float,
         timeout_sec: float,
+        configured_timeout_sec: float | None = None,
         result_count: int = 0,
         error_type: str = "",
+        requested_k: int = 0,
+        fetch_k: int = 0,
+        metadata_filter_count: int = 0,
     ) -> None:
         if observation is None:
             return
         cooldown_remaining = max(0.0, self._unavailable_until - time.monotonic())
+        configured_timeout = float(
+            configured_timeout_sec if configured_timeout_sec is not None else timeout_sec or 0.0
+        )
+        effective_timeout = float(timeout_sec or 0.0)
         observation.clear()
         observation.update(
             {
                 "status": str(status or "unknown"),
                 "elapsed_ms": round(max(0.0, time.monotonic() - started_at) * 1000.0, 1),
-                "timeout_sec": round(max(0.0, float(timeout_sec or 0.0)), 3),
+                "timeout_sec": round(max(0.0, effective_timeout), 3),
+                "configured_timeout_sec": round(max(0.0, configured_timeout), 3),
+                "effective_timeout_sec": round(max(0.0, effective_timeout), 3),
+                "timeout_budget_clamped": bool(effective_timeout + 0.001 < configured_timeout),
+                "failure_threshold": max(1, int(self._failure_threshold() or 1)),
+                "cooldown_sec": round(
+                    max(5.0, self._timing_value("faiss_circuit_breaker_cooldown_sec", 180.0)),
+                    3,
+                ),
+                "requested_k": max(0, int(requested_k or 0)),
+                "fetch_k": max(0, int(fetch_k or 0)),
+                "metadata_filter_count": max(0, int(metadata_filter_count or 0)),
                 "result_count": max(0, int(result_count or 0)),
                 "failure_count": max(0, int(self._failure_count or 0)),
                 "circuit_open": bool(self._circuit_open()),
@@ -135,6 +154,8 @@ class VectorRetriever:
                 status="empty_query",
                 started_at=started_at,
                 timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
+                requested_k=k,
             )
             return []
         if self._circuit_open():
@@ -144,6 +165,8 @@ class VectorRetriever:
                 status="circuit_open",
                 started_at=started_at,
                 timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
+                requested_k=k,
             )
             return []
             
@@ -159,6 +182,7 @@ class VectorRetriever:
             metadata_filters["persona_id"] = persona_id
 
         fetch_k = k * 2 if metadata_filters else k
+        metadata_filter_count = len(metadata_filters)
 
         # 执行原生检索
         try:
@@ -181,7 +205,11 @@ class VectorRetriever:
                 status="timeout",
                 started_at=started_at,
                 timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
                 error_type="TimeoutError",
+                requested_k=k,
+                fetch_k=fetch_k,
+                metadata_filter_count=metadata_filter_count,
             )
             return []
         except Exception as e:
@@ -192,7 +220,11 @@ class VectorRetriever:
                 status="error",
                 started_at=started_at,
                 timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
                 error_type=type(e).__name__,
+                requested_k=k,
+                fetch_k=fetch_k,
+                metadata_filter_count=metadata_filter_count,
             )
             return []
 
@@ -217,6 +249,10 @@ class VectorRetriever:
             status="success",
             started_at=started_at,
             timeout_sec=timeout_sec,
+            configured_timeout_sec=configured_timeout_sec,
             result_count=len(out),
+            requested_k=k,
+            fetch_k=fetch_k,
+            metadata_filter_count=metadata_filter_count,
         )
         return out

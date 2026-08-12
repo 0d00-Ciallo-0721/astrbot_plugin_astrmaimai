@@ -21,6 +21,7 @@ from astrmai.infrastructure.runtime.turn_call_ledger import (
     observe_stage,
     record_context_block_stats,
     record_reply_stats,
+    record_vision_observation,
     turn_telemetry_scope,
 )
 
@@ -136,6 +137,29 @@ class ExecutedTraceFieldContractTests(unittest.TestCase):
 
         self.assertEqual(item["memory_funnel"]["status"], "skipped")
         self.assertEqual(item["memory_funnel"]["skip_reason"], "think_level_0")
+
+    def test_vision_observation_survives_trace_assembly(self):
+        event = self._executed_event()
+        with turn_telemetry_scope(event):
+            record_vision_observation(
+                event,
+                {
+                    "vision_path": "direct",
+                    "vision_call_status": "success",
+                    "image_count": 1,
+                    "analyzed_count": 1,
+                    "visual_memory_ids": ["vm_opaque"],
+                    "description": "不应进入 trace 的原始图片描述",
+                },
+            )
+
+        item = self._build(event)
+
+        self.assertEqual(item["vision_observation"]["vision_path"], "direct")
+        self.assertEqual(item["vision_observation"]["vision_call_status"], "success")
+        self.assertEqual(item["image_count"], 1)
+        self.assertEqual(item["visual_memory_ids"], ["vm_opaque"])
+        self.assertNotIn("原始图片描述", str(item["vision_observation"]))
 
     def test_decision_observation_present_for_every_status(self):
         for status in ("executed", "skipped_wait", "skipped_ignore", "stale_drop"):

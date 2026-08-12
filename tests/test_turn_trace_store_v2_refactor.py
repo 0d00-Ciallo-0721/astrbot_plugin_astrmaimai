@@ -130,3 +130,38 @@ def test_late_duplicate_snapshot_does_not_erase_sent_reply(tmp_path):
     assert items[0]["latest_snapshot_status"] == "duplicate_blocked"
     assert items[0]["reply_stats"]["actual_send_count"] == 1
     assert items[0]["snapshot_seq"] == 2
+
+
+def test_late_duplicate_snapshot_does_not_erase_vision_observation(tmp_path):
+    store = TurnTraceSampleStore(tmp_path, max_per_chat=5, max_global=10)
+
+    async def run():
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 1.0,
+                "turn_id": "turn-vision",
+                "status": "executed",
+                "vision_observation": {
+                    "vision_path": "direct",
+                    "vision_call_status": "success",
+                    "image_count": 1,
+                },
+            }
+        )
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 2.0,
+                "turn_id": "turn-vision",
+                "status": "duplicate_blocked",
+                "vision_observation": {},
+            }
+        )
+        return await store.recent(chat_id="chat-a", limit=5)
+
+    items = asyncio.run(run())
+
+    assert len(items) == 1
+    assert items[0]["vision_observation"]["vision_path"] == "direct"
+    assert items[0]["vision_observation"]["vision_call_status"] == "success"

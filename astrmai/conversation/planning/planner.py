@@ -891,6 +891,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "llm_call_ledger": telemetry["llm_call_ledger"],
                     "context_block_stats": telemetry["context_block_stats"],
                     "stage_ledger": telemetry["stage_ledger"],
+                    "vision_observation": telemetry["vision_observation"],
                     "reply_stats": telemetry["reply_stats"],
                     "budget": telemetry["budget"],
                     "tool_ledger_summary": telemetry["tool_ledger_summary"],
@@ -923,6 +924,31 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     reply_stats.get("actual_reply_chars", reply_stats.get("total_chars", 0)) or 0
                 )
         if hasattr(event, "get_extra"):
+            vision_observation = self._sanitize_vision_observation(item.get("vision_observation"))
+            if not vision_observation:
+                vision_observation = self._sanitize_vision_observation(
+                    event.get_extra("astrmai_vision_observation", {})
+                    or event.get_extra("astrmai_vision_observability", {})
+                )
+            if vision_observation:
+                item["vision_observation"] = vision_observation
+                item["image_count"] = int(float(vision_observation.get("image_count", 0) or 0))
+                item["vision_path"] = str(vision_observation.get("vision_path", "") or "")
+                item["vision_barrier_status"] = str(
+                    vision_observation.get("vision_barrier_status", "") or ""
+                )
+                item["vision_call_status"] = str(
+                    vision_observation.get("vision_call_status", "") or ""
+                )
+                item["vision_fallback"] = str(vision_observation.get("vision_fallback", "") or "")
+                item["vision_wait_ms"] = float(vision_observation.get("vision_wait_ms", 0.0) or 0.0)
+                item["vision_timeout_ms"] = float(
+                    vision_observation.get("vision_timeout_ms", 0.0) or 0.0
+                )
+                item["visual_memory_id"] = str(
+                    vision_observation.get("visual_memory_id", "") or ""
+                )
+                item["visual_memory_ids"] = list(vision_observation.get("visual_memory_ids", []) or [])
             memory_funnel = event.get_extra("astrmai_memory_funnel", {})
             if isinstance(memory_funnel, dict):
                 item["memory_funnel"] = dict(memory_funnel)
@@ -1114,6 +1140,71 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 or str(call.get("stage", "") or "") == "attention.judge"
             )
         )
+
+    @staticmethod
+    def _sanitize_vision_observation(payload: Any) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        allowed = {
+            "policy",
+            "outcome",
+            "image_count",
+            "resolved_count",
+            "analyzed_count",
+            "failed_count",
+            "timeout_count",
+            "attempt_count",
+            "image_source",
+            "image_resolve_status",
+            "vision_barrier_status",
+            "vision_wait_ms",
+            "vision_timeout_ms",
+            "vision_fallback",
+            "visual_memory_id",
+            "visual_memory_ids",
+            "scope",
+            "vision_path",
+            "vision_call_status",
+            "visual_memory_write_status",
+            "prompt_injected",
+            "fallback_reason",
+            "cache_hit_count",
+            "cache_miss_count",
+            "singleflight_wait_count",
+            "asset_ids",
+            "binding_count",
+            "failure_stage",
+            "skip_reason",
+            "model_ids",
+            "analysis_prompt_version",
+            "asset_storage_status",
+            "final_status",
+            "candidate_count",
+            "autonomous_inspection_enabled",
+            "autonomous_inspection_disclosed",
+            "autonomous_inspection_called",
+            "autonomous_inspection_status",
+            "autonomous_inspection_dependency",
+            "autonomous_inspection_elapsed_ms",
+            "autonomous_inspection_cache_hit",
+            "autonomous_inspection_fallback",
+        }
+        normalized: dict = {}
+        for key in allowed:
+            value = payload.get(key)
+            if key in {"image_source", "visual_memory_ids", "asset_ids", "model_ids"}:
+                if isinstance(value, (list, tuple, set)):
+                    normalized[key] = [str(item)[:80] for item in value if str(item).strip()][:16]
+                elif value is not None and str(value).strip():
+                    normalized[key] = [str(value)[:80]]
+                continue
+            if isinstance(value, bool):
+                normalized[key] = value
+            elif isinstance(value, (int, float)):
+                normalized[key] = max(0, round(float(value), 1))
+            elif value is not None and str(value).strip():
+                normalized[key] = str(value)[:120]
+        return normalized
 
     def _build_raw_trace_events(self, chat_id: str, event: AstrMessageEvent) -> list[dict]:
         if not hasattr(event, "get_extra"):

@@ -107,6 +107,11 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(observation["status"], "timeout")
         self.assertTrue(observation["circuit_open"])
         self.assertGreater(observation["cooldown_remaining_sec"], 0.0)
+        self.assertEqual(observation["configured_timeout_sec"], 4.0)
+        self.assertEqual(observation["effective_timeout_sec"], 4.0)
+        self.assertFalse(observation["timeout_budget_clamped"])
+        self.assertEqual(observation["failure_threshold"], 1)
+        self.assertEqual(observation["cooldown_sec"], 30.0)
 
         second_observation = {}
         second_results = asyncio.run(
@@ -136,6 +141,9 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(observation["status"], "timeout")
         self.assertEqual(observation["timeout_sec"], 20.0)
+        self.assertEqual(observation["configured_timeout_sec"], 20.0)
+        self.assertEqual(observation["effective_timeout_sec"], 20.0)
+        self.assertFalse(observation["timeout_budget_clamped"])
 
     def test_vector_store_timeout_is_clamped_to_shared_turn_budget(self):
         from astrmai.memory.retrieval import vector_store
@@ -156,10 +164,14 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
             "clamp_timeout_to_turn_budget",
             return_value=1.25,
         ), patch.object(vector_store.asyncio, "wait_for", new=_wait_for):
-            results = asyncio.run(VectorRetriever(_Faiss()).search("hello"))
+            observation = {}
+            results = asyncio.run(VectorRetriever(_Faiss()).search("hello", observation=observation))
 
         self.assertEqual(results, [])
         self.assertEqual(captured["timeout"], 1.25)
+        self.assertEqual(observation["configured_timeout_sec"], 20.0)
+        self.assertEqual(observation["effective_timeout_sec"], 1.25)
+        self.assertTrue(observation["timeout_budget_clamped"])
 
     def test_hybrid_retriever_reports_bm25_fallback_when_vector_is_unhealthy(self):
         from astrmai.memory.retrieval.hybrid_retriever import HybridRetriever

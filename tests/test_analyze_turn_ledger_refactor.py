@@ -20,6 +20,37 @@ def test_load_traces_prefers_v2_recent_and_filters_instrumentation(tmp_path):
     assert [trace["turn_id"] for trace in traces] == ["new"]
 
 
+def test_load_traces_merges_later_jsonl_snapshots_instead_of_dropping_them(tmp_path):
+    path = tmp_path / "turn_trace_samples.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"turn_id": "turn-1", "created_at": 1, "status": "skipped_wait"}),
+                json.dumps(
+                    {
+                        "turn_id": "turn-1",
+                        "created_at": 2,
+                        "status": "executed",
+                        "vision_observation": {
+                            "vision_path": "direct",
+                            "vision_call_status": "success",
+                            "image_count": 1,
+                            "analyzed_count": 1,
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    traces = load_traces(path)
+
+    assert len(traces) == 1
+    assert traces[0]["status"] == "executed"
+    assert traces[0]["vision_observation"]["vision_path"] == "direct"
+
+
 def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     report = analyze_traces(
         [
@@ -72,6 +103,13 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
                     "rendered_chars": 500,
                     "query_rewrite_trace": {"status": "success"},
                 },
+                "vision_observation": {
+                    "vision_path": "direct",
+                    "vision_call_status": "success",
+                    "vision_wait_ms": 25,
+                    "image_count": 1,
+                    "analyzed_count": 1,
+                },
             }
         ]
     )
@@ -89,6 +127,10 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["budget"]["exhausted_count"] == 0
     assert report["query_rewrite"]["status_counts"] == {"success": 1}
     assert report["memory"]["selection_rate"] == 0.3
+    assert report["vision"]["trace_count"] == 1
+    assert report["vision"]["path_counts"] == {"direct": 1}
+    assert report["vision"]["call_status_counts"] == {"success": 1}
+    assert "## Vision" in render_markdown(report)
 
 
 def test_analyze_traces_counts_abandoned_calls_budget_and_attempt_failures():
