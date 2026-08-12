@@ -13,6 +13,12 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
+from ..vision_state import (
+    classify_autonomous_vision_need,
+    select_autonomous_vision_candidate,
+    user_asked_about_image,
+    vision_observation_facts,
+)
 from ..runtime.architecture_trace import build_architecture_trace_contract
 from ...infrastructure.runtime.turn_call_ledger import (
     finalize_turn_telemetry,
@@ -484,9 +490,99 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             detail += f"；内在状态倾向：{state_bias}"
         return detail
 
+    @staticmethod
+    def _require_vision_tool(
+        event: AstrMessageEvent,
+        candidate: dict,
+        *,
+        source: str,
+        reason: str,
+    ) -> None:
+        tool_name = "vision_message_analyze_tool"
+        required_tools = [
+            str(name or "").strip()
+            for name in event.get_extra("astrmai_required_tools", []) or []
+            if str(name or "").strip()
+        ]
+        if tool_name not in required_tools:
+            required_tools.append(tool_name)
+        event.set_extra("astrmai_required_tools", required_tools)
+        event.set_extra("astrmai_vision_tool_required", True)
+
+        message_id = str(candidate.get("message_id") or "").strip()
+        plans = [
+            dict(item)
+            for item in event.get_extra("astrmai_tool_invocation_plans", []) or []
+            if isinstance(item, dict)
+        ]
+        existing_plan = next(
+            (
+                item
+                for item in plans
+                if str(item.get("tool_name") or "").strip() == tool_name
+            ),
+            None,
+        )
+        if existing_plan is not None:
+            prepared_arguments = dict(existing_plan.get("prepared_arguments") or {})
+            if message_id:
+                prepared_arguments["message_id"] = message_id
+            prepared_arguments.setdefault("image_index", 1)
+            existing_plan.update(
+                {
+                    "family": "vision_message",
+                    "required": True,
+                    "entity_domain": "message_artifact",
+                    "target": message_id or str(existing_plan.get("target") or "").strip(),
+                    "prepared_arguments": prepared_arguments,
+                    "acceptable_statuses": ["success"],
+                    "source": source,
+                    "reason": reason,
+                }
+            )
+            event.set_extra("astrmai_tool_invocation_plans", plans)
+        else:
+            plans.append(
+                {
+                    "tool_name": tool_name,
+                    "family": "vision_message",
+                    "required": True,
+                    "entity_domain": "message_artifact",
+                    "operation": "",
+                    "target": message_id,
+                    "prepared_arguments": {
+                        "message_id": message_id,
+                        "image_index": 1,
+                    },
+                    "acceptable_statuses": ["success"],
+                    "acceptable_source_domains": [],
+                    "source": source,
+                    "reason": reason,
+                }
+            )
+            event.set_extra("astrmai_tool_invocation_plans", plans)
+
     def _append_tool_guidance(self, prompt_envelope, tools, event: AstrMessageEvent | None = None) -> None:
         if not prompt_envelope:
             return
+        guidance_lines = list(getattr(prompt_envelope, "guidance_lines", []) or [])
+        if event is not None and hasattr(event, "get_extra"):
+            vision_state = str(event.get_extra("astrmai_vision_state", "none") or "none")
+            asked_about_image = bool(
+                event.get_extra("astrmai_user_asked_about_image", False)
+                or user_asked_about_image(str(getattr(event, "message_str", "") or ""))
+            )
+            if vision_state == "placeholder_only" and not asked_about_image:
+                guidance_lines.append(
+                    "当前图片只有不可用占位符，且用户没有询问图片。占位符不是聊天主题；"
+                    "忽略它并只回答文字，不要提图片加载、看不到、转圈或要求用户重发。"
+                )
+            elif vision_state == "placeholder_only" and asked_about_image:
+                guidance_lines.append(
+                    "用户明确询问图片；优先使用可用的图片分析工具查证，禁止猜测。"
+                    "若没有可分析的图片引用或工具失败，只需简短说明本次无法确认图片内容。"
+                )
+            prompt_envelope.guidance_lines = self._dedupe_guidance_lines(guidance_lines)
         if event is not None and hasattr(event, "get_extra") and event.get_extra("astrmai_tool_clarification_needed", False):
             prompt = str(event.get_extra("astrmai_tool_clarification_prompt", "") or "").strip()
             missing_slots = [
@@ -494,7 +590,6 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 for item in event.get_extra("astrmai_tool_clarification_missing_slots", []) or []
                 if str(item or "").strip()
             ]
-            guidance_lines = list(getattr(prompt_envelope, "guidance_lines", []) or [])
             detail = "用户像是在请求我使用工具或执行动作，但信息还不完整。"
             if prompt:
                 detail += f"这轮不要声称已经执行，先自然追问：{prompt}"
@@ -520,7 +615,22 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if event is not None and "vision_message_analyze_tool" in tool_names:
             candidates = event.get_extra("astrmai_recent_media_candidates", []) or []
             safe_candidates = [item for item in candidates if isinstance(item, dict)][:4]
+            event.set_extra("astrmai_vision_tool_disclosed", True)
+            asked_about_image = bool(
+                event.get_extra("astrmai_user_asked_about_image", False)
+                or user_asked_about_image(str(getattr(event, "message_str", "") or ""))
+            )
             if safe_candidates:
+                vision_need, vision_need_reason = classify_autonomous_vision_need(
+                    str(getattr(event, "message_str", "") or ""),
+                    safe_candidates,
+                    explicit_request=asked_about_image,
+                )
+                selected_candidate = select_autonomous_vision_candidate(safe_candidates)
+                selected_message_id = str(selected_candidate.get("message_id") or "").strip()
+                event.set_extra("astrmai_autonomous_vision_need", vision_need)
+                event.set_extra("astrmai_autonomous_vision_reason", vision_need_reason)
+                event.set_extra("astrmai_autonomous_vision_candidate_id", selected_message_id)
                 rendered = []
                 for item in safe_candidates:
                     rendered.append(
@@ -534,19 +644,49 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 guidance_lines.append(
                     "系统发现可按需查看的近期图片候选："
                     + "；".join(rendered)
-                    + "。只有当前问题的答案确实依赖图片内容时，才调用 vision_message_analyze_tool；"
-                    "如果当前文字本身足够回答，就忽略图片候选并直接回答。"
+                    + "。在输出最终回复前，先在内部判断答案是否需要知道图片里具体有什么。"
+                    "只要准备描述、评价、解释或依据图片事实作答，就先调用 vision_message_analyze_tool；"
+                    "拿到工具结果后继续推理并生成最终回复，不要把工具结果本身当成最终回答。"
+                    "如果当前文字本身足够回答且答案不依赖图片事实，就忽略图片候选。"
                     "禁止仅因候选图片尚未分析而说‘看不到图片’、‘图片还在加载’或要求用户复述。"
                     "工具失败时，只有图片内容不可替代才简短说明无法确认；否则继续回答文字部分。"
                 )
                 record_vision_observation(
                     event,
                     {
+                        **vision_observation_facts(event),
                         "candidate_count": len(safe_candidates),
                         "autonomous_inspection_enabled": True,
                         "autonomous_inspection_disclosed": True,
+                        "autonomous_inspection_dependency": vision_need,
+                        "autonomous_inspection_decision_reason": vision_need_reason,
+                        "autonomous_inspection_candidate_id": selected_message_id,
+                        "vision_tool_disclosed": True,
                     },
                 )
+                if vision_need == "required":
+                    source = "explicit_user_request" if asked_about_image else "autonomous_dependency"
+                    self._require_vision_tool(
+                        event,
+                        selected_candidate,
+                        source=source,
+                        reason=vision_need_reason,
+                    )
+                    guidance_lines.append(
+                        "这轮答案被判定为依赖近期图片内容，必须先调用 vision_message_analyze_tool 查证；"
+                        "工具返回后继续本轮思考并给出自然的最终回答。不得用其他工具代替，也不得凭聊天文字猜图。"
+                    )
+                    record_vision_observation(
+                        event,
+                        {
+                            **vision_observation_facts(event),
+                            "vision_tool_disclosed": True,
+                            "vision_tool_required": True,
+                            "autonomous_inspection_dependency": vision_need,
+                            "autonomous_inspection_decision_reason": vision_need_reason,
+                            "autonomous_inspection_candidate_id": selected_message_id,
+                        },
+                    )
         if event is not None and hasattr(event, "get_extra"):
             required_tools = [
                 str(name or "").strip()
@@ -1185,6 +1325,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             "autonomous_inspection_called",
             "autonomous_inspection_status",
             "autonomous_inspection_dependency",
+            "autonomous_inspection_decision_reason",
+            "autonomous_inspection_candidate_id",
             "autonomous_inspection_elapsed_ms",
             "autonomous_inspection_cache_hit",
             "autonomous_inspection_fallback",

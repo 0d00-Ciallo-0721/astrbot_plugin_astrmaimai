@@ -41,6 +41,12 @@ from ...multimodal.vision_prompt import (
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
+from ..vision_state import (
+    guard_unresolved_image_reply,
+    has_valid_image_context,
+    reply_mentions_image,
+    vision_observation_facts,
+)
 from ..planning.tool_contracts import record_tool_lifecycle
 from ..planning.tool_disclosure import (
     FAMILY_TO_PACKAGES,
@@ -175,6 +181,16 @@ class ConcurrentExecutor:
             "astrmai_tool_clarification_needed",
             "astrmai_tool_clarification_prompt",
             "astrmai_tool_clarification_missing_slots",
+            "astrmai_vision_observation",
+            "astrmai_vision_observability",
+            "astrmai_vision_state",
+            "astrmai_vision_tool_disclosed",
+            "astrmai_vision_tool_required",
+            "astrmai_vision_tool_selected",
+            "astrmai_vision_tool_result_status",
+            "astrmai_autonomous_vision_need",
+            "astrmai_autonomous_vision_reason",
+            "astrmai_autonomous_vision_candidate_id",
         ):
             value = source_event.get_extra(key, None)
             if value is not None:
@@ -927,7 +943,20 @@ class ConcurrentExecutor:
 
         started_at = monotonic()
         policy = self._vision_reply_policy()
+        configured_max_images = getattr(
+            getattr(self.config, "vision", None),
+            "max_images_per_turn",
+            1,
+        )
+        try:
+            max_images = max(1, min(int(configured_max_images or 1), 8))
+        except (TypeError, ValueError):
+            max_images = 1
+        all_direct_image_urls = list(vision_bundle.direct_image_urls or [])
+        direct_image_urls = all_direct_image_urls[:max_images]
+        dropped_image_count = max(0, len(all_direct_image_urls) - len(direct_image_urls))
         event.set_extra("astrmai_vision_owner", "direct")
+        event.set_extra("astrmai_vision_state", "analysis_pending")
         logger.info(f"[{chat_id}] vision direct path triggered in executor")
         self._mark_vision_direct_state(event, invoked=True, outcome="skipped")
         vision_descriptions: list[str] = []
@@ -960,7 +989,17 @@ class ConcurrentExecutor:
             sender_id = str(event.get_sender_id() or "")
         except Exception:
             sender_id = ""
-        for image_index, url_or_path in enumerate(vision_bundle.direct_image_urls):
+        record_vision_observation(
+            event,
+            {
+                **vision_observation_facts(event),
+                "vision_state": "analysis_pending",
+                "direct_vision_scheduled": True,
+                "image_count": len(all_direct_image_urls),
+                "dropped_image_count": dropped_image_count,
+            },
+        )
+        for image_index, url_or_path in enumerate(direct_image_urls):
             temp_file_path = None
             created_temp_file_path = None
             item_succeeded = False
@@ -1022,6 +1061,14 @@ class ConcurrentExecutor:
                         logger.warning(f"[{chat_id}] vision side-path skipped: turn budget exhausted")
                         continue
                     attempt_count += 1
+                    record_vision_observation(
+                        event,
+                        {
+                            "direct_vision_resolve_status": "success",
+                            "direct_vision_model_called": True,
+                            "direct_vision_model_status": "pending",
+                        },
+                    )
                     picid = hashlib.sha256(
                         f"{chat_id}:{source_text}".encode("utf-8", errors="ignore")
                     ).hexdigest()
@@ -1168,6 +1215,10 @@ class ConcurrentExecutor:
                 outcome="success",
                 details=f"descriptions={len(vision_descriptions)}",
             )
+            event.set_extra(
+                "astrmai_vision_state",
+                "cached_result" if cache_hit_count and cache_miss_count == 0 else "analysis_ready",
+            )
         elif saw_invalid_output:
             self._mark_vision_direct_state(
                 event,
@@ -1175,6 +1226,7 @@ class ConcurrentExecutor:
                 outcome="invalid_output",
                 details="all_descriptions_rejected",
             )
+            event.set_extra("astrmai_vision_state", "analysis_failed")
         elif saw_exception:
             if not event.get_extra("vision_direct_failure_reason"):
                 self._mark_vision_direct_state(
@@ -1182,6 +1234,7 @@ class ConcurrentExecutor:
                     invoked=True,
                     outcome="exception",
                 )
+            event.set_extra("astrmai_vision_state", "analysis_failed")
         else:
             self._mark_vision_direct_state(
                 event,
@@ -1189,6 +1242,7 @@ class ConcurrentExecutor:
                 outcome="exception",
                 details="no_usable_image_input",
             )
+            event.set_extra("astrmai_vision_state", "analysis_failed")
 
         fallback_reason = ""
         if failed_count:
@@ -1217,7 +1271,7 @@ class ConcurrentExecutor:
                             "status": "unavailable",
                             "owner": "direct",
                             "reason": fallback_reason,
-                            "image_count": len(vision_bundle.direct_image_urls),
+                            "image_count": len(all_direct_image_urls),
                             "image_only": media_only_failure,
                         },
                     )
@@ -1232,9 +1286,10 @@ class ConcurrentExecutor:
         else:
             observation_outcome = "success"
         observation = {
+            **vision_observation_facts(event),
             "policy": policy,
             "outcome": observation_outcome,
-            "image_count": len(vision_bundle.direct_image_urls),
+            "image_count": len(all_direct_image_urls),
             "resolved_count": resolved_count,
             "analyzed_count": len(vision_descriptions),
             "failed_count": failed_count,
@@ -1269,6 +1324,13 @@ class ConcurrentExecutor:
             "analysis_prompt_version": prompt_versions[0] if prompt_versions else "",
             "asset_storage_status": ",".join(asset_storage_statuses),
             "final_status": observation_outcome,
+            "direct_vision_scheduled": True,
+            "direct_vision_resolve_status": "success" if resolved_count else "failed",
+            "direct_vision_model_called": bool(attempt_count),
+            "direct_vision_model_status": "success" if vision_descriptions else "failed",
+            "direct_vision_elapsed_ms": elapsed_ms,
+            "direct_vision_injected": prompt_injected,
+            "dropped_image_count": dropped_image_count,
         }
         event.set_extra("astrmai_vision_observability", observation)
         record_vision_observation(event, observation)
@@ -1303,6 +1365,34 @@ class ConcurrentExecutor:
         return text if sent else None
 
     async def _finalize_reply(self, event: AstrMessageEvent, chat_id: str, bot_id: str, reply_text: str, *, trace_mode: str, model: str) -> Optional[str]:
+        valid_image_context = has_valid_image_context(event)
+        mentions_image = reply_mentions_image(reply_text)
+        guard_enabled = bool(
+            getattr(
+                getattr(self.config, "vision", None),
+                "ignore_placeholder_without_question",
+                True,
+            )
+        )
+        reply_text, image_guard_action, image_guard_reason = guard_unresolved_image_reply(
+            reply_text,
+            user_text=str(getattr(event, "message_str", "") or ""),
+            has_valid_image_context=valid_image_context,
+            enabled=guard_enabled,
+        )
+        event.set_extra("astrmai_image_reply_guard_action", image_guard_action)
+        event.set_extra("astrmai_image_reply_guard_reason", image_guard_reason)
+        record_vision_observation(
+            event,
+            {
+                **vision_observation_facts(event),
+                "reply_mentions_image": mentions_image,
+                "has_valid_image_context": valid_image_context,
+                "image_reply_blocked": image_guard_action == "repaired",
+            },
+        )
+        if image_guard_action == "repaired":
+            logger.warning(f"[{chat_id}] removed unrequested unresolved-image claim from reply")
         actor_guard = GroupActorConsistencyGuard.inspect_and_repair(event, reply_text)
         reply_text = actor_guard.text
         if hasattr(event, "set_extra"):

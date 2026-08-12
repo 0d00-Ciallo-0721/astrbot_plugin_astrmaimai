@@ -311,6 +311,27 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertEqual(event.get_extra("extracted_image_urls"), [])
         self.assertFalse(event.get_extra("direct_vision_urls"))
         self.assertEqual(event.get_extra("vision_direct_skip_reason"), "not_direct_path")
+        self.assertEqual(event.get_extra("astrmai_vision_state"), "placeholder_only")
+        self.assertEqual(event.get_extra("astrmai_image_raw_component_count"), 1)
+        self.assertEqual(event.get_extra("astrmai_image_resolved_count"), 0)
+        self.assertEqual(event.get_extra("astrmai_image_placeholder_count"), 1)
+        self.assertFalse(event.get_extra("astrmai_image_focus_allowed"))
+
+    def test_unresolved_image_with_unrelated_text_does_not_claim_image_focus(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[
+                self._image_component(url="https://example.com/unresolved.jpg"),
+                self._plain_component("中文区是什么猎奇区吗？"),
+            ],
+            text="中文区是什么猎奇区吗？",
+        )
+
+        self.assertTrue(asyncio.run(filters.should_process_message(event)))
+        self.assertFalse(event.get_extra("astrmai_user_asked_about_image"))
+        self.assertEqual(event.get_extra("astrmai_image_focus_reason"), "placeholder_ignored")
 
     def test_poke_event_writes_lightweight_play_context(self):
         filters = self.sensors_mod.PreFilters(self._config())

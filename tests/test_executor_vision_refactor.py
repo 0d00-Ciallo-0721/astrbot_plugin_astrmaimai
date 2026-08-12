@@ -20,7 +20,11 @@ class _FakeGateway:
             infra=SimpleNamespace(api_timeout=15),
             global_settings=SimpleNamespace(debug_mode=False, enable_error_interception=False, admin_ids=[]),
             reply=SimpleNamespace(fallback_text="fallback"),
-            vision=SimpleNamespace(vision_reply_policy=vision_policy),
+            vision=SimpleNamespace(
+                vision_reply_policy=vision_policy,
+                max_images_per_turn=1,
+                ignore_placeholder_without_question=True,
+            ),
         )
 
     async def call_vision_task(self, **kwargs):
@@ -117,6 +121,66 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
             is_image_only=is_image_only,
             source="event_extra",
         )
+
+    def test_direct_vision_limits_images_per_turn_and_records_dropped_count(self):
+        visual_cortex = _FakeVisualCortex(
+            {"type": "image", "description": "一张测试图片。", "emotion_tags": []}
+        )
+        executor, _gateway = self._executor({}, visual_cortex=visual_cortex)
+        event = _FakeEvent()
+        first = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        second = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        first.close()
+        second.close()
+        bundle = self.executor_mod.VisionBundle(
+            image_urls=[first.name, second.name],
+            direct_image_urls=[first.name, second.name],
+            is_direct_request=True,
+            is_image_only=True,
+            source="event_extra",
+        )
+
+        try:
+            asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    "prompt",
+                    "system",
+                    bundle,
+                )
+            )
+        finally:
+            for path in (first.name, second.name):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        self.assertEqual(len(visual_cortex.calls), 1)
+        observation = event.get_extra("astrmai_vision_observability")
+        self.assertEqual(observation["image_count"], 2)
+        self.assertEqual(observation["dropped_image_count"], 1)
+
+    def test_finalize_reply_removes_unrequested_image_loading_claim(self):
+        executor, _gateway = self._executor({})
+        event = _FakeEvent()
+        event.message_str = "中文区是什么猎奇区吗？"
+        event.set_extra("astrmai_vision_state", "placeholder_only")
+
+        committed = asyncio.run(
+            executor._finalize_reply(
+                event,
+                "default:GroupMessage:group-1",
+                "bot-1",
+                "图片我看不到啦。中文区一般指中文内容社区。",
+                trace_mode="text",
+                model="test-model",
+            )
+        )
+
+        self.assertEqual(committed, "中文区一般指中文内容社区。")
+        self.assertEqual(event.get_extra("astrmai_image_reply_guard_action"), "repaired")
 
     def test_invalid_provider_like_vision_output_is_rejected(self):
         executor, _gateway = self._executor(

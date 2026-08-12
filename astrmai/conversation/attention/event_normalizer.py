@@ -52,6 +52,9 @@ class NormalizedEvent:
     image_urls: List[str] = field(default_factory=list)
     has_direct_vision: bool = False
     is_image_only: bool = False
+    vision_state: str = 'none'
+    image_placeholder_count: int = 0
+    user_asked_about_image: bool = False
     token_set: Set[str] = field(default_factory=set)
     index: int = 0
     canonical_event: ConversationEvent | None = None
@@ -80,6 +83,8 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
         direct_refs = list(event.get_extra('direct_image_refs', event.get_extra('direct_vision_urls', [])) or [])
         extracted_refs = list(event.get_extra('extracted_image_refs', event.get_extra('extracted_image_urls', [])) or [])
         image_urls = list(dict.fromkeys(direct_refs + extracted_refs))
+        raw_image_count = int(event.get_extra('astrmai_image_raw_component_count', 0) or 0)
+        vision_state = str(event.get_extra('astrmai_vision_state', 'none') or 'none')
         token_set = gate._tokenize_text(rich_text or text)
         reply_target_sender_id, reply_target_sender_name = gate._extract_reply_target(event)
         is_at_bot = gate._is_at_bot_event(event, self_id)
@@ -141,7 +146,10 @@ def build_normalized_events(gate, events, self_id: str) -> list[NormalizedEvent]
                 reply_target_sender_name=reply_target_sender_name,
                 image_urls=image_urls,
                 has_direct_vision=bool(direct_refs),
-                is_image_only=bool(image_urls and not token_set),
+                is_image_only=bool((image_urls or raw_image_count) and not token_set),
+                vision_state=vision_state,
+                image_placeholder_count=int(event.get_extra('astrmai_image_placeholder_count', 0) or 0),
+                user_asked_about_image=bool(event.get_extra('astrmai_user_asked_about_image', False)),
                 token_set=token_set,
                 index=index,
                 canonical_event=canonical_event if canonical_read_enabled else None,

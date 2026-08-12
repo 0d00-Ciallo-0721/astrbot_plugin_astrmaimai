@@ -122,6 +122,10 @@ INTERNAL_EVENT_ENVELOPE_RE = re.compile(
     r"\|\s*类型=[^\]\n]{0,80}\|\s*来源=",
     re.IGNORECASE,
 )
+INTERNAL_MEDIA_CONTEXT_RE = re.compile(
+    r"\[(?:图片|表情包)转述\s*[：:].{1,1200}\]",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def normalize_guard_text(text: str) -> str:
@@ -239,6 +243,13 @@ def looks_like_internal_event_envelope(text: str) -> bool:
     return bool(INTERNAL_EVENT_ENVELOPE_RE.search(normalized))
 
 
+def looks_like_internal_media_context(text: str) -> bool:
+    normalized = normalize_guard_text(text)
+    if not normalized:
+        return False
+    return bool(INTERNAL_MEDIA_CONTEXT_RE.search(normalized))
+
+
 def is_noise_line(line: str) -> bool:
     stripped = normalize_guard_text(line)
     if not stripped:
@@ -275,6 +286,7 @@ def sanitize_visible_reply_text(text: str, fallback_text: str = "", speaker_name
         looks_like_provider_failure_text(normalized)
         or looks_like_tool_protocol_text(normalized)
         or looks_like_internal_event_envelope(normalized)
+        or looks_like_internal_media_context(normalized)
     ):
         return fallback_text.strip()
 
@@ -311,6 +323,8 @@ def validate_visible_output_text(
         return "", "provider_failure_text"
     if looks_like_internal_event_envelope(normalized):
         return "", "internal_event_envelope"
+    if looks_like_internal_media_context(normalized):
+        return "", "internal_media_context"
 
     sanitized = sanitize_visible_reply_text(normalized, fallback_text="", speaker_names=speaker_names)
     if sanitized:

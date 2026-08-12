@@ -560,6 +560,16 @@ class VisionConfig(BaseModel):
         le=1800,
         description="相同图片识别失败后的重试冷却时间(秒)",
     )
+    max_images_per_turn: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description="单轮最多分析的图片数量，超出的图片不阻塞当前回复",
+    )
+    ignore_placeholder_without_question: bool = Field(
+        default=True,
+        description="用户没有询问图片时，禁止未解析图片占位符成为回复焦点",
+    )
     use_native_main_reply_vision: bool = Field(
         default=False,
         description="主回复原生识图直通开关，仅当当前主回复模型支持原生图片输入时再开启；插件不会自动判断模型能力。",

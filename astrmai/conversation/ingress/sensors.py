@@ -14,6 +14,7 @@ from ...shared.helpers.plugin_helpers import (
     is_at_message_component,
     resolve_at_target_id,
 )
+from ..vision_state import derive_vision_state, user_asked_about_image
 from .poke_play import PokePlaybook
 
 class PreFilters:
@@ -161,6 +162,8 @@ class PreFilters:
         # ==========================================
         has_at_bot = False
         reply_image_urls = []
+        raw_image_component_count = 0
+        reply_image_component_count = 0
         bot_id = get_event_self_id(event)
         # 判断私聊环境 (如果不存在 group_id 则为私聊)
         is_private = not bool(event.get_group_id())
@@ -200,11 +203,13 @@ class PreFilters:
 
         async def _scan_reply_chain(chain):
             """递归扫描引用链中的图片"""
+            nonlocal reply_image_component_count
             urls = []
             if not chain:
                 return urls
             for c in chain:
                 if image_cls is not None and isinstance(c, image_cls):
+                    reply_image_component_count += 1
                     image_ref = await _extract_image_ref(c)
                     if image_ref:
                         urls.append(image_ref)
@@ -244,6 +249,7 @@ class PreFilters:
                     
                 # 顺手提取 URL
                 if image_cls is not None and isinstance(seg, image_cls):
+                    raw_image_component_count += 1
                     image_ref = await _extract_image_ref(seg)
                     if image_ref:
                         image_urls.append(image_ref)
@@ -314,6 +320,31 @@ class PreFilters:
         extracted_image_urls = list(dict.fromkeys(list(image_urls or []) + list(reply_image_urls or [])))
         event.set_extra("extracted_image_urls", extracted_image_urls)
         event.set_extra("extracted_image_refs", extracted_image_urls)
+        total_image_components = raw_image_component_count + reply_image_component_count
+        resolved_image_count = len(extracted_image_urls)
+        placeholder_count = max(0, total_image_components - resolved_image_count)
+        asked_about_image = user_asked_about_image(clean_text or raw_msg)
+        vision_state = derive_vision_state(
+            raw_count=total_image_components,
+            resolved_count=resolved_image_count,
+        )
+        image_focus_allowed = bool(resolved_image_count)
+        if image_focus_allowed:
+            image_focus_reason = "resolvable_media"
+        elif asked_about_image and total_image_components:
+            image_focus_reason = "explicit_question_without_resolvable_media"
+        elif total_image_components:
+            image_focus_reason = "placeholder_ignored"
+        else:
+            image_focus_reason = "no_media"
+        event.set_extra("astrmai_vision_state", vision_state)
+        event.set_extra("astrmai_image_event_count", int(bool(total_image_components or resolved_image_count)))
+        event.set_extra("astrmai_image_raw_component_count", total_image_components)
+        event.set_extra("astrmai_image_resolved_count", resolved_image_count)
+        event.set_extra("astrmai_image_placeholder_count", placeholder_count)
+        event.set_extra("astrmai_user_asked_about_image", asked_about_image)
+        event.set_extra("astrmai_image_focus_allowed", image_focus_allowed)
+        event.set_extra("astrmai_image_focus_reason", image_focus_reason)
         
         # 3. 🚨 核心指令拦截防火墙 🚨
         if clean_text:

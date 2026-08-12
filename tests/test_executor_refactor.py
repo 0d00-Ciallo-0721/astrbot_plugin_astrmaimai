@@ -363,6 +363,73 @@ class RefactoredExecutorTests(unittest.TestCase):
         lifecycle = event.get_extra("astrmai_tool_lifecycle_trace", [])
         self.assertTrue(any(item["phase"] == "required_tool_retry" for item in lifecycle))
 
+    def test_tool_mode_retries_required_vision_then_returns_final_reply(self):
+        calls = 0
+
+        def _tool_response(kwargs):
+            nonlocal calls
+            calls += 1
+            execution_event = kwargs["event"]
+            if calls == 2:
+                execution_event.set_extra(
+                    "astrmai_tool_execution_trace",
+                    [
+                        {
+                            "tool_name": "vision_message_analyze_tool",
+                            "family": "vision_message",
+                            "status": "success",
+                        }
+                    ],
+                )
+                execution_event.set_extra("astrmai_vision_tool_selected", True)
+                execution_event.set_extra("astrmai_vision_tool_result_status", "success")
+                return "图里是一个举着布丁的角色，看起来是在撒娇。"
+            return "我先按文字猜一下。"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(text="这个表情是什么意思？")
+        event.set_extra("astrmai_required_tools", ["vision_message_analyze_tool"])
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "vision_message_analyze_tool",
+                    "family": "vision_message",
+                    "required": True,
+                    "prepared_arguments": {"message_id": "image-message-1", "image_index": 1},
+                    "acceptable_statuses": ["success"],
+                }
+            ],
+        )
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="vision_message_analyze_tool")],
+            )
+        )
+
+        self.assertEqual(result, "图里是一个举着布丁的角色，看起来是在撒娇。")
+        self.assertEqual(calls, 2)
+        self.assertTrue(event.get_extra("astrmai_tool_correction_pass_used"))
+        self.assertEqual(event.get_extra("astrmai_tool_contract_unsatisfied"), [])
+        self.assertTrue(event.get_extra("astrmai_vision_tool_selected"))
+        retry_call = gateway.calls[1][1]
+        self.assertEqual(
+            [tool.name for tool in retry_call["tools"].tools],
+            ["vision_message_analyze_tool"],
+        )
+        self.assertIn('"message_id":"image-message-1"', retry_call["prompt"])
+
     def test_tool_mode_corrects_irrelevant_success_with_exact_domain_tool(self):
         calls = 0
 

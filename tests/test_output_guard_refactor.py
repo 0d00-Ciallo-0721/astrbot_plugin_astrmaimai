@@ -80,6 +80,14 @@ class OutputGuardRefactorTests(unittest.TestCase):
             "要继续刚才的话题吗？",
         )
 
+    def test_validate_visible_output_text_blocks_standalone_internal_vision_marker(self):
+        leaked = "[表情包转述：一个金发女孩双手捧着碗，传达情绪：委屈]"
+
+        safe_text, failure_kind = self.guard_mod.validate_visible_output_text(leaked)
+
+        self.assertEqual(safe_text, "")
+        self.assertEqual(failure_kind, "internal_media_context")
+
 
 if __name__ == "__main__":
     unittest.main()

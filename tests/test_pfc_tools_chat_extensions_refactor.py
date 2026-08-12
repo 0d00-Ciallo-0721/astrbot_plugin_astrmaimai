@@ -483,6 +483,9 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("猫猫在挥手", result)
         self.assertIn("emoji", result)
+        self.assertTrue(event.get_extra("astrmai_vision_tool_selected"))
+        self.assertEqual(event.get_extra("astrmai_vision_tool_result_status"), "success")
+        self.assertEqual(event.get_extra("astrmai_vision_state"), "analysis_ready")
 
     def test_04b_vision_message_analyze_uses_barrier_records(self):
         event = _FakeEvent(group_id="777")
@@ -525,6 +528,9 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertNotIn("private.example", result)
         self.assertNotIn("加载", result)
         self.assertNotIn("稍后", result)
+        self.assertTrue(event.get_extra("astrmai_vision_tool_selected"))
+        self.assertEqual(event.get_extra("astrmai_vision_tool_result_status"), "unavailable")
+        self.assertEqual(event.get_extra("astrmai_vision_state"), "analysis_failed")
 
     def test_04bbb_vision_message_resolves_and_analyzes_bound_image(self):
         event = _FakeEvent(group_id="777", message_id="msg-image")
@@ -587,6 +593,9 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertEqual(cortex.calls[0][1]["binding_context"]["image_index"], 0)
         self.assertNotIn("private/cache", result)
         self.assertNotIn("opaque-image-reference", result)
+        self.assertTrue(event.get_extra("astrmai_vision_tool_selected"))
+        self.assertEqual(event.get_extra("astrmai_vision_tool_result_status"), "success")
+        self.assertEqual(event.get_extra("astrmai_vision_state"), "analysis_ready")
 
     def test_04bc_vision_message_reports_runtime_owner_without_duplicate_lookup(self):
         event = _FakeEvent(group_id="777")
@@ -599,6 +608,11 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertEqual(payload["status"], "handled_by_runtime")
         self.assertEqual(payload["owner"], "barrier")
         self.assertFalse(payload["retryable"])
+        self.assertTrue(event.get_extra("astrmai_vision_tool_selected"))
+        self.assertEqual(
+            event.get_extra("astrmai_vision_tool_result_status"),
+            "handled_by_runtime",
+        )
 
     def test_04c_vision_message_rejects_qq_number_as_message_id(self):
         event = _FakeEvent(

@@ -159,6 +159,9 @@ def test_vision_observation_merges_disclosure_and_execution_stages():
                 "autonomous_inspection_called": True,
                 "autonomous_inspection_status": "success",
                 "autonomous_inspection_cache_hit": False,
+                "autonomous_inspection_dependency": "optional",
+                "autonomous_inspection_decision_reason": "same_sender_recent_question",
+                "autonomous_inspection_candidate_id": "opaque-message-id",
             },
         )
 
@@ -167,6 +170,41 @@ def test_vision_observation_merges_disclosure_and_execution_stages():
     assert payload["autonomous_inspection_disclosed"] is True
     assert payload["autonomous_inspection_called"] is True
     assert payload["autonomous_inspection_status"] == "success"
+    assert payload["autonomous_inspection_dependency"] == "optional"
+    assert payload["autonomous_inspection_decision_reason"] == "same_sender_recent_question"
+    assert payload["autonomous_inspection_candidate_id"] == "opaque-message-id"
+
+
+def test_vision_observation_keeps_state_machine_and_tool_contract_fields():
+    event = _Event()
+
+    with turn_telemetry_scope(event):
+        record_vision_observation(
+            event,
+            {
+                "vision_state": "placeholder_only",
+                "image_event_count": 1,
+                "image_raw_component_count": 2,
+                "image_resolved_count": 0,
+                "image_placeholder_count": 2,
+                "image_focus_reason": "explicit_image_question",
+                "image_focus_allowed": True,
+                "user_asked_about_image": True,
+                "vision_tool_disclosed": True,
+                "vision_tool_required": True,
+                "vision_tool_selected": True,
+                "vision_tool_result_status": "no_image",
+                "reply_mentions_image": True,
+                "has_valid_image_context": False,
+                "image_reply_blocked": False,
+            },
+        )
+
+    payload = event.get_extra("astrmai_vision_observation")
+    assert payload["vision_state"] == "placeholder_only"
+    assert payload["image_raw_component_count"] == 2
+    assert payload["vision_tool_required"] is True
+    assert payload["vision_tool_result_status"] == "no_image"
 
 
 def test_tool_ledger_summary_exposes_execution_without_prompt_content():

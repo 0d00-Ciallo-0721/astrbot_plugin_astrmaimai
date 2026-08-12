@@ -1054,12 +1054,105 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         )
 
         guidance = "\n".join(envelope.guidance_lines)
-        self.assertIn("只有当前问题的答案确实依赖图片内容时", guidance)
-        self.assertIn("当前文字本身足够回答，就忽略图片候选", guidance)
+        self.assertIn("先在内部判断答案是否需要知道图片里具体有什么", guidance)
+        self.assertIn("拿到工具结果后继续推理并生成最终回复", guidance)
+        self.assertIn("当前文字本身足够回答且答案不依赖图片事实", guidance)
         self.assertIn("vision_message_analyze_tool", guidance)
         self.assertIn("image-message-1", guidance)
         self.assertNotIn("http", guidance)
         self.assertIn("禁止仅因候选图片尚未分析而说‘看不到图片’", guidance)
+        self.assertEqual(event.get_extra("astrmai_autonomous_vision_need"), "optional")
+        self.assertNotIn("vision_message_analyze_tool", event.get_extra("astrmai_required_tools", []))
+
+    def test_planner_requires_vision_tool_when_answer_depends_on_recent_image(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="刚才那张图里是什么？")
+        event.set_extra("astrmai_user_asked_about_image", True)
+        event.set_extra("astrmai_vision_state", "placeholder_only")
+        event.set_extra(
+            "astrmai_recent_media_candidates",
+            [{"message_id": "image-message-1", "sender_name": "Alice", "age_seconds": 8}],
+        )
+        envelope = SimpleNamespace(guidance_lines=[])
+
+        planner._append_tool_guidance(
+            envelope,
+            [_NamedTool("vision_message_analyze_tool")],
+            event,
+        )
+
+        self.assertIn("vision_message_analyze_tool", event.get_extra("astrmai_required_tools"))
+        self.assertTrue(event.get_extra("astrmai_vision_tool_required"))
+        self.assertTrue(event.get_extra("astrmai_vision_tool_disclosed"))
+        self.assertIn("必须先调用", "\n".join(envelope.guidance_lines))
+        plans = event.get_extra("astrmai_tool_invocation_plans")
+        self.assertEqual(plans[0]["family"], "vision_message")
+        self.assertEqual(plans[0]["prepared_arguments"]["message_id"], "image-message-1")
+        self.assertEqual(plans[0]["source"], "explicit_user_request")
+
+    def test_planner_requires_vision_tool_for_implicit_bound_image_question(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="这个是什么意思？")
+        event.set_extra(
+            "astrmai_recent_media_candidates",
+            [
+                {
+                    "message_id": "reply-image",
+                    "sender_name": "Alice",
+                    "age_seconds": 20,
+                    "relation": "reply_target",
+                }
+            ],
+        )
+        envelope = SimpleNamespace(guidance_lines=[])
+
+        planner._append_tool_guidance(
+            envelope,
+            [_NamedTool("vision_message_analyze_tool")],
+            event,
+        )
+
+        self.assertEqual(event.get_extra("astrmai_autonomous_vision_need"), "required")
+        self.assertEqual(event.get_extra("astrmai_autonomous_vision_reason"), "implicit_visual_reference")
+        self.assertIn("vision_message_analyze_tool", event.get_extra("astrmai_required_tools"))
+        plan = event.get_extra("astrmai_tool_invocation_plans")[0]
+        self.assertEqual(plan["prepared_arguments"]["message_id"], "reply-image")
+        self.assertEqual(plan["source"], "autonomous_dependency")
+        self.assertIn("工具返回后继续本轮思考", "\n".join(envelope.guidance_lines))
+
+    def test_planner_upgrades_existing_vision_plan_to_required_contract(self):
+        planner = self.planner_mod.Planner.__new__(self.planner_mod.Planner)
+        event = _FakeEvent(text="这张图在说什么？")
+        event.set_extra("astrmai_user_asked_about_image", True)
+        event.set_extra(
+            "astrmai_recent_media_candidates",
+            [{"message_id": "bound-image", "age_seconds": 3, "relation": "current"}],
+        )
+        event.set_extra(
+            "astrmai_tool_invocation_plans",
+            [
+                {
+                    "tool_name": "vision_message_analyze_tool",
+                    "family": "vision_message",
+                    "required": False,
+                    "prepared_arguments": {},
+                    "source": "optional_disclosure",
+                }
+            ],
+        )
+        envelope = SimpleNamespace(guidance_lines=[])
+
+        planner._append_tool_guidance(
+            envelope,
+            [_NamedTool("vision_message_analyze_tool")],
+            event,
+        )
+
+        plans = event.get_extra("astrmai_tool_invocation_plans")
+        self.assertEqual(len(plans), 1)
+        self.assertTrue(plans[0]["required"])
+        self.assertEqual(plans[0]["prepared_arguments"]["message_id"], "bound-image")
+        self.assertEqual(plans[0]["source"], "explicit_user_request")
 
     def test_planner_injects_chat_tier_tool_guidance(self):
         decision = self.planner_mod.CognitiveDecision(

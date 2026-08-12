@@ -1896,6 +1896,20 @@
         "maximum": 1800,
         "hint": "视觉模型或网络异常时，同一张图片在冷却期内不会重复消耗整套模型池；设为 0 可关闭。"
       },
+      "max_images_per_turn": {
+        "description": "单轮最多分析图片数",
+        "type": "int",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 8,
+        "hint": "群聊连续出现多张图片时，只让前几张进入本轮识别，避免图片排队耗尽回复预算。其余图片仍保留在聊天历史中，可在后续明确询问时通过工具查看。"
+      },
+      "ignore_placeholder_without_question": {
+        "description": "未询问图片时忽略无效图片占位",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，图片尚未解析或只有“[图片]”占位时，不允许机器人把注意力转向图片、反复说加载中或看不到；用户明确问图时仍会尝试看图或简短说明失败。"
+      },
       "use_native_main_reply_vision": {
         "description": "主回复原生识图直通开关",
         "type": "bool",

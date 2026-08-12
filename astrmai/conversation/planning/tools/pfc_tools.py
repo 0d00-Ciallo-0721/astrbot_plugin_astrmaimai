@@ -2104,7 +2104,8 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
     name: str = "vision_message_analyze_tool"
     description: str = (
         "查询当前/指定图片消息的视觉转述结果；如果已由 VisualCortex 分析，会返回图片描述、类型和情绪标签。"
-        "用于回答“这张图是什么”“这个表情包什么意思”。"
+        "用于回答“这张图是什么”“这个表情包什么意思”，也允许你在推理中发现答案依赖近期图片时主动调用。"
+        "调用后必须结合视觉事实继续完成本轮推理并输出自然回复，不能只复述工具状态。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -2127,6 +2128,23 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
         event = _get_current_event(context)
 
         def result_payload(status: str, **payload: Any) -> str:
+            event.set_extra("astrmai_vision_tool_selected", True)
+            event.set_extra("astrmai_vision_tool_result_status", status)
+            if status == "success":
+                event.set_extra("astrmai_vision_state", "analysis_ready")
+            elif status == "no_image":
+                event.set_extra("astrmai_vision_state", "placeholder_only")
+            elif status not in {"handled_by_runtime"}:
+                event.set_extra("astrmai_vision_state", "analysis_failed")
+            record_vision_observation(
+                event,
+                {
+                    "vision_path": "tool",
+                    "vision_state": str(event.get_extra("astrmai_vision_state", "none") or "none"),
+                    "vision_tool_selected": True,
+                    "vision_tool_result_status": status,
+                },
+            )
             return json.dumps(
                 {"status": status, **payload},
                 ensure_ascii=False,
