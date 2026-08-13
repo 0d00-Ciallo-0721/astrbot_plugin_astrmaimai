@@ -134,6 +134,7 @@ class TurnTraceSampleStore:
         merged = {**previous, **current}
         for key in (
             "vision_observation",
+            "learning_context_observation",
             "memory_funnel",
             "tool_ledger_summary",
             "reply_stats",

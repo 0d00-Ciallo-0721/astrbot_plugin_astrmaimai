@@ -51,8 +51,8 @@ class ExpressionMiner:
                 group_id,
                 limit=2000,
                 only_checked=False,
-                include_rejected=True,
-                statuses=["active", "review_pending", "rejected", "stale"],
+                include_rejected=False,
+                statuses=["active", "review_pending", "stale"],
             )
             return {
                 service.normalize_text(getattr(item, "expression", ""))

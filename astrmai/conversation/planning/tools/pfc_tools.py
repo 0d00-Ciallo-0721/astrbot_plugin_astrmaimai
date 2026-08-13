@@ -2853,6 +2853,158 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
 
 
 @dataclass
+class LearnedLanguageLookupTool(FunctionTool[AstrAgentContext]):
+    name: str = "learned_language_lookup"
+    description: str = (
+        "查询已经人工通过的全局黑话含义，或当前群聊已经通过的说话风格。"
+        "当用户问某个群内词语是什么意思、机器人需要确认黑话含义，或需要核对当前群的表达习惯时使用。"
+        "查询不到时必须如实说明，不能猜测。"
+    )
+    memory_engine: Optional[Any] = Field(default=None, exclude=True)
+    chat_id: str = Field(default="", exclude=True)
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要查询的黑话、语气词、句式或风格关键词。",
+                    "minLength": 1,
+                    "maxLength": 160,
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["auto", "jargon", "expression"],
+                    "description": "auto 自动查询；jargon 只查全局黑话；expression 只查当前群表达习惯。",
+                    "default": "auto",
+                },
+            },
+            "required": ["query"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = _get_current_event(context)
+        query = str(kwargs.get("query", "") or "").strip()
+        kind = str(kwargs.get("kind", "auto") or "auto").strip().lower()
+        if not query:
+            _record_tool_execution(
+                event,
+                self.name,
+                status="failed",
+                source_domain="learned_language",
+                operation="lookup",
+                reason="query_empty",
+            )
+            return json.dumps(
+                {"status": "failed", "reason": "query_empty", "instruction": "不要猜测，请向用户确认要查询的词语。"},
+                ensure_ascii=False,
+            )
+        if self.memory_engine is None:
+            _record_tool_execution(
+                event,
+                self.name,
+                status="failed",
+                source_domain="learned_language",
+                operation="lookup",
+                reason="learning_service_unavailable",
+            )
+            return json.dumps(
+                {"status": "failed", "reason": "learning_service_unavailable", "instruction": "不要猜测词义或群聊风格。"},
+                ensure_ascii=False,
+            )
+
+        results: list[dict[str, Any]] = []
+        if kind in {"auto", "jargon"}:
+            retrieval = getattr(self.memory_engine, "retrieval_service", None)
+            policy = getattr(retrieval, "jargon_policy", None)
+            if policy is not None:
+                candidates = await policy.search(
+                    query=query,
+                    top_k=3,
+                    visibility_mode="tool",
+                    exact_only=False,
+                )
+                for candidate in candidates:
+                    metadata = dict(getattr(candidate, "metadata", {}) or {})
+                    senses = list(metadata.get("selected_senses", []) or [])
+                    results.append(
+                        {
+                            "kind": "jargon",
+                            "term": str(getattr(candidate, "content", "") or ""),
+                            "senses": [
+                                {
+                                    "meaning": str(sense.get("meaning") or ""),
+                                    "scene": str(sense.get("scene") or ""),
+                                    "examples": list(sense.get("examples") or [])[:2],
+                                }
+                                for sense in senses
+                            ],
+                        }
+                    )
+        if kind in {"auto", "expression"}:
+            service = getattr(self.memory_engine, "expression_pattern_service", None)
+            if service is not None and self.chat_id:
+                patterns = await service.list_patterns(
+                    self.chat_id,
+                    limit=12,
+                    only_checked=True,
+                    include_rejected=False,
+                    review_status="approved",
+                    statuses=["active"],
+                )
+                needle = query.casefold()
+                for pattern in patterns:
+                    haystack = " ".join(
+                        (
+                            str(getattr(pattern, "expression", "") or ""),
+                            str(getattr(pattern, "situation", "") or ""),
+                            str(getattr(pattern, "style", "") or ""),
+                        )
+                    ).casefold()
+                    if kind == "expression" or needle in haystack:
+                        results.append(
+                            {
+                                "kind": "expression",
+                                "expression": str(getattr(pattern, "expression", "") or ""),
+                                "situation": str(getattr(pattern, "situation", "") or ""),
+                                "style": str(getattr(pattern, "style", "") or ""),
+                            }
+                        )
+                    if len([item for item in results if item.get("kind") == "expression"]) >= 5:
+                        break
+
+        if not results:
+            _record_tool_execution(
+                event,
+                self.name,
+                status="not_found",
+                source_domain="learned_language",
+                operation="lookup",
+                reason="no_approved_match",
+            )
+            return json.dumps(
+                {
+                    "status": "not_found",
+                    "reason": "no_approved_learned_language_match",
+                    "query": query,
+                    "instruction": "没有已审核知识支持该解释；不要猜测，请明确告诉用户暂时不知道。",
+                },
+                ensure_ascii=False,
+            )
+        _record_tool_execution(
+            event,
+            self.name,
+            source_domain="learned_language",
+            operation="lookup",
+        )
+        return json.dumps(
+            {"status": "success", "query": query, "results": results[:8]},
+            ensure_ascii=False,
+        )
+
+
+@dataclass
 class MemoryWriteCorrectionTool(FunctionTool[AstrAgentContext]):
     name: str = "memory_write_correction_tool"
     description: str = (
@@ -3475,6 +3627,7 @@ __all__ = [
     "CustomFaceCatalogQueryTool",
     "ConstructAtEventTool",
     "GroupSignTool",
+    "LearnedLanguageLookupTool",
     "MemeResonanceTool",
     "MemoryWriteCorrectionTool",
     "MessageEmojiLikeTool",

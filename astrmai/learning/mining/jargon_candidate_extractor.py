@@ -6,6 +6,7 @@ from typing import Any
 
 from ..dedup import normalize_jargon_term
 from .candidate_router import LearningCandidateRouter
+from .learning_evidence import build_evidence_bundle
 
 
 class JargonCandidateExtractor:
@@ -121,6 +122,7 @@ class JargonCandidateExtractor:
         contexts: dict[str, list[str]] = defaultdict(list)
         context_keys: dict[str, set[str]] = defaultdict(set)
         sender_keys: dict[str, set[str]] = defaultdict(set)
+        evidence_indexes: dict[str, list[int]] = defaultdict(list)
         existing = {self._normalize_token(item) for item in (existing_terms or set()) if self._normalize_token(item)}
         sender_tokens: set[str] = set()
         for message in messages or []:
@@ -154,6 +156,7 @@ class JargonCandidateExtractor:
                 accepted_tokens += 1
                 counts[token] += 1
                 context_keys[token].add(message_key)
+                evidence_indexes[token].append(message_index)
                 if sender_key:
                     sender_keys[token].add(sender_key)
                 if len(contexts[token]) < 4:
@@ -166,8 +169,7 @@ class JargonCandidateExtractor:
                 continue
             examples = contexts.get(token, [])
             activation = min(1.0, 0.45 + count * 0.15)
-            candidates.append(
-                {
+            payload = {
                     "content": token,
                     "raw_content": examples[0] if examples else token,
                     "count": count,
@@ -181,7 +183,15 @@ class JargonCandidateExtractor:
                     "classification_reason": "semantic_candidate",
                     "quality_tier": "high" if count >= 3 and len(sender_keys[token]) >= 2 else "medium",
                 }
+            payload.update(
+                build_evidence_bundle(
+                    group_id=group_id,
+                    messages=list(messages or []),
+                    matched_indexes=evidence_indexes.get(token, []),
+                    source_examples=examples,
+                )
             )
+            candidates.append(payload)
             existing.add(token)
         self.last_report = {
             "input_messages": len(messages or []),

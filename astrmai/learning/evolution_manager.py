@@ -23,6 +23,8 @@ from .dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint, normalize_jargo
 from .mining.expression_miner import ExpressionMiner
 from .mining.expression_results import PatternSaveReport
 from .mining.jargon_miner import JargonMiner
+from .mining.learning_evidence import merge_evidence_metadata
+from .mining.jargon_senses import merge_jargon_senses
 
 
 class EvolutionManager:
@@ -793,6 +795,17 @@ class EvolutionManager:
                         "classification_reason": self._field(pattern, "classification_reason", ""),
                         "quality_tier": self._field(pattern, "quality_tier", "review"),
                         "quality_flags": list(self._field(pattern, "quality_flags", []) or []),
+                        "evidence_version": self._field(pattern, "evidence_version", 2),
+                        "source_examples": list(self._field(pattern, "source_examples", []) or []),
+                        "source_message_ids": list(self._field(pattern, "source_message_ids", []) or []),
+                        "source_group_ids": list(self._field(pattern, "source_group_ids", []) or []),
+                        "context_windows": list(self._field(pattern, "context_windows", []) or []),
+                        "reply_relations": list(self._field(pattern, "reply_relations", []) or []),
+                        "support_count": int(self._field(pattern, "support_count", 0) or 0),
+                        "contradiction_count": int(self._field(pattern, "contradiction_count", 0) or 0),
+                        "contributor_count": int(self._field(pattern, "contributor_count", 0) or 0),
+                        "model_examples": list(self._field(pattern, "model_examples", []) or []),
+                        "evidence_digest": self._field(pattern, "evidence_digest", ""),
                         "mining_batch_id": mining_batch_id,
                         "source_ref": f"{source}:{mining_batch_id}:{self._field(pattern, 'candidate_id', '')}",
                     },
@@ -843,15 +856,6 @@ class EvolutionManager:
             existing = await store.get_by_dedup_key(dedup_key, include_inactive=True) if store else None
             existing_metadata = dict(getattr(existing, "metadata", {}) or {})
             existing_status = str(getattr(existing, "status", "") or "").strip().lower()
-            if existing_status == "active":
-                status = "active"
-                review_status = "approved"
-                visibility = "auto_and_tool"
-            elif existing_status == "rejected":
-                status = "rejected"
-                review_status = "rejected"
-            elif existing_status == "stale":
-                status = "stale"
             applied_batches = [
                 str(item)
                 for item in (existing_metadata.get("applied_mining_batch_ids") or [])
@@ -859,6 +863,55 @@ class EvolutionManager:
             ]
             if mining_batch_id and mining_batch_id in applied_batches:
                 continue
+            incoming_evidence = {
+                key: self._field(jargon, key, [] if key.endswith("s") else "")
+                for key in (
+                    "evidence_version",
+                    "source_examples",
+                    "source_message_ids",
+                    "source_group_ids",
+                    "context_windows",
+                    "reply_relations",
+                    "support_count",
+                    "contradiction_count",
+                    "contributor_count",
+                    "model_examples",
+                    "evidence_digest",
+                )
+            }
+            merged_evidence = merge_evidence_metadata(existing_metadata, incoming_evidence)
+            incoming_sense_payload = {
+                **incoming_evidence,
+                "meaning": meaning,
+                "scene": scene,
+                "confidence": confidence,
+                "review_status": review_status,
+                "examples": examples,
+            }
+            senses, incoming_sense_id, is_new_sense, sense_revision_reopened = merge_jargon_senses(
+                existing_metadata,
+                incoming_sense_payload,
+                group_id=str(group_id or ""),
+                record_status=existing_status,
+            )
+            stronger_new_evidence = (
+                bool(incoming_evidence.get("evidence_digest"))
+                and str(incoming_evidence.get("evidence_digest")) != str(existing_metadata.get("evidence_digest") or "")
+                and int(incoming_evidence.get("support_count") or 0) >= 2
+            )
+            if existing_status == "active":
+                status = "active"
+                review_status = "approved"
+                visibility = "auto_and_tool"
+            elif existing_status == "rejected" and (sense_revision_reopened or (is_new_sense and stronger_new_evidence)):
+                status = "review_pending"
+                review_status = "revision_needed"
+            elif existing_status == "rejected":
+                status = "rejected"
+                review_status = "rejected"
+            elif existing_status == "stale":
+                status = "review_pending" if stronger_new_evidence else "stale"
+                review_status = "revision_needed" if stronger_new_evidence else review_status
             aliases = [
                 str(item).strip()
                 for item in [
@@ -877,25 +930,44 @@ class EvolutionManager:
                 )
             )[:12]
             incoming_count = int(self._field(jargon, "count", 1) or 1)
+            approved_senses = [item for item in senses if str(item.get("review_status") or "") == "approved"]
+            primary_sense = approved_senses[0] if approved_senses else next(
+                (item for item in senses if str(item.get("sense_id") or "") == incoming_sense_id),
+                {},
+            )
+            primary_meaning = str(primary_sense.get("meaning") or meaning or existing_metadata.get("meaning") or "")
+            primary_scene = str(primary_sense.get("scene") or scene or existing_metadata.get("scene") or "")
             requests.append(
                 MemoryWriteRequest(
                     source="learning_jargon",
                     kind="jargon",
                     session_id=GLOBAL_JARGON_SESSION_ID,
                     content=str(getattr(existing, "content", "") or content),
-                    summary=meaning or str(getattr(existing, "summary", "") or content),
+                    summary=primary_meaning or str(getattr(existing, "summary", "") or content),
                     tags=["jargon", "learning"],
                     importance=min(1.0, max(0.35, activation_score)),
                     confidence=max(0.1, min(confidence or activation_score or 0.55, 1.0)),
                     metadata={
+                        **merged_evidence,
                         "raw_content": raw_content,
-                        "meaning": meaning or str(existing_metadata.get("meaning") or ""),
+                        "meaning": primary_meaning,
                         "confidence": max(confidence, float(existing_metadata.get("confidence") or 0.0)),
                         "activation_score": max(activation_score, float(existing_metadata.get("activation_score") or 0.0)),
-                        "examples": merged_examples,
+                        "examples": list(primary_sense.get("examples") or merged_examples)[:12],
+                        "model_examples": list(merged_evidence.get("model_examples") or [])[:12],
                         "aliases": list(dict.fromkeys(aliases))[:12],
-                        "scene": scene or str(existing_metadata.get("scene") or ""),
+                        "scene": primary_scene,
                         "review_status": review_status,
+                        "senses": senses,
+                        "sense_count": len(senses),
+                        "active_sense_count": len(approved_senses),
+                        "pending_sense_count": sum(
+                            1 for item in senses
+                            if str(item.get("review_status") or "") in {"review_pending", "revision_needed"}
+                        ),
+                        "last_candidate_sense_id": incoming_sense_id,
+                        "last_candidate_was_new_sense": is_new_sense,
+                        "sense_revision_reopened": sense_revision_reopened,
                         "candidate_origin": self._field(jargon, "candidate_origin", "jargon_miner"),
                         "classification": self._field(jargon, "classification", "jargon"),
                         "classification_reason": self._field(jargon, "classification_reason", ""),

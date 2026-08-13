@@ -21,6 +21,10 @@ class PromptRefiner:
     SOFT_BACKGROUND_MIN_SECTION_CHARS = 80
     SOFT_BACKGROUND_FAST_MODE_BUDGET = 0
     SOFT_BACKGROUND_NEAR_CONTEXT_BUDGET = 0
+    LEARNING_CONTEXT_BUDGET_CHARS = 300
+    LEARNING_CONTEXT_FAST_MODE_BUDGET = 180
+    LEARNING_CONTEXT_NEAR_CONTEXT_BUDGET = 200
+    LEARNING_CONTEXT_PRIORITY_ORDER = ("jargon", "expression")
     RUNTIME_GUIDANCE_MAX_CHARS = 360
     SOFT_BACKGROUND_PRIORITY_ORDER = (
         "cold_summary",
@@ -281,6 +285,63 @@ class PromptRefiner:
             "trimmed_sections": trimmed_sections,
             "rendered_chars": len(rendered),
             "skipped_reason": "" if rendered else "trimmed_to_empty",
+        }
+
+    def _render_learning_context_sections(
+        self,
+        prompt_envelope: PromptEnvelope,
+        *,
+        is_fast_mode: bool,
+        near_context_priority: bool,
+    ) -> tuple[str, dict[str, object]]:
+        budget = self.LEARNING_CONTEXT_BUDGET_CHARS
+        if is_fast_mode:
+            budget = self.LEARNING_CONTEXT_FAST_MODE_BUDGET
+        elif near_context_priority:
+            budget = self.LEARNING_CONTEXT_NEAR_CONTEXT_BUDGET
+        raw_sections = dict(getattr(prompt_envelope, "learning_context_sections", {}) or {})
+        jargon = str(raw_sections.get("jargon", "") or "").strip()
+        expression = str(raw_sections.get("expression", "") or "").strip()
+        if not jargon and not expression:
+            fallback = str(getattr(prompt_envelope, "learning_context_block", "") or "").strip()
+            if not fallback:
+                return "", {
+                    "budget_chars": budget,
+                    "trimmed_sections": [],
+                    "rendered_chars": 0,
+                    "skipped_reason": "empty",
+                    "model_visible_jargon": False,
+                    "model_visible_expression": False,
+                    "selected_jargon_chars": 0,
+                    "selected_expression_chars": 0,
+                }
+            jargon = fallback
+
+        trimmed: list[str] = []
+        kept_jargon = jargon
+        kept_expression = expression
+        separator = 2 if kept_jargon and kept_expression else 0
+        if len(kept_jargon) + separator + len(kept_expression) > budget and kept_expression:
+            remaining = max(0, budget - len(kept_jargon) - separator)
+            if remaining > 0:
+                kept_expression = self._truncate_soft_background_text(kept_expression, remaining)
+                trimmed.append("expression:truncated")
+            else:
+                kept_expression = ""
+                trimmed.append("expression")
+        rendered = "\n\n".join(part for part in (kept_jargon, kept_expression) if part)
+        if len(rendered) > budget:
+            rendered = self._truncate_soft_background_text(rendered, budget)
+            trimmed.append("jargon:truncated")
+        return rendered, {
+            "budget_chars": budget,
+            "trimmed_sections": trimmed,
+            "rendered_chars": len(rendered),
+            "skipped_reason": "" if rendered else "trimmed_to_empty",
+            "model_visible_jargon": bool(kept_jargon and rendered),
+            "model_visible_expression": bool(kept_expression and kept_expression in rendered),
+            "selected_jargon_chars": len(jargon),
+            "selected_expression_chars": len(expression),
         }
 
     def _render_memory_block_for_budget(
@@ -956,11 +1017,21 @@ class PromptRefiner:
             is_fast_mode=is_fast_mode,
             near_context_priority=near_context_priority,
         )
+        learning_context_block, learning_context_meta = self._render_learning_context_sections(
+            prompt_envelope,
+            is_fast_mode=is_fast_mode,
+            near_context_priority=near_context_priority,
+        )
         prompt_envelope.soft_background_block = soft_background_block
         prompt_envelope.soft_background_budget_chars = int(soft_background_meta.get("budget_chars", 0) or 0)
         prompt_envelope.soft_background_trimmed_sections = list(soft_background_meta.get("trimmed_sections", []) or [])
         prompt_envelope.soft_background_rendered_chars = int(soft_background_meta.get("rendered_chars", 0) or 0)
         prompt_envelope.soft_background_skipped_reason = str(soft_background_meta.get("skipped_reason", "") or "")
+        prompt_envelope.learning_context_block = learning_context_block
+        prompt_envelope.learning_context_budget_chars = int(learning_context_meta.get("budget_chars", 0) or 0)
+        prompt_envelope.learning_context_trimmed_sections = list(learning_context_meta.get("trimmed_sections", []) or [])
+        prompt_envelope.learning_context_rendered_chars = int(learning_context_meta.get("rendered_chars", 0) or 0)
+        prompt_envelope.learning_context_skipped_reason = str(learning_context_meta.get("skipped_reason", "") or "")
         if effective_proactive_recall:
             memory_decision.source = (
                 f"proactive_recall+{memory_decision.source}"
@@ -1095,10 +1166,39 @@ class PromptRefiner:
         set_extra = getattr(event, "set_extra", None)
         if callable(set_extra):
             set_extra("astrmai_context_dedup_stats", context_dedup_stats)
+            set_extra(
+                "astrmai_learning_context_trace",
+                {
+                    "mode": "fast" if is_fast_mode else "near" if near_context_priority else "normal",
+                    "budget_chars": prompt_envelope.learning_context_budget_chars,
+                    "rendered_chars": prompt_envelope.learning_context_rendered_chars,
+                    "trimmed_sections": list(prompt_envelope.learning_context_trimmed_sections),
+                    "skipped_reason": prompt_envelope.learning_context_skipped_reason,
+                    "has_jargon": bool((prompt_envelope.learning_context_sections or {}).get("jargon")),
+                    "has_expression": bool((prompt_envelope.learning_context_sections or {}).get("expression")),
+                    "model_visible_jargon": bool(learning_context_meta.get("model_visible_jargon", False)),
+                    "model_visible_expression": bool(learning_context_meta.get("model_visible_expression", False)),
+                    "selected_jargon_chars": int(learning_context_meta.get("selected_jargon_chars", 0) or 0),
+                    "selected_expression_chars": int(learning_context_meta.get("selected_expression_chars", 0) or 0),
+                },
+            )
         else:
             extras = getattr(event, "_extras", None)
             if isinstance(extras, dict):
                 extras["astrmai_context_dedup_stats"] = context_dedup_stats
+                extras["astrmai_learning_context_trace"] = {
+                    "mode": "fast" if is_fast_mode else "near" if near_context_priority else "normal",
+                    "budget_chars": prompt_envelope.learning_context_budget_chars,
+                    "rendered_chars": prompt_envelope.learning_context_rendered_chars,
+                    "trimmed_sections": list(prompt_envelope.learning_context_trimmed_sections),
+                    "skipped_reason": prompt_envelope.learning_context_skipped_reason,
+                    "has_jargon": bool((prompt_envelope.learning_context_sections or {}).get("jargon")),
+                    "has_expression": bool((prompt_envelope.learning_context_sections or {}).get("expression")),
+                    "model_visible_jargon": bool(learning_context_meta.get("model_visible_jargon", False)),
+                    "model_visible_expression": bool(learning_context_meta.get("model_visible_expression", False)),
+                    "selected_jargon_chars": int(learning_context_meta.get("selected_jargon_chars", 0) or 0),
+                    "selected_expression_chars": int(learning_context_meta.get("selected_expression_chars", 0) or 0),
+                }
 
         final_system_prompt = await self._resolve_visual_memory(system_prompt)
 
@@ -1191,6 +1291,14 @@ class PromptRefiner:
             sections.append(
                 "---记忆闪回（仅供内心参考，不要出现在回复正文中）---\n"
                 + "\n".join(part for part in memory_parts if part).strip()
+            )
+        if learning_context_block:
+            sections.append(
+                "---当前已学语言知识（黑话用于理解当前词义；表达仅轻量参考，不要机械模仿）---\n"
+                + PromptEnvelope.sanitize_derived_context(
+                    learning_context_block,
+                    source="learned_language",
+                )
             )
         if soft_background_block:
             sections.append(

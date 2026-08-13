@@ -90,6 +90,9 @@ class ExpressionPatternEnricher:
                     "distinct_turn_count": int(item.get("distinct_turn_count") or len(item.get("evidence_message_ids") or [])),
                     "count": int(item.get("count") or 1),
                     "samples": list(item.get("content_samples") or [])[:4],
+                    "source_message_ids": list(item.get("source_message_ids") or [])[:12],
+                    "support_count": int(item.get("support_count") or 0),
+                    "contributor_count": int(item.get("contributor_count") or 0),
                 }
             )
         prompt = (
@@ -157,7 +160,8 @@ class ExpressionPatternEnricher:
         allowed_habit_types = {"catchphrase", "particle", "sentence_pattern", "ending", "symbol", "rhythm"}
         payload["habit_type"] = habit_type if habit_type in allowed_habit_types else "sentence_pattern"
         model_samples = [str(sample).strip() for sample in extra.get("content_samples", []) if str(sample).strip()]
-        payload["content_samples"] = list(dict.fromkeys([*(payload.get("content_samples") or []), *model_samples]))[:6]
+        payload["model_examples"] = list(dict.fromkeys([*(payload.get("model_examples") or []), *model_samples]))[:6]
+        payload["content_samples"] = list(payload.get("source_examples") or payload.get("content_samples") or [])[:12]
         return payload if payload["expression"] and payload["summary"] else None
 
     async def enrich(self, group_id: str, candidates: list[dict[str, Any]]) -> ExpressionEnrichmentResult:

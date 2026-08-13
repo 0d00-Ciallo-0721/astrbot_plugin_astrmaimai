@@ -1052,7 +1052,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertIn("我现在心情", envelope.situational_context_block)
         self.assertEqual(_proactive_recall, "")
 
-    def test_context_engine_moves_stable_expression_and_jargon_into_soft_background(self):
+    def test_context_engine_moves_stable_expression_and_jargon_into_learning_context(self):
         summarizer = SimpleNamespace(
             gateway=SimpleNamespace(
                 config=SimpleNamespace(memory=SimpleNamespace(auto_recall_probability=0.0)),
@@ -1092,9 +1092,11 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertNotIn("我会先回应眼前这条消息，不突然另起话题。", system_prompt)
         self.assertNotIn("我会优先回应当前这条消息，不突然另起话题。", system_prompt)
         self.assertNotIn("群里最近会说：摸了、开摆", system_prompt)
-        self.assertIn("Use short fragments.", envelope.soft_background_block)
-        self.assertIn("黑话说明：DDL 指截止时间", envelope.soft_background_block)
-        self.assertIn("Keep this turn short; avoid another long reply.", envelope.soft_background_block)
+        self.assertIn("Use short fragments.", envelope.learning_context_block)
+        self.assertIn("黑话说明：DDL 指截止时间", envelope.learning_context_block)
+        self.assertIn("Keep this turn short; avoid another long reply.", envelope.learning_context_block)
+        self.assertNotIn("Use short fragments.", envelope.soft_background_block)
+        self.assertNotIn("黑话说明：DDL 指截止时间", envelope.soft_background_block)
         self.assertIn("群里最近会说：摸了、开摆", envelope.situational_context_block)
         self.assertNotIn("Keep this turn short; avoid another long reply.", envelope.situational_context_block)
         self.assertIn("我会先回应眼前这条消息，不突然另起话题。", envelope.planner_runtime_instruction_block)
@@ -1135,7 +1137,7 @@ class PersonaContextRefactorTests(unittest.TestCase):
         )
 
         self.assertNotIn("Keep this turn short; avoid another long reply.", system_prompt)
-        self.assertIn("Keep this turn short; avoid another long reply.", envelope.soft_background_block)
+        self.assertIn("Keep this turn short; avoid another long reply.", envelope.learning_context_block)
         self.assertNotIn("Keep this turn short; avoid another long reply.", envelope.situational_context_block)
         self.assertIn("群里最近会说：摸了、开摆", envelope.situational_context_block)
 
@@ -1175,8 +1177,8 @@ class PersonaContextRefactorTests(unittest.TestCase):
 
         self.assertNotIn("legacy habit", system_prompt)
         self.assertNotIn("legacy jargon", system_prompt)
-        self.assertIn("legacy habit", envelope.soft_background_block)
-        self.assertIn("legacy jargon", envelope.soft_background_block)
+        self.assertIn("legacy habit", envelope.learning_context_block)
+        self.assertIn("legacy jargon", envelope.learning_context_block)
         self.assertIn("legacy slang", envelope.situational_context_block)
         self.assertNotIn("legacy slang", system_prompt)
 
@@ -1221,10 +1223,10 @@ class PersonaContextRefactorTests(unittest.TestCase):
         self.assertNotIn("new jargon", system_prompt)
         self.assertNotIn("legacy habit", system_prompt)
         self.assertNotIn("legacy jargon", system_prompt)
-        self.assertIn("new habit", envelope.soft_background_block)
-        self.assertIn("new jargon", envelope.soft_background_block)
-        self.assertNotIn("legacy habit", envelope.soft_background_block)
-        self.assertNotIn("legacy jargon", envelope.soft_background_block)
+        self.assertIn("new habit", envelope.learning_context_block)
+        self.assertIn("new jargon", envelope.learning_context_block)
+        self.assertNotIn("legacy habit", envelope.learning_context_block)
+        self.assertNotIn("legacy jargon", envelope.learning_context_block)
         self.assertIn("new slang", envelope.situational_context_block)
         self.assertNotIn("legacy slang", envelope.situational_context_block)
 

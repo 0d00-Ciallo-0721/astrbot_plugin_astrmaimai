@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...learning.dedup import expression_fingerprint, normalize_expression_text
+from ...learning.mining.learning_evidence import merge_evidence_metadata
 from ..contracts.memory_query import MemoryCandidate, MemoryWriteRequest
 from .v2_store import MemoryV2Store
 
@@ -478,7 +479,42 @@ class ExpressionPatternService:
         if existing and mining_batch_id and mining_batch_id in applied_batch_ids:
             return str(existing.id)
         incoming_review_status = self._normalize_incoming_review_status(payload.get("review_status", "pending"), source=source)
-        review_status = self._merge_review_status(existing_metadata.get("review_status", ""), incoming_review_status)
+        incoming_evidence = {
+            key: payload.get(key)
+            for key in (
+                "evidence_version",
+                "source_examples",
+                "source_message_ids",
+                "source_group_ids",
+                "context_windows",
+                "reply_relations",
+                "support_count",
+                "contradiction_count",
+                "contributor_count",
+                "model_examples",
+                "evidence_digest",
+            )
+            if payload.get(key) not in (None, "")
+        }
+        merged_evidence = merge_evidence_metadata(existing_metadata, incoming_evidence)
+        old_review_status = str(existing_metadata.get("review_status") or "").strip().lower()
+        old_digest = str(existing_metadata.get("evidence_digest") or "").strip()
+        new_digest = str(incoming_evidence.get("evidence_digest") or "").strip()
+        old_support = int(existing_metadata.get("support_count") or 0)
+        incoming_support = int(incoming_evidence.get("support_count") or 0)
+        incoming_contributors = int(incoming_evidence.get("contributor_count") or 0)
+        revision_reopened = (
+            old_review_status == "rejected"
+            and bool(new_digest)
+            and new_digest != old_digest
+            and incoming_support >= max(old_support + 1, 3)
+            and incoming_contributors >= 2
+        )
+        review_status = (
+            "revision_needed"
+            if revision_reopened
+            else self._merge_review_status(old_review_status, incoming_review_status)
+        )
         merged_samples = self._sample_list([*self._sample_list(existing_metadata.get("content_samples", [])), *incoming_samples])
         incoming_count = max(int(payload.get("count") or 1), 1)
         if existing and mining_batch_id in applied_batch_ids:
@@ -502,6 +538,7 @@ class ExpressionPatternService:
         status = self._canonical_status(review_status)
         metadata = {
             **existing_metadata,
+            **merged_evidence,
             "situation": situation,
             "style": str(payload.get("style") or existing_metadata.get("style") or "").strip(),
             "habit_type": habit_type,
@@ -541,6 +578,10 @@ class ExpressionPatternService:
                 dict.fromkeys([*applied_batch_ids, *([mining_batch_id] if mining_batch_id else [])])
             )[-128:],
         }
+        if revision_reopened:
+            metadata["revision_of"] = str(getattr(existing, "id", "") or "")
+            metadata["previous_evidence_digest"] = old_digest
+            metadata["revision_reopened_at"] = now
         for legacy_key in ("speaker_id", "speaker_name", "evidence_message_ids"):
             metadata.pop(legacy_key, None)
         if payload.get("legacy_pattern_id"):

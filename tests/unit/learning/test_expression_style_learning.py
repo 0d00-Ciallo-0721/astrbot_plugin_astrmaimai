@@ -99,8 +99,11 @@ class ExpressionStyleLearningTests(unittest.TestCase):
             SimpleNamespace(id=1, sender_id="alice", content="好呀", timestamp=100.0),
             SimpleNamespace(id=2, sender_id="alice", content="知道呀", timestamp=102.0),
             SimpleNamespace(id=3, sender_id="alice", content="来啦", timestamp=104.0),
-            SimpleNamespace(id=4, sender_id="alice", content="(≧ω≦)♡", timestamp=106.0),
-            SimpleNamespace(id=5, sender_id="alice", content="(≧ω≦)♡", timestamp=108.0),
+            SimpleNamespace(id=4, sender_id="bob", content="好呀", timestamp=200.0),
+            SimpleNamespace(id=5, sender_id="bob", content="知道呀", timestamp=202.0),
+            SimpleNamespace(id=6, sender_id="bob", content="来啦", timestamp=204.0),
+            SimpleNamespace(id=7, sender_id="alice", content="(≧ω≦)♡", timestamp=206.0),
+            SimpleNamespace(id=8, sender_id="alice", content="(≧ω≦)♡", timestamp=208.0),
         ]
 
         result = asyncio.run(extractor.extract("group-1", messages))
@@ -108,6 +111,17 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         self.assertTrue(any(item["expression"] == "呀" and item["habit_type"] == "ending" for item in result))
         self.assertTrue(any(item["expression"] == "(≧ω≦)♡" and item["habit_type"] == "symbol" for item in result))
         self.assertTrue(any(item["candidate_type"] == "rhythm" and item["habit_type"] == "rhythm" for item in result))
+
+    def test_multi_user_traffic_is_not_mislearned_as_one_person_reply_rhythm(self):
+        extractor = ExpressionCandidateExtractor(min_count=2)
+        messages = [
+            SimpleNamespace(id=index, sender_id=f"user-{index}", content="好呀", timestamp=100.0 + index)
+            for index in range(1, 8)
+        ]
+
+        result = asyncio.run(extractor.extract("group-1", messages))
+
+        self.assertFalse(any(item.get("candidate_type") == "rhythm" for item in result))
 
     def test_enricher_keeps_original_expression_and_rejects_topic_content(self):
         class Gateway:

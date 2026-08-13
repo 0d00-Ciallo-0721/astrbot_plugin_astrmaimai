@@ -464,6 +464,85 @@ class PromptRefinerFocusLayoutPortedTests(unittest.TestCase):
         self.assertEqual(envelope.soft_background_skipped_reason, "fast_mode")
         self.assertEqual(envelope.soft_background_rendered_chars, 0)
 
+    def test_refiner_keeps_learned_jargon_in_fast_mode(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=False)),
+            react_retriever=None,
+        )
+        event = _FakeEvent()
+        event._extras["retrieve_keys"] = ["CORE_ONLY"]
+        event._extras["astrmai_prompt_envelope"] = PromptEnvelope(
+            raw_user_text="Alice: DDL 是什么？",
+            focus_message_text="Alice: DDL 是什么？",
+            direct_context_text="Focus block",
+            focus_reason="reply_to_bot",
+            focus_thread_reason="reply_to_bot",
+            soft_background_sections={"cold_summary": "应该被快速模式丢弃的旧话题"},
+            learning_context_sections={
+                "jargon": "全局黑话参考：DDL 指截止时间",
+                "expression": "语言习惯参考：句尾偶尔使用呀",
+            },
+        )
+
+        async def _run():
+            return await refiner.refine_prompt(
+                event=event,
+                system_prompt="system prompt only",
+                prompt="wrapped prompt",
+                context={"disable_rag_injection": True},
+            )
+
+        _system_prompt, final_prompt = asyncio.run(_run())
+        envelope = event.get_extra("astrmai_prompt_envelope")
+        self.assertNotIn("应该被快速模式丢弃的旧话题", final_prompt)
+        self.assertIn("DDL 指截止时间", final_prompt)
+        self.assertIn("---当前已学语言知识", final_prompt)
+        self.assertGreater(envelope.learning_context_rendered_chars, 0)
+        learning_trace = event.get_extra("astrmai_learning_context_trace")
+        self.assertEqual(learning_trace["mode"], "fast")
+        self.assertTrue(learning_trace["model_visible_jargon"])
+        self.assertTrue(learning_trace["model_visible_expression"])
+        self.assertGreater(learning_trace["selected_jargon_chars"], 0)
+
+    def test_refiner_prioritizes_jargon_over_expression_when_learning_budget_is_tight(self):
+        refiner = self.prompt_refiner_mod.PromptRefiner(
+            memory_engine=None,
+            config=SimpleNamespace(memory=SimpleNamespace(enable_react_agent=False)),
+            react_retriever=None,
+        )
+        event = _FakeEvent()
+        event._extras["retrieve_keys"] = ["CORE_ONLY"]
+        event._extras["astrmai_prompt_envelope"] = PromptEnvelope(
+            raw_user_text="Alice: DDL？",
+            focus_message_text="Alice: DDL？",
+            learning_context_sections={
+                "jargon": "DDL=截止时间。" + ("J" * 120),
+                "expression": "表达习惯：" + ("E" * 180),
+            },
+        )
+
+        async def _run():
+            return await refiner.refine_prompt(
+                event=event,
+                system_prompt="system prompt only",
+                prompt="wrapped prompt",
+                context={"disable_rag_injection": True},
+            )
+
+        _system_prompt, final_prompt = asyncio.run(_run())
+        envelope = event.get_extra("astrmai_prompt_envelope")
+        self.assertIn("DDL=截止时间", final_prompt)
+        self.assertIn("expression", " ".join(envelope.learning_context_trimmed_sections))
+        learning_trace = event.get_extra("astrmai_learning_context_trace")
+        self.assertTrue(learning_trace["model_visible_jargon"])
+        self.assertTrue(learning_trace["model_visible_expression"])
+        self.assertIn("expression:truncated", learning_trace["trimmed_sections"])
+        self.assertLessEqual(
+            envelope.learning_context_rendered_chars,
+            self.prompt_refiner_mod.PromptRefiner.LEARNING_CONTEXT_FAST_MODE_BUDGET,
+        )
+
     def test_refiner_skips_soft_background_when_near_context_priority(self):
         refiner = self.prompt_refiner_mod.PromptRefiner(
             memory_engine=None,

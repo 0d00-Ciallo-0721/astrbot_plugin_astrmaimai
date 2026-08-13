@@ -300,6 +300,47 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
         self.assertEqual(request.visibility, "auto_and_tool")
         self.assertEqual(request.metadata["review_status"], "approved")
 
+    def test_rejected_pattern_reopens_when_new_group_evidence_is_stronger(self):
+        store = _Store()
+        writer = _WriteService(store)
+        service = ExpressionPatternService(store, writer)
+        payload = {
+            **_candidate("expr-revision", count=3),
+            "habit_type": "catchphrase",
+            "review_status": "pending_human",
+            "source_examples": ["唉嘿嘿", "唉嘿嘿～", "唉嘿嘿呀"],
+            "source_message_ids": ["11", "12", "13"],
+            "source_group_ids": ["chat-1"],
+            "support_count": 3,
+            "contributor_count": 2,
+            "evidence_digest": "new-evidence",
+        }
+        dedup_key = service.build_dedup_key(
+            "chat-1",
+            payload["situation"],
+            payload["expression"],
+            "chat-1",
+            payload["habit_type"],
+        )
+        store.by_key[dedup_key] = SimpleNamespace(
+            id="mem-rejected",
+            content=payload["expression"],
+            metadata={
+                "review_status": "rejected",
+                "support_count": 1,
+                "source_message_ids": ["1"],
+                "evidence_digest": "old-evidence",
+            },
+        )
+
+        asyncio.run(service.write_pattern("chat-1", payload))
+        request = writer.calls[-1]
+
+        self.assertEqual(request.status, "review_pending")
+        self.assertEqual(request.metadata["review_status"], "revision_needed")
+        self.assertEqual(request.metadata["source_message_ids"], ["1", "11", "12", "13"])
+        self.assertEqual(request.metadata["model_examples"], [])
+
     def test_pattern_write_discards_personal_evidence_and_preserves_habit_metadata(self):
         store = _Store()
         writer = _WriteService(store)

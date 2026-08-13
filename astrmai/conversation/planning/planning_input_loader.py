@@ -356,11 +356,25 @@ class PlanningInputLoader:
                 text = str(item.get("text") or item.get("content") or "").strip()
                 meaning = str(item.get("meaning") or item.get("summary") or "").strip()
                 scene = str(item.get("situation") or item.get("scene") or "").strip()
+                selected_senses = list(item.get("selected_senses") or [])
             else:
                 text = str(getattr(item, "content", "") or "").strip()
                 metadata = dict(getattr(item, "metadata", {}) or {})
                 meaning = str(metadata.get("meaning") or getattr(item, "summary", "") or "").strip()
                 scene = str(metadata.get("scene") or "").strip()
+                selected_senses = list(metadata.get("selected_senses") or [])
+            if text and selected_senses:
+                for sense in selected_senses:
+                    sense_meaning = str(sense.get("meaning") or "").strip()
+                    if not sense_meaning:
+                        continue
+                    line = f"{text} -> {sense_meaning}"
+                    sense_scene = str(sense.get("scene") or "").strip()
+                    if sense_scene:
+                        line += f" (scene: {sense_scene})"
+                    if line not in lines:
+                        lines.append(line)
+                continue
             if not text or not meaning:
                 continue
             line = f"{text} -> {meaning}"
@@ -375,20 +389,20 @@ class PlanningInputLoader:
         policy = getattr(retrieval_service, "jargon_policy", None) if retrieval_service else None
         if not policy:
             return ""
-        current_text = str(
-            getattr(event, "message_str", "")
-            or (
-                getattr(prompt_envelope, "raw_user_text", "")
-                if isinstance(prompt_envelope, PromptEnvelope)
-                else ""
+        query_parts = []
+        if isinstance(prompt_envelope, PromptEnvelope):
+            query_parts.extend(
+                (
+                    getattr(prompt_envelope, "raw_user_text", ""),
+                    getattr(prompt_envelope, "focus_message_text", ""),
+                )
             )
-            or (
-                getattr(prompt_envelope, "focus_message_text", "")
-                if isinstance(prompt_envelope, PromptEnvelope)
-                else ""
-            )
-            or (window_lines[-1] if window_lines else "")
-        ).strip()
+        query_parts.append(getattr(event, "message_str", ""))
+        if not any(str(part or "").strip() for part in query_parts):
+            query_parts.extend(window_lines[-1:])
+        current_text = "\n".join(
+            dict.fromkeys(str(part or "").strip() for part in query_parts if str(part or "").strip())
+        )
         if not current_text:
             return ""
         trace: dict[str, Any] = {}

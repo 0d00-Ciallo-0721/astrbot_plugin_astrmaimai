@@ -100,6 +100,12 @@ class PromptEnvelope:
     soft_background_trimmed_sections: list[str] = field(default_factory=list)
     soft_background_rendered_chars: int = 0
     soft_background_skipped_reason: str = ""
+    learning_context_block: str = ""
+    learning_context_sections: dict[str, str] = field(default_factory=dict)
+    learning_context_budget_chars: int = 0
+    learning_context_trimmed_sections: list[str] = field(default_factory=list)
+    learning_context_rendered_chars: int = 0
+    learning_context_skipped_reason: str = ""
     flex_context_budget_chars: int = 0
     flex_context_trimmed_sections: list[str] = field(default_factory=list)
     flex_context_protected_sections: list[str] = field(default_factory=list)

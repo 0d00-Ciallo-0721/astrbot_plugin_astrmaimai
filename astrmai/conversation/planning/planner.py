@@ -1092,6 +1092,59 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             memory_funnel = event.get_extra("astrmai_memory_funnel", {})
             if isinstance(memory_funnel, dict):
                 item["memory_funnel"] = dict(memory_funnel)
+            learning_trace = event.get_extra("astrmai_learning_context_trace", {})
+            expression_trace = event.get_extra("astrmai_expression_pattern_trace", None)
+            jargon_trace = event.get_extra("astrmai_jargon_route_trace", {})
+            if isinstance(learning_trace, dict):
+                expression_ids = list(getattr(expression_trace, "selected_ids", []) or [])
+                if isinstance(expression_trace, dict):
+                    expression_ids = list(expression_trace.get("selected_ids", []) or [])
+                jargon_ids = (
+                    list(jargon_trace.get("selected_ids", []) or [])
+                    if isinstance(jargon_trace, dict)
+                    else []
+                )
+                matched_terms = (
+                    list(jargon_trace.get("matched_terms", []) or [])
+                    if isinstance(jargon_trace, dict)
+                    else []
+                )
+                learning_observation = {
+                    "mode": str(learning_trace.get("mode", "") or ""),
+                    "budget_chars": int(learning_trace.get("budget_chars", 0) or 0),
+                    "rendered_chars": int(learning_trace.get("rendered_chars", 0) or 0),
+                    "selected_jargon_chars": int(learning_trace.get("selected_jargon_chars", 0) or 0),
+                    "selected_expression_chars": int(learning_trace.get("selected_expression_chars", 0) or 0),
+                    "trimmed_sections": [
+                        str(value)
+                        for value in list(learning_trace.get("trimmed_sections", []) or [])[:8]
+                    ],
+                    "skipped_reason": str(learning_trace.get("skipped_reason", "") or ""),
+                    "jargon_selected_ids": [str(value) for value in jargon_ids[:12]],
+                    "expression_selected_ids": [str(value) for value in expression_ids[:12]],
+                    "jargon_selected_count": len(jargon_ids),
+                    "expression_selected_count": len(expression_ids),
+                    "jargon_matched_term_count": len(matched_terms),
+                    "jargon_route_injected": bool(
+                        jargon_trace.get("injected", False)
+                        if isinstance(jargon_trace, dict)
+                        else False
+                    ),
+                    "model_visible_jargon": bool(learning_trace.get("model_visible_jargon", False)),
+                    "model_visible_expression": bool(learning_trace.get("model_visible_expression", False)),
+                }
+                learning_observation["selected_but_not_rendered"] = bool(
+                    (jargon_ids or expression_ids)
+                    and not (
+                        learning_observation["model_visible_jargon"]
+                        or learning_observation["model_visible_expression"]
+                    )
+                )
+                if any(
+                    value not in ("", 0, False, None, [], {})
+                    for value in learning_observation.values()
+                ):
+                    item["learning_context_observation"] = learning_observation
             topic_observation = {
                 "preview_source": str(event.get_extra("astrmai_topic_preview_source", "") or ""),
                 "preview_kind": str(event.get_extra("astrmai_topic_preview_kind", "") or ""),

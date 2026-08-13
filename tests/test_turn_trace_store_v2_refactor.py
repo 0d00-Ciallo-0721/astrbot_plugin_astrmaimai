@@ -165,3 +165,38 @@ def test_late_duplicate_snapshot_does_not_erase_vision_observation(tmp_path):
     assert len(items) == 1
     assert items[0]["vision_observation"]["vision_path"] == "direct"
     assert items[0]["vision_observation"]["vision_call_status"] == "success"
+
+
+def test_late_duplicate_snapshot_does_not_erase_learning_context_observation(tmp_path):
+    store = TurnTraceSampleStore(tmp_path, max_per_chat=5, max_global=10)
+
+    async def run():
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 1.0,
+                "turn_id": "turn-learning",
+                "status": "executed",
+                "learning_context_observation": {
+                    "mode": "fast",
+                    "jargon_selected_count": 1,
+                    "model_visible_jargon": True,
+                },
+            }
+        )
+        await store.append(
+            {
+                "chat_id": "chat-a",
+                "created_at": 2.0,
+                "turn_id": "turn-learning",
+                "status": "duplicate_blocked",
+                "learning_context_observation": {},
+            }
+        )
+        return await store.recent(chat_id="chat-a", limit=5)
+
+    items = asyncio.run(run())
+
+    assert len(items) == 1
+    assert items[0]["learning_context_observation"]["mode"] == "fast"
+    assert items[0]["learning_context_observation"]["model_visible_jargon"] is True

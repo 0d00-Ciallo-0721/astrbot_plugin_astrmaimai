@@ -161,6 +161,45 @@ class ExecutedTraceFieldContractTests(unittest.TestCase):
         self.assertEqual(item["visual_memory_ids"], ["vm_opaque"])
         self.assertNotIn("原始图片描述", str(item["vision_observation"]))
 
+    def test_learning_context_observation_records_selection_and_model_visibility(self):
+        event = self._executed_event()
+        event.set_extra(
+            "astrmai_learning_context_trace",
+            {
+                "mode": "fast",
+                "budget_chars": 180,
+                "rendered_chars": 42,
+                "selected_jargon_chars": 30,
+                "selected_expression_chars": 40,
+                "trimmed_sections": ["expression"],
+                "model_visible_jargon": True,
+                "model_visible_expression": False,
+            },
+        )
+        event.set_extra(
+            "astrmai_jargon_route_trace",
+            {
+                "selected_ids": ["mem-jargon-1"],
+                "matched_terms": ["不应进入 trace 的原始词"],
+                "injected": True,
+            },
+        )
+        event.set_extra(
+            "astrmai_expression_pattern_trace",
+            type("Trace", (), {"selected_ids": ["mem-expression-1"]})(),
+        )
+
+        item = self._build(event)
+        observation = item["learning_context_observation"]
+
+        self.assertEqual(observation["mode"], "fast")
+        self.assertEqual(observation["jargon_selected_ids"], ["mem-jargon-1"])
+        self.assertEqual(observation["expression_selected_ids"], ["mem-expression-1"])
+        self.assertEqual(observation["jargon_matched_term_count"], 1)
+        self.assertTrue(observation["model_visible_jargon"])
+        self.assertFalse(observation["model_visible_expression"])
+        self.assertNotIn("原始词", str(observation))
+
     def test_decision_observation_present_for_every_status(self):
         for status in ("executed", "skipped_wait", "skipped_ignore", "stale_drop"):
             with self.subTest(status=status):

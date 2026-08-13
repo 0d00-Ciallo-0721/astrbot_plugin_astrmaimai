@@ -23,7 +23,9 @@ class JargonEnricher:
         normalized = str(value or "").strip().lower()
         if normalized == "active":
             return "review_pending"
-        if normalized in {"review_pending", "pending_human", "rejected"}:
+        if normalized in {"review_pending", "pending_human"}:
+            return "review_pending"
+        if normalized == "rejected":
             return normalized
         return "review_pending"
 
@@ -39,6 +41,10 @@ class JargonEnricher:
                     "raw_context": str(item.get("raw_content") or ""),
                     "examples": list(item.get("examples") or [])[:3],
                     "count": int(item.get("count") or 1),
+                    "source_message_ids": list(item.get("source_message_ids") or [])[:12],
+                    "context_windows": list(item.get("context_windows") or [])[:4],
+                    "support_count": int(item.get("support_count") or 0),
+                    "contributor_count": int(item.get("contributor_count") or 0),
                 }
             )
         prompt = (
@@ -47,7 +53,9 @@ class JargonEnricher:
             "人名/昵称、作品名等专有名词，普通词汇，命令名，机器人或插件输出也必须拒绝。"
             "返回 JSON：{\"items\":[{\"index\":1,\"meaning\":\"...\",\"scene\":\"...\","
             "\"confidence\":0.0,\"is_jargon\":true,\"term_type\":\"jargon|expression_style|proper_name|common_word|plugin_output\","
-            "\"semantic_novelty\":true,\"review_status\":\"review_pending|pending_human|rejected\","
+            "\"semantic_novelty\":true,\"evidence_sufficient\":true,"
+            "\"supported_by\":[\"真实消息ID\"],\"contradicted_by\":[\"真实消息ID\"],"
+            "\"review_status\":\"review_pending|pending_human|rejected\","
             "\"aliases\":[\"...\"],\"examples\":[\"...\"]}]}\n"
             f"候选：{json.dumps(prompt_items, ensure_ascii=False)}"
         )
@@ -126,8 +134,37 @@ class JargonEnricher:
             payload["semantic_novelty"] = bool(extra.get("semantic_novelty", payload["is_jargon"]))
             payload["aliases"] = [str(alias).strip() for alias in extra.get("aliases", []) if str(alias).strip()][:5]
             model_examples = [str(example).strip() for example in extra.get("examples", []) if str(example).strip()]
-            payload["examples"] = list(dict.fromkeys([*payload.get("examples", []), *model_examples]))[:5]
+            payload["model_examples"] = list(dict.fromkeys([*(payload.get("model_examples") or []), *model_examples]))[:5]
+            payload["examples"] = list(payload.get("source_examples") or payload.get("examples") or [])[:12]
+            valid_source_ids = {
+                str(source_id)
+                for source_id in (payload.get("source_message_ids") or [])
+                if str(source_id).strip()
+            }
+            payload["supported_by"] = list(
+                dict.fromkeys(
+                    str(source_id)
+                    for source_id in (extra.get("supported_by") or [])
+                    if str(source_id) in valid_source_ids
+                )
+            )
+            payload["contradicted_by"] = list(
+                dict.fromkeys(
+                    str(source_id)
+                    for source_id in (extra.get("contradicted_by") or [])
+                    if str(source_id) in valid_source_ids
+                )
+            )
+            payload["support_count"] = len(payload["supported_by"])
+            payload["contradiction_count"] = len(payload["contradicted_by"])
+            payload["evidence_sufficient"] = bool(
+                extra.get("evidence_sufficient", False)
+                and int(payload.get("context_count") or 0) >= 2
+                and payload["support_count"] >= 2
+            )
             payload["review_status"] = self._normalize_review_status(extra.get("review_status") or "")
+            if payload["contradiction_count"] or not payload["evidence_sufficient"]:
+                payload["review_status"] = "review_pending"
             if (
                 payload["is_jargon"]
                 and payload["meaning"]

@@ -6,6 +6,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
+from .learning_evidence import build_evidence_bundle, message_evidence_id
+
 
 class ExpressionCandidateExtractor:
     NOISE_MESSAGES = {
@@ -66,19 +68,7 @@ class ExpressionCandidateExtractor:
 
     @staticmethod
     def _message_evidence_id(message: Any, *, fallback_index: int) -> str:
-        raw_id = getattr(message, "id", None)
-        if raw_id is not None and str(raw_id).strip():
-            return str(raw_id)
-        payload = "|".join(
-            (
-                str(getattr(message, "group_id", "") or ""),
-                str(getattr(message, "sender_id", "") or ""),
-                str(getattr(message, "timestamp", "") or ""),
-                str(getattr(message, "content", "") or ""),
-                str(fallback_index),
-            )
-        )
-        return f"synthetic:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
+        return message_evidence_id(message, fallback_index=fallback_index)
 
     @staticmethod
     def _candidate_id(group_id: str, candidate_type: str, normalized_expression: str, scope_id: str = "") -> str:
@@ -276,6 +266,7 @@ class ExpressionCandidateExtractor:
         turn_keys: dict[str, set[str]] = defaultdict(set)
         day_keys: dict[str, set[str]] = defaultdict(set)
         contributor_keys: dict[str, set[str]] = defaultdict(set)
+        evidence_indexes: dict[str, list[int]] = defaultdict(list)
         existing: set[str] = set()
         for raw_item in existing_patterns or set():
             if isinstance(raw_item, tuple) and len(raw_item) == 2:
@@ -288,9 +279,8 @@ class ExpressionCandidateExtractor:
         phrase_turn_keys: dict[str, set[str]] = defaultdict(set)
         phrase_day_keys: dict[str, set[str]] = defaultdict(set)
         phrase_contributors: dict[str, set[str]] = defaultdict(set)
-        group_messages: list[tuple[int, str, str, float | None]] = []
-        group_days: set[str] = set()
-        group_contributors: set[str] = set()
+        phrase_evidence_indexes: dict[str, list[int]] = defaultdict(list)
+        messages_by_contributor: dict[str, list[tuple[int, str, str, float | None, str]]] = defaultdict(list)
         accepted_messages = 0
         skipped_noise = 0
         skipped_existing = 0
@@ -313,9 +303,9 @@ class ExpressionCandidateExtractor:
             message_day = self._message_day(message, fallback_index=message_index)
             accepted_messages += 1
             evidence_id = self._message_evidence_id(message, fallback_index=message_index)
-            group_messages.append((message_index, content, evidence_id, self._message_timestamp(message)))
-            group_days.add(message_day)
-            group_contributors.add(speaker_identity)
+            messages_by_contributor[speaker_identity].append(
+                (message_index, content, evidence_id, self._message_timestamp(message), message_day)
+            )
             if self._is_expression_candidate(content, exact=True):
                 quality_reason = self._candidate_quality_rejection_reason(content, exact=True)
                 if quality_reason:
@@ -326,6 +316,7 @@ class ExpressionCandidateExtractor:
                     turn_keys[normalized].add(evidence_id)
                     day_keys[normalized].add(message_day)
                     contributor_keys[normalized].add(speaker_identity)
+                    evidence_indexes[normalized].append(message_index)
                     if len(samples[normalized]) < 4:
                         samples[normalized].append(content[:160])
                     situations.setdefault(normalized, self._infer_situation(content))
@@ -338,6 +329,7 @@ class ExpressionCandidateExtractor:
                 phrase_turn_keys[normalized_phrase].add(evidence_id)
                 phrase_day_keys[normalized_phrase].add(message_day)
                 phrase_contributors[normalized_phrase].add(speaker_identity)
+                phrase_evidence_indexes[normalized_phrase].append(message_index)
                 if len(phrase_samples[normalized_phrase]) < 4:
                     phrase_samples[normalized_phrase].append(content[:160])
 
@@ -350,8 +342,7 @@ class ExpressionCandidateExtractor:
             content_samples = list(samples.get(normalized, []))
             expression = content_samples[0] if content_samples else normalized
             activation_score = min(1.0, 0.4 + count * 0.18)
-            candidates.append(
-                {
+            payload = {
                     "group_id": group_id,
                     "shared_scope": group_id,
                     "scope_kind": "group",
@@ -375,7 +366,15 @@ class ExpressionCandidateExtractor:
                     "quality_tier": "high" if count >= 3 else "medium",
                     "candidate_id": self._candidate_id(group_id, "exact", normalized),
                 }
+            payload.update(
+                build_evidence_bundle(
+                    group_id=group_id,
+                    messages=list(messages or []),
+                    matched_indexes=evidence_indexes.get(normalized, []),
+                    source_examples=content_samples,
+                )
             )
+            candidates.append(payload)
             existing.add(normalized)
 
         selected_phrases: list[tuple[str, int]] = []
@@ -391,8 +390,7 @@ class ExpressionCandidateExtractor:
                 continue
             content_samples = list(phrase_samples.get(phrase, []))
             expression = phrase
-            candidates.append(
-                {
+            payload = {
                     "group_id": group_id,
                     "shared_scope": group_id,
                     "scope_kind": "group",
@@ -416,11 +414,19 @@ class ExpressionCandidateExtractor:
                     "quality_tier": "high" if count >= 3 else "medium",
                     "candidate_id": self._candidate_id(group_id, "phrase", phrase),
                 }
+            payload.update(
+                build_evidence_bundle(
+                    group_id=group_id,
+                    messages=list(messages or []),
+                    matched_indexes=phrase_evidence_indexes.get(phrase, []),
+                    source_examples=content_samples,
+                )
             )
+            candidates.append(payload)
             existing.add(phrase)
 
-        rhythm_candidates = 0
-        for entries in ([group_messages] if group_messages else []):
+        rhythm_groups: dict[str, list[tuple[str, list[tuple[int, str, str, float | None, str]]]]] = defaultdict(list)
+        for contributor, entries in messages_by_contributor.items():
             evidence = list(dict.fromkeys(item[2] for item in entries if item[2]))
             if len(evidence) < max(self.min_count, 3):
                 continue
@@ -437,17 +443,27 @@ class ExpressionCandidateExtractor:
                 if 0 <= gap <= 8:
                     burst_pairs += 1
             if burst_pairs >= 2 and short_ratio >= 0.6:
-                expression = "偏好短句连发，常在数秒内连续补充"
                 normalized_rhythm = "rapid_short_bursts"
-                style = "短句连发"
             elif len(evidence) >= 5 and short_ratio >= 0.8:
-                expression = "偏好简短单句回复"
                 normalized_rhythm = "brief_single_replies"
-                style = "简短利落"
             else:
                 continue
-            candidates.append(
-                {
+            rhythm_groups[normalized_rhythm].append((contributor, entries))
+
+        rhythm_candidates = 0
+        for normalized_rhythm, contributor_entries in rhythm_groups.items():
+            if len(contributor_entries) < 2:
+                continue
+            entries = [entry for _, contributor_items in contributor_entries for entry in contributor_items]
+            evidence = list(dict.fromkeys(item[2] for item in entries if item[2]))
+            expression = (
+                "偏好短句连发，常在数秒内连续补充"
+                if normalized_rhythm == "rapid_short_bursts"
+                else "偏好简短单句回复"
+            )
+            style = "短句连发" if normalized_rhythm == "rapid_short_bursts" else "简短利落"
+            matched_indexes = [item[0] for item in entries]
+            payload = {
                     "group_id": group_id,
                     "shared_scope": group_id,
                     "scope_kind": "group",
@@ -461,17 +477,25 @@ class ExpressionCandidateExtractor:
                     "content_samples": [item[1][:160] for item in entries[:4]],
                     "count": len(evidence),
                     "distinct_turn_count": len(evidence),
-                    "distinct_day_count": len(group_days),
-                    "distinct_contributor_count": len(group_contributors),
+                    "distinct_day_count": len({item[4] for item in entries}),
+                    "distinct_contributor_count": len(contributor_entries),
                     "activation_score": min(1.0, 0.35 + len(evidence) * 0.08),
                     "think_level": 0,
                     "candidate_type": "rhythm",
                     "classification": "expression",
-                    "classification_reason": "derived_group_reply_rhythm",
+                    "classification_reason": "independently_observed_group_reply_rhythm",
                     "quality_tier": "medium",
                     "candidate_id": self._candidate_id(group_id, "rhythm", normalized_rhythm),
                 }
+            payload.update(
+                build_evidence_bundle(
+                    group_id=group_id,
+                    messages=list(messages or []),
+                    matched_indexes=matched_indexes,
+                    source_examples=[item[1][:160] for item in entries[:4]],
+                )
             )
+            candidates.append(payload)
             rhythm_candidates += 1
 
         candidates.sort(key=lambda item: (-int(item.get("count", 0)), item.get("candidate_type") != "exact", -len(str(item.get("expression", "")))))
@@ -485,7 +509,7 @@ class ExpressionCandidateExtractor:
             "exact_candidates": len(qualifying_exact),
             "phrase_candidates": sum(1 for item in candidates if item.get("candidate_type") == "phrase"),
             "rhythm_candidates": rhythm_candidates,
-            "contributor_count": len(group_contributors),
+            "contributor_count": len(messages_by_contributor),
             "candidate_count": len(candidates),
             "reason": "candidates_ready" if candidates else "no_repeated_expression",
         }

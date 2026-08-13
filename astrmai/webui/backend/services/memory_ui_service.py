@@ -5,6 +5,7 @@ import re
 import time
 
 from ....learning.mining.jargon_candidate_extractor import JargonCandidateExtractor
+from ....learning.mining.jargon_senses import jargon_sense_id
 from ....learning.dedup import GLOBAL_JARGON_SESSION_ID, jargon_fingerprint
 from ....memory.contracts.memory_query import MemoryWriteRequest
 
@@ -503,19 +504,25 @@ class MemoryUiService:
         metadata = dict(item.get("metadata") or {})
         status = str(item.get("status") or "active")
         review_status = str(metadata.get("review_status") or ("approved" if status == "active" else status))
+        senses = [dict(sense) for sense in (metadata.get("senses") or []) if isinstance(sense, dict)]
+        approved_sense = next(
+            (sense for sense in senses if str(sense.get("review_status") or "").strip().lower() == "approved"),
+            None,
+        )
+        primary_sense = approved_sense or (senses[0] if senses else {})
         return {
             "id": item.get("id"),
             "canonical_id": item.get("id"),
             "content": str(item.get("content") or ""),
             "raw_content": str(metadata.get("raw_content") or item.get("content") or ""),
-            "meaning": str(metadata.get("meaning") or item.get("summary") or ""),
+            "meaning": str(primary_sense.get("meaning") or metadata.get("meaning") or item.get("summary") or ""),
             "is_jargon": 1 if status == "active" else 0,
             "is_complete": 1 if status == "active" else 0,
             "count": int(metadata.get("count") or 1),
             "group_id": str(item.get("session_id") or "GLOBAL"),
             "status": status,
-            "scene": str(metadata.get("scene") or ""),
-            "examples": list(metadata.get("examples") or []),
+            "scene": str(primary_sense.get("scene") or metadata.get("scene") or ""),
+            "examples": list(primary_sense.get("examples") or metadata.get("examples") or []),
             "review_status": review_status,
             "review_reason": str(metadata.get("review_reason") or ""),
             "review_suggestion": str(metadata.get("review_suggestion") or ""),
@@ -527,6 +534,16 @@ class MemoryUiService:
             "term_type": str(metadata.get("term_type") or "jargon"),
             "semantic_novelty": bool(metadata.get("semantic_novelty", True)),
             "source_groups": list(metadata.get("source_groups") or []),
+            "senses": senses,
+            "sense_count": len(senses),
+            "active_sense_count": sum(
+                1 for sense in senses
+                if str(sense.get("review_status") or "").strip().lower() == "approved"
+            ),
+            "pending_sense_count": sum(
+                1 for sense in senses
+                if str(sense.get("review_status") or "").strip().lower() in {"review_pending", "revision_needed", "pending_human"}
+            ),
             "confidence": float(item.get("confidence") or metadata.get("confidence") or 0.0),
             "importance": float(item.get("importance") or 0.0),
             "source": str(item.get("source") or ""),
@@ -537,6 +554,67 @@ class MemoryUiService:
             "updated_at": float(item.get("updated_at") or item.get("update_time") or 0.0),
             "legacy": False,
         }
+
+    @staticmethod
+    def _jargon_sense_row(base: dict, sense: dict) -> dict:
+        review_status = str(sense.get("review_status") or "review_pending").strip().lower()
+        normalized_status = (
+            "active"
+            if review_status == "approved"
+            else "rejected"
+            if review_status == "rejected"
+            else "review_pending"
+        )
+        canonical_id = str(base.get("canonical_id") or base.get("id") or "")
+        sense_id = str(sense.get("sense_id") or "")
+        return {
+            **base,
+            "id": f"{canonical_id}::sense::{sense_id}",
+            "canonical_id": canonical_id,
+            "sense_id": sense_id,
+            "meaning": str(sense.get("meaning") or ""),
+            "scene": str(sense.get("scene") or ""),
+            "examples": list(sense.get("examples") or []),
+            "source_groups": list(sense.get("source_groups") or []),
+            "confidence": float(sense.get("confidence") or base.get("confidence") or 0.0),
+            "status": normalized_status,
+            "review_status": review_status,
+            "is_jargon": 1 if normalized_status == "active" else 0,
+            "is_complete": 1 if normalized_status == "active" else 0,
+            "sense_review_row": True,
+        }
+
+    @classmethod
+    def _canonical_jargon_views_for_status(cls, item: dict, status: str) -> list[dict]:
+        base = cls._canonical_jargon_view(item)
+        requested = str(status or "").strip().lower()
+        if not requested:
+            return [base]
+        senses = list(base.get("senses") or [])
+        if not senses:
+            return [base] if str(base.get("status") or "").strip().lower() == requested else []
+        if requested == "active":
+            accepted = {"approved"}
+        elif requested == "rejected":
+            accepted = {"rejected"}
+        elif requested == "review_pending":
+            accepted = {"review_pending", "revision_needed", "pending_human"}
+        else:
+            return [base] if str(base.get("status") or "").strip().lower() == requested else []
+        return [
+            cls._jargon_sense_row(base, sense)
+            for sense in senses
+            if str(sense.get("review_status") or "review_pending").strip().lower() in accepted
+        ]
+
+    @staticmethod
+    def _split_jargon_sense_row_id(jargon_id: str) -> tuple[str, str]:
+        clean_id = str(jargon_id or "").strip()
+        marker = "::sense::"
+        if marker not in clean_id:
+            return clean_id, ""
+        canonical_id, sense_id = clean_id.split(marker, 1)
+        return canonical_id.strip(), sense_id.strip()
 
     @staticmethod
     def _append_manual_revision(metadata: dict, *, action: str, changes: dict) -> dict:
@@ -681,7 +759,8 @@ class MemoryUiService:
         engine = self._memory_engine()
         store = self.plugin_api.get_v2_store() if self.plugin_api else None
         if store and hasattr(store, "list_canonical"):
-            if not str(query or "").strip():
+            sense_status = str(status or "").strip().lower() in {"active", "review_pending", "rejected"}
+            if not str(query or "").strip() and not sense_status:
                 result = await store.list_canonical(
                     kind="jargon",
                     status=status,
@@ -707,7 +786,7 @@ class MemoryUiService:
             while scanned < scan_cap:
                 chunk = await store.list_canonical(
                     kind="jargon",
-                    status=status,
+                    status="" if sense_status else status,
                     session_id="",
                     limit=scan_chunk,
                     offset=scan_offset,
@@ -715,7 +794,11 @@ class MemoryUiService:
                 rows = chunk.get("items", []) or []
                 if not rows:
                     break
-                views = [self._canonical_jargon_view(item) for item in rows]
+                views = [
+                    view
+                    for item in rows
+                    for view in self._canonical_jargon_views_for_status(item, status)
+                ]
                 matches.extend(self._filter_jargon_rows(views, query=query))
                 got = len(rows)
                 scanned += got
@@ -733,6 +816,41 @@ class MemoryUiService:
             }
         async with self.db_factory() as db:
             try:
+                sense_status = str(status or "").strip().lower() in {
+                    "active",
+                    "review_pending",
+                    "rejected",
+                }
+                if sense_status or str(query or "").strip():
+                    where = ["kind = 'jargon'"]
+                    params = []
+                    if status and not sense_status:
+                        where.append("status = ?")
+                        params.append(status)
+                    scan_cap = 2000
+                    async with db.execute(
+                        f"SELECT * FROM canonical_memories WHERE {' AND '.join(where)} "
+                        "ORDER BY update_time DESC LIMIT ?",
+                        (*params, scan_cap),
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                    views = [
+                        view
+                        for row in rows
+                        for view in self._canonical_jargon_views_for_status(
+                            self._canonical_row(row),
+                            status,
+                        )
+                    ]
+                    matches = self._filter_jargon_rows(views, query=query)
+                    return {
+                        "items": matches[page_offset : page_offset + page_limit],
+                        "total": len(matches),
+                        "limit": page_limit,
+                        "offset": page_offset,
+                        "runtime_bound": False,
+                        "search_scan_capped": len(rows) >= scan_cap,
+                    }
                 where = ["kind = 'jargon'"]
                 params = []
                 if status:
@@ -842,7 +960,7 @@ class MemoryUiService:
             "total": len(candidates),
             "obvious_count": len(obvious),
             "suspect_count": len(candidates) - len(obvious),
-            "destructive": True,
+            "destructive": False,
         }
 
     async def apply_jargon_cleanup(self, data: dict) -> dict[str, object]:
@@ -862,7 +980,13 @@ class MemoryUiService:
                 if action == "merge":
                     await self.merge_canonical(jargon_id, target_id)
                 else:
-                    await self.delete_jargon(jargon_id)
+                    await self.reject_jargon(
+                        jargon_id,
+                        {
+                            "review_reason": "人工批量清理驳回",
+                            "manual_action": "cleanup_reject",
+                        },
+                    )
                 changed.append(jargon_id)
             except Exception as exc:
                 failed.append({"id": jargon_id, "error": str(exc)[:300]})
@@ -872,7 +996,7 @@ class MemoryUiService:
             "changed": changed,
             "changed_count": len(changed),
             "failed": failed,
-            "physical_delete": action == "reject",
+            "physical_delete": False,
         }
 
     async def create_event(self, data: dict) -> dict[str, object]:
@@ -1150,6 +1274,10 @@ class MemoryUiService:
             return {"status": "ok", "id": canonical_id, "canonical_id": canonical_id, "legacy": False}
 
     async def update_jargon(self, jargon_id: str, data: dict) -> dict[str, object]:
+        canonical_id, sense_id = self._split_jargon_sense_row_id(jargon_id)
+        if sense_id:
+            return await self._update_jargon_sense(canonical_id, sense_id, data)
+        jargon_id = canonical_id
         now = time.time()
         engine = self._memory_engine()
         store = self.plugin_api.get_v2_store() if self.plugin_api else None
@@ -1338,6 +1466,199 @@ class MemoryUiService:
             )
             await db.commit()
         return {"status": "ok"}
+
+    async def _update_jargon_sense(
+        self,
+        canonical_id: str,
+        sense_id: str,
+        data: dict,
+    ) -> dict[str, object]:
+        store = self.plugin_api.get_v2_store() if self.plugin_api else None
+        projector = self.plugin_api.get_index_projector() if self.plugin_api else None
+        current = (
+            await store.get_canonical(canonical_id, include_inactive=True)
+            if store and hasattr(store, "get_canonical")
+            else None
+        )
+        current_row: dict = {}
+        if current is None and self.db_factory is not None:
+            async with self.db_factory() as db:
+                try:
+                    async with db.execute(
+                        "SELECT * FROM canonical_memories WHERE id = ? AND kind = 'jargon'",
+                        (canonical_id,),
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    current_row = self._canonical_row(row) if row else {}
+                except Exception:
+                    current_row = {}
+        if current is None and not current_row:
+            return {"status": "not_found", "changed": False}
+
+        metadata = dict(
+            getattr(current, "metadata", {})
+            if current is not None
+            else current_row.get("metadata") or {}
+        )
+        senses = [dict(item) for item in (metadata.get("senses") or []) if isinstance(item, dict)]
+        target_index = next(
+            (index for index, sense in enumerate(senses) if str(sense.get("sense_id") or "") == sense_id),
+            None,
+        )
+        if target_index is None:
+            return {
+                "status": "not_found",
+                "changed": False,
+                "canonical_id": canonical_id,
+                "sense_id": sense_id,
+            }
+
+        sense = dict(senses[target_index])
+        for key in ("meaning", "scene", "review_reason", "review_suggestion"):
+            if key in data:
+                sense[key] = str(data.get(key) or "").strip()
+        if "examples" in data:
+            sense["examples"] = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in (data.get("examples") or [])
+                    if str(item or "").strip()
+                )
+            )[:12]
+        if "confidence" in data:
+            confidence = self._optional_float(data.get("confidence"))
+            if confidence is not None:
+                sense["confidence"] = min(max(confidence, 0.0), 1.0)
+
+        requested_status = str(data.get("status") or data.get("review_status") or "").strip().lower()
+        if requested_status in {"active", "approved", "approve"}:
+            sense_status = "approved"
+        elif requested_status in {"rejected", "reject"}:
+            sense_status = "rejected"
+        elif requested_status in {"review_pending", "revision_needed", "pending_human"}:
+            sense_status = requested_status
+        else:
+            sense_status = str(sense.get("review_status") or "review_pending").strip().lower()
+        sense["review_status"] = sense_status
+        revised_sense_id = jargon_sense_id(
+            str(sense.get("meaning") or ""),
+            str(sense.get("scene") or ""),
+        )
+        sense["sense_id"] = revised_sense_id
+        sense = self._append_manual_revision(
+            sense,
+            action=str(data.get("manual_action") or sense_status),
+            changes=dict(data or {}) | {"review_status": sense_status},
+        )
+
+        collision_index = next(
+            (
+                index
+                for index, existing in enumerate(senses)
+                if index != target_index and str(existing.get("sense_id") or "") == revised_sense_id
+            ),
+            None,
+        )
+        if collision_index is not None:
+            collision = dict(senses[collision_index])
+            collision["review_status"] = sense_status
+            collision["confidence"] = max(
+                float(collision.get("confidence") or 0.0),
+                float(sense.get("confidence") or 0.0),
+            )
+            for key, limit in (("examples", 12), ("model_examples", 12), ("source_groups", 64)):
+                collision[key] = list(
+                    dict.fromkeys([*(collision.get(key) or []), *(sense.get(key) or [])])
+                )[:limit]
+            collision["manual_revision_history"] = list(sense.get("manual_revision_history") or [])[-50:]
+            senses[collision_index] = collision
+            senses.pop(target_index)
+            revised_sense_id = str(collision.get("sense_id") or revised_sense_id)
+        else:
+            senses[target_index] = sense
+
+        approved = [
+            item
+            for item in senses
+            if str(item.get("review_status") or "").strip().lower() == "approved"
+        ]
+        pending = [
+            item
+            for item in senses
+            if str(item.get("review_status") or "").strip().lower()
+            in {"review_pending", "revision_needed", "pending_human"}
+        ]
+        primary = (approved or pending or senses)[0]
+        root_status = "active" if approved else "review_pending" if pending else "rejected"
+        metadata.update(
+            {
+                "senses": senses,
+                "meaning": str(primary.get("meaning") or ""),
+                "scene": str(primary.get("scene") or ""),
+                "examples": list(primary.get("examples") or []),
+                "review_status": "approved" if approved else (
+                    str(primary.get("review_status") or "review_pending")
+                ),
+                "sense_count": len(senses),
+                "active_sense_count": len(approved),
+                "pending_sense_count": len(pending),
+            }
+        )
+        metadata = self._append_manual_revision(
+            metadata,
+            action=f"sense_{str(data.get('manual_action') or sense_status)}",
+            changes={
+                "sense_id": revised_sense_id,
+                "meaning": str(primary.get("meaning") or ""),
+                "status": root_status,
+            },
+        )
+        summary = str(primary.get("meaning") or "").strip()
+        visibility = "auto_and_tool" if root_status == "active" else "maintenance_only"
+        confidence = max((float(item.get("confidence") or 0.0) for item in approved), default=None)
+
+        if store and hasattr(store, "update_memory"):
+            changed = await store.update_memory(
+                canonical_id,
+                summary=summary or None,
+                confidence=confidence,
+                status=root_status,
+                metadata=metadata,
+                visibility=visibility,
+                session_id=GLOBAL_JARGON_SESSION_ID,
+            )
+        else:
+            async with self.db_factory() as db:
+                await self._update(
+                    db,
+                    "canonical_memories",
+                    "id",
+                    canonical_id,
+                    {
+                        "summary": summary or None,
+                        "confidence": confidence,
+                        "status": root_status,
+                        "metadata": metadata,
+                        "visibility": visibility,
+                        "session_id": GLOBAL_JARGON_SESSION_ID,
+                        "update_time": time.time(),
+                    },
+                )
+                await db.commit()
+            changed = True
+        if changed and projector:
+            if root_status == "active":
+                await projector.project(canonical_id)
+            else:
+                await projector.cleanup_deleted([canonical_id])
+        return {
+            "status": "ok",
+            "changed": bool(changed),
+            "id": f"{canonical_id}::sense::{revised_sense_id}",
+            "canonical_id": canonical_id,
+            "sense_id": revised_sense_id,
+            "root_status": root_status,
+        }
 
     async def delete_jargon(self, jargon_id: str) -> dict[str, object]:
         clean_id = str(jargon_id or "").strip()

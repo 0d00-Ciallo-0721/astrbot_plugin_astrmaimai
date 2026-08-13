@@ -163,12 +163,17 @@ class ContextEngine:
             "stable_state": stable_state_block.strip() if stable_state_block else "",
             "stable_behavior_rules": stable_behavior_rule_block.strip() if stable_behavior_rule_block else "",
             "stable_private_chat": stable_private_chat_block.strip() if stable_private_chat_block else "",
-            "stable_expression": stable_expression_block.strip() if stable_expression_block else "",
             "stable_slang": stable_slang_block.strip() if stable_slang_block else "",
-            "stable_jargon": stable_jargon_block.strip() if stable_jargon_block else "",
+        }
+        learning_context_sections = {
+            "jargon": stable_jargon_block.strip() if stable_jargon_block else "",
+            "expression": stable_expression_block.strip() if stable_expression_block else "",
         }
         soft_background_block = "\n\n".join(
             block for block in soft_background_sections.values() if block
+        )
+        learning_context_block = "\n\n".join(
+            block for block in learning_context_sections.values() if block
         )
         frozen_prefix_blocks = {
             "persona_core": len(persona_block or ""),
@@ -219,6 +224,16 @@ class ContextEngine:
             prompt_envelope.soft_background_trimmed_sections = []
             prompt_envelope.soft_background_rendered_chars = len(soft_background_block)
             prompt_envelope.soft_background_skipped_reason = ""
+            prompt_envelope.learning_context_block = learning_context_block.strip()
+            prompt_envelope.learning_context_sections = {
+                key: value
+                for key, value in learning_context_sections.items()
+                if value
+            }
+            prompt_envelope.learning_context_budget_chars = len(learning_context_block)
+            prompt_envelope.learning_context_trimmed_sections = []
+            prompt_envelope.learning_context_rendered_chars = len(learning_context_block)
+            prompt_envelope.learning_context_skipped_reason = ""
             prompt_envelope.situational_context_block = situational_context_block.strip()
         if self.prefix_caching_enabled:
             semantic_system_text = frozen_prefix
@@ -243,7 +258,7 @@ class ContextEngine:
                 "prefix_stable": prefix_stable,
                 "prefix_changed_reason": prefix_changed_reason,
                 "frozen_prefix_length": len(frozen_prefix),
-                "semi_stable_length": len(soft_background_block),
+                "semi_stable_length": len(soft_background_block) + len(learning_context_block),
                 "frozen_prefix_blocks": dict(frozen_prefix_blocks),
                 "semi_stable_blocks": dict(semi_stable_blocks),
                 "system_rules_items": list(system_rules_items),

@@ -70,6 +70,7 @@ def test_all_chat_tools_have_registered_strict_schemas():
             tools_mod.QQMessageRecallLookupTool(),
             tools_mod.TopicThreadLookupTool(),
             tools_mod.BotCapabilityLookupTool(),
+            tools_mod.LearnedLanguageLookupTool(),
             tools_mod.MemoryWriteCorrectionTool(),
             tools_mod.UnverifiedReportRecordTool(),
             tools_mod.PersonaFactCheckTool(),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from ...learning.dedup import normalize_jargon_term
+from ...learning.mining.jargon_senses import select_jargon_senses
 from ..contracts.memory_query import MemoryCandidate
 
 
@@ -42,6 +43,7 @@ class JargonRetrievalPolicy:
         examples = metadata.get("examples", [])
         if not isinstance(examples, list):
             examples = []
+        approved_senses = select_jargon_senses(metadata, candidate.content, limit=12)
         parts = [
             candidate.content,
             candidate.summary,
@@ -49,6 +51,16 @@ class JargonRetrievalPolicy:
             str(metadata.get("scene", "") or ""),
             " ".join(str(item) for item in aliases if str(item).strip()),
             " ".join(str(item) for item in examples if str(item).strip()),
+            " ".join(
+                " ".join(
+                    (
+                        str(sense.get("meaning") or ""),
+                        str(sense.get("scene") or ""),
+                        " ".join(str(item) for item in (sense.get("examples") or [])),
+                    )
+                )
+                for sense in approved_senses
+            ),
         ]
         return "\n".join(part for part in parts if str(part or "").strip()).lower()
 
@@ -140,6 +152,10 @@ class JargonRetrievalPolicy:
             ranked.append((score, candidate))
         ranked.sort(key=lambda item: item[0], reverse=True)
         selected = [candidate for _, candidate in ranked[: max(int(top_k or 3), 1)]]
+        for candidate in selected:
+            metadata = dict(candidate.metadata or {})
+            metadata["selected_senses"] = select_jargon_senses(metadata, query_text, limit=2)
+            candidate.metadata = metadata
         if trace is not None:
             trace.setdefault(
                 "matched_terms",
@@ -149,6 +165,15 @@ class JargonRetrievalPolicy:
                 {"id": str(getattr(c, "id", "") or ""), "score": round(s, 4)}
                 for s, c in ranked[:max(int(top_k or 3), 1)]
             ])
+            trace.setdefault(
+                "selected_sense_ids",
+                [
+                    str(sense.get("sense_id") or "")
+                    for candidate in selected
+                    for sense in (dict(candidate.metadata or {}).get("selected_senses") or [])
+                    if str(sense.get("sense_id") or "")
+                ],
+            )
         return selected
 
 

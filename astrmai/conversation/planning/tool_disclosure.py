@@ -13,6 +13,7 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
         "omni_perception_query",
         "cross_chat_memory_query",
         "bot_capability_lookup",
+        "learned_language_lookup",
     ),
     "persona_lore": (
         "self_lore_query",
@@ -89,6 +90,7 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "wait": ("conversation_control",),
     "query": ("core",),
     "self_lore": ("persona_lore",),
+    "learned_language": ("core",),
     "friend_fact": ("identity", "relationship"),
     "group_member": ("identity",),
     "user_identity": ("identity",),

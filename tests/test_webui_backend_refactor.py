@@ -888,6 +888,249 @@ class WebuiBackendRefactorTests(unittest.TestCase):
             ],
         )
 
+    def test_runtime_jargon_review_lists_pending_sense_inside_active_term(self):
+        from astrmai.learning.dedup import GLOBAL_JARGON_SESSION_ID
+        from astrmai.learning.mining.jargon_senses import jargon_sense_id
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        approved_sense_id = jargon_sense_id("开始团队副本", "游戏")
+        pending_sense_id = jargon_sense_id("开始群体讨论", "群聊")
+
+        row = {
+            "id": "mem-polysemy",
+            "kind": "jargon",
+            "content": "开团",
+            "summary": "开始团队副本",
+            "session_id": GLOBAL_JARGON_SESSION_ID,
+            "source": "learning_jargon",
+            "status": "active",
+            "visibility": "auto_and_tool",
+            "confidence": 0.9,
+            "metadata": {
+                "review_status": "approved",
+                "senses": [
+                    {
+                        "sense_id": approved_sense_id,
+                        "meaning": "开始团队副本",
+                        "scene": "游戏",
+                        "review_status": "approved",
+                    },
+                    {
+                        "sense_id": pending_sense_id,
+                        "meaning": "开始群体讨论",
+                        "scene": "群聊",
+                        "review_status": "review_pending",
+                    },
+                ],
+            },
+        }
+
+        class _Store:
+            async def list_canonical(self, **kwargs):
+                offset = int(kwargs.get("offset", 0) or 0)
+                return {"items": [row] if offset == 0 else [], "total": 1}
+
+        class _PluginApi:
+            def get_v2_store(self):
+                return _Store()
+
+            def get_memory_engine(self):
+                return None
+
+        result = asyncio.run(
+            MemoryUiService(None, _PluginApi()).list_jargon(status="review_pending")
+        )
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["id"], f"mem-polysemy::sense::{pending_sense_id}")
+        self.assertEqual(result["items"][0]["canonical_id"], "mem-polysemy")
+        self.assertEqual(result["items"][0]["meaning"], "开始群体讨论")
+        self.assertTrue(result["items"][0]["sense_review_row"])
+
+    def test_sqlite_jargon_review_lists_pending_sense_inside_active_term(self):
+        from astrmai.learning.mining.jargon_senses import jargon_sense_id
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                db_path = Path(tmp_dir) / "memory.db"
+                approved_id = jargon_sense_id("开始团队副本", "游戏")
+                pending_id = jargon_sense_id("开始群体讨论", "群聊")
+                metadata = {
+                    "review_status": "approved",
+                    "senses": [
+                        {
+                            "sense_id": approved_id,
+                            "meaning": "开始团队副本",
+                            "scene": "游戏",
+                            "review_status": "approved",
+                        },
+                        {
+                            "sense_id": pending_id,
+                            "meaning": "开始群体讨论",
+                            "scene": "群聊",
+                            "review_status": "review_pending",
+                        },
+                    ],
+                }
+                async with aiosqlite.connect(db_path) as db:
+                    await db.execute(
+                        "CREATE TABLE canonical_memories ("
+                        "id TEXT, kind TEXT, content TEXT, summary TEXT, session_id TEXT, "
+                        "status TEXT, confidence REAL, importance REAL, source TEXT, visibility TEXT, "
+                        "last_access_time REAL, create_time REAL, update_time REAL, tags TEXT, metadata TEXT)"
+                    )
+                    await db.execute(
+                        "INSERT INTO canonical_memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            "mem-polysemy",
+                            "jargon",
+                            "开团",
+                            "开始团队副本",
+                            "GLOBAL_JARGON",
+                            "active",
+                            0.9,
+                            0.5,
+                            "learning_jargon",
+                            "auto_and_tool",
+                            0.0,
+                            1.0,
+                            2.0,
+                            "[]",
+                            json.dumps(metadata, ensure_ascii=False),
+                        ),
+                    )
+                    await db.commit()
+
+                @asynccontextmanager
+                async def _db_factory():
+                    conn = await aiosqlite.connect(db_path)
+                    conn.row_factory = aiosqlite.Row
+                    try:
+                        yield conn
+                    finally:
+                        await conn.close()
+
+                return await MemoryUiService(_db_factory).list_jargon(status="review_pending")
+
+        result = asyncio.run(_run())
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["canonical_id"], "mem-polysemy")
+        self.assertEqual(result["items"][0]["meaning"], "开始群体讨论")
+        self.assertFalse(result["runtime_bound"])
+
+    def test_runtime_jargon_rejects_one_sense_without_disabling_approved_sense(self):
+        from astrmai.learning.dedup import GLOBAL_JARGON_SESSION_ID
+        from astrmai.learning.mining.jargon_senses import jargon_sense_id
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        calls = []
+        approved_sense_id = jargon_sense_id("开始团队副本", "游戏")
+        pending_sense_id = jargon_sense_id("开始群体讨论", "群聊")
+        state = {
+            "metadata": {
+                "review_status": "approved",
+                "senses": [
+                    {
+                        "sense_id": approved_sense_id,
+                        "meaning": "开始团队副本",
+                        "scene": "游戏",
+                        "review_status": "approved",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "sense_id": pending_sense_id,
+                        "meaning": "开始群体讨论",
+                        "scene": "群聊",
+                        "review_status": "review_pending",
+                        "confidence": 0.6,
+                    },
+                ],
+            }
+        }
+
+        class _Store:
+            async def get_canonical(self, memory_id, include_inactive=False):
+                return SimpleNamespace(
+                    id=memory_id,
+                    kind="jargon",
+                    content="开团",
+                    summary="开始团队副本",
+                    status="active",
+                    session_id=GLOBAL_JARGON_SESSION_ID,
+                    metadata=state["metadata"],
+                )
+
+            async def update_memory(self, memory_id, **kwargs):
+                calls.append(("update", memory_id, kwargs))
+                state["metadata"] = kwargs["metadata"]
+                return 1
+
+        class _Projector:
+            async def project(self, memory_id):
+                calls.append(("project", memory_id))
+                return 1
+
+            async def cleanup_deleted(self, memory_ids):
+                calls.append(("cleanup", list(memory_ids)))
+                return 1
+
+        class _PluginApi:
+            def get_v2_store(self):
+                return _Store()
+
+            def get_index_projector(self):
+                return _Projector()
+
+            def get_memory_engine(self):
+                return None
+
+        result = asyncio.run(
+            MemoryUiService(None, _PluginApi()).reject_jargon(
+                f"mem-polysemy::sense::{pending_sense_id}",
+                {"review_reason": "该释义证据不足"},
+            )
+        )
+
+        self.assertEqual(result["root_status"], "active")
+        self.assertTrue(result["tombstone"])
+        updated = calls[0][2]
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["visibility"], "auto_and_tool")
+        sense_statuses = {
+            sense["sense_id"]: sense["review_status"]
+            for sense in updated["metadata"]["senses"]
+        }
+        self.assertEqual(sense_statuses[approved_sense_id], "approved")
+        self.assertEqual(sense_statuses[pending_sense_id], "rejected")
+        self.assertEqual(calls[-1], ("project", "mem-polysemy"))
+
+    def test_jargon_cleanup_reject_uses_review_tombstone_for_sense_rows(self):
+        from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
+
+        calls = []
+        service = MemoryUiService(None, None)
+
+        async def _reject(jargon_id, data=None):
+            calls.append((jargon_id, dict(data or {})))
+            return {"status": "ok", "changed": True, "tombstone": True}
+
+        async def _delete(_jargon_id):
+            raise AssertionError("cleanup reject must not physically delete canonical jargon")
+
+        service.reject_jargon = _reject
+        service.delete_jargon = _delete
+        sense_row_id = "mem-polysemy::sense::sense-pending"
+
+        result = asyncio.run(
+            service.apply_jargon_cleanup({"action": "reject", "ids": [sense_row_id]})
+        )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["physical_delete"])
+        self.assertEqual(calls[0][0], sense_row_id)
+        self.assertEqual(calls[0][1]["manual_action"], "cleanup_reject")
+
     def test_memory_route_file_exposes_jargon_review_endpoints(self):
         path = Path(__file__).resolve().parents[1] / "astrmai" / "webui" / "backend" / "routes" / "memory_routes.py"
         content = path.read_text(encoding="utf-8")
@@ -1022,7 +1265,7 @@ class WebuiBackendRefactorTests(unittest.TestCase):
         self.assertIn('api.get("/memory-feedback/sources")', js)
         self.assertIn('api.post(`/memory-feedback/${segment(button.dataset.disableFeedback)}/disable`)', js)
 
-    def test_jargon_cleanup_preview_and_apply_physically_delete_selected_items(self):
+    def test_jargon_cleanup_preview_and_apply_reject_selected_items(self):
         from astrmai.webui.backend.services.memory_ui_service import MemoryUiService
 
         service = MemoryUiService(db_factory=None)
@@ -1037,23 +1280,24 @@ class WebuiBackendRefactorTests(unittest.TestCase):
                 }
             return {"items": []}
 
-        deleted = []
+        rejected = []
 
-        async def _delete(jargon_id):
-            deleted.append(jargon_id)
-            return {"status": "ok", "physical_delete": True}
+        async def _reject(jargon_id, data=None):
+            rejected.append((jargon_id, dict(data or {})))
+            return {"status": "ok", "physical_delete": False, "tombstone": True}
 
         service.list_jargon = _list_jargon
-        service.delete_jargon = _delete
+        service.reject_jargon = _reject
         preview = asyncio.run(service.jargon_cleanup_preview())
         result = asyncio.run(service.apply_jargon_cleanup({"action": "reject", "ids": ["j-1"]}))
 
         self.assertEqual([item["id"] for item in preview["items"]], ["j-1"])
         self.assertEqual(preview["obvious_count"], 1)
-        self.assertTrue(preview["destructive"])
+        self.assertFalse(preview["destructive"])
         self.assertEqual(result["changed"], ["j-1"])
-        self.assertTrue(result["physical_delete"])
-        self.assertEqual(deleted, ["j-1"])
+        self.assertFalse(result["physical_delete"])
+        self.assertEqual(rejected[0][0], "j-1")
+        self.assertEqual(rejected[0][1]["manual_action"], "cleanup_reject")
 
     def test_admin_service_exposes_memory_observability_views(self):
         service_mod = importlib.import_module("astrmai.webui.backend.services.admin_ui_service")

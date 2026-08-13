@@ -90,6 +90,7 @@ def install_planner_stubs():
         "QQMessageRecallLookupTool",
         "TopicThreadLookupTool",
         "BotCapabilityLookupTool",
+        "LearnedLanguageLookupTool",
         "MemoryWriteCorrectionTool",
         "UnverifiedReportRecordTool",
         "PersonaFactCheckTool",

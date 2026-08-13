@@ -808,6 +808,77 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("qq_group_member_lookup", result)
         self.assertIn("contact_route_suggest_tool", result)
 
+    def test_learned_language_lookup_returns_approved_jargon_sense(self):
+        event = _FakeEvent(group_id="777")
+
+        class _JargonPolicy:
+            async def search(self, **kwargs):
+                self.kwargs = kwargs
+                return [
+                    SimpleNamespace(
+                        content="DDL",
+                        metadata={
+                            "selected_senses": [
+                                {
+                                    "meaning": "截止时间",
+                                    "scene": "项目群",
+                                    "examples": ["DDL 到了", "赶 DDL"],
+                                }
+                            ]
+                        },
+                    )
+                ]
+
+        policy = _JargonPolicy()
+        engine = SimpleNamespace(
+            retrieval_service=SimpleNamespace(jargon_policy=policy),
+            expression_pattern_service=None,
+        )
+        result = json.loads(
+            asyncio.run(
+                self.mod.LearnedLanguageLookupTool(
+                    memory_engine=engine,
+                    chat_id=event.unified_msg_origin,
+                ).call(_wrap_event(event), query="DDL", kind="jargon")
+            )
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["results"][0]["term"], "DDL")
+        self.assertEqual(result["results"][0]["senses"][0]["meaning"], "截止时间")
+        self.assertEqual(policy.kwargs["visibility_mode"], "tool")
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace")[-1]["source_domain"],
+            "learned_language",
+        )
+
+    def test_learned_language_lookup_not_found_forbids_guessing(self):
+        event = _FakeEvent(group_id="777")
+
+        class _JargonPolicy:
+            async def search(self, **kwargs):
+                return []
+
+        engine = SimpleNamespace(
+            retrieval_service=SimpleNamespace(jargon_policy=_JargonPolicy()),
+            expression_pattern_service=None,
+        )
+        result = json.loads(
+            asyncio.run(
+                self.mod.LearnedLanguageLookupTool(
+                    memory_engine=engine,
+                    chat_id=event.unified_msg_origin,
+                ).call(_wrap_event(event), query="未知黑话", kind="auto")
+            )
+        )
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertIn("不要猜测", result["instruction"])
+        self.assertEqual(
+            event.get_extra("astrmai_tool_execution_trace")[-1]["status"],
+            "not_found",
+        )
+
     def test_11_memory_write_correction_records_feedback(self):
         event = _FakeEvent(group_id="777")
 

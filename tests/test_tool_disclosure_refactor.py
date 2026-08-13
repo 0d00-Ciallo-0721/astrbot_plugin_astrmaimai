@@ -6,6 +6,7 @@ CORE_TOOLS = {
     "omni_perception_query",
     "cross_chat_memory_query",
     "bot_capability_lookup",
+    "learned_language_lookup",
 }
 
 
@@ -20,6 +21,18 @@ def test_plain_chat_discloses_core_package_only():
     assert plan.packages == ("core",)
     assert set(plan.tool_names) == CORE_TOOLS
     assert plan.tier == "chat"
+
+
+def test_plain_chat_keeps_learned_language_lookup_as_core_fallback():
+    plan = ToolDisclosurePlanner().plan(
+        message="这个词在群里是什么意思",
+        requested_tier="",
+        explicit_tool_intent=False,
+        explicit_tool_families=set(),
+    )
+
+    assert plan.packages == ("core",)
+    assert "learned_language_lookup" in plan.tool_names
 
 
 def test_plain_recommendation_does_not_disclose_persona_lore_tools():

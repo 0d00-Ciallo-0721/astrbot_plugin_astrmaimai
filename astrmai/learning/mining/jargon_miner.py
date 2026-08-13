@@ -39,8 +39,8 @@ class JargonMiner:
                 group_id,
                 limit=2000,
                 only_checked=False,
-                include_rejected=True,
-                statuses=["active", "review_pending", "rejected", "stale"],
+                include_rejected=False,
+                statuses=["active", "review_pending", "stale"],
             )
             return {
                 normalized
@@ -81,6 +81,12 @@ class JargonMiner:
                 existing_terms = {
                     normalize_jargon_term(term)
                     for item in rows
+                    if str(getattr(item, "status", "") or "").strip().lower() != "rejected"
+                    if str(group_id or "") in {
+                        str(source_group)
+                        for source_group in (dict(item.metadata or {}).get("source_groups") or [])
+                        if str(source_group or "").strip()
+                    }
                     for term in [item.content, *(dict(item.metadata or {}).get("aliases", []) or [])]
                     if normalize_jargon_term(term)
                 }

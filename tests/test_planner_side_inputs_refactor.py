@@ -49,6 +49,7 @@ _STUB_TOOL_NAME_ALIASES = {
     "QQMessageRecallLookupTool": "qq_message_recall_lookup",
     "TopicThreadLookupTool": "topic_thread_lookup",
     "BotCapabilityLookupTool": "bot_capability_lookup",
+    "LearnedLanguageLookupTool": "learned_language_lookup",
     "MemoryWriteCorrectionTool": "memory_write_correction_tool",
     "UnverifiedReportRecordTool": "unverified_report_record_tool",
     "PersonaFactCheckTool": "persona_fact_check_tool",
@@ -86,6 +87,7 @@ FACT_TOOL_NAMES = {
     "qq_message_recall_lookup",
     "topic_thread_lookup",
     "bot_capability_lookup",
+    "learned_language_lookup",
     "memory_write_correction_tool",
     "unverified_report_record_tool",
     "persona_fact_check_tool",
@@ -98,6 +100,7 @@ CORE_TOOL_NAMES = {
     "omni_perception_query",
     "cross_chat_memory_query",
     "bot_capability_lookup",
+    "learned_language_lookup",
 }
 
 LEGACY_CHAT_EXPECTED_TOOL_NAMES = FACT_TOOL_NAMES | {
