@@ -135,8 +135,8 @@ class ExpressionEnrichmentPipelineTests(unittest.TestCase):
     def test_candidates_have_stable_ids_without_personal_evidence(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         messages = [
-            SimpleNamespace(id=11, content="唉嘿嘿"),
-            SimpleNamespace(id=12, content="唉嘿嘿"),
+            SimpleNamespace(id=11, sender_id="alice", content="唉嘿嘿"),
+            SimpleNamespace(id=12, sender_id="bob", content="唉嘿嘿"),
         ]
 
         first = asyncio.run(extractor.extract("chat-1", messages))

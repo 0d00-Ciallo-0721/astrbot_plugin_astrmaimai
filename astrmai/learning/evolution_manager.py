@@ -24,7 +24,65 @@ from .mining.expression_miner import ExpressionMiner
 from .mining.expression_results import PatternSaveReport
 from .mining.jargon_miner import JargonMiner
 from .mining.learning_evidence import merge_evidence_metadata
+from .mining.learning_input_policy import LearningMessageView
 from .mining.jargon_senses import merge_jargon_senses
+
+
+def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> dict[str, Any]:
+    supported_by = list(dict.fromkeys(
+        str(item) for item in (sense.get("supported_by") or []) if str(item or "").strip()
+    ))
+    contradicted_by = list(dict.fromkeys(
+        str(item) for item in (sense.get("contradicted_by") or []) if str(item or "").strip()
+    ))
+    citation_ids = set(supported_by) | set(contradicted_by)
+    supported_ids = set(supported_by)
+    source_ids = [
+        str(item) for item in (evidence.get("source_message_ids") or [])
+        if str(item) in supported_ids
+    ]
+    source_spans = [
+        dict(item) for item in (evidence.get("source_spans") or [])
+        if isinstance(item, dict) and str(item.get("message_id") or "") in set(source_ids)
+    ]
+    context_windows = [
+        dict(window) for window in (evidence.get("context_windows") or [])
+        if isinstance(window, dict) and any(
+            str(message.get("message_id") or "") in citation_ids
+            for message in (window.get("messages") or [])
+            if isinstance(message, dict)
+        )
+    ]
+    reply_relations = [
+        dict(item) for item in (evidence.get("reply_relations") or [])
+        if isinstance(item, dict) and (
+            str(item.get("source_message_id") or "") in citation_ids
+            or str(item.get("target_message_id") or "") in citation_ids
+        )
+    ]
+    source_examples = list(dict.fromkeys(
+        str(item.get("text") or "").strip() for item in source_spans
+        if str(item.get("text") or "").strip()
+    ))
+    digest_payload = {
+        "meaning": str(sense.get("meaning") or ""),
+        "scene": str(sense.get("scene") or ""),
+        "supported_by": source_ids,
+        "contradicted_by": contradicted_by,
+    }
+    return {
+        **evidence,
+        "source_examples": source_examples,
+        "source_message_ids": source_ids,
+        "context_windows": context_windows,
+        "reply_relations": reply_relations,
+        "source_spans": source_spans,
+        "support_count": len(source_ids),
+        "contradiction_count": len(contradicted_by),
+        "evidence_digest": hashlib.sha256(
+            json.dumps(digest_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24],
+    }
 
 
 class EvolutionManager:
@@ -327,21 +385,75 @@ class EvolutionManager:
     async def _load_pipeline_logs(self, pipeline: str, group_id: str, limit: int):
         replay_recent = self._pipeline_replay_recent(pipeline)
         if hasattr(self.db, "get_learning_logs_async"):
-            return await self.db.get_learning_logs_async(
+            logs = await self.db.get_learning_logs_async(
                 pipeline,
                 group_id,
                 limit=limit,
                 replay_recent=replay_recent,
             )
-        if hasattr(self.db, "get_learning_logs"):
-            return await asyncio.to_thread(
+        elif hasattr(self.db, "get_learning_logs"):
+            logs = await asyncio.to_thread(
                 self.db.get_learning_logs,
                 pipeline,
                 group_id,
                 limit,
                 replay_recent=replay_recent,
             )
-        return await self._load_unprocessed_logs(group_id, limit=limit)
+        else:
+            logs = await self._load_unprocessed_logs(group_id, limit=limit)
+        return await self._attach_learning_visual_context(group_id, list(logs or []))
+
+    async def _attach_learning_visual_context(self, group_id: str, logs: list[Any]) -> list[Any]:
+        resolver = getattr(self.db, "get_learning_visual_context_async", None)
+        if not logs or not callable(resolver):
+            return logs
+        ids_by_log: list[list[str]] = []
+        all_ids: list[str] = []
+        for index, item in enumerate(logs):
+            ids = list(
+                dict.fromkeys(
+                    str(self._field(item, field, "") or "").strip()
+                    for field in ("event_id", "platform_message_id", "id")
+                    if str(self._field(item, field, "") or "").strip()
+                )
+            )
+            if not ids:
+                ids = [f"row:{index}"]
+            ids_by_log.append(ids)
+            all_ids.extend(ids)
+        try:
+            visual_map = dict(await resolver(str(group_id or ""), all_ids) or {})
+        except Exception as exc:
+            logger.debug(f"[Evolution-LearningContext] visual context lookup degraded: {exc}")
+            return logs
+        enriched: list[Any] = []
+        for item, ids in zip(logs, ids_by_log):
+            records = [record for message_id in ids for record in visual_map.get(message_id, [])]
+            raw_content = str(self._field(item, "content", "") or "").strip()
+            image_refs = str(self._field(item, "image_refs", "") or "").strip()
+            if records:
+                lines = [raw_content] if raw_content else []
+                for record in records:
+                    label = "表情包转述" if str(record.get("type") or "").lower() == "emoji" else "图片转述"
+                    lines.append(f"[{label}：{str(record.get('description') or '').strip()}]")
+                context_content = "\n".join(line for line in lines if line).strip()
+                source_kind = "human_text_with_image" if raw_content else "image_transcription"
+            elif image_refs and image_refs != "[]":
+                context_content = "\n".join(item for item in (raw_content, "[图片]") if item)
+                source_kind = "human_text_with_image" if raw_content else "image_placeholder"
+            else:
+                enriched.append(item)
+                continue
+            enriched.append(
+                LearningMessageView(
+                    item,
+                    raw_content,
+                    source_kind,
+                    context_content=context_content,
+                    evidence_eligible=bool(raw_content),
+                )
+            )
+        return enriched
 
     async def _list_pipeline_log_groups(
         self,
@@ -795,12 +907,13 @@ class EvolutionManager:
                         "classification_reason": self._field(pattern, "classification_reason", ""),
                         "quality_tier": self._field(pattern, "quality_tier", "review"),
                         "quality_flags": list(self._field(pattern, "quality_flags", []) or []),
-                        "evidence_version": self._field(pattern, "evidence_version", 2),
+                        "evidence_version": self._field(pattern, "evidence_version", 3),
                         "source_examples": list(self._field(pattern, "source_examples", []) or []),
                         "source_message_ids": list(self._field(pattern, "source_message_ids", []) or []),
                         "source_group_ids": list(self._field(pattern, "source_group_ids", []) or []),
                         "context_windows": list(self._field(pattern, "context_windows", []) or []),
                         "reply_relations": list(self._field(pattern, "reply_relations", []) or []),
+                        "source_spans": list(self._field(pattern, "source_spans", []) or []),
                         "support_count": int(self._field(pattern, "support_count", 0) or 0),
                         "contradiction_count": int(self._field(pattern, "contradiction_count", 0) or 0),
                         "contributor_count": int(self._field(pattern, "contributor_count", 0) or 0),
@@ -839,8 +952,9 @@ class EvolutionManager:
         requests: list[MemoryWriteRequest] = []
         store = getattr(memory_engine, "v2_store", None)
         for jargon in jargons:
-            content = str(self._field(jargon, "content", "") or "").strip()
-            if not content:
+            observed_content = str(self._field(jargon, "content", "") or "").strip()
+            content = str(self._field(jargon, "canonical_form", "") or observed_content).strip()
+            if not content or not observed_content:
                 continue
             meaning = str(self._field(jargon, "meaning", "") or "").strip()
             raw_content = str(self._field(jargon, "raw_content", "") or content).strip()
@@ -872,6 +986,7 @@ class EvolutionManager:
                     "source_group_ids",
                     "context_windows",
                     "reply_relations",
+                    "source_spans",
                     "support_count",
                     "contradiction_count",
                     "contributor_count",
@@ -880,20 +995,36 @@ class EvolutionManager:
                 )
             }
             merged_evidence = merge_evidence_metadata(existing_metadata, incoming_evidence)
-            incoming_sense_payload = {
-                **incoming_evidence,
+            proposed_senses = [
+                item for item in (self._field(jargon, "proposed_senses", []) or [])
+                if isinstance(item, dict) and str(item.get("meaning") or "").strip()
+            ] or [{
                 "meaning": meaning,
                 "scene": scene,
                 "confidence": confidence,
                 "review_status": review_status,
-                "examples": examples,
-            }
-            senses, incoming_sense_id, is_new_sense, sense_revision_reopened = merge_jargon_senses(
-                existing_metadata,
-                incoming_sense_payload,
-                group_id=str(group_id or ""),
-                record_status=existing_status,
-            )
+                "supported_by": list(self._field(jargon, "supported_by", []) or []),
+                "contradicted_by": list(self._field(jargon, "contradicted_by", []) or []),
+            }]
+            senses = list(existing_metadata.get("senses") or [])
+            incoming_sense_id = ""
+            is_new_sense = False
+            sense_revision_reopened = False
+            for proposed_sense in proposed_senses:
+                sense_evidence = _jargon_sense_evidence(incoming_evidence, proposed_sense)
+                incoming_sense_payload = {
+                    **sense_evidence,
+                    **proposed_sense,
+                    "examples": list(sense_evidence.get("source_examples") or []),
+                }
+                senses, incoming_sense_id, new_sense, reopened_sense = merge_jargon_senses(
+                    {**existing_metadata, "senses": senses},
+                    incoming_sense_payload,
+                    group_id=str(group_id or ""),
+                    record_status=existing_status,
+                )
+                is_new_sense = is_new_sense or new_sense
+                sense_revision_reopened = sense_revision_reopened or reopened_sense
             stronger_new_evidence = (
                 bool(incoming_evidence.get("evidence_digest"))
                 and str(incoming_evidence.get("evidence_digest")) != str(existing_metadata.get("evidence_digest") or "")
@@ -916,8 +1047,9 @@ class EvolutionManager:
                 str(item).strip()
                 for item in [
                     *(existing_metadata.get("aliases") or []),
-                    raw_content,
-                    content,
+                    *(self._field(jargon, "surface_forms", []) or []),
+                    *(self._field(jargon, "aliases", []) or []),
+                    observed_content,
                 ]
                 if str(item or "").strip()
             ]
@@ -950,6 +1082,8 @@ class EvolutionManager:
                     metadata={
                         **merged_evidence,
                         "raw_content": raw_content,
+                        "canonical_term": content,
+                        "surface_forms": list(dict.fromkeys(aliases))[:12],
                         "meaning": primary_meaning,
                         "confidence": max(confidence, float(existing_metadata.get("confidence") or 0.0)),
                         "activation_score": max(activation_score, float(existing_metadata.get("activation_score") or 0.0)),

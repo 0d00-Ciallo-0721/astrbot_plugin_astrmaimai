@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from collections import Counter
 from typing import Any, Iterable
 
@@ -8,10 +9,20 @@ from typing import Any, Iterable
 class LearningMessageView:
     """Read-only message view with sanitized learning content."""
 
-    def __init__(self, source: Any, content: str, source_kind: str = "human_text"):
+    def __init__(
+        self,
+        source: Any,
+        content: str,
+        source_kind: str = "human_text",
+        *,
+        context_content: str = "",
+        evidence_eligible: bool = True,
+    ):
         self._source = source
         self.content = content
         self.learning_source_kind = source_kind
+        self.learning_context_content = context_content or content
+        self.learning_evidence_eligible = bool(evidence_eligible)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._source, name)
@@ -92,10 +103,32 @@ class LearningInputPolicy:
         # Quoted material is context, not evidence for the current speaker's habit.
         value = "\n".join(line for line in value.split("\n") if not line.lstrip().startswith(">"))
         value = re.sub(r"<[^>]+>", " ", value)
-        value = re.sub(r"\[(?:CQ|Image|图片|At|Reply)[^\]]*\]", " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"\[(?:CQ|Image|At|Reply)[^\]]*\]", " ", value, flags=re.IGNORECASE)
         value = re.sub(r"\[[^\]]+\]\(mqqapi://[^)]+\)", " ", value, flags=re.IGNORECASE)
         value = re.sub(r"https?://\S+", " ", value, flags=re.IGNORECASE)
         return " ".join(value.split())
+
+    @classmethod
+    def _sanitize_evidence(cls, text: str) -> str:
+        value = cls._sanitize(text)
+        value = re.sub(
+            r"\[(?:图片转述|表情包转述|图片|表情包|image|pic)[：:][^\]]*\]",
+            " ",
+            value,
+            flags=re.IGNORECASE,
+        )
+        value = re.sub(r"\[(?:图片|表情包|image|pic)\]", " ", value, flags=re.IGNORECASE)
+        return " ".join(value.split())
+
+    @classmethod
+    def _image_ref_count(cls, message: Any) -> int:
+        raw = cls._value(message, "image_refs", [])
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw = [raw] if raw.strip() and raw.strip() != "[]" else []
+        return len(raw or []) if isinstance(raw, (list, tuple, set)) else 0
 
     def normalize(self, messages: Iterable[Any] | None) -> list[LearningMessageView]:
         accepted: list[LearningMessageView] = []
@@ -107,24 +140,44 @@ class LearningInputPolicy:
                 rejected["empty_message"] += 1
                 continue
             raw_text = str(self._value(message, "content", "") or "").strip()
-            if not raw_text:
+            context_text = str(self._value(message, "learning_context_content", "") or raw_text).strip()
+            image_count = self._image_ref_count(message)
+            has_visual_context = bool(image_count or re.search(r"\[(?:图片转述|表情包转述|图片|表情包)", context_text))
+            if not raw_text and not has_visual_context:
                 rejected["empty_content"] += 1
                 continue
             reason = self._reject_reason(message, raw_text)
-            if reason:
+            if reason and not (reason in {"non_text_event", "empty_content"} and has_visual_context):
                 rejected[reason] += 1
                 continue
-            cleaned = self._sanitize(raw_text)
-            if not cleaned or not self._meaningful_text(cleaned):
+            cleaned = self._sanitize_evidence(raw_text)
+            evidence_eligible = bool(cleaned and self._meaningful_text(cleaned))
+            if not evidence_eligible and not has_visual_context:
                 rejected["empty_after_sanitize"] += 1
                 continue
-            accepted.append(LearningMessageView(message, cleaned))
+            context_cleaned = self._sanitize(context_text) or ("[图片]" if has_visual_context else cleaned)
+            source_kind = "human_text"
+            if has_visual_context:
+                source_kind = "human_text_with_image" if evidence_eligible else (
+                    "image_transcription" if "图片转述" in context_cleaned or "表情包转述" in context_cleaned else "image_placeholder"
+                )
+            accepted.append(
+                LearningMessageView(
+                    message,
+                    cleaned,
+                    source_kind,
+                    context_content=context_cleaned,
+                    evidence_eligible=evidence_eligible,
+                )
+            )
         self.last_report = {
             "input_messages": total,
             "accepted_messages": len(accepted),
             "rejected_messages": total - len(accepted),
             "rejected_by_reason": dict(sorted(rejected.items())),
-            "source_kinds": {"human_text": len(accepted)},
+            "evidence_eligible_messages": sum(item.learning_evidence_eligible for item in accepted),
+            "context_only_messages": sum(not item.learning_evidence_eligible for item in accepted),
+            "source_kinds": dict(Counter(item.learning_source_kind for item in accepted)),
         }
         return accepted
 

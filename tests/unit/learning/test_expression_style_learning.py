@@ -17,14 +17,15 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         messages = [
             SimpleNamespace(id=1, sender_id="alice", sender_name="Alice", content="唉嘿嘿～"),
             SimpleNamespace(id=2, sender_id="alice", sender_name="Alice", content="唉嘿嘿～"),
-            SimpleNamespace(id=3, sender_id="alice", sender_name="Alice", content="好呀"),
-            SimpleNamespace(id=4, sender_id="bob", sender_name="Bob", content="充电宝"),
+            SimpleNamespace(id=3, sender_id="alice", sender_name="Alice", content="唉嘿嘿～"),
+            SimpleNamespace(id=4, sender_id="alice", sender_name="Alice", content="好呀"),
             SimpleNamespace(id=5, sender_id="bob", sender_name="Bob", content="充电宝"),
             SimpleNamespace(id=6, sender_id="bob", sender_name="Bob", content="充电宝"),
-            SimpleNamespace(id=7, sender_id="bob", sender_name="Bob", content="OpenAI"),
+            SimpleNamespace(id=7, sender_id="bob", sender_name="Bob", content="充电宝"),
             SimpleNamespace(id=8, sender_id="bob", sender_name="Bob", content="OpenAI"),
             SimpleNamespace(id=9, sender_id="bob", sender_name="Bob", content="OpenAI"),
-            SimpleNamespace(id=10, sender_id="bot", sender_name="SELF", content="唉嘿嘿～", is_bot=True),
+            SimpleNamespace(id=10, sender_id="bob", sender_name="Bob", content="OpenAI"),
+            SimpleNamespace(id=11, sender_id="bot", sender_name="SELF", content="唉嘿嘿～", is_bot=True),
         ]
 
         result = asyncio.run(extractor.extract("group-1", messages))
@@ -33,7 +34,7 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["shared_scope"], "group-1")
         self.assertEqual(matches[0]["scope_kind"], "group")
-        self.assertEqual(matches[0]["distinct_turn_count"], 2)
+        self.assertEqual(matches[0]["distinct_turn_count"], 3)
         self.assertEqual(matches[0]["content_kind"], "expression")
         self.assertNotIn("speaker_id", matches[0])
         self.assertNotIn("speaker_name", matches[0])
@@ -58,6 +59,20 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         self.assertEqual(matches[0]["distinct_contributor_count"], 2)
         self.assertEqual(matches[0]["count"], 4)
 
+    def test_single_active_speaker_requires_three_independent_turns(self):
+        extractor = ExpressionCandidateExtractor(min_count=2)
+        two_turns = [
+            SimpleNamespace(id=1, sender_id="alice", content="唉嘿嘿～"),
+            SimpleNamespace(id=2, sender_id="alice", content="唉嘿嘿～"),
+        ]
+        three_turns = [
+            *two_turns,
+            SimpleNamespace(id=3, sender_id="alice", content="唉嘿嘿～"),
+        ]
+
+        self.assertFalse(any(item.get("expression") == "唉嘿嘿～" for item in asyncio.run(extractor.extract("group-1", two_turns))))
+        self.assertTrue(any(item.get("expression") == "唉嘿嘿～" for item in asyncio.run(extractor.extract("group-1", three_turns))))
+
     def test_unknown_sender_uses_group_compatibility_scope_and_unix_days_are_real_days(self):
         extractor = ExpressionCandidateExtractor(min_count=2)
         day_one = datetime(2026, 7, 1, 12, 0).timestamp()
@@ -65,6 +80,7 @@ class ExpressionStyleLearningTests(unittest.TestCase):
         messages = [
             SimpleNamespace(id=1, sender_name="同名", content="嘿嘿", timestamp=day_one),
             SimpleNamespace(id=2, sender_name="同名", content="嘿嘿", timestamp=day_two),
+            SimpleNamespace(id=3, sender_name="同名", content="嘿嘿", timestamp=day_two + 60),
         ]
 
         result = asyncio.run(extractor.extract("group-1", messages))
@@ -104,6 +120,7 @@ class ExpressionStyleLearningTests(unittest.TestCase):
             SimpleNamespace(id=6, sender_id="bob", content="来啦", timestamp=204.0),
             SimpleNamespace(id=7, sender_id="alice", content="(≧ω≦)♡", timestamp=206.0),
             SimpleNamespace(id=8, sender_id="alice", content="(≧ω≦)♡", timestamp=208.0),
+            SimpleNamespace(id=9, sender_id="alice", content="(≧ω≦)♡", timestamp=210.0),
         ]
 
         result = asyncio.run(extractor.extract("group-1", messages))

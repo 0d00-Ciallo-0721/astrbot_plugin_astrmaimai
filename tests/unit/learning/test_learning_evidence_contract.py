@@ -5,7 +5,9 @@ from astrmai.learning.mining.expression_candidate_extractor import ExpressionCan
 from astrmai.learning.mining.expression_pattern_enricher import ExpressionPatternEnricher
 from astrmai.learning.mining.jargon_candidate_extractor import JargonCandidateExtractor
 from astrmai.learning.mining.jargon_enricher import JargonEnricher
+from astrmai.learning.mining.jargon_identity import resolve_jargon_identity
 from astrmai.learning.mining.jargon_senses import merge_jargon_senses, select_jargon_senses
+from astrmai.learning.evolution_manager import _jargon_sense_evidence
 
 
 class _Gateway:
@@ -27,7 +29,7 @@ def test_jargon_evidence_bundle_contains_real_context_and_no_model_evidence():
     candidates = asyncio.run(extractor.extract("group-1", messages))
     candidate = next(item for item in candidates if item["content"] == "火钳刘明")
 
-    assert candidate["evidence_version"] == 2
+    assert candidate["evidence_version"] == 3
     assert candidate["source_message_ids"] == ["10", "11"]
     assert candidate["support_count"] == 2
     assert candidate["contributor_count"] == 2
@@ -75,6 +77,161 @@ def test_jargon_enricher_separates_model_examples_and_validates_citations():
     assert payload["supported_by"] == ["10", "11"]
     assert payload["support_count"] == 2
     assert payload["evidence_sufficient"] is True
+
+
+def test_jargon_extractor_keeps_explicit_definition_span_and_image_context_only():
+    extractor = JargonCandidateExtractor(min_count=2)
+    messages = [
+        SimpleNamespace(
+            id=10,
+            sender_id="u1",
+            sender_name="甲",
+            content="火钳刘明就是火前留名",
+            learning_context_content="火钳刘明就是火前留名",
+            learning_evidence_eligible=True,
+        ),
+        SimpleNamespace(
+            id=11,
+            sender_id="u2",
+            sender_name="乙",
+            content="",
+            learning_context_content="[图片转述：论坛里很多人在抢先留言]",
+            learning_source_kind="image_transcription",
+            learning_evidence_eligible=False,
+        ),
+    ]
+
+    candidates = asyncio.run(extractor.extract("group-1", messages))
+    candidate = next(item for item in candidates if item["content"] == "火钳刘明")
+
+    assert candidate["explicit_definition"] is True
+    assert candidate["definition_hints"] == ["火前留名"]
+    assert candidate["source_message_ids"] == ["10"]
+    assert candidate["source_spans"][0]["message_id"] == "10"
+    assert "图片转述" in candidate["context_windows"][0]["messages"][1]["content"]
+    assert candidate["context_windows"][0]["messages"][1]["is_evidence"] is False
+
+
+def test_jargon_enricher_supports_multiple_senses_and_invalid_confidence():
+    candidate = {
+        "content": "开香槟",
+        "canonical_form": "开香槟",
+        "source_message_ids": ["10", "20"],
+        "source_spans": [
+            {"message_id": "10", "start": 0, "end": 3, "text": "开香槟"},
+            {"message_id": "20", "start": 0, "end": 3, "text": "开香槟"},
+        ],
+        "context_windows": [],
+        "activation_score": 0.8,
+        "explicit_definition": True,
+    }
+    gateway = _Gateway(
+        {
+            "items": [{
+                "index": 1,
+                "confidence": "not-a-number",
+                "is_jargon": True,
+                "term_type": "jargon",
+                "semantic_novelty": True,
+                "evidence_sufficient": True,
+                "review_status": "review_pending",
+                "senses": [
+                    {"meaning": "提前庆祝胜利", "scene": "比赛", "confidence": 0.9, "supported_by": ["10"]},
+                    {"meaning": "真的打开香槟", "scene": "聚会", "confidence": "bad", "supported_by": ["20"]},
+                ],
+            }]
+        }
+    )
+
+    payload = asyncio.run(JargonEnricher(gateway).enrich("group-1", [candidate])).items[0]
+
+    assert payload["confidence"] == 0.8
+    assert len(payload["proposed_senses"]) == 2
+    assert payload["proposed_senses"][0]["supported_by"] == ["10"]
+    assert payload["proposed_senses"][1]["supported_by"] == ["20"]
+    assert payload["proposed_senses"][1]["confidence"] == 0.8
+
+
+def test_jargon_enricher_never_counts_visual_context_as_sense_support():
+    candidate = {
+        "content": "开香槟",
+        "source_message_ids": ["10"],
+        "context_windows": [{
+            "evidence_message_id": "10",
+            "messages": [
+                {"message_id": "10", "content": "开香槟", "is_evidence": True},
+                {
+                    "message_id": "image-20",
+                    "content": "[图片转述：庆祝胜利]",
+                    "source_kind": "image_transcription",
+                    "is_evidence": False,
+                },
+            ],
+        }],
+        "activation_score": 0.8,
+    }
+    gateway = _Gateway({
+        "items": [{
+            "index": 1,
+            "is_jargon": True,
+            "term_type": "jargon",
+            "semantic_novelty": True,
+            "evidence_sufficient": True,
+            "review_status": "review_pending",
+            "senses": [{
+                "meaning": "庆祝胜利",
+                "scene": "比赛",
+                "supported_by": ["image-20", "10"],
+            }],
+        }]
+    })
+
+    payload = asyncio.run(JargonEnricher(gateway).enrich("group-1", [candidate])).items[0]
+
+    assert payload["proposed_senses"][0]["supported_by"] == ["10"]
+    assert payload["support_count"] == 1
+
+
+def test_jargon_sense_evidence_does_not_cross_contaminate_polysemy():
+    evidence = {
+        "evidence_version": 3,
+        "source_examples": ["开香槟了", "真开香槟了"],
+        "source_message_ids": ["10", "20"],
+        "source_group_ids": ["group-1"],
+        "source_spans": [
+            {"message_id": "10", "start": 0, "end": 3, "text": "开香槟"},
+            {"message_id": "20", "start": 1, "end": 4, "text": "开香槟"},
+        ],
+        "context_windows": [
+            {"evidence_message_id": "10", "messages": [{"message_id": "10", "content": "领先了，开香槟"}]},
+            {"evidence_message_id": "20", "messages": [{"message_id": "20", "content": "聚会真开香槟"}]},
+        ],
+        "reply_relations": [],
+        "contributor_count": 2,
+    }
+
+    result = _jargon_sense_evidence(
+        evidence,
+        {"meaning": "提前庆祝胜利", "scene": "比赛", "supported_by": ["10"], "contradicted_by": []},
+    )
+
+    assert result["source_message_ids"] == ["10"]
+    assert result["source_examples"] == ["开香槟"]
+    assert [item["message_id"] for item in result["source_spans"]] == ["10"]
+    assert [item["evidence_message_id"] for item in result["context_windows"]] == ["10"]
+    assert result["support_count"] == 1
+
+
+def test_similar_jargon_surface_resolves_to_existing_global_identity():
+    record = SimpleNamespace(
+        content="hiyohiyo",
+        metadata={"surface_forms": ["hiyo hiyo"], "aliases": ["hiyohiyo～"]},
+    )
+
+    canonical, similarity = resolve_jargon_identity("hiyohiyo～", [record])
+
+    assert canonical == "hiyohiyo"
+    assert similarity >= 0.9
 
 
 def test_expression_enricher_never_promotes_model_samples_to_source_evidence():

@@ -5,6 +5,7 @@ from astrbot.api import logger
 from ..dedup import GLOBAL_CANDIDATE_REGISTRY, jargon_fingerprint, normalize_jargon_term
 from .jargon_candidate_extractor import JargonCandidateExtractor
 from .jargon_enricher import JargonEnricher
+from .jargon_identity import resolve_jargon_identity
 from .learning_input_policy import LearningInputPolicy
 from typing import Any, Iterable, List, Sequence
 
@@ -68,7 +69,8 @@ class JargonMiner:
                 "input_policy": dict(self.input_policy.last_report),
             }
             return []
-        existing_terms = set()
+        existing_terms: dict[str, str] = {}
+        existing_records: list[Any] = []
         store = getattr(getattr(self.memory_engine, "v2_store", None), "list_candidates", None)
         if callable(store):
             try:
@@ -78,23 +80,32 @@ class JargonMiner:
                     statuses=["active", "review_pending", "rejected", "stale"],
                     limit=10000,
                 )
-                existing_terms = {
-                    normalize_jargon_term(term)
-                    for item in rows
-                    if str(getattr(item, "status", "") or "").strip().lower() != "rejected"
-                    if str(group_id or "") in {
-                        str(source_group)
-                        for source_group in (dict(item.metadata or {}).get("source_groups") or [])
-                        if str(source_group or "").strip()
-                    }
-                    for term in [item.content, *(dict(item.metadata or {}).get("aliases", []) or [])]
-                    if normalize_jargon_term(term)
-                }
+                existing_records = list(rows or [])
+                for item in existing_records:
+                    metadata = dict(item.metadata or {})
+                    canonical = str(item.content or metadata.get("canonical_term") or "").strip()
+                    for term in [canonical, *(metadata.get("surface_forms") or []), *(metadata.get("aliases") or [])]:
+                        normalized_term = normalize_jargon_term(term)
+                        if normalized_term:
+                            existing_terms[normalized_term] = canonical or str(term).strip()
             except Exception as exc:
                 logger.debug(f"[JargonMiner] canonical jargon preload degraded: {exc}")
         expression_terms = await self._existing_expression_terms(group_id)
-        existing_terms.update(expression_terms)
-        candidates = await self.candidate_extractor.extract(group_id, normalized, existing_terms=existing_terms)
+        candidates = await self.candidate_extractor.extract(
+            group_id,
+            normalized,
+            existing_terms=existing_terms,
+            blocked_terms=expression_terms,
+        )
+        for candidate in candidates:
+            observed = str(candidate.get("content") or "")
+            canonical, similarity = resolve_jargon_identity(observed, existing_records)
+            candidate["canonical_form"] = canonical or observed
+            candidate["identity_similarity"] = similarity
+            candidate["existing_identity"] = bool(similarity >= 0.9)
+            candidate["surface_forms"] = list(
+                dict.fromkeys([canonical or observed, observed, *(candidate.get("surface_forms") or [])])
+            )[:12]
         if not candidates:
             self.last_report = {
                 "group_id": group_id,
@@ -118,14 +129,14 @@ class JargonMiner:
             }
             return candidates
         candidate_fingerprints = {
-            jargon_fingerprint(str(item.get("content") or "")): item
+            jargon_fingerprint(str(item.get("canonical_form") or item.get("content") or "")): item
             for item in candidates
         }
         claimed, in_flight = GLOBAL_CANDIDATE_REGISTRY.claim(candidate_fingerprints)
         candidates = [
             item
             for item in candidates
-            if jargon_fingerprint(str(item.get("content") or "")) in claimed
+            if jargon_fingerprint(str(item.get("canonical_form") or item.get("content") or "")) in claimed
         ]
         if not candidates:
             self.last_report = {
@@ -165,6 +176,15 @@ class JargonMiner:
             **dict(getattr(self.candidate_extractor, "last_report", {}) or {}),
             "input_policy": dict(self.input_policy.last_report),
             "enriched_count": len(enriched),
+            "identity_merged_candidates": sum(
+                bool(item.get("existing_identity")) for item in enriched if isinstance(item, dict)
+            ),
+            "multi_sense_candidates": sum(
+                len(item.get("proposed_senses") or []) > 1 for item in enriched if isinstance(item, dict)
+            ),
+            "proposed_sense_count": sum(
+                len(item.get("proposed_senses") or []) for item in enriched if isinstance(item, dict)
+            ),
             "reason": enrichment_reason,
             "enrichment": enrichment_report,
         }

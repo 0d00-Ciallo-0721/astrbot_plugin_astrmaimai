@@ -21,7 +21,7 @@ class _FakeExtractor:
     def __init__(self):
         self.calls = []
 
-    async def extract(self, group_id, messages, *, existing_terms=None):
+    async def extract(self, group_id, messages, *, existing_terms=None, blocked_terms=None):
         self.calls.append((group_id, list(messages), set(existing_terms or set())))
         return [{"content": "ok"}]
 
@@ -51,9 +51,9 @@ class MiningHelpersMigratedTests(unittest.TestCase):
             return await extractor.extract(
                 "group-1",
                 [
-                    SimpleNamespace(content="ship it softly"),
+                    SimpleNamespace(sender_id="alice", content="ship it softly"),
                     SimpleNamespace(content="ok"),
-                    SimpleNamespace(content="ship it softly"),
+                    SimpleNamespace(sender_id="bob", content="ship it softly"),
                     SimpleNamespace(content="ship it softly!"),
                     SimpleNamespace(content="x" * 80),
                 ],
@@ -72,8 +72,8 @@ class MiningHelpersMigratedTests(unittest.TestCase):
             return await extractor.extract(
                 "group-phrase",
                 [
-                    SimpleNamespace(content="唉嘿嘿，今天也见到哥哥啦"),
-                    SimpleNamespace(content="唉嘿嘿～这次可不会被骗了"),
+                    SimpleNamespace(sender_id="alice", content="唉嘿嘿，今天也见到哥哥啦"),
+                    SimpleNamespace(sender_id="bob", content="唉嘿嘿～这次可不会被骗了"),
                     SimpleNamespace(content="今天晚上吃什么"),
                 ],
             )

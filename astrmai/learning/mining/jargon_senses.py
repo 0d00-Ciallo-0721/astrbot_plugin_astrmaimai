@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from .learning_evidence import merge_evidence_metadata
@@ -23,6 +24,22 @@ def _review_status(value: Any) -> str:
     if normalized in {"pending", "pending_human"}:
         return "review_pending"
     return "review_pending"
+
+
+def _sense_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_meaning = _normalize(left.get("meaning"))
+    right_meaning = _normalize(right.get("meaning"))
+    if not left_meaning or not right_meaning:
+        return 0.0
+    meaning_score = SequenceMatcher(None, left_meaning, right_meaning).ratio()
+    if left_meaning in right_meaning or right_meaning in left_meaning:
+        meaning_score = max(meaning_score, 0.93)
+    left_scene = _normalize(left.get("scene"))
+    right_scene = _normalize(right.get("scene"))
+    if not left_scene or not right_scene:
+        return meaning_score
+    scene_score = SequenceMatcher(None, left_scene, right_scene).ratio()
+    return meaning_score * 0.85 + scene_score * 0.15
 
 
 def _sense_payload(payload: dict[str, Any], *, group_id: str) -> dict[str, Any]:
@@ -83,6 +100,12 @@ def merge_jargon_senses(
         (index for index, sense in enumerate(senses) if str(sense.get("sense_id") or "") == incoming_id),
         None,
     )
+    if matched_index is None:
+        scored = [(_sense_similarity(sense, incoming), index) for index, sense in enumerate(senses)]
+        best_score, best_index = max(scored, default=(0.0, None))
+        if best_index is not None and best_score >= 0.9:
+            matched_index = best_index
+            incoming_id = str(senses[best_index].get("sense_id") or incoming_id)
     revision_reopened = False
     is_new_sense = matched_index is None
     if matched_index is None:

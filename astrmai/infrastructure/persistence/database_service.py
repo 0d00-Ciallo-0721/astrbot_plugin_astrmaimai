@@ -11,7 +11,14 @@ from .database_jargon import JargonPersistenceMixin
 from .database_memory import MemoryPersistenceMixin
 from .database_profile_relation import ProfileRelationPersistenceMixin
 from .database_review import ReviewPersistenceMixin
-from .orm_models import ChatState, LastMessageMetadata, MessageLog
+from .orm_models import (
+    ChatState,
+    LastMessageMetadata,
+    MessageLog,
+    VisualAsset,
+    VisualMemory,
+    VisualMessageBinding,
+)
 from .sqlite_helpers import connect_sqlite
 from astrbot.api import logger
 
@@ -192,6 +199,46 @@ class DatabaseService(
             )
             results = session.exec(statement).all()
             return [self._clone_model(item) for item in reversed(results)]
+
+        return self._run_with_session(_sync)
+
+    def get_learning_visual_context(
+        self,
+        chat_id: str,
+        message_ids: List[str],
+    ) -> dict[str, list[dict[str, str]]]:
+        normalized_ids = list(dict.fromkeys(str(item or "").strip() for item in message_ids if str(item or "").strip()))
+        if not normalized_ids:
+            return {}
+
+        def _sync(session: Session) -> dict[str, list[dict[str, str]]]:
+            statement = (
+                select(VisualMessageBinding)
+                .where(
+                    VisualMessageBinding.chat_id == str(chat_id or ""),
+                    VisualMessageBinding.message_id.in_(normalized_ids),
+                )
+                .order_by(VisualMessageBinding.message_id, VisualMessageBinding.image_index)
+            )
+            result: dict[str, list[dict[str, str]]] = {}
+            for binding in session.exec(statement).all():
+                description = ""
+                kind = "image"
+                if binding.asset_id:
+                    asset = session.get(VisualAsset, binding.asset_id)
+                    if asset and str(asset.status or "").lower() == "ready":
+                        description = str(asset.description or "").strip()
+                        kind = str(asset.type or "image").strip() or "image"
+                if not description and binding.legacy_picid:
+                    legacy = session.get(VisualMemory, binding.legacy_picid)
+                    if legacy:
+                        description = str(legacy.description or "").strip()
+                        kind = str(legacy.type or "image").strip() or "image"
+                if description:
+                    result.setdefault(str(binding.message_id), []).append(
+                        {"description": description[:800], "type": kind}
+                    )
+            return result
 
         return self._run_with_session(_sync)
 
@@ -928,6 +975,13 @@ class DatabaseService(
 
     async def get_unprocessed_logs_async(self, group_id: str, limit: int = 50):
         return await self._run_blocking(self.get_unprocessed_logs, group_id, limit)
+
+    async def get_learning_visual_context_async(
+        self,
+        chat_id: str,
+        message_ids: List[str],
+    ) -> dict[str, list[dict[str, str]]]:
+        return await self._run_blocking(self.get_learning_visual_context, chat_id, message_ids)
 
     async def get_learning_logs_async(
         self,

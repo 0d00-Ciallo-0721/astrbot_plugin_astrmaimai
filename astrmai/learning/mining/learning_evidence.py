@@ -5,20 +5,20 @@ import json
 from typing import Any, Iterable
 
 
-EVIDENCE_VERSION = 2
+EVIDENCE_VERSION = 3
 
 
 def message_evidence_id(message: Any, *, fallback_index: int) -> str:
     for field in ("event_id", "platform_message_id", "id"):
-        value = str(getattr(message, field, "") or "").strip()
+        value = str(_value(message, field, "") or "").strip()
         if value:
             return value
     payload = "|".join(
         (
-            str(getattr(message, "group_id", "") or ""),
-            str(getattr(message, "sender_id", "") or ""),
-            str(getattr(message, "timestamp", "") or ""),
-            str(getattr(message, "content", "") or ""),
+            str(_value(message, "group_id", "") or ""),
+            str(_value(message, "sender_id", "") or ""),
+            str(_value(message, "timestamp", "") or ""),
+            str(_value(message, "content", "") or ""),
             str(fallback_index),
         )
     )
@@ -27,6 +27,45 @@ def message_evidence_id(message: Any, *, fallback_index: int) -> str:
 
 def _clean_text(value: Any, *, limit: int = 240) -> str:
     return " ".join(str(value or "").strip().split())[:limit]
+
+
+def _value(message: Any, name: str, default: Any = "") -> Any:
+    if isinstance(message, dict):
+        return message.get(name, default)
+    return getattr(message, name, default)
+
+
+def _context_text(message: Any) -> str:
+    return _clean_text(
+        _value(message, "learning_context_content", "")
+        or _value(message, "content", "")
+        or "[图片]"
+    )
+
+
+def _source_kind(message: Any) -> str:
+    return str(
+        _value(message, "learning_source_kind", "")
+        or _value(message, "message_kind", "")
+        or "human_text"
+    ).strip()
+
+
+def _message_flags(message: Any) -> dict[str, bool]:
+    return {
+        "is_bot": bool(_value(message, "is_bot", False)),
+        "is_echo": str(_value(message, "provenance", "") or "").strip().lower() == "bot_echo",
+        "is_plugin_output": str(_value(message, "provenance", "") or "").strip().lower() == "external_plugin",
+        "is_recalled": bool(_value(message, "recalled", False)),
+        "evidence_eligible": bool(_value(message, "learning_evidence_eligible", True)),
+    }
+
+
+def _timestamp(message: Any) -> float:
+    try:
+        return float(_value(message, "timestamp", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _ordered_unique(values: Iterable[Any], *, limit: int = 24) -> list[str]:
@@ -46,6 +85,7 @@ def build_evidence_bundle(
     messages: list[Any],
     matched_indexes: Iterable[int],
     source_examples: Iterable[str] = (),
+    source_spans: Iterable[dict[str, Any]] = (),
     context_radius: int = 2,
 ) -> dict[str, Any]:
     indexes = sorted({int(index) for index in matched_indexes if 0 <= int(index) < len(messages)})
@@ -54,7 +94,7 @@ def build_evidence_bundle(
         for index in indexes
     ]
     contributor_ids = _ordered_unique(
-        getattr(messages[index], "sender_id", "") or getattr(messages[index], "sender_name", "")
+        _value(messages[index], "sender_id", "") or _value(messages[index], "sender_name", "")
         for index in indexes
     )
     context_windows: list[dict[str, Any]] = []
@@ -68,9 +108,12 @@ def build_evidence_bundle(
             window_messages.append(
                 {
                     "message_id": message_evidence_id(message, fallback_index=offset),
-                    "actor": str(getattr(message, "sender_name", "") or getattr(message, "sender_id", "") or "群友"),
-                    "content": _clean_text(getattr(message, "content", "")),
-                    "is_evidence": offset == index,
+                    "actor": str(_value(message, "sender_name", "") or _value(message, "sender_id", "") or "群友"),
+                    "timestamp": _timestamp(message),
+                    "content": _context_text(message),
+                    "source_kind": _source_kind(message),
+                    "flags": _message_flags(message),
+                    "is_evidence": offset == index and bool(_value(message, "learning_evidence_eligible", True)),
                 }
             )
         context_windows.append(
@@ -81,9 +124,9 @@ def build_evidence_bundle(
         )
         message = messages[index]
         target_event_id = str(
-            getattr(message, "reply_target_event_id", "")
-            or getattr(message, "quote_event_id", "")
-            or getattr(message, "causal_parent_event_id", "")
+            _value(message, "reply_target_event_id", "")
+            or _value(message, "quote_event_id", "")
+            or _value(message, "causal_parent_event_id", "")
             or ""
         ).strip()
         if target_event_id:
@@ -95,11 +138,35 @@ def build_evidence_bundle(
             )
 
     real_examples = _ordered_unique(source_examples, limit=12)
+    normalized_spans: list[dict[str, Any]] = []
+    for span in source_spans:
+        if not isinstance(span, dict):
+            continue
+        message_id = str(span.get("message_id") or "").strip()
+        text = str(span.get("text") or "").strip()
+        try:
+            start = max(0, int(span.get("start", 0) or 0))
+            end = max(start, int(span.get("end", start + len(text)) or start + len(text)))
+        except (TypeError, ValueError):
+            continue
+        if not message_id or not text:
+            continue
+        normalized = {
+            "message_id": message_id,
+            "start": start,
+            "end": end,
+            "text": text[:60],
+        }
+        if normalized not in normalized_spans:
+            normalized_spans.append(normalized)
+        if len(normalized_spans) >= 48:
+            break
     digest_payload = {
         "group_id": str(group_id or ""),
         "source_message_ids": source_message_ids,
         "source_examples": real_examples,
         "reply_relations": reply_relations,
+        "source_spans": normalized_spans,
     }
     evidence_digest = hashlib.sha256(
         json.dumps(digest_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -111,6 +178,7 @@ def build_evidence_bundle(
         "source_group_ids": [str(group_id)] if str(group_id or "").strip() else [],
         "context_windows": context_windows[:12],
         "reply_relations": reply_relations[:12],
+        "source_spans": normalized_spans,
         "support_count": len(set(source_message_ids)),
         "contradiction_count": 0,
         "contributor_count": len(contributor_ids),
@@ -135,7 +203,7 @@ def merge_evidence_metadata(existing: dict[str, Any], incoming: dict[str, Any]) 
             [*(result.get(key) or []), *(incoming.get(key) or [])],
             limit=limit,
         )
-    for key, limit in (("context_windows", 12), ("reply_relations", 24)):
+    for key, limit in (("context_windows", 12), ("reply_relations", 24), ("source_spans", 48)):
         merged: list[Any] = []
         seen: set[str] = set()
         for item in [*(result.get(key) or []), *(incoming.get(key) or [])]:

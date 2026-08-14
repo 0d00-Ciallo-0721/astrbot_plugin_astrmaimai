@@ -289,6 +289,8 @@ class ExpressionCandidateExtractor:
 
         for message_index, message in enumerate(messages or []):
             content = self._clean_text(getattr(message, "content", ""))
+            if not bool(getattr(message, "learning_evidence_eligible", True)):
+                continue
             if self._looks_noise(content):
                 skipped_noise += 1
                 continue
@@ -338,6 +340,10 @@ class ExpressionCandidateExtractor:
         for normalized, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             if count < self.min_count:
                 continue
+            distinct_turn_count = len(turn_keys.get(normalized, set()))
+            distinct_contributor_count = len(contributor_keys.get(normalized, set()))
+            if distinct_contributor_count <= 1 and distinct_turn_count < max(self.min_count, 3):
+                continue
             qualifying_exact.append((normalized, count))
             content_samples = list(samples.get(normalized, []))
             expression = content_samples[0] if content_samples else normalized
@@ -354,9 +360,9 @@ class ExpressionCandidateExtractor:
                     "style": styles.get(normalized, "自然"),
                     "content_samples": content_samples,
                     "count": count,
-                    "distinct_turn_count": len(turn_keys.get(normalized, set())),
+                    "distinct_turn_count": distinct_turn_count,
                     "distinct_day_count": len(day_keys.get(normalized, set())),
-                    "distinct_contributor_count": len(contributor_keys.get(normalized, set())),
+                    "distinct_contributor_count": distinct_contributor_count,
                     "activation_score": activation_score,
                     "think_level": 1 if len(expression) >= 10 else 0,
                     "candidate_type": "exact",
@@ -381,6 +387,10 @@ class ExpressionCandidateExtractor:
         for phrase, count in sorted(phrase_counts.items(), key=lambda item: (-item[1], -len(item[0]), item[0])):
             if count < self.min_count:
                 continue
+            distinct_turn_count = len(phrase_turn_keys.get(phrase, set()))
+            distinct_contributor_count = len(phrase_contributors.get(phrase, set()))
+            if distinct_contributor_count <= 1 and distinct_turn_count < max(self.min_count, 3):
+                continue
             if any(phrase == selected and selected_count == count for selected, selected_count in selected_phrases):
                 continue
             selected_phrases.append((phrase, count))
@@ -402,9 +412,9 @@ class ExpressionCandidateExtractor:
                     "style": self._infer_style(content_samples[0] if content_samples else phrase),
                     "content_samples": content_samples,
                     "count": count,
-                    "distinct_turn_count": len(phrase_turn_keys.get(phrase, set())),
+                    "distinct_turn_count": distinct_turn_count,
                     "distinct_day_count": len(phrase_day_keys.get(phrase, set())),
-                    "distinct_contributor_count": len(phrase_contributors.get(phrase, set())),
+                    "distinct_contributor_count": distinct_contributor_count,
                     "activation_score": min(1.0, 0.35 + count * 0.16),
                     "think_level": 0,
                     "candidate_type": "phrase",
@@ -452,10 +462,10 @@ class ExpressionCandidateExtractor:
 
         rhythm_candidates = 0
         for normalized_rhythm, contributor_entries in rhythm_groups.items():
-            if len(contributor_entries) < 2:
-                continue
             entries = [entry for _, contributor_items in contributor_entries for entry in contributor_items]
             evidence = list(dict.fromkeys(item[2] for item in entries if item[2]))
+            if len(evidence) < max(self.min_count, 3):
+                continue
             expression = (
                 "偏好短句连发，常在数秒内连续补充"
                 if normalized_rhythm == "rapid_short_bursts"
@@ -483,8 +493,8 @@ class ExpressionCandidateExtractor:
                     "think_level": 0,
                     "candidate_type": "rhythm",
                     "classification": "expression",
-                    "classification_reason": "independently_observed_group_reply_rhythm",
-                    "quality_tier": "medium",
+                    "classification_reason": "repeated_group_reply_rhythm",
+                    "quality_tier": "high" if len(contributor_entries) >= 2 else "medium",
                     "candidate_id": self._candidate_id(group_id, "rhythm", normalized_rhythm),
                 }
             payload.update(

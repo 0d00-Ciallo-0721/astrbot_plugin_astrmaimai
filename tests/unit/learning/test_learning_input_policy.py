@@ -47,3 +47,26 @@ def test_candidate_router_keeps_expression_markers_out_of_jargon():
     assert LearningCandidateRouter.classify("的说").target == "expression"
     assert LearningCandidateRouter.classify("摸摸").target == "reject"
     assert LearningCandidateRouter.classify("特定群内缩写").target == "jargon"
+
+
+def test_image_transcription_is_context_only_and_not_learning_evidence():
+    policy = LearningInputPolicy()
+    messages = [
+        _message(
+            "[图片]",
+            id=10,
+            sender_id="1",
+            message_kind="image",
+            image_refs=["image-1"],
+            learning_context_content="[图片转述：一张写有‘火钳刘明’的聊天截图]",
+        )
+    ]
+
+    result = policy.normalize(messages)
+
+    assert len(result) == 1
+    assert result[0].content == ""
+    assert "图片转述" in result[0].learning_context_content
+    assert result[0].learning_source_kind == "image_transcription"
+    assert result[0].learning_evidence_eligible is False
+    assert policy.last_report["context_only_messages"] == 1

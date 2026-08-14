@@ -91,6 +91,8 @@ class ExpressionPatternEnricher:
                     "count": int(item.get("count") or 1),
                     "samples": list(item.get("content_samples") or [])[:4],
                     "source_message_ids": list(item.get("source_message_ids") or [])[:12],
+                    "context_windows": list(item.get("context_windows") or [])[:4],
+                    "reply_relations": list(item.get("reply_relations") or [])[:8],
                     "support_count": int(item.get("support_count") or 0),
                     "contributor_count": int(item.get("contributor_count") or 0),
                 }
@@ -101,13 +103,16 @@ class ExpressionPatternEnricher:
             "表达习惯只包括：口癖、语气词、句式习惯、句末习惯、颜文字/符号习惯、回复节奏。"
             "领域词、物品名、作品名、人名、群名、事件事实、技术术语、单次话题内容必须 reject，"
             "这些内容由黑话/领域词学习器处理。不要把候选改写成机器人自己的台词，不要输出或推断个人身份。"
+            "一个活跃成员也可以形成该群可观察的风格，但必须在至少三个独立轮次重复出现；多人使用只能提高置信度，不能作为硬门槛。"
+            "相邻消息和图片转述只用于理解场景，不能作为表达由群友实际说过的证据。"
             "必须保留候选原文 expression，不得扩写或替换，只能在 summary/style 中说明其语言特征。"
             "Return exactly one decision for every candidate. Return JSON only: "
             "{\"items\":[{\"candidate_id\":\"...\",\"index\":1,\"decision\":\"keep|reject\","
             "\"content_kind\":\"expression|topic_content\",\"habit_type\":\"catchphrase|particle|sentence_pattern|ending|symbol|rhythm\","
             "\"summary\":\"...\",\"situation\":\"...\","
             "\"style\":\"...\",\"confidence\":0.0,\"review_status\":\"pending|pending_human|rejected\","
-            "\"review_reason\":\"...\",\"content_samples\":[\"...\"]}]}\n"
+            "\"review_reason\":\"...\",\"supported_by\":[\"真实消息ID\"],"
+            "\"contradicted_by\":[\"真实消息ID\"],\"content_samples\":[\"模型示例，不作证据\"]}]}\n"
             f"Candidates: {json.dumps(prompt_items, ensure_ascii=False)}"
         )
         result = await self.gateway.call_data_process_task(
@@ -159,6 +164,25 @@ class ExpressionPatternEnricher:
         habit_type = str(extra.get("habit_type") or payload.get("habit_type") or "sentence_pattern").strip().lower()
         allowed_habit_types = {"catchphrase", "particle", "sentence_pattern", "ending", "symbol", "rhythm"}
         payload["habit_type"] = habit_type if habit_type in allowed_habit_types else "sentence_pattern"
+        valid_source_ids = {
+            str(source_id) for source_id in (payload.get("source_message_ids") or []) if str(source_id).strip()
+        }
+        supported_by = list(dict.fromkeys(
+            str(source_id) for source_id in (extra.get("supported_by") or []) if str(source_id) in valid_source_ids
+        ))
+        contradicted_by = list(dict.fromkeys(
+            str(source_id) for source_id in (extra.get("contradicted_by") or []) if str(source_id) in valid_source_ids
+        ))
+        if not supported_by:
+            supported_by = list(payload.get("source_message_ids") or [])[:12]
+            payload["citation_fallback"] = True
+        payload["supported_by"] = supported_by
+        payload["contradicted_by"] = contradicted_by
+        payload["support_count"] = len(supported_by)
+        payload["contradiction_count"] = len(contradicted_by)
+        if payload["support_count"] < 2 or payload["contradiction_count"]:
+            payload["review_status"] = "pending_human"
+            payload["review_reason"] = payload["review_reason"] or "真实表达证据不足或存在反例，需人工复核"
         model_samples = [str(sample).strip() for sample in extra.get("content_samples", []) if str(sample).strip()]
         payload["model_examples"] = list(dict.fromkeys([*(payload.get("model_examples") or []), *model_samples]))[:6]
         payload["content_samples"] = list(payload.get("source_examples") or payload.get("content_samples") or [])[:12]

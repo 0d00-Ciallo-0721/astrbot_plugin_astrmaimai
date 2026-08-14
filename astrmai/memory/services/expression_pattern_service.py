@@ -488,6 +488,7 @@ class ExpressionPatternService:
                 "source_group_ids",
                 "context_windows",
                 "reply_relations",
+                "source_spans",
                 "support_count",
                 "contradiction_count",
                 "contributor_count",
@@ -502,13 +503,12 @@ class ExpressionPatternService:
         new_digest = str(incoming_evidence.get("evidence_digest") or "").strip()
         old_support = int(existing_metadata.get("support_count") or 0)
         incoming_support = int(incoming_evidence.get("support_count") or 0)
-        incoming_contributors = int(incoming_evidence.get("contributor_count") or 0)
         revision_reopened = (
             old_review_status == "rejected"
             and bool(new_digest)
             and new_digest != old_digest
             and incoming_support >= max(old_support + 1, 3)
-            and incoming_contributors >= 2
+            and int(payload.get("distinct_turn_count") or incoming_support) >= 3
         )
         review_status = (
             "revision_needed"
