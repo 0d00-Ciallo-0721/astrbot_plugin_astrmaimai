@@ -23,7 +23,7 @@ from .visual_asset_identity import (
     build_visual_asset_identity,
     store_normalized_visual_asset,
 )
-from .vision_prompt import VISION_SYSTEM_PROMPT, VISION_USER_PROMPT, normalize_vision_result
+from .vision_prompt import normalize_vision_result, vision_prompts_for_animation
 
 
 class VisionAnalysisCoolingDown(RuntimeError):
@@ -78,6 +78,94 @@ class VisualCortex:
             0.0,
             float(getattr(self._vision_config(), "visual_failure_cooldown_sec", 120) or 0),
         )
+
+    def _gif_max_sample_frames(self) -> int:
+        return max(
+            2,
+            min(24, int(getattr(self._vision_config(), "gif_max_sample_frames", 12) or 12)),
+        )
+
+    def _gif_contact_sheet_max_edge_px(self) -> int:
+        return max(
+            512,
+            min(
+                4096,
+                int(
+                    getattr(
+                        self._vision_config(),
+                        "gif_contact_sheet_max_edge_px",
+                        1600,
+                    )
+                    or 1600
+                ),
+            ),
+        )
+
+    def _gif_preprocess_timeout_sec(self) -> float:
+        return max(
+            1.0,
+            min(
+                30.0,
+                float(
+                    getattr(self._vision_config(), "gif_preprocess_timeout_sec", 8.0)
+                    or 8.0
+                ),
+            ),
+        )
+
+    def _gif_max_decode_frames(self) -> int:
+        return max(
+            10,
+            min(
+                2000,
+                int(getattr(self._vision_config(), "gif_max_decode_frames", 500) or 500),
+            ),
+        )
+
+    @staticmethod
+    def _prepared_metadata(prepared) -> dict[str, Any]:
+        return {
+            "_source_format": str(prepared.source_format or ""),
+            "_declared_suffix": str(prepared.declared_suffix or ""),
+            "_is_animated": bool(prepared.is_animated),
+            "_source_frame_count": int(prepared.source_frame_count or 1),
+            "_duration_ms": int(prepared.duration_ms or 0),
+            "_sampled_frame_count": len(prepared.sampled_indices),
+            "_sampled_indices": list(prepared.sampled_indices),
+            "_sampled_timestamps_ms": list(prepared.sampled_timestamps_ms),
+            "_preprocess_version": str(prepared.preprocess_version or ""),
+            "_preprocess_status": str(prepared.preprocess_status or ""),
+            "_preprocess_elapsed_ms": float(prepared.preprocess_elapsed_ms or 0.0),
+            "_preprocess_fallback_reason": str(prepared.fallback_reason or ""),
+            "_model_input_format": str(prepared.image_format or ""),
+            "_contact_sheet_size": list(prepared.contact_sheet_size),
+        }
+
+    @staticmethod
+    def _cached_identity_metadata(
+        identity: VisualAssetIdentity,
+        image_path: str,
+    ) -> dict[str, Any]:
+        source_format = str(identity.mime_type or "").partition("/")[2].lower()
+        is_animated = int(identity.frame_count or 1) > 1
+        return {
+            "_source_format": source_format,
+            "_declared_suffix": Path(image_path).suffix.lower(),
+            "_is_animated": is_animated,
+            "_source_frame_count": int(identity.frame_count or 1),
+            "_duration_ms": 0,
+            "_sampled_frame_count": 0,
+            "_sampled_indices": [],
+            "_sampled_timestamps_ms": [],
+            "_preprocess_version": (
+                ImagePipeline.ANIMATION_PREPROCESS_VERSION if is_animated else "static-v1"
+            ),
+            "_preprocess_status": "cache_hit_no_preprocess",
+            "_preprocess_elapsed_ms": 0.0,
+            "_preprocess_fallback_reason": "",
+            "_model_input_format": "",
+            "_contact_sheet_size": [],
+        }
 
     def start(self):
         if self._worker_task is None or self._worker_task.done():
@@ -201,6 +289,7 @@ class VisualCortex:
         storage_path: str = "",
         status: str = "ready",
         last_error: str = "",
+        initial_recognition_elapsed_ms: float = 0.0,
     ) -> str:
         now = time.time()
         with self.db_service.get_session() as session:
@@ -221,6 +310,9 @@ class VisualCortex:
                     height=identity.height,
                     frame_count=identity.frame_count,
                     byte_size=identity.byte_size,
+                    initial_recognition_elapsed_ms=max(
+                        0.0, float(initial_recognition_elapsed_ms or 0.0)
+                    ),
                     storage_path=storage_path,
                     status=status,
                     last_error=last_error,
@@ -242,6 +334,13 @@ class VisualCortex:
                 asset.height = identity.height
                 asset.frame_count = identity.frame_count
                 asset.byte_size = identity.byte_size
+                if (
+                    float(initial_recognition_elapsed_ms or 0.0) > 0
+                    and float(asset.initial_recognition_elapsed_ms or 0.0) <= 0
+                ):
+                    asset.initial_recognition_elapsed_ms = float(
+                        initial_recognition_elapsed_ms
+                    )
                 if storage_path:
                     asset.storage_path = storage_path
                 asset.status = status
@@ -458,15 +557,32 @@ class VisualCortex:
         timeout_override: float | None,
     ) -> dict | None:
         started_at = time.monotonic()
+        prepared = await asyncio.to_thread(
+            ImagePipeline.prepare_image_path,
+            image_path,
+            max_frames=self._gif_max_sample_frames(),
+            max_edge_px=self._gif_contact_sheet_max_edge_px(),
+            max_decode_frames=self._gif_max_decode_frames(),
+            timeout_sec=self._gif_preprocess_timeout_sec(),
+        )
+        if prepared is None:
+            raise ValueError("vision image preprocessing failed")
+        prompt, system_prompt = vision_prompts_for_animation(prepared.is_animated)
+        prepared_metadata = self._prepared_metadata(prepared)
         logger.info(
             "[AstrMai-Vision] model call started "
-            f"asset={identity.asset_id[:12]} prompt_version={identity.prompt_version}"
+            f"asset={identity.asset_id[:12]} prompt_version={identity.prompt_version} "
+            f"source_format={prepared.source_format or 'unknown'} "
+            f"animated={prepared.is_animated} frames={prepared.source_frame_count} "
+            f"sampled={len(prepared.sampled_indices)} "
+            f"preprocess={prepared.preprocess_status} "
+            f"preprocess_ms={prepared.preprocess_elapsed_ms}"
         )
         try:
             result_dict = await self.gateway.call_vision_task(
-                image_data=image_path,
-                prompt=VISION_USER_PROMPT,
-                system_prompt=VISION_SYSTEM_PROMPT,
+                image_data=prepared.file_path,
+                prompt=prompt,
+                system_prompt=system_prompt,
                 lane_key=self._build_lane_key(scope_id),
                 timeout_override=timeout_override,
             )
@@ -476,6 +592,7 @@ class VisualCortex:
                 f"asset={identity.asset_id[:12]} "
                 f"elapsed_ms={round((time.monotonic() - started_at) * 1000, 1)}"
             )
+            ImagePipeline.cleanup(prepared)
             raise
         except Exception as exc:
             logger.warning(
@@ -483,6 +600,7 @@ class VisualCortex:
                 f"asset={identity.asset_id[:12]} error={type(exc).__name__} "
                 f"elapsed_ms={round((time.monotonic() - started_at) * 1000, 1)}"
             )
+            ImagePipeline.cleanup(prepared)
             raise
         payload, invalid_reason = normalize_vision_result(result_dict)
         elapsed_ms = round((time.monotonic() - started_at) * 1000, 1)
@@ -492,6 +610,7 @@ class VisualCortex:
                 f"asset={identity.asset_id[:12]} reason={invalid_reason or 'invalid_result'} "
                 f"elapsed_ms={elapsed_ms}"
             )
+            ImagePipeline.cleanup(prepared)
             return None
         model_id = str(
             (result_dict or {}).get("_vision_model_id", "")
@@ -503,7 +622,7 @@ class VisualCortex:
             try:
                 storage_path = await asyncio.to_thread(
                     store_normalized_visual_asset,
-                    image_path,
+                    prepared.file_path,
                     asset_id=identity.asset_id,
                     asset_dir=self.asset_dir,
                     max_edge_px=int(
@@ -512,12 +631,16 @@ class VisualCortex:
                     ),
                 )
                 storage_status = "stored"
+            except asyncio.CancelledError:
+                ImagePipeline.cleanup(prepared)
+                raise
             except Exception as exc:
                 storage_status = f"failed:{type(exc).__name__}"
                 logger.warning(
                     "[AstrMai-Vision] asset file storage degraded "
                     f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
                 )
+        ImagePipeline.cleanup(prepared)
         asset_write_status = "skipped_no_db"
         if self.db_service is not None:
             try:
@@ -529,6 +652,7 @@ class VisualCortex:
                     tags_json_str=ImagePipeline.serialize_tags(payload["emotion_tags"]),
                     model_id=model_id,
                     storage_path=storage_path,
+                    initial_recognition_elapsed_ms=elapsed_ms,
                 )
             except Exception as exc:
                 asset_write_status = f"failed:{type(exc).__name__}"
@@ -546,6 +670,7 @@ class VisualCortex:
                 "_prompt_version": identity.prompt_version,
                 "_asset_write_status": asset_write_status,
                 "_asset_storage_status": storage_status,
+                **prepared_metadata,
             }
         )
         logger.info(
@@ -572,6 +697,7 @@ class VisualCortex:
                 build_visual_asset_identity,
                 image_path,
                 prompt_version=self._prompt_version(),
+                animation_preprocess_version=ImagePipeline.ANIMATION_PREPROCESS_VERSION,
             )
         except Exception as exc:
             logger.warning(
@@ -598,6 +724,11 @@ class VisualCortex:
                     f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
                 )
             if payload and payload.get("description"):
+                for key, value in self._cached_identity_metadata(
+                    identity,
+                    image_path,
+                ).items():
+                    payload.setdefault(key, value)
                 payload["_cache_hit"] = True
                 payload["_cache_kind"] = "content"
                 payload["_singleflight_join"] = False
@@ -624,6 +755,7 @@ class VisualCortex:
                         "_model_id": "",
                         "_prompt_version": identity.prompt_version,
                         "_asset_storage_status": "not_stored",
+                        **self._cached_identity_metadata(identity, image_path),
                     }
                 )
                 try:
@@ -736,7 +868,7 @@ class VisualCortex:
     async def process_image_async(self, picid: str, base64_data: str, scope_id: str = "global"):
         prepared = None
         try:
-            prepared = await asyncio.to_thread(ImagePipeline.prepare_image, base64_data)
+            prepared = await asyncio.to_thread(ImagePipeline.materialize_image, base64_data)
             if not prepared:
                 logger.warning(f"[AstrMai-VisualCortex] failed to prepare image payload: {picid}")
                 return

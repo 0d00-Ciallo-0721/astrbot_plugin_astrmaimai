@@ -22,6 +22,7 @@ from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionH
 from ....infrastructure.runtime.turn_call_ledger import record_vision_observation
 from ....multimodal.visual_cortex import VisionAnalysisCoolingDown
 from ....presentation.dto.message_scope import MessageScope
+from ...vision_state import vision_analysis_observation_facts
 from ...contracts.qq_action import PendingQQAction
 from ..tool_contracts import TOOL_CAPABILITIES, record_tool_lifecycle
 from ..tool_disclosure import TOOL_PACKAGES, normalize_requested_packages
@@ -2469,6 +2470,7 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
         record_vision_observation(
             event,
             {
+                **vision_analysis_observation_facts(analysis or {}),
                 "autonomous_inspection_status": "success",
                 "autonomous_inspection_elapsed_ms": elapsed_ms,
                 "autonomous_inspection_cache_hit": bool((analysis or {}).get("_cache_hit", False)),

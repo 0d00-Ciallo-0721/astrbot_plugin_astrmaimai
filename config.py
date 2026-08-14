@@ -549,6 +549,30 @@ class VisionConfig(BaseModel):
         max_length=64,
         description="图片转述规则版本；修改后相同图片会重新识别",
     )
+    gif_max_sample_frames: int = Field(
+        default=12,
+        ge=2,
+        le=24,
+        description="GIF 动图送入视觉模型前最多抽取的代表帧数",
+    )
+    gif_contact_sheet_max_edge_px: int = Field(
+        default=1600,
+        ge=512,
+        le=4096,
+        description="GIF 时间序列联系表的最长边像素",
+    )
+    gif_preprocess_timeout_sec: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=30.0,
+        description="GIF 解码、抽帧和联系表生成的本地处理时限(秒)",
+    )
+    gif_max_decode_frames: int = Field(
+        default=500,
+        ge=10,
+        le=2000,
+        description="单个 GIF 最多解码的原始帧数",
+    )
     vision_reply_policy: str = Field(
         default="超时后忽略图片并继续回复",
         description="图片识别超时后的回复策略",

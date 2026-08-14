@@ -207,6 +207,40 @@ def test_vision_observation_keeps_state_machine_and_tool_contract_fields():
     assert payload["vision_tool_result_status"] == "no_image"
 
 
+def test_vision_observation_keeps_animation_preprocess_facts_without_content():
+    event = _Event()
+
+    record_vision_observation(
+        event,
+        {
+            "source_format": "gif",
+            "declared_suffix": ".jpg",
+            "is_animated": True,
+            "source_frame_count": 149,
+            "duration_ms": 4470,
+            "sampled_frame_count": 12,
+            "sampled_indices": [0, 14, 29, 148],
+            "sampled_timestamps_ms": [0, 420, 870, 4440],
+            "preprocess_version": "animated-grid-v1",
+            "preprocess_status": "contact_sheet",
+            "preprocess_elapsed_ms": 81.25,
+            "preprocess_fallback_reason": "",
+            "model_input_format": "jpeg",
+            "contact_sheet_size": [1200, 1200],
+            "description": "不应记录的图片内容",
+        },
+    )
+
+    payload = event.get_extra("astrmai_vision_observation")
+    assert payload["source_format"] == "gif"
+    assert payload["declared_suffix"] == ".jpg"
+    assert payload["is_animated"] is True
+    assert payload["source_frame_count"] == 149.0
+    assert payload["sampled_indices"] == [0, 14, 29, 148]
+    assert payload["contact_sheet_size"] == [1200, 1200]
+    assert "图片内容" not in str(payload)
+
+
 def test_tool_ledger_summary_exposes_execution_without_prompt_content():
     event = _Event()
     event.set_extra(

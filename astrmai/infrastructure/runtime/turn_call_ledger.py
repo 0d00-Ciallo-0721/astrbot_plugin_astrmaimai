@@ -1013,6 +1013,20 @@ def record_vision_observation(
         "has_valid_image_context",
         "image_reply_blocked",
         "dropped_image_count",
+        "source_format",
+        "declared_suffix",
+        "is_animated",
+        "source_frame_count",
+        "duration_ms",
+        "sampled_frame_count",
+        "sampled_indices",
+        "sampled_timestamps_ms",
+        "preprocess_version",
+        "preprocess_status",
+        "preprocess_elapsed_ms",
+        "preprocess_fallback_reason",
+        "model_input_format",
+        "contact_sheet_size",
     }
     normalized: dict[str, Any] = {}
     for key in allowed:
@@ -1022,6 +1036,16 @@ def record_vision_observation(
                 normalized[key] = [str(item)[:80] for item in value if str(item).strip()][:16]
             elif value is not None and str(value).strip():
                 normalized[key] = [str(value)[:80]]
+            else:
+                normalized[key] = []
+        elif key in {"sampled_indices", "sampled_timestamps_ms", "contact_sheet_size"}:
+            if isinstance(value, (list, tuple)):
+                limit = 2 if key == "contact_sheet_size" else 24
+                normalized[key] = [
+                    max(0, int(item))
+                    for item in value[:limit]
+                    if isinstance(item, (int, float))
+                ]
             else:
                 normalized[key] = []
         elif isinstance(value, bool):

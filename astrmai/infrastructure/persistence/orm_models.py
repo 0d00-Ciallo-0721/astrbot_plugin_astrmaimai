@@ -202,6 +202,7 @@ class VisualAsset(SQLModel, table=True):
     height: int = Field(default=0)
     frame_count: int = Field(default=1)
     byte_size: int = Field(default=0)
+    initial_recognition_elapsed_ms: float = Field(default=0.0)
     storage_path: str = Field(default="")
     status: str = Field(default="ready", index=True)
     hit_count: int = Field(default=0)

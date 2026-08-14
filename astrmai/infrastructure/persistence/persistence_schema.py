@@ -181,6 +181,31 @@ _MIGRATIONS: list[tuple[int, str]] = [
         updated_at REAL NOT NULL DEFAULT 0
     )"""),
     (85, "CREATE INDEX IF NOT EXISTS ix_proactive_scenario_delivery_retry ON proactive_scenario_delivery(status, next_retry_at)"),
+    (86, """CREATE TABLE IF NOT EXISTS visualasset (
+        asset_id TEXT PRIMARY KEY,
+        blob_hash TEXT DEFAULT '',
+        pixel_hash TEXT DEFAULT '',
+        perceptual_hash TEXT DEFAULT '',
+        prompt_version TEXT DEFAULT 'v1',
+        type TEXT DEFAULT 'image',
+        description TEXT DEFAULT '',
+        emotion_tags TEXT DEFAULT '[]',
+        model_id TEXT DEFAULT '',
+        mime_type TEXT DEFAULT '',
+        width INTEGER DEFAULT 0,
+        height INTEGER DEFAULT 0,
+        frame_count INTEGER DEFAULT 1,
+        byte_size INTEGER DEFAULT 0,
+        initial_recognition_elapsed_ms REAL DEFAULT 0,
+        storage_path TEXT DEFAULT '',
+        status TEXT DEFAULT 'ready',
+        hit_count INTEGER DEFAULT 0,
+        last_error TEXT DEFAULT '',
+        created_at REAL DEFAULT 0,
+        updated_at REAL DEFAULT 0,
+        last_access_at REAL DEFAULT 0
+    )"""),
+    (87, "ALTER TABLE visualasset ADD COLUMN initial_recognition_elapsed_ms REAL DEFAULT 0"),
 ]
 
 

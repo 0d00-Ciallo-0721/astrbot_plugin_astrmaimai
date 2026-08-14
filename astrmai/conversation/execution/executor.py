@@ -45,6 +45,7 @@ from ..vision_state import (
     guard_unresolved_image_reply,
     has_valid_image_context,
     reply_mentions_image,
+    vision_analysis_observation_facts,
     vision_observation_facts,
 )
 from ..planning.tool_contracts import record_tool_lifecycle
@@ -978,6 +979,7 @@ class ConcurrentExecutor:
         skip_reasons: list[str] = []
         saw_invalid_output = False
         saw_exception = False
+        analysis_facts: dict[str, Any] = {}
         message_obj = getattr(event, "message_obj", None)
         message_id = str(
             getattr(message_obj, "message_id", "")
@@ -1114,6 +1116,7 @@ class ConcurrentExecutor:
                         logger.warning(f"[{chat_id}] vision side-path invalid output: {invalid_reason}")
                         continue
                     item_succeeded = True
+                    analysis_facts = vision_analysis_observation_facts(result_dict)
                     model_id = str(
                         (result_dict or {}).get("_model_id", "")
                         or (result_dict or {}).get("_vision_model_id", "")
@@ -1287,6 +1290,7 @@ class ConcurrentExecutor:
             observation_outcome = "success"
         observation = {
             **vision_observation_facts(event),
+            **analysis_facts,
             "policy": policy,
             "outcome": observation_outcome,
             "image_count": len(all_direct_image_urls),

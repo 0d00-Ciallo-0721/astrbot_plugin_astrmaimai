@@ -3,14 +3,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import os
-import shutil
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+from PIL import Image
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +186,10 @@ class NapCatImageResolver:
                 try:
                     response = await api("get_image", **params)
                 except Exception as exc:
-                    logger.debug(f"[AstrMai-Vision] NapCat get_image degraded for {candidate}: {exc}")
+                    logger.debug(
+                        "[AstrMai-Vision] NapCat get_image degraded "
+                        f"error={type(exc).__name__}"
+                    )
                     continue
                 source = self._extract_response_source(response)
                 if not source:
@@ -201,7 +205,13 @@ class NapCatImageResolver:
                 header, encoded = reference.split(",", 1)
                 suffix = ".png" if "png" in header.lower() else ".jpg"
                 payload = base64.b64decode(encoded)
-                return await asyncio.to_thread(self._write_bytes, payload, reference, index, suffix)
+                return await asyncio.to_thread(
+                    self._write_bytes,
+                    payload,
+                    reference,
+                    index,
+                    self._detect_suffix(payload, fallback=suffix),
+                )
             except Exception as exc:
                 logger.debug(f"[AstrMai-Vision] data URI decode degraded: {exc}")
                 return ""
@@ -244,11 +254,31 @@ class NapCatImageResolver:
         return self.cache_dir / f"{digest}_{index}{safe_suffix}"
 
     def _copy_to_cache(self, source_path: str, source_ref: str, index: int) -> str:
-        suffix = Path(source_path).suffix or ".img"
-        destination = self._cache_path(source_ref, index, suffix)
-        if Path(source_path).resolve() != destination.resolve():
-            shutil.copy2(source_path, destination)
-        return str(destination)
+        payload = Path(source_path).read_bytes()
+        declared_suffix = Path(source_path).suffix.lower() or ".img"
+        detected_suffix = self._detect_suffix(payload, fallback=declared_suffix)
+        if detected_suffix != declared_suffix:
+            logger.info(
+                "[AstrMai-Vision] image format corrected "
+                f"declared={declared_suffix} detected={detected_suffix}"
+            )
+        return self._write_bytes(payload, source_ref, index, detected_suffix)
+
+    @staticmethod
+    def _detect_suffix(payload: bytes, *, fallback: str = ".img") -> str:
+        try:
+            with Image.open(io.BytesIO(payload)) as image:
+                image_format = str(image.format or "").upper()
+        except Exception:
+            return fallback
+        return {
+            "GIF": ".gif",
+            "WEBP": ".webp",
+            "PNG": ".png",
+            "JPEG": ".jpg",
+            "JPG": ".jpg",
+            "BMP": ".bmp",
+        }.get(image_format, fallback)
 
     def _write_bytes(self, payload: bytes, source_ref: str, index: int, suffix: str) -> str:
         destination = self._cache_path(source_ref, index, suffix)
@@ -262,7 +292,8 @@ class NapCatImageResolver:
             content_type = str(response.headers.get("Content-Type", "") or "").lower()
         if len(payload) > self.MAX_DOWNLOAD_BYTES:
             raise ValueError("image payload exceeds 20MB")
-        suffix = ".png" if "png" in content_type else ".jpg"
+        declared_suffix = ".png" if "png" in content_type else ".jpg"
+        suffix = self._detect_suffix(payload, fallback=declared_suffix)
         return self._write_bytes(payload, url, index, suffix)
 
 

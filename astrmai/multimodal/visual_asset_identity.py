@@ -43,6 +43,7 @@ def build_visual_asset_identity(
     image_path: str,
     *,
     prompt_version: str = "v1",
+    animation_preprocess_version: str = "",
 ) -> VisualAssetIdentity:
     raw = Path(image_path).read_bytes()
     blob_hash = hashlib.sha256(raw).hexdigest()
@@ -72,6 +73,9 @@ def build_visual_asset_identity(
     if not mime_type:
         mime_type = str(mimetypes.guess_type(image_path)[0] or "application/octet-stream")
     version = str(prompt_version or "v1").strip() or "v1"
+    animation_version = str(animation_preprocess_version or "").strip()
+    if frame_count > 1 and animation_version:
+        version = f"{version}+{animation_version}"
     asset_id = hashlib.sha256(f"{version}:{pixel_hash}".encode("utf-8")).hexdigest()
     return VisualAssetIdentity(
         asset_id=asset_id,

@@ -141,6 +141,68 @@ def vision_observation_facts(event: Any) -> dict[str, Any]:
     }
 
 
+def vision_analysis_observation_facts(result: Any) -> dict[str, Any]:
+    """Extract privacy-safe animation preprocessing facts from a vision result."""
+    if not isinstance(result, dict):
+        return {}
+
+    supported_keys = {
+        "source_format",
+        "declared_suffix",
+        "is_animated",
+        "source_frame_count",
+        "duration_ms",
+        "sampled_frame_count",
+        "sampled_indices",
+        "sampled_timestamps_ms",
+        "preprocess_version",
+        "preprocess_status",
+        "preprocess_elapsed_ms",
+        "preprocess_fallback_reason",
+        "model_input_format",
+        "contact_sheet_size",
+    }
+    if not any(key in result or f"_{key}" in result for key in supported_keys):
+        return {}
+
+    def value(key: str, default: Any = None) -> Any:
+        return result.get(f"_{key}", result.get(key, default))
+
+    def int_list(key: str, limit: int = 24) -> list[int]:
+        raw_value = value(key, [])
+        if not isinstance(raw_value, (list, tuple)):
+            return []
+        items: list[int] = []
+        for item in raw_value[:limit]:
+            try:
+                items.append(max(0, int(item)))
+            except (TypeError, ValueError):
+                continue
+        return items
+
+    return {
+        "source_format": str(value("source_format", "") or "")[:24],
+        "declared_suffix": str(value("declared_suffix", "") or "")[:16],
+        "is_animated": bool(value("is_animated", False)),
+        "source_frame_count": max(0, int(value("source_frame_count", 0) or 0)),
+        "duration_ms": max(0, int(value("duration_ms", 0) or 0)),
+        "sampled_frame_count": max(0, int(value("sampled_frame_count", 0) or 0)),
+        "sampled_indices": int_list("sampled_indices"),
+        "sampled_timestamps_ms": int_list("sampled_timestamps_ms"),
+        "preprocess_version": str(value("preprocess_version", "") or "")[:64],
+        "preprocess_status": str(value("preprocess_status", "") or "")[:64],
+        "preprocess_elapsed_ms": max(
+            0.0,
+            float(value("preprocess_elapsed_ms", 0.0) or 0.0),
+        ),
+        "preprocess_fallback_reason": str(
+            value("preprocess_fallback_reason", "") or ""
+        )[:80],
+        "model_input_format": str(value("model_input_format", "") or "")[:24],
+        "contact_sheet_size": int_list("contact_sheet_size", limit=2),
+    }
+
+
 def has_valid_image_context(event: Any) -> bool:
     getter = getattr(event, "get_extra", None)
     if not callable(getter):
@@ -196,5 +258,6 @@ __all__ = [
     "reply_mentions_unavailable_image",
     "select_autonomous_vision_candidate",
     "user_asked_about_image",
+    "vision_analysis_observation_facts",
     "vision_observation_facts",
 ]

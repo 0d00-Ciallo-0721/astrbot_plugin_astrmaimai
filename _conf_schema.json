@@ -1870,6 +1870,38 @@
         "default": "v1",
         "hint": "修改此值后，相同图片会按新的转述规则重新识别。一般保持默认；只有调整视觉提示词并希望刷新旧缓存时才修改。"
       },
+      "gif_max_sample_frames": {
+        "description": "动图最多抽取代表帧数",
+        "type": "int",
+        "default": 12,
+        "minimum": 2,
+        "maximum": 24,
+        "hint": "系统会同时保留动画首尾、均匀时间点和变化明显的画面，再拼成一张时间序列联系表交给视觉模型。"
+      },
+      "gif_contact_sheet_max_edge_px": {
+        "description": "动图联系表最长边像素",
+        "type": "int",
+        "default": 1600,
+        "minimum": 512,
+        "maximum": 4096,
+        "hint": "数值越大越容易看清细节，但会增加图片体积和视觉模型输入成本。"
+      },
+      "gif_preprocess_timeout_sec": {
+        "description": "动图本地预处理时限（秒）",
+        "type": "float",
+        "default": 8.0,
+        "minimum": 1,
+        "maximum": 30,
+        "hint": "只限制本地解码、抽帧和联系表生成。失败时会降级为首帧静态图片，不会阻断聊天。"
+      },
+      "gif_max_decode_frames": {
+        "description": "动图最多解码原始帧数",
+        "type": "int",
+        "default": 500,
+        "minimum": 10,
+        "maximum": 2000,
+        "hint": "用于限制异常超长动图的处理器和内存占用；普通聊天表情保持默认即可。"
+      },
       "vision_reply_policy": {
         "description": "图片识别超时后的回复方式",
         "type": "string",

@@ -11,6 +11,10 @@ from ..infrastructure.gateway.output_guard import (
 
 VISION_USER_PROMPT = "分析当前图片，并严格按照系统规则返回 JSON。"
 
+ANIMATION_VISION_USER_PROMPT = (
+    "分析这张由同一动态图片按时间顺序生成的联系表，并严格按照系统规则返回 JSON。"
+)
+
 VISION_SYSTEM_PROMPT = (
     "你是聊天系统中的视觉转述模块。每次请求只分析一张图片，并输出供后续对话模型理解图片内容的结构化结果。\n"
     "\n"
@@ -43,6 +47,19 @@ VISION_SYSTEM_PROMPT = (
     "只输出一个 JSON 对象，且必须是合法 JSON；不得使用 Markdown 代码块，不得添加任何 JSON 以外的文字。JSON 键必须严格保持为："
     '{"type": "image 或 emoji", "description": "完整中文转述", "emotion_tags": ["中文标签"]}'
 )
+
+ANIMATION_VISION_SYSTEM_PROMPT = VISION_SYSTEM_PROMPT + (
+    "\n\n当前输入是同一张动态图片生成的时间序列联系表。每个格子都是同一张 GIF/WebP 动画在不同时间点的画面，"
+    "阅读顺序为从左到右、从上到下；格子下方的 frame 和 ms 是原动画帧号与时间。"
+    "不要把重复出现的同一角色误认为多个角色。description 应概括动作、表情、文字或场景如何随时间变化，"
+    "并说明动画最后形成的反应或笑点；如果各帧几乎相同，应明确按同一主体的细微动作描述。"
+)
+
+
+def vision_prompts_for_animation(is_animated: bool) -> tuple[str, str]:
+    if is_animated:
+        return ANIMATION_VISION_USER_PROMPT, ANIMATION_VISION_SYSTEM_PROMPT
+    return VISION_USER_PROMPT, VISION_SYSTEM_PROMPT
 
 DESCRIPTION_PREFIXES = (
     "这是一张图片，",
@@ -115,8 +132,11 @@ def render_vision_record(record: dict[str, Any]) -> str:
 
 
 __all__ = [
+    "ANIMATION_VISION_SYSTEM_PROMPT",
+    "ANIMATION_VISION_USER_PROMPT",
     "VISION_SYSTEM_PROMPT",
     "VISION_USER_PROMPT",
     "normalize_vision_result",
     "render_vision_record",
+    "vision_prompts_for_animation",
 ]

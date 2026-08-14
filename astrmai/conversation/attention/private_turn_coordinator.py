@@ -12,6 +12,7 @@ from astrbot.api import logger
 from ...infrastructure.runtime.trace_runtime import debug_trace
 from ...infrastructure.runtime.turn_call_ledger import record_vision_observation
 from ...multimodal.vision_prompt import normalize_vision_result, render_vision_record
+from ..vision_state import vision_analysis_observation_facts
 
 
 @dataclass
@@ -631,6 +632,7 @@ class PrivateTurnCoordinator:
                         "prompt_version": str(
                             (result or {}).get("_prompt_version", "") or ""
                         ),
+                        **vision_analysis_observation_facts(result or {}),
                     }
                 )
             else:
@@ -949,6 +951,7 @@ class PrivateTurnCoordinator:
                 if str(record.get("asset_storage_status", "") or "").strip()
             )
         )
+        analysis_facts = vision_analysis_observation_facts(records[-1]) if records else {}
         if outcome.outcome in {"success", "partial_failure"}:
             resolve_status = "success"
         elif outcome.outcome in {"resolve_failed", "resolver_unavailable", "resolve_timeout"}:
@@ -963,6 +966,7 @@ class PrivateTurnCoordinator:
         }
         observation = {
             **payload,
+            **analysis_facts,
             "image_source": source_categories,
             "image_resolve_status": resolve_status,
             "vision_barrier_status": (

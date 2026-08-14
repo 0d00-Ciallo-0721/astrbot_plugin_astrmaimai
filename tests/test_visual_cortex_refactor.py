@@ -68,6 +68,20 @@ class VisualCortexRefactorTests(unittest.TestCase):
         img.save(buffer, format="PNG")
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+    def _build_gif_base64(self):
+        first = Image.new("RGB", (8, 8), color="red")
+        second = Image.new("RGB", (8, 8), color="blue")
+        buffer = io.BytesIO()
+        first.save(
+            buffer,
+            format="GIF",
+            save_all=True,
+            append_images=[second],
+            duration=80,
+            loop=0,
+        )
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
     def test_visual_cortex_processes_and_persists_result(self):
         stored = {}
 
@@ -100,6 +114,35 @@ class VisualCortexRefactorTests(unittest.TestCase):
         asyncio.run(cortex.process_image_async("pic-1", self._build_png_base64(), scope_id="chat-1"))
         self.assertIn("chat-1:pic-1", stored)
         self.assertEqual(stored["chat-1:pic-1"].description, "test")
+
+    def test_visual_cortex_queue_path_keeps_gif_animated_until_analysis(self):
+        captured = {}
+
+        class _Gateway:
+            async def call_vision_task(self, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "type": "emoji",
+                    "description": "角色由红色变成蓝色",
+                    "emotion_tags": ["变化"],
+                }
+
+        cortex = self.visual_mod.VisualCortex(_Gateway(), db_service=None)
+        result = asyncio.run(
+            cortex.process_image_async(
+                "animated-queue",
+                self._build_gif_base64(),
+                scope_id="chat-queue",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["_is_animated"])
+        self.assertEqual(result["_source_format"], "gif")
+        self.assertEqual(result["_source_frame_count"], 2)
+        self.assertEqual(result["_model_input_format"], "jpeg")
+        self.assertEqual(result["_preprocess_status"], "contact_sheet")
+        self.assertIn("按时间顺序生成的联系表", captured["prompt"])
 
     def test_visual_prompt_requests_detailed_image_and_emoji_transcription(self):
         captured = {}
@@ -230,6 +273,112 @@ class VisualCortexRefactorTests(unittest.TestCase):
         self.assertEqual(len(legacy), 2)
         self.assertEqual(assets[0].model_id, "vision-test")
         self.assertNotIn("private-source", bindings[0].source_ref_hash)
+
+    def test_animated_content_cache_survives_restart_and_rebinds_message(self):
+        from astrmai.infrastructure.persistence.orm_models import (
+            VisualAsset,
+            VisualMemory,
+            VisualMessageBinding,
+        )
+
+        db_path = os.path.join(self.temp_dir.name, "vision-cache.db")
+        db_url = f"sqlite:///{db_path.replace(os.sep, '/')}"
+
+        class _DB:
+            def __init__(self, engine):
+                self.engine = engine
+
+            def get_session(self):
+                return Session(self.engine)
+
+        class _Gateway:
+            def __init__(self):
+                self.calls = 0
+
+            async def call_vision_task(self, **kwargs):
+                self.calls += 1
+                return {
+                    "type": "emoji",
+                    "description": "黄色角色连续挥手表示热情欢迎",
+                    "emotion_tags": ["欢迎", "开心"],
+                    "_vision_model_id": "vision-restart-test",
+                }
+
+        frames = [
+            Image.new("RGB", (24, 24), color=color)
+            for color in ("yellow", "orange", "gold")
+        ]
+        source_path = os.path.join(self.temp_dir.name, "restart-animation.jpg")
+        frames[0].save(
+            source_path,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=90,
+            loop=0,
+        )
+
+        first_engine = create_engine(db_url, connect_args={"check_same_thread": False})
+        SQLModel.metadata.create_all(first_engine)
+        first_gateway = _Gateway()
+        first_cortex = self.visual_mod.VisualCortex(first_gateway, _DB(first_engine))
+        first = asyncio.run(
+            first_cortex.analyze_image_path(
+                "first",
+                source_path,
+                scope_id="chat-a",
+                binding_context={
+                    "chat_id": "chat-a",
+                    "message_id": "message-a",
+                    "sender_id": "user-a",
+                    "image_index": 0,
+                },
+            )
+        )
+        with Session(first_engine) as session:
+            first_asset = session.get(VisualAsset, first["_asset_id"])
+            first_recognition_elapsed_ms = first_asset.initial_recognition_elapsed_ms
+        first_engine.dispose()
+
+        second_engine = create_engine(db_url, connect_args={"check_same_thread": False})
+        SQLModel.metadata.create_all(second_engine)
+        second_gateway = _Gateway()
+        second_cortex = self.visual_mod.VisualCortex(second_gateway, _DB(second_engine))
+        second = asyncio.run(
+            second_cortex.analyze_image_path(
+                "second",
+                source_path,
+                scope_id="chat-b",
+                binding_context={
+                    "chat_id": "chat-b",
+                    "message_id": "message-b",
+                    "sender_id": "user-b",
+                    "image_index": 0,
+                },
+            )
+        )
+
+        self.assertEqual(first_gateway.calls, 1)
+        self.assertEqual(second_gateway.calls, 0)
+        self.assertEqual(first["_asset_id"], second["_asset_id"])
+        self.assertEqual(second["_cache_kind"], "content")
+        self.assertEqual(second["description"], first["description"])
+        self.assertEqual(second["emotion_tags"], first["emotion_tags"])
+        self.assertTrue(second["_is_animated"])
+        with Session(second_engine) as session:
+            assets = list(session.exec(select(VisualAsset)).all())
+            bindings = list(session.exec(select(VisualMessageBinding)).all())
+            legacy = list(session.exec(select(VisualMemory)).all())
+        second_engine.dispose()
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(len(bindings), 2)
+        self.assertEqual(len(legacy), 2)
+        self.assertEqual({item.message_id for item in bindings}, {"message-a", "message-b"})
+        self.assertGreater(assets[0].initial_recognition_elapsed_ms, 0)
+        self.assertEqual(
+            assets[0].initial_recognition_elapsed_ms,
+            first_recognition_elapsed_ms,
+        )
 
     def test_concurrent_same_image_uses_singleflight(self):
         class _Gateway:
@@ -419,6 +568,108 @@ class VisualCortexRefactorTests(unittest.TestCase):
         self.assertEqual(blue_identity.frame_count, 2)
         self.assertNotEqual(red_identity.pixel_hash, blue_identity.pixel_hash)
         self.assertNotEqual(red_identity.asset_id, blue_identity.asset_id)
+
+    def test_animated_jpg_is_preprocessed_to_contact_sheet_before_model_call(self):
+        captured = {}
+
+        class _Gateway:
+            async def call_vision_task(self, **kwargs):
+                captured.update(kwargs)
+                with Image.open(kwargs["image_data"]) as model_input:
+                    captured["model_input_format"] = model_input.format
+                    captured["model_input_size"] = model_input.size
+                return {
+                    "type": "emoji",
+                    "description": "角色按时间顺序从平静变为生气",
+                    "emotion_tags": ["生气"],
+                }
+
+        frames = []
+        for index in range(8):
+            frame = Image.new("RGBA", (64, 48), color=(255, 255, 255, 255))
+            for x in range(4 + index * 5, 20 + index * 5):
+                for y in range(12, 36):
+                    frame.putpixel((x, y), (220, 30, 30, 255))
+            frames.append(frame)
+        source_path = os.path.join(self.temp_dir.name, "qq-animation.jpg")
+        frames[0].save(
+            source_path,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=100,
+            disposal=2,
+            loop=0,
+        )
+        cortex = self.visual_mod.VisualCortex(_Gateway(), db_service=None)
+
+        result = asyncio.run(
+            cortex.analyze_image_path("animated", source_path, scope_id="chat")
+        )
+
+        self.assertEqual(captured["model_input_format"], "JPEG")
+        self.assertIn("同一张动态图片", captured["system_prompt"])
+        self.assertTrue(result["_is_animated"])
+        self.assertEqual(result["_source_format"], "gif")
+        self.assertGreater(result["_sampled_frame_count"], 1)
+        self.assertEqual(result["_model_input_format"], "jpeg")
+        self.assertIn("animated-grid", result["_prompt_version"])
+
+    def test_animated_content_cache_hit_retains_animation_identity(self):
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(engine)
+
+        class _DB:
+            def get_session(self):
+                return Session(engine)
+
+        class _Gateway:
+            def __init__(self):
+                self.calls = 0
+
+            async def call_vision_task(self, **kwargs):
+                self.calls += 1
+                return {
+                    "type": "emoji",
+                    "description": "角色连续挥手",
+                    "emotion_tags": ["开心"],
+                }
+
+        frames = [
+            Image.new("RGB", (24, 24), color=color)
+            for color in ("white", "red", "blue")
+        ]
+        source_path = os.path.join(self.temp_dir.name, "cached-animation.jpg")
+        frames[0].save(
+            source_path,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=90,
+            loop=0,
+        )
+        gateway = _Gateway()
+        cortex = self.visual_mod.VisualCortex(gateway, _DB())
+
+        async def _run():
+            first = await cortex.analyze_image_path("first", source_path, scope_id="chat")
+            second = await cortex.analyze_image_path("second", source_path, scope_id="chat")
+            return first, second
+
+        first, second = asyncio.run(_run())
+
+        self.assertEqual(gateway.calls, 1)
+        self.assertFalse(first["_cache_hit"])
+        self.assertTrue(second["_cache_hit"])
+        self.assertTrue(second["_is_animated"])
+        self.assertEqual(second["_source_format"], "gif")
+        self.assertEqual(second["_source_frame_count"], 3)
+        self.assertEqual(second["_preprocess_status"], "cache_hit_no_preprocess")
+        self.assertIn("animated-grid", second["_preprocess_version"])
 
     def test_optional_standardized_file_storage_does_not_store_source_path(self):
         from astrmai.infrastructure.persistence.orm_models import VisualAsset

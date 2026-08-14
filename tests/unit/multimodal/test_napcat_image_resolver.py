@@ -1,8 +1,11 @@
 import asyncio
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+from PIL import Image
 
 
 class _Api:
@@ -30,6 +33,23 @@ class _Event:
 
 
 class NapCatImageResolverTests(unittest.TestCase):
+    @staticmethod
+    def _gif_bytes() -> bytes:
+        output = io.BytesIO()
+        frames = [
+            Image.new("RGB", (12, 12), color="white"),
+            Image.new("RGB", (12, 12), color="red"),
+        ]
+        frames[0].save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=100,
+            loop=0,
+        )
+        return output.getvalue()
+
     def test_download_timeout_uses_central_timing_and_refreshes(self):
         from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
 
@@ -104,6 +124,25 @@ class NapCatImageResolverTests(unittest.TestCase):
             self.assertEqual(len(result.images), 1)
             self.assertEqual(result.images[0].index, 0)
             self.assertEqual(api.calls, [])
+
+    def test_local_gif_with_jpg_suffix_is_cached_with_detected_suffix(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "qq-animation.jpg"
+            source.write_bytes(self._gif_bytes())
+            api = _Api({})
+            event = _Event({"type": "image", "data": {"path": str(source)}}, api)
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(resolver.resolve_event_images(event))
+
+            self.assertEqual(len(result.images), 1)
+            resolved = Path(result.images[0].local_path)
+            self.assertEqual(resolved.suffix, ".gif")
+            with Image.open(resolved) as image:
+                self.assertEqual(image.format, "GIF")
+                self.assertGreater(image.n_frames, 1)
 
 
 if __name__ == "__main__":
