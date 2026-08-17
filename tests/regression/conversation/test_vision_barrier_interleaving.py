@@ -7,7 +7,7 @@
 1. 屏障执行期间新消息入池 → 第二轮批次含旧+新且不重复派发下游
 2. abort 分支：整批只发一次失败通知；池非空时新消息继续处理，池空才收工
 3. resolve 超时 → outcome=resolve_timeout，downstream_action 按策略
-   （require_analysis→abort_required_vision / timeout_fallback→continue_with_placeholder）
+   （require_analysis→abort_required_vision / 私聊 timeout_fallback→notify_failure）
 
 附带锚定 OPT-07：burst deadline 跨迭代不重置（否则屏障期间不断有新消息时视觉预算无上界）。
 """

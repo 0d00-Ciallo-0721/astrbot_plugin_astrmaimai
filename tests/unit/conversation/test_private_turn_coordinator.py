@@ -419,6 +419,11 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_rich_text"), "告诉我天气")
         self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text"))
 
+        coordinator.bind_batch_context([event], event)
+
+        self.assertEqual(event.get_extra("astrmai_rich_text"), "告诉我天气")
+        self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text"))
+
     def test_required_vision_failure_aborts_without_placeholder_reply_context(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 
@@ -492,9 +497,13 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertEqual(outcome.image_count, 2)
         self.assertEqual(outcome.analyzed_count, 1)
         self.assertEqual(outcome.failed_count, 1)
-        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
+        self.assertEqual(outcome.downstream_action, "continue_with_partial_results")
+        self.assertEqual(
+            event.get_extra("astrmai_vision_failure_disposition"),
+            "continue_with_partial_results",
+        )
         self.assertIn("第一张识别成功", event.get_extra("astrmai_rich_text"))
-        self.assertEqual(event.get_extra("astrmai_rich_text").count("[图片]"), 1)
+        self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text"))
         self.assertEqual(persistence.marked, [])
 
     def test_fallback_does_not_duplicate_existing_image_placeholder(self):

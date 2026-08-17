@@ -1475,8 +1475,26 @@ class ConcurrentExecutor:
             if text_kind == "independent_text" and independent_text:
                 failure_disposition = "continue_text_only"
                 event.set_extra("astrmai_vision_independent_text", independent_text)
-                if user_text and user_text in model_prompt:
-                    model_prompt = model_prompt.replace(user_text, independent_text)
+                if user_text:
+                    text_offset = model_prompt.rfind(user_text)
+                    if text_offset >= 0:
+                        before = model_prompt[:text_offset]
+                        after = model_prompt[text_offset + len(user_text) :]
+                        before = re.sub(
+                            r"\[(?:图片|image)\](?P<spacing>[ \t]*(?:\r?\n[ \t]*)?)$",
+                            lambda match: "\n" if "\n" in match.group("spacing") else "",
+                            before,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                        after = re.sub(
+                            r"^(?P<spacing>[ \t]*(?:\r?\n[ \t]*)?)\[(?:图片|image)\]",
+                            lambda match: "\n" if "\n" in match.group("spacing") else "",
+                            after,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                        model_prompt = before + independent_text + after
                 model_prompt += (
                     "\n\n[媒体失败处置] 图片内容不可用。只回答以下独立文字任务："
                     f"{independent_text}。禁止猜测或回答图片相关部分。"

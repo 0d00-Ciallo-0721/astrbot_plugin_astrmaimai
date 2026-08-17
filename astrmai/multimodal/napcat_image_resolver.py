@@ -245,7 +245,10 @@ class NapCatImageResolver:
 
         api = getattr(getattr(getattr(event, "bot", None), "api", None), "call_action", None)
         if not callable(api):
-            self._record_failure(details, index, "no_reference", "napcat_api_unavailable")
+            self._record_failure(details, index, "get_image_failed", "napcat_api_unavailable")
+            self._record_failure(details, index, "get_file_failed", "napcat_api_unavailable")
+            if source_message_id:
+                self._record_failure(details, index, "get_msg_failed", "napcat_api_unavailable")
             return None
         for candidate in candidates:
             if candidate.startswith("onebot-message://"):

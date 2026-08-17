@@ -216,6 +216,31 @@ class NapCatImageResolverTests(unittest.TestCase):
             self.assertEqual(result.images, [])
             self.assertEqual(result.failure_details, [{"index": 0, "reason": "no_reference"}])
 
+    def test_candidate_with_reference_and_missing_api_is_not_reported_as_no_reference(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event = _Event({"type": "text", "data": {"text": "current"}}, _Api({}))
+            event.bot.api = object()
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(
+                resolver.resolve_candidate(
+                    event,
+                    {
+                        "message_id": "fake-message-api-missing",
+                        "candidate_refs": ["fake-image-reference"],
+                    },
+                )
+            )
+
+            reasons = [item["reason"] for item in result.failure_details]
+            self.assertNotIn("no_reference", reasons)
+            self.assertEqual(
+                reasons,
+                ["get_image_failed", "get_file_failed", "get_msg_failed"],
+            )
+
     def test_failed_fallback_chain_records_each_structured_reason_in_order(self):
         from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
 

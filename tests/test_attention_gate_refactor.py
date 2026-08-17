@@ -1638,6 +1638,95 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual((first, second), (expected, expected))
         self.assertEqual(sent, [expected])
 
+    def test_private_default_vision_failure_real_coordinator_stops_before_downstream(self):
+        from astrmai.conversation.attention.private_turn_coordinator import (
+            PrivateTurnCoordinator,
+        )
+        from astrmai.multimodal.napcat_image_resolver import (
+            ImageResolutionBatch,
+            ResolvedImage,
+        )
+
+        class _Resolver:
+            async def resolve_event_images(self, event):
+                return ImageResolutionBatch(
+                    had_images=True,
+                    images=[
+                        ResolvedImage(
+                            index=0,
+                            source_ref="fake-image-reference",
+                            local_path="C:/fake/image.jpg",
+                        )
+                    ],
+                )
+
+        class _FailedCortex:
+            async def analyze_image_path(self, *args, **kwargs):
+                return None
+
+        coordinator = PrivateTurnCoordinator(
+            config=SimpleNamespace(
+                private_chat=SimpleNamespace(input_settle_sec=0.0),
+                timing=SimpleNamespace(
+                    image_resolve_timeout_sec=1.0,
+                    image_analysis_timeout_sec=1.0,
+                    vision_barrier_total_timeout_sec=1.0,
+                ),
+                vision=SimpleNamespace(
+                    enable_vision=True,
+                    vision_reply_policy="超时后忽略图片并继续回复",
+                    image_analysis_retries=1,
+                ),
+            ),
+            image_resolver=_Resolver(),
+            visual_cortex=_FailedCortex(),
+        )
+        self.gate.private_turn_coordinator = coordinator
+        mood_calls = []
+        judge_calls = []
+        system2_calls = []
+        self.gate._apply_primary_mood_update = lambda *args: mood_calls.append(args)
+        self.gate._evaluate_judge_gate = lambda *args, **kwargs: judge_calls.append(
+            (args, kwargs)
+        )
+        self.gate.sys2_process = lambda *args: system2_calls.append(args)
+        event = _FakePrivateEvent(
+            "user-1",
+            "Alice",
+            "",
+            extras={"direct_image_refs": ["fake-image-reference"]},
+        )
+        sent = []
+
+        async def send(result):
+            sent.append(result)
+
+        event.send = send
+        event.plain_result = lambda text: text
+
+        async def run():
+            session = self.gate_mod.SessionContext()
+            session.accumulation_pool = [event]
+            session.is_evaluating = True
+            await self.gate._debounce_and_judge(
+                event.unified_msg_origin,
+                session,
+                "bot-1",
+                is_private=True,
+            )
+
+        asyncio.run(run())
+
+        self.assertEqual(mood_calls, [])
+        self.assertEqual(judge_calls, [])
+        self.assertEqual(system2_calls, [])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("无法确认图片内容", sent[0])
+        self.assertEqual(
+            event.get_extra("astrmai_vision_failure_disposition"),
+            "notify_failure",
+        )
+
     def test_group_perception_uses_unified_origin_as_chat_id(self):
         event = _FakeEvent("user-1", "Alice", "hello")
         event.unified_msg_origin = "napcat-a:GroupMessage:group-1"

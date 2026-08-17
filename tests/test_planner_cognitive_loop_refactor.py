@@ -585,7 +585,6 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
             focus_event=at_event,
             root_event=image_event,
             core_events=[image_event, at_event],
-            focus_sender_id="user-b",
             vision_bundle=focus_mod.VisionBundle(
                 image_urls=["a.jpg"],
                 direct_image_urls=[],
@@ -599,6 +598,76 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
 
         self.assertEqual(selected, [])
         self.assertIsNone(at_event.get_extra("astrmai_final_vision_target"))
+
+    def test_final_reply_rejects_unsafe_candidate_copied_to_focus_event(self):
+        focus_event = _FakeEvent(sender_id="user-b", text="@AstrMai")
+        focus_event.set_extra("astrmai_at_bot_wakeup", True)
+        candidate_mod = importlib.import_module(
+            "astrmai.conversation.contracts.vision_candidate"
+        )
+        copied = candidate_mod.VisionCandidate(
+            message_id="image-from-a",
+            group_id="group-1",
+            sender_id="user-a",
+            timestamp=10.0,
+            image_index=0,
+            candidate_refs=("a.jpg",),
+            prefilter_selected=True,
+            pairing_mode="at_then_image",
+        )
+        focus_event.set_extra("astrmai_vision_candidates", [copied.as_dict()])
+        focus_mod = importlib.import_module(
+            "astrmai.conversation.contracts.focus_context"
+        )
+        focus_context = focus_mod.FocusThreadContext(
+            focus_event=focus_event,
+            core_events=[focus_event],
+        )
+
+        selected = self.planner_mod.Planner._latest_reply_vision_urls(
+            focus_event, focus_context
+        )
+
+        self.assertEqual(selected, [])
+        self.assertIsNone(focus_event.get_extra("astrmai_final_vision_target"))
+
+    def test_final_reply_accepts_verified_same_sender_pairing_on_focus_event(self):
+        focus_event = _FakeEvent(sender_id="user-b", text="@AstrMai")
+        focus_event.set_extra("astrmai_at_bot_wakeup", True)
+        focus_event.set_extra("astrmai_cross_message_vision_bound", True)
+        candidate_mod = importlib.import_module(
+            "astrmai.conversation.contracts.vision_candidate"
+        )
+        paired = candidate_mod.VisionCandidate(
+            message_id="image-from-b",
+            group_id="group-1",
+            sender_id="user-b",
+            timestamp=10.0,
+            image_index=0,
+            candidate_refs=("b.jpg",),
+            prefilter_selected=True,
+            pairing_mode="image_then_at",
+            pairing_verified=True,
+            paired_sender_id="user-b",
+            paired_group_id="group-1",
+        )
+        focus_event.set_extra("astrmai_vision_candidates", [paired.as_dict()])
+        focus_mod = importlib.import_module(
+            "astrmai.conversation.contracts.focus_context"
+        )
+        focus_context = focus_mod.FocusThreadContext(
+            focus_event=focus_event,
+            core_events=[focus_event],
+        )
+
+        selected = self.planner_mod.Planner._latest_reply_vision_urls(
+            focus_event, focus_context
+        )
+
+        self.assertEqual(selected, ["b.jpg"])
+        target = focus_event.get_extra("astrmai_final_vision_target")
+        self.assertTrue(target["pairing_verified"])
+        self.assertEqual(target["paired_sender_id"], "user-b")
 
     def test_final_reply_prefers_focus_sender_over_newer_passive_candidate(self):
         focus_event = _FakeEvent(sender_id="user-a", text="这张图怎么样")

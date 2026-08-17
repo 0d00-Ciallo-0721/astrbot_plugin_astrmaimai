@@ -806,7 +806,14 @@ class PrivateTurnCoordinator:
         event.set_extra("astrmai_vision_no_guess", True)
         failure_disposition = ""
         independent_text = ""
-        if not records:
+        if records:
+            failure_disposition = (
+                "notify_failure"
+                if policy == "require_analysis"
+                else "continue_with_partial_results"
+            )
+            event.set_extra("astrmai_vision_failure_disposition", failure_disposition)
+        else:
             if self._is_media_only_event(event):
                 text_kind = "image_only"
             else:
@@ -846,6 +853,11 @@ class PrivateTurnCoordinator:
             self._clear_raw_image_refs(event)
             event.set_extra("astrmai_rich_text", independent_text)
             downstream_action = "continue_text_only"
+        elif failure_disposition == "continue_with_partial_results":
+            event.set_extra("astrmai_vision_required_failed", False)
+            self._clear_raw_image_refs(event)
+            self._append_vision_context(event, records, 0)
+            downstream_action = "continue_with_partial_results"
         elif policy == "require_analysis":
             event.set_extra("astrmai_vision_required_failed", True)
             downstream_action = "abort_required_vision"
@@ -964,6 +976,11 @@ class PrivateTurnCoordinator:
             downstream_action = "notify_failure"
         elif any(outcome.downstream_action == "continue_text_only" for outcome in outcomes):
             downstream_action = "continue_text_only"
+        elif any(
+            outcome.downstream_action == "continue_with_partial_results"
+            for outcome in outcomes
+        ):
+            downstream_action = "continue_with_partial_results"
         elif failed_count:
             downstream_action = "continue_with_placeholder"
         else:
@@ -1083,7 +1100,11 @@ class PrivateTurnCoordinator:
             ),
             "vision_wait_ms": outcome.elapsed_ms,
             "vision_timeout_ms": outcome.elapsed_ms if outcome.timeout_count else 0,
-            "vision_fallback": outcome.downstream_action == "continue_with_placeholder",
+            "vision_fallback": outcome.downstream_action in {
+                "continue_with_placeholder",
+                "continue_with_partial_results",
+                "continue_text_only",
+            },
             "visual_memory_id": memory_ids[0] if memory_ids else "",
             "visual_memory_ids": memory_ids,
             "vision_path": "barrier",
@@ -1154,9 +1175,6 @@ class PrivateTurnCoordinator:
         base_text = str(event.get_extra("astrmai_rich_text", getattr(event, "message_str", "")) or "").strip()
         lines = [base_text] if base_text else []
         lines.extend(line for record in records if (line := render_vision_record(record)))
-        if failed_count and event.get_extra("astrmai_vision_failure_disposition", "") != "continue_text_only":
-            if "[图片]" not in base_text:
-                lines.append("[图片]")
         event.set_extra("astrmai_rich_text", "\n".join(lines).strip())
 
     @classmethod

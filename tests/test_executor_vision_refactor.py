@@ -408,6 +408,36 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
             "continue_text_only",
         )
 
+    def test_independent_text_failure_removes_only_current_image_placeholder(self):
+        visual_cortex = _FakeVisualCortex(asyncio.TimeoutError())
+        executor, _gateway = self._executor({}, visual_cortex=visual_cortex)
+        event = _FakeEvent()
+        event.message_str = "看图顺便告诉我天气"
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+        original_prompt = (
+            "历史消息：昨天的内容\n[图片]\n"
+            "当前消息：看图顺便告诉我天气\n[图片]"
+        )
+
+        try:
+            model_prompt, _system_prompt = asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    original_prompt,
+                    "system",
+                    self._vision_bundle(temp_image.name, is_image_only=False),
+                )
+            )
+        finally:
+            os.remove(temp_image.name)
+
+        self.assertIn("历史消息：昨天的内容\n[图片]", model_prompt)
+        self.assertIn("当前消息：告诉我天气", model_prompt)
+        self.assertNotIn("看图顺便告诉我天气", model_prompt)
+        self.assertEqual(model_prompt.count("[图片]"), 1)
+
     def test_invalid_provider_like_vision_output_is_rejected(self):
         executor, _gateway = self._executor(
             {"description": "request id: 1\nstatus code: 500", "emotion_tags": ["oops"]}
