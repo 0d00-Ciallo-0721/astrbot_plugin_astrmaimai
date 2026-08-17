@@ -586,7 +586,10 @@ class VisionConfig(BaseModel):
     )
     vision_reply_policy: str = Field(
         default="超时后忽略图片并继续回复",
-        description="图片识别超时后的回复策略",
+        description=(
+            "图片识别失败后的回复策略；被动群聊纯图始终静默，独立文字任务始终继续，"
+            "该选项只影响必须依赖图片的直接请求"
+        ),
     )
     image_analysis_retries: int = Field(default=2, ge=1, le=5, description="图片识别失败重试次数")
     visual_failure_cooldown_sec: int = Field(

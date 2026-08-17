@@ -36,19 +36,20 @@ class _FakeStateEngine:
 
 
 class _FakeEvent:
-    def __init__(self, text="", extras=None, group_id="group-1"):
+    def __init__(self, text="", extras=None, group_id="group-1", sender_id="user-1"):
         self.message_str = text
         self.unified_msg_origin = f"default:{'GroupMessage' if group_id else 'FriendMessage'}:{group_id or 'user-1'}"
         self.message_obj = None
         self.timestamp = 123.0
         self._group_id = group_id
+        self._sender_id = sender_id
         self._extra = dict(extras or {})
 
     def get_group_id(self):
         return self._group_id
 
     def get_sender_id(self):
-        return "user-1"
+        return self._sender_id
 
     def get_sender_name(self):
         return "Alice"
@@ -375,6 +376,130 @@ class AttentionImageGatingTests(unittest.TestCase):
         self.assertEqual(mention.get_extra("astrmai_vision_candidates"), [])
         self.assertIn("default:GroupMessage:group-1", gate.focus_pools)
         self.assertIn("default:GroupMessage:group-2", gate.focus_pools)
+
+    def test_real_worker_merges_at_then_image_into_one_system2_turn(self):
+        async def _run():
+            completed = asyncio.Event()
+            calls = []
+
+            async def _system2(focus_event, events):
+                calls.append((focus_event, list(events)))
+                completed.set()
+                return "ok"
+
+            self.config.vision.at_image_pair_window_sec = 0.5
+            gate = self.attention_mod.AttentionGate(
+                state_engine=_FakeStateEngine(self.config),
+                judge=SimpleNamespace(),
+                sensors=_FakeSensors(wakeup=False),
+                system2_callback=_system2,
+            )
+            gate._format_and_filter_messages = lambda events: asyncio.sleep(0, result=events)
+            mention = _FakeEvent(
+                text="",
+                extras={
+                    "astrmai_at_bot_wakeup": True,
+                    "astrmai_pure_at_bot": True,
+                    "astrmai_vision_candidates": [],
+                },
+            )
+            image = _FakeEvent(
+                text="",
+                extras={
+                    "extracted_image_refs": ["after-at.jpg"],
+                    "extracted_image_urls": ["after-at.jpg"],
+                    "vision_prefilter_selected": False,
+                    "astrmai_vision_candidates": [
+                        {
+                            "message_id": "worker-image-second",
+                            "group_id": "group-1",
+                            "sender_id": "user-1",
+                            "timestamp": 11.0,
+                            "image_index": 0,
+                            "candidate_refs": ["after-at.jpg"],
+                            "prefilter_selected": False,
+                        }
+                    ],
+                },
+            )
+
+            self.assertEqual(await gate.process_event(mention), "BUFFERED")
+            self.assertEqual(await gate.process_event(image), "BUFFERED")
+            await asyncio.wait_for(completed.wait(), timeout=2.0)
+            await asyncio.gather(*list(gate._background_tasks), return_exceptions=True)
+
+            self.assertEqual(len(calls), 1)
+            focus_event, events = calls[0]
+            session = gate.focus_pools[mention.unified_msg_origin]
+            self.assertEqual(session.attention_window[-2:], [mention, image])
+            self.assertTrue(events)
+            self.assertEqual(
+                focus_event.get_extra("astrmai_vision_candidates")[0]["pairing_mode"],
+                "at_then_image",
+            )
+
+        asyncio.run(_run())
+
+    def test_real_worker_merges_image_then_at_into_one_system2_turn(self):
+        async def _run():
+            completed = asyncio.Event()
+            calls = []
+
+            async def _system2(focus_event, events):
+                calls.append((focus_event, list(events)))
+                completed.set()
+                return "ok"
+
+            self.config.vision.at_image_pair_window_sec = 0.5
+            gate = self.attention_mod.AttentionGate(
+                state_engine=_FakeStateEngine(self.config),
+                judge=SimpleNamespace(),
+                sensors=_FakeSensors(wakeup=False),
+                system2_callback=_system2,
+            )
+            gate._format_and_filter_messages = lambda events: asyncio.sleep(0, result=events)
+            image = _FakeEvent(
+                text="",
+                extras={
+                    "extracted_image_refs": ["before-at.jpg"],
+                    "extracted_image_urls": ["before-at.jpg"],
+                    "vision_prefilter_selected": False,
+                    "astrmai_vision_candidates": [
+                        {
+                            "message_id": "worker-image-first",
+                            "group_id": "group-1",
+                            "sender_id": "user-1",
+                            "timestamp": 10.0,
+                            "image_index": 0,
+                            "candidate_refs": ["before-at.jpg"],
+                            "prefilter_selected": False,
+                        }
+                    ],
+                },
+            )
+            mention = _FakeEvent(
+                text="@bot",
+                extras={
+                    "astrmai_at_bot_wakeup": True,
+                    "astrmai_pure_at_bot": True,
+                    "astrmai_vision_candidates": [],
+                },
+            )
+
+            self.assertEqual(await gate.process_event(image), "IGNORED_IMAGE")
+            self.assertEqual(await gate.process_event(mention), "BUFFERED")
+            await asyncio.wait_for(completed.wait(), timeout=2.0)
+            await asyncio.gather(*list(gate._background_tasks), return_exceptions=True)
+
+            self.assertEqual(len(calls), 1)
+            focus_event, events = calls[0]
+            self.assertEqual(events, [mention])
+            self.assertEqual(
+                focus_event.get_extra("astrmai_vision_candidates")[0]["pairing_mode"],
+                "image_then_at",
+            )
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

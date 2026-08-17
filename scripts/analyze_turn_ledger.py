@@ -199,10 +199,17 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     vision_call_status_counts: Counter[str] = Counter()
     vision_fallback_counts: Counter[str] = Counter()
     vision_image_count = 0
+    vision_raw_image_count = 0
+    vision_candidate_ref_count = 0
+    vision_resolved_count = 0
+    vision_model_attempt_count = 0
     vision_analyzed_count = 0
     vision_failed_count = 0
     vision_timeout_count = 0
     vision_wait_ms: list[float] = []
+    vision_failure_disposition_counts: Counter[str] = Counter()
+    vision_reply_guard_action_counts: Counter[str] = Counter()
+    vision_resolve_failure_reason_counts: Counter[str] = Counter()
 
     for trace in items:
         status = str(trace.get("status", "unknown") or "unknown")
@@ -335,12 +342,32 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             if fallback:
                 vision_fallback_counts[fallback] += 1
             vision_image_count += int(_number(vision.get("image_count")))
+            vision_raw_image_count += int(
+                _number(vision.get("raw_image_count", vision.get("image_raw_component_count")))
+            )
+            vision_candidate_ref_count += int(_number(vision.get("candidate_ref_count")))
+            vision_resolved_count += int(
+                _number(vision.get("resolved_count", vision.get("image_resolved_count")))
+            )
+            vision_model_attempt_count += int(
+                _number(vision.get("vision_model_attempt_count", vision.get("attempt_count")))
+            )
             vision_analyzed_count += int(_number(vision.get("analyzed_count")))
             vision_failed_count += int(_number(vision.get("failed_count")))
             vision_timeout_count += int(_number(vision.get("timeout_count")))
             wait = vision.get("vision_wait_ms")
             if wait is not None:
                 vision_wait_ms.append(_number(wait))
+            failure_disposition = str(vision.get("failure_disposition") or "").strip()
+            if failure_disposition:
+                vision_failure_disposition_counts[failure_disposition] += 1
+            reply_guard_action = str(vision.get("reply_guard_action") or "").strip()
+            if reply_guard_action:
+                vision_reply_guard_action_counts[reply_guard_action] += 1
+            for reason in list(vision.get("resolve_failure_reasons") or []):
+                normalized_reason = str(reason or "").strip()
+                if normalized_reason:
+                    vision_resolve_failure_reason_counts[normalized_reason] += 1
         else:
             missing["vision_observation"] += 1
 
@@ -520,11 +547,18 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "call_status_counts": dict(vision_call_status_counts.most_common()),
             "fallback_counts": dict(vision_fallback_counts.most_common()),
             "image_count": vision_image_count,
+            "raw_image_count": vision_raw_image_count,
+            "candidate_ref_count": vision_candidate_ref_count,
+            "resolved_count": vision_resolved_count,
+            "model_attempt_count": vision_model_attempt_count,
             "analyzed_count": vision_analyzed_count,
             "failed_count": vision_failed_count,
             "timeout_count": vision_timeout_count,
             "wait_ms_p50": _percentile(vision_wait_ms, 0.50),
             "wait_ms_p95": _percentile(vision_wait_ms, 0.95),
+            "failure_disposition_counts": dict(vision_failure_disposition_counts.most_common()),
+            "reply_guard_action_counts": dict(vision_reply_guard_action_counts.most_common()),
+            "resolve_failure_reason_counts": dict(vision_resolve_failure_reason_counts.most_common()),
         },
         "tools": {
             "trace_present_count": tool_trace_present_count,

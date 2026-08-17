@@ -2195,7 +2195,11 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                         if binding is not None
                         else None
                     )
-                if asset is not None and str(asset.description or "").strip():
+                if (
+                    asset is not None
+                    and str(asset.status or "").strip().lower() == "ready"
+                    and str(asset.description or "").strip()
+                ):
                     tags = []
                     try:
                         parsed_tags = json.loads(str(asset.emotion_tags or "[]"))

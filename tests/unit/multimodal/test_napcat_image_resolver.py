@@ -204,6 +204,111 @@ class NapCatImageResolverTests(unittest.TestCase):
             self.assertEqual(result.images[0].strategy, "get_msg")
             self.assertEqual(api.calls[-1], ("get_msg", {"message_id": 42}))
 
+    def test_candidate_without_reference_records_no_reference(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event = _Event({"type": "text", "data": {"text": "current"}}, _Api({}))
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(resolver.resolve_candidate(event, {}))
+
+            self.assertEqual(result.images, [])
+            self.assertEqual(result.failure_details, [{"index": 0, "reason": "no_reference"}])
+
+    def test_failed_fallback_chain_records_each_structured_reason_in_order(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        class _FailingApi:
+            def __init__(self):
+                self.calls = []
+
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                raise RuntimeError(f"{action} unavailable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            api = _FailingApi()
+            event = _Event({"type": "text", "data": {"text": "current"}}, api)
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(
+                resolver.resolve_candidate(
+                    event,
+                    {
+                        "message_id": "fake-message-1",
+                        "candidate_refs": ["fake-image-reference"],
+                    },
+                )
+            )
+
+            reasons = [item["reason"] for item in result.failure_details]
+            self.assertEqual(
+                reasons,
+                ["get_image_failed", "get_file_failed", "get_msg_failed"],
+            )
+            self.assertEqual(
+                [call[0] for call in api.calls],
+                ["get_image", "get_image", "get_file", "get_file", "get_msg"],
+            )
+
+    def test_failed_http_materialization_records_download_failed(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event = _Event({"type": "text", "data": {"text": "current"}}, _Api({}))
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+            resolver._download_to_cache = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError("synthetic download failure")
+            )
+
+            result = asyncio.run(
+                resolver.resolve_candidate(
+                    event,
+                    {
+                        "message_id": "fake-message-2",
+                        "candidate_refs": ["https://invalid.example/fake-image.png"],
+                    },
+                )
+            )
+
+            self.assertIn("download_failed", [item["reason"] for item in result.failure_details])
+
+    def test_get_msg_cq_string_degrades_without_regex_parsing(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        class _CQStringApi:
+            async def call_action(self, action, **params):
+                if action == "get_msg":
+                    return {
+                        "data": {
+                            "message": "[CQ:image,file=fake-image.jpg,url=https://invalid.example/fake.jpg]"
+                        }
+                    }
+                return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event = _Event(
+                {"type": "text", "data": {"text": "current"}},
+                _CQStringApi(),
+            )
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(
+                resolver.resolve_candidate(
+                    event,
+                    {
+                        "reply_to_message_id": "fake-message-3",
+                        "candidate_refs": ["onebot-message://fake-message-3"],
+                    },
+                )
+            )
+
+            self.assertIn(
+                {"index": 0, "reason": "get_msg_failed", "detail": "unsupported_cq_string"},
+                result.failure_details,
+            )
+
     def test_local_gif_with_jpg_suffix_is_cached_with_detected_suffix(self):
         from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
 

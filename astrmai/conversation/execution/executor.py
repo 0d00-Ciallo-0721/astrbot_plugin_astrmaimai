@@ -43,6 +43,7 @@ from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
 from ..vision_state import (
+    classify_vision_failure_text,
     guard_unresolved_image_reply,
     has_valid_image_context,
     reply_mentions_image,
@@ -1088,9 +1089,13 @@ class ConcurrentExecutor:
 
         started_at = monotonic()
         policy = self._vision_reply_policy()
+        event.set_extra("astrmai_vision_failure_disposition", "")
+        event.set_extra("astrmai_vision_independent_text", "")
+        event.set_extra("astrmai_vision_required_failed", False)
         original_direct_image_urls = list(vision_bundle.direct_image_urls or [])
         resolver_failed_count = 0
         resolver_strategy = ""
+        resolver_failure_reasons: list[str] = []
         final_target = event.get_extra("astrmai_final_vision_target", None)
         if final_target and self.image_resolver is not None:
             resolve_timeout = min(
@@ -1115,6 +1120,7 @@ class ConcurrentExecutor:
             except asyncio.TimeoutError:
                 resolution = None
                 resolver_failed_count = 1
+                resolver_failure_reasons.append("resolve_timeout")
                 event.set_extra("astrmai_final_vision_resolve_status", "timeout")
             except Exception as exc:
                 resolution = None
@@ -1130,10 +1136,21 @@ class ConcurrentExecutor:
                 event.set_extra("astrmai_final_vision_resolve_status", "success")
                 event.set_extra("astrmai_final_vision_resolver_strategy", resolver_strategy)
             else:
+                if resolution is not None:
+                    for item in list(getattr(resolution, "failure_details", []) or []):
+                        if not isinstance(item, dict):
+                            continue
+                        reason = str(item.get("reason") or "").strip()
+                        if reason and reason not in resolver_failure_reasons:
+                            resolver_failure_reasons.append(reason)
                 vision_bundle.direct_image_urls = []
                 resolver_failed_count = max(1, resolver_failed_count)
                 if not event.get_extra("astrmai_final_vision_resolve_status", ""):
                     event.set_extra("astrmai_final_vision_resolve_status", "failed")
+        event.set_extra(
+            "astrmai_vision_resolve_failure_reasons",
+            list(resolver_failure_reasons),
+        )
         configured_max_images = getattr(
             getattr(self.config, "vision", None),
             "max_images_per_turn",
@@ -1439,39 +1456,65 @@ class ConcurrentExecutor:
             event.set_extra("astrmai_vision_state", "analysis_failed")
 
         fallback_reason = ""
-        if failed_count:
-            if policy == "require_analysis":
-                event.set_extra("astrmai_vision_required_failed", True)
-                fallback_reason = "required_analysis_failed"
+        failure_disposition = ""
+        if failed_count and not vision_descriptions:
+            user_text = str(getattr(event, "message_str", "") or "").strip()
+            if vision_bundle.is_image_only:
+                text_kind, independent_text = "image_only", ""
             else:
-                if vision_bundle.is_image_only:
-                    model_prompt += "\n\n[图片]"
-                    prompt_injected = True
-                    fallback_reason = "image_only_placeholder"
-                else:
-                    fallback_reason = "text_only_continue"
-                system_prompt += (
-                    "\n\n[媒体状态约束] 当前图片内容不可用。它不是新的聊天话题；"
-                    "不要反复说明图片加载、转圈或看不清，也不要猜测图片内容。"
-                    "若用户同时发送了文字，只回答文字；只有问题必须依赖图片时，简短说明无法确认。"
+                text_kind, independent_text = classify_vision_failure_text(user_text)
+            origin = str(getattr(event, "unified_msg_origin", "") or "")
+            is_private = "FriendMessage" in origin
+            is_direct = bool(
+                is_private
+                or event.get_extra("astrmai_at_bot_wakeup", False)
+                or event.get_extra("astrmai_group_direct_wakeup", False)
+                or event.get_extra("astrmai_cross_message_vision_bound", False)
+            )
+            image_dependent = text_kind in {"image_dependent", "ambiguous"}
+            if text_kind == "independent_text" and independent_text:
+                failure_disposition = "continue_text_only"
+                event.set_extra("astrmai_vision_independent_text", independent_text)
+                if user_text and user_text in model_prompt:
+                    model_prompt = model_prompt.replace(user_text, independent_text)
+                model_prompt += (
+                    "\n\n[媒体失败处置] 图片内容不可用。只回答以下独立文字任务："
+                    f"{independent_text}。禁止猜测或回答图片相关部分。"
                 )
-                if not vision_descriptions:
-                    media_only_failure = bool(vision_bundle.is_image_only)
-                    event.set_extra("astrmai_media_status_nonsemantic", True)
-                    event.set_extra("astrmai_media_only_failure", media_only_failure)
-                    event.set_extra(
-                        "astrmai_media_status",
-                        {
-                            "status": "unavailable",
-                            "owner": "direct",
-                            "reason": fallback_reason,
-                            "image_count": len(all_direct_image_urls),
-                            "image_only": media_only_failure,
-                        },
-                    )
+                system_prompt += (
+                    "\n\n[媒体状态约束] 当前图片内容不可用；只处理已提取的独立文字任务，"
+                    "不要猜测图片，也不要提及加载、转圈或看不清。"
+                )
+            elif is_direct or image_dependent or event.get_extra(
+                "astrmai_user_asked_about_image", False
+            ):
+                failure_disposition = "notify_failure"
+            else:
+                failure_disposition = "suppress_passive_group"
+
+            fallback_reason = failure_disposition
+            event.set_extra("astrmai_vision_failure_text_kind", text_kind)
+            event.set_extra("astrmai_vision_failure_disposition", failure_disposition)
+            event.set_extra(
+                "astrmai_vision_required_failed",
+                bool(policy == "require_analysis" and failure_disposition == "notify_failure"),
+            )
+            media_only_failure = bool(vision_bundle.is_image_only or text_kind == "image_only")
+            event.set_extra("astrmai_media_status_nonsemantic", True)
+            event.set_extra("astrmai_media_only_failure", media_only_failure)
+            event.set_extra(
+                "astrmai_media_status",
+                {
+                    "status": "unavailable",
+                    "owner": "direct",
+                    "reason": fallback_reason,
+                    "image_count": len(all_direct_image_urls),
+                    "image_only": media_only_failure,
+                },
+            )
 
         elapsed_ms = int((monotonic() - started_at) * 1000)
-        if failed_count and policy == "require_analysis":
+        if failure_disposition == "notify_failure" and policy == "require_analysis":
             observation_outcome = "required_failed"
         elif failed_count and vision_descriptions:
             observation_outcome = "partial_fallback"
@@ -1485,11 +1528,20 @@ class ConcurrentExecutor:
             "policy": policy,
             "outcome": observation_outcome,
             "image_count": len(all_direct_image_urls),
+            "raw_image_count": int(
+                event.get_extra("astrmai_image_raw_component_count", 0) or 0
+            ),
+            "candidate_ref_count": len(
+                list((final_target or {}).get("candidate_refs", []) or [])
+                if isinstance(final_target, dict)
+                else []
+            ),
             "resolved_count": resolved_count,
             "analyzed_count": len(vision_descriptions),
             "failed_count": failed_count,
             "timeout_count": timeout_count,
             "attempt_count": attempt_count,
+            "vision_model_attempt_count": attempt_count,
             "image_source": image_sources,
             "image_resolve_status": "failed" if failed_count and not vision_descriptions else "success",
             "vision_barrier_status": "failed" if failed_count else "completed",
@@ -1508,6 +1560,23 @@ class ConcurrentExecutor:
             ),
             "prompt_injected": prompt_injected,
             "fallback_reason": fallback_reason,
+            "failure_disposition": failure_disposition,
+            "resolve_failure_reasons": resolver_failure_reasons,
+            "selected_message_id": str(
+                (final_target or {}).get("message_id", "")
+                if isinstance(final_target, dict)
+                else ""
+            ),
+            "selected_sender_id": str(
+                (final_target or {}).get("sender_id", "")
+                if isinstance(final_target, dict)
+                else ""
+            ),
+            "selected_pairing_mode": str(
+                (final_target or {}).get("pairing_mode", "")
+                if isinstance(final_target, dict)
+                else ""
+            ),
             "cache_hit_count": cache_hit_count,
             "cache_miss_count": cache_miss_count,
             "singleflight_wait_count": singleflight_wait_count,
@@ -1546,7 +1615,9 @@ class ConcurrentExecutor:
         event: AstrMessageEvent,
         chat_id: str,
     ) -> Optional[str]:
-        text = "这张图片暂时没有识别成功，请稍后再发一次。"
+        text = "这张图片暂时没有识别成功，我现在无法确认图片内容，请稍后再发一次。"
+        if bool(event.get_extra("astrmai_vision_failure_notice_sent", False)):
+            return text
         sent = False
         try:
             artifact = await self.reply_engine.handle_reply(event, text, chat_id)
@@ -1578,15 +1649,21 @@ class ConcurrentExecutor:
         )
         event.set_extra("astrmai_image_reply_guard_action", image_guard_action)
         event.set_extra("astrmai_image_reply_guard_reason", image_guard_reason)
+        event.set_extra("astrmai_reply_guard_action", image_guard_action)
         record_vision_observation(
             event,
             {
                 **vision_observation_facts(event),
                 "reply_mentions_image": mentions_image,
                 "has_valid_image_context": valid_image_context,
-                "image_reply_blocked": image_guard_action == "repaired",
+                "image_reply_blocked": image_guard_action in {"repaired", "suppressed"},
+                "reply_guard_action": image_guard_action,
             },
         )
+        if image_guard_action == "suppressed":
+            event.set_extra("astrmai_execution_status", "suppressed_reply_guard")
+            logger.warning(f"[{chat_id}] suppressed reply emptied by unresolved-image guard")
+            return None
         if image_guard_action == "repaired":
             logger.warning(f"[{chat_id}] removed unrequested unresolved-image claim from reply")
         actor_guard = GroupActorConsistencyGuard.inspect_and_repair(event, reply_text)
@@ -2088,6 +2165,12 @@ class ConcurrentExecutor:
                                 image_urls=vision_bundle.direct_image_urls,
                                 raise_on_exhaustion=True,
                             )
+                        if result is None and str(
+                            event.get_extra("astrmai_execution_status", "") or ""
+                        ) == "suppressed_reply_guard":
+                            raise RuntimeError(
+                                "provider_failure_text: unresolved native image reply"
+                            )
                         if result is not None:
                             self._mark_vision_main_reply_state(
                                 event,
@@ -2130,7 +2213,13 @@ class ConcurrentExecutor:
                     event.set_extra("astrmai_execution_status", "stale_drop")
                     debug_trace(event, "execution.executor.stale_drop", reason="post_vision_freshness_failed")
                     return None
-                if bool(event.get_extra("astrmai_vision_required_failed", False)):
+                failure_disposition = str(
+                    event.get_extra("astrmai_vision_failure_disposition", "") or ""
+                )
+                if failure_disposition == "suppress_passive_group":
+                    event.set_extra("astrmai_execution_status", "suppressed_vision_failure")
+                    return None
+                if failure_disposition == "notify_failure":
                     return await self._send_required_vision_failure(event, chat_id)
 
                 if tools is None or len(tools) == 0:

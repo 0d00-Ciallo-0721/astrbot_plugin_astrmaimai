@@ -27,6 +27,7 @@ class ImageResolutionBatch:
     had_images: bool = False
     images: list[ResolvedImage] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    failure_details: list[dict[str, Any]] = field(default_factory=list)
 
 
 class NapCatImageResolver:
@@ -83,11 +84,16 @@ class NapCatImageResolver:
             or ""
         ).strip()
         result = ImageResolutionBatch(had_images=bool(references or source_message_id))
+        if not references and not source_message_id:
+            self._record_failure(result.failure_details, 0, "no_reference")
+            result.failures.append("image-0")
+            return result
         resolved = await self._resolve_candidates(
             event,
             0,
             references,
             source_message_id=source_message_id,
+            failure_details=result.failure_details,
         )
         if resolved is None:
             result.failures.append(references[0] if references else source_message_id or "image-0")
@@ -102,12 +108,33 @@ class NapCatImageResolver:
     ) -> ImageResolutionBatch:
         result = ImageResolutionBatch(had_images=bool(references))
         for index, candidates in enumerate(references):
-            resolved = await self._resolve_candidates(event, index, candidates)
+            resolved = await self._resolve_candidates(
+                event,
+                index,
+                candidates,
+                failure_details=result.failure_details,
+            )
             if resolved is None:
                 result.failures.append(candidates[0] if candidates else f"image-{index}")
             else:
                 result.images.append(resolved)
         return result
+
+    @staticmethod
+    def _record_failure(
+        failure_details: list[dict[str, Any]],
+        index: int,
+        reason: str,
+        detail: str = "",
+    ) -> None:
+        item = {
+            "index": max(0, int(index or 0)),
+            "reason": str(reason or "")[:64],
+        }
+        if detail:
+            item["detail"] = str(detail or "")[:80]
+        if item not in failure_details:
+            failure_details.append(item)
 
     def _extract_payload_image_references(self, payload: Any) -> list[list[str]]:
         data = payload
@@ -203,19 +230,28 @@ class NapCatImageResolver:
         *,
         source_message_id: str = "",
         allow_message_refresh: bool = True,
+        failure_details: list[dict[str, Any]] | None = None,
     ) -> ResolvedImage | None:
+        details = failure_details if failure_details is not None else []
+        if not candidates and not source_message_id:
+            self._record_failure(details, index, "no_reference")
+            return None
         for candidate in candidates:
             local_path = await self._materialize_reference(candidate, index)
             if local_path:
                 return ResolvedImage(index=index, source_ref=candidate, local_path=local_path, strategy="direct")
+            if candidate.startswith(("http://", "https://")):
+                self._record_failure(details, index, "download_failed")
 
         api = getattr(getattr(getattr(event, "bot", None), "api", None), "call_action", None)
         if not callable(api):
+            self._record_failure(details, index, "no_reference", "napcat_api_unavailable")
             return None
         for candidate in candidates:
             if candidate.startswith("onebot-message://"):
                 continue
             for action in ("get_image", "get_file"):
+                action_resolved = False
                 for params in ({"file": candidate}, {"file_id": candidate}):
                     try:
                         response = await api(action, **params)
@@ -228,22 +264,37 @@ class NapCatImageResolver:
                     for source in self._extract_response_sources(response):
                         local_path = await self._materialize_reference(source, index)
                         if local_path:
+                            action_resolved = True
                             return ResolvedImage(
                                 index=index,
                                 source_ref=candidate,
                                 local_path=local_path,
                                 strategy=action,
                             )
+                if not action_resolved:
+                    self._record_failure(details, index, f"{action}_failed")
         if allow_message_refresh and source_message_id:
             try:
                 response = await api("get_msg", message_id=self._coerce_api_id(source_message_id))
             except Exception as exc:
+                self._record_failure(details, index, "get_msg_failed", type(exc).__name__)
                 logger.debug(
                     "[AstrMai-Vision] NapCat get_msg degraded "
                     f"error={type(exc).__name__}"
                 )
             else:
                 refreshed_references = self._extract_payload_image_references(response)
+                payload = response.get("data", response) if isinstance(response, dict) else response
+                message_value = payload.get("message") if isinstance(payload, dict) else None
+                if isinstance(message_value, str):
+                    self._record_failure(
+                        details,
+                        index,
+                        "get_msg_failed",
+                        "unsupported_cq_string",
+                    )
+                elif not refreshed_references:
+                    self._record_failure(details, index, "get_msg_failed", "no_image_segment")
                 for refreshed in reversed(refreshed_references):
                     resolved = await self._resolve_candidates(
                         event,
@@ -251,6 +302,7 @@ class NapCatImageResolver:
                         refreshed,
                         source_message_id="",
                         allow_message_refresh=False,
+                        failure_details=details,
                     )
                     if resolved is not None:
                         return ResolvedImage(
@@ -259,6 +311,8 @@ class NapCatImageResolver:
                             local_path=resolved.local_path,
                             strategy="get_msg",
                         )
+        elif allow_message_refresh:
+            self._record_failure(details, index, "get_msg_failed", "missing_message_id")
         return None
 
     async def _materialize_reference(self, reference: str, index: int) -> str:

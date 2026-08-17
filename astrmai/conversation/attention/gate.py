@@ -1533,7 +1533,9 @@ class AttentionGate:
         return bool(getattr(outcome, "should_abort", False))
 
     async def _send_required_vision_failure(self, event: AstrMessageEvent) -> str | None:
-        text = "这张图片暂时没有识别成功，请稍后再发一次。"
+        text = "这张图片暂时没有识别成功，我现在无法确认图片内容，请稍后再发一次。"
+        if bool(event.get_extra("astrmai_vision_failure_notice_sent", False)):
+            return text
         if not hasattr(event, "send") or not hasattr(event, "plain_result"):
             return None
         try:

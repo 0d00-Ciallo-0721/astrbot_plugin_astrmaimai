@@ -980,7 +980,35 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if not thread_events:
             thread_events = [event]
 
-        ranked: list[tuple[float, int, int, int, VisionCandidate, object]] = []
+        focus_event = getattr(focus_context, "focus_event", None) or event
+        focus_sender_id = str(getattr(focus_context, "focus_sender_id", "") or "").strip()
+        if not focus_sender_id:
+            focus_sender_id = str(
+                getattr(focus_event, "get_sender_id", lambda: "")() or ""
+            ).strip()
+        focus_group_id = str(
+            getattr(focus_event, "get_group_id", lambda: "")() or ""
+        ).strip()
+        focus_message_id = str(
+            getattr(getattr(focus_event, "message_obj", None), "message_id", "")
+            or ""
+        ).strip()
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        direct_or_bound = bool(
+            "FriendMessage" in origin
+            or event.get_extra("astrmai_at_bot_wakeup", False)
+            or event.get_extra("astrmai_group_direct_wakeup", False)
+            or event.get_extra("astrmai_cross_message_vision_bound", False)
+            or event.get_extra("astrmai_user_asked_about_image", False)
+            or user_asked_about_image(str(getattr(event, "message_str", "") or ""))
+        )
+        pairing_modes = {
+            "same_message",
+            "same_message_reply",
+            "at_then_image",
+            "image_then_at",
+        }
+        ranked: list[tuple[int, float, int, int, int, VisionCandidate, object]] = []
         saw_typed_image_candidates = False
         for event_order, source_event in enumerate(thread_events):
             getter = getattr(source_event, "get_extra", None)
@@ -995,9 +1023,35 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             for candidate in candidates:
                 if not candidate.prefilter_selected:
                     continue
+                sender_matches = bool(
+                    focus_sender_id and candidate.sender_id == focus_sender_id
+                )
+                verified_pairing = bool(
+                    candidate.pairing_verified
+                    and candidate.pairing_mode in pairing_modes
+                    and candidate.paired_sender_id == focus_sender_id
+                    and (
+                        not focus_group_id
+                        or candidate.paired_group_id == focus_group_id
+                    )
+                )
+                if not sender_matches and not verified_pairing and direct_or_bound:
+                    continue
+                explicitly_bound = bool(
+                    focus_message_id and candidate.message_id == focus_message_id
+                )
+                if explicitly_bound and (sender_matches or verified_pairing):
+                    selection_priority = 4
+                elif verified_pairing:
+                    selection_priority = 3
+                elif sender_matches:
+                    selection_priority = 2
+                else:
+                    selection_priority = 1
                 source_priority = 1 if candidate.source_kind == "reply" else 2
                 ranked.append(
                     (
+                        selection_priority,
                         float(candidate.timestamp or getattr(source_event, "timestamp", 0.0) or 0.0),
                         event_order,
                         source_priority,
@@ -1008,7 +1062,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 )
 
         if ranked:
-            _, _, _, _, selected, source_event = max(ranked, key=lambda item: item[:4])
+            _, _, _, _, _, selected, source_event = max(ranked, key=lambda item: item[:5])
             target = selected.as_dict()
             target["selected_from_message_id"] = str(
                 getattr(getattr(source_event, "message_obj", None), "message_id", "")
@@ -1020,6 +1074,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             return [selected.primary_ref] if selected.primary_ref else []
 
         if saw_typed_image_candidates:
+            return []
+
+        if direct_or_bound:
             return []
 
         bundle = getattr(focus_context, "vision_bundle", None)
@@ -2219,7 +2276,6 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
 
         direct_vision_urls = self._latest_reply_vision_urls(event, focus_context)
         if direct_vision_urls:
-            final_prompt += "\n(Director note: the user shared photos with you; please respond with the image content in mind.)"
             logger.info(f"[{chat_id}] Scheduled direct-vision payload with {len(direct_vision_urls)} image(s) into executor.")
 
         focus_text = str(getattr(prompt_envelope, "focus_message_text", "") or "")

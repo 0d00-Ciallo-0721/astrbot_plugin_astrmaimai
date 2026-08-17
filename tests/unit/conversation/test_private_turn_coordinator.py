@@ -332,9 +332,9 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
         self.assertEqual(calls, ["第一张", "后续文字"])
         self.assertTrue(first.get_extra("astrmai_vision_barrier_complete"))
         self.assertTrue(first.get_extra("astrmai_vision_barrier_failed"))
-        self.assertIn("[图片]", first.get_extra("astrmai_rich_text"))
+        self.assertNotIn("[图片]", first.get_extra("astrmai_rich_text"))
 
-    def test_timeout_fallback_uses_placeholder_and_clears_image_refs(self):
+    def test_timeout_fallback_notifies_for_private_image_dependent_text(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 
         config = SimpleNamespace(
@@ -363,22 +363,61 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
             visual_cortex=cortex,
             persistence=persistence,
         )
-        event = _Event("你看")
+        event = _Event("看看这个")
 
         started = time.monotonic()
         outcome = asyncio.run(coordinator.prepare_batch([event], "ff:FriendMessage:user-1"))
         elapsed = time.monotonic() - started
 
         self.assertLess(elapsed, 0.15)
-        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
+        self.assertEqual(outcome.downstream_action, "notify_failure")
+        self.assertTrue(outcome.should_abort)
         self.assertEqual(outcome.timeout_count, 1)
         self.assertEqual(cortex.calls, 1)
         self.assertEqual(event.get_extra("direct_image_refs"), [])
         self.assertEqual(event.get_extra("extracted_image_refs"), [])
-        self.assertIn("你看", event.get_extra("astrmai_rich_text"))
-        self.assertIn("[图片]", event.get_extra("astrmai_rich_text"))
+        self.assertEqual(event.get_extra("astrmai_vision_failure_disposition"), "notify_failure")
+        self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text", ""))
         self.assertTrue(event.get_extra("astrmai_vision_no_guess"))
         self.assertEqual(persistence.marked, [])
+
+    def test_timeout_fallback_keeps_only_private_independent_text(self):
+        from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
+
+        config = SimpleNamespace(
+            private_chat=SimpleNamespace(
+                input_settle_sec=0.0,
+                image_resolve_timeout_sec=1.0,
+                image_barrier_timeout_sec=1.0,
+                image_analysis_retries=1,
+            ),
+            timing=SimpleNamespace(
+                image_resolve_timeout_sec=1.0,
+                image_analysis_timeout_sec=1.0,
+                vision_barrier_total_timeout_sec=0.05,
+            ),
+            vision=SimpleNamespace(
+                enable_vision=True,
+                vision_reply_policy="超时后忽略图片并继续回复",
+                image_analysis_retries=1,
+            ),
+        )
+        coordinator = PrivateTurnCoordinator(
+            config=config,
+            image_resolver=_Resolver(),
+            visual_cortex=_SlowVisualCortex(),
+            persistence=_Persistence(),
+        )
+        event = _Event("看图顺便告诉我天气")
+
+        outcome = asyncio.run(coordinator.prepare_batch([event], event.unified_msg_origin))
+
+        self.assertEqual(outcome.downstream_action, "continue_text_only")
+        self.assertFalse(outcome.should_abort)
+        self.assertEqual(event.get_extra("astrmai_vision_failure_disposition"), "continue_text_only")
+        self.assertEqual(event.get_extra("astrmai_vision_independent_text"), "告诉我天气")
+        self.assertEqual(event.get_extra("astrmai_rich_text"), "告诉我天气")
+        self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text"))
 
     def test_required_vision_failure_aborts_without_placeholder_reply_context(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
@@ -480,8 +519,9 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
             outcome="timeout",
         )
 
-        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
-        self.assertEqual(event.get_extra("astrmai_rich_text").count("[图片]"), 1)
+        self.assertEqual(outcome.downstream_action, "notify_failure")
+        self.assertEqual(event.get_extra("astrmai_vision_failure_disposition"), "notify_failure")
+        self.assertNotIn("[图片]", event.get_extra("astrmai_rich_text"))
 
     def test_image_only_fallback_is_marked_nonsemantic(self):
         from astrmai.conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
@@ -697,7 +737,7 @@ class PrivateTurnCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(fast_outcome.outcome, "success")
         self.assertFalse(slow_done_when_fast_completed)
-        self.assertEqual(slow_outcome.downstream_action, "continue_with_placeholder")
+        self.assertEqual(slow_outcome.downstream_action, "notify_failure")
 
 
 if __name__ == "__main__":

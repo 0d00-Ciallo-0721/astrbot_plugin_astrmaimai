@@ -39,12 +39,29 @@ _QUESTION_SIGNAL_RE = re.compile(
     r"评价|分析|看懂|觉得|感觉)",
     re.IGNORECASE,
 )
+_SHORT_IMAGE_DEPENDENT_RE = re.compile(
+    r"^(?:(?:你|帮我)?(?:看|看看|看下|看一下)(?:这|那)?(?:个|张|幅)?|"
+    r"(?:这|那)(?:个|张|幅)?(?:呢|是什么|怎么样|好看吗)?|"
+    r"(?:好看吗|怎么样|什么意思|这是什么|这是谁))\s*[?？。！!]*$",
+    re.IGNORECASE,
+)
+_IMAGE_CONTEXT_ONLY_RE = re.compile(
+    r"^(?:这|那)?(?:是|有)?(?:一)?(?:张|个)?(?:图(?:片)?|照片|截图|表情包|表情)"
+    r"(?:在这|在这里|来了|而已)?\s*[。！!]*$",
+    re.IGNORECASE,
+)
+_INDEPENDENT_CLAUSE_RE = re.compile(
+    r"(?:[,，。；;]\s*)?(?:顺便|另外|此外|还有|然后)\s*(?P<text>.+)$",
+    re.IGNORECASE,
+)
 
 
 def user_asked_about_image(text: str) -> bool:
     normalized = str(text or "").strip()
     if not normalized:
         return False
+    if _SHORT_IMAGE_DEPENDENT_RE.fullmatch(normalized):
+        return True
     reference = _IMAGE_REFERENCE_RE.search(normalized)
     if not reference:
         return False
@@ -52,6 +69,35 @@ def user_asked_about_image(text: str) -> bool:
         return True
     tail = normalized[max(0, reference.start() - 8) : reference.end() + 18]
     return bool(_IMAGE_QUESTION_RE.search(tail) or "?" in tail or "？" in tail)
+
+
+def classify_vision_failure_text(text: str) -> tuple[str, str]:
+    """Split image-dependent wording from a deterministic independent task."""
+
+    normalized = re.sub(r"\[(?:图片|image)\]", "", str(text or ""), flags=re.IGNORECASE).strip()
+    if not normalized:
+        return "image_only", ""
+
+    connector = _INDEPENDENT_CLAUSE_RE.search(normalized)
+    if connector:
+        prefix = normalized[: connector.start()].strip(" ,，。；;")
+        independent = str(connector.group("text") or "").strip(" ,，。；;")
+        if independent and (
+            not prefix
+            or user_asked_about_image(prefix)
+            or _IMAGE_CONTEXT_ONLY_RE.fullmatch(prefix)
+            or _IMAGE_MENTION_RE.search(prefix)
+        ):
+            if not user_asked_about_image(independent) and not _SHORT_IMAGE_DEPENDENT_RE.fullmatch(independent):
+                return "independent_text", independent
+
+    if user_asked_about_image(normalized) or _SHORT_IMAGE_DEPENDENT_RE.fullmatch(normalized):
+        return "image_dependent", ""
+    if _IMAGE_CONTEXT_ONLY_RE.fullmatch(normalized):
+        return "image_dependent", ""
+    if _IMAGE_MENTION_RE.search(normalized) or _VISUAL_DEICTIC_RE.search(normalized):
+        return "ambiguous", ""
+    return "independent_text", normalized
 
 
 def classify_autonomous_vision_need(
@@ -246,11 +292,12 @@ def guard_unresolved_image_reply(
     repaired = "".join(kept).strip()
     if repaired:
         return repaired, "repaired", "unrequested_unresolved_image_claim"
-    return "我在听，接着说吧。", "repaired", "unrequested_unresolved_image_claim"
+    return "", "suppressed", "unrequested_unresolved_image_claim"
 
 
 __all__ = [
     "classify_autonomous_vision_need",
+    "classify_vision_failure_text",
     "derive_vision_state",
     "guard_unresolved_image_reply",
     "has_valid_image_context",

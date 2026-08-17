@@ -41,9 +41,25 @@ class AttentionWindowBuffer:
         return [candidate.as_dict() for candidate in load_vision_candidates(getter("astrmai_vision_candidates", []) or [])]
 
     @staticmethod
-    def _set_pairing(event: Any, candidates: list[dict[str, Any]], mode: str) -> None:
+    def _set_pairing(
+        event: Any,
+        candidates: list[dict[str, Any]],
+        mode: str,
+        *,
+        sender_id: str,
+    ) -> None:
         loaded = load_vision_candidates(candidates)
-        selected = [candidate.with_selection(selected=True, pairing_mode=mode) for candidate in loaded]
+        group_id = str(getattr(event, "get_group_id", lambda: "")() or "")
+        selected = [
+            candidate.with_selection(
+                selected=True,
+                pairing_mode=mode,
+                pairing_verified=True,
+                paired_sender_id=sender_id,
+                paired_group_id=group_id or candidate.group_id,
+            )
+            for candidate in loaded
+        ]
         refs = [candidate.primary_ref for candidate in selected if candidate.primary_ref]
         event.set_extra("astrmai_vision_candidates", [candidate.as_dict() for candidate in selected])
         event.set_extra("extracted_image_refs", refs)
@@ -84,7 +100,7 @@ class AttentionWindowBuffer:
             mode = "same_message_reply" if any(
                 str(item.get("source_kind") or "") == "reply" for item in candidates
             ) else "same_message"
-            self._set_pairing(event, candidates, mode)
+            self._set_pairing(event, candidates, mode, sender_id=sender_id)
             session.pending_vision_images.pop(sender_id, None)
             session.pending_vision_mentions.pop(sender_id, None)
             session.vision_pair_signal.set()
@@ -93,7 +109,12 @@ class AttentionWindowBuffer:
         if pure_at:
             pending_image = session.pending_vision_images.pop(sender_id, None)
             if pending_image is not None:
-                self._set_pairing(event, list(pending_image.get("candidates", []) or []), "image_then_at")
+                self._set_pairing(
+                    event,
+                    list(pending_image.get("candidates", []) or []),
+                    "image_then_at",
+                    sender_id=sender_id,
+                )
                 event.set_extra("astrmai_release_vision_pair_waiter", True)
                 return "image_then_at"
             session.pending_vision_mentions[sender_id] = {
@@ -109,8 +130,13 @@ class AttentionWindowBuffer:
             if pending_at is not None:
                 mention_event = pending_at.get("event")
                 if mention_event is not None:
-                    self._set_pairing(mention_event, candidates, "at_then_image")
-                self._set_pairing(event, candidates, "at_then_image")
+                    self._set_pairing(
+                        mention_event,
+                        candidates,
+                        "at_then_image",
+                        sender_id=sender_id,
+                    )
+                self._set_pairing(event, candidates, "at_then_image", sender_id=sender_id)
                 event.set_extra("astrmai_group_direct_wakeup", True)
                 event.set_extra("astrmai_at_bot_wakeup", True)
                 event.set_extra("astrmai_release_vision_pair_waiter", True)

@@ -950,11 +950,14 @@ def record_vision_observation(
         "policy",
         "outcome",
         "image_count",
+        "raw_image_count",
+        "candidate_ref_count",
         "resolved_count",
         "analyzed_count",
         "failed_count",
         "timeout_count",
         "attempt_count",
+        "vision_model_attempt_count",
         "image_source",
         "image_resolve_status",
         "vision_barrier_status",
@@ -969,6 +972,12 @@ def record_vision_observation(
         "visual_memory_write_status",
         "prompt_injected",
         "fallback_reason",
+        "failure_disposition",
+        "reply_guard_action",
+        "resolve_failure_reasons",
+        "selected_message_id",
+        "selected_sender_id",
+        "selected_pairing_mode",
         "cache_hit_count",
         "cache_miss_count",
         "singleflight_wait_count",
@@ -1031,7 +1040,13 @@ def record_vision_observation(
     normalized: dict[str, Any] = {}
     for key in allowed:
         value = payload.get(key)
-        if key in {"image_source", "visual_memory_ids", "asset_ids", "model_ids"}:
+        if key in {
+            "image_source",
+            "visual_memory_ids",
+            "asset_ids",
+            "model_ids",
+            "resolve_failure_reasons",
+        }:
             if isinstance(value, (list, tuple, set)):
                 normalized[key] = [str(item)[:80] for item in value if str(item).strip()][:16]
             elif value is not None and str(value).strip():

@@ -108,7 +108,14 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
                     "vision_call_status": "success",
                     "vision_wait_ms": 25,
                     "image_count": 1,
+                    "raw_image_count": 2,
+                    "candidate_ref_count": 3,
+                    "resolved_count": 1,
+                    "vision_model_attempt_count": 1,
                     "analyzed_count": 1,
+                    "failure_disposition": "continue_text_only",
+                    "reply_guard_action": "allowed",
+                    "resolve_failure_reasons": ["get_image_failed"],
                 },
             }
         ]
@@ -130,6 +137,13 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["vision"]["trace_count"] == 1
     assert report["vision"]["path_counts"] == {"direct": 1}
     assert report["vision"]["call_status_counts"] == {"success": 1}
+    assert report["vision"]["raw_image_count"] == 2
+    assert report["vision"]["candidate_ref_count"] == 3
+    assert report["vision"]["resolved_count"] == 1
+    assert report["vision"]["model_attempt_count"] == 1
+    assert report["vision"]["failure_disposition_counts"] == {"continue_text_only": 1}
+    assert report["vision"]["reply_guard_action_counts"] == {"allowed": 1}
+    assert report["vision"]["resolve_failure_reason_counts"] == {"get_image_failed": 1}
     assert "## Vision" in render_markdown(report)
 
 

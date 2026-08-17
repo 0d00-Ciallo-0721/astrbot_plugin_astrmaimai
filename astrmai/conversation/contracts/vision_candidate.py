@@ -18,16 +18,38 @@ class VisionCandidate:
     reply_to_message_id: str = ""
     prefilter_selected: bool = False
     pairing_mode: str = "none"
+    pairing_verified: bool = False
+    paired_sender_id: str = ""
+    paired_group_id: str = ""
 
     @property
     def primary_ref(self) -> str:
         return self.candidate_refs[0] if self.candidate_refs else ""
 
-    def with_selection(self, *, selected: bool, pairing_mode: str | None = None) -> "VisionCandidate":
+    def with_selection(
+        self,
+        *,
+        selected: bool,
+        pairing_mode: str | None = None,
+        pairing_verified: bool | None = None,
+        paired_sender_id: str | None = None,
+        paired_group_id: str | None = None,
+    ) -> "VisionCandidate":
         return replace(
             self,
             prefilter_selected=bool(selected),
             pairing_mode=str(pairing_mode or self.pairing_mode or "none"),
+            pairing_verified=(
+                self.pairing_verified
+                if pairing_verified is None
+                else bool(pairing_verified)
+            ),
+            paired_sender_id=str(
+                self.paired_sender_id if paired_sender_id is None else paired_sender_id
+            ),
+            paired_group_id=str(
+                self.paired_group_id if paired_group_id is None else paired_group_id
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -42,6 +64,9 @@ class VisionCandidate:
             "reply_to_message_id": self.reply_to_message_id,
             "prefilter_selected": bool(self.prefilter_selected),
             "pairing_mode": self.pairing_mode,
+            "pairing_verified": bool(self.pairing_verified),
+            "paired_sender_id": self.paired_sender_id,
+            "paired_group_id": self.paired_group_id,
         }
 
     @classmethod
@@ -75,6 +100,9 @@ class VisionCandidate:
             reply_to_message_id=str(value.get("reply_to_message_id") or ""),
             prefilter_selected=bool(value.get("prefilter_selected", False)),
             pairing_mode=str(value.get("pairing_mode") or "none"),
+            pairing_verified=bool(value.get("pairing_verified", False)),
+            paired_sender_id=str(value.get("paired_sender_id") or ""),
+            paired_group_id=str(value.get("paired_group_id") or ""),
         )
 
 

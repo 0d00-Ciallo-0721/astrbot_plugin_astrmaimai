@@ -733,6 +733,113 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             asset = session.get(VisualAsset, "asset-stored")
         self.assertEqual(asset.reuse_count, 1)
 
+    def test_04e_vision_message_non_ready_asset_falls_through_to_fresh_analysis(self):
+        from astrmai.infrastructure.persistence.orm_models import (
+            VisualAsset,
+            VisualMessageBinding,
+        )
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        metadata = MetaData()
+        for source_table in (VisualAsset.__table__, VisualMessageBinding.__table__):
+            table = source_table.to_metadata(metadata)
+            seen_index_names = set()
+            for index in list(table.indexes):
+                if index.name in seen_index_names:
+                    table.indexes.discard(index)
+                    continue
+                seen_index_names.add(index.name)
+        metadata.create_all(engine)
+        event = _FakeEvent(group_id="777", message_id="msg-non-ready")
+        event.bot.api = _FakeApi(
+            result={
+                "data": {
+                    "message": [
+                        {"type": "image", "data": {"file": "fake-image-reference"}}
+                    ]
+                }
+            }
+        )
+        with Session(engine) as session:
+            session.add(
+                VisualAsset(
+                    asset_id="asset-non-ready",
+                    status="failed",
+                    type="image",
+                    description="不应返回的旧描述",
+                    reuse_count=0,
+                )
+            )
+            session.add(
+                VisualMessageBinding(
+                    chat_id=event.unified_msg_origin,
+                    message_id="msg-non-ready",
+                    image_index=0,
+                    asset_id="asset-non-ready",
+                )
+            )
+            session.commit()
+
+        class _DB:
+            def get_session(self):
+                return Session(engine)
+
+        class _Resolver:
+            def __init__(self):
+                self.calls = []
+
+            async def resolve_message_payload(self, resolved_event, payload):
+                self.calls.append((resolved_event, payload))
+                return SimpleNamespace(
+                    images=[
+                        SimpleNamespace(
+                            index=0,
+                            local_path="C:/fake/cache/image.jpg",
+                            source_ref="fake-image-reference",
+                        )
+                    ],
+                    failures=[],
+                )
+
+        class _VisualCortex:
+            def __init__(self):
+                self.config = SimpleNamespace(
+                    timing=SimpleNamespace(image_analysis_timeout_sec=2.0)
+                )
+                self.calls = []
+
+            async def analyze_image_path(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return {
+                    "type": "image",
+                    "description": "重新识别得到的新描述",
+                    "emotion_tags": [],
+                    "_cache_hit": False,
+                }
+
+        resolver = _Resolver()
+        cortex = _VisualCortex()
+        result = asyncio.run(
+            self.mod.VisionMessageAnalyzeTool(
+                db_service=_DB(),
+                visual_cortex=cortex,
+                image_resolver=resolver,
+            ).call(_wrap_event(event), message_id="msg-non-ready")
+        )
+
+        self.assertIn("重新识别得到的新描述", result)
+        self.assertNotIn("不应返回的旧描述", result)
+        self.assertEqual(len(event.bot.api.calls), 1)
+        self.assertEqual(len(resolver.calls), 1)
+        self.assertEqual(len(cortex.calls), 1)
+        with Session(engine) as session:
+            asset = session.get(VisualAsset, "asset-non-ready")
+        self.assertEqual(asset.reuse_count, 0)
+
     def test_05_cross_session_reply_lookup_reads_friend_history(self):
         event = _FakeEvent(group_id="777")
         event.bot.api = _MapApi(

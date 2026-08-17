@@ -56,7 +56,11 @@ def test_same_message_at_image_reply_is_bound_without_pending_state():
 
     assert mode == "same_message_reply"
     assert event.get_extra("vision_prefilter_selected") is True
-    assert event.get_extra("astrmai_vision_candidates")[0]["pairing_mode"] == mode
+    paired = event.get_extra("astrmai_vision_candidates")[0]
+    assert paired["pairing_mode"] == mode
+    assert paired["pairing_verified"] is True
+    assert paired["paired_sender_id"] == "user-1"
+    assert paired["paired_group_id"] == "group-1"
     assert session.pending_vision_images == {}
 
 
@@ -81,6 +85,9 @@ def test_image_then_at_binds_only_same_sender():
     assert matching_at.get_extra("extracted_image_refs") == ["image-1.jpg"]
     assert matching_at.get_extra("astrmai_cross_message_vision_bound") is True
     assert matching_at.get_extra("astrmai_release_vision_pair_waiter") is True
+    paired = matching_at.get_extra("astrmai_vision_candidates")[0]
+    assert paired["pairing_verified"] is True
+    assert paired["paired_sender_id"] == "user-1"
 
 
 def test_at_then_image_wakes_pair_waiter_and_copies_candidate_to_mention():

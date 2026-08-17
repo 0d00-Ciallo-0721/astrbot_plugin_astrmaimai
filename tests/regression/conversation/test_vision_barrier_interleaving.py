@@ -353,7 +353,7 @@ class VisionResolveTimeoutTests(unittest.TestCase):
         self.assertEqual(outcome.outcome, "failed", "聚合层按设计归并明细 outcome")
         self.assertTrue(batch_event.get_extra("astrmai_vision_required_failed", False))
 
-    def test_resolve_timeout_falls_back_to_placeholder_by_default(self):
+    def test_resolve_timeout_notifies_private_user_by_default(self):
         policy = "超时后忽略图片并继续回复"
         detail = asyncio.run(
             self._coordinator(policy)._prepare_event(
@@ -362,7 +362,7 @@ class VisionResolveTimeoutTests(unittest.TestCase):
         )
         self.assertEqual(detail.outcome, "resolve_timeout")
         self.assertEqual(detail.timeout_count, 1)
-        self.assertEqual(detail.downstream_action, "continue_with_placeholder")
+        self.assertEqual(detail.downstream_action, "notify_failure")
 
         batch_event = self._image_event()
         outcome = asyncio.run(
@@ -370,10 +370,15 @@ class VisionResolveTimeoutTests(unittest.TestCase):
                 [batch_event], "default:FriendMessage:user-1"
             )
         )
-        self.assertEqual(outcome.downstream_action, "continue_with_placeholder")
+        self.assertEqual(outcome.downstream_action, "notify_failure")
         self.assertEqual(outcome.timeout_count, 1)
-        self.assertFalse(outcome.should_abort)
+        self.assertTrue(outcome.should_abort)
         self.assertTrue(batch_event.get_extra("astrmai_vision_unavailable", False))
+        self.assertEqual(
+            batch_event.get_extra("astrmai_vision_failure_disposition"),
+            "notify_failure",
+        )
+        self.assertNotIn("[图片]", batch_event.get_extra("astrmai_rich_text", ""))
         self.assertTrue(batch_event.get_extra("astrmai_vision_barrier_complete", False))
 
 

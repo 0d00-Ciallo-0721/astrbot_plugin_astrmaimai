@@ -1612,7 +1612,31 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(mood_calls, [])
         self.assertEqual(judge_calls, [])
         self.assertEqual(system2_calls, [])
-        self.assertEqual(sent, ["这张图片暂时没有识别成功，请稍后再发一次。"])
+        self.assertEqual(
+            sent,
+            ["这张图片暂时没有识别成功，我现在无法确认图片内容，请稍后再发一次。"],
+        )
+
+    def test_private_vision_failure_notice_is_sent_at_most_once(self):
+        event = _FakePrivateEvent("user-1", "Alice", "看看这个")
+        sent = []
+
+        async def send(result):
+            sent.append(result)
+
+        event.send = send
+        event.plain_result = lambda text: text
+
+        async def run():
+            first = await self.gate._send_required_vision_failure(event)
+            second = await self.gate._send_required_vision_failure(event)
+            return first, second
+
+        first, second = asyncio.run(run())
+
+        expected = "这张图片暂时没有识别成功，我现在无法确认图片内容，请稍后再发一次。"
+        self.assertEqual((first, second), (expected, expected))
+        self.assertEqual(sent, [expected])
 
     def test_group_perception_uses_unified_origin_as_chat_id(self):
         event = _FakeEvent("user-1", "Alice", "hello")

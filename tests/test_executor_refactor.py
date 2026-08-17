@@ -1484,6 +1484,52 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertGreater(float(event.get_extra("vision_native_direct_breaker_until", 0.0) or 0.0), 0.0)
         self.assertTrue(any(mode == "vision" for mode, _kwargs in gateway.calls))
 
+    def test_native_unresolved_image_reply_falls_back_to_relay(self):
+        gateway = _FakeGateway(
+            chat_responses={
+                "model-a": lambda kwargs: (
+                    "我看不到这张图片。" if kwargs.get("image_urls") else "lane-text-reply"
+                )
+            }
+        )
+        gateway.config.vision.use_native_main_reply_vision = True
+        reply_service = _FakeReplyService()
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=reply_service,
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent(text="")
+        temp_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        temp_image.close()
+
+        async def _run():
+            return await executor.execute(
+                event,
+                "prompt",
+                "system",
+                direct_vision_urls=[temp_image.name],
+            )
+
+        try:
+            result = asyncio.run(_run())
+        finally:
+            try:
+                os.remove(temp_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(result, "lane-text-reply")
+        self.assertEqual([mode for mode, _kwargs in gateway.calls], ["chat", "vision", "chat"])
+        self.assertEqual(reply_service.calls, [(event.unified_msg_origin, "lane-text-reply")])
+        self.assertEqual(event.get_extra("vision_native_direct_outcome"), "fallback_to_relay")
+        self.assertEqual(
+            event.get_extra("vision_native_direct_fallback_reason"),
+            "provider_failure_text",
+        )
+
     def test_native_main_reply_vision_tool_mode_passes_direct_images(self):
         gateway = _FakeGateway()
         gateway.config.vision.use_native_main_reply_vision = True

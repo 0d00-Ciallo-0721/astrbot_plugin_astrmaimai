@@ -113,6 +113,17 @@ def test_vision_observation_keeps_diagnostics_without_source_or_description():
             "vision_path": "direct",
             "vision_call_status": "failed",
             "image_count": 1,
+            "raw_image_count": 2,
+            "candidate_ref_count": 3,
+            "resolved_count": 0,
+            "attempt_count": 1,
+            "vision_model_attempt_count": 1,
+            "failure_disposition": "notify_failure",
+            "reply_guard_action": "suppressed",
+            "resolve_failure_reasons": ["get_image_failed", "resolve_timeout"],
+            "selected_message_id": "opaque-message-id",
+            "selected_sender_id": "opaque-sender-id",
+            "selected_pairing_mode": "at_then_image",
             "cache_hit_count": 0,
             "cache_miss_count": 1,
             "singleflight_wait_count": 0,
@@ -135,6 +146,13 @@ def test_vision_observation_keeps_diagnostics_without_source_or_description():
     assert payload["asset_ids"] == ["opaque-asset-id"]
     assert payload["model_ids"] == ["vision-model"]
     assert payload["analysis_prompt_version"] == "v2"
+    assert payload["raw_image_count"] == 2.0
+    assert payload["candidate_ref_count"] == 3.0
+    assert payload["vision_model_attempt_count"] == 1.0
+    assert payload["failure_disposition"] == "notify_failure"
+    assert payload["reply_guard_action"] == "suppressed"
+    assert payload["resolve_failure_reasons"] == ["get_image_failed", "resolve_timeout"]
+    assert payload["selected_pairing_mode"] == "at_then_image"
     assert "source_ref" not in payload
     assert "description" not in payload
     assert "private.example" not in str(payload)

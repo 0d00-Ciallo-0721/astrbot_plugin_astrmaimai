@@ -12,7 +12,7 @@ from astrbot.api import logger
 from ...infrastructure.runtime.trace_runtime import debug_trace
 from ...infrastructure.runtime.turn_call_ledger import record_vision_observation
 from ...multimodal.vision_prompt import normalize_vision_result, render_vision_record
-from ..vision_state import vision_analysis_observation_facts
+from ..vision_state import classify_vision_failure_text, vision_analysis_observation_facts
 
 
 @dataclass
@@ -38,7 +38,7 @@ class VisionBarrierOutcome:
 
     @property
     def should_abort(self) -> bool:
-        return self.downstream_action == "abort_required_vision"
+        return self.downstream_action in {"abort_required_vision", "notify_failure"}
 
 
 class PrivateTurnCoordinator:
@@ -355,6 +355,16 @@ class PrivateTurnCoordinator:
             all(bool(event.get_extra("astrmai_vision_barrier_complete", False)) for event in image_events),
         )
         focus_event.set_extra("astrmai_vision_barrier_failed", bool(failed_count))
+        failure_dispositions = [
+            str(event.get_extra("astrmai_vision_failure_disposition", "") or "")
+            for event in image_events
+            if str(event.get_extra("astrmai_vision_failure_disposition", "") or "")
+        ]
+        if failure_dispositions:
+            focus_event.set_extra(
+                "astrmai_vision_failure_disposition",
+                failure_dispositions[-1],
+            )
         self._bind_batch_vision_observation(events, focus_event)
         if not str(focus_event.get_extra("astrmai_rich_text", "") or "").strip():
             focus_event.set_extra(
@@ -398,6 +408,10 @@ class PrivateTurnCoordinator:
             "failed_count": sum(int(item.get("failed_count", 0) or 0) for item in observations),
             "timeout_count": sum(int(item.get("timeout_count", 0) or 0) for item in observations),
             "attempt_count": sum(int(item.get("attempt_count", 0) or 0) for item in observations),
+            "vision_model_attempt_count": sum(
+                int(item.get("vision_model_attempt_count", item.get("attempt_count", 0)) or 0)
+                for item in observations
+            ),
             "image_source": sources,
             "image_resolve_status": "failed" if any(
                 item.get("image_resolve_status") == "failed" for item in observations
@@ -437,6 +451,20 @@ class PrivateTurnCoordinator:
                 if any(item.get("final_status") == "failed" for item in observations)
                 else "success"
             ),
+            "failure_disposition": str(
+                focus_event.get_extra("astrmai_vision_failure_disposition", "") or ""
+            ),
+            "reply_guard_action": str(
+                focus_event.get_extra("astrmai_reply_guard_action", "") or ""
+            ),
+            "resolve_failure_reasons": list(
+                dict.fromkeys(
+                    str(reason or "")
+                    for item in observations
+                    for reason in list(item.get("resolve_failure_reasons", []) or [])
+                    if str(reason or "").strip()
+                )
+            ),
         }
         focus_event.set_extra("astrmai_vision_observability", payload)
         record_vision_observation(focus_event, payload)
@@ -451,7 +479,13 @@ class PrivateTurnCoordinator:
             if event_key in seen_keys:
                 continue
             seen_keys.add(event_key)
-            text = str(getattr(event, "message_str", "") or "").strip()
+            text = str(
+                event.get_extra("astrmai_vision_independent_text", "")
+                if event.get_extra("astrmai_vision_failure_disposition", "")
+                == "continue_text_only"
+                else getattr(event, "message_str", "")
+                or ""
+            ).strip()
             if text:
                 lines.append(text)
             if event_key.startswith("id:"):
@@ -523,6 +557,7 @@ class PrivateTurnCoordinator:
                 timeout=resolve_timeout,
             )
         except asyncio.TimeoutError:
+            event.set_extra("astrmai_vision_resolve_failure_reasons", ["resolve_timeout"])
             return self._apply_failed_policy(
                 event,
                 image_count=1,
@@ -533,6 +568,7 @@ class PrivateTurnCoordinator:
             )
         except Exception as exc:
             logger.warning(f"[AstrMai-Vision] image resolution failed for {chat_id}: {exc}")
+            event.set_extra("astrmai_vision_resolve_failure_reasons", [])
             return self._apply_failed_policy(
                 event,
                 image_count=1,
@@ -541,6 +577,17 @@ class PrivateTurnCoordinator:
                 elapsed_ms=int((time.monotonic() - started_at) * 1000),
                 outcome="resolve_failed",
             )
+        resolve_failure_reasons = list(
+            dict.fromkeys(
+                str(item.get("reason") or "")
+                for item in list(getattr(resolution, "failure_details", []) or [])
+                if isinstance(item, dict) and str(item.get("reason") or "").strip()
+            )
+        )
+        event.set_extra(
+            "astrmai_vision_resolve_failure_reasons",
+            resolve_failure_reasons,
+        )
         if not resolution.had_images:
             outcome = VisionBarrierOutcome(
                 policy=self._vision_policy(),
@@ -757,27 +804,69 @@ class PrivateTurnCoordinator:
         event.set_extra("astrmai_vision_failed_count", failed_count)
         event.set_extra("astrmai_vision_unavailable", True)
         event.set_extra("astrmai_vision_no_guess", True)
-        if policy == "require_analysis":
+        failure_disposition = ""
+        independent_text = ""
+        if not records:
+            if self._is_media_only_event(event):
+                text_kind = "image_only"
+            else:
+                text_kind, independent_text = classify_vision_failure_text(
+                    str(getattr(event, "message_str", "") or "")
+                )
+            is_private = "FriendMessage" in str(
+                getattr(event, "unified_msg_origin", "") or ""
+            )
+            if text_kind == "independent_text" and independent_text:
+                failure_disposition = "continue_text_only"
+            elif is_private or policy == "require_analysis":
+                failure_disposition = "notify_failure"
+            else:
+                failure_disposition = "continue_with_placeholder"
+            event.set_extra("astrmai_vision_failure_text_kind", text_kind)
+            event.set_extra("astrmai_vision_failure_disposition", failure_disposition)
+            event.set_extra("astrmai_vision_independent_text", independent_text)
+
+        if failure_disposition == "notify_failure":
+            event.set_extra("astrmai_vision_required_failed", True)
+            self._clear_raw_image_refs(event)
+            event.set_extra(
+                "astrmai_rich_text",
+                re.sub(
+                    r"\[(?:图片|图像|表情包?|image)(?:[^\]]*)\]",
+                    "",
+                    str(getattr(event, "message_str", "") or ""),
+                    flags=re.IGNORECASE,
+                ).strip(),
+            )
+            downstream_action = (
+                "abort_required_vision" if policy == "require_analysis" else "notify_failure"
+            )
+        elif failure_disposition == "continue_text_only":
+            event.set_extra("astrmai_vision_required_failed", False)
+            self._clear_raw_image_refs(event)
+            event.set_extra("astrmai_rich_text", independent_text)
+            downstream_action = "continue_text_only"
+        elif policy == "require_analysis":
             event.set_extra("astrmai_vision_required_failed", True)
             downstream_action = "abort_required_vision"
         else:
             self._clear_raw_image_refs(event)
             self._append_vision_context(event, records, failed_count)
-            if not records:
-                media_only_failure = self._is_media_only_event(event)
-                event.set_extra("astrmai_media_status_nonsemantic", True)
-                event.set_extra("astrmai_media_only_failure", media_only_failure)
-                event.set_extra(
-                    "astrmai_media_status",
-                    {
-                        "status": "unavailable",
-                        "owner": "barrier",
-                        "reason": str(outcome or "analysis_failed"),
-                        "image_count": max(image_count, failed_count),
-                        "image_only": media_only_failure,
-                    },
-                )
-            downstream_action = "continue_with_placeholder"
+            downstream_action = failure_disposition or "continue_with_placeholder"
+        if not records:
+            media_only_failure = self._is_media_only_event(event)
+            event.set_extra("astrmai_media_status_nonsemantic", True)
+            event.set_extra("astrmai_media_only_failure", media_only_failure)
+            event.set_extra(
+                "astrmai_media_status",
+                {
+                    "status": "unavailable",
+                    "owner": "barrier",
+                    "reason": str(outcome or "analysis_failed"),
+                    "image_count": max(image_count, failed_count),
+                    "image_only": media_only_failure,
+                },
+            )
         barrier_outcome = VisionBarrierOutcome(
             policy=policy,
             outcome=outcome,
@@ -865,10 +954,16 @@ class PrivateTurnCoordinator:
         outcomes = [outcome for outcome in outcomes if outcome is not None]
         if not outcomes:
             return VisionBarrierOutcome(policy=self._vision_policy(), elapsed_ms=elapsed_ms)
-        should_abort = any(outcome.should_abort for outcome in outcomes)
+        requires_abort = any(
+            outcome.downstream_action == "abort_required_vision" for outcome in outcomes
+        )
         failed_count = sum(outcome.failed_count for outcome in outcomes)
-        if should_abort:
+        if requires_abort:
             downstream_action = "abort_required_vision"
+        elif any(outcome.downstream_action == "notify_failure" for outcome in outcomes):
+            downstream_action = "notify_failure"
+        elif any(outcome.downstream_action == "continue_text_only" for outcome in outcomes):
+            downstream_action = "continue_text_only"
         elif failed_count:
             downstream_action = "continue_with_placeholder"
         else:
@@ -899,14 +994,28 @@ class PrivateTurnCoordinator:
             "policy": outcome.policy,
             "outcome": outcome.outcome,
             "image_count": outcome.image_count,
+            "raw_image_count": int(
+                event.get_extra("astrmai_image_raw_component_count", 0) or 0
+            ),
+            "candidate_ref_count": 0,
             "resolved_count": outcome.resolved_count,
             "analyzed_count": outcome.analyzed_count,
             "failed_count": outcome.failed_count,
             "timeout_count": outcome.timeout_count,
             "cache_hit_count": outcome.cache_hit_count,
             "attempt_count": outcome.attempt_count,
+            "vision_model_attempt_count": outcome.attempt_count,
             "elapsed_ms": outcome.elapsed_ms,
             "downstream_action": outcome.downstream_action,
+            "failure_disposition": str(
+                event.get_extra("astrmai_vision_failure_disposition", "") or ""
+            ),
+            "reply_guard_action": str(
+                event.get_extra("astrmai_reply_guard_action", "") or ""
+            ),
+            "resolve_failure_reasons": list(
+                event.get_extra("astrmai_vision_resolve_failure_reasons", []) or []
+            ),
             "scope": "private" if "FriendMessage" in effective_chat_id else "group",
         }
         source_categories = list(event.get_extra("astrmai_vision_image_sources", []) or [])
@@ -1045,7 +1154,7 @@ class PrivateTurnCoordinator:
         base_text = str(event.get_extra("astrmai_rich_text", getattr(event, "message_str", "")) or "").strip()
         lines = [base_text] if base_text else []
         lines.extend(line for record in records if (line := render_vision_record(record)))
-        if failed_count:
+        if failed_count and event.get_extra("astrmai_vision_failure_disposition", "") != "continue_text_only":
             if "[图片]" not in base_text:
                 lines.append("[图片]")
         event.set_extra("astrmai_rich_text", "\n".join(lines).strip())
