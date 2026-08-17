@@ -104,8 +104,20 @@ class WebUiGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(catalog["status"], "ok")
         self.assertFalse(catalog["runtime_bound"])
-        self.assertGreater(catalog["data"]["total"], 0)
-        self.assertTrue(all("name" in item and "tier" in item for item in catalog["data"]["items"]))
+        self.assertEqual(catalog["data"]["total"], 33)
+        self.assertTrue(
+            all(
+                "name" in item
+                and "tier" in item
+                and "request_policy" in item
+                for item in catalog["data"]["items"]
+            )
+        )
+        by_name = {item["name"]: item for item in catalog["data"]["items"]}
+        self.assertEqual(by_name["bot_capability_lookup"]["tier"], "default")
+        self.assertEqual(by_name["qq_friend_lookup"]["request_policy"], "model_lookup")
+        self.assertEqual(by_name["space_transition_action"]["request_policy"], "explicit_only")
+        self.assertEqual(by_name["qq_friend_lookup"]["families"], ["friend_fact", "query"])
 
     def test_admin_api_treats_string_migration_source_as_one_source(self):
         from astrmai.webui.plugin_pages import AstrMaiAdminPageApi

@@ -1366,8 +1366,9 @@ async function renderDashboardTools() {
   if (!isCurrentView(request)) return;
   const catalogRows = asItems(calls).map((item, index) => `
     <tr>
-      <td>${escapeHtml(item.name || "-")}</td>
-      <td>${statusChip(item.tier || "unknown", item.tier === "full_only" ? "warn" : "ok")}</td>
+      <td>${escapeHtml(item.display_name ? `${item.display_name} (${item.name || "-"})` : (item.name || "-"))}</td>
+      <td>${statusChip(item.tier || "unknown", item.tier === "on_demand" ? "warn" : "ok")}</td>
+      <td>${statusChip(item.request_policy || "unknown", item.request_policy === "explicit_only" ? "warn" : "ok")}</td>
       <td>${escapeHtml(Array.isArray(item.families) ? item.families.join(", ") : "-")}</td>
       <td><button class="ghost-button" data-tool-detail="${index}" type="button">详情</button></td>
     </tr>
@@ -1383,7 +1384,7 @@ async function renderDashboardTools() {
     </tr>
   `);
   const renderedRows = isCatalog ? catalogRows : rows;
-  const renderedHeaders = isCatalog ? ["工具", "层级", "能力族", "操作"] : ["时间", "Chat", "工具", "Tier", "状态", "操作"];
+  const renderedHeaders = isCatalog ? ["工具", "层级", "申请策略", "能力族", "操作"] : ["时间", "Chat", "工具", "Tier", "状态", "操作"];
   const viewLabel = state.toolsTab === "executions" ? "真实执行" : (isCatalog ? "能力目录" : "策略披露");
   const viewDescription = state.toolsTab === "executions"
     ? "工具实际被调用后的生命周期轨迹。"

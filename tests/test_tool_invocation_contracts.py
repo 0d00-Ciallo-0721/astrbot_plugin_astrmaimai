@@ -65,7 +65,6 @@ def test_all_chat_tools_have_registered_strict_schemas():
             tools_mod.QQMessageArtifactLookupTool(),
             tools_mod.VisionMessageAnalyzeTool(),
             tools_mod.CrossSessionReplyLookupTool(),
-            tools_mod.QQCustomFaceSendTool(),
             tools_mod.QuoteReplyActionTool(),
             tools_mod.QQMessageRecallLookupTool(),
             tools_mod.TopicThreadLookupTool(),
@@ -87,8 +86,6 @@ def test_all_chat_tools_have_registered_strict_schemas():
             tools_mod.MessageReactionTool(),
             tools_mod.MessageEmojiLikeTool(),
             tools_mod.ProactiveLikeTool(),
-            tools_mod.CustomFaceCatalogQueryTool(),
-            tools_mod.GroupSignTool(),
         ]
         normalized = contracts.normalize_tool_schemas(tools)
 
@@ -177,7 +174,6 @@ def test_context_specific_tools_keep_cross_session_send_in_private_chat():
         tools = [
             tools_mod.ConstructAtEventTool(),
             tools_mod.SpaceTransitionTool(),
-            tools_mod.GroupSignTool(),
             tools_mod.ProactivePokeTool(),
         ]
 
@@ -205,6 +201,7 @@ def test_explicit_meme_fallback_uses_configured_emotion_hint():
 
         assert queued == ["proactive_meme"]
         assert event.get_extra("astrmai_bypass_mood_analysis") == "happy"
+        assert event.get_extra("astrmai_force_meme") is True
         assert event.get_extra("astrmai_pending_actions")[0]["tag"] == "happy"
     finally:
         temp_dir.cleanup()

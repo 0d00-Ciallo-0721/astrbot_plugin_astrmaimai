@@ -142,6 +142,78 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
             [],
         )
 
+    def test_capability_lookup_records_exact_family_request(self):
+        event = _FakeEvent(group_id="12345")
+        event._astrmai_disclosure_hidden_tools = [
+            SimpleNamespace(name="qq_group_member_lookup"),
+        ]
+        event.set_extra(
+            "astrmai_turn_context",
+            SimpleNamespace(
+                tools=SimpleNamespace(
+                    available_tools=["bot_capability_lookup"],
+                    filtered_tools=["bot_capability_lookup"],
+                    required_tools=[],
+                )
+            ),
+        )
+
+        result = asyncio.run(
+            self.mod.BotCapabilityLookupTool().call(
+                _wrap_event(event),
+                needed_family="group_member",
+            )
+        )
+
+        self.assertEqual(
+            event.get_extra("astrmai_requested_tool_names"),
+            ["qq_group_member_lookup"],
+        )
+        self.assertIn("精确工具二次开放请求", result)
+        self.assertIn("只读查询能力", result)
+        self.assertIn("可执行动作能力", result)
+
+    def test_capability_lookup_resolves_natural_language_need_to_exact_tool(self):
+        event = _FakeEvent(group_id="12345")
+        event._astrmai_disclosure_hidden_tools = [
+            SimpleNamespace(name="qq_group_presence_lookup"),
+            SimpleNamespace(name="qq_friend_lookup"),
+        ]
+
+        result = asyncio.run(
+            self.mod.BotCapabilityLookupTool().call(
+                _wrap_event(event),
+                need="查一下这个人和你有没有共同群",
+            )
+        )
+
+        self.assertEqual(
+            event.get_extra("astrmai_requested_tool_names"),
+            ["qq_group_presence_lookup"],
+        )
+        self.assertIn("request_status=accepted", result)
+        self.assertEqual(
+            event.get_extra("astrmai_tool_disclosure_request_source"),
+            "natural_language_need",
+        )
+
+    def test_capability_lookup_rejects_side_effect_tool_request(self):
+        event = _FakeEvent(group_id="12345")
+        event._astrmai_disclosure_hidden_tools = [
+            SimpleNamespace(name="space_transition_action"),
+        ]
+
+        result = asyncio.run(
+            self.mod.BotCapabilityLookupTool().call(
+                _wrap_event(event),
+                needed_tool="space_transition_action",
+            )
+        )
+
+        self.assertIsNone(event.get_extra("astrmai_requested_tool_names"))
+        self.assertIn("request_status=invalid", result)
+        self.assertIn("not_hidden_or_not_readonly", result)
+
     def test_wait_tool_records_actual_execution(self):
         event = _FakeEvent(group_id="12345")
 
@@ -161,17 +233,6 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
                 }
             ],
         )
-
-    def test_group_sign_tool_blocks_private_chat(self):
-        event = _FakeEvent(group_id=None)
-        api = _FakeApi()
-        event.bot.api = api
-        tool = self.mod.GroupSignTool()
-
-        result = asyncio.run(tool.call(_wrap_event(event)))
-
-        self.assertIn("当前不是群聊", result)
-        self.assertEqual(api.calls, [])
 
     def test_construct_at_event_ignores_dirty_none_target_when_deduping(self):
         event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")
@@ -254,28 +315,6 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("没有在当前群 111 中确认", result)
         self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
-
-    def test_group_sign_tool_calls_current_group_only(self):
-        event = _FakeEvent(group_id="67890")
-        api = _FakeApi()
-        event.bot.api = api
-        tool = self.mod.GroupSignTool()
-
-        result = asyncio.run(tool.call(_wrap_event(event)))
-
-        self.assertIn("群签到", result)
-        self.assertEqual(api.calls, [])
-        self.assertEqual(event.get_extra("astrmai_pending_actions")[0]["action"], "group_sign")
-        self.assertEqual(event.get_extra("astrmai_pending_actions")[0]["group_id"], "67890")
-
-    def test_custom_face_catalog_query_accepts_wrapped_napcat_data(self):
-        event = _FakeEvent(group_id="12345")
-        api = _FakeApi(result={"data": ["cat_smile"]})
-        event.bot.api = api
-
-        result = asyncio.run(self.mod.CustomFaceCatalogQueryTool().call(_wrap_event(event), count=1))
-
-        self.assertIn("cat_smile", result)
 
     def test_qq_friend_lookup_matches_friend_remark_without_sending(self):
         event = _FakeEvent(group_id="12345")
@@ -744,17 +783,6 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("delegated:", result)
         self.assertEqual(history_service.calls[0]["count"], 20)
 
-    def test_06_custom_face_send_queues_selected_face(self):
-        event = _FakeEvent(group_id="777")
-        event.bot.api = _MapApi({"fetch_custom_face": {"data": [{"id": "face-1", "name": "开心猫"}]}})
-
-        result = asyncio.run(self.mod.QQCustomFaceSendTool().call(_wrap_event(event), keyword="开心"))
-
-        self.assertIn("准备发送", result)
-        action = event.get_extra("astrmai_pending_actions")[0]
-        self.assertEqual(action["action"], "custom_face_send")
-        self.assertEqual(action["payload"]["face"]["id"], "face-1")
-
     def test_07_quote_reply_action_queues_current_message_reply(self):
         event = _FakeEvent(group_id="777", message_id="m-current")
 
@@ -964,27 +992,6 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
 
         self.assertIn("机器人好友", result)
         self.assertIn("space_transition_action", result)
-
-    def test_dispatcher_commits_custom_face_send_action(self):
-        event = _FakeEvent(group_id="777")
-        event.bot.api = _MapApi({"send_msg": {"data": {"message_id": "out-1"}}})
-        event.set_extra(
-            "astrmai_pending_actions",
-            [
-                self.mod.PendingQQAction(
-                    action_type="custom_face_send",
-                    group_id="777",
-                    payload={"face": {"id": "face-1"}},
-                ).to_dict()
-            ],
-        )
-        dispatcher_mod = importlib.import_module("astrmai.conversation.execution.qq_action_dispatcher")
-
-        result = asyncio.run(dispatcher_mod.QQActionDispatcher().commit(event, "chat-1", send_key="send-1"))
-
-        self.assertEqual(result[-1]["status"], "success")
-        self.assertEqual(event.bot.api.calls[0][0], "send_msg")
-        self.assertEqual(event.bot.api.calls[0][1]["message"][0]["type"], "mface")
 
     def test_dispatcher_commits_quote_reply_action(self):
         event = _FakeEvent(group_id="777")
@@ -1241,18 +1248,6 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("没有找到", result)
         self.assertEqual(event.get_extra("astrmai_pending_actions", []), [])
         self.assertEqual(event.bot.api.calls[0][0], "get_friend_msg_history")
-
-    def test_custom_face_catalog_query_returns_preview(self):
-        event = _FakeEvent(group_id="12345")
-        api = _FakeApi(result=["cat_smile", "dog_wave"])
-        event.bot.api = api
-        tool = self.mod.CustomFaceCatalogQueryTool()
-
-        result = asyncio.run(tool.call(_wrap_event(event), count=2))
-
-        self.assertIn("cat_smile", result)
-        self.assertIn("dog_wave", result)
-        self.assertEqual(api.calls, [("fetch_custom_face", {"count": 2})])
 
     def test_proactive_poke_rejects_cross_group_target(self):
         event = _FakeEvent(group_id="111", sender_id="user-1", sender_name="Alice")

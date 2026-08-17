@@ -17,9 +17,7 @@ class QQActionDispatcher:
     TOOL_NAMES = {
         "poke": "proactive_poke",
         "message_emoji_like": "message_emoji_like_action",
-        "group_sign": "group_sign_action",
         "withdraw": "regret_and_withdraw_action",
-        "custom_face_send": "qq_custom_face_send_tool",
         "quote_reply": "quote_reply_action",
     }
 
@@ -183,8 +181,6 @@ class QQActionDispatcher:
                 emoji_id=str(action.payload.get("emoji_id") or ""),
                 set=True,
             )
-        elif action_type == "group_sign":
-            await api.call_action("set_group_sign", group_id=str(action.group_id))
         elif action_type == "withdraw":
             message_id = str(action.message_id or "").strip()
             if not message_id:
@@ -200,13 +196,6 @@ class QQActionDispatcher:
             if not message_id:
                 raise RuntimeError("没有可撤回的上一条 AstrMai 回复")
             await api.call_action("delete_msg", message_id=self._coerce_identifier(message_id))
-        elif action_type == "custom_face_send":
-            face = action.payload.get("face")
-            if not isinstance(face, dict) or not face:
-                raise RuntimeError("缺少自定义表情数据")
-            segment_data = dict(face)
-            segment_type = str(action.payload.get("segment_type") or segment_data.pop("type", "") or "mface")
-            await self._send_qq_message(api, action, [{"type": segment_type, "data": segment_data}])
         elif action_type == "quote_reply":
             message_id = str(action.message_id or "").strip()
             text = str(action.payload.get("text") or "").strip()
@@ -232,7 +221,7 @@ class QQActionDispatcher:
         actions = [
             action
             for action in self._queued_actions(event)
-            if action.action_type in {"poke", "message_emoji_like", "group_sign", "withdraw", "custom_face_send", "quote_reply"}
+            if action.action_type in {"poke", "message_emoji_like", "withdraw", "quote_reply"}
         ]
         if not actions:
             return []

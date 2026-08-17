@@ -48,7 +48,6 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "qq_message_artifact_lookup": ToolCapabilitySpec("qq_message_artifact_lookup", "message_artifact", "query", explicit_policy="required", autonomous_allowed=True),
     "vision_message_analyze_tool": ToolCapabilitySpec("vision_message_analyze_tool", "vision_message", "query", explicit_policy="required", autonomous_allowed=True),
     "cross_session_reply_lookup": ToolCapabilitySpec("cross_session_reply_lookup", "cross_reply", "query", explicit_policy="required", autonomous_allowed=True),
-    "qq_custom_face_send_tool": ToolCapabilitySpec("qq_custom_face_send_tool", "custom_face", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
     "quote_reply_action": ToolCapabilitySpec("quote_reply_action", "quote_reply", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
     "qq_message_recall_lookup": ToolCapabilitySpec("qq_message_recall_lookup", "message_recall", "query", explicit_policy="required", autonomous_allowed=True),
     "topic_thread_lookup": ToolCapabilitySpec("topic_thread_lookup", "topic_thread", "query", explicit_policy="required", autonomous_allowed=True),
@@ -69,9 +68,60 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "message_reaction_action": ToolCapabilitySpec("message_reaction_action", "reaction", "text", explicit_policy="required", autonomous_allowed=True),
     "message_emoji_like_action": ToolCapabilitySpec("message_emoji_like_action", "qq_reaction", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
     "proactive_like_action": ToolCapabilitySpec("proactive_like_action", "like", "text", explicit_policy="required", autonomous_allowed=True),
-    "custom_face_catalog_query": ToolCapabilitySpec("custom_face_catalog_query", "qq_query", "query", explicit_policy="required"),
-    "group_sign_action": ToolCapabilitySpec("group_sign_action", "sign", "qq_side_effect", contexts=("group",), explicit_policy="required", deterministic_fallback=True),
 }
+
+
+TOOL_DISPLAY_NAMES: dict[str, str] = {
+    "wait_and_listen": "等待并继续倾听",
+    "omni_perception_query": "综合感知查询",
+    "self_lore_query": "人格设定查询",
+    "learned_language_lookup": "已学习语言查询",
+    "qq_friend_lookup": "QQ 好友查询",
+    "qq_group_member_lookup": "QQ群成员查询",
+    "qq_user_identity_lookup": "QQ 用户身份查询",
+    "qq_forward_message_lookup": "QQ 合并转发查询",
+    "qq_group_presence_lookup": "QQ群关系查询",
+    "qq_recent_contact_lookup": "QQ 最近联系人查询",
+    "qq_message_artifact_lookup": "QQ 消息资料查询",
+    "vision_message_analyze_tool": "图片消息分析",
+    "cross_session_reply_lookup": "跨会话回复查询",
+    "quote_reply_action": "引用回复",
+    "qq_message_recall_lookup": "消息回溯查询",
+    "topic_thread_lookup": "话题线索查询",
+    "bot_capability_lookup": "工具能力查询",
+    "memory_write_correction_tool": "记忆纠正",
+    "unverified_report_record_tool": "未核实说法记录",
+    "persona_fact_check_tool": "人格事实核查",
+    "group_activity_snapshot_tool": "群聊活动快照",
+    "contact_route_suggest_tool": "联系人路由建议",
+    "cross_chat_memory_query": "跨聊天记忆查询",
+    "construct_at_event": "群聊成员提醒",
+    "proactive_poke": "QQ 戳一戳",
+    "proactive_meme": "发送表情包",
+    "meme_resonance_action": "表情共鸣复读",
+    "topic_hijack_action": "话题切换",
+    "space_transition_action": "跨会话发送",
+    "regret_and_withdraw_action": "撤回机器人消息",
+    "message_reaction_action": "文字互动回应",
+    "message_emoji_like_action": "QQ 消息表情回应",
+    "proactive_like_action": "主动夸赞回应",
+}
+
+
+def is_model_disclosure_requestable(tool_name: str) -> bool:
+    """Only read-only tools may be opened from a model-originated request."""
+    spec = TOOL_CAPABILITIES.get(str(tool_name or "").strip())
+    return bool(spec and spec.effect_type == "query")
+
+
+def requires_explicit_disclosure(tool_name: str) -> bool:
+    spec = TOOL_CAPABILITIES.get(str(tool_name or "").strip())
+    return bool(spec and spec.effect_type in {"memory_write", "cross_session_message"})
+
+
+def tool_display_name(tool_name: str) -> str:
+    name = str(tool_name or "").strip()
+    return TOOL_DISPLAY_NAMES.get(name, name)
 
 
 FAMILY_TO_TOOL: dict[str, str] = {
@@ -88,7 +138,6 @@ FAMILY_TO_TOOL: dict[str, str] = {
     "message_artifact": "qq_message_artifact_lookup",
     "vision_message": "vision_message_analyze_tool",
     "cross_reply": "cross_session_reply_lookup",
-    "custom_face": "qq_custom_face_send_tool",
     "quote_reply": "quote_reply_action",
     "message_recall": "qq_message_recall_lookup",
     "topic_thread": "topic_thread_lookup",
@@ -109,8 +158,6 @@ FAMILY_TO_TOOL: dict[str, str] = {
     "reaction": "message_reaction_action",
     "qq_reaction": "message_emoji_like_action",
     "like": "proactive_like_action",
-    "qq_query": "custom_face_catalog_query",
-    "sign": "group_sign_action",
 }
 
 
@@ -255,12 +302,16 @@ __all__ = [
     "AUTONOMOUS_INTERACTION_TOOLS",
     "FAMILY_TO_TOOL",
     "TOOL_CAPABILITIES",
+    "TOOL_DISPLAY_NAMES",
     "ToolCapabilitySpec",
     "ToolInvocationPlan",
     "build_explicit_invocation_plans",
     "filter_tools_for_context",
+    "is_model_disclosure_requestable",
     "normalize_tool_schema",
     "normalize_tool_schemas",
     "publish_invocation_plans",
     "record_tool_lifecycle",
+    "requires_explicit_disclosure",
+    "tool_display_name",
 ]

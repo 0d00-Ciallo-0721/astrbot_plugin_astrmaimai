@@ -261,6 +261,12 @@ class ToolDecisionTrace:
     disclosure_reasons: list[str] = field(default_factory=list)
     disclosure_second_pass_packages: list[str] = field(default_factory=list)
     disclosure_expanded_packages: list[str] = field(default_factory=list)
+    disclosure_decisions: list[dict[str, Any]] = field(default_factory=list)
+    preselected_tools: list[str] = field(default_factory=list)
+    hidden_requestable_tools: list[str] = field(default_factory=list)
+    disclosure_request_source: str = ""
+    disclosure_requested_tools: list[str] = field(default_factory=list)
+    disclosure_rejected_requests: list[dict[str, Any]] = field(default_factory=list)
     explicit_tool_intent: bool = False
     invocation_mode: str = "auto"
     required_tools: list[str] = field(default_factory=list)
@@ -274,6 +280,8 @@ class ToolDecisionTrace:
     second_pass_resolution: str = ""
     second_pass_selected_tools: list[str] = field(default_factory=list)
     second_pass_reason: str = ""
+    second_pass_added_tools: list[str] = field(default_factory=list)
+    second_pass_tool_executed: bool = False
     social_intent: str = ""
     allowed_families: list[str] = field(default_factory=list)
     initial_tools: list[str] = field(default_factory=list)
@@ -671,6 +679,12 @@ def build_turn_trace_summary(
             "disclosure_reasons": list(tools.disclosure_reasons or []),
             "disclosure_second_pass_packages": list(tools.disclosure_second_pass_packages or []),
             "disclosure_expanded_packages": list(tools.disclosure_expanded_packages or []),
+            "disclosure_decisions": list(tools.disclosure_decisions or []),
+            "preselected_tools": list(tools.preselected_tools or []),
+            "hidden_requestable_tools": list(tools.hidden_requestable_tools or []),
+            "disclosure_request_source": tools.disclosure_request_source,
+            "disclosure_requested_tools": list(tools.disclosure_requested_tools or []),
+            "disclosure_rejected_requests": list(tools.disclosure_rejected_requests or []),
             "explicit_tool_intent": bool(tools.explicit_tool_intent),
             "invocation_mode": tools.invocation_mode,
             "required_tools": list(tools.required_tools or []),
@@ -684,6 +698,8 @@ def build_turn_trace_summary(
             "second_pass_resolution": tools.second_pass_resolution,
             "second_pass_selected_tools": list(tools.second_pass_selected_tools or []),
             "second_pass_reason": tools.second_pass_reason,
+            "second_pass_added_tools": list(tools.second_pass_added_tools or []),
+            "second_pass_tool_executed": bool(tools.second_pass_tool_executed),
             "social_intent": tools.social_intent,
             "allowed_families": list(tools.allowed_families or []),
             "initial_tools": list(tools.initial_tools or []),

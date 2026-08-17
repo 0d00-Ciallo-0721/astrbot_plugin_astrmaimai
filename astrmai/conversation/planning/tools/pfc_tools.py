@@ -24,8 +24,37 @@ from ....multimodal.visual_cortex import VisionAnalysisCoolingDown
 from ....presentation.dto.message_scope import MessageScope
 from ...vision_state import vision_analysis_observation_facts
 from ...contracts.qq_action import PendingQQAction
-from ..tool_contracts import TOOL_CAPABILITIES, record_tool_lifecycle
-from ..tool_disclosure import TOOL_PACKAGES, normalize_requested_packages
+from ..tool_contracts import (
+    FAMILY_TO_TOOL,
+    TOOL_CAPABILITIES,
+    is_model_disclosure_requestable,
+    record_tool_lifecycle,
+    tool_display_name,
+)
+from ..tool_disclosure import (
+    DEFAULT_VISIBLE_TOOL_NAMES,
+    SECOND_PASS_ALLOWED_PACKAGES,
+    TOOL_PACKAGES,
+    normalize_requested_packages,
+)
+from ..tool_intent_resolution import resolve_capability_need
+
+
+MODEL_REQUESTABLE_TOOL_NAMES: tuple[str, ...] = tuple(
+    name
+    for name in TOOL_CAPABILITIES
+    if name not in DEFAULT_VISIBLE_TOOL_NAMES and is_model_disclosure_requestable(name)
+)
+MODEL_REQUESTABLE_FAMILIES: tuple[str, ...] = tuple(
+    family
+    for family, tool_name in FAMILY_TO_TOOL.items()
+    if tool_name in MODEL_REQUESTABLE_TOOL_NAMES
+)
+MODEL_REQUESTABLE_PACKAGES: tuple[str, ...] = tuple(
+    package
+    for package in SECOND_PASS_ALLOWED_PACKAGES
+    if any(name in MODEL_REQUESTABLE_TOOL_NAMES for name in TOOL_PACKAGES.get(package, ()))
+)
 
 
 QQ_MESSAGE_EMOJI_OPTIONS: dict[str, list[str]] = {
@@ -107,9 +136,7 @@ def _append_qq_action(event, action: PendingQQAction) -> bool:
         tool_name = {
             "poke": "proactive_poke",
             "message_emoji_like": "message_emoji_like_action",
-            "group_sign": "group_sign_action",
             "withdraw": "regret_and_withdraw_action",
-            "custom_face_send": "qq_custom_face_send_tool",
             "quote_reply": "quote_reply_action",
         }.get(action.action_type, action.action_type)
         record_tool_lifecycle(
@@ -668,7 +695,11 @@ async def prepare_explicit_tool_fallbacks(
     """Queue unambiguous explicit actions without relying on model tool selection."""
     required = set(required_tools or [])
     queued: list[str] = []
-    message = str(getattr(event, "message_str", "") or "").strip().lower()
+    message = str(
+        event.get_extra("astrmai_tool_intent_text", getattr(event, "message_str", ""))
+        if hasattr(event, "get_extra")
+        else getattr(event, "message_str", "")
+    ).strip().lower()
     group_id = str(event.get_group_id() or "").strip()
 
     if "proactive_poke" in required:
@@ -704,13 +735,6 @@ async def prepare_explicit_tool_fallbacks(
             ):
                 queued.append("message_emoji_like_action")
 
-    if "group_sign_action" in required and group_id:
-        if _append_qq_action(
-            event,
-            PendingQQAction(action_type="group_sign", group_id=group_id),
-        ):
-            queued.append("group_sign_action")
-
     if "regret_and_withdraw_action" in required:
         message_id = await _resolve_latest_bot_message_id(event)
         if message_id:
@@ -742,8 +766,9 @@ async def prepare_explicit_tool_fallbacks(
             (tag for tag, hints in tag_hints if tag in message or any(hint in message for hint in hints)),
             "",
         )
-        emotion_tag = requested_tag or (mood_tag if mood_tag in valid_tags else (
-            "neutral" if "neutral" in valid_tags else (valid_tags[0] if valid_tags else "neutral")
+        non_neutral_tags = [tag for tag in valid_tags if tag not in {"neutral", "none"}]
+        emotion_tag = requested_tag or (mood_tag if mood_tag in non_neutral_tags else (
+            non_neutral_tags[0] if non_neutral_tags else "happy"
         ))
         event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
         event.set_extra("astrmai_force_meme", True)
@@ -1195,7 +1220,10 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
         current_event = _get_current_event(context)
         message_id = _current_message_id(current_event)
         if not message_id:
-            return "动作取消：当前消息没有可定位的 message_id。"
+            return json.dumps(
+                {"status": "failed", "reason": "message_id_missing", "message": "当前消息没有可定位的 message_id。"},
+                ensure_ascii=False,
+            )
 
         tone = str(kwargs.get("tone", "") or "").strip().lower()
         selected_pool = list(self.emoji_options.get(tone) or [])
@@ -1219,67 +1247,6 @@ class MessageEmojiLikeTool(FunctionTool[AstrAgentContext]):
             ),
         )
         return "已将 QQ 原生消息表情回复加入待执行动作；不要声称已经成功，继续生成最终回复。"
-
-
-@dataclass
-class GroupSignTool(FunctionTool[AstrAgentContext]):
-    name: str = "group_sign_action"
-    description: str = "对当前群聊执行一次群签到。只允许在当前群上下文里使用。"
-    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
-
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        del kwargs
-        current_event = _get_current_event(context)
-        group_id = str(current_event.get_group_id() or "").strip()
-        if not group_id:
-            return "动作取消：当前不是群聊，无法执行群签到。"
-        _append_qq_action(
-            current_event,
-            PendingQQAction(action_type="group_sign", group_id=group_id),
-        )
-        return "已将当前群签到加入待执行动作；不要声称已经成功，继续生成最终回复。"
-
-
-@dataclass
-class CustomFaceCatalogQueryTool(FunctionTool[AstrAgentContext]):
-    name: str = "custom_face_catalog_query"
-    description: str = "查询当前账号可用的 QQ 自定义表情目录，供后续聊天动作参考。"
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "count": {"type": "integer", "description": "最多返回多少个表情，默认 24。", "minimum": 1, "maximum": 96}
-            },
-        }
-    )
-
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        current_event = _get_current_event(context)
-        client = getattr(current_event, "bot", None)
-        api = getattr(client, "api", None)
-        if api is None:
-            return "系统提示：当前无法访问 QQ 自定义表情目录。"
-        try:
-            count = int(kwargs.get("count", 24) or 24)
-        except (TypeError, ValueError):
-            count = 24
-        count = max(1, min(count, 96))
-        try:
-            payload = await api.call_action("fetch_custom_face", count=count)
-        except Exception as exc:
-            logger.error(f"[CustomFaceCatalogQueryTool] execution failed: {exc}")
-            return f"系统提示：查询自定义表情失败：{exc}"
-
-        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-            faces = payload["data"]
-        else:
-            faces = payload if isinstance(payload, list) else []
-        normalized = [str(item).strip() for item in faces if str(item or "").strip()]
-        if not normalized:
-            return "系统提示：当前没有查询到可用的 QQ 自定义表情。"
-        _record_tool_execution(current_event, self.name)
-        preview = "\n".join(f"- {item}" for item in normalized[:count])
-        return f"可用的 QQ 自定义表情如下：\n{preview}"
 
 
 @dataclass
@@ -2569,71 +2536,6 @@ class CrossSessionReplyLookupTool(FunctionTool[AstrAgentContext]):
 
 
 @dataclass
-class QQCustomFaceSendTool(FunctionTool[AstrAgentContext]):
-    name: str = "qq_custom_face_send_tool"
-    description: str = (
-        "从机器人自定义表情列表中挑选并发送一个自定义表情。"
-        "适合普通聊天中表达调侃、开心、震惊等情绪；如果找不到表情，必须如实说明。"
-    )
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {
-                "keyword": {"type": "string", "description": "想匹配的表情关键词、名字或情绪。", "maxLength": 80},
-                "face_id": {"type": "string", "description": "已知的自定义表情 id，可为空。", "maxLength": 120},
-                "reason": {"type": "string", "description": "为什么想发这个表情，给审计日志使用。", "maxLength": 120},
-            },
-        }
-    )
-
-    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
-        event = _get_current_event(context)
-        api = getattr(getattr(event, "bot", None), "api", None)
-        keyword = str(kwargs.get("keyword", "") or "").strip()
-        face_id = str(kwargs.get("face_id", "") or "").strip()
-        reason = str(kwargs.get("reason", "") or "").strip()
-        face_payload: dict[str, Any] = {"id": face_id} if face_id else {}
-        if api is not None and not face_payload:
-            try:
-                payload = await api.call_action("fetch_custom_face", count=80)
-                entries = _list_entries(payload, "faces", "list", "items")
-                if not entries and isinstance(_payload_data(payload), list):
-                    entries = _list_entries(payload)
-                lowered = keyword.casefold()
-                match = next(
-                    (
-                        item
-                        for item in entries
-                        if not lowered
-                        or lowered
-                        in " ".join(str(item.get(k) or "") for k in ("id", "name", "summary", "key", "emoji_id")).casefold()
-                    ),
-                    None,
-                )
-                if isinstance(match, dict):
-                    face_payload = dict(match)
-            except Exception as exc:
-                logger.debug(f"[QQCustomFaceSendTool] custom face lookup degraded: {exc}")
-        if not face_payload:
-            _record_tool_execution(event, self.name, status="failed")
-            return "自定义表情发送失败：没有匹配到可发送的自定义表情。"
-        group_id = str(event.get_group_id() or "").strip()
-        target_id = str(event.get_sender_id() or "").strip() if not group_id else ""
-        queued = _append_qq_action(
-            event,
-            PendingQQAction(
-                action_type="custom_face_send",
-                target_id=target_id,
-                group_id=group_id,
-                payload={"face": face_payload, "keyword": keyword, "reason": reason},
-            ),
-        )
-        if queued:
-            return "已准备发送自定义表情；如果平台发送失败，会在动作结果里记录失败原因。"
-        return "自定义表情发送已经在本轮排队，无需重复调用。"
-
-
-@dataclass
 class QuoteReplyActionTool(FunctionTool[AstrAgentContext]):
     name: str = "quote_reply_action"
     description: str = (
@@ -2656,10 +2558,16 @@ class QuoteReplyActionTool(FunctionTool[AstrAgentContext]):
         text = str(kwargs.get("text", "") or "").strip()
         if not message_id:
             _record_tool_execution(event, self.name, status="failed")
-            return "引用回复失败：没有可引用的 message_id。"
+            return json.dumps(
+                {"status": "failed", "reason": "message_id_missing", "message": "没有可引用的 message_id。"},
+                ensure_ascii=False,
+            )
         if not text:
             _record_tool_execution(event, self.name, status="failed")
-            return "引用回复失败：text 不能为空。"
+            return json.dumps(
+                {"status": "failed", "reason": "text_missing", "message": "引用回复正文不能为空。"},
+                ensure_ascii=False,
+            )
         queued = _append_qq_action(
             event,
             PendingQQAction(
@@ -2796,20 +2704,38 @@ class TopicThreadLookupTool(FunctionTool[AstrAgentContext]):
 class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
     name: str = "bot_capability_lookup"
     description: str = (
-        "只读查询本轮模型可用的工具能力、工具族和已过滤/已要求的工具。"
-        "用于模型不知道自己能不能查好友、发私聊、引用回复、发自定义表情时自检。"
+        "只读查询本轮已披露和仍可申请的工具能力。当前工具不足时，"
+        "优先把用户的原始需求放入 need，系统会映射并申请一个精确的只读工具；"
+        "也可使用枚举中的 needed_family、needed_tool 或 needed_package。"
+        "撤回、戳一戳、@、引用回复、消息表情回应、看图和发表情包属于首轮常用工具，无需申请。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
+                "need": {
+                    "type": "string",
+                    "description": "用自然语言描述缺少的查证能力，推荐直接复述用户需求。",
+                    "minLength": 2,
+                    "maxLength": 240,
+                },
                 "needed_package": {
                     "type": "string",
                     "description": (
-                        "如果当前工具不够用，可以填写希望系统二次开放的工具包名称；"
-                        "可选：identity、relationship、artifact、memory_governance。"
+                        "需要一组只读能力时使用；能确定单个能力时优先使用 need、needed_family 或 needed_tool。"
                     ),
-                }
+                    "enum": list(MODEL_REQUESTABLE_PACKAGES),
+                },
+                "needed_family": {
+                    "type": "string",
+                    "description": "精确申请一个只读工具族。",
+                    "enum": list(MODEL_REQUESTABLE_FAMILIES),
+                },
+                "needed_tool": {
+                    "type": "string",
+                    "description": "精确申请一个只读工具；只追加这个工具。",
+                    "enum": list(MODEL_REQUESTABLE_TOOL_NAMES),
+                },
             },
         }
     )
@@ -2821,7 +2747,63 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
         available = list(getattr(tools_state, "available_tools", []) or [])
         filtered = list(getattr(tools_state, "filtered_tools", []) or [])
         required = list(getattr(tools_state, "required_tools", []) or [])
-        package = normalize_requested_packages([kwargs.get("needed_package", "")])
+        hidden_tools = list(getattr(event, "_astrmai_disclosure_hidden_tools", []) or [])
+        hidden_names = [
+            str(getattr(tool, "name", "") or "").strip()
+            for tool in hidden_tools
+            if str(getattr(tool, "name", "") or "").strip()
+        ]
+        hidden_requestable = [
+            name for name in hidden_names if is_model_disclosure_requestable(name)
+        ]
+        if not hidden_requestable and hasattr(event, "get_extra"):
+            hidden_requestable = [
+                str(name or "").strip()
+                for name in event.get_extra("astrmai_hidden_requestable_tools", []) or []
+                if is_model_disclosure_requestable(str(name or "").strip())
+            ]
+
+        need = str(kwargs.get("need", "") or "").strip()
+        package_value = str(kwargs.get("needed_package", "") or "").strip()
+        needed_family = str(kwargs.get("needed_family", "") or "").strip()
+        needed_tool = str(kwargs.get("needed_tool", "") or "").strip()
+        package = normalize_requested_packages([package_value])
+        rejected: list[dict[str, str]] = []
+        if package_value and package_value not in MODEL_REQUESTABLE_PACKAGES:
+            package = ()
+            rejected.append({"field": "needed_package", "value": package_value, "reason": "not_requestable"})
+
+        exact_tools: list[str] = []
+        request_source = ""
+        if needed_tool:
+            if needed_tool in hidden_requestable:
+                exact_tools.append(needed_tool)
+                request_source = "needed_tool"
+            else:
+                rejected.append({"field": "needed_tool", "value": needed_tool, "reason": "not_hidden_or_not_readonly"})
+        elif needed_family:
+            family_tool = FAMILY_TO_TOOL.get(needed_family, "")
+            if family_tool in hidden_requestable:
+                exact_tools.append(family_tool)
+                request_source = "needed_family"
+            else:
+                rejected.append({"field": "needed_family", "value": needed_family, "reason": "not_hidden_or_not_readonly"})
+        elif need:
+            resolution = resolve_capability_need(
+                need,
+                available_tool_names=hidden_requestable,
+            )
+            if resolution is not None:
+                exact_tools.append(resolution.tool_name)
+                request_source = "natural_language_need"
+            else:
+                rejected.append({"field": "need", "value": need, "reason": "unresolved"})
+        elif package:
+            request_source = "needed_package"
+
+        if needed_tool or needed_family or need:
+            package = ()
+
         if package and hasattr(event, "set_extra"):
             existing = list(event.get_extra("astrmai_requested_tool_packages", []) or [])
             merged = []
@@ -2830,17 +2812,69 @@ class BotCapabilityLookupTool(FunctionTool[AstrAgentContext]):
                 if text and text not in merged:
                     merged.append(text)
             event.set_extra("astrmai_requested_tool_packages", merged)
+        if exact_tools and hasattr(event, "set_extra"):
+            existing = list(event.get_extra("astrmai_requested_tool_names", []) or [])
+            event.set_extra(
+                "astrmai_requested_tool_names",
+                list(dict.fromkeys([*existing, *exact_tools])),
+            )
+        request_record = {
+            "source": request_source or ("invalid" if rejected else "catalog"),
+            "need": need,
+            "needed_family": needed_family,
+            "needed_tool": needed_tool,
+            "needed_package": package_value,
+            "resolved_tools": list(exact_tools),
+            "resolved_packages": list(package),
+            "rejected": list(rejected),
+        }
+        if hasattr(event, "set_extra"):
+            requests = list(event.get_extra("astrmai_tool_disclosure_requests", []) or [])
+            event.set_extra("astrmai_tool_disclosure_requests", [*requests, request_record][-16:])
+            event.set_extra("astrmai_tool_disclosure_request_source", request_record["source"])
+            event.set_extra("astrmai_tool_disclosure_rejected_requests", list(rejected))
+        if tools_state is not None:
+            tools_state.disclosure_request_source = request_record["source"]
+            tools_state.disclosure_requested_tools = list(exact_tools)
+            tools_state.disclosure_rejected_requests = list(rejected)
         if not available:
             available = sorted(TOOL_CAPABILITIES)
+        available_set = {str(item) for item in available}
+        filtered_set = {str(item) for item in filtered}
+        readonly = sorted(
+            name
+            for name in available_set
+            if TOOL_CAPABILITIES.get(name) and TOOL_CAPABILITIES[name].effect_type == "query"
+        )
+        actions = sorted(
+            name
+            for name in available_set
+            if TOOL_CAPABILITIES.get(name) and TOOL_CAPABILITIES[name].effect_type != "query"
+        )
+        unavailable = sorted(
+            set(MODEL_REQUESTABLE_TOOL_NAMES) - set(hidden_requestable) - filtered_set
+        )
+        hidden_catalog = [
+            f"{name}（{tool_display_name(name)}）"
+            for name in hidden_requestable
+        ]
         lines = [
+            "request_status=" + ("accepted" if package or exact_tools else "invalid" if rejected else "catalog"),
             f"本轮可用工具数量：{len(available)}。",
-            "可用工具：" + ", ".join(sorted(str(item) for item in available)[:40]),
-            "可请求二次开放的只读工具包：" + ", ".join(
-                name for name in ("identity", "relationship", "artifact", "memory_governance") if name in TOOL_PACKAGES
-            ),
+            "只读查询能力：" + (", ".join(readonly[:40]) or "无"),
+            "可执行动作能力：" + (", ".join(actions[:40]) or "无"),
+            "当前可申请的隐藏只读能力：" + (", ".join(hidden_catalog[:40]) or "无"),
+            "当前环境不可用或已过滤能力：" + (", ".join(unavailable[:40]) or "无"),
+            "可请求二次开放的只读工具包：" + ", ".join(MODEL_REQUESTABLE_PACKAGES),
         ]
         if package:
             lines.append("已记录工具包二次开放请求：" + ", ".join(package))
+        if exact_tools:
+            lines.append("已记录精确工具二次开放请求：" + ", ".join(exact_tools))
+        if rejected:
+            lines.append("无效或不可申请的请求：" + json.dumps(rejected, ensure_ascii=False, separators=(",", ":")))
+            lines.append("合法工具族：" + ", ".join(MODEL_REQUESTABLE_FAMILIES))
+            lines.append("合法隐藏工具：" + (", ".join(hidden_requestable) or "无"))
         if filtered:
             lines.append("过滤后工具：" + ", ".join(sorted(str(item) for item in filtered)[:40]))
         if required:
@@ -3473,7 +3507,10 @@ class RegretAndWithdrawTool(FunctionTool[AstrAgentContext]):
         current_event = _get_current_event(context)
         message_id = await _resolve_latest_bot_message_id(current_event)
         if not message_id:
-            return "动作取消：没有找到可撤回的上一条机器人消息。"
+            return json.dumps(
+                {"status": "not_found", "reason": "bot_message_not_found", "message": "没有找到可撤回的上一条机器人消息。"},
+                ensure_ascii=False,
+            )
         pending_actions = _get_pending_actions(current_event)
         if not any(item.get("action") == "withdraw" for item in pending_actions):
             _append_qq_action(
@@ -3626,9 +3663,7 @@ __all__ = [
     "ContactRouteSuggestTool",
     "CrossChatMemoryQueryTool",
     "CrossSessionReplyLookupTool",
-    "CustomFaceCatalogQueryTool",
     "ConstructAtEventTool",
-    "GroupSignTool",
     "LearnedLanguageLookupTool",
     "MemeResonanceTool",
     "MemoryWriteCorrectionTool",
@@ -3639,7 +3674,6 @@ __all__ = [
     "ProactiveLikeTool",
     "ProactiveMemeTool",
     "ProactivePokeTool",
-    "QQCustomFaceSendTool",
     "QQFriendLookupTool",
     "QQForwardMessageLookupTool",
     "QQGroupMemberLookupTool",

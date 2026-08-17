@@ -220,6 +220,11 @@ def test_analyzer_reads_nested_tool_disclosure_and_execution_fields():
                     "correction_packages": ["identity"],
                     "second_pass_resolution": "satisfied",
                     "second_pass_selected_tools": ["qq_friend_lookup"],
+                    "disclosure_request_source": "natural_language_need",
+                    "disclosure_requested_tools": ["qq_friend_lookup"],
+                    "disclosure_rejected_requests": [],
+                    "second_pass_added_tools": ["qq_friend_lookup"],
+                    "second_pass_tool_executed": True,
                 },
                 "tool_ledger_summary": {
                     "tool_disclosure_tier": "task",
@@ -243,6 +248,9 @@ def test_analyzer_reads_nested_tool_disclosure_and_execution_fields():
     assert tools["ledger_summary_present_count"] == 1
     assert tools["field_presence_counts"]["intent_contracts"] == 1
     assert tools["second_pass_resolution_counts"] == {"satisfied": 1}
+    assert tools["request_source_counts"] == {"natural_language_need": 1}
+    assert tools["second_pass_added_tool_count"] == 1
+    assert tools["second_pass_executed_count"] == 1
     assert tools["execution_name_counts"] == {"qq_friend_lookup": 1}
     assert tools["execution_missing_structure"] == {}
     assert "## Tool Disclosure" in render_markdown(report)

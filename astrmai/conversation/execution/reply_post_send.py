@@ -610,3 +610,17 @@ class ReplyPostSendMixin:
                     event.set_extra("astrmai_meme_send_degraded", True)
                 except Exception:
                     pass
+        else:
+            try:
+                event.set_extra(
+                    "astrmai_meme_send_result",
+                    {
+                        "status": "skipped",
+                        "reason": "neutral",
+                        "emotion_tag": str(tag or "neutral"),
+                        "probability": 100 if force_meme_flag else self.meme_probability,
+                        "file": "",
+                    },
+                )
+            except Exception:
+                pass

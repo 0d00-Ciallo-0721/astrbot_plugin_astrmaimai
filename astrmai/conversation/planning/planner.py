@@ -67,8 +67,6 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         "message_reaction_action": "互动反应",
         "message_emoji_like_action": "消息表情回复",
         "proactive_like_action": "表达好感",
-        "custom_face_catalog_query": "查自定义表情",
-        "group_sign_action": "群签到",
         "vision_message_analyze_tool": "按需查看图片内容",
     }
 
@@ -121,6 +119,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         self.tool_execution_history: list[dict] = []
         self.turn_trace_history: list[dict] = []
         self.follow_up_cooldowns: dict[str, float] = {}
+        self._pending_explicit_meme_intents: dict[tuple[str, str], dict] = {}
         self.dialogue_store = getattr(getattr(self.context_engine, "db", None), "dialogue_store", None)
         if self.dialogue_store is None:
             self.dialogue_store = getattr(getattr(self.context_engine, "db_service", None), "dialogue_store", None)
@@ -610,7 +609,9 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         # bot_capability_lookup，但 guidance 从未提示该自检路径
         if "bot_capability_lookup" in tool_names:
             guidance_lines.append(
-                "如果当前工具不足以查证事实，可先调用 bot_capability_lookup(needed_package=...) 申请追加工具包，系统会带新工具重跑本轮再回答。"
+                "如果回答依赖当前不可见的 QQ、关系、历史消息或人格事实，禁止猜测；"
+                "调用 bot_capability_lookup，把用户的原始需求放入 need。系统会精确追加一个只读工具并重跑本轮；"
+                "只有已经知道合法内部标识时才使用 needed_family/needed_tool，需要一组能力时才使用 needed_package。"
             )
         if event is not None and "vision_message_analyze_tool" in tool_names:
             candidates = event.get_extra("astrmai_recent_media_candidates", []) or []
@@ -900,6 +901,14 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             "initial_tools": list(turn_tools.initial_tools or []),
             "family_filtered_tools": list(turn_tools.family_filtered_tools or []),
             "filtered_tools": list(turn_tools.filtered_tools or []),
+            "disclosure_decisions": list(turn_tools.disclosure_decisions or []),
+            "preselected_tools": list(turn_tools.preselected_tools or []),
+            "hidden_requestable_tools": list(turn_tools.hidden_requestable_tools or []),
+            "disclosure_request_source": turn_tools.disclosure_request_source,
+            "disclosure_requested_tools": list(turn_tools.disclosure_requested_tools or []),
+            "disclosure_rejected_requests": list(turn_tools.disclosure_rejected_requests or []),
+            "second_pass_added_tools": list(turn_tools.second_pass_added_tools or []),
+            "second_pass_tool_executed": bool(turn_tools.second_pass_tool_executed),
             "filter_reasons": list(turn_tools.filter_reasons or []),
             "filter_steps": list(turn_tools.filter_steps or []),
         }
@@ -943,6 +952,44 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             f"current_image_owned_by_{owner}",
         )
         return filtered
+
+    @staticmethod
+    def _event_image_refs(candidate) -> list[str]:
+        getter = getattr(candidate, "get_extra", None)
+        if not callable(getter):
+            return []
+        direct_refs = list(
+            getter("direct_image_refs", getter("direct_vision_urls", [])) or []
+        )
+        extracted_refs = list(
+            getter("extracted_image_refs", getter("extracted_image_urls", [])) or []
+        )
+        return list(dict.fromkeys([*direct_refs, *extracted_refs]))
+
+    @classmethod
+    def _latest_reply_vision_urls(cls, event: AstrMessageEvent, focus_context) -> list[str]:
+        if bool(event.get_extra("astrmai_vision_barrier_complete", False)):
+            return []
+
+        turn_context = ensure_turn_context(event)
+        window_events = list(getattr(turn_context.attention, "window_events", []) or [])
+        if not window_events:
+            window_events = list(event.get_extra("astrmai_window_events", []) or [])
+        for candidate in reversed(window_events):
+            refs = cls._event_image_refs(candidate)
+            if not refs:
+                continue
+            if bool(candidate.get_extra("astrmai_vision_barrier_complete", False)):
+                return []
+            if list(candidate.get_extra("astrmai_vision_records", []) or []):
+                return []
+            return [refs[-1]]
+
+        bundle = getattr(focus_context, "vision_bundle", None)
+        image_refs = list(getattr(bundle, "direct_image_urls", []) or []) or list(
+            getattr(bundle, "image_urls", []) or []
+        )
+        return [image_refs[-1]] if image_refs else []
 
     async def _remember_turn_trace(
         self,
@@ -2116,12 +2163,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             prompt_envelope=prompt_envelope,
         )
 
-        direct_vision_urls = list(
-            dict.fromkeys(
-                list(focus_context.vision_bundle.direct_image_urls or [])
-                or list(focus_context.vision_bundle.image_urls or [])
-            )
-        )
+        direct_vision_urls = self._latest_reply_vision_urls(event, focus_context)
         if direct_vision_urls:
             final_prompt += "\n(Director note: the user shared photos with you; please respond with the image content in mind.)"
             logger.info(f"[{chat_id}] Scheduled direct-vision payload with {len(direct_vision_urls)} image(s) into executor.")

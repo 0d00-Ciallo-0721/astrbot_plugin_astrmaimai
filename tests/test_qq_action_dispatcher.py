@@ -65,7 +65,6 @@ class QQActionDispatcherTests(unittest.TestCase):
             [
                 {"action": "poke", "target_id": "123", "group_id": "456"},
                 {"action": "message_emoji_like", "message_id": "789", "payload": {"emoji_id": "66"}},
-                {"action": "group_sign", "group_id": "456"},
             ],
         )
         dispatcher = self.mod.QQActionDispatcher(self.config, _Coordinator())
@@ -78,11 +77,10 @@ class QQActionDispatcherTests(unittest.TestCase):
             [
                 ("send_poke", {"user_id": 123, "group_id": 456}),
                 ("set_msg_emoji_like", {"message_id": 789, "emoji_id": "66", "set": True}),
-                ("set_group_sign", {"group_id": "456"}),
             ],
         )
         statuses = [item["status"] for item in event.get_extra("astrmai_qq_action_results")]
-        self.assertEqual(statuses, ["success", "success", "success", "skipped", "skipped", "skipped"])
+        self.assertEqual(statuses, ["success", "success", "skipped", "skipped"])
 
     def test_stale_turn_never_calls_napcat(self):
         event = _Event()
@@ -115,7 +113,7 @@ class QQActionDispatcherTests(unittest.TestCase):
 
     def test_disabled_dispatcher_does_not_construct_side_effects(self):
         event = _Event()
-        event.set_extra("astrmai_pending_actions", [{"action": "group_sign", "group_id": "456"}])
+        event.set_extra("astrmai_pending_actions", [{"action": "poke", "target_id": "123"}])
         self.config.conversation.qq_deferred_action_commit_enabled = False
         dispatcher = self.mod.QQActionDispatcher(self.config, _Coordinator())
 

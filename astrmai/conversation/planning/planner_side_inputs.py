@@ -18,10 +18,13 @@ from .tool_contracts import (
     AUTONOMOUS_INTERACTION_TOOLS,
     build_explicit_invocation_plans,
     filter_tools_for_context,
+    is_model_disclosure_requestable,
     normalize_tool_schemas,
     publish_invocation_plans,
+    tool_display_name,
 )
 from .tool_disclosure import (
+    DEFAULT_VISIBLE_TOOL_NAMES,
     ToolDisclosurePlanner,
     select_tools_by_names,
 )
@@ -31,6 +34,7 @@ from .entity_domain_resolution import (
     resolve_entity_domain,
 )
 from .tool_intent_resolution import (
+    ToolIntentResolution,
     clarification_resolutions,
     ready_families,
     resolve_explicit_tool_intents,
@@ -41,10 +45,8 @@ from .tools.pfc_tools import (
     ContactRouteSuggestTool,
     CrossChatMemoryQueryTool,
     CrossSessionReplyLookupTool,
-    CustomFaceCatalogQueryTool,
     ConstructAtEventTool,
     GroupActivitySnapshotTool,
-    GroupSignTool,
     LearnedLanguageLookupTool,
     MemeResonanceTool,
     MemoryWriteCorrectionTool,
@@ -55,7 +57,6 @@ from .tools.pfc_tools import (
     ProactiveLikeTool,
     ProactiveMemeTool,
     ProactivePokeTool,
-    QQCustomFaceSendTool,
     QQFriendLookupTool,
     QQForwardMessageLookupTool,
     QQGroupMemberLookupTool,
@@ -84,6 +85,15 @@ except ImportError:  # Compatibility with lightweight host/test tool modules.
 
 
 class PlannerSideInputMixin:
+    PENDING_MEME_INTENT_TTL_SECONDS = 60.0
+    MEME_EMOTION_HINTS = {
+        "happy": ("开心", "高兴", "快乐", "喜悦", "兴奋"),
+        "sad": ("难过", "伤心", "悲伤", "委屈"),
+        "angry": ("生气", "愤怒", "恼火", "暴躁"),
+        "surprised": ("惊讶", "震惊", "吃惊"),
+        "cute": ("可爱", "卖萌", "萌"),
+        "comfort": ("安慰", "鼓励", "加油"),
+    }
     FOLLOW_UP_ALLOWED_INTENTS = {"comfort", "tease", "inquire", "answer"}
     FOLLOW_UP_COOLDOWN_SECONDS = {
         "comfort": 300.0,
@@ -125,14 +135,11 @@ class PlannerSideInputMixin:
         "switch topic",
     }
     QQ_ACTION_INTENT_KEYWORDS = {
-        "poke": ("戳一下", "戳一戳", "戳戳", "poke"),
+        "poke": ("戳一下", "戳我一下", "戳一戳", "戳戳", "poke"),
         "at": ("艾特", "帮我@", "@一下"),
         "qq_reaction": ("消息表情", "表情回应", "加个表情", "给这条消息点赞", "点赞这条消息"),
-        "sign": ("群签到", "群打卡", "签到一下"),
         "withdraw": ("撤回", "删掉上一条", "撤回上一条", "withdraw", "delete last reply", "remove last reply"),
         "meme": ("发个表情包", "发表情包", "来个表情包"),
-        "qq_query": ("查自定义表情", "自定义表情列表", "有哪些自定义表情"),
-        "custom_face": ("发自定义表情", "自定义表情发一个", "来个自定义表情"),
         "quote_reply": ("引用回复", "引用那条", "回这条消息"),
     }
     GENERAL_EXPLICIT_TOOL_KEYWORDS = {
@@ -151,7 +158,6 @@ class PlannerSideInputMixin:
             "照片里", "截图里", "这个表情", "帮我看", "看一下", "表情包什么意思", "图片是什么意思",
         ),
         "cross_reply": ("对方回了吗", "有没有回复", "他回了什么", "跨会话回复"),
-        "custom_face": ("发自定义表情", "自定义表情发一个", "来个自定义表情"),
         "quote_reply": ("引用回复", "回这条", "引用那条"),
         "message_recall": ("上一条消息", "刚才发的", "可撤回", "消息id"),
         "topic_thread": ("刚才说的", "那个", "这件事", "话题线索"),
@@ -183,6 +189,7 @@ class PlannerSideInputMixin:
     }
     POKE_INTENT_KEYWORDS = {
         "戳一下",
+        "戳我一下",
         "戳一戳",
         "戳戳",
         "poke",
@@ -194,9 +201,10 @@ class PlannerSideInputMixin:
     }
     CHAT_TOOL_NAMES = {
         "proactive_meme",
-        "proactive_like_action",
-        "message_reaction_action",
         "message_emoji_like_action",
+        "vision_message_analyze_tool",
+        "quote_reply_action",
+        "regret_and_withdraw_action",
     }
     GUARDED_CHAT_TOOL_NAMES = {
         "proactive_poke",
@@ -206,22 +214,15 @@ class PlannerSideInputMixin:
         "wait_and_listen",
         "omni_perception_query",
         "self_lore_query",
-        "custom_face_catalog_query",
-        "qq_custom_face_send_tool",
-        "group_sign_action",
-        "quote_reply_action",
         "topic_hijack_action",
         "space_transition_action",
-        "regret_and_withdraw_action",
         "meme_resonance_action",
     }
     QQ_NATIVE_TOOL_NAMES = {
         "proactive_poke",
+        "construct_at_event",
         "message_emoji_like_action",
-        "group_sign_action",
         "regret_and_withdraw_action",
-        "custom_face_catalog_query",
-        "qq_custom_face_send_tool",
         "quote_reply_action",
     }
     TOOL_NAME_ALIASES = {
@@ -237,7 +238,6 @@ class PlannerSideInputMixin:
         "QQMessageArtifactLookupTool": "qq_message_artifact_lookup",
         "VisionMessageAnalyzeTool": "vision_message_analyze_tool",
         "CrossSessionReplyLookupTool": "cross_session_reply_lookup",
-        "QQCustomFaceSendTool": "qq_custom_face_send_tool",
         "QuoteReplyActionTool": "quote_reply_action",
         "QQMessageRecallLookupTool": "qq_message_recall_lookup",
         "TopicThreadLookupTool": "topic_thread_lookup",
@@ -258,8 +258,6 @@ class PlannerSideInputMixin:
         "MessageReactionTool": "message_reaction_action",
         "MessageEmojiLikeTool": "message_emoji_like_action",
         "ProactiveLikeTool": "proactive_like_action",
-        "CustomFaceCatalogQueryTool": "custom_face_catalog_query",
-        "GroupSignTool": "group_sign_action",
         "LearnedLanguageLookupTool": "learned_language_lookup",
     }
     TOOL_FAMILIES = {
@@ -276,7 +274,6 @@ class PlannerSideInputMixin:
         "qq_message_artifact_lookup": {"message_artifact", "query"},
         "vision_message_analyze_tool": {"vision_message", "message_artifact", "query"},
         "cross_session_reply_lookup": {"cross_reply", "recent_contact", "query"},
-        "qq_custom_face_send_tool": {"custom_face", "meme"},
         "quote_reply_action": {"quote_reply"},
         "qq_message_recall_lookup": {"message_recall", "message_artifact", "query"},
         "topic_thread_lookup": {"topic_thread", "query"},
@@ -297,8 +294,6 @@ class PlannerSideInputMixin:
         "message_reaction_action": {"reaction"},
         "message_emoji_like_action": {"qq_reaction"},
         "proactive_like_action": {"reaction", "like"},
-        "custom_face_catalog_query": {"qq_query"},
-        "group_sign_action": {"sign"},
     }
     MODE_INSTRUCTION_MAX_CHARS = 240
     PRIVATE_JUMP_CONTEXT_MAX_CHARS = 360
@@ -405,7 +400,7 @@ class PlannerSideInputMixin:
         }
 
     def _has_tool_intent(self, event: AstrMessageEvent) -> bool:
-        msg = str(getattr(event, "message_str", "") or "").strip()
+        msg = self._tool_intent_text(event)
         if not msg:
             return False
         lowered = msg.lower()
@@ -414,7 +409,7 @@ class PlannerSideInputMixin:
         return bool(self._explicit_tool_families(event))
 
     def _explicit_tool_families(self, event: AstrMessageEvent) -> set[str]:
-        message = str(getattr(event, "message_str", "") or "").strip()
+        message = self._tool_intent_text(event)
         if not message:
             return set()
         lowered = message.lower()
@@ -433,6 +428,104 @@ class PlannerSideInputMixin:
         if self._looks_like_cross_session_relay_request(message):
             families.add("private")
         return families
+
+    @staticmethod
+    def _raw_tool_intent_text(event: AstrMessageEvent) -> str:
+        current = str(getattr(event, "message_str", "") or "").strip()
+        if not hasattr(event, "get_extra"):
+            return current
+        merged = str(event.get_extra("astrmai_private_batch_text", "") or "").strip()
+        if not merged:
+            merged = str(event.get_extra("astrmai_rich_text", "") or "").strip()
+        if merged and current and current not in merged:
+            return f"{merged}\n{current}".strip()
+        return merged or current
+
+    @classmethod
+    def _tool_intent_text(cls, event: AstrMessageEvent) -> str:
+        if hasattr(event, "get_extra"):
+            prepared = str(event.get_extra("astrmai_tool_intent_text", "") or "").strip()
+            if prepared:
+                return prepared
+        return cls._raw_tool_intent_text(event)
+
+    @classmethod
+    def _meme_emotion_from_text(cls, message: str) -> str:
+        text = str(message or "").strip().lower()
+        for tag, hints in cls.MEME_EMOTION_HINTS.items():
+            if tag in text or any(hint in text for hint in hints):
+                return tag
+        return ""
+
+    @classmethod
+    def _extract_meme_topic(cls, message: str) -> str:
+        topic = " ".join(str(message or "").strip().split())
+        topic = re.sub(r"^(?:请|麻烦)?(?:你)?(?:给我)?(?:发|来|整)(?:一个|个|一张|张)?", "", topic)
+        topic = re.sub(r"(?:给我|给一下|一下|一个|一张|张)$", "", topic)
+        topic = re.sub(r"(?:表情包|表情图|梗图|能表示|用来表示|表达|的图|图片)", " ", topic)
+        topic = topic.replace("给我", " ")
+        for hints in cls.MEME_EMOTION_HINTS.values():
+            for hint in hints:
+                topic = topic.replace(hint, " ")
+        return " ".join(topic.strip(" ，,。！？!~～的").split())[:80]
+
+    @classmethod
+    def _looks_like_meme_supplement(cls, message: str) -> bool:
+        text = str(message or "").strip(" ，,。！？!~～")
+        if not text or len(text) > 24 or cls._looks_like_meme_request(text):
+            return False
+        return bool(cls._meme_emotion_from_text(text)) and bool(
+            re.fullmatch(r"[\u4e00-\u9fffA-Za-z_-]{1,12}(?:一点|点)?(?:的)?", text)
+        )
+
+    def _prepare_pending_meme_intent(
+        self,
+        chat_id: str,
+        user_id,
+        event: AstrMessageEvent,
+    ) -> str:
+        text = self._raw_tool_intent_text(event)
+        now = time.monotonic()
+        store = getattr(self, "_pending_explicit_meme_intents", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self, "_pending_explicit_meme_intents", store)
+        for stale_key, payload in list(store.items()):
+            if float(payload.get("expires_at", 0.0) or 0.0) <= now:
+                store.pop(stale_key, None)
+
+        key = (str(chat_id or ""), str(user_id or ""))
+        pending = store.get(key)
+        if pending and self._looks_like_meme_supplement(text):
+            text = f"{pending.get('text', '')}\n{text}".strip()
+            store.pop(key, None)
+            event.set_extra("astrmai_pending_meme_intent_inherited", True)
+            event.set_extra("astrmai_pending_meme_intent_consumed", True)
+
+        if self._looks_like_meme_request(text):
+            intent = {
+                "action": "meme",
+                "topic": self._extract_meme_topic(text),
+                "emotion": self._meme_emotion_from_text(text),
+                "text": text,
+                "chat_id": key[0],
+                "sender_id": key[1],
+                "created_at": now,
+                "expires_at": now + self.PENDING_MEME_INTENT_TTL_SECONDS,
+            }
+            store[key] = intent
+            event.set_extra("astrmai_pending_meme_intent", dict(intent))
+            event.set_extra(
+                "astrmai_meme_intent",
+                {name: intent[name] for name in ("action", "topic", "emotion")},
+            )
+        return text
+
+    def _consume_pending_meme_intent(self, chat_id: str, user_id, event: AstrMessageEvent) -> None:
+        store = getattr(self, "_pending_explicit_meme_intents", None)
+        if isinstance(store, dict):
+            store.pop((str(chat_id or ""), str(user_id or "")), None)
+        event.set_extra("astrmai_pending_meme_intent_consumed", True)
 
     @staticmethod
     def _member_action_families(event: AstrMessageEvent, message: str) -> set[str]:
@@ -481,7 +574,7 @@ class PlannerSideInputMixin:
         return any(re.search(pattern, text) for pattern in patterns)
 
     def _explicit_qq_action_families(self, event: AstrMessageEvent) -> set[str]:
-        message = str(getattr(event, "message_str", "") or "").strip()
+        message = self._tool_intent_text(event)
         if not message:
             return set()
         lowered = message.lower()
@@ -490,7 +583,34 @@ class PlannerSideInputMixin:
             for family, keywords in self.QQ_ACTION_INTENT_KEYWORDS.items()
             if any(keyword in message or keyword in lowered for keyword in keywords)
         }
+        if self._looks_like_meme_request(message):
+            families.add("meme")
         return families
+
+    @staticmethod
+    def _looks_like_meme_request(message: str) -> bool:
+        text = " ".join(str(message or "").strip().split())
+        if not text:
+            return False
+        action_requested = any(
+            token in text
+            for token in (
+                "发",
+                "来一个",
+                "来个",
+                "给我",
+                "整一个",
+                "整张",
+                "想要",
+                "要一个",
+                "要张",
+            )
+        )
+        if not action_requested:
+            return False
+        if any(token in text for token in ("表情包", "表情图", "梗图")):
+            return True
+        return bool(re.search(r"(?:能|可以|用来)?(?:表示|表达).{1,24}(?:的)?(?:图|图片)", text))
 
     def _conversation_flag(self, name: str, default: bool) -> bool:
         config = getattr(self.gateway, "config", None)
@@ -555,7 +675,7 @@ class PlannerSideInputMixin:
             return [f"{key}: {item}" for key, item in value.items()]
         return []
 
-    def _build_full_pfc_tools(self, chat_id: str, user_id, sender_name: str):
+    def _build_full_pfc_tools(self, chat_id: str, user_id, sender_name: str, event: AstrMessageEvent | None = None):
         target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
         memory_tool_service = getattr(self.memory_engine, "tool_service", None)
         tools = [
@@ -582,7 +702,6 @@ class PlannerSideInputMixin:
                 db_service=self.context_engine.db,
                 history_service=getattr(self, "conversation_history_service", None),
             ),
-            QQCustomFaceSendTool(),
             QuoteReplyActionTool(),
             QQMessageRecallLookupTool(),
             TopicThreadLookupTool(history_service=getattr(self, "conversation_history_service", None)),
@@ -623,18 +742,25 @@ class PlannerSideInputMixin:
             MessageReactionTool(),
             MessageEmojiLikeTool(),
             ProactiveLikeTool(db_service=self.context_engine.db),
-            CustomFaceCatalogQueryTool(),
-            GroupSignTool(),
         ]
-        if not self._conversation_flag("qq_native_tools_enabled", True) or not self._conversation_flag(
-            "qq_deferred_action_commit_enabled",
-            True,
-        ):
+        if not self._qq_native_tools_available(event):
             tools = [tool for tool in tools if self._canonical_tool_name(tool) not in self.QQ_NATIVE_TOOL_NAMES]
         return tools
 
     def _build_chat_tools(self, event: AstrMessageEvent):
-        tools = []
+        tools = [
+            VisionMessageAnalyzeTool(
+                db_service=self.context_engine.db,
+                visual_cortex=getattr(self, "visual_cortex", None),
+                image_resolver=getattr(self, "image_resolver", None),
+            ),
+            QuoteReplyActionTool(),
+            RegretAndWithdrawTool(),
+            ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
+            MessageEmojiLikeTool(),
+            ProactivePokeTool(db_service=self.context_engine.db),
+            ConstructAtEventTool(db_service=self.context_engine.db),
+        ]
         if self._conversation_flag("autonomous_chat_tools_enabled", True):
             target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""
             memory_tool_service = getattr(self.memory_engine, "tool_service", None)
@@ -650,16 +776,10 @@ class PlannerSideInputMixin:
                     memory_engine=self.memory_engine,
                     chat_id=str(getattr(event, "unified_msg_origin", "") or ""),
                 ),
-                VisionMessageAnalyzeTool(
-                    db_service=self.context_engine.db,
-                    visual_cortex=getattr(self, "visual_cortex", None),
-                    image_resolver=getattr(self, "image_resolver", None),
-                ),
                 CrossSessionReplyLookupTool(
                     db_service=self.context_engine.db,
                     history_service=getattr(self, "conversation_history_service", None),
                 ),
-                QQCustomFaceSendTool(),
                 QQMessageRecallLookupTool(),
                 TopicThreadLookupTool(history_service=getattr(self, "conversation_history_service", None)),
                 BotCapabilityLookupTool(),
@@ -677,33 +797,29 @@ class PlannerSideInputMixin:
                     memory_tool_service=memory_tool_service,
                     persona_id=target_persona_id,
                 ),
-                ProactiveMemeTool(emotion_mapping=self._emotion_mapping_for_meme_tool()),
                 MessageReactionTool(),
-                MessageEmojiLikeTool(),
                 ProactiveLikeTool(db_service=self.context_engine.db),
-                ProactivePokeTool(db_service=self.context_engine.db),
-                ConstructAtEventTool(db_service=self.context_engine.db),
                 SpaceTransitionTool(
                     db_service=self.context_engine.db,
                     handoff_store=getattr(self, "cross_session_handoff_store", None),
                     runtime_coordinator=getattr(self, "runtime_coordinator", None),
                 ),
+                *tools,
             ]
-        elif self._has_guarded_chat_intent(event) or (
-            str(event.get_extra("astrmai_interaction_kind", "") or "").strip().lower() == "peer_poke"
-        ):
-            tools.extend(
-                [
-                    ProactivePokeTool(db_service=self.context_engine.db),
-                    ConstructAtEventTool(db_service=self.context_engine.db),
-                ]
-            )
+        if not self._qq_native_tools_available(event):
+            tools = [tool for tool in tools if self._canonical_tool_name(tool) not in self.QQ_NATIVE_TOOL_NAMES]
+        return tools
+
+    def _qq_native_tools_available(self, event: AstrMessageEvent | None) -> bool:
         if not self._conversation_flag("qq_native_tools_enabled", True) or not self._conversation_flag(
             "qq_deferred_action_commit_enabled",
             True,
         ):
-            tools = [tool for tool in tools if self._canonical_tool_name(tool) not in self.QQ_NATIVE_TOOL_NAMES]
-        return tools
+            return False
+        if event is None or not hasattr(event, "bot"):
+            return True
+        api = getattr(getattr(event, "bot", None), "api", None)
+        return callable(getattr(api, "call_action", None))
 
     @classmethod
     def _canonical_tool_name(cls, tool: object) -> str:
@@ -870,11 +986,13 @@ class PlannerSideInputMixin:
         else:
             self._set_disable_rag_injection(ctx, False)
 
+        tool_intent_text = self._prepare_pending_meme_intent(chat_id, user_id, event)
+        event.set_extra("astrmai_tool_intent_text", tool_intent_text)
         explicit_qq_families = self._explicit_qq_action_families(event)
         explicit_tool_families = self._explicit_tool_families(event)
         persona_catalog_text = self._persona_entity_catalog_text()
         entity_domain, _, _, entity_reason = resolve_entity_domain(
-            str(getattr(event, "message_str", "") or ""),
+            tool_intent_text,
             explicit_families=explicit_tool_families,
             persona_text=persona_catalog_text,
         )
@@ -916,6 +1034,14 @@ class PlannerSideInputMixin:
         turn_tools.disclosure_reasons = []
         turn_tools.disclosure_second_pass_packages = []
         turn_tools.disclosure_expanded_packages = []
+        turn_tools.disclosure_decisions = []
+        turn_tools.preselected_tools = []
+        turn_tools.hidden_requestable_tools = []
+        turn_tools.disclosure_request_source = ""
+        turn_tools.disclosure_requested_tools = []
+        turn_tools.disclosure_rejected_requests = []
+        turn_tools.second_pass_added_tools = []
+        turn_tools.second_pass_tool_executed = False
         turn_tools.intent_contracts = []
         turn_tools.contract_outcomes = []
         turn_tools.contract_unsatisfied = []
@@ -1013,6 +1139,7 @@ class PlannerSideInputMixin:
                 requested_tier = "chat"
 
         progressive_enabled = self._conversation_flag("tool_progressive_disclosure_enabled", True)
+        disclosure_plan = None
         if requested_tier == "none":
             self._set_tool_tier(event, "none")
             tools = []
@@ -1026,7 +1153,7 @@ class PlannerSideInputMixin:
             )
         elif progressive_enabled:
             self._set_tool_tier(event, "full" if requested_tier == "full" or explicit_tool_intent else "chat")
-            candidate_tools = self._build_full_pfc_tools(chat_id, user_id, sender_name)
+            candidate_tools = self._build_full_pfc_tools(chat_id, user_id, sender_name, event)
             candidate_tools = filter_tools_for_context(
                 candidate_tools,
                 is_group=bool(event.get_group_id()),
@@ -1037,6 +1164,7 @@ class PlannerSideInputMixin:
                     tool
                     for tool in candidate_tools
                     if self._canonical_tool_name(tool) not in AUTONOMOUS_INTERACTION_TOOLS
+                    or self._canonical_tool_name(tool) in DEFAULT_VISIBLE_TOOL_NAMES
                 ]
             has_image = bool(
                 event.get_extra("direct_image_refs", event.get_extra("direct_vision_urls", []))
@@ -1050,7 +1178,7 @@ class PlannerSideInputMixin:
             has_reply = self._event_has_component_hint(event, ("reply",))
             requested_packages = self._event_string_list(event, "astrmai_requested_tool_packages")
             disclosure_plan = ToolDisclosurePlanner().plan(
-                message=str(getattr(event, "message_str", "") or ""),
+                message=tool_intent_text,
                 requested_tier=requested_tier,
                 explicit_tool_intent=explicit_tool_intent,
                 explicit_tool_families=explicit_tool_families,
@@ -1074,6 +1202,12 @@ class PlannerSideInputMixin:
                 if self._canonical_tool_name(tool) not in selected_tool_names
             ]
             setattr(event, "_astrmai_disclosure_hidden_tools", hidden_tools)
+            hidden_requestable_tools = [
+                self._canonical_tool_name(tool)
+                for tool in hidden_tools
+                if is_model_disclosure_requestable(self._canonical_tool_name(tool))
+            ]
+            event.set_extra("astrmai_hidden_requestable_tools", hidden_requestable_tools)
             second_pass_packages = (
                 list(disclosure_plan.second_pass_packages)
                 if self._conversation_flag("tool_disclosure_allow_second_pass", True)
@@ -1085,6 +1219,9 @@ class PlannerSideInputMixin:
             turn_tools.disclosure_packages = list(disclosure_plan.packages)
             turn_tools.disclosure_reasons = list(disclosure_plan.package_reasons)
             turn_tools.disclosure_second_pass_packages = list(second_pass_packages)
+            turn_tools.disclosure_decisions = [asdict(item) for item in disclosure_plan.decisions]
+            turn_tools.preselected_tools = list(disclosure_plan.preselected_tool_names)
+            turn_tools.hidden_requestable_tools = list(hidden_requestable_tools)
             disclosure_families: set[str] = set()
             for tool_name in disclosure_plan.tool_names:
                 disclosure_families.update(self.TOOL_FAMILIES.get(tool_name, set()))
@@ -1114,7 +1251,7 @@ class PlannerSideInputMixin:
             )
         elif requested_tier == "full" or explicit_tool_intent:
             self._set_tool_tier(event, "full")
-            tools = self._build_full_pfc_tools(chat_id, user_id, sender_name)
+            tools = self._build_full_pfc_tools(chat_id, user_id, sender_name, event)
             setattr(event, "_astrmai_disclosure_hidden_tools", [])
         else:
             self._set_tool_tier(event, "chat")
@@ -1137,6 +1274,7 @@ class PlannerSideInputMixin:
                 tool
                 for tool in tools
                 if self._canonical_tool_name(tool) not in AUTONOMOUS_INTERACTION_TOOLS
+                or self._canonical_tool_name(tool) in DEFAULT_VISIBLE_TOOL_NAMES
             ]
 
         built_tool_names = [
@@ -1149,7 +1287,16 @@ class PlannerSideInputMixin:
 
         if tools:
             before_family_names = list(built_tool_names)
+            tools_before_family = list(tools)
             tools = self._filter_tools_by_families(tools, allowed_families if allowed_families else intent_families)
+            filtered_names = {self._canonical_tool_name(tool) for tool in tools or []}
+            default_names = set(DEFAULT_VISIBLE_TOOL_NAMES)
+            if default_names - filtered_names:
+                tools = [
+                    tool
+                    for tool in tools_before_family
+                    if self._canonical_tool_name(tool) in filtered_names | default_names
+                ]
             after_family_names = [
                 self._canonical_tool_name(tool)
                 for tool in tools or []
@@ -1180,6 +1327,22 @@ class PlannerSideInputMixin:
             cooldown_tags=event.get_extra("astrmai_agency_cooldown_tags", []) if hasattr(event, "get_extra") else [],
             trace=turn_tools,
         )
+        modifier_names = {self._canonical_tool_name(tool) for tool in tools or []}
+        default_names = set(DEFAULT_VISIBLE_TOOL_NAMES)
+        if default_names - modifier_names:
+            before_names = [self._canonical_tool_name(tool) for tool in tools or []]
+            tools = [
+                tool
+                for tool in tools_before_modifier
+                if self._canonical_tool_name(tool) in modifier_names | default_names
+            ]
+            turn_tools.record_step(
+                "planner.default_actions_restore",
+                before_names,
+                [self._canonical_tool_name(tool) for tool in tools],
+                "default_visible_tools_bypass_action_modifier",
+                category="tool_disclosure",
+            )
         incompatible_domain_tools: set[str] = set()
         if entity_domain == EntityDomain.PLATFORM_FRIEND:
             incompatible_domain_tools.add("self_lore_query")
@@ -1242,15 +1405,41 @@ class PlannerSideInputMixin:
             if self._canonical_tool_name(tool)
         ]
         reliable_explicit_enabled = self._conversation_flag("explicit_tool_execution_enabled", True)
-        intent_resolutions = (
+        contract_families = set(explicit_tool_families)
+        if disclosure_plan is not None:
+            contract_families.update(disclosure_plan.required_families)
+        intent_resolutions = list(
             resolve_explicit_tool_intents(
-                explicit_tool_families,
-                message=str(getattr(event, "message_str", "") or ""),
+                contract_families,
+                message=tool_intent_text,
                 available_tool_names=turn_tools.filtered_tools,
             )
             if reliable_explicit_enabled
             else []
         )
+        if reliable_explicit_enabled and disclosure_plan is not None:
+            visible_names = set(turn_tools.filtered_tools)
+            existing_families = {item.family for item in intent_resolutions}
+            for decision in disclosure_plan.decisions:
+                if (
+                    decision.source != "explicit_user_intent"
+                    or decision.family in existing_families
+                    or decision.tool_name in visible_names
+                ):
+                    continue
+                intent_resolutions.append(
+                    ToolIntentResolution(
+                        family=decision.family,
+                        tool_name=decision.tool_name,
+                        required_state="clarify_needed",
+                        missing_slots=("tool_unavailable",),
+                        reason="tool_unavailable_in_current_context",
+                        clarification_prompt=(
+                            f"当前会话或平台不支持{tool_display_name(decision.tool_name)}，"
+                            "所以这次不能可靠执行。"
+                        ),
+                    )
+                )
         clarification_items = clarification_resolutions(intent_resolutions)
         if clarification_items:
             prompt = "；".join(
@@ -1266,7 +1455,7 @@ class PlannerSideInputMixin:
             event.set_extra("astrmai_tool_clarification_missing_slots", missing_slots)
             turn_tools.record_step(
                 "planner.tool_slot_clarification",
-                list(explicit_tool_families),
+                list(contract_families),
                 sorted(ready_families(intent_resolutions)),
                 "missing_slots(" + ",".join(missing_slots) + ")",
                 category="tool_slots",
@@ -1279,7 +1468,7 @@ class PlannerSideInputMixin:
         intent_contracts = (
             build_tool_intent_contracts(
                 executable_families,
-                message=str(getattr(event, "message_str", "") or ""),
+                message=tool_intent_text,
                 available_tool_names=turn_tools.filtered_tools,
                 persona_text=persona_catalog_text,
             )
@@ -1309,6 +1498,11 @@ class PlannerSideInputMixin:
                 emotion_mapping=self._emotion_mapping_for_meme_tool(),
             )
             event.set_extra("astrmai_prepared_required_tools", prepared_tools)
+            if "proactive_meme" in turn_tools.required_tools and any(
+                isinstance(item, dict) and item.get("action") == "meme"
+                for item in event.get_extra("astrmai_pending_actions", []) or []
+            ):
+                self._consume_pending_meme_intent(chat_id, user_id, event)
         elif clarification_items:
             event.set_extra("astrmai_prepared_required_tools", [])
             turn_tools.invocation_mode = "clarify"

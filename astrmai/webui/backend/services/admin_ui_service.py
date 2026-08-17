@@ -611,6 +611,11 @@ class AdminUiService:
 
     async def tools_status(self) -> dict[str, Any]:
         from ....conversation.planning.planner_side_inputs import PlannerSideInputMixin
+        from ....conversation.planning.tool_contracts import (
+            TOOL_CAPABILITIES,
+            is_model_disclosure_requestable,
+        )
+        from ....conversation.planning.tool_disclosure import DEFAULT_VISIBLE_TOOL_NAMES
 
         planner = self.plugin_api.get_planner()
         chat_tier = set(getattr(planner, "CHAT_TOOL_NAMES", set()) or PlannerSideInputMixin.CHAT_TOOL_NAMES)
@@ -619,6 +624,13 @@ class AdminUiService:
         )
         full_only = set(getattr(planner, "FULL_ONLY_TOOL_NAMES", set()) or PlannerSideInputMixin.FULL_ONLY_TOOL_NAMES)
         families = getattr(planner, "TOOL_FAMILIES", None) or PlannerSideInputMixin.TOOL_FAMILIES
+        all_tools = set(TOOL_CAPABILITIES)
+        default_tier = all_tools & set(DEFAULT_VISIBLE_TOOL_NAMES)
+        on_demand_tier = all_tools - default_tier
+        model_requestable = {
+            name for name in on_demand_tier if is_model_disclosure_requestable(name)
+        }
+        explicit_only = on_demand_tier - model_requestable
         return {
             "status": "ok",
             "data": {
@@ -626,29 +638,46 @@ class AdminUiService:
                 "guarded_chat_tier": sorted(guarded_chat_tier),
                 "full_only": sorted(full_only),
                 "families": {key: sorted(value) for key, value in families.items()},
-                "tool_count": len(chat_tier | guarded_chat_tier | full_only),
+                "default_tier": sorted(default_tier),
+                "on_demand_tier": sorted(on_demand_tier),
+                "model_requestable": sorted(model_requestable),
+                "explicit_only": sorted(explicit_only),
+                "tool_count": len(all_tools),
             },
             "runtime_bound": planner is not None,
         }
 
     async def tools_catalog(self) -> dict[str, Any]:
+        from ....conversation.planning.tool_contracts import TOOL_CAPABILITIES, tool_display_name
+
         status = await self.tools_status()
         data = status.get("data", {})
         tier_by_tool: dict[str, str] = {}
-        for tier, key in (("chat", "chat_tier"), ("guarded_chat", "guarded_chat_tier"), ("full_only", "full_only")):
+        for tier, key in (("default", "default_tier"), ("on_demand", "on_demand_tier")):
             for name in list(data.get(key, []) or []):
                 tier_by_tool[str(name)] = tier
-        families_by_tool: dict[str, list[str]] = {}
-        for family, names in (data.get("families", {}) or {}).items():
-            for name in list(names or []):
-                families_by_tool.setdefault(str(name), []).append(str(family))
+        families_by_tool = {
+            str(name): [str(family) for family in list(families or [])]
+            for name, families in (data.get("families", {}) or {}).items()
+        }
+        model_requestable = set(data.get("model_requestable", []) or [])
         items = [
             {
                 "name": name,
+                "display_name": tool_display_name(name),
                 "tier": tier_by_tool.get(name, "unknown"),
                 "families": sorted(families_by_tool.get(name, [])),
+                "effect_type": TOOL_CAPABILITIES[name].effect_type,
+                "contexts": list(TOOL_CAPABILITIES[name].contexts),
+                "request_policy": (
+                    "default"
+                    if tier_by_tool.get(name) == "default"
+                    else "model_lookup"
+                    if name in model_requestable
+                    else "explicit_only"
+                ),
             }
-            for name in sorted(tier_by_tool)
+            for name in sorted(TOOL_CAPABILITIES)
         ]
         return {
             "status": "ok",

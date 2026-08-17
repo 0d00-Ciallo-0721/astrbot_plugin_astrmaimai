@@ -179,6 +179,7 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     tool_tier_counts: Counter[str] = Counter()
     tool_package_counts: Counter[str] = Counter()
     tool_resolution_counts: Counter[str] = Counter()
+    tool_request_source_counts: Counter[str] = Counter()
     tool_execution_name_counts: Counter[str] = Counter()
     tool_execution_status_counts: Counter[str] = Counter()
     tool_execution_family_counts: Counter[str] = Counter()
@@ -188,6 +189,9 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     tool_contract_count = 0
     tool_contract_unsatisfied_count = 0
     tool_correction_pass_count = 0
+    tool_second_pass_added_count = 0
+    tool_second_pass_executed_count = 0
+    tool_disclosure_rejected_count = 0
     missing = Counter()
     vision_trace_count = 0
     vision_status_counts: Counter[str] = Counter()
@@ -351,6 +355,12 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "disclosure_packages",
                 "disclosure_second_pass_packages",
                 "disclosure_expanded_packages",
+                "disclosure_decisions",
+                "preselected_tools",
+                "hidden_requestable_tools",
+                "disclosure_request_source",
+                "disclosure_requested_tools",
+                "disclosure_rejected_requests",
                 "explicit_tool_intent",
                 "intent_contracts",
                 "contract_outcomes",
@@ -359,6 +369,8 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 "correction_packages",
                 "second_pass_resolution",
                 "second_pass_selected_tools",
+                "second_pass_added_tools",
+                "second_pass_tool_executed",
             ):
                 if field in tools:
                     tool_field_presence_counts[field] += 1
@@ -372,6 +384,13 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             resolution = str(tools.get("second_pass_resolution") or "").strip()
             if resolution:
                 tool_resolution_counts[resolution] += 1
+            request_source = str(tools.get("disclosure_request_source") or "").strip()
+            if request_source:
+                tool_request_source_counts[request_source] += 1
+            tool_second_pass_added_count += len(list(tools.get("second_pass_added_tools") or []))
+            tool_disclosure_rejected_count += len(list(tools.get("disclosure_rejected_requests") or []))
+            if bool(tools.get("second_pass_tool_executed")):
+                tool_second_pass_executed_count += 1
             tool_contract_count += len(list(tools.get("intent_contracts") or []))
             tool_contract_unsatisfied_count += len(list(tools.get("contract_unsatisfied") or []))
             if bool(tools.get("correction_pass_used")):
@@ -515,6 +534,10 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "tier_counts": dict(tool_tier_counts.most_common()),
             "package_counts": dict(tool_package_counts.most_common()),
             "second_pass_resolution_counts": dict(tool_resolution_counts.most_common()),
+            "request_source_counts": dict(tool_request_source_counts.most_common()),
+            "second_pass_added_tool_count": tool_second_pass_added_count,
+            "second_pass_executed_count": tool_second_pass_executed_count,
+            "disclosure_rejected_count": tool_disclosure_rejected_count,
             "contract_count": tool_contract_count,
             "contract_unsatisfied_count": tool_contract_unsatisfied_count,
             "correction_pass_count": tool_correction_pass_count,
@@ -594,8 +617,13 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append(f"- Tool ledger summary present: {int(tools.get('ledger_summary_present_count', 0) or 0)}")
     lines.append(f"- Contracts/unsatisfied: {int(tools.get('contract_count', 0) or 0)} / {int(tools.get('contract_unsatisfied_count', 0) or 0)}")
     lines.append(f"- Correction passes: {int(tools.get('correction_pass_count', 0) or 0)}")
+    lines.append(f"- Second-pass tools added: {int(tools.get('second_pass_added_tool_count', 0) or 0)}")
+    lines.append(f"- Second-pass tools executed: {int(tools.get('second_pass_executed_count', 0) or 0)}")
+    lines.append(f"- Rejected disclosure requests: {int(tools.get('disclosure_rejected_count', 0) or 0)}")
     for key, value in _safe_dict(tools.get("second_pass_resolution_counts")).items():
         lines.append(f"- `resolution:{key}`: {value}")
+    for key, value in _safe_dict(tools.get("request_source_counts")).items():
+        lines.append(f"- `request_source:{key}`: {value}")
     for key, value in _safe_dict(tools.get("execution_status_counts")).items():
         lines.append(f"- `execution:{key}`: {value}")
     for key, value in _safe_dict(tools.get("execution_missing_structure")).items():

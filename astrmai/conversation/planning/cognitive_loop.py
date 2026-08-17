@@ -99,7 +99,7 @@ class CognitiveLoop:
         "Valid memory_policy: none|light|deep. "
         "Valid social_intent: answer|comfort|tease|pushback|boundary|observe|join|inquire|recall|redirect. "
         "Valid action_tier: none|chat|full|sys3. "
-        "Valid allowed_action_families values: wait|query|qq_query|at|poke|meme|resonance|topic|private|withdraw|reaction|qq_reaction|like|sign. "
+        "Valid allowed_action_families values: wait|query|at|poke|meme|resonance|topic|private|withdraw|reaction|qq_reaction|like. "
         "When a Member action candidate is supplied, classify its actual purpose as exactly one of "
         "mention_member|lookup_member|discuss_member|unclear. Confirm intent only: copy the supplied target text, "
         "never invent a QQ number or group id. Use mention_member only when the user truly asks the bot to call/@ that person. "

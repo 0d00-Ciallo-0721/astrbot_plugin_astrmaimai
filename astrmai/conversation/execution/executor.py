@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import time
+from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Optional
 
@@ -48,10 +49,15 @@ from ..vision_state import (
     vision_analysis_observation_facts,
     vision_observation_facts,
 )
-from ..planning.tool_contracts import record_tool_lifecycle
+from ..planning.tool_contracts import (
+    TOOL_CAPABILITIES,
+    is_model_disclosure_requestable,
+    record_tool_lifecycle,
+)
 from ..planning.tool_disclosure import (
     FAMILY_TO_PACKAGES,
     normalize_requested_packages,
+    select_tools_by_names,
     select_tools_by_packages,
 )
 from .group_actor_consistency import GroupActorConsistencyGuard
@@ -60,6 +66,16 @@ from ...infrastructure.runtime.turn_call_ledger import (
     clamp_timeout_to_turn_budget,
     record_vision_observation,
 )
+
+
+@dataclass(slots=True)
+class ToolDisclosureExpansion:
+    tools: list[Any]
+    requested_packages: list[str] = field(default_factory=list)
+    requested_tools: list[str] = field(default_factory=list)
+    added_tools: list[str] = field(default_factory=list)
+    rejected_requests: list[dict[str, str]] = field(default_factory=list)
+    source: str = ""
 
 
 class ConcurrentExecutor:
@@ -171,8 +187,15 @@ class ConcurrentExecutor:
             "astrmai_required_tools",
             "astrmai_prepared_required_tools",
             "astrmai_requested_tool_packages",
+            "astrmai_requested_tool_names",
+            "astrmai_tool_disclosure_requests",
+            "astrmai_tool_disclosure_request_source",
+            "astrmai_tool_disclosure_rejected_requests",
+            "astrmai_hidden_requestable_tools",
             "astrmai_tool_disclosure_expanded_once",
             "astrmai_disclosure_expanded_packages",
+            "astrmai_disclosure_expanded_tools",
+            "astrmai_second_pass_added_tools",
             "astrmai_pending_actions",
             "astrmai_at_action_verified",
             "astrmai_at_action_target_id",
@@ -365,6 +388,8 @@ class ConcurrentExecutor:
             tools_state.second_pass_resolution = str(resolution or "")
             tools_state.second_pass_selected_tools = selected
             tools_state.second_pass_reason = str(reason or "")[:160]
+            added = set(getattr(tools_state, "second_pass_added_tools", []) or [])
+            tools_state.second_pass_tool_executed = bool(added & set(selected))
 
     @staticmethod
     def _executed_tool_names(event: AstrMessageEvent) -> list[str]:
@@ -416,12 +441,15 @@ class ConcurrentExecutor:
         api_prompt: str,
         missing_tools: list[str],
         expanded_packages: Optional[list[str]] = None,
+        added_tools: Optional[list[str]] = None,
         invocation_plans: Optional[list[dict[str, Any]]] = None,
     ) -> str:
         tool_list = "、".join(missing_tools)
         disclosure_line = ""
         if expanded_packages:
             disclosure_line = "系统已追加工具包：" + "、".join(expanded_packages) + "。"
+        if added_tools:
+            disclosure_line += "本次新增工具：" + "、".join(added_tools) + "；回答前必须先调用与用户需求匹配的新增工具。"
         missing_set = {str(name or "").strip() for name in missing_tools if str(name or "").strip()}
         contract_lines: list[str] = []
         for plan in invocation_plans or []:
@@ -465,7 +493,6 @@ class ConcurrentExecutor:
             "unverified_report_record_tool": "记录未确认说法",
             "persona_fact_check_tool": "核查设定事实",
             "proactive_meme": "发表情包",
-            "qq_custom_face_send_tool": "发自定义表情",
             "message_reaction_action": "互动回应",
             "qq_friend_lookup": "读取机器人 QQ 好友事实",
             "self_lore_query": "查询角色设定人物",
@@ -826,24 +853,77 @@ class ConcurrentExecutor:
         self,
         event: AstrMessageEvent,
         current_tools: list[Any],
-    ) -> tuple[list[Any], list[str]]:
+    ) -> ToolDisclosureExpansion:
+        expansion = ToolDisclosureExpansion(tools=list(current_tools or []))
         if not hasattr(event, "get_extra") or not hasattr(event, "set_extra"):
-            return current_tools, []
+            return expansion
         if event.get_extra("astrmai_tool_disclosure_expanded_once", False):
-            return current_tools, []
+            return expansion
         conversation = getattr(self.config, "conversation", None)
         if not bool(getattr(conversation, "tool_disclosure_allow_second_pass", True)):
-            return current_tools, []
+            return expansion
         requested = normalize_requested_packages(event.get_extra("astrmai_requested_tool_packages", []))
-        if not requested:
-            return current_tools, []
+        raw_requested_names = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in event.get_extra("astrmai_requested_tool_names", []) or []
+                if str(item or "").strip()
+            )
+        )
+        rejected = [
+            dict(item)
+            for item in event.get_extra("astrmai_tool_disclosure_rejected_requests", []) or []
+            if isinstance(item, dict)
+        ]
+        requested_names: list[str] = []
+        for name in raw_requested_names:
+            if is_model_disclosure_requestable(name):
+                requested_names.append(name)
+            else:
+                rejected.append(
+                    {
+                        "field": "needed_tool",
+                        "value": name,
+                        "reason": "model_disclosure_requires_readonly_tool",
+                    }
+                )
+        expansion.requested_tools = list(requested_names)
+        expansion.rejected_requests = list(rejected)
+        expansion.source = str(event.get_extra("astrmai_tool_disclosure_request_source", "") or "")
+        if not requested and not requested_names:
+            event.set_extra("astrmai_tool_disclosure_rejected_requests", rejected)
+            turn_context = event.get_extra("astrmai_turn_context", None)
+            tools_state = getattr(turn_context, "tools", None)
+            if tools_state is not None:
+                tools_state.disclosure_request_source = expansion.source
+                tools_state.disclosure_requested_tools = []
+                tools_state.disclosure_rejected_requests = list(rejected)
+            return expansion
         allowed = set(normalize_requested_packages(event.get_extra("astrmai_disclosure_second_pass_packages", [])))
         packages = [package for package in requested if package in allowed]
-        if not packages:
-            return current_tools, []
+        for package in requested:
+            if package not in allowed:
+                rejected.append(
+                    {
+                        "field": "needed_package",
+                        "value": package,
+                        "reason": "package_not_allowed_this_turn",
+                    }
+                )
+        expansion.requested_packages = list(packages)
+        expansion.rejected_requests = list(rejected)
+        event.set_extra("astrmai_tool_disclosure_rejected_requests", rejected)
+        turn_context = event.get_extra("astrmai_turn_context", None)
+        tools_state = getattr(turn_context, "tools", None)
+        if tools_state is not None:
+            tools_state.disclosure_request_source = expansion.source
+            tools_state.disclosure_requested_tools = list(requested_names)
+            tools_state.disclosure_rejected_requests = list(rejected)
+        if not packages and not requested_names:
+            return expansion
         hidden_tools = list(getattr(event, "_astrmai_disclosure_hidden_tools", []) or [])
         if not hidden_tools:
-            return current_tools, []
+            return expansion
         max_extra = max(1, int(getattr(conversation, "tool_disclosure_max_tools_task", 16) or 16))
         additions = select_tools_by_packages(
             hidden_tools,
@@ -851,8 +931,22 @@ class ConcurrentExecutor:
             name_resolver=self._tool_name,
             max_tools=max_extra,
         )
+        exact_additions = select_tools_by_names(
+            hidden_tools,
+            requested_names,
+            name_resolver=self._tool_name,
+        )
+        merged_additions: list[Any] = []
+        seen_addition_names: set[str] = set()
+        for tool in [*additions, *exact_additions]:
+            name = self._tool_name(tool)
+            if not name or name in seen_addition_names or not is_model_disclosure_requestable(name):
+                continue
+            seen_addition_names.add(name)
+            merged_additions.append(tool)
+        additions = merged_additions[:max_extra]
         if not additions:
-            return current_tools, []
+            return expansion
         existing = {self._tool_name(tool) for tool in current_tools or []}
         merged = list(current_tools or [])
         added_names: list[str] = []
@@ -864,19 +958,26 @@ class ConcurrentExecutor:
             merged.append(tool)
             added_names.append(name)
         if not added_names:
-            return current_tools, []
+            return expansion
+        expansion.tools = merged
+        expansion.added_tools = list(added_names)
         event.set_extra("astrmai_tool_disclosure_expanded_once", True)
         event.set_extra("astrmai_disclosure_expanded_packages", packages)
-        turn_context = event.get_extra("astrmai_turn_context", None)
-        tools_state = getattr(turn_context, "tools", None)
+        event.set_extra("astrmai_disclosure_expanded_tools", added_names)
+        event.set_extra("astrmai_second_pass_added_tools", added_names)
+        event.set_extra("astrmai_tool_disclosure_rejected_requests", rejected)
         if tools_state is not None:
             tools_state.disclosure_expanded_packages = list(packages)
+            tools_state.disclosure_request_source = expansion.source
+            tools_state.disclosure_requested_tools = list(requested_names)
+            tools_state.disclosure_rejected_requests = list(rejected)
+            tools_state.second_pass_added_tools = list(added_names)
             tools_state.filtered_tools = [self._tool_name(tool) for tool in merged if self._tool_name(tool)]
             tools_state.record_step(
                 "executor.tool_disclosure_second_pass",
                 [self._tool_name(tool) for tool in current_tools or []],
                 tools_state.filtered_tools,
-                "requested_packages(" + ",".join(packages) + ")",
+                "requested_packages(" + ",".join(packages) + ");requested_tools(" + ",".join(requested_names) + ")",
             )
         for tool_name in added_names:
             record_tool_lifecycle(
@@ -885,9 +986,48 @@ class ConcurrentExecutor:
                 "disclosed_second_pass",
                 source="bot_capability_lookup",
                 status="available",
-                reason="requested_packages(" + ",".join(packages) + ")",
+                reason="requested_second_pass",
             )
-        return merged, packages
+        exact_required = [name for name in added_names if name in requested_names]
+        if exact_required:
+            required_tools = list(event.get_extra("astrmai_required_tools", []) or [])
+            invocation_plans = [
+                dict(item)
+                for item in event.get_extra("astrmai_tool_invocation_plans", []) or []
+                if isinstance(item, dict)
+            ]
+            planned_names = {
+                str(item.get("tool_name") or "").strip()
+                for item in invocation_plans
+            }
+            for name in exact_required:
+                if name not in required_tools:
+                    required_tools.append(name)
+                if name in planned_names:
+                    continue
+                spec = TOOL_CAPABILITIES.get(name)
+                invocation_plans.append(
+                    {
+                        "tool_name": name,
+                        "family": str(getattr(spec, "family", "") or ""),
+                        "source": "model_disclosure_request",
+                        "required": True,
+                        "deterministic_fallback": False,
+                        "reason": "model_requested_exact_readonly_tool",
+                        "entity_domain": "",
+                        "operation": "",
+                        "target": "",
+                        "prepared_arguments": {},
+                        "acceptable_statuses": ["success", "not_found"],
+                        "acceptable_source_domains": [],
+                    }
+                )
+            event.set_extra("astrmai_required_tools", required_tools)
+            event.set_extra("astrmai_tool_invocation_plans", invocation_plans)
+            if tools_state is not None:
+                tools_state.required_tools = list(required_tools)
+                tools_state.invocation_plans = list(invocation_plans)
+        return expansion
 
     async def _inject_direct_vision_context(
         self,
@@ -1606,11 +1746,15 @@ class ConcurrentExecutor:
                 self._sync_execution_event_trace(execution_event, event)
                 missing_required = self._record_required_tool_outcomes(event)
                 auto_packages = self._request_contract_correction_packages(event, missing_required)
-                expanded_tools, expanded_packages = self._expand_tools_for_disclosure_request(event, tools)
-                correction_packages = list(dict.fromkeys([*auto_packages, *expanded_packages]))
-                needs_correction = bool(missing_required or expanded_packages)
+                expansion = self._expand_tools_for_disclosure_request(event, tools)
+                expansion_markers = [
+                    *expansion.requested_packages,
+                    *(f"tool:{name}" for name in expansion.added_tools if name in expansion.requested_tools),
+                ]
+                correction_packages = list(dict.fromkeys([*auto_packages, *expansion_markers]))
+                needs_correction = bool(missing_required or expansion.added_tools)
                 if needs_correction:
-                    tools = expanded_tools if expanded_packages else tools
+                    tools = expansion.tools if expansion.added_tools else tools
                     missing_set = set(missing_required)
                     correction_tools = list(tools)
                     if missing_set:
@@ -1649,6 +1793,7 @@ class ConcurrentExecutor:
                         reason="correction_started",
                         selected_tools=self._executed_tool_names(event),
                     )
+                    self._sync_execution_event_trace(event, execution_event)
                     result = await self.gateway.tool_chat_in_lane_result(
                         lane_key=runtime["dialog_lane_key"],
                         base_origin=runtime["dialog_base_origin"],
@@ -1657,6 +1802,7 @@ class ConcurrentExecutor:
                             api_prompt,
                             missing_required,
                             correction_packages,
+                            expansion.added_tools,
                             list(event.get_extra("astrmai_tool_invocation_plans", []) or []),
                         ),
                         system_prompt=system_prompt,
@@ -1670,6 +1816,30 @@ class ConcurrentExecutor:
                     )
                     self._sync_execution_event_trace(execution_event, event)
                     missing_required = self._record_required_tool_outcomes(event)
+                executed_after_correction = set(self._executed_tool_names(event))
+                expanded_tool_not_used = bool(
+                    expansion.added_tools
+                    and not (set(expansion.added_tools) & executed_after_correction)
+                )
+                if expanded_tool_not_used and not missing_required:
+                    self._record_tool_second_pass_resolution(
+                        event,
+                        "unresolved",
+                        reason="second_pass_added_tool_not_executed",
+                        selected_tools=list(executed_after_correction),
+                    )
+                    if not str(event.get_extra("astrmai_tool_clarification_prompt", "") or "").strip():
+                        event.set_extra(
+                            "astrmai_tool_clarification_prompt",
+                            "我还没能可靠完成刚才申请的查询。请补充要查的对象或具体信息，我再继续核对。",
+                        )
+                    return await self._handle_required_tool_missing(
+                        event,
+                        chat_id,
+                        runtime["bot_id"],
+                        ["requested_readonly_capability"],
+                        model=provider_id,
+                    )
                 if missing_required:
                     self._record_tool_second_pass_resolution(
                         event,
@@ -1685,11 +1855,23 @@ class ConcurrentExecutor:
                         model=provider_id,
                     )
                 invocation_plans = list(event.get_extra("astrmai_tool_invocation_plans", []) or [])
-                resolution = "satisfied" if needs_correction or invocation_plans else "not_needed"
+                resolution = (
+                    "degraded"
+                    if expansion.rejected_requests and not needs_correction
+                    else "satisfied"
+                    if needs_correction or invocation_plans
+                    else "not_needed"
+                )
                 self._record_tool_second_pass_resolution(
                     event,
                     resolution,
-                    reason=("correction_completed" if needs_correction else "no_second_pass_required"),
+                    reason=(
+                        "disclosure_request_rejected"
+                        if expansion.rejected_requests and not needs_correction
+                        else "correction_completed"
+                        if needs_correction
+                        else "no_second_pass_required"
+                    ),
                     selected_tools=self._executed_tool_names(event),
                 )
                 reply_text = result.text

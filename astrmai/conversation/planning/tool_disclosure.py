@@ -4,7 +4,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from .tool_contracts import FAMILY_TO_TOOL, TOOL_CAPABILITIES
+from .tool_contracts import (
+    FAMILY_TO_TOOL,
+    TOOL_CAPABILITIES,
+    requires_explicit_disclosure,
+)
 
 
 TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
@@ -14,6 +18,15 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
         "cross_chat_memory_query",
         "bot_capability_lookup",
         "learned_language_lookup",
+    ),
+    "default_actions": (
+        "regret_and_withdraw_action",
+        "proactive_poke",
+        "construct_at_event",
+        "quote_reply_action",
+        "message_emoji_like_action",
+        "vision_message_analyze_tool",
+        "proactive_meme",
     ),
     "persona_lore": (
         "self_lore_query",
@@ -34,7 +47,6 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
         "qq_message_artifact_lookup",
         "qq_message_recall_lookup",
         "qq_forward_message_lookup",
-        "vision_message_analyze_tool",
         "topic_thread_lookup",
     ),
     "cross_session": (
@@ -50,30 +62,20 @@ TOOL_PACKAGES: dict[str, tuple[str, ...]] = {
         "unverified_report_record_tool",
     ),
     "fun": (
-        "proactive_meme",
-        "custom_face_catalog_query",
-        "qq_custom_face_send_tool",
         "message_reaction_action",
-        "message_emoji_like_action",
         "proactive_like_action",
-    ),
-    "native_action": (
-        "proactive_poke",
-        "construct_at_event",
-        "quote_reply_action",
-        "group_sign_action",
     ),
     "conversation_control": (
         "wait_and_listen",
         "topic_hijack_action",
         "meme_resonance_action",
-        "regret_and_withdraw_action",
     ),
 }
 
 
 PACKAGE_ORDER: tuple[str, ...] = (
     "core",
+    "default_actions",
     "persona_lore",
     "identity",
     "relationship",
@@ -81,8 +83,13 @@ PACKAGE_ORDER: tuple[str, ...] = (
     "cross_session",
     "memory_governance",
     "fun",
-    "native_action",
     "conversation_control",
+)
+
+
+DEFAULT_VISIBLE_TOOL_NAMES: tuple[str, ...] = (
+    *TOOL_PACKAGES["core"],
+    *TOOL_PACKAGES["default_actions"],
 )
 
 
@@ -98,11 +105,9 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "group_fact": ("relationship",),
     "recent_contact": ("relationship", "cross_session"),
     "message_artifact": ("artifact",),
-    "vision_message": ("artifact",),
+    "vision_message": ("default_actions",),
     "cross_reply": ("cross_session",),
-    "custom_face": ("fun",),
-    # OPT-12/TL-08: quote_reply 属 PRECISION_ONLY（plan() 剔除包映射），此处映射
-    # 为死配置且与 TOOL_PACKAGES 矛盾——引用能力只经 exact_tool_names 显式注入
+    "quote_reply": ("default_actions",),
     "message_recall": ("artifact",),
     "topic_thread": ("artifact", "conversation_control"),
     "capability": ("core",),
@@ -112,18 +117,16 @@ FAMILY_TO_PACKAGES: dict[str, tuple[str, ...]] = {
     "group_activity": ("relationship",),
     "route_suggest": ("relationship", "cross_session"),
     "cross_memory": ("core",),
-    "at": ("native_action",),
-    "poke": ("native_action",),
-    "meme": ("fun",),
+    "at": ("default_actions",),
+    "poke": ("default_actions",),
+    "meme": ("default_actions",),
     "resonance": ("conversation_control",),
     "topic": ("conversation_control",),
     "private": ("cross_session",),
-    "withdraw": ("conversation_control",),
+    "withdraw": ("default_actions",),
     "reaction": ("fun",),
-    "qq_reaction": ("fun",),
+    "qq_reaction": ("default_actions",),
     "like": ("fun",),
-    "qq_query": ("fun",),
-    "sign": ("native_action",),
 }
 
 
@@ -138,7 +141,6 @@ SECOND_PASS_ALLOWED_PACKAGES: tuple[str, ...] = (
 
 PRECISION_ONLY_FAMILIES: frozenset[str] = frozenset(
     {
-        "custom_face",
         "quote_reply",
         "at",
         "poke",
@@ -149,11 +151,19 @@ PRECISION_ONLY_FAMILIES: frozenset[str] = frozenset(
         "reaction",
         "qq_reaction",
         "like",
-        "qq_query",
-        "sign",
         "wait",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDisclosureDecision:
+    family: str
+    tool_name: str
+    source: str
+    confidence: float
+    invocation_mode: str
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +174,9 @@ class ToolDisclosurePlan:
     package_reasons: tuple[str, ...]
     tool_names: tuple[str, ...]
     second_pass_packages: tuple[str, ...]
+    decisions: tuple[ToolDisclosureDecision, ...]
+    preselected_tool_names: tuple[str, ...]
+    required_families: tuple[str, ...]
 
 
 def _ordered_unique(items: Iterable[str]) -> tuple[str, ...]:
@@ -267,7 +280,6 @@ class ToolDisclosurePlanner:
     )
     ARTIFACT_KEYWORDS = (
         "图片",
-        "表情包",
         "文件",
         "转发",
         "聊天记录",
@@ -305,23 +317,11 @@ class ToolDisclosurePlanner:
     )
     FUN_KEYWORDS = (
         "表情包",
-        "自定义表情",
         "点赞",
         "夸夸我",
         "夸我",
         "发表情",
         "来个表情",
-    )
-    NATIVE_ACTION_KEYWORDS = (
-        "戳一下",
-        "戳一戳",
-        "戳戳",
-        "艾特",
-        "帮我@",
-        "@一下",
-        "引用回复",
-        "群签到",
-        "群打卡",
     )
     CONTROL_KEYWORDS = (
         "撤回",
@@ -364,7 +364,7 @@ class ToolDisclosurePlanner:
     }
 
     @classmethod
-    def _semantic_intent_packages(cls, text: str, existing: list[str]) -> list[str]:
+    def _semantic_intent_decisions(cls, text: str) -> list[ToolDisclosureDecision]:
         query = str(text or "").strip()
         if not query:
             return []
@@ -374,11 +374,21 @@ class ToolDisclosurePlanner:
             _primary, intents, _confidence = QueryIntentClassifier().classify(query)
         except Exception:
             return []
-        resolved: list[str] = []
+        resolved: list[ToolDisclosureDecision] = []
         for intent in intents or []:
             package = cls._SEMANTIC_INTENT_PACKAGES.get(str(intent or "").strip())
-            if package and package not in existing and package not in resolved:
-                resolved.append(package)
+            if package != "identity":
+                continue
+            decision = ToolDisclosureDecision(
+                family="user_identity",
+                tool_name=FAMILY_TO_TOOL["user_identity"],
+                source="semantic_query",
+                confidence=float(_confidence or 0.0),
+                invocation_mode="required",
+                reason=f"semantic_intent_{intent}",
+            )
+            if decision.tool_name not in {item.tool_name for item in resolved}:
+                resolved.append(decision)
         return resolved
 
     def plan(
@@ -399,7 +409,9 @@ class ToolDisclosurePlanner:
         text = str(message or "").strip()
         packages: list[str] = []
         reasons: list[str] = []
+        decisions: list[ToolDisclosureDecision] = []
         self._append_package(packages, reasons, "core", "default")
+        self._append_package(packages, reasons, "default_actions", "default")
 
         explicit_families = tuple(str(family or "").strip() for family in (explicit_tool_families or []) if str(family or "").strip())
         exact_tool_names = [
@@ -408,6 +420,20 @@ class ToolDisclosurePlanner:
             for tool_name in (FAMILY_TO_TOOL.get(family),)
             if tool_name
         ]
+        for family in explicit_families:
+            tool_name = FAMILY_TO_TOOL.get(family, "")
+            if not tool_name:
+                continue
+            decisions.append(
+                ToolDisclosureDecision(
+                    family=family,
+                    tool_name=tool_name,
+                    source="explicit_user_intent",
+                    confidence=1.0,
+                    invocation_mode="required",
+                    reason=f"explicit_{family}_intent",
+                )
+            )
         package_families = [
             family
             for family in explicit_families
@@ -429,11 +455,15 @@ class ToolDisclosurePlanner:
             self._append_package(packages, reasons, "identity", "identity_signal")
         if self._contains_any(text, self.RELATIONSHIP_KEYWORDS):
             self._append_package(packages, reasons, "relationship", "relationship_signal")
-        # G5/TL-01 后半：关键词未命中时用语义意图兜底并包只读查询工具。
+        # G5/TL-01 后半：关键词未命中时用语义意图兜底并精确披露只读查询工具。
         # 二段披露（模型自检调 bot_capability_lookup）16h 零触发，不能只靠它；
         # 这里让"我叫什么名字/我们是什么关系"这类问句即使不含关键词也拿到工具。
-        for package in self._semantic_intent_packages(text, packages):
-            self._append_package(packages, reasons, package, f"{package}_semantic_intent")
+        semantic_decisions = self._semantic_intent_decisions(text)
+        for decision in semantic_decisions:
+            if decision.tool_name not in exact_tool_names:
+                exact_tool_names.append(decision.tool_name)
+            if decision.tool_name not in {item.tool_name for item in decisions}:
+                decisions.append(decision)
         if self._contains_any(text, self.CROSS_SESSION_KEYWORDS):
             self._append_package(packages, reasons, "cross_session", "cross_session_signal")
         if self._contains_any(text, self.MEMORY_GOVERNANCE_KEYWORDS):
@@ -442,18 +472,26 @@ class ToolDisclosurePlanner:
             self._append_package(packages, reasons, "fun", f"social_intent_{social_intent}")
         if not explicit_tool_intent and self._contains_any(text, self.FUN_KEYWORDS):
             self._append_package(packages, reasons, "fun", "fun_signal")
-        if not explicit_tool_intent and self._contains_any(text, self.NATIVE_ACTION_KEYWORDS):
-            self._append_package(packages, reasons, "native_action", "native_action_signal")
         if str(social_intent or "").strip().lower() == "redirect":
             self._append_package(packages, reasons, "conversation_control", "social_intent_redirect")
         if not explicit_tool_intent and self._contains_any(text, self.CONTROL_KEYWORDS):
             self._append_package(packages, reasons, "conversation_control", "control_signal")
 
-        task_like = explicit_tool_intent or len(packages) > 1 or str(requested_tier or "").lower() in {"full", "sys3"}
+        dynamic_packages = [
+            package
+            for package in packages
+            if package not in {"core", "default_actions"}
+        ]
+        task_like = explicit_tool_intent or bool(dynamic_packages) or str(requested_tier or "").lower() in {"full", "sys3"}
         max_tools = max_task_tools if task_like else max_chat_tools
-        selected_tool_names = _ordered_unique([*tool_names_for_packages(packages), *exact_tool_names])
+        package_tool_names = [
+            name
+            for name in tool_names_for_packages(packages)
+            if not requires_explicit_disclosure(name) or name in exact_tool_names
+        ]
+        selected_tool_names = _ordered_unique([*package_tool_names, *exact_tool_names])
         if max_tools and max_tools > 0:
-            protected = _ordered_unique([*exact_tool_names, "bot_capability_lookup"])
+            protected = _ordered_unique([*DEFAULT_VISIBLE_TOOL_NAMES, *exact_tool_names])
             selected_tool_names = _ordered_unique(
                 [*selected_tool_names[:max_tools], *protected]
             )
@@ -469,15 +507,28 @@ class ToolDisclosurePlanner:
             package_reasons=tuple(reasons),
             tool_names=selected_tool_names,
             second_pass_packages=second_pass_packages,
+            decisions=tuple(decisions),
+            preselected_tool_names=_ordered_unique(
+                decision.tool_name
+                for decision in decisions
+                if decision.tool_name not in DEFAULT_VISIBLE_TOOL_NAMES
+            ),
+            required_families=_ordered_unique(
+                decision.family
+                for decision in decisions
+                if decision.invocation_mode == "required"
+            ),
         )
 
 
 __all__ = [
+    "DEFAULT_VISIBLE_TOOL_NAMES",
     "FAMILY_TO_PACKAGES",
     "PACKAGE_ORDER",
     "SECOND_PASS_ALLOWED_PACKAGES",
     "TOOL_PACKAGES",
     "ToolDisclosurePlan",
+    "ToolDisclosureDecision",
     "ToolDisclosurePlanner",
     "normalize_requested_packages",
     "package_names_for_families",

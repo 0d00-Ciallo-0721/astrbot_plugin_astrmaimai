@@ -5,6 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -57,11 +58,13 @@ class MemeServiceRefactorTests(unittest.TestCase):
         (memes_dir / "a.png").write_bytes(b"fake")
         sent = []
 
+        extras = {}
+
         class _Event:
             unified_msg_origin = "group-1"
 
-            def set_extra(self, *_args, **_kwargs):
-                return None
+            def set_extra(self, key, value):
+                extras[key] = value
 
         class _Context:
             async def send_message(self, origin, chain):
@@ -78,6 +81,7 @@ class MemeServiceRefactorTests(unittest.TestCase):
         )
         self.assertEqual(sent[0][0], "group-1")
         self.assertTrue(sent[0][1])
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "sent")
 
     def test_send_meme_adapter_failure_is_best_effort(self):
         memes_dir = Path(self.temp_dir.name) / "happy"
@@ -107,6 +111,108 @@ class MemeServiceRefactorTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertTrue(extras["astrmai_meme_send_degraded"])
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "send_failed")
+
+    def test_send_meme_records_directory_missing_reason(self):
+        extras = {}
+
+        class _Event:
+            def set_extra(self, key, value):
+                extras[key] = value
+
+        result = asyncio.run(
+            self.sender_mod.send_meme(
+                event=_Event(),
+                emotion_tag="happy",
+                probability=100,
+                memes_dir=Path(self.temp_dir.name),
+            )
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "directory_missing")
+
+    def test_send_meme_records_neutral_reason(self):
+        extras = {}
+
+        class _Event:
+            def set_extra(self, key, value):
+                extras[key] = value
+
+        result = asyncio.run(
+            self.sender_mod.send_meme(
+                event=_Event(),
+                emotion_tag="neutral",
+                probability=100,
+                memes_dir=Path(self.temp_dir.name),
+            )
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "neutral")
+
+    def test_send_meme_records_probability_miss_reason(self):
+        extras = {}
+
+        class _Event:
+            def set_extra(self, key, value):
+                extras[key] = value
+
+        with patch.object(self.sender_mod.random, "randint", return_value=100):
+            result = asyncio.run(
+                self.sender_mod.send_meme(
+                    event=_Event(),
+                    emotion_tag="happy",
+                    probability=80,
+                    memes_dir=Path(self.temp_dir.name),
+                )
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "probability_miss")
+
+    def test_send_meme_records_directory_empty_reason(self):
+        extras = {}
+        (Path(self.temp_dir.name) / "happy").mkdir()
+
+        class _Event:
+            def set_extra(self, key, value):
+                extras[key] = value
+
+        result = asyncio.run(
+            self.sender_mod.send_meme(
+                event=_Event(),
+                emotion_tag="happy",
+                probability=100,
+                memes_dir=Path(self.temp_dir.name),
+            )
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "directory_empty")
+
+    def test_send_meme_records_file_unreadable_reason(self):
+        extras = {}
+        memes_dir = Path(self.temp_dir.name) / "happy"
+        memes_dir.mkdir()
+        (memes_dir / "a.png").write_bytes(b"fake")
+
+        class _Event:
+            def set_extra(self, key, value):
+                extras[key] = value
+
+        with patch.object(Path, "open", side_effect=OSError("denied")):
+            result = asyncio.run(
+                self.sender_mod.send_meme(
+                    event=_Event(),
+                    emotion_tag="happy",
+                    probability=100,
+                    memes_dir=Path(self.temp_dir.name),
+                )
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(extras["astrmai_meme_send_result"]["reason"], "file_unreadable")
 
 
 if __name__ == "__main__":

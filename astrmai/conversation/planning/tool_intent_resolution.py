@@ -22,6 +22,14 @@ class ToolIntentResolution:
         return self.required_state == "ready_required"
 
 
+@dataclass(frozen=True, slots=True)
+class ToolNeedResolution:
+    family: str
+    tool_name: str
+    confidence: float
+    reason: str
+
+
 QQ_NUMBER_RE = re.compile(r"(?<!\d)\d{5,12}(?!\d)")
 
 _SEND_VERBS = (
@@ -53,6 +61,71 @@ _AMBIGUOUS_TARGETS = {
     "好友",
     "联系人",
 }
+
+
+_CAPABILITY_NEED_HINTS: dict[str, tuple[str, ...]] = {
+    "group_member": ("群成员", "群名片", "管理员", "群主", "在群里吗", "是不是群员"),
+    "group_fact": ("共同群", "哪些群", "哪个群", "群里见过", "同一个群", "群关系"),
+    "forward_message": ("合并转发", "转发消息", "转发记录", "转发里", "聊天记录里"),
+    "cross_reply": ("对方回了吗", "有没有回复", "他回了什么", "她回了什么", "跨会话回复"),
+    "recent_contact": ("最近联系人", "最近联系", "联系过谁", "刚联系过", "最近聊过"),
+    "message_recall": ("上一条消息", "刚才发的", "消息id", "消息 ID", "可撤回消息"),
+    "message_artifact": ("消息附件", "那条消息", "刚才那条", "消息里的文件", "消息里的图片"),
+    "topic_thread": ("刚才说的", "前面说的", "那个话题", "话题线索", "之前聊的"),
+    "group_activity": ("群里刚才", "谁在聊天", "群活跃", "最近群消息", "群里发生了什么"),
+    "route_suggest": ("该发哪里", "要不要私聊", "怎么联系", "路由建议", "在哪联系"),
+    "persona_fact": ("有没有授权", "官方设定", "人格事实", "设定事实", "是否官方"),
+    "self_lore": ("你的设定", "你的人设", "你的世界观", "你的经历", "你是谁"),
+    "user_identity": ("我是谁", "他是谁", "她是谁", "这个人是谁", "用户身份", "昵称", "备注", "名字"),
+    "friend_fact": ("好友", "朋友列表", "联系人", "是不是朋友", "是否为好友", "好友关系"),
+}
+
+
+def resolve_capability_need(
+    message: str,
+    *,
+    available_tool_names: Iterable[str] = (),
+) -> ToolNeedResolution | None:
+    """Resolve a natural-language capability request without another LLM call."""
+    text = _clean(message)
+    if not text:
+        return None
+    lowered = text.lower()
+    allowed = {
+        str(name or "").strip()
+        for name in available_tool_names
+        if str(name or "").strip()
+    }
+
+    for family, tool_name in FAMILY_TO_TOOL.items():
+        if allowed and tool_name not in allowed:
+            continue
+        if family.lower() in lowered or tool_name.lower() in lowered:
+            return ToolNeedResolution(
+                family=family,
+                tool_name=tool_name,
+                confidence=1.0,
+                reason="explicit_capability_identifier",
+            )
+
+    best: ToolNeedResolution | None = None
+    for family, hints in _CAPABILITY_NEED_HINTS.items():
+        tool_name = FAMILY_TO_TOOL.get(family, "")
+        if not tool_name or (allowed and tool_name not in allowed):
+            continue
+        matches = [hint for hint in hints if hint.lower() in lowered]
+        if not matches:
+            continue
+        confidence = min(0.98, 0.86 + 0.04 * (len(matches) - 1))
+        candidate = ToolNeedResolution(
+            family=family,
+            tool_name=tool_name,
+            confidence=confidence,
+            reason="natural_language_capability_match:" + ",".join(matches[:3]),
+        )
+        if best is None or candidate.confidence > best.confidence:
+            best = candidate
+    return best
 
 
 def _clean(text: str) -> str:
@@ -213,7 +286,7 @@ def resolve_explicit_tool_intents(
                     prompt="你想让我核查或记录哪条说法？请把具体说法发给我。",
                 )
             )
-        elif family in {"meme", "custom_face"}:
+        elif family == "meme":
             resolutions.append(
                 _simple_slot_resolution(
                     family,
@@ -243,8 +316,10 @@ def clarification_resolutions(resolutions: Iterable[ToolIntentResolution]) -> li
 
 
 __all__ = [
+    "ToolNeedResolution",
     "ToolIntentResolution",
     "clarification_resolutions",
     "ready_families",
+    "resolve_capability_need",
     "resolve_explicit_tool_intents",
 ]

@@ -820,6 +820,10 @@ class RefactoredExecutorTests(unittest.TestCase):
             self.assertIn("qq_friend_lookup", tool_names)
             self.assertIn("qq_user_identity_lookup", tool_names)
             self.assertEqual(kwargs["max_steps"], 7)
+            kwargs["event"].set_extra(
+                "astrmai_tool_execution_trace",
+                [{"tool_name": "qq_friend_lookup", "status": "success"}],
+            )
             return "[TERMINAL_YIELD]: expanded identity result"
 
         gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
@@ -852,6 +856,141 @@ class RefactoredExecutorTests(unittest.TestCase):
         self.assertEqual(result, "expanded identity result")
         self.assertEqual(call_count["value"], 2)
         self.assertEqual(event.get_extra("astrmai_disclosure_expanded_packages"), ["identity"])
+
+    def test_second_pass_package_without_new_tool_execution_degrades_safely(self):
+        call_count = {"value": 0}
+
+        def _tool_response(kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                kwargs["event"].set_extra("astrmai_requested_tool_packages", ["identity"])
+                return "[TERMINAL_YIELD]: request identity"
+            return "[TERMINAL_YIELD]: 我已经查到了"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        gateway.config.conversation = SimpleNamespace(
+            tool_disclosure_allow_second_pass=True,
+            tool_disclosure_max_tools_task=16,
+        )
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event.set_extra("astrmai_disclosure_second_pass_packages", ["identity"])
+        event._astrmai_disclosure_hidden_tools = [SimpleNamespace(name="qq_friend_lookup")]
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="bot_capability_lookup")],
+            )
+        )
+
+        self.assertNotEqual(result, "我已经查到了")
+        self.assertIn("还没能可靠完成", result)
+        self.assertEqual(event.get_extra("astrmai_tool_second_pass_resolution"), "unresolved")
+
+    def test_tool_mode_can_expand_one_exact_readonly_tool_without_opening_package(self):
+        call_count = {"value": 0}
+
+        def _tool_response(kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                kwargs["event"].set_extra("astrmai_requested_tool_names", ["qq_group_presence_lookup"])
+                return "[TERMINAL_YIELD]: need exact tool"
+            tool_names = [getattr(tool, "name", "") for tool in kwargs["tools"].tools]
+            self.assertIn("qq_group_presence_lookup", tool_names)
+            self.assertNotIn("qq_recent_contact_lookup", tool_names)
+            kwargs["event"].set_extra(
+                "astrmai_tool_execution_trace",
+                [
+                    {
+                        "tool_name": "qq_group_presence_lookup",
+                        "status": "success",
+                    }
+                ],
+            )
+            return "[TERMINAL_YIELD]: exact tool result"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        gateway.config.conversation = SimpleNamespace(
+            tool_disclosure_allow_second_pass=True,
+            tool_disclosure_max_tools_task=16,
+        )
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        setattr(
+            event,
+            "_astrmai_disclosure_hidden_tools",
+            [
+                SimpleNamespace(name="message_reaction_action"),
+                SimpleNamespace(name="qq_group_presence_lookup"),
+                SimpleNamespace(name="qq_recent_contact_lookup"),
+            ],
+        )
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="bot_capability_lookup")],
+            )
+        )
+
+        self.assertEqual(result, "exact tool result")
+        self.assertEqual(call_count["value"], 2)
+        self.assertEqual(event.get_extra("astrmai_disclosure_expanded_tools"), ["qq_group_presence_lookup"])
+        self.assertIn("qq_group_presence_lookup", event.get_extra("astrmai_required_tools"))
+
+    def test_tool_mode_rejects_exact_side_effect_disclosure_request(self):
+        def _tool_response(kwargs):
+            kwargs["event"].set_extra("astrmai_requested_tool_names", ["space_transition_action"])
+            return "[TERMINAL_YIELD]: no expansion"
+
+        gateway = _FakeGateway(tool_responses={"model-a": _tool_response})
+        gateway.config.conversation = SimpleNamespace(
+            tool_disclosure_allow_second_pass=True,
+            tool_disclosure_max_tools_task=16,
+        )
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=_FakeReplyService(),
+            evolution_manager=_FakeEvolution(),
+            config=gateway.config,
+        )
+        event = _FakeEvent()
+        event._astrmai_disclosure_hidden_tools = [SimpleNamespace(name="space_transition_action")]
+
+        result = asyncio.run(
+            executor.execute(
+                event,
+                "prompt",
+                "system",
+                tools=[SimpleNamespace(name="bot_capability_lookup")],
+            )
+        )
+
+        self.assertEqual(result, "no expansion")
+        self.assertIsNone(event.get_extra("astrmai_disclosure_expanded_tools"))
+        self.assertEqual(
+            event.get_extra("astrmai_tool_disclosure_rejected_requests")[0]["reason"],
+            "model_disclosure_requires_readonly_tool",
+        )
+        self.assertEqual(event.get_extra("astrmai_tool_second_pass_resolution"), "degraded")
 
     def test_chat_tool_tier_uses_configured_multi_tool_max_steps(self):
         gateway = _FakeGateway()
