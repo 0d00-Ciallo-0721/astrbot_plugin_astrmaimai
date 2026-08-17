@@ -33,6 +33,8 @@ _EXPORTS = {
     "build_p0_thread_id": ".turn_identity",
     "build_turn_send_key": ".turn_identity",
     "PendingQQAction": ".qq_action",
+    "VisionCandidate": ".vision_candidate",
+    "load_vision_candidates": ".vision_candidate",
 }
 
 __all__ = list(_EXPORTS)

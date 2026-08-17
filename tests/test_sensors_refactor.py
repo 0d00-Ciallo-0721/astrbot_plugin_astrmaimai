@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -152,7 +153,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertTrue(event.get_extra("astrmai_is_direct_vision_request"))
         self.assertEqual(event.get_extra("direct_vision_urls"), ["private.jpg"])
 
-    def test_group_at_reply_image_bypasses_probability_gate(self):
+    def test_group_at_reply_image_bypasses_probability_and_defers_to_reply(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
         filters._commands_loaded = True
 
@@ -169,12 +170,14 @@ class RefactoredSensorsTests(unittest.TestCase):
         result = asyncio.run(filters.should_process_message(event))
 
         self.assertTrue(result)
-        self.assertTrue(event.get_extra("vision_direct_selected"))
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
-        self.assertEqual(event.get_extra("direct_vision_urls"), ["reply.jpg"])
+        self.assertFalse(event.get_extra("vision_direct_selected"))
+        self.assertTrue(event.get_extra("vision_prefilter_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "deferred_to_reply")
+        self.assertFalse(event.get_extra("direct_vision_urls"))
         self.assertEqual(event.get_extra("extracted_image_urls"), ["reply.jpg"])
+        self.assertEqual(event.get_extra("astrmai_vision_candidates")[0]["source_kind"], "reply")
 
-    def test_group_at_inline_image_bypasses_probability_gate(self):
+    def test_group_at_inline_image_bypasses_probability_and_defers_to_reply(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
         filters._commands_loaded = True
 
@@ -191,11 +194,78 @@ class RefactoredSensorsTests(unittest.TestCase):
         result = asyncio.run(filters.should_process_message(event))
 
         self.assertTrue(result)
-        self.assertTrue(event.get_extra("vision_direct_selected"))
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
-        self.assertTrue(event.get_extra("astrmai_is_direct_vision_request"))
-        self.assertEqual(event.get_extra("direct_vision_urls"), ["inline.jpg"])
+        self.assertFalse(event.get_extra("vision_direct_selected"))
+        self.assertTrue(event.get_extra("vision_prefilter_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "deferred_to_reply")
+        self.assertFalse(event.get_extra("astrmai_is_direct_vision_request"))
+        self.assertFalse(event.get_extra("direct_vision_urls"))
         self.assertEqual(event.get_extra("extracted_image_urls"), ["inline.jpg"])
+
+    def test_group_at_inline_image_and_reply_preserves_both_candidates(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            text="看这张",
+            components=[
+                self._at_component("bot-1"),
+                self._image_component(file_path="inline.jpg"),
+                self._reply_component([self._image_component(file_path="quoted.jpg")]),
+                self._plain_component("看这张"),
+            ],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertTrue(event.get_extra("vision_prefilter_selected"))
+        candidates = event.get_extra("astrmai_vision_candidates")
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            {(item["source_kind"], item["candidate_refs"][0]) for item in candidates},
+            {("inline", "inline.jpg"), ("reply", "quoted.jpg")},
+        )
+
+    def test_group_at_reply_without_chain_keeps_message_refresh_candidate(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
+        filters._commands_loaded = True
+        reply = self._reply_component([])
+        reply.id = "quoted-message-42"
+        event = _FakeEvent(
+            group_id="group-1",
+            text="看引用",
+            components=[
+                self._at_component("bot-1"),
+                reply,
+                self._plain_component("看引用"),
+            ],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        candidates = event.get_extra("astrmai_vision_candidates")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["source_kind"], "reply")
+        self.assertEqual(candidates[0]["reply_to_message_id"], "quoted-message-42")
+        self.assertEqual(
+            candidates[0]["candidate_refs"],
+            ["onebot-message://quoted-message-42"],
+        )
+
+    def test_napcat_raw_at_data_qq_is_recognized(self):
+        filters = self.sensors_mod.PreFilters(self._config())
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[{"type": "at", "data": {"qq": "bot-1"}}],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertTrue(event.get_extra("astrmai_at_bot_wakeup"))
+        self.assertTrue(event.get_extra("astrmai_pure_at_bot"))
 
     def test_pure_at_bot_message_is_not_filtered_as_empty(self):
         filters = self.sensors_mod.PreFilters(self._config())
@@ -211,6 +281,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertTrue(filters.is_wakeup_signal(event, "bot-1"))
         self.assertTrue(event.get_extra("astrmai_at_bot_wakeup"))
         self.assertTrue(event.get_extra("astrmai_group_direct_wakeup"))
+        self.assertTrue(event.get_extra("astrmai_pure_at_bot"))
 
     def test_at_target_id_adapter_shape_is_recognized(self):
         filters = self.sensors_mod.PreFilters(self._config())
@@ -239,7 +310,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertFalse(filters.is_wakeup_signal(event, "bot-1"))
         self.assertFalse(event.get_extra("astrmai_at_bot_wakeup", False))
 
-    def test_passive_group_image_keeps_original_non_direct_behavior(self):
+    def test_passive_group_image_probability_one_selects_reply_phase_vision(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
         filters._commands_loaded = True
 
@@ -252,11 +323,68 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertFalse(event.get_extra("vision_direct_selected"))
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "not_direct_path")
+        self.assertTrue(event.get_extra("vision_prefilter_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "deferred_to_reply")
         self.assertFalse(event.get_extra("astrmai_is_direct_vision_request"))
         self.assertTrue(event.get_extra("astrmai_is_passive_image_share"))
         self.assertFalse(event.get_extra("direct_vision_urls"))
         self.assertEqual(event.get_extra("extracted_image_urls"), ["passive.jpg"])
+
+    def test_passive_group_image_probability_zero_is_rejected(self):
+        filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=0.0))
+        filters._commands_loaded = True
+        event = _FakeEvent(
+            group_id="group-1",
+            components=[self._image_component(file_path="passive.jpg")],
+        )
+
+        result = asyncio.run(filters.should_process_message(event))
+
+        self.assertTrue(result)
+        self.assertFalse(event.get_extra("vision_prefilter_selected"))
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "probability_gate")
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["passive.jpg"])
+
+    def test_passive_group_image_probability_uses_strict_random_boundary(self):
+        for random_value, expected in ((0.49, True), (0.51, False)):
+            with self.subTest(random_value=random_value):
+                filters = self.sensors_mod.PreFilters(
+                    self._config(enable_vision=True, probability=0.5)
+                )
+                filters._commands_loaded = True
+                event = _FakeEvent(
+                    group_id="group-1",
+                    components=[self._image_component(file_path="passive.jpg")],
+                )
+
+                with patch.object(self.sensors_mod.random, "random", return_value=random_value):
+                    result = asyncio.run(filters.should_process_message(event))
+
+                self.assertTrue(result)
+                self.assertEqual(event.get_extra("vision_prefilter_selected"), expected)
+                self.assertEqual(
+                    event.get_extra("vision_direct_skip_reason"),
+                    "deferred_to_reply" if expected else "probability_gate",
+                )
+
+    def test_probability_zero_and_one_do_not_draw_random(self):
+        for probability, expected in ((0.0, False), (1.0, True)):
+            with self.subTest(probability=probability):
+                filters = self.sensors_mod.PreFilters(
+                    self._config(enable_vision=True, probability=probability)
+                )
+                filters._commands_loaded = True
+                event = _FakeEvent(
+                    group_id="group-1",
+                    components=[self._image_component(file_path="passive.jpg")],
+                )
+                with patch.object(
+                    self.sensors_mod.random,
+                    "random",
+                    side_effect=AssertionError("boundary probability must not draw"),
+                ):
+                    self.assertTrue(asyncio.run(filters.should_process_message(event)))
+                self.assertEqual(event.get_extra("vision_prefilter_selected"), expected)
 
     def test_group_reply_image_disable_switch_still_keeps_extracted_urls(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=False, probability=1.0))
@@ -296,7 +424,7 @@ class RefactoredSensorsTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(event.get_extra("extracted_image_urls"), ["reply.jpg"])
 
-    def test_remote_url_only_image_is_not_selected_for_direct_vision(self):
+    def test_remote_url_only_private_image_is_resolver_candidate(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
         filters._commands_loaded = True
 
@@ -308,14 +436,14 @@ class RefactoredSensorsTests(unittest.TestCase):
         result = asyncio.run(filters.should_process_message(event))
 
         self.assertTrue(result)
-        self.assertEqual(event.get_extra("extracted_image_urls"), [])
-        self.assertFalse(event.get_extra("direct_vision_urls"))
-        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "not_direct_path")
-        self.assertEqual(event.get_extra("astrmai_vision_state"), "placeholder_only")
+        self.assertEqual(event.get_extra("extracted_image_urls"), ["https://example.com/private.jpg"])
+        self.assertEqual(event.get_extra("direct_vision_urls"), ["https://example.com/private.jpg"])
+        self.assertEqual(event.get_extra("vision_direct_skip_reason"), "")
+        self.assertEqual(event.get_extra("astrmai_vision_state"), "resolvable")
         self.assertEqual(event.get_extra("astrmai_image_raw_component_count"), 1)
-        self.assertEqual(event.get_extra("astrmai_image_resolved_count"), 0)
-        self.assertEqual(event.get_extra("astrmai_image_placeholder_count"), 1)
-        self.assertFalse(event.get_extra("astrmai_image_focus_allowed"))
+        self.assertEqual(event.get_extra("astrmai_image_resolved_count"), 1)
+        self.assertEqual(event.get_extra("astrmai_image_placeholder_count"), 0)
+        self.assertTrue(event.get_extra("astrmai_image_focus_allowed"))
 
     def test_unresolved_image_with_unrelated_text_does_not_claim_image_focus(self):
         filters = self.sensors_mod.PreFilters(self._config(enable_vision=True, probability=1.0))
@@ -331,7 +459,7 @@ class RefactoredSensorsTests(unittest.TestCase):
 
         self.assertTrue(asyncio.run(filters.should_process_message(event)))
         self.assertFalse(event.get_extra("astrmai_user_asked_about_image"))
-        self.assertEqual(event.get_extra("astrmai_image_focus_reason"), "placeholder_ignored")
+        self.assertEqual(event.get_extra("astrmai_image_focus_reason"), "resolvable_media")
 
     def test_poke_event_writes_lightweight_play_context(self):
         filters = self.sensors_mod.PreFilters(self._config())

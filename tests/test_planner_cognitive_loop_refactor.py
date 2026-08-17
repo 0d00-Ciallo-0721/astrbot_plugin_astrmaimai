@@ -81,6 +81,7 @@ class _FakeExecutor:
                 "system_prompt": system_prompt,
                 "prompt": prompt,
                 "tools": tools,
+                "direct_vision_urls": list(direct_vision_urls or []),
             }
         )
         return "ok"
@@ -449,6 +450,147 @@ class PlannerCognitiveLoopRefactorTests(unittest.TestCase):
         rendered_trace = str(turn_trace)
         self.assertNotIn("focus on this sentence first", rendered_trace)
         self.assertNotIn("final prompt", rendered_trace)
+
+    def test_final_reply_vision_uses_only_latest_context_image(self):
+        planner = self._make_planner(
+            self.planner_mod.CognitiveDecision(
+                action="reply",
+                intent="react to current image",
+                memory_policy="light",
+            )
+        )
+        event = _FakeEvent(text="please look at the latest image")
+        _install_focus_extras(event)
+        focus_mod = importlib.import_module("astrmai.conversation.contracts.focus_context")
+        focus_context = focus_mod.FocusThreadContext(
+            focus_event=event,
+            core_events=[event],
+            vision_bundle=focus_mod.VisionBundle(
+                image_urls=["older.jpg", "latest.jpg"],
+                direct_image_urls=[],
+                is_direct_request=False,
+                is_image_only=True,
+                source="focus_thread",
+            ),
+        )
+        event.set_extra("astrmai_focus_thread_context", focus_context)
+
+        asyncio.run(planner.plan_and_execute(event, [event]))
+
+        self.assertEqual(
+            planner.executor.calls[0]["direct_vision_urls"],
+            ["latest.jpg"],
+        )
+
+    def test_final_reply_inline_image_wins_over_same_message_reply_image(self):
+        event = _FakeEvent(text="please compare this image")
+        event.timestamp = 20.0
+        candidate_mod = importlib.import_module(
+            "astrmai.conversation.contracts.vision_candidate"
+        )
+        reply_candidate = candidate_mod.VisionCandidate(
+            message_id="message-1",
+            group_id="group-1",
+            sender_id="user-1",
+            timestamp=20.0,
+            image_index=0,
+            candidate_refs=("quoted.jpg",),
+            source_kind="reply",
+            reply_to_message_id="quoted-message",
+            prefilter_selected=True,
+        )
+        inline_candidate = candidate_mod.VisionCandidate(
+            message_id="message-1",
+            group_id="group-1",
+            sender_id="user-1",
+            timestamp=20.0,
+            image_index=1,
+            candidate_refs=("inline.jpg",),
+            source_kind="inline",
+            prefilter_selected=True,
+        )
+        event.set_extra(
+            "astrmai_vision_candidates",
+            [reply_candidate.as_dict(), inline_candidate.as_dict()],
+        )
+        focus_mod = importlib.import_module("astrmai.conversation.contracts.focus_context")
+        focus_context = focus_mod.FocusThreadContext(
+            focus_event=event,
+            core_events=[event],
+        )
+
+        selected = self.planner_mod.Planner._latest_reply_vision_urls(
+            event, focus_context
+        )
+
+        self.assertEqual(selected, ["inline.jpg"])
+        target = event.get_extra("astrmai_final_vision_target")
+        self.assertEqual(target["message_id"], "message-1")
+        self.assertEqual(target["source_kind"], "inline")
+
+    def test_final_reply_does_not_bypass_prefilter_through_legacy_bundle(self):
+        event = _FakeEvent(text="ambient image")
+        candidate_mod = importlib.import_module(
+            "astrmai.conversation.contracts.vision_candidate"
+        )
+        rejected = candidate_mod.VisionCandidate(
+            message_id="message-rejected",
+            group_id="group-1",
+            sender_id="user-1",
+            timestamp=30.0,
+            image_index=0,
+            candidate_refs=("rejected.jpg",),
+            prefilter_selected=False,
+        )
+        event.set_extra("astrmai_vision_candidates", [rejected.as_dict()])
+        focus_mod = importlib.import_module("astrmai.conversation.contracts.focus_context")
+        focus_context = focus_mod.FocusThreadContext(
+            focus_event=event,
+            core_events=[event],
+            vision_bundle=focus_mod.VisionBundle(
+                image_urls=["rejected.jpg"],
+                direct_image_urls=[],
+                source="focus_thread",
+            ),
+        )
+
+        selected = self.planner_mod.Planner._latest_reply_vision_urls(
+            event, focus_context
+        )
+
+        self.assertEqual(selected, [])
+        self.assertIsNone(event.get_extra("astrmai_final_vision_target"))
+
+    def test_wait_and_ignore_never_schedule_selected_vision_candidate(self):
+        candidate_mod = importlib.import_module(
+            "astrmai.conversation.contracts.vision_candidate"
+        )
+        for action in ("wait", "ignore"):
+            with self.subTest(action=action):
+                decision = self.planner_mod.CognitiveDecision(
+                    action=action,
+                    reply_need=action,
+                    intent="do not answer",
+                )
+                planner = self._make_planner(decision)
+                event = _FakeEvent(text="look")
+                _install_focus_extras(event)
+                selected = candidate_mod.VisionCandidate(
+                    message_id=f"message-{action}",
+                    group_id="group-1",
+                    sender_id="user-1",
+                    timestamp=40.0,
+                    image_index=0,
+                    candidate_refs=(f"{action}.jpg",),
+                    prefilter_selected=True,
+                )
+                event.set_extra("astrmai_vision_candidates", [selected.as_dict()])
+
+                result = asyncio.run(planner.plan_and_execute(event, [event]))
+
+                self.assertEqual(result, "")
+                self.assertEqual(planner.executor.calls, [])
+                self.assertIsNone(event.get_extra("astrmai_final_vision_target"))
 
     def test_judge_call_count_accepts_gateway_pool_and_legacy_stage(self):
         calls = [

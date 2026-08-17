@@ -206,6 +206,7 @@ class VisualAsset(SQLModel, table=True):
     storage_path: str = Field(default="")
     status: str = Field(default="ready", index=True)
     hit_count: int = Field(default=0)
+    reuse_count: int = Field(default=0)
     last_error: str = Field(default="")
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)

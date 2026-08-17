@@ -729,6 +729,9 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         self.assertIn("一只猫举着写有加油的牌子", result)
         self.assertIn("鼓励", result)
         self.assertIn("emoji", result)
+        with Session(engine) as session:
+            asset = session.get(VisualAsset, "asset-stored")
+        self.assertEqual(asset.reuse_count, 1)
 
     def test_05_cross_session_reply_lookup_reads_friend_history(self):
         event = _FakeEvent(group_id="777")

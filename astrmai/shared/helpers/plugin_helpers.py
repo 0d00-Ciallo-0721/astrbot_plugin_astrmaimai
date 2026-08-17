@@ -165,9 +165,11 @@ def is_at_message_component(component: Any) -> bool:
 def resolve_at_target_id(component: Any) -> str:
     if not is_at_message_component(component):
         return ""
+    data = component.get("data") if isinstance(component, dict) else None
+    nested_data = data if isinstance(data, dict) else {}
     for field_name in ("qq", "target", "target_id", "user_id"):
         value = (
-            component.get(field_name)
+            component.get(field_name, nested_data.get(field_name))
             if isinstance(component, dict)
             else getattr(component, field_name, None)
         )

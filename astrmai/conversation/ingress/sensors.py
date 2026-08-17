@@ -14,6 +14,7 @@ from ...shared.helpers.plugin_helpers import (
     is_at_message_component,
     resolve_at_target_id,
 )
+from ..contracts.vision_candidate import VisionCandidate, unique_image_refs
 from ..vision_state import derive_vision_state, user_asked_about_image
 from .poke_play import PokePlaybook
 
@@ -162,11 +163,30 @@ class PreFilters:
         # ==========================================
         has_at_bot = False
         reply_image_urls = []
+        vision_candidates: list[VisionCandidate] = []
+        pending_reply_ids: list[str] = []
         raw_image_component_count = 0
         reply_image_component_count = 0
         bot_id = get_event_self_id(event)
         # 判断私聊环境 (如果不存在 group_id 则为私聊)
         is_private = not bool(event.get_group_id())
+        message_obj = getattr(event, "message_obj", None)
+        message_id = str(
+            getattr(message_obj, "message_id", "")
+            or getattr(message_obj, "id", "")
+            or getattr(event, "message_id", "")
+            or ""
+        )
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+        try:
+            message_timestamp = float(
+                getattr(event, "timestamp", 0.0)
+                or getattr(message_obj, "timestamp", 0.0)
+                or time.time()
+            )
+        except (TypeError, ValueError):
+            message_timestamp = time.time()
         reply_cls = getattr(Comp, "Reply", None)
         plain_cls = getattr(Comp, "Plain", None)
         image_cls = getattr(Comp, "Image", None)
@@ -181,27 +201,85 @@ class PreFilters:
             if cls is not None
         )
 
-        async def _extract_image_ref(image_component):
-            file_path = getattr(image_component, "file", None) or getattr(image_component, "path", None)
-            if file_path:
-                return str(file_path)
-            # non-HTTP URLs (WeChat wxfile://, QQ local references, etc.) may be extractable
-            image_url = getattr(image_component, "url", None) or getattr(image_component, "image_url", None) or getattr(image_component, "src", None)
-            if image_url and not str(image_url).startswith(("http://", "https://")):
-                return str(image_url)
+        raw_inline_refs: list[tuple[str, ...]] = []
+        raw_event = getattr(message_obj, "raw_message", None)
+        raw_segments = raw_event.get("message") if isinstance(raw_event, dict) else None
+        if isinstance(raw_segments, list):
+            for raw_segment in raw_segments:
+                if not isinstance(raw_segment, dict) or str(raw_segment.get("type", "")).lower() != "image":
+                    continue
+                raw_data = raw_segment.get("data") if isinstance(raw_segment.get("data"), dict) else raw_segment
+                refs = unique_image_refs(
+                    raw_data.get(key)
+                    for key in ("local_path", "path", "file", "file_id", "url", "file_unique")
+                )
+                if refs:
+                    raw_inline_refs.append(refs)
+
+        async def _extract_image_refs(image_component):
+            refs = list(
+                unique_image_refs(
+                    getattr(image_component, key, None)
+                    for key in (
+                        "local_path",
+                        "path",
+                        "file",
+                        "file_id",
+                        "url",
+                        "image_url",
+                        "src",
+                        "file_unique",
+                    )
+                )
+            )
             file_to_base64 = getattr(image_component, "file_to_base64", None)
-            if callable(file_to_base64):
+            if not refs and callable(file_to_base64):
                 try:
                     encoded = file_to_base64()
                     if inspect.isawaitable(encoded):
                         encoded = await encoded
                     if encoded:
-                        return f"data:image/jpeg;base64,{encoded}"
+                        refs.append(f"data:image/jpeg;base64,{encoded}")
                 except Exception:
                     pass
-            return ""
+            return unique_image_refs(refs)
 
-        async def _scan_reply_chain(chain):
+        def _append_candidate(
+            refs,
+            *,
+            source_kind: str,
+            reply_to_message_id: str = "",
+        ) -> None:
+            normalized_refs = unique_image_refs(refs)
+            if not normalized_refs:
+                return
+            for index, existing in enumerate(vision_candidates):
+                if set(existing.candidate_refs).intersection(normalized_refs):
+                    vision_candidates[index] = VisionCandidate(
+                        message_id=existing.message_id,
+                        group_id=existing.group_id,
+                        sender_id=existing.sender_id,
+                        timestamp=existing.timestamp,
+                        image_index=existing.image_index,
+                        candidate_refs=unique_image_refs([*existing.candidate_refs, *normalized_refs]),
+                        source_kind=existing.source_kind,
+                        reply_to_message_id=existing.reply_to_message_id or reply_to_message_id,
+                    )
+                    return
+            vision_candidates.append(
+                VisionCandidate(
+                    message_id=message_id,
+                    group_id=group_id,
+                    sender_id=sender_id,
+                    timestamp=message_timestamp,
+                    image_index=len(vision_candidates),
+                    candidate_refs=normalized_refs,
+                    source_kind=source_kind,
+                    reply_to_message_id=reply_to_message_id,
+                )
+            )
+
+        async def _scan_reply_chain(chain, reply_to_message_id: str = ""):
             """递归扫描引用链中的图片"""
             nonlocal reply_image_component_count
             urls = []
@@ -210,11 +288,23 @@ class PreFilters:
             for c in chain:
                 if image_cls is not None and isinstance(c, image_cls):
                     reply_image_component_count += 1
-                    image_ref = await _extract_image_ref(c)
-                    if image_ref:
-                        urls.append(image_ref)
+                    image_refs = await _extract_image_refs(c)
+                    if image_refs:
+                        urls.append(image_refs[0])
+                        _append_candidate(
+                            image_refs,
+                            source_kind="reply",
+                            reply_to_message_id=reply_to_message_id,
+                        )
                 elif reply_cls is not None and isinstance(c, reply_cls) and hasattr(c, 'chain'):
-                    urls.extend(await _scan_reply_chain(c.chain))
+                    nested_reply_id = str(
+                        getattr(c, "id", "")
+                        or getattr(c, "message_id", "")
+                        or getattr(c, "reply_id", "")
+                        or reply_to_message_id
+                        or ""
+                    )
+                    urls.extend(await _scan_reply_chain(c.chain, nested_reply_id))
             return urls
 
         if event.message_obj and event.message_obj.message:
@@ -226,8 +316,18 @@ class PreFilters:
                     
                 # 探针：检测引用组件，并递归挖掘被引用消息中的图片
                 if reply_cls is not None and isinstance(seg, reply_cls):
+                    has_payload = True
+                    reply_id = str(
+                        getattr(seg, "id", "")
+                        or getattr(seg, "message_id", "")
+                        or getattr(seg, "reply_id", "")
+                        or getattr(seg, "target_id", "")
+                        or ""
+                    ).strip()
+                    if reply_id:
+                        pending_reply_ids.append(reply_id)
                     if hasattr(seg, 'chain'):
-                        scanned_reply_images = await _scan_reply_chain(seg.chain)
+                        scanned_reply_images = await _scan_reply_chain(seg.chain, reply_id)
                         if scanned_reply_images:
                             has_payload = True
                             reply_image_urls.extend(scanned_reply_images)
@@ -250,23 +350,29 @@ class PreFilters:
                 # 顺手提取 URL
                 if image_cls is not None and isinstance(seg, image_cls):
                     raw_image_component_count += 1
-                    image_ref = await _extract_image_ref(seg)
-                    if image_ref:
-                        image_urls.append(image_ref)
+                    image_refs = list(await _extract_image_refs(seg))
+                    raw_index = raw_image_component_count - 1
+                    if raw_index < len(raw_inline_refs):
+                        image_refs = list(unique_image_refs([*image_refs, *raw_inline_refs[raw_index]]))
+                    if image_refs:
+                        image_urls.append(image_refs[0])
+                        _append_candidate(image_refs, source_kind="inline")
+
+        if has_at_bot:
+            for reply_id in pending_reply_ids:
+                if not any(candidate.reply_to_message_id == reply_id for candidate in vision_candidates):
+                    _append_candidate(
+                        [f"onebot-message://{reply_id}"],
+                        source_kind="reply",
+                        reply_to_message_id=reply_id,
+                    )
                     
-        # 封装着色逻辑：主脑视觉直通车
-        direct_vision_urls = []
-        
-        if is_private and image_urls:
-            direct_vision_urls.extend(image_urls)
-        elif has_at_bot:
-            if image_urls:
-                direct_vision_urls.extend(image_urls)
-            if reply_image_urls:
-                direct_vision_urls.extend(reply_image_urls)
-        
-        if direct_vision_urls:
-            direct_vision_urls = list(dict.fromkeys(direct_vision_urls))
+        # 私聊/@Bot 图片立即进入视觉；普通群图仅由概率闸门决定是否进入回复判断。
+        # 普通群图即使命中，也延迟到真正回复阶段才识别，避免为最终 IGNORE 的消息付视觉调用。
+        candidate_refs = [candidate.primary_ref for candidate in vision_candidates if candidate.primary_ref]
+        force_direct_vision = bool(candidate_refs) and is_private
+        explicit_group_vision = bool(candidate_refs) and has_at_bot and not is_private
+        direct_vision_urls = candidate_refs[:] if force_direct_vision else []
         vision_cfg = getattr(self.config, "vision", None)
         vision_enabled = bool(getattr(vision_cfg, "enable_vision", True))
         probability = getattr(vision_cfg, "image_recognition_probability", 1.0)
@@ -275,43 +381,78 @@ class PreFilters:
         except (TypeError, ValueError):
             probability = 1.0
         probability = max(0.0, min(1.0, probability))
-        force_direct_vision = bool(direct_vision_urls) and (is_private or has_at_bot)
-
-        selected_direct = bool(direct_vision_urls)
+        prefilter_selected = False
         vision_direct_skip_reason = ""
-        if direct_vision_urls and not vision_enabled:
-            selected_direct = False
+        if candidate_refs and not vision_enabled:
             vision_direct_skip_reason = "disabled"
             logger.debug("[AstrMai-Sensor] vision direct path skipped: disabled")
-        elif direct_vision_urls and not force_direct_vision and random.random() > probability:
-            selected_direct = False
-            vision_direct_skip_reason = "probability_gate"
-            logger.debug(
-                "[AstrMai-Sensor] vision direct path skipped by probability gate "
-                f"(p={probability:.2f}, candidates={len(direct_vision_urls)})"
-            )
-        elif direct_vision_urls:
+        elif force_direct_vision:
+            prefilter_selected = True
             event.set_extra("direct_vision_urls", direct_vision_urls)
             event.set_extra("direct_image_refs", direct_vision_urls)
             logger.debug(
                 "[AstrMai-Sensor] vision direct path selected "
                 f"(urls={len(direct_vision_urls)}, probability={probability:.2f}, "
-                f"forced={force_direct_vision})"
+                "forced=True)"
             )
+        elif explicit_group_vision:
+            prefilter_selected = True
+            vision_direct_skip_reason = "deferred_to_reply"
+            logger.debug(
+                "[AstrMai-Sensor] addressed group image deferred to final reply "
+                f"(candidates={len(candidate_refs)})"
+            )
+        elif candidate_refs:
+            probability_hit = probability >= 1.0 or (
+                probability > 0.0 and random.random() < probability
+            )
+            if probability_hit:
+                prefilter_selected = True
+                vision_direct_skip_reason = "deferred_to_reply"
+                logger.debug(
+                    "[AstrMai-Sensor] passive group image selected for reply consideration "
+                    f"(p={probability:.2f}, candidates={len(candidate_refs)})"
+                )
+            else:
+                vision_direct_skip_reason = "probability_gate"
+                logger.debug(
+                    "[AstrMai-Sensor] passive group image skipped by probability gate "
+                    f"(p={probability:.2f}, candidates={len(candidate_refs)})"
+                )
         else:
             vision_direct_skip_reason = "not_direct_path"
 
+        selected_direct = bool(direct_vision_urls and prefilter_selected)
+        selected_candidates = [
+            candidate.with_selection(
+                selected=prefilter_selected,
+                pairing_mode=(
+                    "same_message_reply"
+                    if explicit_group_vision and candidate.source_kind == "reply"
+                    else "same_message" if explicit_group_vision else "none"
+                ),
+            )
+            for candidate in vision_candidates
+        ]
+        event.set_extra("astrmai_vision_candidates", [candidate.as_dict() for candidate in selected_candidates])
+        event.set_extra("vision_prefilter_probability", probability)
+        event.set_extra("vision_prefilter_sampled", bool(candidate_refs and not force_direct_vision and not explicit_group_vision and vision_enabled and 0.0 < probability < 1.0))
+        event.set_extra("vision_prefilter_selected", prefilter_selected)
         event.set_extra("vision_direct_selected", selected_direct)
         event.set_extra("vision_direct_skip_reason", vision_direct_skip_reason)
         event.set_extra("astrmai_is_direct_vision_request", selected_direct)
         event.set_extra(
             "astrmai_is_passive_image_share",
-            bool(image_urls) and not selected_direct and not is_private and not has_at_bot,
+            bool(candidate_refs) and not is_private and not has_at_bot,
         )
         if has_at_bot:
             event.set_extra("astrmai_at_bot_wakeup", True)
             if not is_private:
                 event.set_extra("astrmai_group_direct_wakeup", True)
+        event.set_extra(
+            "astrmai_pure_at_bot",
+            bool(has_at_bot and not clean_text_parts and not has_payload),
+        )
         # ==========================================
 
         clean_text = " ".join(clean_text_parts).strip().lower()

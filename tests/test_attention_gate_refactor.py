@@ -1503,7 +1503,7 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             "internal_event_envelope",
         )
 
-    def test_group_direct_image_waits_for_visual_context_before_fast_dispatch(self):
+    def test_group_direct_message_does_not_run_pre_judge_visual_barrier(self):
         class _GroupVisionBarrier:
             def __init__(self):
                 self.calls = []
@@ -1539,13 +1539,10 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         status = asyncio.run(_run())
 
         self.assertEqual(status, "ENGAGED")
-        self.assertEqual(
-            barrier.calls,
-            [("你看", "default:GroupMessage:group-1")],
-        )
-        self.assertEqual(captured, [("你看\n[图片转述：一只白猫坐在窗边]", True)])
+        self.assertEqual(barrier.calls, [])
+        self.assertEqual(captured, [("", False)])
 
-    def test_group_required_vision_failure_stops_before_dispatch(self):
+    def test_group_required_vision_barrier_is_deferred_to_executor(self):
         class _RequiredVisionBarrier:
             async def prepare_direct_event(self, event, chat_id):
                 event.set_extra("astrmai_vision_required_failed", True)
@@ -1553,7 +1550,11 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         self.gate.private_turn_coordinator = _RequiredVisionBarrier()
         system2_calls = []
-        self.gate.sys2_process = lambda event, events: system2_calls.append((event, events))
+
+        async def fake_sys2(event, events):
+            system2_calls.append((event, events))
+
+        self.gate.sys2_process = fake_sys2
         event = _FakeEvent("user-1", "Alice", "你看", extras={"wakeup": True})
         sent = []
 
@@ -1565,10 +1566,10 @@ class RefactoredAttentionGateTests(unittest.TestCase):
 
         status = asyncio.run(self.gate.process_event(event))
 
-        self.assertEqual(status, "VISION_REQUIRED_FAILED")
-        self.assertEqual(system2_calls, [])
-        self.assertEqual(sent, ["这张图片暂时没有识别成功，请稍后再发一次。"])
-        self.assertTrue(event.get_extra("astrmai_vision_failure_notice_sent"))
+        self.assertEqual(status, "ENGAGED")
+        self.assertEqual(len(system2_calls), 1)
+        self.assertEqual(sent, [])
+        self.assertFalse(event.get_extra("astrmai_vision_failure_notice_sent", False))
 
     def test_private_required_vision_failure_stops_before_mood_judge_and_system2(self):
         class _RequiredVisionBarrier:

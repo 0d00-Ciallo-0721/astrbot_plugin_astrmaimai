@@ -22,8 +22,9 @@ def test_visual_asset_timing_migration_upgrades_existing_table(tmp_path):
         }
         version = db.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == 87
+    assert version == 88
     assert "initial_recognition_elapsed_ms" in columns
+    assert "reuse_count" in columns
     assert float(columns["initial_recognition_elapsed_ms"][4]) == 0.0
 
 
@@ -38,6 +39,7 @@ def test_visual_asset_timing_migration_bootstraps_sparse_database(tmp_path):
         }
         version = db.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == 87
+    assert version == 88
     assert "asset_id" in columns
     assert "initial_recognition_elapsed_ms" in columns
+    assert "reuse_count" in columns

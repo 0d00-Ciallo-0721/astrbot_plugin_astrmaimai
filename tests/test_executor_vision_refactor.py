@@ -33,6 +33,9 @@ class _FakeGateway:
             return self.vision_result(kwargs)
         return self.vision_result
 
+    def get_agent_models(self):
+        return ["agent-test"]
+
 
 class _FakeReplyService:
     async def handle_reply(self, event, text, chat_id):
@@ -61,6 +64,26 @@ class _FakeVisualCortex:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+
+class _FakeImageResolver:
+    def __init__(self, local_path, *, strategy="get_msg"):
+        self.local_path = local_path
+        self.strategy = strategy
+        self.calls = []
+
+    async def resolve_candidate(self, event, candidate):
+        self.calls.append({"event": event, "candidate": candidate})
+        return SimpleNamespace(
+            images=[
+                SimpleNamespace(
+                    local_path=self.local_path,
+                    source_ref="resolved-ref",
+                    strategy=self.strategy,
+                )
+            ],
+            failures=[],
+        )
 
 
 class _FakeEvent:
@@ -101,7 +124,15 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         except Exception:
             pass
 
-    def _executor(self, vision_result, *, visual_cortex=None, vision_policy="超时后忽略图片并继续回复"):
+    def _executor(
+        self,
+        vision_result,
+        *,
+        visual_cortex=None,
+        image_resolver=None,
+        runtime_coordinator=None,
+        vision_policy="超时后忽略图片并继续回复",
+    ):
         gateway = _FakeGateway(vision_result=vision_result, vision_policy=vision_policy)
         executor = self.executor_mod.ConcurrentExecutor(
             context=SimpleNamespace(),
@@ -110,6 +141,8 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
             evolution_manager=_FakeEvolution(),
             config=gateway.config,
             visual_cortex=visual_cortex,
+            image_resolver=image_resolver,
+            runtime_coordinator=runtime_coordinator,
         )
         return executor, gateway
 
@@ -312,6 +345,120 @@ class RefactoredExecutorVisionTests(unittest.TestCase):
         self.assertEqual(observation["visual_memory_write_status"], "persisted_or_cache_hit")
         self.assertTrue(observation["visual_memory_ids"])
         self.assertTrue(observation["prompt_injected"])
+
+    def test_final_reply_resolves_and_injects_only_selected_latest_image(self):
+        resolved_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        resolved_image.close()
+        resolver = _FakeImageResolver(resolved_image.name, strategy="get_msg")
+        visual_cortex = _FakeVisualCortex(
+            {
+                "type": "image",
+                "description": "最新图片里是一杯布丁。",
+                "emotion_tags": [],
+                "_cache_hit": False,
+            }
+        )
+        executor, _gateway = self._executor(
+            {},
+            visual_cortex=visual_cortex,
+            image_resolver=resolver,
+        )
+        event = _FakeEvent()
+        event.set_extra(
+            "astrmai_final_vision_target",
+            {
+                "message_id": "message-latest",
+                "candidate_refs": ["expired-url"],
+                "source_kind": "inline",
+                "prefilter_selected": True,
+            },
+        )
+        bundle = self.executor_mod.VisionBundle(
+            image_urls=["expired-url"],
+            direct_image_urls=["expired-url"],
+            is_direct_request=True,
+            is_image_only=True,
+            source="focus_thread",
+        )
+
+        try:
+            model_prompt, _system_prompt = asyncio.run(
+                executor._inject_direct_vision_context(
+                    event,
+                    "default:GroupMessage:group-1",
+                    "prompt",
+                    "system",
+                    bundle,
+                )
+            )
+        finally:
+            try:
+                os.remove(resolved_image.name)
+            except OSError:
+                pass
+
+        self.assertEqual(len(resolver.calls), 1)
+        self.assertEqual(resolver.calls[0]["candidate"]["message_id"], "message-latest")
+        self.assertEqual(len(visual_cortex.calls), 1)
+        self.assertEqual(visual_cortex.calls[0]["image_path"], resolved_image.name)
+        self.assertIn("[最新图片转述]", model_prompt)
+        self.assertIn("最新图片里是一杯布丁", model_prompt)
+        self.assertEqual(event.get_extra("astrmai_final_vision_resolver_strategy"), "get_msg")
+
+    def test_post_vision_stale_turn_never_calls_final_text_model(self):
+        resolved_image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        resolved_image.close()
+        resolver = _FakeImageResolver(resolved_image.name)
+        visual_cortex = _FakeVisualCortex(
+            {"type": "image", "description": "一张已经识别的图片。", "emotion_tags": []}
+        )
+        executor, _gateway = self._executor(
+            {},
+            visual_cortex=visual_cortex,
+            image_resolver=resolver,
+        )
+        event = _FakeEvent()
+        event.set_extra(
+            "astrmai_final_vision_target",
+            {
+                "message_id": "message-stale",
+                "candidate_refs": ["stale-ref"],
+                "prefilter_selected": True,
+            },
+        )
+        freshness_results = iter((True, False))
+        text_calls = []
+
+        async def _freshness(*_args, **_kwargs):
+            return next(freshness_results)
+
+        async def _text_mode(*args, **kwargs):
+            text_calls.append((args, kwargs))
+            return "should-not-run"
+
+        executor._check_pre_model_freshness = _freshness
+        executor._run_text_mode = _text_mode
+
+        try:
+            result = asyncio.run(
+                executor.execute(
+                    event,
+                    prompt="prompt",
+                    system_prompt="system",
+                    direct_vision_urls=["stale-ref"],
+                )
+            )
+        finally:
+            try:
+                os.remove(resolved_image.name)
+            except OSError:
+                pass
+
+        self.assertIsNone(result)
+        self.assertEqual(len(resolver.calls), 1)
+        self.assertEqual(len(visual_cortex.calls), 1)
+        self.assertEqual(text_calls, [])
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "stale_drop")
 
     def test_direct_vision_timeout_fallback_injects_image_placeholder(self):
         visual_cortex = _FakeVisualCortex(asyncio.TimeoutError())

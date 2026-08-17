@@ -19,6 +19,7 @@ class ResolvedImage:
     index: int
     source_ref: str
     local_path: str
+    strategy: str = "direct"
 
 
 @dataclass(slots=True)
@@ -66,6 +67,33 @@ class NapCatImageResolver:
         """Resolve images from a historical OneBot ``get_msg`` payload."""
         references = self._extract_payload_image_references(payload)
         return await self._resolve_references(event, references)
+
+    async def resolve_candidate(self, event: Any, candidate: Any) -> ImageResolutionBatch:
+        """Resolve exactly one final-reply candidate with NapCat refresh fallbacks."""
+
+        values = candidate if isinstance(candidate, dict) else {}
+        raw_references = values.get("candidate_refs") or values.get("refs") or []
+        if isinstance(raw_references, str):
+            raw_references = [raw_references]
+        references = self._unique_refs(raw_references)
+        source_message_id = str(
+            values.get("reply_to_message_id")
+            or values.get("message_id")
+            or values.get("selected_from_message_id")
+            or ""
+        ).strip()
+        result = ImageResolutionBatch(had_images=bool(references or source_message_id))
+        resolved = await self._resolve_candidates(
+            event,
+            0,
+            references,
+            source_message_id=source_message_id,
+        )
+        if resolved is None:
+            result.failures.append(references[0] if references else source_message_id or "image-0")
+        else:
+            result.images.append(resolved)
+        return result
 
     async def _resolve_references(
         self,
@@ -172,34 +200,70 @@ class NapCatImageResolver:
         event: Any,
         index: int,
         candidates: list[str],
+        *,
+        source_message_id: str = "",
+        allow_message_refresh: bool = True,
     ) -> ResolvedImage | None:
         for candidate in candidates:
             local_path = await self._materialize_reference(candidate, index)
             if local_path:
-                return ResolvedImage(index=index, source_ref=candidate, local_path=local_path)
+                return ResolvedImage(index=index, source_ref=candidate, local_path=local_path, strategy="direct")
 
         api = getattr(getattr(getattr(event, "bot", None), "api", None), "call_action", None)
         if not callable(api):
             return None
         for candidate in candidates:
-            for params in ({"file": candidate}, {"file_id": candidate}):
-                try:
-                    response = await api("get_image", **params)
-                except Exception as exc:
-                    logger.debug(
-                        "[AstrMai-Vision] NapCat get_image degraded "
-                        f"error={type(exc).__name__}"
+            if candidate.startswith("onebot-message://"):
+                continue
+            for action in ("get_image", "get_file"):
+                for params in ({"file": candidate}, {"file_id": candidate}):
+                    try:
+                        response = await api(action, **params)
+                    except Exception as exc:
+                        logger.debug(
+                            f"[AstrMai-Vision] NapCat {action} degraded "
+                            f"error={type(exc).__name__}"
+                        )
+                        continue
+                    for source in self._extract_response_sources(response):
+                        local_path = await self._materialize_reference(source, index)
+                        if local_path:
+                            return ResolvedImage(
+                                index=index,
+                                source_ref=candidate,
+                                local_path=local_path,
+                                strategy=action,
+                            )
+        if allow_message_refresh and source_message_id:
+            try:
+                response = await api("get_msg", message_id=self._coerce_api_id(source_message_id))
+            except Exception as exc:
+                logger.debug(
+                    "[AstrMai-Vision] NapCat get_msg degraded "
+                    f"error={type(exc).__name__}"
+                )
+            else:
+                refreshed_references = self._extract_payload_image_references(response)
+                for refreshed in reversed(refreshed_references):
+                    resolved = await self._resolve_candidates(
+                        event,
+                        index,
+                        refreshed,
+                        source_message_id="",
+                        allow_message_refresh=False,
                     )
-                    continue
-                source = self._extract_response_source(response)
-                if not source:
-                    continue
-                local_path = await self._materialize_reference(source, index)
-                if local_path:
-                    return ResolvedImage(index=index, source_ref=candidate, local_path=local_path)
+                    if resolved is not None:
+                        return ResolvedImage(
+                            index=index,
+                            source_ref=resolved.source_ref,
+                            local_path=resolved.local_path,
+                            strategy="get_msg",
+                        )
         return None
 
     async def _materialize_reference(self, reference: str, index: int) -> str:
+        if reference.startswith("onebot-message://"):
+            return ""
         if reference.startswith("data:image"):
             try:
                 header, encoded = reference.split(",", 1)
@@ -236,17 +300,38 @@ class NapCatImageResolver:
         return os.path.abspath(value) if value else ""
 
     @staticmethod
-    def _extract_response_source(response: Any) -> str:
+    def _extract_response_sources(response: Any) -> list[str]:
         payload = response
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             payload = payload["data"]
         if not isinstance(payload, dict):
-            return ""
+            return []
+        sources: list[str] = []
         for key in ("file", "path", "url"):
             value = str(payload.get(key, "") or "").strip()
-            if value:
-                return value
-        return ""
+            if value and value not in sources:
+                sources.append(value)
+        encoded = str(payload.get("base64", "") or "").strip()
+        if encoded:
+            data_uri = f"data:image/jpeg;base64,{encoded}"
+            if data_uri not in sources:
+                sources.append(data_uri)
+        return sources
+
+    @classmethod
+    def _extract_response_source(cls, response: Any) -> str:
+        sources = cls._extract_response_sources(response)
+        return sources[0] if sources else ""
+
+    @staticmethod
+    def _coerce_api_id(value: str) -> str | int:
+        normalized = str(value or "").strip()
+        if normalized and normalized.lstrip("-").isdigit():
+            try:
+                return int(normalized)
+            except ValueError:
+                pass
+        return normalized
 
     def _cache_path(self, source: str, index: int, suffix: str) -> Path:
         digest = hashlib.sha256(source.encode("utf-8", errors="ignore")).hexdigest()[:20]

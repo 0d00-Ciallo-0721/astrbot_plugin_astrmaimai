@@ -125,6 +125,85 @@ class NapCatImageResolverTests(unittest.TestCase):
             self.assertEqual(result.images[0].index, 0)
             self.assertEqual(api.calls, [])
 
+    def test_final_candidate_falls_back_from_get_image_to_get_file(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        class _FallbackApi:
+            def __init__(self, source):
+                self.source = source
+                self.calls = []
+
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_file":
+                    return {"status": "ok", "retcode": 0, "data": {"file": self.source}}
+                return {"status": "ok", "retcode": 0, "data": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "refreshed.png"
+            source.write_bytes(b"image-bytes")
+            api = _FallbackApi(str(source))
+            event = _Event({"type": "text", "data": {"text": "current"}}, api)
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(
+                resolver.resolve_candidate(
+                    event,
+                    {
+                        "message_id": "message-1",
+                        "candidate_refs": ["expired-image-reference"],
+                    },
+                )
+            )
+
+            self.assertEqual(len(result.images), 1)
+            self.assertEqual(result.images[0].strategy, "get_file")
+            self.assertIn(("get_file", {"file": "expired-image-reference"}), api.calls)
+
+    def test_reply_candidate_uses_get_msg_when_component_chain_is_missing(self):
+        from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
+
+        class _MessageApi:
+            def __init__(self, source):
+                self.source = source
+                self.calls = []
+
+            async def call_action(self, action, **params):
+                self.calls.append((action, params))
+                if action == "get_msg":
+                    return {
+                        "status": "ok",
+                        "retcode": 0,
+                        "data": {
+                            "message": [
+                                {"type": "image", "data": {"path": self.source}}
+                            ]
+                        },
+                    }
+                return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "quoted.png"
+            source.write_bytes(b"image-bytes")
+            api = _MessageApi(str(source))
+            event = _Event({"type": "reply", "data": {"id": "42"}}, api)
+            resolver = NapCatImageResolver(Path(tmp) / "cache")
+
+            result = asyncio.run(
+                resolver.resolve_candidate(
+                    event,
+                    {
+                        "message_id": "current",
+                        "reply_to_message_id": "42",
+                        "candidate_refs": ["onebot-message://42"],
+                    },
+                )
+            )
+
+            self.assertEqual(len(result.images), 1)
+            self.assertEqual(result.images[0].strategy, "get_msg")
+            self.assertEqual(api.calls[-1], ("get_msg", {"message_id": 42}))
+
     def test_local_gif_with_jpg_suffix_is_cached_with_detected_suffix(self):
         from astrmai.multimodal.napcat_image_resolver import NapCatImageResolver
 

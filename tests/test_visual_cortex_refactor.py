@@ -272,6 +272,7 @@ class VisualCortexRefactorTests(unittest.TestCase):
         self.assertEqual(len(bindings), 2)
         self.assertEqual(len(legacy), 2)
         self.assertEqual(assets[0].model_id, "vision-test")
+        self.assertEqual(assets[0].reuse_count, 1)
         self.assertNotIn("private-source", bindings[0].source_ref_hash)
 
     def test_animated_content_cache_survives_restart_and_rebinds_message(self):
@@ -379,8 +380,50 @@ class VisualCortexRefactorTests(unittest.TestCase):
             assets[0].initial_recognition_elapsed_ms,
             first_recognition_elapsed_ms,
         )
+        self.assertEqual(assets[0].reuse_count, 1)
+
+    def test_visual_asset_reuse_counter_is_atomic_under_concurrency(self):
+        from astrmai.infrastructure.persistence.orm_models import VisualAsset
+
+        db_path = os.path.join(self.temp_dir.name, "reuse-counter.db")
+        db_url = f"sqlite:///{db_path.replace(os.sep, '/')}"
+        engine = create_engine(
+            db_url,
+            connect_args={"check_same_thread": False, "timeout": 30.0},
+        )
+        SQLModel.metadata.create_all(engine)
+
+        class _DB:
+            def get_session(self):
+                return Session(engine)
+
+        with Session(engine) as session:
+            session.add(
+                VisualAsset(
+                    asset_id="asset-concurrent",
+                    status="ready",
+                    description="cached",
+                )
+            )
+            session.commit()
+        cortex = self.visual_mod.VisualCortex(SimpleNamespace(), _DB())
+
+        async def _run():
+            return await asyncio.gather(
+                *(cortex.record_asset_reuse("asset-concurrent") for _ in range(20))
+            )
+
+        results = asyncio.run(_run())
+        with Session(engine) as session:
+            asset = session.get(VisualAsset, "asset-concurrent")
+
+        self.assertTrue(all(results))
+        self.assertEqual(asset.reuse_count, 20)
+        engine.dispose()
 
     def test_concurrent_same_image_uses_singleflight(self):
+        from astrmai.infrastructure.persistence.orm_models import VisualAsset
+
         class _Gateway:
             def __init__(self):
                 self.calls = 0
@@ -396,8 +439,20 @@ class VisualCortexRefactorTests(unittest.TestCase):
 
         path = os.path.join(self.temp_dir.name, "singleflight.png")
         Image.new("RGB", (6, 6), color="green").save(path, format="PNG")
+        db_path = os.path.join(self.temp_dir.name, "singleflight.db")
+        db_url = f"sqlite:///{db_path.replace(os.sep, '/')}"
+        engine = create_engine(
+            db_url,
+            connect_args={"check_same_thread": False, "timeout": 30.0},
+        )
+        SQLModel.metadata.create_all(engine)
+
+        class _DB:
+            def get_session(self):
+                return Session(engine)
+
         gateway = _Gateway()
-        cortex = self.visual_mod.VisualCortex(gateway, db_service=None)
+        cortex = self.visual_mod.VisualCortex(gateway, db_service=_DB())
 
         async def _run():
             return await asyncio.gather(
@@ -411,6 +466,42 @@ class VisualCortexRefactorTests(unittest.TestCase):
         self.assertTrue(
             first["_singleflight_join"] or second["_singleflight_join"]
         )
+        with Session(engine) as session:
+            asset = session.get(VisualAsset, first["_asset_id"])
+            self.assertEqual(asset.reuse_count, 0)
+        engine.dispose()
+
+    def test_reuse_counter_ignores_non_ready_asset(self):
+        from astrmai.infrastructure.persistence.orm_models import VisualAsset
+
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(engine)
+
+        class _DB:
+            def get_session(self):
+                return Session(engine)
+
+        with Session(engine) as session:
+            session.add(
+                VisualAsset(
+                    asset_id="asset-failed",
+                    status="failed",
+                    description="unusable",
+                )
+            )
+            session.commit()
+        cortex = self.visual_mod.VisualCortex(SimpleNamespace(), _DB())
+
+        counted = asyncio.run(cortex.record_asset_reuse("asset-failed"))
+
+        with Session(engine) as session:
+            asset = session.get(VisualAsset, "asset-failed")
+            self.assertEqual(asset.reuse_count, 0)
+        self.assertFalse(counted)
 
     def test_failed_image_enters_cooldown_and_does_not_repeat_model_call(self):
         class _Gateway:

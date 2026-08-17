@@ -13,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.turn_context import build_turn_trace_summary, ensure_turn_context
+from ..contracts.vision_candidate import VisionCandidate, load_vision_candidates
 from ..vision_state import (
     classify_autonomous_vision_need,
     select_autonomous_vision_candidate,
@@ -159,6 +160,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             config=gateway.config,
             runtime_coordinator=runtime_coordinator,
             visual_cortex=visual_cortex,
+            image_resolver=image_resolver,
         )
 
     def refresh_config(self, config) -> None:
@@ -971,25 +973,77 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         if bool(event.get_extra("astrmai_vision_barrier_complete", False)):
             return []
 
-        turn_context = ensure_turn_context(event)
-        window_events = list(getattr(turn_context.attention, "window_events", []) or [])
-        if not window_events:
-            window_events = list(event.get_extra("astrmai_window_events", []) or [])
-        for candidate in reversed(window_events):
-            refs = cls._event_image_refs(candidate)
-            if not refs:
+        thread_events: list = []
+        all_thread_events = getattr(focus_context, "all_thread_events", None)
+        if callable(all_thread_events):
+            thread_events = list(all_thread_events() or [])
+        if not thread_events:
+            thread_events = [event]
+
+        ranked: list[tuple[float, int, int, int, VisionCandidate, object]] = []
+        saw_typed_image_candidates = False
+        for event_order, source_event in enumerate(thread_events):
+            getter = getattr(source_event, "get_extra", None)
+            if not callable(getter):
                 continue
-            if bool(candidate.get_extra("astrmai_vision_barrier_complete", False)):
-                return []
-            if list(candidate.get_extra("astrmai_vision_records", []) or []):
-                return []
-            return [refs[-1]]
+            if bool(getter("astrmai_vision_barrier_complete", False)):
+                continue
+            if list(getter("astrmai_vision_records", []) or []):
+                continue
+            candidates = load_vision_candidates(getter("astrmai_vision_candidates", []) or [])
+            saw_typed_image_candidates = saw_typed_image_candidates or bool(candidates)
+            for candidate in candidates:
+                if not candidate.prefilter_selected:
+                    continue
+                source_priority = 1 if candidate.source_kind == "reply" else 2
+                ranked.append(
+                    (
+                        float(candidate.timestamp or getattr(source_event, "timestamp", 0.0) or 0.0),
+                        event_order,
+                        source_priority,
+                        int(candidate.image_index or 0),
+                        candidate,
+                        source_event,
+                    )
+                )
+
+        if ranked:
+            _, _, _, _, selected, source_event = max(ranked, key=lambda item: item[:4])
+            target = selected.as_dict()
+            target["selected_from_message_id"] = str(
+                getattr(getattr(source_event, "message_obj", None), "message_id", "")
+                or selected.message_id
+                or ""
+            )
+            event.set_extra("astrmai_final_vision_target", target)
+            event.set_extra("astrmai_final_vision_source_message_id", selected.message_id)
+            return [selected.primary_ref] if selected.primary_ref else []
+
+        if saw_typed_image_candidates:
+            return []
 
         bundle = getattr(focus_context, "vision_bundle", None)
         image_refs = list(getattr(bundle, "direct_image_urls", []) or []) or list(
             getattr(bundle, "image_urls", []) or []
         )
-        return [image_refs[-1]] if image_refs else []
+        if not image_refs:
+            return []
+        selected_ref = str(image_refs[-1] or "").strip()
+        if not selected_ref:
+            return []
+        legacy_target = VisionCandidate(
+            message_id=str(
+                getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+            ),
+            group_id=str(getattr(event, "get_group_id", lambda: "")() or ""),
+            sender_id=str(getattr(event, "get_sender_id", lambda: "")() or ""),
+            timestamp=float(getattr(event, "timestamp", 0.0) or 0.0),
+            image_index=max(0, len(image_refs) - 1),
+            candidate_refs=(selected_ref,),
+            prefilter_selected=True,
+        )
+        event.set_extra("astrmai_final_vision_target", legacy_target.as_dict())
+        return [selected_ref]
 
     async def _remember_turn_trace(
         self,

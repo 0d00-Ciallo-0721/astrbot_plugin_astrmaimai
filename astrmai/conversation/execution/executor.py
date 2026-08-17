@@ -88,6 +88,7 @@ class ConcurrentExecutor:
         config=None,
         runtime_coordinator=None,
         visual_cortex=None,
+        image_resolver=None,
     ):
         self.context = context
         self.gateway = gateway
@@ -96,6 +97,7 @@ class ConcurrentExecutor:
         self.config = config if config else gateway.config
         self.runtime_coordinator = runtime_coordinator
         self.visual_cortex = visual_cortex
+        self.image_resolver = image_resolver
         self._chat_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
@@ -630,6 +632,8 @@ class ConcurrentExecutor:
         chat_id: str,
         vision_bundle: VisionBundle,
     ) -> tuple[bool, str, float]:
+        if event.get_extra("astrmai_final_vision_target", None):
+            return False, "final_reply_translation_required", 0.0
         if not self._native_main_reply_vision_enabled():
             return False, "disabled", 0.0
         if self._vision_reply_policy() == "require_analysis":
@@ -1084,6 +1088,52 @@ class ConcurrentExecutor:
 
         started_at = monotonic()
         policy = self._vision_reply_policy()
+        original_direct_image_urls = list(vision_bundle.direct_image_urls or [])
+        resolver_failed_count = 0
+        resolver_strategy = ""
+        final_target = event.get_extra("astrmai_final_vision_target", None)
+        if final_target and self.image_resolver is not None:
+            resolve_timeout = min(
+                self._vision_side_path_timeout_override(),
+                max(
+                    0.1,
+                    float(
+                        getattr(
+                            getattr(self.config, "timing", None),
+                            "image_resolve_timeout_sec",
+                            15.0,
+                        )
+                        or 15.0
+                    ),
+                ),
+            )
+            try:
+                resolution = await asyncio.wait_for(
+                    self.image_resolver.resolve_candidate(event, final_target),
+                    timeout=resolve_timeout,
+                )
+            except asyncio.TimeoutError:
+                resolution = None
+                resolver_failed_count = 1
+                event.set_extra("astrmai_final_vision_resolve_status", "timeout")
+            except Exception as exc:
+                resolution = None
+                resolver_failed_count = 1
+                event.set_extra("astrmai_final_vision_resolve_status", f"failed:{type(exc).__name__}")
+                logger.warning(
+                    f"[{chat_id}] final reply image resolver degraded: {type(exc).__name__}"
+                )
+            if resolution is not None and resolution.images:
+                resolved_image = resolution.images[-1]
+                vision_bundle.direct_image_urls = [resolved_image.local_path]
+                resolver_strategy = str(getattr(resolved_image, "strategy", "") or "direct")
+                event.set_extra("astrmai_final_vision_resolve_status", "success")
+                event.set_extra("astrmai_final_vision_resolver_strategy", resolver_strategy)
+            else:
+                vision_bundle.direct_image_urls = []
+                resolver_failed_count = max(1, resolver_failed_count)
+                if not event.get_extra("astrmai_final_vision_resolve_status", ""):
+                    event.set_extra("astrmai_final_vision_resolve_status", "failed")
         configured_max_images = getattr(
             getattr(self.config, "vision", None),
             "max_images_per_turn",
@@ -1093,9 +1143,10 @@ class ConcurrentExecutor:
             max_images = max(1, min(int(configured_max_images or 1), 8))
         except (TypeError, ValueError):
             max_images = 1
-        all_direct_image_urls = list(vision_bundle.direct_image_urls or [])
-        direct_image_urls = all_direct_image_urls[:max_images]
-        dropped_image_count = max(0, len(all_direct_image_urls) - len(direct_image_urls))
+        all_direct_image_urls = original_direct_image_urls or list(vision_bundle.direct_image_urls or [])
+        final_reply_limit = 1 if final_target else max_images
+        direct_image_urls = list(vision_bundle.direct_image_urls or [])[:final_reply_limit]
+        dropped_image_count = max(0, len(all_direct_image_urls) - len(direct_image_urls) - resolver_failed_count)
         event.set_extra("astrmai_vision_owner", "direct")
         event.set_extra("astrmai_vision_state", "analysis_pending")
         logger.info(f"[{chat_id}] vision direct path triggered in executor")
@@ -1105,7 +1156,7 @@ class ConcurrentExecutor:
         asset_ids: list[str] = []
         model_ids: list[str] = []
         image_sources: list[str] = []
-        failed_count = 0
+        failed_count = resolver_failed_count
         resolved_count = 0
         timeout_count = 0
         attempt_count = 0
@@ -1115,13 +1166,15 @@ class ConcurrentExecutor:
         binding_count = 0
         asset_storage_statuses: list[str] = []
         prompt_versions: list[str] = []
-        failure_stages: list[str] = []
-        skip_reasons: list[str] = []
+        failure_stages: list[str] = ["resolve"] if resolver_failed_count else []
+        skip_reasons: list[str] = ["resolver_failed"] if resolver_failed_count else []
         saw_invalid_output = False
         saw_exception = False
         analysis_facts: dict[str, Any] = {}
         message_obj = getattr(event, "message_obj", None)
         message_id = str(
+            (final_target or {}).get("message_id", "") if isinstance(final_target, dict) else ""
+        ) or str(
             getattr(message_obj, "message_id", "")
             or getattr(message_obj, "id", "")
             or getattr(event, "message_id", "")
@@ -1347,10 +1400,8 @@ class ConcurrentExecutor:
 
         prompt_injected = bool(vision_descriptions)
         if vision_descriptions:
-            vision_inject = (
-                "\n\n"
-                + "\n".join(vision_descriptions)
-            )
+            heading = "[最新图片转述]\n" if final_target else ""
+            vision_inject = "\n\n" + heading + "\n".join(vision_descriptions)
             model_prompt += vision_inject
             self._mark_vision_direct_state(
                 event,
@@ -1467,6 +1518,7 @@ class ConcurrentExecutor:
             "model_ids": model_ids,
             "analysis_prompt_version": prompt_versions[0] if prompt_versions else "",
             "asset_storage_status": ",".join(asset_storage_statuses),
+            "resolver_strategy": resolver_strategy,
             "final_status": observation_outcome,
             "direct_vision_scheduled": True,
             "direct_vision_resolve_status": "success" if resolved_count else "failed",
@@ -2074,6 +2126,10 @@ class ConcurrentExecutor:
                 api_prompt, relay_system_prompt = await self._inject_direct_vision_context(
                     event, chat_id, prompt, system_prompt, vision_bundle
                 )
+                if not await self._check_pre_model_freshness(event, chat_id, "post-vision execution"):
+                    event.set_extra("astrmai_execution_status", "stale_drop")
+                    debug_trace(event, "execution.executor.stale_drop", reason="post_vision_freshness_failed")
+                    return None
                 if bool(event.get_extra("astrmai_vision_required_failed", False)):
                     return await self._send_required_vision_failure(event, chat_id)
 

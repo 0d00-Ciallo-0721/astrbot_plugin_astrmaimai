@@ -200,12 +200,14 @@ _MIGRATIONS: list[tuple[int, str]] = [
         storage_path TEXT DEFAULT '',
         status TEXT DEFAULT 'ready',
         hit_count INTEGER DEFAULT 0,
+        reuse_count INTEGER DEFAULT 0,
         last_error TEXT DEFAULT '',
         created_at REAL DEFAULT 0,
         updated_at REAL DEFAULT 0,
         last_access_at REAL DEFAULT 0
     )"""),
     (87, "ALTER TABLE visualasset ADD COLUMN initial_recognition_elapsed_ms REAL DEFAULT 0"),
+    (88, "ALTER TABLE visualasset ADD COLUMN reuse_count INTEGER DEFAULT 0"),
 ]
 
 

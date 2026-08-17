@@ -86,6 +86,7 @@ class AttentionImageGatingTests(unittest.TestCase):
                 thread_reply_priority_enabled=True,
             ),
             system1=SimpleNamespace(wakeup_words=[], nicknames=[]),
+            vision=SimpleNamespace(enable_vision=True, at_image_pair_window_sec=3.0),
             global_settings=SimpleNamespace(debug_mode=False),
         )
 
@@ -111,6 +112,51 @@ class AttentionImageGatingTests(unittest.TestCase):
         result = asyncio.run(gate.process_event(event))
         self.assertEqual(result, "IGNORED_IMAGE")
 
+    def test_prefilter_selected_group_image_reaches_attention_without_forcing_wakeup(self):
+        gate = self.attention_mod.AttentionGate(
+            state_engine=_FakeStateEngine(self.config),
+            judge=SimpleNamespace(),
+            sensors=_FakeSensors(wakeup=False),
+            system2_callback=None,
+        )
+        event = _FakeEvent(
+            text="",
+            extras={
+                "extracted_image_urls": ["passive.jpg"],
+                "vision_prefilter_selected": True,
+            },
+            group_id="group-1",
+        )
+
+        result = asyncio.run(gate.process_event(event))
+
+        self.assertEqual(result, "BUFFERED")
+        self.assertFalse(event.get_extra("astrmai_group_direct_wakeup", False))
+
+    def test_group_perception_is_refreshed_after_sensor_extracts_image(self):
+        class _SelectingSensors(_FakeSensors):
+            async def should_process_message(self, event):
+                event.set_extra("extracted_image_urls", ["selected.jpg"])
+                event.set_extra("extracted_image_refs", ["selected.jpg"])
+                event.set_extra("vision_prefilter_selected", True)
+                return True
+
+        gate = self.attention_mod.AttentionGate(
+            state_engine=_FakeStateEngine(self.config),
+            judge=SimpleNamespace(),
+            sensors=_SelectingSensors(wakeup=False),
+            system2_callback=None,
+        )
+        event = _FakeEvent(text="", group_id="group-1")
+
+        result = asyncio.run(gate.process_event(event))
+
+        self.assertEqual(result, "BUFFERED")
+        self.assertEqual(
+            self.attention_mod.ensure_turn_context(event).perception.image_urls,
+            ["selected.jpg"],
+        )
+
     def test_direct_vision_request_is_not_treated_as_passive_share(self):
         gate = self.attention_mod.AttentionGate(
             state_engine=_FakeStateEngine(self.config),
@@ -129,6 +175,206 @@ class AttentionImageGatingTests(unittest.TestCase):
 
         result = asyncio.run(gate.process_event(event))
         self.assertEqual(result, "ENGAGED")
+
+    def test_gate_upgrades_probability_missed_image_when_followed_by_pure_at(self):
+        gate = self.attention_mod.AttentionGate(
+            state_engine=_FakeStateEngine(self.config),
+            judge=SimpleNamespace(),
+            sensors=_FakeSensors(wakeup=False),
+            system2_callback=None,
+        )
+        gate._spawn_session_worker = lambda *args, **kwargs: None
+        image = _FakeEvent(
+            text="",
+            extras={
+                "extracted_image_refs": ["missed.jpg"],
+                "extracted_image_urls": ["missed.jpg"],
+                "vision_prefilter_selected": False,
+                "astrmai_vision_candidates": [
+                    {
+                        "message_id": "image-first",
+                        "group_id": "group-1",
+                        "sender_id": "user-1",
+                        "timestamp": 10.0,
+                        "image_index": 0,
+                        "candidate_refs": ["missed.jpg"],
+                        "source_kind": "inline",
+                        "prefilter_selected": False,
+                    }
+                ],
+            },
+        )
+        mention = _FakeEvent(
+            text="@bot",
+            extras={
+                "astrmai_at_bot_wakeup": True,
+                "astrmai_pure_at_bot": True,
+                "astrmai_vision_candidates": [],
+            },
+        )
+
+        first_result = asyncio.run(gate.process_event(image))
+        second_result = asyncio.run(gate.process_event(mention))
+
+        self.assertEqual(first_result, "IGNORED_IMAGE")
+        self.assertEqual(second_result, "BUFFERED")
+        self.assertTrue(mention.get_extra("vision_prefilter_selected"))
+        self.assertEqual(mention.get_extra("extracted_image_refs"), ["missed.jpg"])
+        self.assertEqual(
+            mention.get_extra("astrmai_vision_candidates")[0]["pairing_mode"],
+            "image_then_at",
+        )
+
+    def test_gate_merges_pure_at_then_image_without_passive_image_drop(self):
+        gate = self.attention_mod.AttentionGate(
+            state_engine=_FakeStateEngine(self.config),
+            judge=SimpleNamespace(),
+            sensors=_FakeSensors(wakeup=False),
+            system2_callback=None,
+        )
+        gate._spawn_session_worker = lambda *args, **kwargs: None
+        mention = _FakeEvent(
+            text="",
+            extras={
+                "astrmai_at_bot_wakeup": True,
+                "astrmai_pure_at_bot": True,
+                "astrmai_vision_candidates": [],
+            },
+        )
+        image = _FakeEvent(
+            text="",
+            extras={
+                "extracted_image_refs": ["after-at.jpg"],
+                "extracted_image_urls": ["after-at.jpg"],
+                "vision_prefilter_selected": False,
+                "astrmai_vision_candidates": [
+                    {
+                        "message_id": "image-second",
+                        "group_id": "group-1",
+                        "sender_id": "user-1",
+                        "timestamp": 11.0,
+                        "image_index": 0,
+                        "candidate_refs": ["after-at.jpg"],
+                        "source_kind": "inline",
+                        "prefilter_selected": False,
+                    }
+                ],
+            },
+        )
+
+        first_result = asyncio.run(gate.process_event(mention))
+        second_result = asyncio.run(gate.process_event(image))
+
+        self.assertEqual(first_result, "BUFFERED")
+        self.assertEqual(second_result, "BUFFERED")
+        self.assertTrue(image.get_extra("vision_prefilter_selected"))
+        self.assertEqual(mention.get_extra("extracted_image_refs"), ["after-at.jpg"])
+        self.assertEqual(
+            mention.get_extra("astrmai_vision_candidates")[0]["pairing_mode"],
+            "at_then_image",
+        )
+        session = gate.focus_pools[mention.unified_msg_origin]
+        self.assertEqual(session.accumulation_pool, [mention, image])
+        self.assertTrue(session.vision_pair_signal.is_set())
+        self.assertFalse(image.get_extra("astrmai_release_vision_pair_waiter"))
+
+    def test_gate_holds_selected_image_until_following_pure_at_joins_batch(self):
+        gate = self.attention_mod.AttentionGate(
+            state_engine=_FakeStateEngine(self.config),
+            judge=SimpleNamespace(),
+            sensors=_FakeSensors(wakeup=False),
+            system2_callback=None,
+        )
+        gate._spawn_session_worker = lambda *args, **kwargs: None
+        image = _FakeEvent(
+            text="",
+            extras={
+                "extracted_image_refs": ["selected-first.jpg"],
+                "extracted_image_urls": ["selected-first.jpg"],
+                "vision_prefilter_selected": True,
+                "astrmai_vision_candidates": [
+                    {
+                        "message_id": "selected-image-first",
+                        "group_id": "group-1",
+                        "sender_id": "user-1",
+                        "timestamp": 12.0,
+                        "image_index": 0,
+                        "candidate_refs": ["selected-first.jpg"],
+                        "source_kind": "inline",
+                        "prefilter_selected": True,
+                    }
+                ],
+            },
+        )
+        mention = _FakeEvent(
+            text="@bot",
+            extras={
+                "astrmai_at_bot_wakeup": True,
+                "astrmai_pure_at_bot": True,
+                "astrmai_vision_candidates": [],
+            },
+        )
+
+        first_result = asyncio.run(gate.process_event(image))
+        second_result = asyncio.run(gate.process_event(mention))
+
+        self.assertEqual(first_result, "BUFFERED")
+        self.assertEqual(second_result, "BUFFERED")
+        session = gate.focus_pools[image.unified_msg_origin]
+        self.assertEqual(session.accumulation_pool, [image, mention])
+        self.assertTrue(session.vision_pair_signal.is_set())
+        self.assertEqual(
+            mention.get_extra("astrmai_vision_candidates")[0]["pairing_mode"],
+            "image_then_at",
+        )
+
+    def test_gate_never_pairs_same_sender_across_groups(self):
+        gate = self.attention_mod.AttentionGate(
+            state_engine=_FakeStateEngine(self.config),
+            judge=SimpleNamespace(),
+            sensors=_FakeSensors(wakeup=False),
+            system2_callback=None,
+        )
+        gate._spawn_session_worker = lambda *args, **kwargs: None
+        image = _FakeEvent(
+            text="",
+            group_id="group-1",
+            extras={
+                "extracted_image_refs": ["group-one.jpg"],
+                "extracted_image_urls": ["group-one.jpg"],
+                "vision_prefilter_selected": False,
+                "astrmai_vision_candidates": [
+                    {
+                        "message_id": "group-one-image",
+                        "group_id": "group-1",
+                        "sender_id": "user-1",
+                        "timestamp": 13.0,
+                        "image_index": 0,
+                        "candidate_refs": ["group-one.jpg"],
+                        "source_kind": "inline",
+                        "prefilter_selected": False,
+                    }
+                ],
+            },
+        )
+        mention = _FakeEvent(
+            text="@bot",
+            group_id="group-2",
+            extras={
+                "astrmai_at_bot_wakeup": True,
+                "astrmai_pure_at_bot": True,
+                "astrmai_vision_candidates": [],
+            },
+        )
+
+        first_result = asyncio.run(gate.process_event(image))
+        second_result = asyncio.run(gate.process_event(mention))
+
+        self.assertEqual(first_result, "IGNORED_IMAGE")
+        self.assertEqual(second_result, "BUFFERED")
+        self.assertEqual(mention.get_extra("astrmai_vision_candidates"), [])
+        self.assertIn("default:GroupMessage:group-1", gate.focus_pools)
+        self.assertIn("default:GroupMessage:group-2", gate.focus_pools)
 
 
 if __name__ == "__main__":

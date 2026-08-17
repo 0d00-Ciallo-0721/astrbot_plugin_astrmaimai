@@ -516,7 +516,18 @@ class InfraConfig(BaseModel):
 
 class VisionConfig(BaseModel):
     enable_vision: bool = Field(default=True, description="多模态视觉总开关")
-    image_recognition_probability: float = Field(default=0.5, ge=0.0, le=1.0, description="图片被送入视觉皮层解析的概率 (0.0~1.0)")
+    image_recognition_probability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="普通群聊图片进入回复判断的概率；仅在最终回复阶段识别 (0.0~1.0)",
+    )
+    at_image_pair_window_sec: float = Field(
+        default=3.0,
+        ge=0.5,
+        le=10.0,
+        description="群聊中纯 @Bot 与相邻图片跨消息配对的时间窗口（秒）",
+    )
     enable_visual_result_cache: bool = Field(
         default=True,
         description="复用已经识别过的相同图片，避免重复调用视觉模型",

@@ -958,6 +958,27 @@ class AttentionGate:
     def _compute_debounce_delay(self, session: SessionContext, is_private: bool, is_strong_wakeup: bool) -> float:
         return self.window_buffer.compute_debounce_delay(session, is_private, is_strong_wakeup)
 
+    async def _wait_for_pending_vision_pairing(self, session: SessionContext) -> None:
+        while True:
+            async with session.lock:
+                sender_ids = {
+                    str(getattr(item, "get_sender_id", lambda: "")() or "")
+                    for item in session.accumulation_pool
+                }
+                sender_ids.discard("")
+                remaining = self.window_buffer.pending_pair_wait_seconds(
+                    session,
+                    sender_ids=sender_ids,
+                )
+                if remaining <= 0:
+                    return
+                signal = session.vision_pair_signal
+                signal.clear()
+            try:
+                await asyncio.wait_for(signal.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return
+
     def _prune_attention_window(self, session: SessionContext, now: float | None = None) -> list[AstrMessageEvent]:
         return self.window_buffer.prune(session, now=now)
 
@@ -1060,6 +1081,11 @@ class AttentionGate:
     async def _handle_fast_wakeup(self, event: AstrMessageEvent, chat_id: str, is_strong_wakeup: bool) -> str | None:
         if not is_strong_wakeup:
             return None
+        if bool(
+            event.get_extra("astrmai_wait_for_image_pair", False)
+            or event.get_extra("astrmai_cross_message_vision_bound", False)
+        ):
+            return None
         if not self._is_simple_wakeup_payload(getattr(event, "message_str", "")):
             return None
         event.set_extra("astrmai_group_direct_wakeup", True)
@@ -1087,8 +1113,20 @@ class AttentionGate:
                 return True
         return True
 
-    def _should_ignore_passive_group_image(self, is_private: bool, extracted_images: list[Any], is_strong_wakeup: bool) -> bool:
-        return bool(extracted_images) and not is_private and not is_strong_wakeup
+    def _should_ignore_passive_group_image(
+        self,
+        event: AstrMessageEvent,
+        is_private: bool,
+        extracted_images: list[Any],
+        is_strong_wakeup: bool,
+    ) -> bool:
+        prefilter_selected = bool(event.get_extra("vision_prefilter_selected", False))
+        return (
+            bool(extracted_images)
+            and not is_private
+            and not is_strong_wakeup
+            and not prefilter_selected
+        )
 
     def _should_skip_by_throttle(self, msg_str: str, extracted_images: list[Any], chat_state: Any, chat_id: str, is_private: bool, is_strong_wakeup: bool) -> str | None:
         del chat_id
@@ -1275,14 +1313,55 @@ class AttentionGate:
 
         session = await self._get_or_create_session(chat_id)
 
+        if not sensor_checked:
+            if not await self._passes_sensor_filters(event, msg_str):
+                rejected_perception = self.perception_builder.build(event)
+                if not is_private and rejected_perception.is_strong_wakeup:
+                    fast_result = await self._handle_fast_wakeup(
+                        event,
+                        chat_id,
+                        rejected_perception.is_strong_wakeup,
+                    )
+                    if fast_result:
+                        return fast_result
+                await self._complete_proactive_candidate(event, reason="sensor_filtered")
+                await self._finalize_pre_planner_turn(
+                    event,
+                    chat_id,
+                    status="skipped_sensor_filter",
+                )
+                return "FILTERED"
+            sensor_checked = True
+            perception = self.perception_builder.build(event)
+            context = perception.as_event_context()
+            msg_str = context["msg_str"]
+            extracted_images = context["extracted_images"]
+            is_private = context["is_private"]
+
+        is_direct = perception.is_direct_wakeup
+        is_at_bot = perception.is_at_bot
+        is_reply = perception.is_reply_to_bot
+        is_strong_wakeup = perception.is_strong_wakeup
+        if not is_private and bool(getattr(getattr(self.config, "vision", None), "enable_vision", True)):
+            async with session.lock:
+                pairing_mode = self.window_buffer.register_group_vision_pairing(
+                    session,
+                    event,
+                    sender_id=sender_id,
+                    is_at_bot=is_at_bot,
+                )
+            if pairing_mode not in {"none", "pending_image", "pending_at"}:
+                perception = self.perception_builder.build(event)
+                context = perception.as_event_context()
+                msg_str = context["msg_str"]
+                extracted_images = context["extracted_images"]
+                is_direct = perception.is_direct_wakeup
+                is_at_bot = perception.is_at_bot
+                is_reply = perception.is_reply_to_bot
+                is_strong_wakeup = perception.is_strong_wakeup
+
         defer_private_context = bool(is_private and self.private_turn_coordinator is not None)
-        defer_direct_vision_context = bool(
-            not is_private
-            and perception.is_strong_wakeup
-            and extracted_images
-            and self.private_turn_coordinator is not None
-        )
-        if not defer_private_context and not defer_direct_vision_context:
+        if not defer_private_context:
             # OPT-08/RT-03: mood LLM 后置——ambient 消息（88% 最终不回复）不再在
             # ingress 无条件付一次 3-40s 情绪调用；强唤醒（必回复）保持即时感知
             if not self._mood_post_judge_enabled() or perception.is_strong_wakeup:
@@ -1292,10 +1371,6 @@ class AttentionGate:
         if forced:
             return forced
 
-        is_direct = perception.is_direct_wakeup
-        is_at_bot = perception.is_at_bot
-        is_reply = perception.is_reply_to_bot
-        is_strong_wakeup = perception.is_strong_wakeup
         if is_direct:
             event.set_extra("astrmai_group_direct_wakeup", True)
         if is_at_bot:
@@ -1303,56 +1378,16 @@ class AttentionGate:
         if is_reply:
             event.set_extra("astrmai_reply_wakeup", True)
 
-        if not is_private and is_strong_wakeup:
-            prepare_direct_event = getattr(self.private_turn_coordinator, "prepare_direct_event", None)
-            vision_outcome = None
-            if callable(prepare_direct_event):
-                try:
-                    vision_outcome = await prepare_direct_event(event, chat_id)
-                except Exception as exc:
-                    logger.warning(
-                        f"[AttentionGate] direct group vision barrier degraded for {chat_id}: {exc}",
-                        exc_info=True,
-                    )
-            if self._vision_barrier_should_abort(vision_outcome, event):
-                failure_text = await self._send_required_vision_failure(event)
-                await self._complete_proactive_candidate(event, reason="vision_required_failed")
-                await self._finalize_pre_planner_turn(
-                    event,
-                    chat_id,
-                    status="skipped_vision_required",
-                    reply_text=failure_text,
-                )
-                return "VISION_REQUIRED_FAILED"
-            perception = self.perception_builder.build(event)
-            context = perception.as_event_context()
-            msg_str = context["msg_str"]
-            extracted_images = context["extracted_images"]
-            is_direct = perception.is_direct_wakeup
-            is_at_bot = perception.is_at_bot
-            is_reply = perception.is_reply_to_bot
-            is_strong_wakeup = perception.is_strong_wakeup
-            if defer_direct_vision_context:
-                await self._apply_primary_mood_update(
-                    event,
-                    chat_id,
-                    str(event.get_extra("astrmai_rich_text", msg_str) or msg_str),
-                )
-
         fast_result = None if is_private else await self._handle_fast_wakeup(event, chat_id, is_strong_wakeup)
         if fast_result:
             return fast_result
 
-        if not sensor_checked and not await self._passes_sensor_filters(event, msg_str):
-            await self._complete_proactive_candidate(event, reason="sensor_filtered")
-            await self._finalize_pre_planner_turn(
-                event,
-                chat_id,
-                status="skipped_sensor_filter",
-            )
-            return "FILTERED"
-
-        if self._should_ignore_passive_group_image(is_private, extracted_images, is_strong_wakeup):
+        if self._should_ignore_passive_group_image(
+            event,
+            is_private,
+            extracted_images,
+            is_strong_wakeup,
+        ):
             await self._complete_proactive_candidate(event, reason="passive_group_image")
             await self._finalize_pre_planner_turn(
                 event,
@@ -1418,6 +1453,9 @@ class AttentionGate:
         async with session.lock:
             session.accumulation_pool.append(event)
             session.last_active_time = time.time()
+            if bool(event.get_extra("astrmai_release_vision_pair_waiter", False)):
+                session.vision_pair_signal.set()
+                event.set_extra("astrmai_release_vision_pair_waiter", False)
             should_schedule = not session.is_evaluating
             session.is_evaluating = True
 
@@ -1522,6 +1560,7 @@ class AttentionGate:
                 await self.private_turn_coordinator.wait_for_input_stability(session)
             else:
                 await asyncio.sleep(self._compute_debounce_delay(session, is_private, current_is_strong_wakeup))
+                await self._wait_for_pending_vision_pairing(session)
             async with session.lock:
                 batch_events = list(session.accumulation_pool)
                 session.accumulation_pool.clear()

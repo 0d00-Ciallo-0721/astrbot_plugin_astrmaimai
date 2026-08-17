@@ -469,11 +469,14 @@ class RefactoredReplyServiceTests(unittest.TestCase):
                 generation=1,
             ),
         )
-        event.set_extra("astrmai_pending_actions", [{"action": "group_sign", "group_id": "group-1"}])
+        event.set_extra(
+            "astrmai_pending_actions",
+            [{"action": "poke", "target_id": "user-1", "group_id": "group-1"}],
+        )
 
         asyncio.run(engine.handle_reply(event, "answer", event.unified_msg_origin))
 
-        self.assertEqual(order, ["reply", "set_group_sign"])
+        self.assertEqual(order, ["reply", "send_poke"])
         self.assertEqual(event.get_extra("astrmai_qq_action_results")[0]["status"], "success")
 
     def test_boolean_context_send_result_is_not_recorded_as_message_id(self):
@@ -1442,6 +1445,34 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "angry")
         self.assertEqual(send_meme.await_args.kwargs["probability"], 80)
+
+    def test_explicit_meme_force_uses_one_hundred_percent_probability(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.meme_probability = 37
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "给我发张开心的表情包")
+        event.set_extra("astrmai_force_meme", True)
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(
+                service._settle_post_send(
+                    event,
+                    event.unified_msg_origin,
+                    bypassed_tag="happy",
+                    window_events=[event],
+                    anchor_event=event,
+                )
+            )
+
+        self.assertEqual(send_meme.await_args.kwargs["probability"], 100)
 
     def test_merge_wait_targets_preserves_existing_targets_before_pending_actions(self):
         service = self._service()

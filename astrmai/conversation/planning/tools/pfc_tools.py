@@ -15,6 +15,7 @@ from astrbot.api.event import MessageChain
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
+from sqlalchemy import text as sql_text
 from sqlmodel import select
 
 from ....infrastructure.persistence.orm_models import VisualAsset, VisualMessageBinding
@@ -2202,6 +2203,28 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                             tags = parsed_tags
                     except (TypeError, ValueError):
                         tags = []
+                    reuse_counted = False
+                    if self.visual_cortex is not None and hasattr(
+                        self.visual_cortex, "record_asset_reuse"
+                    ):
+                        reuse_counted = bool(
+                            await self.visual_cortex.record_asset_reuse(str(asset.asset_id or ""))
+                        )
+                    elif self.db_service is not None:
+                        with self.db_service.get_session() as session:
+                            update_result = session.execute(
+                                sql_text(
+                                    "UPDATE visualasset "
+                                    "SET reuse_count = COALESCE(reuse_count, 0) + 1, "
+                                    "last_access_at = :now "
+                                    "WHERE asset_id = :asset_id AND status = 'ready'"
+                                ),
+                                {"asset_id": str(asset.asset_id or ""), "now": time.time()},
+                            )
+                            session.commit()
+                            reuse_counted = bool(
+                                int(getattr(update_result, "rowcount", 0) or 0)
+                            )
                     record_vision_observation(
                         event,
                         {
@@ -2210,6 +2233,7 @@ class VisionMessageAnalyzeTool(FunctionTool[AstrAgentContext]):
                             "autonomous_inspection_cache_hit": True,
                             "vision_path": "tool",
                             "asset_ids": [str(asset.asset_id or "")],
+                            "reuse_counted": reuse_counted,
                         },
                     )
                     _record_tool_execution(event, self.name)

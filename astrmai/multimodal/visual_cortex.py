@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
+from sqlalchemy import text
 from sqlmodel import select
 
 from ..infrastructure.persistence.orm_models import (
@@ -277,6 +278,34 @@ class VisualCortex:
                 session.commit()
                 session.refresh(asset)
             return asset
+
+    def _increment_visual_asset_reuse(self, asset_id: str) -> bool:
+        normalized_asset_id = str(asset_id or "").strip()
+        if not normalized_asset_id or self.db_service is None:
+            return False
+        with self.db_service.get_session() as session:
+            result = session.execute(
+                text(
+                    "UPDATE visualasset "
+                    "SET reuse_count = COALESCE(reuse_count, 0) + 1, last_access_at = :now "
+                    "WHERE asset_id = :asset_id AND status = 'ready'"
+                ),
+                {"asset_id": normalized_asset_id, "now": time.time()},
+            )
+            session.commit()
+            return bool(int(getattr(result, "rowcount", 0) or 0))
+
+    async def record_asset_reuse(self, asset_id: str) -> bool:
+        """Record a validated cache result that replaced a model call."""
+
+        try:
+            return await asyncio.to_thread(self._increment_visual_asset_reuse, asset_id)
+        except Exception as exc:
+            logger.warning(
+                "[AstrMai-Vision] reuse counter degraded "
+                f"asset={str(asset_id or '')[:12]} error={type(exc).__name__}"
+            )
+            return False
 
     def _upsert_visual_asset(
         self,
@@ -603,7 +632,7 @@ class VisualCortex:
             ImagePipeline.cleanup(prepared)
             raise
         payload, invalid_reason = normalize_vision_result(result_dict)
-        elapsed_ms = round((time.monotonic() - started_at) * 1000, 1)
+        elapsed_ms = max(0.1, round((time.monotonic() - started_at) * 1000, 1))
         if payload is None:
             logger.warning(
                 "[AstrMai-Vision] model call returned unusable result "
@@ -732,6 +761,7 @@ class VisualCortex:
                 payload["_cache_hit"] = True
                 payload["_cache_kind"] = "content"
                 payload["_singleflight_join"] = False
+                payload["_reuse_counted"] = await self.record_asset_reuse(identity.asset_id)
                 logger.info(
                     "[AstrMai-Vision] content cache hit "
                     f"asset={identity.asset_id[:12]} prompt_version={identity.prompt_version}"
@@ -773,6 +803,7 @@ class VisualCortex:
                         "[AstrMai-Vision] legacy cache migration degraded "
                         f"asset={identity.asset_id[:12]} error={type(exc).__name__}"
                     )
+                payload["_reuse_counted"] = await self.record_asset_reuse(identity.asset_id)
                 logger.info(
                     "[AstrMai-Vision] legacy cache migrated "
                     f"asset={identity.asset_id[:12]}"

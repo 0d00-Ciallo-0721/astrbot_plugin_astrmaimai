@@ -32,6 +32,9 @@ class SessionContext:
     repeat_count: int = 0
     last_active_user_time: float = 0.0
     last_window_open_ts: float = 0.0
+    pending_vision_images: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_vision_mentions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    vision_pair_signal: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
