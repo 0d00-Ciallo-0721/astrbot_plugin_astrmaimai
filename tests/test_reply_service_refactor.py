@@ -1388,6 +1388,61 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "excited")
         self.assertEqual(send_meme.await_args.kwargs["probability"], 37)
 
+    def test_handle_reply_uses_primary_mood_tag_for_passive_meme(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.meme_probability = 80
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "今天真开心")
+        event.set_extra("astrmai_primary_mood_tag", "happy")
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(
+                service.handle_reply(
+                    event,
+                    "我也很开心呀",
+                    event.unified_msg_origin,
+                )
+            )
+
+        self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "happy")
+        self.assertEqual(send_meme.await_args.kwargs["probability"], 80)
+
+    def test_handle_reply_prefers_bypassed_mood_tag_over_primary_mood_tag(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.meme_probability = 80
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "今天真开心")
+        event.set_extra("astrmai_bypass_mood_analysis", "angry")
+        event.set_extra("astrmai_primary_mood_tag", "happy")
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(
+                service.handle_reply(
+                    event,
+                    "我知道啦",
+                    event.unified_msg_origin,
+                )
+            )
+
+        self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "angry")
+        self.assertEqual(send_meme.await_args.kwargs["probability"], 80)
+
     def test_merge_wait_targets_preserves_existing_targets_before_pending_actions(self):
         service = self._service()
         event = FakeEvent("user-1", "Alice", "question")

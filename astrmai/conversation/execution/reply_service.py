@@ -286,7 +286,11 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         await self._settle_post_send(
             event,
             chat_id,
-            bypassed_tag=bypassed_tag or event.get_extra("astrmai_bypass_mood_analysis", None),
+            bypassed_tag=(
+                bypassed_tag
+                or event.get_extra("astrmai_bypass_mood_analysis", None)
+                or event.get_extra("astrmai_primary_mood_tag", None)
+            ),
             window_events=window_events,
             anchor_event=anchor_event,
         )
