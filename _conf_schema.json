@@ -1592,7 +1592,7 @@
         "type": "string",
         "default": "legacy",
         "options": ["legacy", "shadow", "event_only"],
-        "hint": "legacy 保持旧兼容；shadow 仅记录新关系事件；event_only 仅按明确的规范关系事件改变关系状态。"
+        "hint": "旧兼容模式保持原有行为；影子记录模式仅记录新关系事件；仅事件模式只按明确的规范关系事件改变关系状态。"
       },
       "min_confidence": {
         "description": "关系事件最低置信度",
@@ -1600,7 +1600,7 @@
         "default": 0.75,
         "minimum": 0,
         "maximum": 1,
-        "hint": "低于该值的候选只会记录为 suppressed，不会改变关系向量。"
+        "hint": "低于该值的候选只会记录为已抑制，不会改变关系向量。"
       },
       "policy_version": {
         "description": "关系策略版本",
