@@ -23,6 +23,7 @@ from ....infrastructure.runtime.cross_session_handoff_store import CrossSessionH
 from ....infrastructure.runtime.turn_call_ledger import record_vision_observation
 from ....multimodal.visual_cortex import VisionAnalysisCoolingDown
 from ....presentation.dto.message_scope import MessageScope
+from ....shared.emotion_tags import parse_emotion_mapping
 from ...vision_state import vision_analysis_observation_facts
 from ...contracts.qq_action import PendingQQAction
 from ..tool_contracts import (
@@ -1258,12 +1259,11 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
     emotion_mapping: list = Field(default_factory=list, exclude=True)
 
     def __post_init__(self) -> None:
-        valid_tags = [
-            str(item).split(":", 1)[0].strip().lower()
-            for item in self.emotion_mapping
-            if str(item or "").strip()
-        ]
-        available = "\n".join(f"- {item}" for item in self.emotion_mapping) if self.emotion_mapping else "- neutral: 平静"
+        configured_tags = parse_emotion_mapping(self.emotion_mapping)
+        valid_tags = list(configured_tags)
+        available = "\n".join(
+            f"- {tag}: {description}" for tag, description in configured_tags.items()
+        ) or "- neutral: 平静"
         self.description = (
             "选择一个表情包情绪标签，系统会在最终回复后自动按该标签补发表情包。\n"
             f"可用标签:\n{available}"
@@ -1283,7 +1283,7 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         current_event = _get_current_event(context)
         emotion_tag = str(kwargs.get("emotion_tag", "neutral") or "neutral").strip().lower()
-        valid_tags = [str(item).split(":")[0].strip().lower() for item in self.emotion_mapping if str(item).strip()]
+        valid_tags = set(parse_emotion_mapping(self.emotion_mapping))
         if valid_tags and emotion_tag not in valid_tags:
             emotion_tag = "neutral"
         current_event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)

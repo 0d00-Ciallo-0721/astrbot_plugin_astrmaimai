@@ -636,11 +636,13 @@ class StateEngine:
             )
         elif resolved_event_type == RelationshipEvent.IGNORE:
             effective_intensity *= self.relationship_engine.ignore_affection_intensity_bias(message_text)
-        effective_event_type = (
-            self.relationship_engine.MOOD_TO_EVENT.get(effective_mood_tag, resolved_event_type)
-            if effective_mood_tag and resolved_event_type == RelationshipEvent.NORMAL_CHAT
-            else resolved_event_type
-        )
+        mood_mapping_source = "not_applied"
+        if effective_mood_tag and resolved_event_type == RelationshipEvent.NORMAL_CHAT:
+            mood_resolution = self.relationship_engine.resolve_mood_event(effective_mood_tag)
+            effective_event_type = mood_resolution.event_type
+            mood_mapping_source = mood_resolution.source
+        else:
+            effective_event_type = resolved_event_type
         new_score = self.relationship_engine.process_event(
             user_id=user_id,
             event_type=effective_event_type,
@@ -655,6 +657,13 @@ class StateEngine:
             new_score,
             effective_mood_tag,
             effective_event_type,
+        )
+        logger.debug(
+            "[StateEngine] relationship mood mapping user=%s tag=%s event=%s source=%s",
+            user_id,
+            effective_mood_tag or "neutral",
+            effective_event_type,
+            mood_mapping_source,
         )
 
     async def settle_no_send_affection(

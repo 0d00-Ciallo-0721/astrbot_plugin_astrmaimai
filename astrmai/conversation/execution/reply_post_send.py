@@ -18,6 +18,7 @@ from ...conversation.contracts.turn_context import get_turn_context
 from ...conversation.contracts.turn_target import TargetKind, TurnTarget
 from ...infrastructure.runtime.lane_manager import LaneKey
 from ...multimodal import MEMES_DIR, send_meme
+from ...shared.emotion_tags import build_emotion_tag_catalog, normalize_emotion_tag
 from ...state.relationship.affection_router import AffectionRouter
 
 
@@ -527,8 +528,11 @@ class ReplyPostSendMixin:
         return str(getattr(getattr(config, "persona", None), "persona_id", "") or "")
 
     def _resolve_post_send_tag(self, bypassed_tag: str | None) -> tuple[str, bool]:
-        tag = str(bypassed_tag or "").strip().lower()
-        if not tag:
+        tag = normalize_emotion_tag(bypassed_tag)
+        if not tag or tag in {"neutral", "none"}:
+            return "neutral", False
+        config = getattr(self, "config", None)
+        if config is not None and not build_emotion_tag_catalog(config).contains(tag):
             return "neutral", False
         return tag, False
 
@@ -587,7 +591,18 @@ class ReplyPostSendMixin:
         window_events: list | None,
         anchor_event: AstrMessageEvent | None,
     ) -> None:
+        requested_tag = normalize_emotion_tag(bypassed_tag)
         tag, force_meme_flag = self._resolve_post_send_tag(bypassed_tag)
+        if hasattr(event, "set_extra"):
+            validation = (
+                "neutral"
+                if not requested_tag or requested_tag in {"neutral", "none"}
+                else "configured"
+                if tag != "neutral"
+                else "unknown_tag"
+            )
+            event.set_extra("astrmai_meme_tag", tag)
+            event.set_extra("astrmai_meme_tag_validation", validation)
         if hasattr(event, "get_extra") and event.get_extra("astrmai_force_meme", False):
             force_meme_flag = True
         is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))

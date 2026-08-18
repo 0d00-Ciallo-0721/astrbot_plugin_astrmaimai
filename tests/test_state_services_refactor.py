@@ -324,6 +324,68 @@ class StateRefactorTests(unittest.TestCase):
         self.assertIn("excited=兴奋、期待、庆祝", observed["prompt"])
         self.assertIn("Available mood tags", observed["system_prompt"])
 
+    def test_relationship_mapping_uses_configured_custom_tag_and_records_fallback(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(
+                emotion_mapping=[
+                    "surprised: 惊讶、震惊、意外",
+                    "color: 暧昧、调情、心动",
+                ],
+                emotion_relationship_mapping=["surprised: shared_interest"],
+            ),
+        )
+        engine = self.state_mod.StateEngine(_FakePersistence(), SimpleNamespace(config=config), config=config)
+
+        surprised = engine.relationship_engine.resolve_mood_event("SURPRISED")
+        color = engine.relationship_engine.resolve_mood_event("color")
+
+        self.assertEqual((surprised.event_type, surprised.source), ("shared_interest", "config"))
+        self.assertEqual((color.event_type, color.source), ("normal_chat", "fallback_normal_chat"))
+
+        observed = {}
+
+        async def _publish_change(user_id, old_score, new_score, mood_tag, event_type):
+            observed.update(
+                mood_tag=mood_tag,
+                event_type=event_type,
+            )
+
+        engine.affection_router.publish_change = _publish_change
+        asyncio.run(
+            engine.calculate_and_update_affection(
+                user_id="user-surprised",
+                group_id="default:FriendMessage:user-surprised",
+                mood_tag="surprised",
+                message_text="真的假的，太意外了",
+            )
+        )
+        self.assertEqual(observed, {"mood_tag": "surprised", "event_type": "shared_interest"})
+
+    def test_relationship_mapping_refreshes_without_restart(self):
+        base_config = SimpleNamespace(
+            reply=SimpleNamespace(
+                emotion_mapping=["surprised: 惊讶、震惊、意外"],
+                emotion_relationship_mapping=[],
+            ),
+        )
+        next_config = SimpleNamespace(
+            reply=SimpleNamespace(
+                emotion_mapping=["surprised: 惊讶、震惊、意外"],
+                emotion_relationship_mapping=["surprised: shared_interest"],
+            ),
+        )
+        engine = self.state_mod.RelationshipEngine(config=base_config)
+
+        self.assertEqual(
+            engine.resolve_mood_event("surprised").source,
+            "fallback_normal_chat",
+        )
+        engine.refresh_config(next_config)
+        refreshed = engine.resolve_mood_event("surprised")
+        self.assertEqual((refreshed.event_type, refreshed.source), ("shared_interest", "config"))
+
     def test_mood_manager_fallback_keeps_sarcasm_negative(self):
         tag, mood_value = self.mood_mod.MoodManager._fallback_analyze_local("你可真行啊，又把事情搞砸了，真棒。", 0.0)
 

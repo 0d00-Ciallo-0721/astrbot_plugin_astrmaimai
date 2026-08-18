@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from config import AstrMaiConfig, MemoryConfig
+from astrmai.shared.emotion_tags import build_emotion_tag_catalog
 
 
 class ConfigStandaloneRefactorTests(unittest.TestCase):
@@ -47,6 +48,49 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(config.private_chat.image_barrier_timeout_sec, 90.0)
         self.assertEqual(config.evolution.jargon_min_count, 2)
         self.assertEqual(config.evolution.expression_min_count, 2)
+        self.assertEqual(config.reply.emotion_relationship_mapping, [])
+
+    def test_emotion_catalog_accepts_deployed_custom_tags_and_relationship_override(self):
+        deployed_tags = [
+            "angry: 生气、愤怒、不满",
+            "happy: 开心、积极、感谢",
+            "sad: 悲伤、难过、遗憾",
+            "surprised: 惊讶、震惊、意外",
+            "confused: 困惑、疑惑、不理解",
+            "color: 暧昧、调情、心动",
+            "cpu: 卡顿、宕机、无语",
+            "fool: 幽默、自嘲、开玩笑",
+            "like: 喜欢、欣赏、认同",
+            "see: 看见、注意到、发现",
+            "shy: 害羞、扭捏、不好意思",
+            "meow: 猫叫、撒娇、卖萌",
+            "baka: 笨蛋、吐槽、调侃",
+            "morning: 早安、晨间、打招呼",
+            "sleep: 困倦、晚安、休息",
+            "sigh: 叹气、无奈、疲惫",
+            "hello: 你好、问候、招呼",
+            "work: 工作、忙碌、加班",
+            "givemoney: 打钱、红包、奖励",
+            "reply: 回复、回应、收到",
+        ]
+        config = AstrMaiConfig(
+            reply={
+                "emotion_mapping": deployed_tags,
+                "emotion_relationship_mapping": ["surprised: shared_interest"],
+            }
+        )
+        catalog = build_emotion_tag_catalog(config)
+
+        self.assertEqual(catalog.tags, {item.split(":", 1)[0] for item in deployed_tags})
+        self.assertTrue(catalog.contains("SURPRISED"))
+        self.assertEqual(
+            catalog.resolve_relationship_event("surprised").event_type,
+            "shared_interest",
+        )
+        self.assertEqual(
+            catalog.resolve_relationship_event("confused").source,
+            "fallback_normal_chat",
+        )
 
     def test_astrmai_config_migrates_legacy_timing_fields_and_syncs_aliases(self):
         config = AstrMaiConfig(
@@ -167,6 +211,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         performance_items = schema["performance"]["items"]
         vision_items = schema["vision"]["items"]
         evolution_items = schema["evolution"]["items"]
+        reply_items = schema["reply"]["items"]
         self.assertIn("summary_threshold", performance_items)
         self.assertIn("use_native_main_reply_vision", vision_items)
         self.assertIn("native_main_reply_failure_cooldown_sec", vision_items)
@@ -181,6 +226,8 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(vision_items["visual_asset_max_disk_mb"]["default"], 512)
         self.assertEqual(vision_items["visual_asset_max_edge_px"]["default"], 1600)
         self.assertEqual(vision_items["visual_prompt_version"]["default"], "v1")
+        self.assertIn("emotion_relationship_mapping", reply_items)
+        self.assertEqual(reply_items["emotion_relationship_mapping"]["default"], [])
         self.assertEqual(vision_items["visual_failure_cooldown_sec"]["default"], 120)
         self.assertEqual(vision_items["visual_failure_cooldown_sec"]["maximum"], 1800)
         self.assertEqual(vision_items["max_images_per_turn"]["default"], 1)

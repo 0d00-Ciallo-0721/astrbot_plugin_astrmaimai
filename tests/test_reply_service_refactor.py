@@ -1365,6 +1365,7 @@ class RefactoredReplyServiceTests(unittest.TestCase):
     def test_post_send_meme_tag_uses_configured_probability(self):
         state_engine = FakeStateEngine()
         state_engine.config.reply.meme_probability = 37
+        state_engine.config.reply.emotion_mapping = ["excited: 兴奋、期待、庆祝"]
         service = self.reply_mod.ReplyService(
             state_engine=state_engine,
             mood_manager=SimpleNamespace(),
@@ -1390,6 +1391,58 @@ class RefactoredReplyServiceTests(unittest.TestCase):
 
         self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "excited")
         self.assertEqual(send_meme.await_args.kwargs["probability"], 37)
+        self.assertEqual(event.get_extra("astrmai_meme_tag_validation"), "configured")
+
+    def test_post_send_unknown_meme_tag_is_suppressed(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.emotion_mapping = ["happy: 开心"]
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "随便发一个")
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(
+                service._settle_post_send(
+                    event,
+                    event.unified_msg_origin,
+                    bypassed_tag="not-configured",
+                    window_events=[event],
+                    anchor_event=event,
+                )
+            )
+
+        send_meme.assert_not_awaited()
+        self.assertEqual(event.get_extra("astrmai_meme_tag"), "neutral")
+        self.assertEqual(event.get_extra("astrmai_meme_tag_validation"), "unknown_tag")
+
+    def test_handle_reply_uses_configured_custom_primary_mood_tag_for_passive_meme(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.meme_probability = 80
+        state_engine.config.reply.emotion_mapping = ["surprised: 惊讶、震惊、意外"]
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "真的假的")
+        event.set_extra("astrmai_primary_mood_tag", "surprised")
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(service.handle_reply(event, "太意外了", event.unified_msg_origin))
+
+        self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "surprised")
+        self.assertEqual(event.get_extra("astrmai_meme_tag_validation"), "configured")
 
     def test_handle_reply_uses_primary_mood_tag_for_passive_meme(self):
         state_engine = FakeStateEngine()

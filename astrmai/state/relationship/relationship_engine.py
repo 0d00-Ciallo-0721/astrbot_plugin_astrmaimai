@@ -28,6 +28,8 @@ from typing import Dict, Optional
 from dataclasses import dataclass, field
 from astrbot.api import logger
 
+from ...shared.emotion_tags import DEFAULT_RELATIONSHIP_EVENTS, build_emotion_tag_catalog
+
 
 @dataclass
 class RelationshipVector:
@@ -204,14 +206,7 @@ class RelationshipEngine:
     }
 
     # 情绪标签到事件类型的映射 (零 LLM 消耗)
-    MOOD_TO_EVENT: Dict[str, str] = {
-        "happy": RelationshipEvent.COMPLIMENT,
-        "surprise": RelationshipEvent.SHARED_INTEREST,
-        "curious": RelationshipEvent.NORMAL_CHAT,
-        "neutral": RelationshipEvent.NORMAL_CHAT,
-        "sad": RelationshipEvent.EMOTIONAL_SUPPORT,
-        "angry": RelationshipEvent.ARGUMENT,
-    }
+    MOOD_TO_EVENT: Dict[str, str] = dict(DEFAULT_RELATIONSHIP_EVENTS)
 
     MIXED_AFFECT_SUPPORT_WORDS = {
         "谢谢",
@@ -250,7 +245,15 @@ class RelationshipEngine:
 
     def __init__(self, config=None):
         self.config = config
+        self._emotion_catalog = build_emotion_tag_catalog(config)
         self._vectors: Dict[str, RelationshipVector] = {}  # user_id -> vector
+
+    def refresh_config(self, config) -> None:
+        self.config = config
+        self._emotion_catalog = build_emotion_tag_catalog(config)
+
+    def resolve_mood_event(self, mood_tag: str):
+        return self._emotion_catalog.resolve_relationship_event(mood_tag)
 
     def get_or_create(self, user_id: str) -> RelationshipVector:
         """获取或创建用户的关系向量"""
@@ -343,7 +346,7 @@ class RelationshipEngine:
 
         # 1. 如果传入了 mood_tag 但没有明确 event_type，自动映射
         if mood_tag and event_type == RelationshipEvent.NORMAL_CHAT:
-            event_type = self.MOOD_TO_EVENT.get(mood_tag, event_type)
+            event_type = self.resolve_mood_event(mood_tag).event_type
 
         # 2. 查找事件影响矩阵
         deltas = self.EVENT_MATRIX.get(event_type)
@@ -407,7 +410,7 @@ class RelationshipEngine:
         便捷入口: 根据情绪标签更新关系。
         由 StateEngine.calculate_and_update_affection 调用，替代旧的简单加减法。
         """
-        event_type = self.MOOD_TO_EVENT.get(mood_tag, RelationshipEvent.NORMAL_CHAT)
+        event_type = self.resolve_mood_event(mood_tag).event_type
         return self.process_event(user_id, event_type, intensity, mood_tag)
 
     def get_social_score(self, user_id: str) -> float:

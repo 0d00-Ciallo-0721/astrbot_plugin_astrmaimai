@@ -13,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from ..contracts.turn_context import ensure_turn_context
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...shared.emotion_tags import build_emotion_tag_catalog
 from ..contracts.prompt_envelope import PromptEnvelope
 from .tool_contracts import (
     AUTONOMOUS_INTERACTION_TOOLS,
@@ -668,12 +669,7 @@ class PlannerSideInputMixin:
             setattr(event, "astrmai_tool_tier", tier)
 
     def _emotion_mapping_for_meme_tool(self) -> list:
-        value = getattr(getattr(self.reply_engine.config, "reply", None), "emotion_mapping", [])
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            return [f"{key}: {item}" for key, item in value.items()]
-        return []
+        return build_emotion_tag_catalog(self.reply_engine.config).mapping_entries()
 
     def _build_full_pfc_tools(self, chat_id: str, user_id, sender_name: str, event: AstrMessageEvent | None = None):
         target_persona_id = getattr(self.gateway.config.persona, "persona_id", "") if hasattr(self.gateway.config, "persona") else ""

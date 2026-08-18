@@ -9,6 +9,7 @@ from astrbot.api import logger
 
 from ...infrastructure.gateway import GlobalModelGateway
 from ...infrastructure.runtime.lane_manager import LaneKey
+from ...shared.emotion_tags import build_emotion_tag_catalog
 
 
 MOOD_SYSTEM_PROMPT = """
@@ -37,7 +38,8 @@ class MoodManager:
     def __init__(self, gateway: GlobalModelGateway, config=None):
         self.gateway = gateway
         self.config = config if config else gateway.config
-        self.emotion_mapping = self._build_emotion_mapping(self.config)
+        self.catalog = build_emotion_tag_catalog(self.config)
+        self.emotion_mapping = dict(self.catalog.descriptions)
 
     def _analysis_timeout_seconds(self) -> float:
         timing = getattr(self.config, "timing", None)
@@ -49,31 +51,12 @@ class MoodManager:
 
     @staticmethod
     def _build_emotion_mapping(config) -> dict[str, str]:
-        mapping = {}
-        if hasattr(config, "reply") and hasattr(config.reply, "emotion_mapping"):
-            mapping_list = config.reply.emotion_mapping
-            for item in mapping_list:
-                if ":" in item:
-                    k, v = item.split(":", 1)
-                    mapping[k.strip().lower()] = v.strip()
-                elif "：" in item:
-                    k, v = item.split("：", 1)
-                    mapping[k.strip().lower()] = v.strip()
-        if not mapping:
-            mapping = {
-                "happy": "positive, glad, relieved, affectionate",
-                "sad": "hurt, low, apologetic, disappointed",
-                "angry": "annoyed, hostile, blaming, rejecting",
-                "neutral": "plain, procedural, emotionally weak",
-                "curious": "wondering, asking, probing",
-                "surprise": "unexpected, startled, sudden turn",
-            }
-        return mapping
+        return dict(build_emotion_tag_catalog(config).descriptions)
 
     def refresh_config(self, config) -> None:
-        mapping = self._build_emotion_mapping(config)
         self.config = config
-        self.emotion_mapping = mapping
+        self.catalog = build_emotion_tag_catalog(config)
+        self.emotion_mapping = dict(self.catalog.descriptions)
 
     @staticmethod
     def _extract_lane_text_result(result: Any) -> Any:

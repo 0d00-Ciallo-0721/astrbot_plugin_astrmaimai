@@ -1,6 +1,11 @@
 from pydantic import BaseModel, Field
 from typing import Dict, List
 
+try:
+    from .astrmai.shared.emotion_tags import build_emotion_tag_catalog
+except ImportError:  # pragma: no cover - standalone config/test import
+    from astrmai.shared.emotion_tags import build_emotion_tag_catalog
+
 
 LEGACY_MEMORY_NAMESPACE_FIELDS = (
     "deep_temporal_alpha",
@@ -292,6 +297,10 @@ class ReplyConfig(BaseModel):
             "surprise: 惊讶、意外",
         ],
         description="表情标签及其模型识别说明；标签名同时对应 AstrBot 数据目录下 memes_data/memes 中的同名文件夹",
+    )
+    emotion_relationship_mapping: List[str] = Field(
+        default=[],
+        description="可选的情绪标签到好感关系事件映射，格式为“标签名: 关系事件”；未配置的自定义标签按普通聊天结算",
     )
     typing_speed_factor: float = Field(default=0.1, ge=0.0, description="模拟打字等待的强度系数，越大看起来越像在慢慢打字")
 
@@ -792,9 +801,16 @@ class AstrMaiConfig(BaseModel):
             logger.warning("[AstrMai] Vision enabled but vision_models is empty — image recognition will silently fail")
         # ── 格式校验 ──
         for entry in self.reply.emotion_mapping:
-            if ":" not in entry:
+            if ":" not in entry and "：" not in entry:
                 from astrbot.api import logger as _log
                 _log.warning(f"[AstrMai] emotion_mapping entry missing colon: {entry!r}")
+        catalog = build_emotion_tag_catalog(self)
+        for entry in catalog.malformed_emotion_entries:
+            from astrbot.api import logger as _log
+            _log.warning(f"[AstrMai] emotion_mapping entry invalid or empty: {entry!r}")
+        for entry in catalog.invalid_relationship_entries:
+            from astrbot.api import logger as _log
+            _log.warning(f"[AstrMai] emotion_relationship_mapping entry invalid or unknown: {entry!r}")
         for pool_name, pool in [("agent", self.provider.agent_models), ("vision", self.provider.vision_models)]:
             for model in pool:
                 if "/" not in str(model):
