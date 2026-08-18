@@ -43,6 +43,7 @@ class DialogueSegment:
     source_event_ids: list[str] = field(default_factory=list)
     stance: str = ""
     social_event: str = ""
+    internal_note: str = ""
 
 
 @dataclass(slots=True)
@@ -245,6 +246,7 @@ class GroupDialogueStore:
         source_event_ids: list[str] | None = None,
         stance: str = "",
         social_event: str = "",
+        internal_note: str = "",
         create_pending_direct: bool = False,
     ) -> DialogueSegment:
         chat_key = self._resolve_chat_key(chat_id)
@@ -278,6 +280,7 @@ class GroupDialogueStore:
             ][-8:],
             stance=str(stance or ""),
             social_event=str(social_event or ""),
+            internal_note=str(internal_note or "")[:500],
         )
         async with self._lock:
             thread = self._get_thread(chat_key)
@@ -1388,7 +1391,10 @@ class GroupDialogueStore:
         if semantic_visual and segment.message_kind == "mixed":
             prefix_bits.append("图文")
         prefix = f"({'，'.join(prefix_bits)}) " if prefix_bits else ""
-        return f"{speaker} {prefix}: {segment.content}".replace("  ", " ").strip().replace(" :", ":")
+        rendered = f"{speaker} {prefix}: {segment.content}".replace("  ", " ").strip().replace(" :", ":")
+        if segment.internal_note:
+            rendered += f"\n[内部动作说明：{segment.internal_note}]"
+        return rendered
 
     @staticmethod
     def _normalize_message_text(text: str) -> str:

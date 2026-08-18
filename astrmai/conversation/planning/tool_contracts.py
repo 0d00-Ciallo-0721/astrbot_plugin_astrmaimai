@@ -61,7 +61,7 @@ TOOL_CAPABILITIES: dict[str, ToolCapabilitySpec] = {
     "construct_at_event": ToolCapabilitySpec("construct_at_event", "at", "message", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
     "proactive_poke": ToolCapabilitySpec("proactive_poke", "poke", "qq_side_effect", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
     "proactive_meme": ToolCapabilitySpec("proactive_meme", "meme", "message", explicit_policy="required", autonomous_allowed=True, deterministic_fallback=True),
-    "meme_resonance_action": ToolCapabilitySpec("meme_resonance_action", "resonance", "control", explicit_policy="required", autonomous_allowed=True),
+    "meme_resonance_action": ToolCapabilitySpec("meme_resonance_action", "resonance", "control", contexts=("group",), explicit_policy="required", autonomous_allowed=True),
     "topic_hijack_action": ToolCapabilitySpec("topic_hijack_action", "topic", "control", explicit_policy="required", autonomous_allowed=True),
     "space_transition_action": ToolCapabilitySpec("space_transition_action", "private", "cross_session_message", explicit_policy="required", autonomous_allowed=True),
     "regret_and_withdraw_action": ToolCapabilitySpec("regret_and_withdraw_action", "withdraw", "qq_side_effect", explicit_policy="required", deterministic_fallback=True),

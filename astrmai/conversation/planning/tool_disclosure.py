@@ -90,6 +90,7 @@ PACKAGE_ORDER: tuple[str, ...] = (
 DEFAULT_VISIBLE_TOOL_NAMES: tuple[str, ...] = (
     *TOOL_PACKAGES["core"],
     *TOOL_PACKAGES["default_actions"],
+    "meme_resonance_action",
 )
 
 

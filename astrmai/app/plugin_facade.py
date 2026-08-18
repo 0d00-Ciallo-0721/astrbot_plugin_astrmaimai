@@ -152,6 +152,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("runtime_coordinator", getattr(runtime, "runtime_coordinator", None), "clear_runtime_state", True),
             ("dialogue_store", getattr(runtime, "dialogue_store", None), "clear_chat", True),
             ("group_social_feedback_observer", getattr(runtime, "group_social_feedback_observer", None), "clear_chat", True),
+            ("group_reread_observer", getattr(runtime, "group_reread_observer", None), "clear_chat", True),
             ("chat_loop_kernel", getattr(runtime, "chat_loop_kernel", None), "clear_chat_state", True),
         ]
         proactive_task = getattr(runtime, "proactive_task", None)
@@ -242,6 +243,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("private_chat_manager", getattr(self.runtime, "private_chat_manager", None)),
             ("group_reply_wait_manager", getattr(self.runtime, "group_reply_wait_manager", None)),
             ("group_social_feedback_observer", getattr(self.runtime, "group_social_feedback_observer", None)),
+            ("group_reread_observer", getattr(self.runtime, "group_reread_observer", None)),
             ("attention_gate", getattr(self.runtime, "attention_gate", None)),
             ("reply_engine", getattr(self.runtime, "reply_engine", None)),
             ("system2_planner", getattr(self.runtime, "system2_planner", None)),
@@ -385,6 +387,22 @@ class PluginFacade(RuntimeFacadeProtocol):
         if coordinator is None:
             return None
         return await coordinator.observe_incoming(event)
+
+    async def try_dispatch_group_reread(self, event) -> bool:
+        observer = getattr(self.runtime, "group_reread_observer", None)
+        dispatcher = getattr(self.runtime, "reread_action_dispatcher", None)
+        if observer is None or dispatcher is None:
+            return False
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_reread_action_dispatcher", dispatcher)
+        request = await observer.observe(event)
+        if request is None:
+            return False
+        result = await dispatcher.dispatch(event, request)
+        if hasattr(event, "set_extra"):
+            event.set_extra("astrmai_group_reread_status", result.status)
+            event.set_extra("astrmai_group_reread_detail", result.detail)
+        return bool(result.sent)
 
     async def handle_group_reply_wait(self, event, scope) -> str:
         if not event.get_group_id() or not self.runtime.group_reply_wait_manager:

@@ -108,9 +108,10 @@ DEFAULT_ACTION_TOOL_NAMES = {
     "message_emoji_like_action",
     "vision_message_analyze_tool",
     "proactive_meme",
+    "meme_resonance_action",
 }
 
-PRIVATE_DEFAULT_ACTION_TOOL_NAMES = DEFAULT_ACTION_TOOL_NAMES - {"construct_at_event"}
+PRIVATE_DEFAULT_ACTION_TOOL_NAMES = DEFAULT_ACTION_TOOL_NAMES - {"construct_at_event", "meme_resonance_action"}
 
 LEGACY_CHAT_EXPECTED_TOOL_NAMES = FACT_TOOL_NAMES | {
     "proactive_meme",

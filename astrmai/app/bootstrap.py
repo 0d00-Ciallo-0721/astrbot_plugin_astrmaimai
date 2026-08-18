@@ -12,11 +12,13 @@ from ..conversation.attention.context_compaction import ContextCompactionEngine
 from ..conversation.attention.gate import AttentionGate
 from ..conversation.attention.group_dialogue_store import GroupDialogueStore
 from ..conversation.attention.group_social_feedback_observer import GroupSocialFeedbackObserver
+from ..conversation.attention.group_reread_observer import GroupRereadObserver
 from ..conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 from ..conversation.decision.judge import Judge
 from ..conversation.execution.reply_service import ReplyService
 from ..conversation.execution.reply_commit_service import ReplyCommitService
 from ..conversation.execution.post_reply_feedback_coordinator import PostReplyFeedbackCoordinator
+from ..conversation.execution.reread_action_dispatcher import RereadActionDispatcher
 from ..conversation.execution.system2_runner import System2Runner
 from ..conversation.loop import ChatLoopKernel
 from ..conversation.planning.context_engine import ContextEngine
@@ -408,6 +410,13 @@ class PluginBootstrap:
             dialogue_store=runtime.dialogue_store,
             gateway=runtime.gateway,
         )
+        group_reread_observer = GroupRereadObserver(config=runtime.config)
+        reread_action_dispatcher = RereadActionDispatcher(
+            context=runtime.context,
+            config=runtime.config,
+            runtime_coordinator=runtime.runtime_coordinator,
+            dialogue_store=runtime.dialogue_store,
+        )
         post_reply_feedback_coordinator = PostReplyFeedbackCoordinator(
             private_chat_manager=private_chat_manager,
             group_social_feedback_observer=group_social_feedback_observer,
@@ -420,6 +429,13 @@ class PluginBootstrap:
         )
         if callable(bind_feedback_coordinator):
             bind_feedback_coordinator(post_reply_feedback_coordinator)
+        bind_reread_observer = getattr(reply_engine, "bind_group_reread_observer", None)
+        if callable(bind_reread_observer):
+            bind_reread_observer(group_reread_observer)
+        executor = getattr(getattr(runtime, "system2_planner", None), "executor", None)
+        bind_reread_dispatcher = getattr(executor, "bind_reread_action_dispatcher", None)
+        if callable(bind_reread_dispatcher):
+            bind_reread_dispatcher(reread_action_dispatcher)
         attention_gate = AttentionGate(
             state_engine=runtime.state_engine,
             judge=runtime.judge,
@@ -449,6 +465,8 @@ class PluginBootstrap:
             group_reply_wait_manager=group_reply_wait_manager,
             group_social_feedback_observer=group_social_feedback_observer,
             post_reply_feedback_coordinator=post_reply_feedback_coordinator,
+            group_reread_observer=group_reread_observer,
+            reread_action_dispatcher=reread_action_dispatcher,
             attention_gate=attention_gate,
         )
 

@@ -1314,12 +1314,12 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
 @dataclass
 class MemeResonanceTool(FunctionTool[AstrAgentContext]):
     name: str = "meme_resonance_action"
-    description: str = "当需要 1:1 跟队复读时调用，系统会强制终止为固定输出。"
+    description: str = "仅当当前群聊消息适合精确跟读时调用。系统会原样发送当前纯文本并结束本轮，不表示事实认可或立场承诺。"
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "target_message": {"type": "string", "description": "要 1:1 复读的内容。", "minLength": 1, "maxLength": 500}
+                "target_message": {"type": "string", "description": "当前群消息中要 1:1 复读的纯文本，必须原样填写。", "minLength": 1, "maxLength": 500}
             },
             "required": ["target_message"],
         }
@@ -1330,12 +1330,33 @@ class MemeResonanceTool(FunctionTool[AstrAgentContext]):
         if not target_message:
             return "执行失败：target_message 不能为空。"
         current_event = _get_current_event(context)
+        if not getattr(current_event, "get_group_id", lambda: "")():
+            return "执行失败：主动复读只适用于群聊。"
+        current_message = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", str(getattr(current_event, "message_str", "") or ""))
+        current_message = re.sub(r"\s+", " ", current_message).strip()
+        normalized_target = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", target_message)
+        normalized_target = re.sub(r"\s+", " ", normalized_target).strip()
+        chain = getattr(getattr(current_event, "message_obj", None), "message", None) or []
+        component_type = str(getattr(chain[0], "type", chain[0].__class__.__name__)).lstrip("_").lower() if chain else "plain"
+        if len(chain) > 1 or component_type not in {"plain", "text"} or not current_message or normalized_target != current_message:
+            return "执行失败：只能精确复读当前群聊中的单段纯文本。"
+        message_id = _current_message_id(current_event)
+        current_event.set_extra(
+            "astrmai_reread_request",
+            {
+                "chat_id": str(getattr(current_event, "unified_msg_origin", "") or ""),
+                "text": current_message,
+                "trigger_kind": "group_reread_active",
+                "source_event_ids": [message_id] if message_id else [],
+                "explanation": "模型基于当前群聊语境主动选择精确跟读该消息；这是一种社交表达，不表示事实认可、立场承诺或独立判断。",
+            },
+        )
         _append_once(
             current_event,
             matcher=lambda item: item.get("action") == "terminal_reread",
-            action={"action": "terminal_reread", "content": target_message},
+            action={"action": "terminal_reread", "content": current_message},
         )
-        return f"[TERMINAL_YIELD]:{target_message}"
+        return f"[TERMINAL_YIELD]:{current_message}"
 
 
 @dataclass

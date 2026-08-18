@@ -76,6 +76,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             else ReplyCommitService()
         )
         self.post_reply_feedback_coordinator = post_reply_feedback_coordinator
+        self.group_reread_observer = None
         self.qq_action_dispatcher = QQActionDispatcher(
             config=self.config,
             runtime_coordinator=runtime_coordinator,
@@ -104,6 +105,32 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
 
     def bind_post_reply_feedback_coordinator(self, coordinator) -> None:
         self.post_reply_feedback_coordinator = coordinator
+
+    def bind_group_reread_observer(self, observer) -> None:
+        self.group_reread_observer = observer
+
+    async def _record_group_reread_seeds(self, event, chat_id: str, receipt) -> None:
+        observer = self.group_reread_observer
+        if (
+            observer is None
+            or not getattr(event, "get_group_id", lambda: "")()
+            or event.get_extra("astrmai_group_reread_dispatched", False)
+            or event.get_extra("astrmai_reread_request", None)
+        ):
+            return
+        bot_id = str(getattr(event, "get_self_id", lambda: "")() or "")
+        message_ids = list(getattr(receipt, "outbound_message_ids", ()) or ())
+        for index, segment in enumerate(getattr(receipt, "sent_segments", ()) or ()):
+            event_id = message_ids[index] if index < len(message_ids) else ""
+            try:
+                await observer.record_outbound_text_seed(
+                    chat_id,
+                    segment,
+                    bot_id=bot_id,
+                    event_id=event_id,
+                )
+            except Exception:
+                logger.debug("[ReplyService] group reread seed degraded", exc_info=True)
 
     async def handle_reply(
         self,
@@ -253,6 +280,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             reply_plan,
             send_receipt,
         )
+        await self._record_group_reread_seeds(event, chat_id, send_receipt)
         artifact.metadata["reply_commit_id"] = committed_turn.commit_id
         artifact.metadata["reply_commit_status"] = committed_turn.send_status.value
         artifact.metadata["partial_send"] = committed_turn.partial_send

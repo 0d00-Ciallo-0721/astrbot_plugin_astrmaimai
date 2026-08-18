@@ -265,6 +265,42 @@
         "default": 5,
         "hint": "限制并行观察窗口数量，避免高频群聊积累过多短期状态。"
       },
+      "group_reread_enabled": {
+        "description": "启用群聊被动复读",
+        "type": "bool",
+        "default": true,
+        "hint": "只对群聊纯文本的连续多人复读触发一次原样跟读。"
+      },
+      "group_reread_threshold": {
+        "description": "被动复读触发人数",
+        "type": "int",
+        "default": 5,
+        "hint": "连续发送同一纯文本且发送者互不相同的人数达到此值后触发。"
+      },
+      "group_reread_window_sec": {
+        "description": "被动复读时间窗口（秒）",
+        "type": "float",
+        "default": 60,
+        "hint": "超过该时间未形成连续复读链时重新计数。"
+      },
+      "group_reread_cooldown_sec": {
+        "description": "被动复读冷却时间（秒）",
+        "type": "float",
+        "default": 45,
+        "hint": "一次复读成功后，在同一群暂不再次触发。"
+      },
+      "group_reread_max_groups": {
+        "description": "复读状态最大群数",
+        "type": "int",
+        "default": 256,
+        "hint": "限制内存中同时保留的群聊复读状态数量。"
+      },
+      "group_reread_state_ttl_sec": {
+        "description": "复读状态清理时间（秒）",
+        "type": "float",
+        "default": 600,
+        "hint": "长时间没有活动的群聊复读状态会自动清理。"
+      },
       "group_shared_history_enabled": {
         "description": "启用群聊共享话题历史",
         "type": "bool",

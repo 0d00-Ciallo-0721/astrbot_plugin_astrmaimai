@@ -128,6 +128,25 @@ def test_explicit_private_poke_is_prepared_once_without_fake_success():
         temp_dir.cleanup()
 
 
+def test_meme_resonance_tool_creates_validated_active_reread_request():
+    temp_dir, _, tools_mod = _load_modules()
+    try:
+        event = _Event("跟上", group_id="group-1")
+        event.unified_msg_origin = "default:GroupMessage:group-1"
+        event.message_obj.message = [SimpleNamespace(type="Plain")]
+        context = SimpleNamespace(context=SimpleNamespace(event=event))
+
+        result = asyncio.run(tools_mod.MemeResonanceTool().call(context, target_message="跟上"))
+
+        assert result == "[TERMINAL_YIELD]:跟上"
+        request = event.get_extra("astrmai_reread_request")
+        assert request["trigger_kind"] == "group_reread_active"
+        assert request["text"] == "跟上"
+        assert "不表示事实认可" in request["explanation"]
+    finally:
+        temp_dir.cleanup()
+
+
 def test_group_poke_for_named_target_is_not_guessed_as_current_sender():
     temp_dir, _, tools_mod = _load_modules()
     try:

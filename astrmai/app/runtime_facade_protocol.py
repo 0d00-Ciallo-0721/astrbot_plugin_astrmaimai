@@ -208,6 +208,9 @@ class RuntimeFacadeProtocol(Protocol):
     async def observe_post_reply_feedback(self, event: Any) -> Any:
         ...
 
+    async def try_dispatch_group_reread(self, event: Any) -> bool:
+        ...
+
     async def handle_group_reply_wait(self, event: Any, scope: Any) -> str:
         ...
 

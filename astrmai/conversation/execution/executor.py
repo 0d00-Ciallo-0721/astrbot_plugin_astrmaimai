@@ -42,6 +42,7 @@ from ...multimodal.vision_prompt import (
 from ..contracts.dialog_history_policy import DialogHistoryPolicy
 from ..contracts.focus_context import FocusThreadContext, FreshnessState, VisionBundle
 from ..contracts.prompt_envelope import PromptEnvelope
+from ..contracts.reread import RereadActionRequest
 from ..vision_state import (
     classify_vision_failure_text,
     guard_unresolved_image_reply,
@@ -99,6 +100,7 @@ class ConcurrentExecutor:
         self.runtime_coordinator = runtime_coordinator
         self.visual_cortex = visual_cortex
         self.image_resolver = image_resolver
+        self.reread_action_dispatcher = None
         self._chat_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
@@ -106,6 +108,9 @@ class ConcurrentExecutor:
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    def bind_reread_action_dispatcher(self, dispatcher) -> None:
+        self.reread_action_dispatcher = dispatcher
 
     def _build_vision_bundle(
         self,
@@ -218,10 +223,38 @@ class ConcurrentExecutor:
             "astrmai_autonomous_vision_need",
             "astrmai_autonomous_vision_reason",
             "astrmai_autonomous_vision_candidate_id",
+            "astrmai_reread_request",
+            "astrmai_reread_action_dispatcher",
         ):
             value = source_event.get_extra(key, None)
             if value is not None:
                 target_event.set_extra(key, value)
+
+    async def _dispatch_reread_request(self, event: AstrMessageEvent) -> bool:
+        raw = event.get_extra("astrmai_reread_request", None)
+        if not isinstance(raw, dict):
+            return False
+        dispatcher = event.get_extra("astrmai_reread_action_dispatcher", None) or self.reread_action_dispatcher
+        if dispatcher is None or not hasattr(dispatcher, "dispatch"):
+            raise RuntimeError("reread_dispatcher_unavailable")
+        text = str(raw.get("text", "") or "").strip()
+        chat_id = str(raw.get("chat_id", "") or getattr(event, "unified_msg_origin", "") or "").strip()
+        if not text or not chat_id:
+            raise ValueError("invalid_reread_request")
+        request = RereadActionRequest(
+            chat_id=chat_id,
+            text=text,
+            fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            trigger_kind=str(raw.get("trigger_kind", "group_reread_active") or "group_reread_active"),
+            source_event_ids=tuple(str(item) for item in raw.get("source_event_ids", []) or [] if str(item)),
+            explanation=str(raw.get("explanation", "") or ""),
+        )
+        result = await dispatcher.dispatch(event, request)
+        event.set_extra("astrmai_reread_dispatch_status", result.status)
+        if result.sent:
+            event.set_extra("astrmai_execution_status", "reread_dispatched")
+            return True
+        raise RuntimeError(f"reread_dispatch_{result.status}:{result.detail}")
 
     @staticmethod
     def _record_required_tool_outcomes(event: AstrMessageEvent) -> list[str]:
@@ -2031,6 +2064,10 @@ class ConcurrentExecutor:
                     debug_trace(event, "execution.executor.wait_signal", model=provider_id)
                     return None
                 if "[TERMINAL_YIELD]:" in reply_text:
+                    if event.get_extra("astrmai_reread_request", None):
+                        if await self._dispatch_reread_request(event):
+                            debug_trace(event, "execution.executor.reread_dispatched", model=provider_id)
+                            return None
                     idx = reply_text.find("[TERMINAL_YIELD]:")
                     terminal_content = reply_text[idx + len("[TERMINAL_YIELD]:"):].strip()
                     safe_content, failure_kind = validate_visible_output_text(terminal_content)

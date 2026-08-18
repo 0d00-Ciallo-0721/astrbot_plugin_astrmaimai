@@ -53,6 +53,8 @@ class InteractionServices:
     group_reply_wait_manager: Any = None
     group_social_feedback_observer: Any = None
     post_reply_feedback_coordinator: Any = None
+    group_reread_observer: Any = None
+    reread_action_dispatcher: Any = None
     attention_gate: Any = None
 
 
@@ -316,6 +318,14 @@ class PluginRuntimeContext:
         return self.interaction.post_reply_feedback_coordinator
 
     @property
+    def group_reread_observer(self) -> Any:
+        return self.interaction.group_reread_observer
+
+    @property
+    def reread_action_dispatcher(self) -> Any:
+        return self.interaction.reread_action_dispatcher
+
+    @property
     def attention_gate(self) -> Any:
         return self.interaction.attention_gate
 
@@ -365,6 +375,7 @@ class PluginRuntimeContext:
             self.expression_governance_runner,
             self.proactive_task,
             self.group_social_feedback_observer,
+            self.group_reread_observer,
         )
 
     def build_diagnostics(self) -> dict[str, Any]:

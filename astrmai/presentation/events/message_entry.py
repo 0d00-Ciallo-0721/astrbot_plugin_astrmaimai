@@ -325,6 +325,16 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
 
     await _bind_turn_identity(facade, event, scope)
 
+    dispatch_group_reread = getattr(facade, "try_dispatch_group_reread", None)
+    if callable(dispatch_group_reread):
+        try:
+            if await dispatch_group_reread(event):
+                debug_trace(event, "ingress.stop", reason="group_reread_dispatched")
+                event.stop_event()
+                return
+        except Exception:
+            logger.exception("[AstrMai] try_dispatch_group_reread failed")
+
     observe_feedback = getattr(facade, "observe_post_reply_feedback", None)
     if callable(observe_feedback):
         try:

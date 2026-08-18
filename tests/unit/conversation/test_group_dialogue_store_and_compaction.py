@@ -25,6 +25,29 @@ class _TelemetryEvent:
 
 
 class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
+    def test_reread_internal_note_is_rendered_only_as_context_annotation(self):
+        async def run():
+            store = GroupDialogueStore()
+            segment = await store.append_segment(
+                "chat-1",
+                event_id="reread-1",
+                speaker_id="bot-1",
+                speaker_name="Bot",
+                content="早",
+                role="assistant",
+                is_bot=True,
+                provenance="group_reread_passive",
+                internal_note="群内连续复读触发的社交跟读，不表示事实认可。",
+            )
+            return segment.content, store._format_segment_line(segment)
+
+        content, rendered = asyncio.run(run())
+
+        self.assertEqual(content, "早")
+        self.assertIn("Bot: 早", rendered)
+        self.assertIn("内部动作说明", rendered)
+        self.assertIn("不表示事实认可", rendered)
+
     def test_feedback_records_are_deduplicated_without_storing_message_content(self):
         async def run():
             store = GroupDialogueStore()

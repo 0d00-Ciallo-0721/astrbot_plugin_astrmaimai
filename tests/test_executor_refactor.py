@@ -139,6 +139,44 @@ class RefactoredExecutorTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_terminal_reread_request_uses_shared_dispatcher(self):
+        gateway = _FakeGateway()
+        dispatcher = SimpleNamespace()
+        calls = []
+
+        class _Result:
+            status = "sent"
+            detail = ""
+            sent = True
+
+        async def _dispatch(event, request):
+            calls.append((event, request))
+            return _Result()
+
+        dispatcher.dispatch = _dispatch
+        event = _FakeEvent(text="跟上")
+        event.set_extra(
+            "astrmai_reread_request",
+            {
+                "chat_id": event.unified_msg_origin,
+                "text": "跟上",
+                "trigger_kind": "group_reread_active",
+                "source_event_ids": ["msg-1"],
+                "explanation": "主动跟读",
+            },
+        )
+        event.set_extra("astrmai_reread_action_dispatcher", dispatcher)
+        executor = self.executor_mod.ConcurrentExecutor(
+            context=SimpleNamespace(),
+            gateway=gateway,
+            reply_engine=SimpleNamespace(),
+            evolution_manager=SimpleNamespace(),
+        )
+
+        self.assertTrue(asyncio.run(executor._dispatch_reread_request(event)))
+        self.assertEqual(calls[0][1].text, "跟上")
+        self.assertEqual(event.get_extra("astrmai_reread_dispatch_status"), "sent")
+
     def test_required_tool_outcome_distinguishes_satisfied_and_missing(self):
         event = _FakeEvent()
         event.set_extra("astrmai_required_tools", ["proactive_poke", "omni_perception_query"])

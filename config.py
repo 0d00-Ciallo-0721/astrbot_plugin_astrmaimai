@@ -340,6 +340,12 @@ class ConversationConfig(BaseModel):
     social_feedback_observation_enabled: bool = Field(default=True)
     social_feedback_window_sec: float = Field(default=45.0, ge=5.0, le=300.0)
     social_feedback_max_active_per_chat: int = Field(default=5, ge=1, le=20)
+    group_reread_enabled: bool = Field(default=True, description="启用群聊被动复读社交动作")
+    group_reread_threshold: int = Field(default=5, ge=2, le=12, description="触发被动复读所需的连续不同成员数量")
+    group_reread_window_sec: float = Field(default=60.0, ge=5.0, le=300.0, description="连续复读链允许的最长时间窗口（秒）")
+    group_reread_cooldown_sec: float = Field(default=45.0, ge=0.0, le=600.0, description="同一群聊复读动作成功后的冷却时间（秒）")
+    group_reread_max_groups: int = Field(default=256, ge=16, le=4096, description="内存中最多保留多少个群聊的复读运行状态")
+    group_reread_state_ttl_sec: float = Field(default=600.0, ge=30.0, le=86400.0, description="无活动群聊复读状态的自动清理时间（秒）")
     group_shared_history_enabled: bool = Field(
         default=True,
         description="启用群聊共享话题历史；参与者事实仍按 QQ 号隔离",

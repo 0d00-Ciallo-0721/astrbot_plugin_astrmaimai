@@ -25,16 +25,17 @@ DEFAULT_ACTION_TOOLS = {
     "message_emoji_like_action",
     "vision_message_analyze_tool",
     "proactive_meme",
+    "meme_resonance_action",
 }
 
 
-def test_tool_catalog_has_12_default_and_21_on_demand_tools():
+def test_tool_catalog_has_13_default_and_20_on_demand_tools():
     registered = set(TOOL_CAPABILITIES)
     defaults = set(DEFAULT_VISIBLE_TOOL_NAMES)
 
     assert len(registered) == 33
-    assert len(defaults) == 12
-    assert len(registered - defaults) == 21
+    assert len(defaults) == 13
+    assert len(registered - defaults) == 20
     assert set(TOOL_DISPLAY_NAMES) == registered
     assert not {
         "group_sign_action",

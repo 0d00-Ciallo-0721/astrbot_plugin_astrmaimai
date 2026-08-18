@@ -67,6 +67,10 @@ class _Facade:
         self.calls.append("group_wait")
         return "NONE"
 
+    async def try_dispatch_group_reread(self, _event):
+        self.calls.append("reread")
+        return False
+
     @staticmethod
     def is_debug_mode():
         return False
@@ -130,6 +134,23 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
             return_value=self.entry_mod.IngressDecision.allow(),
         ), patch.object(self.entry_mod, "is_direct_call_event", return_value=False):
             return asyncio.run(_run())
+
+    def test_group_reread_stops_before_attention(self):
+        facade = _Facade()
+
+        async def _dispatch(_event):
+            facade.calls.append("reread")
+            return True
+
+        facade.try_dispatch_group_reread = _dispatch
+        event = _Event()
+
+        self._collect(facade, event)
+
+        self.assertTrue(event.stopped)
+        self.assertIn("reread", facade.calls)
+        self.assertNotIn("group_wait", facade.calls)
+        self.assertNotIn("attention", facade.calls)
 
     def test_duplicate_message_stops_event_before_facade_guards(self):
         facade = _Facade()
