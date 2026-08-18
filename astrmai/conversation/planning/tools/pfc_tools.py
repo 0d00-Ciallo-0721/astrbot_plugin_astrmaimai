@@ -772,6 +772,11 @@ async def prepare_explicit_tool_fallbacks(
         emotion_tag = requested_tag or (mood_tag if mood_tag in non_neutral_tags else (
             non_neutral_tags[0] if non_neutral_tags else "happy"
         ))
+        event.set_extra(
+            "astrmai_bot_expression_decision",
+            {"expression_tag": emotion_tag, "source": "explicit_fallback", "force": True},
+        )
+        event.set_extra("astrmai_bot_expression_tag", emotion_tag)
         event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
         event.set_extra("astrmai_force_meme", True)
         if _append_once(
@@ -1286,6 +1291,16 @@ class ProactiveMemeTool(FunctionTool[AstrAgentContext]):
         valid_tags = set(parse_emotion_mapping(self.emotion_mapping))
         if valid_tags and emotion_tag not in valid_tags:
             emotion_tag = "neutral"
+        current_event.set_extra(
+            "astrmai_bot_expression_decision",
+            {
+                "expression_tag": emotion_tag,
+                "source": "explicit_tool",
+                "force": True,
+            },
+        )
+        current_event.set_extra("astrmai_bot_expression_tag", emotion_tag)
+        # Compatibility for integrations that have not adopted the decision contract.
         current_event.set_extra("astrmai_bypass_mood_analysis", emotion_tag)
         current_event.set_extra("astrmai_force_meme", True)
         _append_once(

@@ -147,6 +147,31 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert "## Vision" in render_markdown(report)
 
 
+def test_analyze_traces_reports_relationship_and_expression_decisions():
+    report = analyze_traces(
+        [
+            {
+                "turn_id": "turn-social-1",
+                "relationship_observation": {
+                    "event_type": "compliment",
+                    "source": "deterministic_rule",
+                    "disposition": "applied",
+                },
+                "expression_observation": {
+                    "bot_expression_tag": "shy",
+                    "source": "explicit_tool",
+                    "disposition": "eligible",
+                },
+            }
+        ]
+    )
+
+    assert report["relationship"]["event_counts"] == {"compliment": 1}
+    assert report["relationship"]["disposition_counts"] == {"applied": 1}
+    assert report["expression"]["tag_counts"] == {"shy": 1}
+    assert "## Relationship Events" in render_markdown(report)
+
+
 def test_analyze_traces_counts_abandoned_calls_budget_and_attempt_failures():
     report = analyze_traces(
         [

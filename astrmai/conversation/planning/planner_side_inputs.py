@@ -1857,6 +1857,14 @@ class PlannerSideInputMixin:
                 skipped_reason=skipped_reason,
                 attack_confidence=attack_confidence,
                 risk_flags=risk_flags,
+                event=event,
+                turn_id=str(event.get_extra("astrmai_trace_id", "") or ""),
+                source_event_ids=(
+                    str(
+                        getattr(getattr(focus_event or anchor_event or event, "message_obj", None), "message_id", "")
+                        or ""
+                    ),
+                ),
             )
         except Exception as exc:
             logger.debug(f"[Planner] no-send relationship settlement skipped: {exc}")

@@ -200,6 +200,11 @@ def test_explicit_meme_fallback_uses_configured_emotion_hint():
         )
 
         assert queued == ["proactive_meme"]
+        assert event.get_extra("astrmai_bot_expression_decision") == {
+            "expression_tag": "happy",
+            "source": "explicit_fallback",
+            "force": True,
+        }
         assert event.get_extra("astrmai_bypass_mood_analysis") == "happy"
         assert event.get_extra("astrmai_force_meme") is True
         assert event.get_extra("astrmai_pending_actions")[0]["tag"] == "happy"

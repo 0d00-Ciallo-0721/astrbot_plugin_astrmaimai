@@ -197,6 +197,9 @@ def test_migration_audit_reports_legacy_schema_without_mutating_it():
         "ix_reply_commit_outbox_next_retry_at",
         "ix_learning_mining_run_created_at",
         "ix_memory_turn_checkpoint_updated_at",
+        "ix_relationship_event_ledger_user_created",
+        "ix_relationship_event_ledger_chat_created",
+        "ix_relationship_event_ledger_turn_id",
     }
     assert report.table_row_counts == {"messagelog": 1, "chat_states": 0}
     assert db.total_changes == before

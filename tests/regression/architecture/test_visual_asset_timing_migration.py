@@ -4,6 +4,7 @@ from sqlmodel import SQLModel, create_engine
 
 from astrmai.infrastructure.persistence.persistence_schema import (
     PersistenceSchemaMixin,
+    _MIGRATIONS,
     _dedupe_sqlmodel_metadata_indexes,
     _run_migrations,
 )
@@ -30,7 +31,7 @@ def test_visual_asset_timing_migration_upgrades_v87_to_v88(tmp_path):
         }
         version = db.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == 88
+    assert version == len(_MIGRATIONS)
     assert "initial_recognition_elapsed_ms" in columns
     assert "reuse_count" in columns
     assert float(columns["initial_recognition_elapsed_ms"][4]) == 0.0
@@ -57,7 +58,7 @@ def test_visual_asset_timing_migration_bootstraps_fresh_database(tmp_path):
         }
         version = db.execute("PRAGMA user_version").fetchone()[0]
 
-    assert version == 88
+    assert version == len(_MIGRATIONS)
     assert "asset_id" in columns
     assert "initial_recognition_elapsed_ms" in columns
     assert "reuse_count" in columns

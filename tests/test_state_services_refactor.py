@@ -114,6 +114,32 @@ class StateRefactorTests(unittest.TestCase):
         self.assertEqual(observed["chat_id"], "chat-1")
         # delta 不再通过 atomic_update_mood 观测（新 CAS 路径直接 clamp）
 
+    def test_event_only_relationship_mode_does_not_promote_mood_tag_to_event(self):
+        config = SimpleNamespace(
+            energy=SimpleNamespace(cost_per_reply=0.1, min_reply_threshold=0.1, daily_recovery=0.1, recovery_silence_min=60),
+            mood=SimpleNamespace(decay_interval=3600, decay_rate=0.05),
+            reply=SimpleNamespace(
+                emotion_mapping=["surprised: 惊讶"],
+                emotion_relationship_mapping=["surprised: shared_interest"],
+            ),
+            relationship=SimpleNamespace(settlement_mode="event_only", min_confidence=0.75, policy_version="relationship-v1"),
+        )
+        engine = self.state_mod.StateEngine(_FakePersistence(), SimpleNamespace(config=config), config=config)
+
+        entry = asyncio.run(
+            engine.calculate_and_update_affection(
+                user_id="user-event-only",
+                group_id="group-event-only",
+                mood_tag="surprised",
+                message_text="普通消息",
+                turn_id="turn-event-only",
+            )
+        )
+
+        self.assertEqual(entry.proposal.event_type, self.state_mod.RelationshipEvent.NORMAL_CHAT)
+        self.assertEqual(entry.disposition, "suppressed")
+        self.assertEqual(entry.proposal.source, "deterministic_rule")
+
     def test_consume_energy_skips_private_chat_by_design(self):
         persistence = _FakePersistence()
         config = SimpleNamespace(

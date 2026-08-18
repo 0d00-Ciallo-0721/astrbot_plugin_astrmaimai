@@ -19,6 +19,7 @@ from .energy.energy_manager import EnergyManager
 from .mood.mood_decay import apply_natural_decay
 from .mood.mood_manager import MoodManager
 from .relationship.affection_router import AffectionRouter
+from .relationship.relationship_ledger import RelationshipEventProposal, RelationshipLedgerEntry
 from .relationship.relationship_engine import RelationshipEngine, RelationshipEvent
 from .user_profile_service import UserProfileService
 
@@ -433,6 +434,12 @@ class StateEngine:
         self.relationship_engine = RelationshipEngine(config=self.config)
         self.affection_router = AffectionRouter(self.relationship_engine, event_bus=event_bus)
         self.energy_manager = EnergyManager(self.config)
+        self._relationship_settlement_locks: Dict[str, asyncio.Lock] = {}
+
+    def _relationship_settlement_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._relationship_settlement_locks:
+            self._relationship_settlement_locks[key] = asyncio.Lock()
+        return self._relationship_settlement_locks[key]
 
     def refresh_config(self, config):
         """ponytail: hot-reload config into state engine and sub-components"""
@@ -604,6 +611,118 @@ class StateEngine:
     def apply_natural_decay(self, state: ChatState):
         apply_natural_decay(state, self.config)
 
+    def _relationship_settings(self) -> tuple[str, float, str]:
+        settings = getattr(self.config, "relationship", None)
+        mode = str(getattr(settings, "settlement_mode", "legacy") or "legacy").strip().lower()
+        if mode not in {"legacy", "shadow", "event_only"}:
+            mode = "legacy"
+        try:
+            min_confidence = float(getattr(settings, "min_confidence", 0.75))
+        except (TypeError, ValueError):
+            min_confidence = 0.75
+        version = str(getattr(settings, "policy_version", "relationship-v1") or "relationship-v1").strip()
+        return mode, max(0.0, min(1.0, min_confidence)), version
+
+    @staticmethod
+    def _relationship_vector_delta(before: dict, after: dict) -> dict[str, float]:
+        return {
+            name: round(float(after.get(name, 0.0) or 0.0) - float(before.get(name, 0.0) or 0.0), 6)
+            for name in ("trust", "familiarity", "emotion_bond", "respect")
+        }
+
+    async def settle_relationship_event(
+        self,
+        proposal: RelationshipEventProposal,
+        *,
+        event: Any = None,
+    ) -> RelationshipLedgerEntry:
+        """Settle one canonical event and record an idempotent audit entry."""
+        mode, min_confidence, policy_version = self._relationship_settings()
+        async with self._relationship_settlement_lock(proposal.idempotency_key):
+            lookup_entry = getattr(self.persistence, "get_relationship_ledger_entry", None)
+            if callable(lookup_entry):
+                existing = await lookup_entry(proposal.idempotency_key)
+                if existing is not None:
+                    entry = RelationshipLedgerEntry(
+                        proposal=proposal,
+                        policy_version=str(existing.get("policy_version", policy_version) or policy_version),
+                        disposition="duplicate",
+                        event_id=str(existing.get("event_id", "") or ""),
+                        created_at=float(existing.get("created_at", 0.0) or 0.0),
+                    )
+                    if event is not None and hasattr(event, "set_extra"):
+                        event.set_extra("astrmai_relationship_event_id", entry.event_id)
+                        event.set_extra("astrmai_relationship_event_type", proposal.event_type)
+                        event.set_extra("astrmai_relationship_event_source", proposal.source)
+                        event.set_extra("astrmai_relationship_event_confidence", proposal.confidence)
+                        event.set_extra("astrmai_relationship_event_disposition", entry.disposition)
+                        event.set_extra("astrmai_relationship_policy_version", entry.policy_version)
+                        event.set_extra("astrmai_relationship_delta", {})
+                    return entry
+            disposition = "applied"
+            if proposal.event_type not in self.relationship_engine.EVENT_MATRIX:
+                disposition = "rejected"
+            elif proposal.confidence < min_confidence:
+                disposition = "suppressed"
+            elif mode == "shadow":
+                disposition = "suppressed"
+            elif mode == "event_only" and proposal.event_type == RelationshipEvent.NORMAL_CHAT:
+                disposition = "suppressed"
+
+            before: dict[str, float] = {}
+            after: dict[str, float] = {}
+            delta: dict[str, float] = {}
+            old_score = 0.0
+            new_score = 0.0
+            if disposition == "applied":
+                profile = await self.get_user_profile(proposal.user_id)
+                before = self.relationship_engine.export_user_vector(proposal.user_id)
+                old_score = profile.social_score
+                new_score = self.relationship_engine.process_event(
+                    proposal.user_id,
+                    proposal.event_type,
+                    intensity=proposal.intensity,
+                )
+                after = self.relationship_engine.export_user_vector(proposal.user_id)
+                delta = self._relationship_vector_delta(before, after)
+                await self.user_profile_service.update_social_score(proposal.user_id, new_score, after)
+                await self.affection_router.publish_change(
+                    proposal.user_id,
+                    old_score,
+                    new_score,
+                    proposal.mood_tag,
+                    proposal.event_type,
+                )
+
+            entry = RelationshipLedgerEntry(
+                proposal=proposal,
+                policy_version=policy_version,
+                disposition=disposition,
+                before_vector=before,
+                delta_vector=delta,
+                after_vector=after,
+            )
+            append_entry = getattr(self.persistence, "append_relationship_ledger_entry", None)
+            if callable(append_entry):
+                inserted, existing = await append_entry(entry)
+                if not inserted:
+                    entry = RelationshipLedgerEntry(
+                        proposal=proposal,
+                        policy_version=str(existing.get("policy_version", policy_version) or policy_version),
+                        disposition="duplicate",
+                        event_id=str(existing.get("event_id", entry.event_id) or entry.event_id),
+                        created_at=float(existing.get("created_at", entry.created_at) or entry.created_at),
+                    )
+            if event is not None and hasattr(event, "set_extra"):
+                event.set_extra("astrmai_relationship_event_id", entry.event_id)
+                event.set_extra("astrmai_relationship_event_type", proposal.event_type)
+                event.set_extra("astrmai_relationship_event_source", proposal.source)
+                event.set_extra("astrmai_relationship_event_confidence", proposal.confidence)
+                event.set_extra("astrmai_relationship_event_disposition", entry.disposition)
+                event.set_extra("astrmai_relationship_policy_version", entry.policy_version)
+                event.set_extra("astrmai_relationship_delta", dict(entry.delta_vector))
+            return entry
+
     async def calculate_and_update_affection(
         self,
         user_id: str,
@@ -612,9 +731,10 @@ class StateEngine:
         intensity: float = 1.0,
         message_text: str = "",
         event_type: str | None = None,
+        event: Any = None,
+        turn_id: str = "",
+        source_event_ids: tuple[str, ...] | list[str] = (),
     ):
-        profile = await self.get_user_profile(user_id)
-        old_score = profile.social_score
         resolved_event_type = event_type or self._resolve_affection_event_type(message_text)
         if (
             event_type is None
@@ -637,34 +757,35 @@ class StateEngine:
         elif resolved_event_type == RelationshipEvent.IGNORE:
             effective_intensity *= self.relationship_engine.ignore_affection_intensity_bias(message_text)
         mood_mapping_source = "not_applied"
-        if effective_mood_tag and resolved_event_type == RelationshipEvent.NORMAL_CHAT:
+        mode, _, _ = self._relationship_settings()
+        if effective_mood_tag and resolved_event_type == RelationshipEvent.NORMAL_CHAT and mode == "legacy":
             mood_resolution = self.relationship_engine.resolve_mood_event(effective_mood_tag)
             effective_event_type = mood_resolution.event_type
             mood_mapping_source = mood_resolution.source
         else:
             effective_event_type = resolved_event_type
-        new_score = self.relationship_engine.process_event(
-            user_id=user_id,
+        proposal = RelationshipEventProposal(
             event_type=effective_event_type,
+            user_id=str(user_id),
+            chat_id=str(group_id),
+            turn_id=str(turn_id),
+            source_event_ids=tuple(source_event_ids),
+            confidence=1.0,
             intensity=effective_intensity,
+            evidence_codes=("explicit_event" if event_type else "interaction_classifier",),
+            source=("legacy_mood_mapping" if mood_mapping_source != "not_applied" else "deterministic_rule"),
             mood_tag=effective_mood_tag,
         )
-        rel_vector = self.relationship_engine.export_user_vector(user_id)
-        await self.user_profile_service.update_social_score(user_id, new_score, rel_vector)
-        await self.affection_router.publish_change(
-            user_id,
-            old_score,
-            new_score,
-            effective_mood_tag,
-            effective_event_type,
-        )
+        entry = await self.settle_relationship_event(proposal, event=event)
         logger.debug(
-            "[StateEngine] relationship mood mapping user=%s tag=%s event=%s source=%s",
+            "[StateEngine] relationship settlement user=%s tag=%s event=%s source=%s disposition=%s",
             user_id,
             effective_mood_tag or "neutral",
             effective_event_type,
             mood_mapping_source,
+            entry.disposition,
         )
+        return entry
 
     async def settle_no_send_affection(
         self,
@@ -676,6 +797,9 @@ class StateEngine:
         attack_confidence: float = 0.0,
         risk_flags: list[str] | None = None,
         intensity: float = 0.75,
+        event: Any = None,
+        turn_id: str = "",
+        source_event_ids: tuple[str, ...] | list[str] = (),
     ) -> bool:
         event_type = self._resolve_no_send_affection_event_type(
             message_text,
@@ -692,6 +816,9 @@ class StateEngine:
             intensity=intensity,
             message_text=message_text,
             event_type=event_type,
+            event=event,
+            turn_id=turn_id,
+            source_event_ids=source_event_ids,
         )
         return True
 

@@ -210,6 +210,12 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     vision_failure_disposition_counts: Counter[str] = Counter()
     vision_reply_guard_action_counts: Counter[str] = Counter()
     vision_resolve_failure_reason_counts: Counter[str] = Counter()
+    relationship_event_counts: Counter[str] = Counter()
+    relationship_source_counts: Counter[str] = Counter()
+    relationship_disposition_counts: Counter[str] = Counter()
+    expression_tag_counts: Counter[str] = Counter()
+    expression_source_counts: Counter[str] = Counter()
+    expression_disposition_counts: Counter[str] = Counter()
 
     for trace in items:
         status = str(trace.get("status", "unknown") or "unknown")
@@ -371,6 +377,29 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
         else:
             missing["vision_observation"] += 1
 
+        relationship = _safe_dict(trace.get("relationship_observation"))
+        if relationship:
+            event_type = str(relationship.get("event_type") or "").strip()
+            source = str(relationship.get("source") or "").strip()
+            disposition = str(relationship.get("disposition") or "").strip()
+            if event_type:
+                relationship_event_counts[event_type] += 1
+            if source:
+                relationship_source_counts[source] += 1
+            if disposition:
+                relationship_disposition_counts[disposition] += 1
+        expression = _safe_dict(trace.get("expression_observation"))
+        if expression:
+            tag = str(expression.get("bot_expression_tag") or "").strip()
+            source = str(expression.get("source") or "").strip()
+            disposition = str(expression.get("disposition") or "").strip()
+            if tag:
+                expression_tag_counts[tag] += 1
+            if source:
+                expression_source_counts[source] += 1
+            if disposition:
+                expression_disposition_counts[disposition] += 1
+
         tools = trace.get("tools")
         if isinstance(tools, dict):
             tool_trace_present_count += 1
@@ -504,6 +533,16 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "chars_p95": _percentile(reply_lengths, 0.95),
             "chars_max": round(max(reply_lengths), 1) if reply_lengths else 0.0,
         },
+        "relationship": {
+            "event_counts": dict(relationship_event_counts.most_common()),
+            "source_counts": dict(relationship_source_counts.most_common()),
+            "disposition_counts": dict(relationship_disposition_counts.most_common()),
+        },
+        "expression": {
+            "tag_counts": dict(expression_tag_counts.most_common()),
+            "source_counts": dict(expression_source_counts.most_common()),
+            "disposition_counts": dict(expression_disposition_counts.most_common()),
+        },
         "context": {
             "samples": len(context_totals),
             "chars_p50": _percentile(context_totals, 0.50),
@@ -596,6 +635,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     rewrite = _safe_dict(report.get("query_rewrite"))
     tools = _safe_dict(report.get("tools"))
     vision = _safe_dict(report.get("vision"))
+    relationship = _safe_dict(report.get("relationship"))
+    expression = _safe_dict(report.get("expression"))
     lines = [
         "# AstrMai Turn Ledger Analysis",
         "",
@@ -646,6 +687,16 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- `call:{key}`: {value}")
     for key, value in _safe_dict(vision.get("fallback_counts")).items():
         lines.append(f"- `fallback:{key}`: {value}")
+    lines.extend(["", "## Relationship Events"])
+    for key, value in _safe_dict(relationship.get("event_counts")).items():
+        lines.append(f"- `event:{key}`: {value}")
+    for key, value in _safe_dict(relationship.get("disposition_counts")).items():
+        lines.append(f"- `disposition:{key}`: {value}")
+    lines.extend(["", "## Expression Decisions"])
+    for key, value in _safe_dict(expression.get("tag_counts")).items():
+        lines.append(f"- `tag:{key}`: {value}")
+    for key, value in _safe_dict(expression.get("disposition_counts")).items():
+        lines.append(f"- `disposition:{key}`: {value}")
     lines.extend(["", "## Tool Disclosure"])
     lines.append(f"- Tool trace present: {int(tools.get('trace_present_count', 0) or 0)}")
     lines.append(f"- Tool ledger summary present: {int(tools.get('ledger_summary_present_count', 0) or 0)}")

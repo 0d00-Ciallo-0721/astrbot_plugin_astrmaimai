@@ -10,9 +10,15 @@ from .persona_cache import PersonaCacheMixin
 from .persistence_schema import PersistenceSchemaMixin, _dedupe_sqlmodel_metadata_indexes
 from .sqlite_helpers import sqlite_connect_args
 from .state_profile_persistence import StateProfilePersistenceMixin
+from .relationship_ledger_persistence import RelationshipLedgerPersistenceMixin
 
 
-class PersistenceManager(PersistenceSchemaMixin, PersonaCacheMixin, StateProfilePersistenceMixin):
+class PersistenceManager(
+    PersistenceSchemaMixin,
+    PersonaCacheMixin,
+    StateProfilePersistenceMixin,
+    RelationshipLedgerPersistenceMixin,
+):
     """Persistence manager for refactored local storage."""
     def __init__(self):
         try:

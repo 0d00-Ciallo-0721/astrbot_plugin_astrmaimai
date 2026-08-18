@@ -208,6 +208,31 @@ _MIGRATIONS: list[tuple[int, str]] = [
     )"""),
     (87, "ALTER TABLE visualasset ADD COLUMN initial_recognition_elapsed_ms REAL DEFAULT 0"),
     (88, "ALTER TABLE visualasset ADD COLUMN reuse_count INTEGER DEFAULT 0"),
+    (89, """CREATE TABLE IF NOT EXISTS relationship_event_ledger (
+        event_id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        user_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL DEFAULT '',
+        turn_id TEXT NOT NULL DEFAULT '',
+        source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+        actor_kind TEXT NOT NULL DEFAULT 'user',
+        target_kind TEXT NOT NULL DEFAULT 'bot',
+        event_type TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0,
+        intensity REAL NOT NULL DEFAULT 1,
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        policy_version TEXT NOT NULL DEFAULT 'relationship-v1',
+        source TEXT NOT NULL DEFAULT 'deterministic_rule',
+        mood_tag TEXT NOT NULL DEFAULT '',
+        before_vector_json TEXT NOT NULL DEFAULT '{}',
+        delta_vector_json TEXT NOT NULL DEFAULT '{}',
+        after_vector_json TEXT NOT NULL DEFAULT '{}',
+        disposition TEXT NOT NULL DEFAULT 'rejected',
+        created_at REAL NOT NULL DEFAULT 0
+    )"""),
+    (90, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_user_created ON relationship_event_ledger(user_id, created_at)"),
+    (91, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_chat_created ON relationship_event_ledger(chat_id, created_at)"),
+    (92, "CREATE INDEX IF NOT EXISTS ix_relationship_event_ledger_turn_id ON relationship_event_ledger(turn_id)"),
 ]
 
 

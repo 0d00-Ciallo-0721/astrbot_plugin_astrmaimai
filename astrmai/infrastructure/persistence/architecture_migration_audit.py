@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-LATEST_ARCHITECTURE_SCHEMA_VERSION = 88
+LATEST_ARCHITECTURE_SCHEMA_VERSION = 92
 
 MESSAGELOG_REQUIRED_COLUMNS = (
     "event_id",
@@ -52,6 +52,9 @@ REQUIRED_INDEXES = (
     "ix_reply_commit_outbox_next_retry_at",
     "ix_learning_mining_run_created_at",
     "ix_memory_turn_checkpoint_updated_at",
+    "ix_relationship_event_ledger_user_created",
+    "ix_relationship_event_ledger_chat_created",
+    "ix_relationship_event_ledger_turn_id",
 )
 
 
@@ -166,6 +169,7 @@ def inspect_architecture_migration(
         "chat_states",
         "reply_commit_outbox",
         "memory_turn_checkpoint",
+        "relationship_event_ledger",
     )
     missing_tables = tuple(name for name in required_tables if name not in tables)
     table_row_counts = {

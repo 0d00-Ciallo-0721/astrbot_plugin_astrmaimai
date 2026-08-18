@@ -446,6 +446,22 @@ def turn_telemetry_snapshot(event: Any = None) -> dict[str, Any]:
         "vision_observation": copy.deepcopy(context.vision_observation),
         "tool_ledger_summary": _tool_ledger_summary(event, context.calls),
         "reply_stats": copy.deepcopy(context.reply_stats),
+        "relationship_observation": {
+            "event_id": str(_event_extra(event, "astrmai_relationship_event_id", "") or ""),
+            "event_type": str(_event_extra(event, "astrmai_relationship_event_type", "") or ""),
+            "source": str(_event_extra(event, "astrmai_relationship_event_source", "") or ""),
+            "confidence": float(_event_extra(event, "astrmai_relationship_event_confidence", 0.0) or 0.0),
+            "disposition": str(_event_extra(event, "astrmai_relationship_event_disposition", "") or ""),
+            "policy_version": str(_event_extra(event, "astrmai_relationship_policy_version", "") or ""),
+            "delta": copy.deepcopy(_event_extra(event, "astrmai_relationship_delta", {}) or {}),
+        },
+        "expression_observation": {
+            "bot_expression_tag": str(_event_extra(event, "astrmai_bot_expression_tag", "") or ""),
+            "source": str(_event_extra(event, "astrmai_expression_source", "") or ""),
+            "disposition": str(_event_extra(event, "astrmai_expression_disposition", "") or ""),
+            "meme_tag": str(_event_extra(event, "astrmai_meme_tag", "") or ""),
+            "bot_state_snapshot": copy.deepcopy(_event_extra(event, "astrmai_bot_state_snapshot", {}) or {}),
+        },
         "dialog_history_policy": history_policy_summary,
         "group_context_snapshot": group_context_snapshot,
     }

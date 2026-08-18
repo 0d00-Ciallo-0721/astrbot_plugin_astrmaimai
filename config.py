@@ -200,6 +200,12 @@ class MoodConfig(BaseModel):
     decay_rate: float = Field(default=0.1, ge=0.0, le=1.0)
 
 
+class RelationshipConfig(BaseModel):
+    settlement_mode: str = Field(default="legacy")
+    min_confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    policy_version: str = Field(default="relationship-v1", min_length=1, max_length=64)
+
+
 class EvolutionConfig(BaseModel):
     min_mining_context: int = Field(default=10, ge=1, description="兼容旧版的学习触发原始消息阈值")
     batch_size: int = Field(default=50, ge=1)
@@ -826,6 +832,7 @@ class AstrMaiConfig(BaseModel):
     attention: AttentionConfig = Field(default_factory=AttentionConfig)
     energy: EnergyConfig = Field(default_factory=EnergyConfig)
     mood: MoodConfig = Field(default_factory=MoodConfig)
+    relationship: RelationshipConfig = Field(default_factory=RelationshipConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     life: LifeConfig = Field(default_factory=LifeConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)

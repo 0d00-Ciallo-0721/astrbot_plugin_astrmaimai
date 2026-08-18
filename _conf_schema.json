@@ -1547,6 +1547,33 @@
       }
     }
   },
+  "relationship": {
+    "type": "object",
+    "description": "关系事件结算",
+    "items": {
+      "settlement_mode": {
+        "description": "关系结算模式",
+        "type": "string",
+        "default": "legacy",
+        "options": ["legacy", "shadow", "event_only"],
+        "hint": "legacy 保持旧兼容；shadow 仅记录新关系事件；event_only 仅按明确的规范关系事件改变关系状态。"
+      },
+      "min_confidence": {
+        "description": "关系事件最低置信度",
+        "type": "float",
+        "default": 0.75,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "低于该值的候选只会记录为 suppressed，不会改变关系向量。"
+      },
+      "policy_version": {
+        "description": "关系策略版本",
+        "type": "string",
+        "default": "relationship-v1",
+        "hint": "账本会记录本次结算所用版本，便于后续审计和重算。"
+      }
+    }
+  },
   "timing": {
     "title": "时间与超时设置",
     "type": "object",

@@ -1317,6 +1317,7 @@ class RefactoredReplyServiceTests(unittest.TestCase):
                 return None
 
         event = _PrivateEvent("user-1", "Alice", "assistant-visible-reply")
+        event.set_extra("astrmai_primary_mood_tag", "happy")
         anchor = _PrivateEvent("user-1", "Alice", "thank you, you are amazing")
 
         asyncio.run(
@@ -1422,7 +1423,7 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         self.assertEqual(event.get_extra("astrmai_meme_tag"), "neutral")
         self.assertEqual(event.get_extra("astrmai_meme_tag_validation"), "unknown_tag")
 
-    def test_handle_reply_uses_configured_custom_primary_mood_tag_for_passive_meme(self):
+    def test_handle_reply_does_not_use_primary_mood_tag_as_bot_expression(self):
         state_engine = FakeStateEngine()
         state_engine.config.reply.meme_probability = 80
         state_engine.config.reply.emotion_mapping = ["surprised: 惊讶、震惊、意外"]
@@ -1441,10 +1442,10 @@ class RefactoredReplyServiceTests(unittest.TestCase):
         with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
             asyncio.run(service.handle_reply(event, "太意外了", event.unified_msg_origin))
 
-        self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "surprised")
-        self.assertEqual(event.get_extra("astrmai_meme_tag_validation"), "configured")
+        send_meme.assert_not_awaited()
+        self.assertEqual(event.get_extra("astrmai_expression_disposition"), "no_expression_decision")
 
-    def test_handle_reply_uses_primary_mood_tag_for_passive_meme(self):
+    def test_handle_reply_does_not_turn_user_happy_mood_into_meme(self):
         state_engine = FakeStateEngine()
         state_engine.config.reply.meme_probability = 80
         service = self.reply_mod.ReplyService(
@@ -1468,8 +1469,53 @@ class RefactoredReplyServiceTests(unittest.TestCase):
                 )
             )
 
+        send_meme.assert_not_awaited()
+        self.assertEqual(event.get_extra("astrmai_expression_source"), "none")
+
+    def test_handle_reply_sends_only_explicit_bot_expression_decision(self):
+        state_engine = FakeStateEngine()
+        state_engine.config.reply.meme_probability = 80
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "nice work")
+        event.set_extra(
+            "astrmai_bot_expression_decision",
+            {"expression_tag": "happy", "source": "explicit_tool", "force": True},
+        )
+
+        async def _no_affection_target(*_args, **_kwargs):
+            return None
+
+        service._collect_affection_target = _no_affection_target
+        send_meme = AsyncMock(return_value=True)
+        with patch("astrmai.conversation.execution.reply_post_send.send_meme", new=send_meme):
+            asyncio.run(service.handle_reply(event, "thanks", event.unified_msg_origin))
+
         self.assertEqual(send_meme.await_args.kwargs["emotion_tag"], "happy")
-        self.assertEqual(send_meme.await_args.kwargs["probability"], 80)
+        self.assertEqual(send_meme.await_args.kwargs["probability"], 100)
+        self.assertEqual(event.get_extra("astrmai_expression_source"), "explicit_tool")
+
+    def test_expression_decision_is_suppressed_by_cooldown_or_long_reply(self):
+        state_engine = FakeStateEngine()
+        service = self.reply_mod.ReplyService(
+            state_engine=state_engine,
+            mood_manager=SimpleNamespace(),
+        )
+        event = FakeEvent("user-1", "Alice", "hello")
+        event.set_extra(
+            "astrmai_bot_expression_decision",
+            {"expression_tag": "happy", "source": "explicit_tool", "force": True},
+        )
+        event.set_extra("astrmai_cooldown_tags", ["meme"])
+
+        tag, force, source, disposition = service._resolve_expression_decision(event, None, "short reply")
+        self.assertEqual((tag, force, source, disposition), ("neutral", False, "explicit_tool", "cooldown"))
+
+        event.set_extra("astrmai_cooldown_tags", [])
+        tag, force, source, disposition = service._resolve_expression_decision(event, None, "x" * 160)
+        self.assertEqual((tag, force, source, disposition), ("neutral", False, "explicit_tool", "long_reply"))
 
     def test_handle_reply_prefers_bypassed_mood_tag_over_primary_mood_tag(self):
         state_engine = FakeStateEngine()

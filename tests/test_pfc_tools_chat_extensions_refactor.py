@@ -1132,6 +1132,10 @@ class PfcToolsChatExtensionsRefactorTests(unittest.TestCase):
         asyncio.run(self.mod.ProactiveMemeTool(emotion_mapping=["happy: 开心"]).call(_wrap_event(event), emotion_tag="happy"))
 
         self.assertTrue(event.get_extra("astrmai_force_meme"))
+        self.assertEqual(
+            event.get_extra("astrmai_bot_expression_decision"),
+            {"expression_tag": "happy", "source": "explicit_tool", "force": True},
+        )
 
     def test_textual_reaction_does_not_create_fake_qq_action(self):
         event = _FakeEvent(group_id="12345")

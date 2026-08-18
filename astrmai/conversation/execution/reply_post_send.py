@@ -421,6 +421,9 @@ class ReplyPostSendMixin:
                 skipped_reason=skipped_reason,
                 attack_confidence=attack_confidence,
                 risk_flags=risk_flags,
+                event=event,
+                turn_id=str(event.get_extra("astrmai_trace_id", "") or ""),
+                source_event_ids=(self._resolve_source_event_id(anchor_event or event),),
             )
         except Exception as exc:
             logger.warning(f"[ReplyService] no-send affection settlement failed: {exc}")
@@ -536,6 +539,36 @@ class ReplyPostSendMixin:
             return "neutral", False
         return tag, False
 
+    def _resolve_expression_decision(
+        self,
+        event: AstrMessageEvent,
+        bypassed_tag: str | None,
+        reply_text: str,
+    ) -> tuple[str, bool, str, str]:
+        raw_decision = event.get_extra("astrmai_bot_expression_decision", {}) if hasattr(event, "get_extra") else {}
+        decision = raw_decision if isinstance(raw_decision, Mapping) else {}
+        requested_tag = normalize_emotion_tag(decision.get("expression_tag", ""))
+        source = str(decision.get("source", "") or "").strip() or ""
+        force = bool(decision.get("force", False))
+        if not requested_tag and bypassed_tag:
+            requested_tag = normalize_emotion_tag(bypassed_tag)
+            source = "legacy_bypass"
+            force = bool(event.get_extra("astrmai_force_meme", False)) if hasattr(event, "get_extra") else False
+        tag, _ = self._resolve_post_send_tag(requested_tag)
+        if not tag or tag == "neutral":
+            return "neutral", False, source or "none", "no_expression_decision"
+        cooldown_tags = {
+            str(item or "").strip().lower()
+            for item in (event.get_extra("astrmai_cooldown_tags", []) or [])
+        } if hasattr(event, "get_extra") else set()
+        if "meme" in cooldown_tags:
+            return "neutral", False, source, "cooldown"
+        if bool(event.get_extra("astrmai_reply_failure_notice", False)) if hasattr(event, "get_extra") else False:
+            return "neutral", False, source, "failure_notice"
+        if len(str(reply_text or "")) >= 160:
+            return "neutral", False, source, "long_reply"
+        return tag, force, source, "eligible"
+
     async def _collect_affection_target(
         self,
         event: AstrMessageEvent,
@@ -590,9 +623,17 @@ class ReplyPostSendMixin:
         bypassed_tag: str | None,
         window_events: list | None,
         anchor_event: AstrMessageEvent | None,
+        reply_text: str = "",
     ) -> None:
-        requested_tag = normalize_emotion_tag(bypassed_tag)
-        tag, force_meme_flag = self._resolve_post_send_tag(bypassed_tag)
+        raw_expression_decision = event.get_extra("astrmai_bot_expression_decision", {}) if hasattr(event, "get_extra") else {}
+        requested_tag = normalize_emotion_tag(
+            raw_expression_decision.get("expression_tag", "") if isinstance(raw_expression_decision, Mapping) else bypassed_tag
+        ) or normalize_emotion_tag(bypassed_tag)
+        tag, force_meme_flag, expression_source, expression_disposition = self._resolve_expression_decision(
+            event,
+            bypassed_tag,
+            reply_text,
+        )
         if hasattr(event, "set_extra"):
             validation = (
                 "neutral"
@@ -603,11 +644,23 @@ class ReplyPostSendMixin:
             )
             event.set_extra("astrmai_meme_tag", tag)
             event.set_extra("astrmai_meme_tag_validation", validation)
-        if hasattr(event, "get_extra") and event.get_extra("astrmai_force_meme", False):
-            force_meme_flag = True
+            event.set_extra("astrmai_bot_expression_tag", tag if tag != "neutral" else "")
+            event.set_extra("astrmai_expression_source", expression_source)
+            event.set_extra("astrmai_expression_disposition", expression_disposition)
         is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
         try:
             await self.state_engine.atomic_update_mood(chat_id, delta=0.0 if not bypassed_tag else (0.1 if tag == "happy" else -0.1 if tag in ["sad", "angry"] else 0.0))
+            get_state = getattr(self.state_engine, "get_state", None)
+            if callable(get_state):
+                state = await get_state(chat_id)
+                event.set_extra(
+                    "astrmai_bot_state_snapshot",
+                    {
+                        "mood_value": float(getattr(state, "mood", 0.0) or 0.0),
+                        "energy_level": "low" if float(getattr(state, "energy", 0.0) or 0.0) < 0.25 else "normal",
+                        "stance": str(event.get_extra("astrmai_social_stance", "") or ""),
+                    },
+                )
             is_private_chat = "FriendMessage" in chat_id or not event.get_group_id()
             if is_private_chat:
                 await self._record_private_profile_touch(
@@ -616,10 +669,11 @@ class ReplyPostSendMixin:
                     sender_name=str(event.get_sender_name() or ""),
                 )
             if not is_proactive_event:
+                relationship_mood_tag = str(event.get_extra("astrmai_primary_mood_tag", "") or "")
                 target_user_id = await self._collect_affection_target(
                     event,
                     chat_id,
-                    tag,
+                    relationship_mood_tag,
                     window_events=window_events,
                     anchor_event=anchor_event,
                 )
@@ -628,9 +682,12 @@ class ReplyPostSendMixin:
                     await self.state_engine.calculate_and_update_affection(
                         user_id=str(target_user_id),
                         group_id=chat_id,
-                        mood_tag=tag,
+                        mood_tag=relationship_mood_tag,
                         intensity=1.0,
                         message_text=message_text,
+                        event=event,
+                        turn_id=str(event.get_extra("astrmai_trace_id", "") or ""),
+                        source_event_ids=(self._resolve_source_event_id(anchor_event or event),),
                     )
         except Exception as exc:
             logger.warning(f"[ReplyService] post-send settlement failed: {exc}")

@@ -208,6 +208,17 @@ def build_architecture_trace_contract(
         "reply_commit": _reply_commit_payload(
             _extra(event, "astrmai_committed_bot_turn", None)
         ),
+        "relationship_observation": {
+            "event_type": str(_extra(event, "astrmai_relationship_event_type", "") or ""),
+            "source": str(_extra(event, "astrmai_relationship_event_source", "") or ""),
+            "disposition": str(_extra(event, "astrmai_relationship_event_disposition", "") or ""),
+            "policy_version": str(_extra(event, "astrmai_relationship_policy_version", "") or ""),
+        },
+        "expression_observation": {
+            "bot_expression_tag": str(_extra(event, "astrmai_bot_expression_tag", "") or ""),
+            "source": str(_extra(event, "astrmai_expression_source", "") or ""),
+            "disposition": str(_extra(event, "astrmai_expression_disposition", "") or ""),
+        },
         "memory_actor_filter": memory_filter,
         "proactive_observation": {
             "is_proactive": bool(proactive.is_proactive),
