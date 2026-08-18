@@ -322,6 +322,9 @@ class ConversationConfig(BaseModel):
     conversation_generation_enabled: bool = Field(default=True, repr=False)
     reply_send_claim_enabled: bool = Field(default=True, repr=False)
     group_thread_wait_enabled: bool = Field(default=True, repr=False)
+    social_feedback_observation_enabled: bool = Field(default=True)
+    social_feedback_window_sec: float = Field(default=45.0, ge=5.0, le=300.0)
+    social_feedback_max_active_per_chat: int = Field(default=5, ge=1, le=20)
     group_shared_history_enabled: bool = Field(
         default=True,
         description="启用群聊共享话题历史；参与者事实仍按 QQ 号隔离",

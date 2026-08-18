@@ -325,6 +325,13 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
 
     await _bind_turn_identity(facade, event, scope)
 
+    observe_feedback = getattr(facade, "observe_post_reply_feedback", None)
+    if callable(observe_feedback):
+        try:
+            await observe_feedback(event)
+        except Exception:
+            logger.exception("[AstrMai] observe_post_reply_feedback failed")
+
     try:
         group_wait_result = await facade.handle_group_reply_wait(event, scope)
     except Exception:

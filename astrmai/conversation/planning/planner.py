@@ -2639,7 +2639,37 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     " Generate one extremely short follow-up message that feels like a natural second message from a real person."
                     " Never repeat what you already said just now!)"
                 )
-                await asyncio.sleep(random.uniform(1.0, 3.5))
+                feedback_cancelled = await self._wait_for_post_reply_feedback(
+                    event,
+                    random.uniform(1.0, 3.5),
+                )
+                if feedback_cancelled:
+                    current_follow_up = ensure_turn_context(event).follow_up
+                    self._record_follow_up_decision(
+                        event,
+                        eligible=True,
+                        skipped_reason="post_reply_feedback",
+                        signals=[
+                            *current_follow_up.signals,
+                            "post_reply_feedback",
+                        ],
+                        probability=current_follow_up.probability,
+                        llm_checked=current_follow_up.llm_checked,
+                        followed=False,
+                        reason=current_follow_up.reason,
+                        cooldown_until=current_follow_up.cooldown_until,
+                    )
+                    event.set_extra(
+                        "astrmai_auto_followup_cancelled_by_feedback",
+                        True,
+                    )
+                    await self._remember_turn_trace(
+                        chat_id,
+                        event,
+                        status="executed",
+                        reply_text=reply_text,
+                    )
+                    return reply_text
                 previous_response_kind = event.get_extra("astrmai_response_kind", None)
                 event.set_extra("astrmai_response_kind", "follow_up")
                 try:

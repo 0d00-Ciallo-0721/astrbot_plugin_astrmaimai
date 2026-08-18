@@ -25,6 +25,45 @@ class _TelemetryEvent:
 
 
 class GroupDialogueStoreAndCompactionTests(unittest.TestCase):
+    def test_feedback_records_are_deduplicated_without_storing_message_content(self):
+        async def run():
+            store = GroupDialogueStore()
+            first = await store.record_bot_turn_feedback(
+                "chat-1",
+                observation_id="feedback-1",
+                bot_turn_id="commit-1",
+                feedback_kind="direct_quote",
+                status="engaged",
+                actor_id="user-1",
+                evidence_event_id="message-1",
+                confidence=1.0,
+                feedback_at=100.0,
+                latency_ms=20.0,
+                caused_reply=True,
+            )
+            second = await store.record_bot_turn_feedback(
+                "chat-1",
+                observation_id="feedback-1",
+                bot_turn_id="commit-1",
+                feedback_kind="direct_quote",
+                status="engaged",
+                actor_id="user-1",
+                evidence_event_id="message-1",
+                confidence=1.0,
+                feedback_at=101.0,
+                latency_ms=21.0,
+                caused_reply=True,
+            )
+            return first, second, await store.get_feedback_records("chat-1"), await store.export_snapshot()
+
+        first, second, records, snapshot = asyncio.run(run())
+
+        self.assertEqual(first.feedback_id, second.feedback_id)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].feedback_at, 101.0)
+        self.assertNotIn("content", records[0].__slots__)
+        self.assertIn("feedback_records", snapshot)
+
     def test_compaction_engine_exposes_split_helper_components(self):
         engine = ContextCompactionEngine(dialogue_store=None)
         self.assertTrue(hasattr(engine, "safety_analyzer"))

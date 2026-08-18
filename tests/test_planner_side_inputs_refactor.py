@@ -754,6 +754,27 @@ class PlannerSideInputsRefactorTests(unittest.TestCase):
         self.assertIn("follow_up_probability_scaled:0.35", trace.signals)
         self.assertEqual(trace.skipped_reason, "probability_gate")
 
+    def test_post_reply_feedback_event_cancels_followup_delay(self):
+        event = _FakeEvent()
+        feedback_event = asyncio.Event()
+        feedback_event.set()
+        event.set_extra("astrmai_post_reply_feedback_event", feedback_event)
+
+        cancelled = asyncio.run(
+            self.mixin._wait_for_post_reply_feedback(event, 60.0)
+        )
+
+        self.assertTrue(cancelled)
+
+    def test_followup_delay_runs_normally_without_feedback_event(self):
+        event = _FakeEvent()
+
+        cancelled = asyncio.run(
+            self.mixin._wait_for_post_reply_feedback(event, 0.0)
+        )
+
+        self.assertFalse(cancelled)
+
     def test_all_mode_plain_chat_loads_chat_tier_and_tool_intent_loads_full_pfc_tools(self):
         mixin = self._prepare_tool_mixin()
         ctx = SimpleNamespace(shared_dict={})

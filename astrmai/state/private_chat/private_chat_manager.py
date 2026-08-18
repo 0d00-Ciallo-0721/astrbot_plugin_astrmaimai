@@ -15,6 +15,14 @@ class PrivateSession:
     is_bot_waiting: bool = False
     pending_messages: list = field(default_factory=list)
     turn_count: int = 0
+    reply_cycle_id: str = ""
+    reply_cycle_status: str = "idle"
+    reply_cycle_started_at: float = 0.0
+    reply_cycle_generation: int = 0
+    outbound_message_ids: list[str] = field(default_factory=list)
+    continuation_event_id: str = ""
+    continuation_message_kind: str = ""
+    continuation_at: float = 0.0
 
 
 class PrivateChatManager:
@@ -84,7 +92,58 @@ class PrivateChatManager:
         else:
             self.timeout_sec = self.DEFAULT_TIMEOUT_SEC
 
-    async def signal_new_message(self, user_id: str, message_str: str = "", chat_id: str = "") -> bool:
+    def arm_reply_cycle(
+        self,
+        user_id: str,
+        *,
+        chat_id: str = "",
+        turn_id: str = "",
+        turn_generation: int = 0,
+        outbound_message_ids: list[str] | None = None,
+    ) -> asyncio.Event:
+        session = self._get_or_create_session(user_id, chat_id)
+        self._bind_chat_session(chat_id, user_id)
+        normalized_turn_id = str(turn_id or "")
+        if normalized_turn_id and session.reply_cycle_id == normalized_turn_id:
+            for message_id in outbound_message_ids or []:
+                normalized_message_id = str(message_id or "").strip()
+                if (
+                    normalized_message_id
+                    and normalized_message_id not in session.outbound_message_ids
+                ):
+                    session.outbound_message_ids.append(normalized_message_id)
+            session.reply_cycle_generation = max(
+                session.reply_cycle_generation,
+                max(0, int(turn_generation or 0)),
+            )
+            return session.new_message_event
+        session.new_message_event.clear()
+        session.is_bot_waiting = True
+        session.reply_cycle_id = normalized_turn_id
+        session.reply_cycle_status = "waiting_user"
+        session.reply_cycle_started_at = monotonic()
+        session.reply_cycle_generation = max(0, int(turn_generation or 0))
+        session.outbound_message_ids = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in list(outbound_message_ids or [])
+                if str(item or "").strip()
+            )
+        )
+        session.continuation_event_id = ""
+        session.continuation_message_kind = ""
+        session.continuation_at = 0.0
+        return session.new_message_event
+
+    async def signal_new_message(
+        self,
+        user_id: str,
+        message_str: str = "",
+        chat_id: str = "",
+        *,
+        event_id: str = "",
+        message_kind: str = "text",
+    ) -> bool:
         session = self._get_or_create_session(user_id, chat_id)
         self._bind_chat_session(chat_id, user_id)
         session.last_message_time = monotonic()
@@ -93,6 +152,10 @@ class PrivateChatManager:
         if not session.is_bot_waiting:
             return False
 
+        session.reply_cycle_status = "user_continued"
+        session.continuation_event_id = str(event_id or "")
+        session.continuation_message_kind = str(message_kind or "text")
+        session.continuation_at = monotonic()
         session.new_message_event.set()
         logger.debug(f"[PrivateChat] message resumed waiting session for {user_id}")
         return True
@@ -111,19 +174,28 @@ class PrivateChatManager:
             logger.debug(f"[PrivateChat] reusing buffered message for {user_id}")
             return True
 
-        session.new_message_event.clear()
-        session.is_bot_waiting = True
+        if session.new_message_event.is_set():
+            session.is_bot_waiting = False
+            return True
+        if not session.is_bot_waiting:
+            session.new_message_event.clear()
+            session.is_bot_waiting = True
+            session.reply_cycle_status = "waiting_user"
         logger.debug(f"[PrivateChat] waiting for {user_id} reply with timeout={wait_timeout}s")
+        expected_cycle_id = session.reply_cycle_id
 
         try:
             await asyncio.wait_for(session.new_message_event.wait(), timeout=wait_timeout)
             logger.debug(f"[PrivateChat] {user_id} replied before timeout")
             return True
         except asyncio.TimeoutError:
+            if session.reply_cycle_id == expected_cycle_id:
+                session.reply_cycle_status = "timed_out"
             logger.info(f"[PrivateChat] {user_id} timed out after {wait_timeout}s")
             return False
         finally:
-            session.is_bot_waiting = False
+            if session.reply_cycle_id == expected_cycle_id:
+                session.is_bot_waiting = False
 
     def get_pending_messages(self, user_id: str) -> list:
         session = self._resolve_session(user_id)
@@ -143,6 +215,17 @@ class PrivateChatManager:
             "is_bot_waiting": session.is_bot_waiting,
             "last_message_time": session.last_message_time,
             "silence_sec": monotonic() - session.last_message_time,
+            "reply_cycle_id": session.reply_cycle_id,
+            "reply_cycle_status": session.reply_cycle_status,
+            "reply_cycle_generation": session.reply_cycle_generation,
+            "outbound_message_ids": list(session.outbound_message_ids),
+            "continuation_event_id": session.continuation_event_id,
+            "continuation_message_kind": session.continuation_message_kind,
+            "continuation_latency_ms": (
+                max(0.0, session.continuation_at - session.reply_cycle_started_at) * 1000.0
+                if session.continuation_at and session.reply_cycle_started_at
+                else 0.0
+            ),
         }
 
     def get_session_info_by_chat_id(self, chat_id: str) -> Optional[dict]:

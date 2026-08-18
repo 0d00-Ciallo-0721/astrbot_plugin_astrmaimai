@@ -111,6 +111,21 @@ class BotTurnRecord:
 
 
 @dataclass(slots=True)
+class SocialFeedbackRecord:
+    feedback_id: str
+    observation_id: str
+    bot_turn_id: str
+    feedback_kind: str
+    status: str
+    actor_id: str
+    evidence_event_id: str
+    confidence: float
+    feedback_at: float
+    latency_ms: float
+    caused_reply: bool = False
+
+
+@dataclass(slots=True)
 class GroupSocialIncident:
     incident_id: str
     kind: str
@@ -152,6 +167,7 @@ class GroupDialogueStore:
         self._social_states: dict[str, list[GroupSocialStateItem]] = {}
         self._pending_direct: dict[str, list[PendingDirectItem]] = {}
         self._bot_turns: dict[str, list[BotTurnRecord]] = {}
+        self._feedback_records: dict[str, list[SocialFeedbackRecord]] = {}
         self._social_incidents: dict[str, list[GroupSocialIncident]] = {}
         self._sequence_by_chat: dict[str, int] = {}
         self._lock = asyncio.Lock()
@@ -170,6 +186,7 @@ class GroupDialogueStore:
             social_removed = self._social_states.pop(key, None) is not None
             pending_removed = self._pending_direct.pop(key, None) is not None
             bot_turns_removed = self._bot_turns.pop(key, None) is not None
+            feedback_removed = self._feedback_records.pop(key, None) is not None
             incidents_removed = self._social_incidents.pop(key, None) is not None
             self._sequence_by_chat.pop(key, None)
             return (
@@ -177,6 +194,7 @@ class GroupDialogueStore:
                 or social_removed
                 or pending_removed
                 or bot_turns_removed
+                or feedback_removed
                 or incidents_removed
             )
 
@@ -441,6 +459,67 @@ class GroupDialogueStore:
                 pending.status = "answered"
                 pending.resolved_by_event_id = turn.turn_id
                 pending.updated_at = turn.timestamp
+
+    async def record_bot_turn_feedback(
+        self,
+        chat_id: str,
+        *,
+        observation_id: str,
+        bot_turn_id: str,
+        feedback_kind: str,
+        status: str,
+        actor_id: str = "",
+        evidence_event_id: str = "",
+        confidence: float = 0.0,
+        feedback_at: float | None = None,
+        latency_ms: float = 0.0,
+        caused_reply: bool = False,
+    ) -> SocialFeedbackRecord | None:
+        key = self._resolve_chat_key(chat_id)
+        normalized_observation_id = str(observation_id or "").strip()
+        normalized_kind = str(feedback_kind or "").strip().lower()
+        if not normalized_observation_id or not normalized_kind:
+            return None
+        timestamp = time.time() if feedback_at is None else float(feedback_at)
+        evidence_id = str(evidence_event_id or "").strip()
+        feedback_id = self._stable_id(
+            "feedback",
+            normalized_observation_id,
+            normalized_kind,
+            evidence_id or str(status or ""),
+        )
+        record = SocialFeedbackRecord(
+            feedback_id=feedback_id,
+            observation_id=normalized_observation_id,
+            bot_turn_id=str(bot_turn_id or "").strip(),
+            feedback_kind=normalized_kind,
+            status=str(status or "impacted").strip().lower() or "impacted",
+            actor_id=str(actor_id or "").strip(),
+            evidence_event_id=evidence_id,
+            confidence=max(0.0, min(1.0, float(confidence or 0.0))),
+            feedback_at=timestamp,
+            latency_ms=max(0.0, float(latency_ms or 0.0)),
+            caused_reply=bool(caused_reply),
+        )
+        async with self._lock:
+            records = self._feedback_records.setdefault(key, [])
+            for index, existing in enumerate(records):
+                if existing.feedback_id == feedback_id:
+                    records[index] = record
+                    return record
+            records.append(record)
+            self._feedback_records[key] = records[-160:]
+        return record
+
+    async def get_feedback_records(
+        self,
+        chat_id: str,
+        *,
+        limit: int = 80,
+    ) -> list[SocialFeedbackRecord]:
+        key = self._resolve_chat_key(chat_id)
+        async with self._lock:
+            return list(self._feedback_records.get(key, [])[-max(1, int(limit or 1)) :])
 
     async def get_actor_tail(
         self,
@@ -834,6 +913,19 @@ class GroupDialogueStore:
             return None
 
     @staticmethod
+    def _deserialize_feedback_record(payload: dict) -> SocialFeedbackRecord | None:
+        try:
+            valid_names = {field.name for field in dataclass_fields(SocialFeedbackRecord)}
+            record = SocialFeedbackRecord(
+                **{key: value for key, value in dict(payload or {}).items() if key in valid_names}
+            )
+            if not record.feedback_id or not record.observation_id or not record.feedback_kind:
+                return None
+            return record
+        except Exception:
+            return None
+
+    @staticmethod
     def _deserialize_social_incident(payload: dict) -> GroupSocialIncident | None:
         try:
             valid_names = {field.name for field in dataclass_fields(GroupSocialIncident)}
@@ -1013,6 +1105,11 @@ class GroupDialogueStore:
                 for chat_id, items in self._bot_turns.items()
                 if items
             }
+            feedback_records = {
+                chat_id: [self._serialize_dataclass(item) for item in items[-160:]]
+                for chat_id, items in self._feedback_records.items()
+                if items
+            }
             social_incidents = {
                 chat_id: [self._serialize_dataclass(item) for item in items[-80:]]
                 for chat_id, items in self._social_incidents.items()
@@ -1039,6 +1136,7 @@ class GroupDialogueStore:
             "social_states": social_states,
             "pending_direct": pending_direct,
             "bot_turns": bot_turns,
+            "feedback_records": feedback_records,
             "social_incidents": social_incidents,
             "sequence_by_chat": sequence_by_chat,
         }
@@ -1055,6 +1153,7 @@ class GroupDialogueStore:
                 "social_states",
                 "pending_direct",
                 "bot_turns",
+                "feedback_records",
                 "social_incidents",
             )
         ):
@@ -1147,6 +1246,7 @@ class GroupDialogueStore:
         causal_specs = (
             ("pending_direct", self._pending_direct, self._deserialize_pending_direct),
             ("bot_turns", self._bot_turns, self._deserialize_bot_turn),
+            ("feedback_records", self._feedback_records, self._deserialize_feedback_record),
             ("social_incidents", self._social_incidents, self._deserialize_social_incident),
         )
         for payload_key, target, deserializer in causal_specs:
@@ -1169,6 +1269,7 @@ class GroupDialogueStore:
                     existing = {
                         getattr(item, "pending_id", "")
                         or getattr(item, "turn_id", "")
+                        or getattr(item, "feedback_id", "")
                         or getattr(item, "incident_id", ""): item
                         for item in target.get(key, [])
                     }
@@ -1176,6 +1277,7 @@ class GroupDialogueStore:
                         item_id = (
                             getattr(item, "pending_id", "")
                             or getattr(item, "turn_id", "")
+                            or getattr(item, "feedback_id", "")
                             or getattr(item, "incident_id", "")
                         )
                         existing.setdefault(item_id, item)

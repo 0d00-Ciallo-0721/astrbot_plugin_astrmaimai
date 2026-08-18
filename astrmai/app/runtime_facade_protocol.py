@@ -205,6 +205,9 @@ class RuntimeFacadeProtocol(Protocol):
     async def prepare_conversation_turn(self, event: Any, scope: Any) -> None:
         ...
 
+    async def observe_post_reply_feedback(self, event: Any) -> Any:
+        ...
+
     async def handle_group_reply_wait(self, event: Any, scope: Any) -> str:
         ...
 

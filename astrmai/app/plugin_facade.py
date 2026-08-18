@@ -151,6 +151,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("state_engine", getattr(runtime, "state_engine", None), "clear_chat_state", True),
             ("runtime_coordinator", getattr(runtime, "runtime_coordinator", None), "clear_runtime_state", True),
             ("dialogue_store", getattr(runtime, "dialogue_store", None), "clear_chat", True),
+            ("group_social_feedback_observer", getattr(runtime, "group_social_feedback_observer", None), "clear_chat", True),
             ("chat_loop_kernel", getattr(runtime, "chat_loop_kernel", None), "clear_chat_state", True),
         ]
         proactive_task = getattr(runtime, "proactive_task", None)
@@ -240,6 +241,7 @@ class PluginFacade(RuntimeFacadeProtocol):
             ("frequency_controller", getattr(self.runtime, "frequency_controller", None)),
             ("private_chat_manager", getattr(self.runtime, "private_chat_manager", None)),
             ("group_reply_wait_manager", getattr(self.runtime, "group_reply_wait_manager", None)),
+            ("group_social_feedback_observer", getattr(self.runtime, "group_social_feedback_observer", None)),
             ("attention_gate", getattr(self.runtime, "attention_gate", None)),
             ("reply_engine", getattr(self.runtime, "reply_engine", None)),
             ("system2_planner", getattr(self.runtime, "system2_planner", None)),
@@ -374,11 +376,28 @@ class PluginFacade(RuntimeFacadeProtocol):
             },
         )
 
+    async def observe_post_reply_feedback(self, event):
+        coordinator = getattr(
+            self.runtime,
+            "post_reply_feedback_coordinator",
+            None,
+        )
+        if coordinator is None:
+            return None
+        return await coordinator.observe_incoming(event)
+
     async def handle_group_reply_wait(self, event, scope) -> str:
         if not event.get_group_id() or not self.runtime.group_reply_wait_manager:
             return "NONE"
         thread_id = str(event.get_extra("astrmai_turn_thread_id", "") or "")
         group_wait_result = self.runtime.group_reply_wait_manager.handle_incoming_message(event)
+        coordinator = getattr(
+            self.runtime,
+            "post_reply_feedback_coordinator",
+            None,
+        )
+        if coordinator is not None:
+            await coordinator.mark_group_wait_result(event, group_wait_result)
         if group_wait_result != "NONE":
             record_conversation_concurrency_trace(
                 event,

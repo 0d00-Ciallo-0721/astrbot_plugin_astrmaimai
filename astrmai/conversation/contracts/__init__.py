@@ -35,6 +35,9 @@ _EXPORTS = {
     "PendingQQAction": ".qq_action",
     "VisionCandidate": ".vision_candidate",
     "load_vision_candidates": ".vision_candidate",
+    "SocialFeedbackDecision": ".social_feedback",
+    "SocialFeedbackEvidence": ".social_feedback",
+    "SocialFeedbackObservation": ".social_feedback",
 }
 
 __all__ = list(_EXPORTS)

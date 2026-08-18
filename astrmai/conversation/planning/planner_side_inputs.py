@@ -1800,6 +1800,27 @@ class PlannerSideInputMixin:
         snapshot.reason = str(reason or "")
         snapshot.cooldown_until = float(cooldown_until or 0.0)
 
+    async def _wait_for_post_reply_feedback(
+        self,
+        event: AstrMessageEvent | None,
+        delay_seconds: float,
+    ) -> bool:
+        if event is None or not hasattr(event, "get_extra"):
+            await asyncio.sleep(max(0.0, float(delay_seconds)))
+            return False
+        feedback_event = event.get_extra("astrmai_post_reply_feedback_event", None)
+        if not isinstance(feedback_event, asyncio.Event):
+            await asyncio.sleep(max(0.0, float(delay_seconds)))
+            return False
+        try:
+            await asyncio.wait_for(
+                feedback_event.wait(),
+                timeout=max(0.0, float(delay_seconds)),
+            )
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def _settle_no_send_relationship_event(
         self,
         event: AstrMessageEvent | None,

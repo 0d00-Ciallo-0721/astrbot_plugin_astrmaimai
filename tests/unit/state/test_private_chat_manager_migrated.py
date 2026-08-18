@@ -5,6 +5,65 @@ from astrmai.state.private_chat.private_chat_manager import PrivateChatManager
 
 
 class PrivateChatManagerMigratedTests(unittest.TestCase):
+    def test_arm_reply_cycle_exposes_feedback_event_and_records_continuation(self):
+        manager = PrivateChatManager()
+
+        async def _run():
+            feedback_event = manager.arm_reply_cycle(
+                "user-1",
+                chat_id="default:FriendMessage:user-1",
+                turn_id="turn-1",
+                turn_generation=3,
+                outbound_message_ids=["bot-message-1"],
+            )
+            signaled = await manager.signal_new_message(
+                "user-1",
+                "继续",
+                chat_id="default:FriendMessage:user-1",
+                event_id="user-message-2",
+                message_kind="text",
+            )
+            return feedback_event, signaled, manager.get_session_info("user-1")
+
+        feedback_event, signaled, info = asyncio.run(_run())
+
+        self.assertTrue(signaled)
+        self.assertTrue(feedback_event.is_set())
+        self.assertEqual(info["reply_cycle_status"], "user_continued")
+        self.assertEqual(info["continuation_event_id"], "user-message-2")
+        self.assertEqual(info["continuation_message_kind"], "text")
+
+    def test_same_turn_followup_merges_outbound_ids_without_losing_continuation(self):
+        manager = PrivateChatManager()
+
+        async def _run():
+            first_event = manager.arm_reply_cycle(
+                "user-1",
+                chat_id="default:FriendMessage:user-1",
+                turn_id="turn-1",
+                outbound_message_ids=["bot-message-1"],
+            )
+            await manager.signal_new_message(
+                "user-1",
+                "继续",
+                chat_id="default:FriendMessage:user-1",
+                event_id="user-message-2",
+            )
+            second_event = manager.arm_reply_cycle(
+                "user-1",
+                chat_id="default:FriendMessage:user-1",
+                turn_id="turn-1",
+                outbound_message_ids=["bot-message-2"],
+            )
+            return first_event, second_event, manager.get_session_info("user-1")
+
+        first_event, second_event, info = asyncio.run(_run())
+
+        self.assertIs(first_event, second_event)
+        self.assertTrue(second_event.is_set())
+        self.assertEqual(info["outbound_message_ids"], ["bot-message-1", "bot-message-2"])
+        self.assertEqual(info["reply_cycle_status"], "user_continued")
+
     def test_message_without_active_wait_is_not_buffered(self):
         manager = PrivateChatManager()
 

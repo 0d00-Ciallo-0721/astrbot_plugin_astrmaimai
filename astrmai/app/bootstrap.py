@@ -11,10 +11,12 @@ from ..conversation.history import ConversationHistoryService
 from ..conversation.attention.context_compaction import ContextCompactionEngine
 from ..conversation.attention.gate import AttentionGate
 from ..conversation.attention.group_dialogue_store import GroupDialogueStore
+from ..conversation.attention.group_social_feedback_observer import GroupSocialFeedbackObserver
 from ..conversation.attention.private_turn_coordinator import PrivateTurnCoordinator
 from ..conversation.decision.judge import Judge
 from ..conversation.execution.reply_service import ReplyService
 from ..conversation.execution.reply_commit_service import ReplyCommitService
+from ..conversation.execution.post_reply_feedback_coordinator import PostReplyFeedbackCoordinator
 from ..conversation.execution.system2_runner import System2Runner
 from ..conversation.loop import ChatLoopKernel
 from ..conversation.planning.context_engine import ContextEngine
@@ -401,6 +403,23 @@ class PluginBootstrap:
                 getattr(conversation_config, "group_thread_wait_enabled", True)
             )
         )
+        group_social_feedback_observer = GroupSocialFeedbackObserver(
+            config=runtime.config,
+            dialogue_store=runtime.dialogue_store,
+            gateway=runtime.gateway,
+        )
+        post_reply_feedback_coordinator = PostReplyFeedbackCoordinator(
+            private_chat_manager=private_chat_manager,
+            group_social_feedback_observer=group_social_feedback_observer,
+        )
+        reply_engine = runtime.reply_engine
+        bind_feedback_coordinator = getattr(
+            reply_engine,
+            "bind_post_reply_feedback_coordinator",
+            None,
+        )
+        if callable(bind_feedback_coordinator):
+            bind_feedback_coordinator(post_reply_feedback_coordinator)
         attention_gate = AttentionGate(
             state_engine=runtime.state_engine,
             judge=runtime.judge,
@@ -428,6 +447,8 @@ class PluginBootstrap:
             frequency_controller=frequency_controller,
             private_chat_manager=private_chat_manager,
             group_reply_wait_manager=group_reply_wait_manager,
+            group_social_feedback_observer=group_social_feedback_observer,
+            post_reply_feedback_coordinator=post_reply_feedback_coordinator,
             attention_gate=attention_gate,
         )
 

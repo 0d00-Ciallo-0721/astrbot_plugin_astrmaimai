@@ -61,6 +61,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         dialogue_store=None,
         evolution_manager=None,
         reply_commit_service=None,
+        post_reply_feedback_coordinator=None,
     ):
         self.state_engine = state_engine
         self.mood_manager = mood_manager
@@ -74,6 +75,7 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
             if reply_commit_service is not None
             else ReplyCommitService()
         )
+        self.post_reply_feedback_coordinator = post_reply_feedback_coordinator
         self.qq_action_dispatcher = QQActionDispatcher(
             config=self.config,
             runtime_coordinator=runtime_coordinator,
@@ -99,6 +101,9 @@ class ReplyService(ReplyFreshnessMixin, ReplyArtifactMixin, ReplyPostSendMixin):
         )
         self.qq_action_dispatcher.refresh_config(config)
         self.tts_bridge.refresh_config(config)
+
+    def bind_post_reply_feedback_coordinator(self, coordinator) -> None:
+        self.post_reply_feedback_coordinator = coordinator
 
     async def handle_reply(
         self,

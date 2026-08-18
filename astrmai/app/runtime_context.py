@@ -51,6 +51,8 @@ class InteractionServices:
     frequency_controller: Any = None
     private_chat_manager: Any = None
     group_reply_wait_manager: Any = None
+    group_social_feedback_observer: Any = None
+    post_reply_feedback_coordinator: Any = None
     attention_gate: Any = None
 
 
@@ -306,6 +308,14 @@ class PluginRuntimeContext:
         return self.interaction.group_reply_wait_manager
 
     @property
+    def group_social_feedback_observer(self) -> Any:
+        return self.interaction.group_social_feedback_observer
+
+    @property
+    def post_reply_feedback_coordinator(self) -> Any:
+        return self.interaction.post_reply_feedback_coordinator
+
+    @property
     def attention_gate(self) -> Any:
         return self.interaction.attention_gate
 
@@ -354,6 +364,7 @@ class PluginRuntimeContext:
             self.evolution,
             self.expression_governance_runner,
             self.proactive_task,
+            self.group_social_feedback_observer,
         )
 
     def build_diagnostics(self) -> dict[str, Any]:

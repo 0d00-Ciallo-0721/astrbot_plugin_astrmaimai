@@ -1396,7 +1396,11 @@ class AttentionGate:
             )
             return "IGNORED_IMAGE"
 
-        if is_private and self.private_chat_manager and not is_strong_wakeup:
+        if (
+            is_private
+            and self.private_chat_manager
+            and not event.get_extra("astrmai_private_reply_cycle_checked", False)
+        ):
             try:
                 wait_signaled = await self.private_chat_manager.signal_new_message(
                     sender_id,

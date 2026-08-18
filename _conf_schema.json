@@ -247,6 +247,24 @@
         "default": true,
         "hint": "开启后，群聊等待状态和对话轮次会按群内话题线程隔离，减少不同用户或不同话题互相串扰；关闭后使用整群共用状态。"
       },
+      "social_feedback_observation_enabled": {
+        "description": "启用回复后的群聊社交反馈观察",
+        "type": "bool",
+        "default": true,
+        "hint": "机器人发送成功后短暂观察引用、@、同线程续接和互动；普通相关讨论只提高注意力，不会强制抢话。"
+      },
+      "social_feedback_window_sec": {
+        "description": "群聊社交反馈观察窗口（秒）",
+        "type": "float",
+        "default": 45,
+        "hint": "机器人成功发送后保留反馈关联的时长。"
+      },
+      "social_feedback_max_active_per_chat": {
+        "description": "每个群最大活动反馈观察数",
+        "type": "int",
+        "default": 5,
+        "hint": "限制并行观察窗口数量，避免高频群聊积累过多短期状态。"
+      },
       "group_shared_history_enabled": {
         "description": "启用群聊共享话题历史",
         "type": "bool",

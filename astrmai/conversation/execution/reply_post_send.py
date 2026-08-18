@@ -191,6 +191,15 @@ class ReplyPostSendMixin:
             "skip_semantic_persistence": bool(
                 event.get_extra("astrmai_media_only_failure", False)
             ),
+            "thread_id": str(
+                event.get_extra("astrmai_turn_thread_id", "") or ""
+            ),
+            "generation": int(
+                event.get_extra("astrmai_turn_generation", 0) or 0
+            ),
+            "thread_signature": str(
+                event.get_extra("astrmai_thread_signature", "") or ""
+            ),
         }
 
     async def _commit_group_dialogue_turn_from_context(
@@ -247,6 +256,22 @@ class ReplyPostSendMixin:
         def should_skip_semantic_persistence() -> bool:
             return bool(context.get("skip_semantic_persistence", False))
 
+        async def social_feedback(turn: CommittedBotTurn) -> str:
+            if should_skip_semantic_persistence():
+                return "skipped_nonsemantic_media"
+            coordinator = getattr(self, "post_reply_feedback_coordinator", None)
+            if coordinator is None:
+                return "skipped_unavailable"
+            # Feedback observation is intentionally real-time: retrying an outbox
+            # later would create a window after its relevant inbound events passed.
+            if event is None:
+                return "skipped_repair_no_event"
+            return await coordinator.register_committed_reply(
+                event,
+                turn,
+                context=context,
+            )
+
         async def group_dialogue(turn: CommittedBotTurn) -> str:
             if should_skip_semantic_persistence():
                 return "skipped_nonsemantic_media"
@@ -289,12 +314,16 @@ class ReplyPostSendMixin:
             )
             return "committed"
 
-        return {
+        consumers = {
+            "social_feedback": social_feedback,
             "group_dialogue": group_dialogue,
             "native_history": native_history,
             "memory": memory,
             "learning": learning,
         }
+        if should_skip_semantic_persistence():
+            consumers.pop("social_feedback", None)
+        return consumers
 
     async def _commit_visible_reply(
         self,
