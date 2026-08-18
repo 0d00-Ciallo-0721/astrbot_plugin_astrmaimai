@@ -29,6 +29,14 @@ class PersonaSummarizer:
         "secrets",
     )
     MANUAL_CORE_FIELDS = ("summary", "first_person_rewrite", "style")
+    STRUCTURED_CORE_FIELDS = (
+        "identity_core",
+        "voice_style",
+        "behavior_policy",
+        "relationship_rules",
+        "values_boundaries",
+    )
+    PERSONA_SCHEMA_VERSION = 1
     DERIVATION_VERSION = 2
     REGENERATION_CACHE_PREFIX = "__persona_regeneration__:"
 
@@ -54,6 +62,40 @@ class PersonaSummarizer:
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    @classmethod
+    def normalize_structured_core(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose a stable persona core without discarding legacy cache fields.
+
+        Existing extraction already produces the identity and voice material in
+        ``summary`` and ``style``.  The remaining fields are intentionally
+        optional until a source explicitly provides them; inventing values here
+        would turn a missing persona fact into a false instruction.
+        """
+        if not isinstance(payload, dict):
+            return {}
+        existing = payload.get("persona_core")
+        core = dict(existing) if isinstance(existing, dict) else {}
+        summary = str(payload.get("summary", "") or "").strip()
+        style = str(payload.get("style", "") or "").strip()
+        fallbacks = {
+            "identity_core": summary,
+            "voice_style": style,
+        }
+        for field in cls.STRUCTURED_CORE_FIELDS:
+            value = str(core.get(field, "") or payload.get(field, "") or "").strip()
+            if not value:
+                value = fallbacks.get(field, "")
+            core[field] = value
+        payload["persona_core"] = core
+        payload["persona_schema_version"] = cls.PERSONA_SCHEMA_VERSION
+        payload["persona_core_fields_present"] = [
+            field for field in cls.STRUCTURED_CORE_FIELDS if core.get(field)
+        ]
+        payload["persona_core_fields_missing"] = [
+            field for field in cls.STRUCTURED_CORE_FIELDS if not core.get(field)
+        ]
+        return core
 
     def _handle_background_task_result(self, task: asyncio.Task) -> None:
         self.pending_tasks = {k: v for k, v in self.pending_tasks.items() if v is not task}
@@ -660,6 +702,7 @@ Rules:
                     "raw_hash": self._compute_hash(original_prompt),
                     "timestamp": time.time(),
                 }
+                self.normalize_structured_core(self.cache[cache_key])
                 await self._persist_cache(strict=True)
             await self._verify_persisted_core(cache_key, original_prompt)
             return dict(self.cache[cache_key])
@@ -739,6 +782,7 @@ Rules:
             )
 
         async with self._lock:
+            self.normalize_structured_core(self.cache[cache_key])
             self.cache[cache_key]["core_ready"] = True
             self.cache[cache_key]["persona_state"] = "core_ready"
             self.cache[cache_key]["core_completed_at"] = time.time()
@@ -797,7 +841,7 @@ Rules:
         except Exception as exc:
             logger.warning(f"[PersonaSummarizer] core persona unavailable [{cache_key}]: {exc}")
             cached = self.cache.get(cache_key, {})
-            return {
+            fallback = {
                 "summary": str(cached.get("summary", "") or original_prompt or ""),
                 "first_person_rewrite": str(
                     cached.get("first_person_rewrite", "") or cached.get("summary", "") or original_prompt or ""
@@ -810,9 +854,12 @@ Rules:
                 "raw_hash": self._compute_hash(original_prompt),
                 "timestamp": time.time(),
             }
+            self.normalize_structured_core(fallback)
+            return fallback
 
         if not payload.get("is_full_ready", False) and cache_key not in self.pending_tasks:
             self._start_shard_task(original_prompt, cache_key)
+        self.normalize_structured_core(payload)
         return dict(payload)
 
 # [新增] 核心后台调度器：全维度切片提取引擎

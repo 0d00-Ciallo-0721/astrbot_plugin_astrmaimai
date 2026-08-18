@@ -30,6 +30,48 @@ class _Event:
 
 
 class PersonaAddressingScopeTests(unittest.TestCase):
+    def test_structured_persona_core_is_rendered_before_legacy_fields(self):
+        engine = ContextEngine.__new__(ContextEngine)
+        block = engine._build_role_block(
+            {
+                "summary": "旧摘要",
+                "first_person_rewrite": "旧自述",
+                "style": "旧风格",
+                "persona_core": {
+                    "identity_core": "稳定身份",
+                    "voice_style": "稳定语气",
+                    "behavior_policy": "先接住情绪再回答",
+                    "relationship_rules": "默认称呼为你",
+                    "values_boundaries": "不编造事实",
+                },
+                "shards": {"world_view": "不应自动注入的世界观"},
+            },
+            retrieve_keys=[],
+            is_fast_mode=True,
+        )
+
+        for value in ("稳定身份", "先接住情绪再回答", "默认称呼为你", "不编造事实"):
+            self.assertIn(value, block)
+        self.assertEqual(engine._build_style_block({"persona_core": {"voice_style": "稳定语气"}}), "稳定语气")
+        self.assertNotIn("不应自动注入的世界观", block)
+
+    def test_legacy_persona_payload_normalizes_without_inventing_missing_core(self):
+        payload = {
+            "summary": "核心摘要",
+            "style": "语言规则",
+            "shards": {"values": "价值切片"},
+        }
+
+        core = PersonaSummarizer.normalize_structured_core(payload)
+
+        self.assertEqual(core["identity_core"], "核心摘要")
+        self.assertEqual(core["voice_style"], "语言规则")
+        self.assertEqual(core["behavior_policy"], "")
+        self.assertEqual(core["values_boundaries"], "")
+        self.assertEqual(payload["persona_schema_version"], PersonaSummarizer.PERSONA_SCHEMA_VERSION)
+        self.assertIn("behavior_policy", payload["persona_core_fields_missing"])
+        self.assertIn("values_boundaries", payload["persona_core_fields_missing"])
+
     def test_core_only_uses_compact_persona_without_raw_prompt(self):
         engine = ContextEngine.__new__(ContextEngine)
         block = engine._build_role_block(

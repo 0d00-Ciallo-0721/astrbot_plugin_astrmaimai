@@ -109,6 +109,26 @@ class ContextEngine:
 
         state = self.db.get_chat_state(chat_id) if hasattr(self.db, "get_chat_state") else None
         persona_payload = await self._load_persona_payload(chat_id, retrieve_keys=valid_keys, is_fast_mode=is_fast_mode)
+        if isinstance(prompt_envelope, PromptEnvelope):
+            prompt_envelope.persona_schema_version = int(persona_payload.get("persona_schema_version", 0) or 0)
+            prompt_envelope.persona_core_fields_present = list(
+                persona_payload.get("persona_core_fields_present", []) or []
+            )
+            prompt_envelope.persona_core_fields_missing = list(
+                persona_payload.get("persona_core_fields_missing", []) or []
+            )
+            prompt_envelope.persona_shards_selected = [
+                key for key in valid_keys if key not in {"ALL", "CORE_ONLY"}
+            ]
+        event_extras = getattr(event_messages[-1], "_extras", None) if event_messages else None
+        if isinstance(event_extras, dict):
+            event_extras["astrmai_persona_injection"] = {
+                "schema_version": int(persona_payload.get("persona_schema_version", 0) or 0),
+                "core_fields_present": list(persona_payload.get("persona_core_fields_present", []) or []),
+                "core_fields_missing": list(persona_payload.get("persona_core_fields_missing", []) or []),
+                "selected_shards": [key for key in valid_keys if key not in {"ALL", "CORE_ONLY"}],
+                "mode": "fast" if is_fast_mode else ("all" if "ALL" in valid_keys else "normal"),
+            }
 
         role_block = self._build_role_block(persona_payload, valid_keys, is_fast_mode)
         style_block = self._build_style_block(persona_payload)
@@ -414,11 +434,23 @@ class ContextEngine:
         summary = str(persona_payload.get("summary", "") or raw_persona)
         first_person_rewrite = str(persona_payload.get("first_person_rewrite", "") or "")
         shards = dict(persona_payload.get("shards", {}) or {})
+        persona_core = persona_payload.get("persona_core", {})
+        persona_core = persona_core if isinstance(persona_core, dict) else {}
 
         core_parts: list[str] = []
+        for label, value in (
+            ("身份核心", persona_core.get("identity_core", "")),
+            ("行为表现", persona_core.get("behavior_policy", "")),
+            ("关系规则", persona_core.get("relationship_rules", "")),
+            ("价值与边界", persona_core.get("values_boundaries", "")),
+        ):
+            value = str(value or "").strip()
+            if value and value not in core_parts:
+                core_parts.append(f"{label}：{value}")
+        structured_values = set(persona_core.values())
         for value in (summary, first_person_rewrite):
             value = value.strip()
-            if value and value not in core_parts:
+            if value and value not in structured_values and value not in core_parts:
                 core_parts.append(value)
         compact_core = "\n\n".join(core_parts)
 
@@ -439,7 +471,9 @@ class ContextEngine:
         return base.strip()
 
     def _build_style_block(self, persona_payload: dict[str, Any]) -> str:
-        style = str(persona_payload.get("style", "") or "").strip()
+        persona_core = persona_payload.get("persona_core", {})
+        persona_core = persona_core if isinstance(persona_core, dict) else {}
+        style = str(persona_core.get("voice_style", "") or persona_payload.get("style", "") or "").strip()
         return style or "保持自然、简短、贴近聊天窗口的语气。"
 
     def _build_addressing_boundary_block(self, persona_payload: dict[str, Any]) -> str:

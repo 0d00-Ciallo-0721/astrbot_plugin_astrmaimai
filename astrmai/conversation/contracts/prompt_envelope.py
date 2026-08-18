@@ -116,6 +116,10 @@ class PromptEnvelope:
     planner_runtime_instruction_block: str = ""
     guidance_lines: list[str] = field(default_factory=list)
     context_package: ContextPackage | None = None
+    persona_schema_version: int = 0
+    persona_core_fields_present: list[str] = field(default_factory=list)
+    persona_core_fields_missing: list[str] = field(default_factory=list)
+    persona_shards_selected: list[str] = field(default_factory=list)
 
 
 __all__ = [
