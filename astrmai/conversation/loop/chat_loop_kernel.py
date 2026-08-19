@@ -44,6 +44,7 @@ class ChatLoopKernel:
     NORMAL_POLL_SECONDS = 10.0
     IDLE_POLL_SECONDS = 15.0
     FORCED_PROMOTION_MAX_SLOTS = 4
+    PERSISTENT_DUE_RESERVED_SLOTS = 2
     DIALOGUE_BATCH_SLOTS = 24
     MAINTENANCE_BATCH_SLOTS = 4
     MAINTENANCE_HEAVY_DIALOGUE_SLOTS = 12
@@ -562,12 +563,14 @@ class ChatLoopKernel:
         now: float | None = None,
         horizon_seconds: float | None = None,
         max_batch: int | None = None,
+        candidate_sources: dict[str, str] | None = None,
     ) -> list[str]:
         report = await self.describe_due_selection(
             chat_ids,
             now=now,
             horizon_seconds=horizon_seconds,
             max_batch=max_batch,
+            candidate_sources=candidate_sources,
         )
         return list(report.get("selected", []) or [])
 
@@ -578,6 +581,7 @@ class ChatLoopKernel:
         now: float | None = None,
         horizon_seconds: float | None = None,
         max_batch: int | None = None,
+        candidate_sources: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         now_ts = float(now if now is not None else time.time())
         horizon = float(self.HEARTBEAT_DUE_HORIZON_SECONDS if horizon_seconds is None else horizon_seconds)
@@ -587,8 +591,14 @@ class ChatLoopKernel:
         score_breakdown: dict[str, dict[str, Any]] = {}
         due_phase_mix: dict[str, int] = {}
         states_by_chat: dict[str, ChatLoopState] = {}
+        normalized_sources = {
+            str(chat_id or ""): str(source or "active")
+            for chat_id, source in dict(candidate_sources or {}).items()
+            if str(chat_id or "").strip()
+        }
 
         for chat_id in [str(item or "") for item in chat_ids or [] if str(item or "").strip()]:
+            candidate_source = normalized_sources.get(chat_id, "active")
             state = await self._state_store.get(chat_id)
             runtime_snapshot = {}
             if self.runtime_coordinator is not None and hasattr(self.runtime_coordinator, "get_activity_snapshot"):
@@ -603,6 +613,8 @@ class ChatLoopKernel:
             if state is None:
                 breakdown = {
                     "chat_id": chat_id,
+                    "candidate_source": candidate_source,
+                    "persistent_due_candidate": candidate_source == "persistent_due",
                     "is_new_chat": True,
                     "due_rank": 0,
                     "phase": "ACTIVE",
@@ -648,6 +660,8 @@ class ChatLoopKernel:
                 overdue=overdue,
                 latest_activity_ts=latest_ts,
             )
+            breakdown["candidate_source"] = candidate_source
+            breakdown["persistent_due_candidate"] = candidate_source == "persistent_due"
             score_breakdown[chat_id] = breakdown
             phase_name = str(breakdown.get("phase", "IDLE") or "IDLE")
             due_phase_mix[phase_name] = int(due_phase_mix.get(phase_name, 0) or 0) + 1
@@ -659,10 +673,16 @@ class ChatLoopKernel:
         poll_mode = self._determine_poll_mode(due_phase_mix)
         batch_pressure = self._build_batch_pressure(score_breakdown, ranked)
         promotion_candidates = [chat_id for _, chat_id, breakdown in ranked if bool(breakdown.get("forced_promotion_eligible", False))]
+        persistent_due_candidates = [
+            chat_id
+            for _, chat_id, breakdown in ranked
+            if bool(breakdown.get("persistent_due_candidate", False))
+        ]
         batch_plan = self._build_batch_plan(
             batch_limit=batch_limit,
             due_phase_mix=due_phase_mix,
             promotion_candidates=promotion_candidates,
+            persistent_due_candidates=persistent_due_candidates,
             batch_pressure=batch_pressure,
             score_breakdown=score_breakdown,
         )
@@ -678,6 +698,7 @@ class ChatLoopKernel:
         forced_promotions_selected = selection_summary["forced_promotions_selected"]
         dialogue_selected = selection_summary["dialogue_selected"]
         maintenance_selected = selection_summary["maintenance_selected"]
+        persistent_due_selected = selection_summary["persistent_due_selected"]
         batch_fill_rate = (len(selected) / float(batch_limit)) if batch_limit > 0 else 0.0
         maintenance_budget_total = self._determine_maintenance_budget(
             due_phase_mix,
@@ -694,6 +715,8 @@ class ChatLoopKernel:
             "poll_mode": poll_mode,
             "poll_mode_reason": self._poll_mode_reason(due_phase_mix),
             "promotion_candidates": promotion_candidates,
+            "persistent_due_candidates": persistent_due_candidates,
+            "persistent_due_selected": persistent_due_selected,
             "forced_promotions_selected": forced_promotions_selected,
             "dialogue_selected": dialogue_selected,
             "maintenance_selected": maintenance_selected,
@@ -888,6 +911,7 @@ class ChatLoopKernel:
         batch_limit: int,
         due_phase_mix: dict[str, int],
         promotion_candidates: list[str],
+        persistent_due_candidates: list[str],
         batch_pressure: dict[str, Any],
         score_breakdown: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
@@ -930,7 +954,12 @@ class ChatLoopKernel:
         busy_backpressure_active = has_dialogue_pressure and float(batch_pressure.get("busy_ratio", 0.0) or 0.0) >= busy_backpressure_ratio
         maintenance_backpressure_active = has_maintenance_backlog and self._maintenance_quota_pressure_rounds > 0
         promotion_slots = min(forced_promotion_max_slots, len(promotion_candidates), total_limit)
-        remaining = max(0, total_limit - promotion_slots)
+        persistent_due_slots = min(
+            self.PERSISTENT_DUE_RESERVED_SLOTS,
+            len(persistent_due_candidates),
+            max(0, total_limit - promotion_slots),
+        )
+        remaining = max(0, total_limit - promotion_slots - persistent_due_slots)
         if has_dialogue_pressure:
             dialogue_slots = min(dialogue_batch_slots, remaining)
             if busy_backpressure_active:
@@ -949,6 +978,7 @@ class ChatLoopKernel:
         return {
             "total_limit": total_limit,
             "promotion_slots": promotion_slots,
+            "persistent_due_slots": persistent_due_slots,
             "dialogue_slots": dialogue_slots,
             "maintenance_slots": maintenance_slots,
             "overflow_slots": overflow_slots,
@@ -965,6 +995,7 @@ class ChatLoopKernel:
     ) -> dict[str, Any]:
         entries = [(chat_id, breakdown) for _, chat_id, breakdown in ranked]
         promotion_slots = int(batch_plan.get("promotion_slots", 0) or 0)
+        persistent_due_slots = int(batch_plan.get("persistent_due_slots", 0) or 0)
         dialogue_slots = int(batch_plan.get("dialogue_slots", 0) or 0)
         maintenance_slots = int(batch_plan.get("maintenance_slots", 0) or 0)
         overflow_slots = int(batch_plan.get("overflow_slots", 0) or 0)
@@ -972,6 +1003,15 @@ class ChatLoopKernel:
         promotion_candidates = [(chat_id, breakdown) for chat_id, breakdown in entries if bool(breakdown.get("forced_promotion_eligible", False))]
         forced_promotions_selected = [chat_id for chat_id, _ in promotion_candidates[:promotion_slots]]
         selected_set = set(forced_promotions_selected)
+
+        remaining_entries = [(chat_id, breakdown) for chat_id, breakdown in entries if chat_id not in selected_set]
+        persistent_due_candidates = [
+            (chat_id, breakdown)
+            for chat_id, breakdown in remaining_entries
+            if bool(breakdown.get("persistent_due_candidate", False))
+        ]
+        persistent_due_selected = [chat_id for chat_id, _ in persistent_due_candidates[:persistent_due_slots]]
+        selected_set.update(persistent_due_selected)
 
         remaining_entries = [(chat_id, breakdown) for chat_id, breakdown in entries if chat_id not in selected_set]
         dialogue_candidates = [(chat_id, breakdown) for chat_id, breakdown in remaining_entries if str(breakdown.get("quota_bucket", "DIALOGUE")) != "MAINTENANCE"]
@@ -984,7 +1024,9 @@ class ChatLoopKernel:
         selected_set.update(maintenance_selected)
 
         remaining_after_quota = [(chat_id, breakdown) for chat_id, breakdown in entries if chat_id not in selected_set]
-        overflow_selected: list[str] = []
+        reclaimed_reserved_slots = max(0, persistent_due_slots - len(persistent_due_selected))
+        overflow_selected = [chat_id for chat_id, _ in remaining_after_quota[:reclaimed_reserved_slots]]
+        selected_set.update(overflow_selected)
         ranked_selected = [chat_id for chat_id, _ in entries if chat_id in selected_set and chat_id not in forced_promotions_selected]
         selected_order = list(forced_promotions_selected) + ranked_selected
 
@@ -1004,6 +1046,8 @@ class ChatLoopKernel:
             breakdown["due_rank"] = index
             if chat_id in forced_candidate_set and chat_id in forced_promotions_selected:
                 breakdown["selected_reason"] = "selected_by_forced_promotion"
+            elif chat_id in persistent_due_selected:
+                breakdown["selected_reason"] = "selected_by_persistent_due_reservation"
             elif chat_id in dialogue_candidate_set and chat_id in dialogue_selected:
                 breakdown["selected_reason"] = "selected_by_dialogue_quota"
             elif chat_id in maintenance_candidate_set and chat_id in maintenance_selected:
@@ -1038,6 +1082,11 @@ class ChatLoopKernel:
             "skipped_by_batch": skipped_by_batch,
             "quota_skipped": quota_skipped,
             "forced_promotions_selected": forced_promotions_selected,
+            "persistent_due_selected": [
+                chat_id
+                for chat_id in selected_order
+                if bool(score_breakdown.get(chat_id, {}).get("persistent_due_candidate", False))
+            ],
             "dialogue_selected": [chat_id for chat_id in selected_order if chat_id in set(dialogue_selected + overflow_selected) and str(score_breakdown.get(chat_id, {}).get("quota_bucket", "")) != "MAINTENANCE"],
             "maintenance_selected": [chat_id for chat_id in selected_order if str(score_breakdown.get(chat_id, {}).get("quota_bucket", "")) == "MAINTENANCE"],
         }

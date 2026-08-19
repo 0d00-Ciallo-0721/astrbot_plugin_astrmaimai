@@ -160,6 +160,76 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertEqual(focus_thread["core_events"], [bot_event, focus_event])
         self.assertEqual(focus_thread["ambient_events"], [unrelated])
 
+    def test_topic_activity_uses_continuity_and_excludes_bot_generated_events(self):
+        continuity_mod = importlib.import_module("astrmai.conversation.planning.conversation_continuity")
+        continuity = continuity_mod.ConversationContinuityStore()
+        chat_id = "default:GroupMessage:group-1"
+        continuity.record(
+            chat_id=chat_id,
+            focus_preview="天气和周末安排",
+            sender_id="user-1",
+            reply_need="reply",
+        )
+        self.gate.conversation_continuity = continuity
+
+        continuing = _FakeEvent("user-2", "Bob", "天气周末怎么样")
+        classified = self.gate._classify_topic_activity(
+            chat_id,
+            continuing,
+            "user-2",
+            is_private=False,
+        )
+        self.assertTrue(classified["valid"])
+        self.assertEqual(classified["kind"], "continuing")
+
+        proactive = _FakeEvent(
+            "astrmai_proactive_candidate",
+            "AstrMai",
+            "顺便聊聊周末吧",
+            extras={"astrmai_is_proactive_event": True},
+        )
+        generated = self.gate._classify_topic_activity(
+            chat_id,
+            proactive,
+            "astrmai_proactive_candidate",
+            is_private=False,
+        )
+        self.assertFalse(generated["valid"])
+        self.assertEqual(generated["reason"], "proactive_event")
+
+    def test_record_event_activity_only_persists_semantic_human_activity(self):
+        calls = []
+
+        async def record_real_user_activity(chat_id, **kwargs):
+            calls.append((chat_id, kwargs))
+
+        self.gate.state_engine.bot_id = "bot-1"
+        self.gate.state_engine.record_real_user_activity = record_real_user_activity
+
+        async def _run():
+            semantic = _FakeEvent("user-1", "Alice", "这个周末去看电影吗")
+            punctuation = _FakeEvent("user-2", "Bob", "！！！")
+            response = _FakeEvent(
+                "user-3",
+                "Carol",
+                "那就周六吧",
+                components=[Reply(sender_id="bot-1", sender_nickname="AstrMai")],
+            )
+            await self.gate._record_event_activity(semantic.unified_msg_origin, semantic, "user-1")
+            await self.gate._record_event_activity(punctuation.unified_msg_origin, punctuation, "user-2")
+            await self.gate._record_event_activity(response.unified_msg_origin, response, "user-3")
+            return semantic, punctuation, response
+
+        semantic, punctuation, response = asyncio.run(_run())
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(semantic.get_extra("astrmai_topic_activity_valid"))
+        self.assertEqual(semantic.get_extra("astrmai_topic_activity_kind"), "message")
+        self.assertFalse(punctuation.get_extra("astrmai_topic_activity_valid"))
+        self.assertEqual(punctuation.get_extra("astrmai_topic_activity_reason"), "nonsemantic_topic_text")
+        self.assertTrue(response.get_extra("astrmai_effective_user_response"))
+        self.assertTrue(calls[-1][1]["effective_response"])
+
     def test_message_dedup_prefers_platform_message_id_and_expires_fallback(self):
         first = _FakeEvent("user-1", "Alice", "same", message_id="message-1")
         second = _FakeEvent("user-1", "Alice", "same", message_id="message-2")

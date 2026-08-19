@@ -9,6 +9,7 @@ from time import monotonic
 
 from astrbot.api import logger
 
+from ..conversation.runtime.architecture_rollout import rollout_enabled
 from ..infrastructure.context_economy import PromptTemplateId
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..learning.profiling.nickname_generator import NicknameGenerator
@@ -76,6 +77,12 @@ class ProactiveTask:
         self._last_global_maintenance_run = 0.0
         self._last_due_chat_count = 0
         self._last_skipped_not_due_count = 0
+        self._last_active_candidate_count = 0
+        self._last_persistent_due_candidate_count = 0
+        self._last_merged_candidate_count = 0
+        self._last_selected_persistent_due_count = 0
+        self._persistent_due_scan_enabled = False
+        self._persistent_due_scan_degraded_reason = ""
         self._scheduler_poll_mode = "FAST"
         self._scheduler_poll_interval_seconds = self.FAST_POLL_INTERVAL_SECONDS
         self._last_due_phase_mix: dict[str, int] = {}
@@ -685,33 +692,64 @@ class ProactiveTask:
         }
 
     async def _run_chat_heartbeat_pass(self) -> list[dict]:
-        if self.runtime_coordinator is None or self.chat_loop_kernel is None:
+        if self.chat_loop_kernel is None:
             self._last_due_chat_count = 0
             self._last_skipped_not_due_count = 0
             self._last_due_phase_mix = {}
+            self._last_active_candidate_count = 0
+            self._last_persistent_due_candidate_count = 0
+            self._last_merged_candidate_count = 0
+            self._last_selected_persistent_due_count = 0
+            self._persistent_due_scan_enabled = False
+            self._persistent_due_scan_degraded_reason = "kernel_unavailable"
             self._set_scheduler_poll_mode("IDLE")
             return []
-        if not hasattr(self.runtime_coordinator, "list_active_chats"):
-            self._last_due_chat_count = 0
-            self._last_skipped_not_due_count = 0
-            self._last_due_phase_mix = {}
-            self._set_scheduler_poll_mode("IDLE")
-            return []
-        try:
-            chat_ids = await self.runtime_coordinator.list_active_chats()
-        except Exception as exc:
-            logger.debug(f"[ProactiveTask] active chat scan degraded for kernel heartbeat: {exc}")
-            self._last_due_chat_count = 0
-            self._last_skipped_not_due_count = 0
-            self._last_due_phase_mix = {}
-            self._set_scheduler_poll_mode("IDLE")
-            return []
+        active_chat_ids: list[str] = []
+        if self.runtime_coordinator is not None and hasattr(self.runtime_coordinator, "list_active_chats"):
+            try:
+                active_chat_ids = list(await self.runtime_coordinator.list_active_chats() or [])
+            except Exception as exc:
+                logger.debug(f"[ProactiveTask] active chat scan degraded for kernel heartbeat: {exc}")
+
+        self._persistent_due_scan_enabled = rollout_enabled(self.config, "proactive_due_enabled", True)
+        self._persistent_due_scan_degraded_reason = ""
+        persistent_due_chat_ids: list[str] = []
+        due_loader = getattr(self.state_engine, "list_due_proactive_chat_ids", None)
+        if self._persistent_due_scan_enabled and callable(due_loader):
+            try:
+                persistent_due_chat_ids = list(
+                    await due_loader(now=time.time(), limit=self.HEARTBEAT_MAX_BATCH * 4) or []
+                )
+            except Exception as exc:
+                self._persistent_due_scan_degraded_reason = exc.__class__.__name__
+                logger.warning(f"[ProactiveTask] persisted proactive due scan degraded: {exc}")
+        elif self._persistent_due_scan_enabled:
+            self._persistent_due_scan_degraded_reason = "due_loader_unavailable"
+
+        candidate_sources: dict[str, str] = {}
+        chat_ids: list[str] = []
+        for chat_id in active_chat_ids:
+            normalized = str(chat_id or "").strip()
+            if normalized and normalized not in candidate_sources:
+                candidate_sources[normalized] = "active"
+                chat_ids.append(normalized)
+        for chat_id in persistent_due_chat_ids:
+            normalized = str(chat_id or "").strip()
+            if not normalized:
+                continue
+            if normalized not in candidate_sources:
+                chat_ids.append(normalized)
+            candidate_sources[normalized] = "persistent_due"
+        self._last_active_candidate_count = len({str(chat_id or "").strip() for chat_id in active_chat_ids if str(chat_id or "").strip()})
+        self._last_persistent_due_candidate_count = len({str(chat_id or "").strip() for chat_id in persistent_due_chat_ids if str(chat_id or "").strip()})
+        self._last_merged_candidate_count = len(chat_ids)
         try:
             selection_report = await self.chat_loop_kernel.describe_due_selection(
                 chat_ids,
                 now=time.time(),
                 horizon_seconds=self.HEARTBEAT_DUE_HORIZON_SECONDS,
                 max_batch=self.HEARTBEAT_MAX_BATCH,
+                candidate_sources=candidate_sources,
             )
         except Exception as exc:
             logger.debug(f"[ProactiveTask] due chat selection degraded for kernel heartbeat: {exc}")
@@ -725,6 +763,7 @@ class ProactiveTask:
                 "maintenance_budget_used": 0,
                 "maintenance_budget_remaining": 0,
                 "maintenance_blocked_by_budget": [],
+                "persistent_due_selected": [],
             }
         due_chat_ids = list(selection_report.get("selected", []) or [])
         previous_poll_mode = self._scheduler_poll_mode
@@ -738,6 +777,7 @@ class ProactiveTask:
         self._last_scheduler_batch_plan = dict(selection_report.get("batch_plan", {}) or {})
         self._last_batch_fill_rate = float(selection_report.get("batch_fill_rate", 0.0) or 0.0)
         self._last_forced_promotion_count = len(list(selection_report.get("forced_promotions_selected", []) or []))
+        self._last_selected_persistent_due_count = len(list(selection_report.get("persistent_due_selected", []) or []))
         self._last_quota_skip_counts = dict(selection_report.get("quota_skip_counts", {}) or {})
         self._busy_backpressure_active = bool(selection_report.get("busy_backpressure_active", False))
         self._maintenance_backpressure_active = bool(selection_report.get("maintenance_backpressure_active", False))
@@ -746,6 +786,7 @@ class ProactiveTask:
             "forced_promotion_count": self._last_forced_promotion_count,
             "dialogue_selected_count": len(list(selection_report.get("dialogue_selected", []) or [])),
             "maintenance_selected_count": len(list(selection_report.get("maintenance_selected", []) or [])),
+            "persistent_due_selected_count": self._last_selected_persistent_due_count,
             "skipped_by_batch_count": len(list(selection_report.get("skipped_by_batch", []) or [])),
         }
         self._set_scheduler_poll_mode(str(selection_report.get("poll_mode", "IDLE") or "IDLE"))
@@ -924,6 +965,12 @@ class ProactiveTask:
             "global_maintenance_interval": self.GLOBAL_MAINTENANCE_INTERVAL_SECONDS,
             "due_chat_count": self._last_due_chat_count,
             "skipped_not_due_count": self._last_skipped_not_due_count,
+            "active_candidate_count": self._last_active_candidate_count,
+            "persistent_due_candidate_count": self._last_persistent_due_candidate_count,
+            "merged_candidate_count": self._last_merged_candidate_count,
+            "selected_persistent_due_count": self._last_selected_persistent_due_count,
+            "persistent_due_scan_enabled": self._persistent_due_scan_enabled,
+            "persistent_due_scan_degraded_reason": self._persistent_due_scan_degraded_reason,
             "due_phase_mix": dict(self._last_due_phase_mix),
             "scheduler_batch_limit": self._scheduler_batch_limit,
             "scheduler_batch_plan": dict(self._last_scheduler_batch_plan),

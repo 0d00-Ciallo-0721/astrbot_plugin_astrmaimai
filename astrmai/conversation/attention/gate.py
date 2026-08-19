@@ -22,6 +22,7 @@ from ...infrastructure.gateway.output_guard import validate_visible_output_text
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
 from ...infrastructure.runtime.turn_call_ledger import attach_background_task_trace, rebind_turn_telemetry
 from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id
+from ..planning.message_renderer import MessageRenderer
 from .decision_router import AttentionDecisionRouter
 from .event_normalizer import SessionContext, build_normalized_events
 from .focus_selector import score_focus_candidate, select_focus_event
@@ -297,7 +298,16 @@ class AttentionGate:
 
     def _is_reply_to_bot_event(self, event: AstrMessageEvent, self_id: str) -> bool:
         message = getattr(getattr(event, "message_obj", None), "message", None) or []
-        bot_names = [str(name).strip() for name in getattr(getattr(self.config, "system1", None), "nicknames", []) or [] if str(name).strip()]
+        bot_names = [
+            str(name).strip()
+            for name in getattr(
+                getattr(getattr(self, "config", None), "system1", None),
+                "nicknames",
+                [],
+            )
+            or []
+            if str(name).strip()
+        ]
         for component in message:
             component_type = str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
             if component_type != "reply":
@@ -556,6 +566,88 @@ class AttentionGate:
         attention_cfg = getattr(self.config, "attention", None)
         return bool(getattr(attention_cfg, "private_skip_judge_enabled", True))
 
+    @staticmethod
+    def _has_semantic_topic_text(text: str) -> bool:
+        normalized = " ".join(str(text or "").strip().split())
+        if not normalized:
+            return False
+        return any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in normalized)
+
+    def _classify_topic_activity(
+        self,
+        chat_id: str,
+        event: AstrMessageEvent,
+        sender_id: str,
+        *,
+        is_private: bool,
+    ) -> dict[str, Any]:
+        result = {
+            "valid": False,
+            "kind": "",
+            "reason": "",
+            "source": "human_message",
+            "effective_response": False,
+            "preview": "",
+        }
+        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            result["source"] = "bot_proactive_event"
+            result["reason"] = "proactive_event"
+            return result
+        if bool(event.get_extra("astrmai_is_external_bot_reply", False)):
+            result["source"] = "external_bot_reply"
+            result["reason"] = "external_bot_reply"
+            return result
+        if bool(event.get_extra("astrmai_is_command", False)) or bool(event.get_extra("heartflow_is_command", False)):
+            result["reason"] = "command"
+            return result
+
+        projection = MessageRenderer.project_topic_preview(event, max_chars=120)
+        result["preview"] = str(projection.text or "")
+        if not projection.safe:
+            result["reason"] = str(projection.rejected_reason or "unsafe_topic_preview")
+            return result
+        if not self._has_semantic_topic_text(projection.text):
+            result["reason"] = "nonsemantic_topic_text"
+            return result
+
+        self_id = get_event_self_id(event)
+        is_at_bot = self._is_at_bot_event(event, self_id)
+        is_reply_to_bot = self._is_reply_to_bot_event(event, self_id)
+        result["effective_response"] = bool(is_private or is_at_bot or is_reply_to_bot)
+        conversation_continuity = getattr(self, "conversation_continuity", None)
+        if is_private:
+            result["kind"] = "private_message"
+            result["reason"] = "private_semantic_message"
+        elif conversation_continuity is not None and hasattr(
+            conversation_continuity, "evaluate_group_message"
+        ):
+            try:
+                policy = conversation_continuity.evaluate_group_message(
+                    chat_id,
+                    projection.text,
+                    sender_id=sender_id,
+                    has_reply_reference=is_reply_to_bot,
+                )
+                rotation_reason = str(getattr(policy, "rotation_reason", "") or "")
+                if str(getattr(policy, "history_mode", "") or "") == "current_topic":
+                    result["kind"] = "continuing"
+                elif rotation_reason == "explicit_topic_switch":
+                    result["kind"] = "switched"
+                else:
+                    result["kind"] = "new"
+                result["reason"] = rotation_reason or ",".join(
+                    str(item) for item in getattr(policy, "continuity_evidence", ()) or ()
+                ) or "semantic_topic_message"
+            except Exception as exc:
+                logger.debug(f"[AttentionGate] topic activity classification degraded for {chat_id}: {exc}")
+                result["kind"] = "message"
+                result["reason"] = "continuity_classifier_degraded"
+        else:
+            result["kind"] = "message"
+            result["reason"] = "semantic_topic_message"
+        result["valid"] = True
+        return result
+
     async def _record_event_activity(self, chat_id: str, event: AstrMessageEvent, sender_id: str) -> float:
         session = await self._get_or_create_session(chat_id)
         now = time.time()
@@ -565,24 +657,56 @@ class AttentionGate:
         is_real_user_activity = bool(
             activity_sender_id
             and activity_sender_id != str(getattr(self.state_engine, "bot_id", "") or "")
+            and activity_sender_id != str(get_event_self_id(event) or "")
             and not str(activity_sender_id).startswith("astrmai_")
             and not bool(event.get_extra("astrmai_is_proactive_event", False))
             and not bool(event.get_extra("astrmai_is_external_bot_reply", False))
             and provenance == "original"
         )
+        topic_activity = (
+            self._classify_topic_activity(
+                chat_id,
+                event,
+                activity_sender_id,
+                is_private=not bool(event.get_group_id()),
+            )
+            if is_real_user_activity
+            else {
+                "valid": False,
+                "kind": "",
+                "reason": "non_user_source",
+                "source": "non_user_source",
+                "effective_response": False,
+                "preview": "",
+            }
+        )
         if hasattr(event, "set_extra"):
             event.set_extra("astrmai_timestamp", now)
             ensure_turn_context(event).perception.timestamp = now
-        if is_real_user_activity:
+            event.set_extra("astrmai_topic_activity_valid", bool(topic_activity.get("valid", False)))
+            event.set_extra("astrmai_topic_activity_kind", str(topic_activity.get("kind", "") or ""))
+            event.set_extra("astrmai_topic_activity_reason", str(topic_activity.get("reason", "") or ""))
+            event.set_extra("astrmai_topic_activity_source", str(topic_activity.get("source", "") or ""))
+            event.set_extra("astrmai_topic_activity_preview", str(topic_activity.get("preview", "") or ""))
+            event.set_extra("astrmai_effective_user_response", bool(topic_activity.get("effective_response", False)))
+        if is_real_user_activity and bool(topic_activity.get("valid", False)):
             session.last_active_user_time = now
             recorder = getattr(self.state_engine, "record_real_user_activity", None)
             if callable(recorder):
                 try:
-                    await recorder(
-                        chat_id,
-                        chat_kind="group" if bool(event.get_group_id()) else "private",
-                        occurred_at=now,
-                    )
+                    try:
+                        await recorder(
+                            chat_id,
+                            chat_kind="group" if bool(event.get_group_id()) else "private",
+                            occurred_at=now,
+                            effective_response=bool(topic_activity.get("effective_response", False)),
+                        )
+                    except TypeError:
+                        await recorder(
+                            chat_id,
+                            chat_kind="group" if bool(event.get_group_id()) else "private",
+                            occurred_at=now,
+                        )
                     event.set_extra("astrmai_proactive_generation_invalidated", True)
                 except Exception as exc:
                     logger.warning(f"[AttentionGate] proactive user watermark degraded for {chat_id}: {exc}")

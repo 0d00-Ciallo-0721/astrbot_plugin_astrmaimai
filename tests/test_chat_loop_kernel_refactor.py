@@ -290,6 +290,71 @@ class ChatLoopKernelRefactorTests(unittest.TestCase):
         self.assertEqual(result.decision.next_tick_delay, 300.0)
         self.assertEqual(result.decision.metadata["scheduler_bucket"], "idle_backoff")
 
+    def test_persisted_due_candidate_is_selected_but_not_dispatched_during_quiet_hours(self):
+        bridge_calls = []
+
+        class _Coordinator:
+            async def get_activity_snapshot(self, chat_id):
+                return {"chat_id": chat_id, "executor_pending": 0, "wait_targets": []}
+
+        class _WakeupService:
+            config = SimpleNamespace(
+                life=SimpleNamespace(proactive_quiet_hours=["00:00-23:59"]),
+                reply=SimpleNamespace(base_frequency=0.7),
+            )
+
+            async def build_signal(self, chat_id, now=None):
+                return {"eligible": True, "reason": "silence_threshold_reached", "wakeup_cooldown": 60.0}
+
+        async def _wakeup_bridge(chat_id, snapshot, decision):
+            bridge_calls.append((chat_id, decision.action))
+            return {"performed": True}
+
+        kernel = self.kernel_mod.ChatLoopKernel(runtime_coordinator=_Coordinator())
+        kernel.bind_signal_sources(wakeup_service=_WakeupService())
+        kernel.bind_dispatch_bridge("PROACTIVE_WAKEUP", _wakeup_bridge)
+
+        async def _run():
+            report = await kernel.describe_due_selection(
+                ["group:persisted-due"],
+                now=100.0,
+                horizon_seconds=2.0,
+                max_batch=1,
+                candidate_sources={"group:persisted-due": "persistent_due"},
+            )
+            result = await kernel.tick(chat_id="group:persisted-due", trigger="heartbeat")
+            return report, result
+
+        report, result = asyncio.run(_run())
+
+        self.assertEqual(report["selected"], ["group:persisted-due"])
+        self.assertEqual(report["persistent_due_selected"], ["group:persisted-due"])
+        self.assertEqual(result.decision.reason, "quiet_hours")
+        self.assertEqual(bridge_calls, [])
+
+    def test_persisted_due_reservation_prevents_saturated_active_batch_starvation(self):
+        kernel = self.kernel_mod.ChatLoopKernel()
+        active_chat_ids = [f"group:active-{index:02d}" for index in range(40)]
+        persisted_due_chat_id = "group:persisted-due"
+
+        report = asyncio.run(
+            kernel.describe_due_selection(
+                [*active_chat_ids, persisted_due_chat_id],
+                now=100.0,
+                horizon_seconds=2.0,
+                max_batch=1,
+                candidate_sources={persisted_due_chat_id: "persistent_due"},
+            )
+        )
+
+        self.assertEqual(report["batch_plan"]["persistent_due_slots"], 1)
+        self.assertEqual(report["selected"], [persisted_due_chat_id])
+        self.assertEqual(report["persistent_due_selected"], [persisted_due_chat_id])
+        self.assertEqual(
+            report["score_breakdown"][persisted_due_chat_id]["selected_reason"],
+            "selected_by_persistent_due_reservation",
+        )
+
     def test_per_action_cooldown_blocks_only_same_action(self):
         class _Coordinator:
             async def get_activity_snapshot(self, chat_id):

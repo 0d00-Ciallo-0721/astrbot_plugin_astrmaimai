@@ -1703,6 +1703,13 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     and projection.vision_state in {"failed", "pending_or_unknown"}
                 )
             )
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                # 主动合成事件的回复可以承接话题，但不能伪装成新的用户话题活动。
+                focus_preview = ""
+                topic_preview_updates_continuity = False
+                event.set_extra("astrmai_topic_activity_valid", False)
+                event.set_extra("astrmai_topic_activity_source", "bot_proactive_event")
+                event.set_extra("astrmai_topic_activity_reason", "bot_reply_not_human_activity")
             event.set_extra("astrmai_topic_preview", focus_preview)
             event.set_extra("astrmai_topic_preview_source", projection.source)
             event.set_extra("astrmai_topic_preview_kind", projection.message_kind)

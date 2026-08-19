@@ -383,6 +383,114 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(status["poll_mode_transition"]["previous"], "FAST")
         self.assertEqual(status["poll_mode_transition"]["current"], "NORMAL")
 
+    def _build_heartbeat_task_for_due_tests(self, state_engine, runtime_coordinator, *, proactive_due_enabled=True):
+        config = SimpleNamespace(
+            life=SimpleNamespace(
+                dream_interval_min=1,
+                dream_time_ranges=[],
+                silence_threshold=10,
+                wakeup_min_energy=20,
+                wakeup_cost=5,
+                wakeup_cooldown=60,
+                dream_visible=False,
+            ),
+            persona=SimpleNamespace(persona_id="global", name="Mai"),
+            evolution=SimpleNamespace(enable_expression_mining=False, enable_relationship_engine=False),
+            architecture_rollout=SimpleNamespace(proactive_due_enabled=proactive_due_enabled),
+        )
+        gateway = SimpleNamespace(config=config, call_proactive_task=lambda **_kwargs: asyncio.sleep(0, result="ok"))
+
+        class _Kernel:
+            def __init__(self):
+                self.selection_args = None
+
+            async def describe_due_selection(self, chat_ids, **kwargs):
+                self.selection_args = (list(chat_ids), dict(kwargs))
+                sources = dict(kwargs.get("candidate_sources", {}) or {})
+                persistent_due_selected = [
+                    chat_id for chat_id in chat_ids if sources.get(chat_id) == "persistent_due"
+                ]
+                return {
+                    "selected": list(chat_ids),
+                    "skipped_not_due": [],
+                    "skipped_by_batch": [],
+                    "due_phase_mix": {"ACTIVE": len(chat_ids)} if chat_ids else {},
+                    "poll_mode": "FAST" if chat_ids else "IDLE",
+                    "poll_mode_reason": "dialogue_pressure" if chat_ids else "idle_backoff",
+                    "persistent_due_selected": persistent_due_selected,
+                    "batch_plan": {"total_limit": 32},
+                }
+
+            async def tick(self, *, chat_id, trigger):
+                return SimpleNamespace(decision=SimpleNamespace(action="NOOP", reason="no_signal_ready"))
+
+        task = self.mod.ProactiveTask(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            gateway=gateway,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}),
+            memory_engine=SimpleNamespace(add_memory=None),
+            reflector=None,
+            config=config,
+            runtime_coordinator=runtime_coordinator,
+        )
+        kernel = _Kernel()
+        task.bind_chat_loop_kernel(kernel)
+        return task, kernel
+
+    def test_chat_heartbeat_recovers_persisted_due_chat_after_empty_runtime_cache(self):
+        class _Coordinator:
+            async def list_active_chats(self):
+                return []
+
+        class _StateEngine:
+            async def list_due_proactive_chat_ids(self, **_kwargs):
+                return ["group:restart", "group:restart"]
+
+        task, kernel = self._build_heartbeat_task_for_due_tests(_StateEngine(), _Coordinator())
+
+        results = asyncio.run(task._run_chat_heartbeat_pass())
+
+        self.assertEqual(results, [{"chat_id": "group:restart", "action": "NOOP", "reason": "no_signal_ready"}])
+        self.assertEqual(kernel.selection_args[0], ["group:restart"])
+        self.assertEqual(kernel.selection_args[1]["candidate_sources"], {"group:restart": "persistent_due"})
+        status = task.describe_status()
+        self.assertEqual(status["active_candidate_count"], 0)
+        self.assertEqual(status["persistent_due_candidate_count"], 1)
+        self.assertEqual(status["merged_candidate_count"], 1)
+        self.assertEqual(status["selected_persistent_due_count"], 1)
+        self.assertTrue(status["persistent_due_scan_enabled"])
+
+    def test_chat_heartbeat_keeps_active_scan_when_persistent_due_scan_disabled_or_degraded(self):
+        class _Coordinator:
+            async def list_active_chats(self):
+                return ["group:active"]
+
+        class _DisabledStateEngine:
+            async def list_due_proactive_chat_ids(self, **_kwargs):
+                raise AssertionError("disabled due scan must not query persistence")
+
+        disabled_task, disabled_kernel = self._build_heartbeat_task_for_due_tests(
+            _DisabledStateEngine(),
+            _Coordinator(),
+            proactive_due_enabled=False,
+        )
+        asyncio.run(disabled_task._run_chat_heartbeat_pass())
+        self.assertEqual(disabled_kernel.selection_args[0], ["group:active"])
+        self.assertFalse(disabled_task.describe_status()["persistent_due_scan_enabled"])
+
+        class _FailingStateEngine:
+            async def list_due_proactive_chat_ids(self, **_kwargs):
+                raise RuntimeError("database temporarily unavailable")
+
+        degraded_task, degraded_kernel = self._build_heartbeat_task_for_due_tests(
+            _FailingStateEngine(),
+            _Coordinator(),
+        )
+        asyncio.run(degraded_task._run_chat_heartbeat_pass())
+        self.assertEqual(degraded_kernel.selection_args[0], ["group:active"])
+        self.assertEqual(degraded_task.describe_status()["persistent_due_scan_degraded_reason"], "RuntimeError")
+
     def test_handle_chat_heartbeat_marks_observe_only_dispatch_mode(self):
         gateway = SimpleNamespace(
             config=SimpleNamespace(

@@ -102,6 +102,47 @@ def test_real_user_activity_and_committed_bot_watermarks_are_independent():
         asyncio.run(_run(Path(temp_dir) / "state.db"))
 
 
+def test_ordinary_group_activity_resets_silence_but_not_unanswered_proactive_count():
+    async def _run(db_path: Path):
+        persistence = _SqliteStatePersistence(db_path)
+        service = ChatStateService(persistence, _config())
+
+        await service.record_real_user_activity(
+            "ff:GroupMessage:42",
+            chat_kind="group",
+            occurred_at=100.0,
+            effective_response=True,
+        )
+        await service.record_committed_bot_reply(
+            "ff:GroupMessage:42",
+            committed_at=150.0,
+            is_proactive=True,
+            commit_id="proactive-1",
+        )
+        ordinary = await service.record_real_user_activity(
+            "ff:GroupMessage:42",
+            chat_kind="group",
+            occurred_at=200.0,
+            effective_response=False,
+        )
+        assert ordinary.last_real_user_activity_at == 200.0
+        assert ordinary.next_proactive_due_at == 800.0
+        assert ordinary.unanswered_proactive_count == 1
+        assert ordinary.last_proactive_cancel_reason == "meaningful_group_activity"
+
+        response = await service.record_real_user_activity(
+            "ff:GroupMessage:42",
+            chat_kind="group",
+            occurred_at=300.0,
+            effective_response=True,
+        )
+        assert response.unanswered_proactive_count == 0
+        assert response.last_proactive_cancel_reason == "user_activity"
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        asyncio.run(_run(Path(temp_dir) / "state.db"))
+
+
 def test_persistent_due_scan_and_atomic_claim_are_restart_safe():
     async def _run(db_path: Path):
         persistence = _SqliteStatePersistence(db_path)

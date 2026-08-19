@@ -255,7 +255,14 @@ class ChatStateService:
         *,
         chat_kind: str = "",
         occurred_at: float | None = None,
+        effective_response: bool = True,
     ) -> ChatState:
+        """Record a semantic human message, not arbitrary runtime activity.
+
+        ``effective_response`` distinguishes a member's ordinary group
+        conversation from a direct response to the bot. Both reset the
+        silence timer, but only the latter clears unanswered proactive turns.
+        """
         occurred_at = float(occurred_at or time.time())
         generation = self._chat_generation(chat_id)
         async with self._get_chat_lock(chat_id):
@@ -271,8 +278,11 @@ class ChatStateService:
             )
             state.last_reply_time = state.last_real_user_activity_at
             state.proactive_generation = int(getattr(state, "proactive_generation", 0) or 0) + 1
-            state.unanswered_proactive_count = 0
-            state.last_proactive_cancel_reason = "user_activity"
+            if effective_response:
+                state.unanswered_proactive_count = 0
+                state.last_proactive_cancel_reason = "user_activity"
+            else:
+                state.last_proactive_cancel_reason = "meaningful_group_activity"
             state.proactive_claim_token = ""
             state.proactive_claimed_at = 0.0
             state.next_proactive_due_at = occurred_at + silence_minutes * 60.0
@@ -900,11 +910,13 @@ class StateEngine:
         *,
         chat_kind: str = "",
         occurred_at: float | None = None,
+        effective_response: bool = True,
     ) -> ChatState:
         return await self.chat_state_service.record_real_user_activity(
             chat_id,
             chat_kind=chat_kind,
             occurred_at=occurred_at,
+            effective_response=effective_response,
         )
 
     async def record_committed_bot_reply(
