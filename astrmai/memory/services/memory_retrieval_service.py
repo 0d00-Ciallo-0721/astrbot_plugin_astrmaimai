@@ -712,7 +712,14 @@ class MemoryRetrievalService:
         vector_status = str(
             (latest_hybrid_observation.get("vector") or {}).get("status") or ""
         )
-        if vector_status in {"timeout", "error", "circuit_open", "unavailable", "initialization_failed"}:
+        if vector_status in {
+            "timeout",
+            "query_queue_timeout",
+            "error",
+            "circuit_open",
+            "unavailable",
+            "initialization_failed",
+        }:
             if canonical_results:
                 fallback_source = "canonical_fts"
             elif int(latest_hybrid_observation.get("bm25_result_count", 0) or 0) > 0:

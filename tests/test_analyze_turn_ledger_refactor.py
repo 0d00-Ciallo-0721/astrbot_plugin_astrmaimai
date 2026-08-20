@@ -76,6 +76,27 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
                 "stage_ledger": [
                     {"stage": "reply.send", "status": "success", "elapsed_ms": 30},
                 ],
+                "timing_coverage": {
+                    "coverage_ratio": 0.8,
+                    "instrumented_ms": 800,
+                    "unattributed_ms": 200,
+                    "first_observed_delay_ms": 20,
+                    "post_last_observed_delay_ms": 80,
+                    "max_unattributed_gap_ms": 100,
+                },
+                "topic_observation": {
+                    "valid": True,
+                    "kind": "message",
+                    "reason": "semantic_topic_text",
+                    "effective_user_response": True,
+                },
+                "proactive_observation": {
+                    "dispatch_status": "sent",
+                    "blocked_reason": "",
+                    "stage_ledger": [
+                        {"stage": "proactive.reply_commit", "status": "success"},
+                    ],
+                },
                 "context_block_stats": [
                     {
                         "stage": "planner.final_prompt_sources",
@@ -95,12 +116,30 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
                     "stale_category": "newer_activity_same_thread",
                     "judge_outcome": "reply",
                 },
+                "judge_decision": {
+                    "cache_hit": True,
+                    "cache_action": "IGNORE",
+                    "cache_scope": "ambient_topic",
+                    "avoided": True,
+                    "prefilter_judge_agreement": False,
+                },
                 "budget": {"remaining_ms": 120000, "exhausted": False},
                 "memory_funnel": {
                     "status": "injected",
                     "candidate_count": 10,
                     "selected_count": 3,
                     "rendered_chars": 500,
+                    "hybrid_observations": [
+                        {
+                            "vector": {
+                                "status": "timeout",
+                                "timeout_origin": "faiss_index",
+                                "query_queue_wait_ms": 12.5,
+                                "runtime_metrics": {"degraded_ratio": 0.25},
+                            }
+                        }
+                    ],
+                    "vector_fallback": {"source": "bm25", "used": True},
                     "query_rewrite_trace": {"status": "success"},
                 },
                 "vision_observation": {
@@ -124,6 +163,11 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["reply"]["chars_max"] == 321
     assert report["llm"]["attempts_per_call_p95"] == 2
     assert report["llm"]["judge_calls_per_turn_p95"] == 1
+    assert report["llm"]["judge_observation_count"] == 1
+    assert report["llm"]["judge_cache_hit_count"] == 1
+    assert report["llm"]["judge_avoided_count"] == 1
+    assert report["llm"]["judge_cache_scope_counts"] == {"ambient_topic": 1}
+    assert report["llm"]["prefilter_judge_agreement_counts"] == {"false": 1}
     assert report["llm"]["path_counts"] == {"critical": 1}
     assert report["context"]["duplicate_block_count"] == 2
     assert report["context"]["by_scope"]["source"]["duplicate_block_count"] == 2
@@ -134,6 +178,12 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["budget"]["exhausted_count"] == 0
     assert report["query_rewrite"]["status_counts"] == {"success": 1}
     assert report["memory"]["selection_rate"] == 0.3
+    assert report["faiss"]["status_counts"] == {"timeout": 1}
+    assert report["faiss"]["timeout_origin_counts"] == {"faiss_index": 1}
+    assert report["faiss"]["fallback_source_counts"] == {"bm25": 1}
+    assert report["faiss"]["query_queue_wait_ms_p95"] == 12.5
+    assert report["faiss"]["degraded_ratio_p50"] == 0.25
+    assert "## Faiss Retrieval" in render_markdown(report)
     assert report["vision"]["trace_count"] == 1
     assert report["vision"]["path_counts"] == {"direct": 1}
     assert report["vision"]["call_status_counts"] == {"success": 1}
@@ -144,7 +194,20 @@ def test_analyze_traces_uses_real_reply_length_and_exact_attempts():
     assert report["vision"]["failure_disposition_counts"] == {"continue_text_only": 1}
     assert report["vision"]["reply_guard_action_counts"] == {"allowed": 1}
     assert report["vision"]["resolve_failure_reason_counts"] == {"get_image_failed": 1}
+    assert report["timing_coverage"]["coverage_ratio_p50"] == 0.8
+    assert report["timing_coverage"]["unattributed_ms_p95"] == 200.0
+    assert report["timing_coverage"]["total_ms_p95"] == 1000.0
+    assert report["timing_coverage"]["post_last_observed_delay_ms_p95"] == 80.0
+    assert report["topic_activity"]["valid_count"] == 1
+    assert report["topic_activity"]["effective_user_response_count"] == 1
+    assert report["proactive"]["dispatch_status_counts"] == {"sent": 1}
+    assert report["proactive"]["stage_status_counts"] == {
+        "proactive.reply_commit:success": 1,
+    }
     assert "## Vision" in render_markdown(report)
+    assert "Judge observed/cache-hit/avoided" in render_markdown(report)
+    assert "## Topic Activity" in render_markdown(report)
+    assert "## Proactive Lifecycle" in render_markdown(report)
 
 
 def test_analyze_traces_reports_relationship_and_expression_decisions():
@@ -170,6 +233,26 @@ def test_analyze_traces_reports_relationship_and_expression_decisions():
     assert report["relationship"]["disposition_counts"] == {"applied": 1}
     assert report["expression"]["tag_counts"] == {"shy": 1}
     assert "## Relationship Events" in render_markdown(report)
+
+
+def test_analyze_traces_reads_memory_retrieval_from_architecture_contract():
+    report = analyze_traces(
+        [
+            {
+                "architecture_contract": {
+                    "memory_retrieval_observation": {
+                        "vector_fallback": {"source": "canonical_fts"},
+                        "hybrid_observations": [
+                            {"vector": {"status": "circuit_open"}}
+                        ],
+                    }
+                }
+            }
+        ]
+    )
+
+    assert report["faiss"]["status_counts"] == {"circuit_open": 1}
+    assert report["faiss"]["fallback_source_counts"] == {"canonical_fts": 1}
 
 
 def test_analyze_traces_counts_abandoned_calls_budget_and_attempt_failures():

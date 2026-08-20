@@ -929,15 +929,24 @@ class MemoryV2ServiceTests(unittest.TestCase):
         class _FakeRetriever:
             def __init__(self):
                 self.added = []
+                self.deleted = []
+                self.events = []
 
             async def add_memory(self, content, metadata):
                 self.added.append((content, metadata))
+                self.events.append(("add", metadata["canonical_id"]))
                 return len(self.added)
+
+            async def delete_document(self, doc_key):
+                self.deleted.append(doc_key)
+                self.events.append(("delete", doc_key))
+                return True
 
         class _FakeEngine:
             def __init__(self, store):
                 self.v2_store = store
                 self.retriever = _FakeRetriever()
+                self.vec_retriever = self.retriever
                 self.deleted = []
                 self.ready_calls = 0
 
@@ -949,7 +958,7 @@ class MemoryV2ServiceTests(unittest.TestCase):
                 return dict(kwargs)
 
             async def _run_documents_query(self, query, params=(), *, db_path=None):
-                return [(len(self.deleted) + 1,)]
+                return [(len(self.deleted) + 1, f"doc-{len(self.deleted) + 1}")]
 
             async def _execute_documents_write(self, query, params=(), *, db_path=None):
                 self.deleted.append((query, params))
@@ -973,6 +982,9 @@ class MemoryV2ServiceTests(unittest.TestCase):
             self.assertEqual(rebuilt, 1)
             self.assertEqual(len(engine.retriever.added), 3)
             self.assertTrue(all(item[1]["canonical_id"] == memory_id for item in engine.retriever.added))
+            self.assertGreaterEqual(len(engine.retriever.deleted), 3)
+            self.assertEqual(engine.retriever.events[-2][0], "delete")
+            self.assertEqual(engine.retriever.events[-1], ("add", memory_id))
             self.assertGreaterEqual(len(engine.deleted), 3)
 
         asyncio.run(run())

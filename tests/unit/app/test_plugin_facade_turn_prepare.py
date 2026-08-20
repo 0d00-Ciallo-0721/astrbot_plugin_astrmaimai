@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.helpers.astrbot_stubs import install_astrbot_stubs
 
@@ -78,6 +79,29 @@ class PluginFacadeTurnPrepareTests(unittest.TestCase):
             ),
         )
         return facade
+
+    def test_system2_entry_rebuilds_missing_runner_and_uses_bounded_implementation(self):
+        calls = []
+
+        class _Runner:
+            async def run(self, event, events):
+                calls.append((event, events))
+                return "done"
+
+        runner = _Runner()
+        facade = self.facade_mod.PluginFacade.__new__(self.facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(system2_runner=None)
+        event = _Event()
+
+        with patch(
+            "astrmai.conversation.execution.system2_runner.System2Runner",
+            return_value=runner,
+        ):
+            result = asyncio.run(facade._system2_entry(event, [event]))
+
+        self.assertEqual(result, "done")
+        self.assertIs(facade.runtime.system2_runner, runner)
+        self.assertEqual(calls, [(event, [event])])
 
     def test_group_turn_uses_thread_signature(self):
         coordinator = _Coordinator()
@@ -189,6 +213,33 @@ class PluginFacadeTurnPrepareTests(unittest.TestCase):
 
         self.assertIsNone(event.get_extra("astrmai_turn_identity"))
         self.assertEqual(coordinator.calls, [])
+
+    def test_flush_deferred_turn_trace_uses_latest_pending_snapshot(self):
+        recorded = []
+
+        class _Planner:
+            async def record_turn_trace(self, chat_id, event, *, status, reply_text=None):
+                recorded.append((chat_id, status, reply_text, event.get_extra("astrmai_defer_turn_trace_persist")))
+
+        facade = self.facade_mod.PluginFacade.__new__(self.facade_mod.PluginFacade)
+        facade.runtime = SimpleNamespace(system2_planner=_Planner())
+        event = _Event(
+            extras={
+                "astrmai_defer_turn_trace_persist": True,
+                "astrmai_deferred_turn_trace": {
+                    "chat_id": "chat-final",
+                    "status": "executed",
+                    "reply_text": "reply",
+                },
+            }
+        )
+
+        flushed = asyncio.run(facade.flush_deferred_turn_trace(event, fallback_status="fallback"))
+
+        self.assertTrue(flushed)
+        self.assertEqual(recorded, [("chat-final", "executed", "reply", False)])
+        self.assertFalse(event.get_extra("astrmai_defer_turn_trace_persist"))
+        self.assertIsNone(event.get_extra("astrmai_deferred_turn_trace"))
 
     def test_group_wait_interrupt_cancels_only_current_turn_thread(self):
         from astrmai.state.group_wait.group_reply_wait_manager import GroupReplyWaitManager

@@ -40,11 +40,19 @@ class PersonaSummarizer:
     DERIVATION_VERSION = 2
     REGENERATION_CACHE_PREFIX = "__persona_regeneration__:"
 
-    def __init__(self, persistence: PersistenceManager, gateway: GlobalModelGateway, config=None, memory_engine=None):
+    def __init__(
+        self,
+        persistence: PersistenceManager,
+        gateway: GlobalModelGateway,
+        config=None,
+        memory_engine=None,
+        background_task_budget=None,
+    ):
         self.persistence = persistence
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.memory_engine = memory_engine
+        self.background_task_budget = background_task_budget
         # 加载持久化缓存
         self.cache = self.persistence.load_persona_cache()
         # 运行时任务锁
@@ -62,6 +70,12 @@ class PersonaSummarizer:
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    async def _run_background_model(self, awaitable_factory):
+        budget = self.background_task_budget
+        if budget is None:
+            return await awaitable_factory()
+        return await budget.run(awaitable_factory)
 
     @classmethod
     def normalize_structured_core(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -128,16 +142,19 @@ class PersonaSummarizer:
         delay = initial_delay
         while not self._closed:
             try:
-                try:
-                    await self._generate_all_shards_background(
-                        original_prompt,
-                        cache_key,
-                        raise_on_failure=True,
-                    )
-                except TypeError as exc:
-                    if "raise_on_failure" not in str(exc):
-                        raise
-                    await self._generate_all_shards_background(original_prompt, cache_key)
+                async def _generate_shards():
+                    try:
+                        await self._generate_all_shards_background(
+                            original_prompt,
+                            cache_key,
+                            raise_on_failure=True,
+                        )
+                    except TypeError as exc:
+                        if "raise_on_failure" not in str(exc):
+                            raise
+                        await self._generate_all_shards_background(original_prompt, cache_key)
+
+                await self._run_background_model(_generate_shards)
                 return
             except asyncio.CancelledError:
                 raise
@@ -1147,17 +1164,21 @@ Rules:
         old_payload = copy.deepcopy(self.cache.get(cache_key, {}))
         try:
             self._cache_generations.setdefault(staging_key, 0)
-            await self._initialize_core(
-                original_prompt,
-                staging_key,
-                force_compression=True,
+            await self._run_background_model(
+                lambda: self._initialize_core(
+                    original_prompt,
+                    staging_key,
+                    force_compression=True,
+                )
             )
             job["stage"] = "shards"
-            await self._generate_all_shards_background(
-                original_prompt,
-                staging_key,
-                raise_on_failure=True,
-                skip_self_lore=True,
+            await self._run_background_model(
+                lambda: self._generate_all_shards_background(
+                    original_prompt,
+                    staging_key,
+                    raise_on_failure=True,
+                    skip_self_lore=True,
+                )
             )
             staging_payload = copy.deepcopy(self.cache.get(staging_key, {}))
             if not self._full_cache_is_ready(

@@ -5,11 +5,18 @@ from types import SimpleNamespace
 
 
 class _DummyLock:
-    async def __aenter__(self):
-        return self
+    def __init__(self):
+        self._locked = False
 
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
+    async def acquire(self):
+        self._locked = True
+        return True
+
+    def release(self):
+        self._locked = False
+
+    def locked(self):
+        return self._locked
 
 
 class _FakeCoordinator:
@@ -113,6 +120,65 @@ class _FakeEvent:
 
 
 class RefactoredSystem2RunnerTests(unittest.TestCase):
+    def test_runner_preserves_cancellation_while_waiting_for_chat_lock(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _BlockingLock:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self._locked = False
+
+            async def acquire(self):
+                self.started.set()
+                await asyncio.Event().wait()
+
+            def release(self):
+                self._locked = False
+
+            def locked(self):
+                return self._locked
+
+        lock = _BlockingLock()
+        runtime = SimpleNamespace(
+            runtime_coordinator=SimpleNamespace(get_sys2_lock=lambda chat_id: asyncio.sleep(0, result=lock)),
+        )
+        runner = runner_mod.System2Runner(runtime)
+        event = _FakeEvent()
+
+        async def _run():
+            task = asyncio.create_task(runner.run(event))
+            await lock.started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run())
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["status"], "cancelled")
+
+    def test_runner_times_out_while_waiting_for_chat_lock(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+        lock = asyncio.Lock()
+        runtime = SimpleNamespace(
+            runtime_coordinator=SimpleNamespace(get_sys2_lock=lambda chat_id: asyncio.sleep(0, result=lock)),
+            config=SimpleNamespace(timing=SimpleNamespace(sys2_lock_wait_timeout_sec=0.1)),
+        )
+        runner = runner_mod.System2Runner(runtime)
+        event = _FakeEvent()
+
+        async def _run():
+            await lock.acquire()
+            try:
+                return await runner.run(event)
+            finally:
+                lock.release()
+
+        self.assertFalse(asyncio.run(_run()))
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "system2.chat_lock_wait")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["status"], "timeout")
+
     def test_runner_handles_queue_energy_wait_targets_and_group_followup(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
         runtime = type(
@@ -131,6 +197,7 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         )()
         runner = runner_mod.System2Runner(runtime)
         event = _FakeEvent()
+        event.set_extra("astrmai_turn_thread_id", "thread-a")
 
         reply_sent = asyncio.run(runner.run(event))
 
@@ -150,6 +217,43 @@ class RefactoredSystem2RunnerTests(unittest.TestCase):
         )
         self.assertEqual(runtime.chat_loop_kernel.cooldowns[0][1:], ("followup", "followup_dispatch"))
         self.assertEqual(runtime.group_reply_wait_manager.events, [event])
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-2]["stage"], "system2.chat_lock_wait")
+        self.assertEqual(stages[-2]["status"], "success")
+        self.assertEqual(stages[-2]["metadata"]["thread_id"], "thread-a")
+        self.assertEqual(stages[-2]["metadata"]["lock_scope"], "chat")
+        self.assertEqual(stages[-1]["stage"], "system2.lane_prepare")
+        self.assertEqual(stages[-1]["status"], "success")
+
+    def test_runner_times_out_while_preparing_system2_lane(self):
+        runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")
+
+        class _BlockingLaneManager:
+            async def ensure_lane(self, lane_key, base_origin):
+                await asyncio.Event().wait()
+
+        runtime = type(
+            "Runtime",
+            (),
+            {
+                "runtime_coordinator": _FakeCoordinator(),
+                "state_engine": _FakeStateEngine(),
+                "lane_manager": _BlockingLaneManager(),
+                "system2_planner": _FakePlanner(),
+                "config": SimpleNamespace(
+                    timing=SimpleNamespace(lane_prepare_timeout_sec=0.1),
+                ),
+            },
+        )()
+        runner = runner_mod.System2Runner(runtime)
+        event = _FakeEvent()
+
+        self.assertFalse(asyncio.run(runner.run(event)))
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "system2.lane_prepare")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["stage"], "system2.lane_prepare")
+        self.assertEqual(stages[-1]["status"], "timeout")
 
     def test_runner_private_followup_does_not_block_and_expires_wait_in_background(self):
         runner_mod = importlib.import_module("astrmai.conversation.execution.system2_runner")

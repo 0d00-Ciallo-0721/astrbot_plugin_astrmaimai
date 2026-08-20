@@ -84,6 +84,20 @@ class GroupRereadObserver:
 
     @staticmethod
     def _is_pure_text(event: Any) -> bool:
+        if bool(getattr(event, "get_extra", lambda *_args: False)("astrmai_is_command", False)):
+            return False
+        if bool(getattr(event, "get_extra", lambda *_args: False)("heartflow_is_command", False)):
+            return False
+        if bool(getattr(event, "get_extra", lambda *_args: False)("astrmai_non_conversational", False)):
+            return False
+        try:
+            sender_id = str(event.get_sender_id() or "").strip()
+        except Exception:
+            sender_id = ""
+        if not sender_id or sender_id.startswith("80000000"):
+            return False
+        if sender_id == str(getattr(event, "get_self_id", lambda: "")() or "").strip():
+            return False
         message = getattr(getattr(event, "message_obj", None), "message", None)
         if not message:
             return bool(str(getattr(event, "message_str", "") or "").strip())
@@ -160,7 +174,6 @@ class GroupRereadObserver:
                 return None
             records = state.records[:]
             state.records = []
-            state.cooldown_until = now + self._cooldown_seconds()
             self._stats["threshold_hit"] += 1
         participants = tuple(item.sender_id for item in records)
         source_ids = tuple(item.event_id for item in records if item.event_id)
@@ -178,6 +191,34 @@ class GroupRereadObserver:
             participant_ids=participants,
             explanation=explanation,
         )
+
+    async def claim_dispatch(self, chat_id: str) -> bool:
+        """Atomically claim the shared cooldown for either passive or active reread."""
+        if not self._enabled() or not chat_id:
+            return False
+        now = time.time()
+        async with self._lock:
+            self._prune_locked(now)
+            state = self._get_state_locked(str(chat_id), now)
+            if now < state.cooldown_until:
+                self._stats["cooldown_blocked"] += 1
+                return False
+            state.cooldown_until = now + self._cooldown_seconds()
+            self._stats["dispatch_claimed"] += 1
+            return True
+
+    async def release_dispatch(self, chat_id: str) -> bool:
+        """Release a cooldown reservation when no visible message was sent."""
+        if not chat_id:
+            return False
+        now = time.time()
+        async with self._lock:
+            state = self._states.get(str(chat_id))
+            if state is None or state.cooldown_until <= now:
+                return False
+            state.cooldown_until = 0.0
+            self._stats["dispatch_released"] += 1
+            return True
 
     async def clear_chat(self, chat_id: str) -> bool:
         async with self._lock:

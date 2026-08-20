@@ -27,6 +27,19 @@ class LaneStorageMixin:
                         break
         return self._lane_creation_locks[lane_key_str]
 
+    def _lane_timeout(self, name: str, default: float) -> float:
+        timing = getattr(getattr(self, "config", None), "timing", None)
+        try:
+            return max(0.1, float(getattr(timing, name, default) or default))
+        except (TypeError, ValueError):
+            return default
+
+    async def _ensure_lane_with_timeout(self, **kwargs):
+        return await asyncio.wait_for(
+            self.ensure_lane(**kwargs),
+            timeout=self._lane_timeout("lane_prepare_timeout_sec", 20.0),
+        )
+
     async def ensure_lane(
         self,
         lane_key: LaneKey,
@@ -158,13 +171,16 @@ class LaneStorageMixin:
         persona_core_version: str = "",
     ) -> List[dict]:
         normalized = self._normalize_history(history, lane_key)
-        await self.conversation_manager.update_conversation(
-            unified_msg_origin=lane_umo,
-            conversation_id=conversation_id,
-            history=normalized,
-            title=self._build_title(lane_key),
-            persona_id=persona_id or None,
-            token_usage=token_usage,
+        await asyncio.wait_for(
+            self.conversation_manager.update_conversation(
+                unified_msg_origin=lane_umo,
+                conversation_id=conversation_id,
+                history=normalized,
+                title=self._build_title(lane_key),
+                persona_id=persona_id or None,
+                token_usage=token_usage,
+            ),
+            timeout=self._lane_timeout("lane_persist_timeout_sec", 5.0),
         )
         async with self._meta_lock:
             prev = self._runtime_meta.get(lane_umo, {})
@@ -196,7 +212,7 @@ class LaneStorageMixin:
         schema_id: str = "",
         persona_core_version: str = "",
     ) -> List[dict]:
-        lane_umo, conversation_id, history, _ = await self.ensure_lane(
+        lane_umo, conversation_id, history, _ = await self._ensure_lane_with_timeout(
             lane_key=lane_key,
             base_origin=base_origin,
             prefix_hash=prefix_hash,
@@ -250,7 +266,7 @@ class LaneStorageMixin:
         persona_core_version: str = "",
     ) -> List[dict]:
         if artifact.blocked or not artifact.persistable_text:
-            lane_umo, conversation_id, history, _ = await self.ensure_lane(
+            lane_umo, conversation_id, history, _ = await self._ensure_lane_with_timeout(
                 lane_key=lane_key,
                 base_origin=base_origin,
                 prefix_hash=prefix_hash,
@@ -280,7 +296,7 @@ class LaneStorageMixin:
         lane_key: LaneKey,
         base_origin: Optional[str],
     ) -> List[dict]:
-        _lane_umo, _conversation_id, history, _ = await self.ensure_lane(
+        _lane_umo, _conversation_id, history, _ = await self._ensure_lane_with_timeout(
             lane_key=lane_key,
             base_origin=base_origin,
         )

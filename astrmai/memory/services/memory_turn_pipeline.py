@@ -28,6 +28,7 @@ class MemoryTurnPipeline:
         config: Any = None,
         observer: Any = None,
         checkpoint_store: Any = None,
+        background_task_budget: Any = None,
     ) -> None:
         self.context = context
         self.gateway = gateway
@@ -38,6 +39,7 @@ class MemoryTurnPipeline:
         self.config = config if config is not None else getattr(gateway, "config", None)
         self.observer = observer
         self.checkpoint_store = checkpoint_store
+        self.background_task_budget = background_task_budget
         self._session_history_buffer: dict[str, dict[str, Any]] = {}
         self._inflight_maintenance: dict[str, list[Any]] = {}
         self._memory_locks: dict[str, asyncio.Lock] = {}
@@ -47,15 +49,29 @@ class MemoryTurnPipeline:
         self._instant_llm_last_check: dict[str, float] = {}
         self._running = False
         self._sweep_task: asyncio.Task[Any] | None = None
+        self._maintenance_limit = self._maintenance_concurrency()
+        self._maintenance_semaphore = asyncio.Semaphore(self._maintenance_limit)
+        self._active_maintenance = 0
 
     def refresh_config(self, config: Any) -> None:
         self.config = config
+        configured = self._maintenance_concurrency()
+        if configured != self._maintenance_limit and self._active_maintenance == 0:
+            self._maintenance_limit = configured
+            self._maintenance_semaphore = asyncio.Semaphore(configured)
         for component in (self.session_summarizer, self.instant_gate):
             refresh = getattr(component, "refresh_config", None)
             if callable(refresh):
                 refresh(config)
             elif component is not None:
                 component.config = config
+
+    def _maintenance_concurrency(self) -> int:
+        value = getattr(getattr(self.config, "memory", None), "maintenance_concurrency", 1)
+        try:
+            return max(1, min(4, int(value or 1)))
+        except (TypeError, ValueError):
+            return 1
 
     async def start(self) -> None:
         if self._running:
@@ -334,6 +350,9 @@ class MemoryTurnPipeline:
             "tracked_chats": len(self._session_history_buffer),
             "active_worker_count": len(active_workers),
             "active_worker_chats": list(active_workers[:50]),
+            "maintenance_concurrency": int(self._maintenance_limit),
+            "active_maintenance": int(self._active_maintenance),
+            "maintenance_available_slots": max(0, int(getattr(self._maintenance_semaphore, "_value", 0) or 0)),
         }
 
     def is_worker_active(self, chat_id: str) -> bool:
@@ -387,7 +406,24 @@ class MemoryTurnPipeline:
                 "maintenance_started",
                 summary=f"processing {len(messages_to_process)} messages",
             )
-            await self.session_summarizer.summarize_session(session_id=chat_id, chat_history_text=history_text)
+            await self._maintenance_semaphore.acquire()
+            self._active_maintenance += 1
+            try:
+                if self.background_task_budget is not None:
+                    await self.background_task_budget.run(
+                        lambda: self.session_summarizer.summarize_session(
+                            session_id=chat_id,
+                            chat_history_text=history_text,
+                        )
+                    )
+                else:
+                    await self.session_summarizer.summarize_session(
+                        session_id=chat_id,
+                        chat_history_text=history_text,
+                    )
+            finally:
+                self._active_maintenance = max(0, self._active_maintenance - 1)
+                self._maintenance_semaphore.release()
             completed_at = time.time()
             async with lock:
                 current_data = self._session_history_buffer.setdefault(

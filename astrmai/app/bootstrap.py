@@ -33,6 +33,7 @@ from ..infrastructure.runtime.cross_session_handoff_store import CrossSessionHan
 from ..infrastructure.runtime.context_economy_benchmark_store import ContextEconomyBenchmarkSampleStore
 from ..infrastructure.runtime.event_bus import EventBus
 from ..infrastructure.runtime.host_bridge import HostBridge
+from ..infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 from ..infrastructure.runtime.lane_manager import LaneManager
 from ..infrastructure.runtime.observability import RuntimeObservabilityHub
 from ..infrastructure.runtime.raw_trace_store import RawTraceEventStore
@@ -79,6 +80,21 @@ class PluginBootstrap:
             runtime_coordinator=ChatRuntimeCoordinator(),
             host_bridge=HostBridge(),
             infrastructure_settings=build_infrastructure_settings(self.config),
+            background_task_budget=BackgroundTaskBudget(
+                int(getattr(getattr(self.config, "infra", None), "background_task_concurrency", 2) or 2),
+                max_queue=int(
+                    getattr(getattr(self.config, "infra", None), "background_task_queue_limit", 64)
+                    or 0
+                ),
+                wait_timeout_sec=float(
+                    getattr(
+                        getattr(self.config, "infra", None),
+                        "background_task_wait_timeout_sec",
+                        120.0,
+                    )
+                    or 120.0
+                ),
+            ),
         )
         runtime.set_boot_phase("bootstrap.logging")
         self._log_boot_status(runtime)
@@ -189,6 +205,7 @@ class PluginBootstrap:
         embedding_models = getattr(runtime.config.provider, "embedding_models", [])
         event_bus = EventBus()
         memory_engine = MemoryEngine(self.context, gateway, embedding_models=embedding_models)
+        memory_engine.background_task_budget = getattr(runtime, "background_task_budget", None)
         self._wire_memory_database_services(persistence, db_service, gateway, memory_engine)
         observability_hub = RuntimeObservabilityHub(db_service.raw_trace_store)
         db_service.observability_hub = observability_hub
@@ -262,6 +279,7 @@ class PluginBootstrap:
                 compaction_summary_max_tokens=getattr(conversation_settings, "compaction_summary_max_tokens", 450),
                 provider_id=getattr(conversation_settings, "compaction_provider_id", ""),
                 gateway=gateway,
+                background_task_budget=getattr(runtime, "background_task_budget", None),
             )
         db_service.context_compaction = compaction
         gateway.context_compaction = compaction
@@ -335,7 +353,12 @@ class PluginBootstrap:
         return WorkModeServices()
 
     def _build_cognition_stack(self, runtime: PluginRuntimeContext) -> CognitionServices:
-        evolution = EvolutionManager(runtime.db_service, runtime.gateway, event_bus=runtime.event_bus)
+        evolution = EvolutionManager(
+            runtime.db_service,
+            runtime.gateway,
+            event_bus=runtime.event_bus,
+            background_task_budget=getattr(runtime, "background_task_budget", None),
+        )
         reply_engine = ReplyService(
             runtime.state_engine,
             runtime.state_engine.mood_manager,
@@ -347,7 +370,12 @@ class PluginBootstrap:
                 ReplyCommitOutboxStore(runtime.db_service.db_path)
             ),
         )
-        persona_summarizer = PersonaSummarizer(runtime.persistence, runtime.gateway, memory_engine=runtime.memory_engine)
+        persona_summarizer = PersonaSummarizer(
+            runtime.persistence,
+            runtime.gateway,
+            memory_engine=runtime.memory_engine,
+            background_task_budget=getattr(runtime, "background_task_budget", None),
+        )
         context_engine = ContextEngine(runtime.db_service, persona_summarizer)
         react_retriever = ReActRetriever(
             memory_engine=runtime.memory_engine,
@@ -416,6 +444,7 @@ class PluginBootstrap:
             config=runtime.config,
             runtime_coordinator=runtime.runtime_coordinator,
             dialogue_store=runtime.dialogue_store,
+            reread_observer=group_reread_observer,
         )
         post_reply_feedback_coordinator = PostReplyFeedbackCoordinator(
             private_chat_manager=private_chat_manager,
@@ -591,6 +620,7 @@ class PluginBootstrap:
                 config=runtime.config,
                 runtime_coordinator=runtime.runtime_coordinator,
                 attention_gate=runtime.attention_gate,
+                background_task_budget=getattr(runtime, "background_task_budget", None),
             )
             proactive_task.configure(
                 ProactiveDeps(

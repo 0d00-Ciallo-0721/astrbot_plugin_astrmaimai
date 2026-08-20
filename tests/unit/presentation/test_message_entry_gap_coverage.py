@@ -332,6 +332,16 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
         self.assertNotIn("scope_access", facade.calls)
         self.assertNotIn("attention", facade.calls)
 
+    def test_link_parser_like_message_stays_available_when_astrmai_buffers(self):
+        facade = _Facade()
+        event = _Event(text="https://example.com/video/123")
+
+        result = self._collect(facade, event)
+
+        self.assertEqual(result, [])
+        self.assertFalse(event.stopped)
+        self.assertIn("attention", facade.calls)
+
     def test_activated_external_command_bypasses_before_astrmai_dedup(self):
         facade = _Facade()
         event = _Event(text="合成 欧尼酱")
@@ -443,6 +453,21 @@ class MessageEntryGapCoverageTests(unittest.TestCase):
             [{"type": "plain", "text": "runtime fallback"}],
         )
         self.assertTrue(event.stopped)
+
+    def test_trace_flush_runs_after_attention_stage_is_finished(self):
+        facade = _Facade()
+        event = _Event()
+        observed = []
+
+        async def _flush(flush_event, *, fallback_status=""):
+            stages = list(flush_event.get_extra("astrmai_stage_ledger", []) or [])
+            observed.append((fallback_status, stages[-1]["stage"], stages[-1]["status"]))
+            return True
+
+        facade.flush_deferred_turn_trace = _flush
+
+        self.assertEqual(self._collect(facade, event), [])
+        self.assertEqual(observed, [("BUFFERED", "attention.dispatch", "success")])
 
     def test_reflect_feedback_yields_response_and_stops_event(self):
         facade = _Facade()

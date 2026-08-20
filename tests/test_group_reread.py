@@ -38,6 +38,7 @@ class _Coordinator:
     def __init__(self):
         self.claims = set()
         self.commits = []
+        self.failures = []
 
     async def claim_send(self, _chat_id, key):
         if key in self.claims:
@@ -49,7 +50,9 @@ class _Coordinator:
         self.commits.append((chat_id, key, list(message_ids)))
 
     async def mark_send_failed(self, *_args):
-        pass
+        self.failures.append(_args)
+        if len(_args) > 1:
+            self.claims.discard(_args[1])
 
     async def is_current_turn(self, _turn):
         return True
@@ -166,6 +169,23 @@ class GroupRereadTests(unittest.TestCase):
 
         self.assertIsNone(asyncio.run(_run()))
 
+    def test_commands_anonymous_and_self_messages_do_not_enter_reread_window(self):
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+
+        async def _run():
+            for index in range(5):
+                event = _Event("早", sender_id=f"user-{index}", message_id=f"cmd-{index}")
+                event.set_extra("heartflow_is_command", True)
+                self.assertIsNone(await observer.observe(event))
+            for index in range(5):
+                event = _Event("早", sender_id=f"80000000{index}", message_id=f"anon-{index}")
+                self.assertIsNone(await observer.observe(event))
+            for index in range(5):
+                event = _Event("早", sender_id="bot-1", message_id=f"self-{index}")
+                self.assertIsNone(await observer.observe(event))
+
+        asyncio.run(_run())
+
     def test_dispatcher_claims_once_and_records_internal_note(self):
         observer = self.observer_mod.GroupRereadObserver(config=self.config)
         request = asyncio.run(observer.observe(_Event("早", sender_id="u0", message_id="m0")))
@@ -192,6 +212,82 @@ class GroupRereadTests(unittest.TestCase):
         self.assertEqual(context.sent[0][1].chain[0].text, "早")
         self.assertEqual(store.calls[0][1]["provenance"], "group_reread_passive")
         self.assertIn("不表示事实认可", store.calls[0][1]["internal_note"])
+
+    def test_active_and_passive_reread_share_group_cooldown(self):
+        self.config.conversation.group_reread_cooldown_sec = 60
+        observer = self.observer_mod.GroupRereadObserver(config=self.config)
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        passive = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="passive",
+            trigger_kind="group_reread_passive",
+            source_event_ids=("m1",),
+        )
+        active = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="晚安",
+            fingerprint="active",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m2",),
+        )
+        context = _Context()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=context,
+            config=self.config,
+            runtime_coordinator=_Coordinator(),
+            dialogue_store=_Store(),
+            reread_observer=observer,
+        )
+        event = _Event("早", sender_id="u1", message_id="m1")
+
+        async def _run():
+            return await dispatcher.dispatch(event, passive), await dispatcher.dispatch(event, active)
+
+        first, second = asyncio.run(_run())
+        self.assertTrue(first.sent)
+        self.assertEqual(second.status, "cooldown")
+        self.assertEqual(len(context.sent), 1)
+
+    def test_cooldown_rejection_releases_send_claim_for_retry(self):
+        contract_mod = importlib.import_module("astrmai.conversation.contracts.reread")
+        request = contract_mod.RereadActionRequest(
+            chat_id="default:GroupMessage:group-1",
+            text="早",
+            fingerprint="retry",
+            trigger_kind="group_reread_active",
+            source_event_ids=("m-retry",),
+        )
+
+        class _RejectOnceObserver:
+            def __init__(self):
+                self.calls = 0
+
+            async def claim_dispatch(self, _chat_id):
+                self.calls += 1
+                return self.calls > 1
+
+            async def release_dispatch(self, _chat_id):
+                return True
+
+        coordinator = _Coordinator()
+        dispatcher = self.dispatcher_mod.RereadActionDispatcher(
+            context=_Context(),
+            config=self.config,
+            runtime_coordinator=coordinator,
+            reread_observer=_RejectOnceObserver(),
+        )
+        event = _Event("早", sender_id="u1", message_id="m-retry")
+
+        async def _run():
+            first = await dispatcher.dispatch(event, request)
+            second = await dispatcher.dispatch(event, request)
+            return first, second
+
+        first, second = asyncio.run(_run())
+        self.assertEqual(first.status, "cooldown")
+        self.assertTrue(second.sent)
+        self.assertEqual(len(coordinator.failures), 1)
 
 
 if __name__ == "__main__":

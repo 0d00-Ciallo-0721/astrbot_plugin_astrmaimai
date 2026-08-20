@@ -65,7 +65,9 @@ from ..planning.tool_disclosure import (
 from .group_actor_consistency import GroupActorConsistencyGuard
 from .reply_freshness import ReplyFreshnessMixin, is_stale_reply_reason, resolve_reply_max_age_seconds
 from ...infrastructure.runtime.turn_call_ledger import (
+    begin_stage,
     clamp_timeout_to_turn_budget,
+    finish_stage,
     record_vision_observation,
 )
 
@@ -793,24 +795,64 @@ class ConcurrentExecutor:
             allow_parallel_threads=not bool(event.get_extra("is_private_chat", False)),
         )
 
-    async def _acquire_chat_execution_lock(self, chat_id: str):
+    def _executor_lock_wait_timeout(self, event: AstrMessageEvent) -> float:
+        timing = getattr(self.config, "timing", None)
+        try:
+            configured = float(getattr(timing, "executor_lock_wait_timeout_sec", 15.0) or 15.0)
+        except (TypeError, ValueError):
+            configured = 15.0
+        return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
+
+    @staticmethod
+    def _turn_thread_id(event: AstrMessageEvent) -> str:
+        turn = event.get_extra("astrmai_turn_identity", None)
+        return str(
+            getattr(turn, "thread_id", "")
+            or event.get_extra("astrmai_turn_thread_id", "")
+            or ""
+        ).strip()
+
+    async def _acquire_chat_execution_lock(self, chat_id: str, event: AstrMessageEvent | None = None):
+        timeout_sec = self._executor_lock_wait_timeout(event) if event is not None else 15.0
         using_runtime_coordinator = self.runtime_coordinator is not None
         if using_runtime_coordinator:
-            chat_lock = await self.runtime_coordinator.try_acquire_executor(chat_id, max_pending=2)
+            if timeout_sec <= 0.0:
+                return None, True, "queue_timeout"
+            try:
+                chat_lock = await asyncio.wait_for(
+                    self.runtime_coordinator.try_acquire_executor(chat_id, max_pending=2),
+                    timeout=max(0.1, timeout_sec),
+                )
+            except asyncio.TimeoutError:
+                return None, True, "queue_timeout"
             if chat_lock is None:
-                return None, True
-            return chat_lock, True
+                return None, True, "too_many_pending"
+            return chat_lock, True, ""
 
         async with self._global_lock:
             if chat_id not in self._chat_locks:
                 self._chat_locks[chat_id] = asyncio.Lock()
                 self._chat_pending_count[chat_id] = 0
             if self._chat_pending_count[chat_id] >= 2:
-                return None, False
+                return None, False, "too_many_pending"
             self._chat_pending_count[chat_id] += 1
             chat_lock = self._chat_locks[chat_id]
-        await chat_lock.acquire()
-        return chat_lock, False
+        if timeout_sec <= 0.0:
+            acquired = False
+        else:
+            try:
+                await asyncio.wait_for(chat_lock.acquire(), timeout=max(0.1, timeout_sec))
+                acquired = True
+            except asyncio.TimeoutError:
+                acquired = False
+        if not acquired:
+            async with self._global_lock:
+                self._chat_pending_count[chat_id] = max(0, self._chat_pending_count.get(chat_id, 1) - 1)
+                if self._chat_pending_count.get(chat_id, 0) == 0:
+                    self._chat_locks.pop(chat_id, None)
+                    self._chat_pending_count.pop(chat_id, None)
+            return None, False, "queue_timeout"
+        return chat_lock, False, ""
 
     async def _release_chat_execution_lock(
         self,
@@ -1837,6 +1879,15 @@ class ConcurrentExecutor:
             except Exception as exc:
                 last_error = str(exc)
                 last_failure_kind = self._classify_execution_failure_kind(last_error)
+                if str(event.get_extra("astrmai_execution_status", "") or "") == "queue_timeout":
+                    debug_trace(
+                        event,
+                        "execution.executor.queue_timeout_stop",
+                        mode="chat",
+                        stage=str(event.get_extra("astrmai_queue_timeout_stage", "") or ""),
+                        model=provider_id,
+                    )
+                    return None
                 debug_trace(
                     event,
                     "execution.executor.model_failure",
@@ -2095,6 +2146,15 @@ class ConcurrentExecutor:
             except Exception as exc:
                 last_error = str(exc)
                 last_failure_kind = self._classify_execution_failure_kind(last_error)
+                if str(event.get_extra("astrmai_execution_status", "") or "") == "queue_timeout":
+                    debug_trace(
+                        event,
+                        "execution.executor.queue_timeout_stop",
+                        mode="tool",
+                        stage=str(event.get_extra("astrmai_queue_timeout_stage", "") or ""),
+                        model=provider_id,
+                    )
+                    return None
                 side_effects_recorded = self._side_effect_footprint(event) > side_effect_baseline
                 debug_trace(
                     event,
@@ -2161,12 +2221,36 @@ class ConcurrentExecutor:
         )
 
         chat_id = event.unified_msg_origin
-        chat_lock, using_runtime_coordinator = await self._acquire_chat_execution_lock(chat_id)
+        lock_stage = begin_stage(
+            event,
+            "executor.chat_lock_wait",
+            critical_path=True,
+            metadata={
+                "chat_id": str(chat_id or ""),
+                "thread_id": self._turn_thread_id(event),
+                "lock_scope": "chat",
+            },
+        )
+        try:
+            chat_lock, using_runtime_coordinator, lock_outcome = await self._acquire_chat_execution_lock(chat_id, event)
+        except asyncio.CancelledError:
+            finish_stage(event, lock_stage, status="cancelled", reason="acquire_cancelled")
+            raise
+        except Exception as exc:
+            finish_stage(event, lock_stage, status="error", reason=type(exc).__name__)
+            raise
         if chat_lock is None:
-            logger.warning(f"[{chat_id}] executor dropped because pending tasks exceeded budget")
-            debug_trace(event, "execution.executor.dropped", reason="too_many_pending")
-            event.set_extra("astrmai_execution_status", "pending_drop")
+            reason = lock_outcome or "too_many_pending"
+            finish_stage(event, lock_stage, status="timeout" if reason == "queue_timeout" else "dropped", reason=reason)
+            logger.warning(f"[{chat_id}] executor ended before execution: {reason}")
+            debug_trace(event, "execution.executor.dropped", reason=reason)
+            if reason == "queue_timeout":
+                event.set_extra("astrmai_execution_status", "queue_timeout")
+                event.set_extra("astrmai_queue_timeout_stage", "executor.chat_lock_wait")
+            else:
+                event.set_extra("astrmai_execution_status", "pending_drop")
             return None
+        finish_stage(event, lock_stage, metadata={"using_runtime_coordinator": using_runtime_coordinator})
 
         try:
             models = self.gateway.get_agent_models()
@@ -2317,6 +2401,15 @@ class ConcurrentExecutor:
                 event,
                 "execution.executor.fatal_fallback_skipped",
                 reason="stale_drop",
+                error_preview=preview_text(error_detail, 120),
+            )
+            return None
+        if str(event.get_extra("astrmai_execution_status", "") or "") == "queue_timeout":
+            debug_trace(
+                event,
+                "execution.executor.fatal_fallback_skipped",
+                reason="queue_timeout",
+                stage=str(event.get_extra("astrmai_queue_timeout_stage", "") or ""),
                 error_preview=preview_text(error_detail, 120),
             )
             return None

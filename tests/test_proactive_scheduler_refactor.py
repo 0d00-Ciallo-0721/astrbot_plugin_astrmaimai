@@ -1097,6 +1097,7 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
                         event.get_extra("astrmai_proactive_candidate"),
                         event.get_extra("astrmai_force_engage", False),
                         event.message_str,
+                        list(event.get_extra("astrmai_proactive_stage_ledger", []) or []),
                     )
                 )
                 return SimpleNamespace(dispatch_result="BUFFERED")
@@ -1156,6 +1157,7 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertTrue(calls[0][4])
         self.assertFalse(calls[0][5])
         self.assertIn("主动开口候选", calls[0][6])
+        self.assertTrue(any(item["stage"] == "proactive.event_enqueue" for item in calls[0][7]))
 
     def test_dispatcher_blocks_wakeup_after_other_bot_command_noise(self):
         dispatcher_mod = importlib.import_module("astrmai.proactive.dispatcher")
@@ -1302,6 +1304,99 @@ class ProactiveSchedulerRefactorTests(unittest.TestCase):
         self.assertEqual(signal["reason"], "silence_threshold_reached")
         self.assertEqual(signal["wakeup_cost"], float(defaults.wakeup_cost))
         self.assertEqual(signal["wakeup_cooldown"], float(defaults.wakeup_cooldown))
+
+    def test_wakeup_success_uses_quiet_recheck_floor(self):
+        wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
+        now = time.time()
+        state = SimpleNamespace(
+            chat_id="group:10001",
+            last_reply_time=now - 99999,
+            energy=1.0,
+            next_wakeup_timestamp=0,
+        )
+        service = wakeup_mod.WakeupService(
+            context=SimpleNamespace(send_message=None),
+            state_engine=SimpleNamespace(get_state=lambda chat_id: state, settle_proactive_wakeup=lambda *args, **kwargs: asyncio.sleep(0)),
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda chat_id, target_state: asyncio.sleep(0)),
+            call_background_lane=lambda *args, **kwargs: None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    silence_threshold=10,
+                    wakeup_min_energy=0.0,
+                    wakeup_cost=1,
+                    wakeup_cooldown=60,
+                    proactive_quiet_recheck_sec=7200,
+                ),
+                persona=SimpleNamespace(persona_id="global"),
+                reply=SimpleNamespace(base_frequency=0.7),
+            ),
+            dispatcher=SimpleNamespace(
+                dispatch=lambda intent, *, on_complete=None: asyncio.sleep(0, result=SimpleNamespace(allowed=True, blocked_reason=""))
+            ),
+        )
+
+        signal = asyncio.run(service.build_signal("group:10001", now=now))
+        self.assertTrue(signal["eligible"])
+        intent = asyncio.run(service.build_wakeup_intent(state, 1.0, 60.0))
+        self.assertIsNotNone(intent)
+
+    def test_wakeup_failure_applies_progressive_backoff(self):
+        wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")
+        now = time.time()
+        state = SimpleNamespace(
+            chat_id="group:10001",
+            last_reply_time=now - 99999,
+            energy=1.0,
+            next_wakeup_timestamp=0,
+            unanswered_proactive_count=1,
+        )
+
+        class _StateEngine:
+            def __init__(self):
+                self.settle_calls = []
+
+            def get_state(self, chat_id):
+                return state
+
+            async def settle_proactive_attempt(self, chat_id, **kwargs):
+                self.settle_calls.append(kwargs)
+                state.next_proactive_due_at = kwargs["next_due_at"]
+                return state
+
+        class _Dispatcher:
+            def __init__(self):
+                self.callback = None
+
+            async def dispatch(self, intent, *, on_complete=None):
+                self.callback = on_complete
+                return SimpleNamespace(allowed=True, blocked_reason="")
+
+        state_engine = _StateEngine()
+        dispatcher = _Dispatcher()
+        service = wakeup_mod.WakeupService(
+            context=SimpleNamespace(send_message=None),
+            state_engine=state_engine,
+            persistence=SimpleNamespace(load_persona_cache=lambda: {}, save_chat_state=lambda chat_id, target_state: asyncio.sleep(0)),
+            call_background_lane=lambda *args, **kwargs: None,
+            config=SimpleNamespace(
+                life=SimpleNamespace(
+                    silence_threshold=10,
+                    wakeup_min_energy=0.0,
+                    wakeup_cost=1,
+                    wakeup_cooldown=60,
+                    proactive_failure_retry_sec=300,
+                    proactive_failure_backoff_factor=2.0,
+                ),
+                persona=SimpleNamespace(persona_id="global"),
+                reply=SimpleNamespace(base_frequency=0.7),
+            ),
+            dispatcher=dispatcher,
+        )
+
+        result = asyncio.run(service.run_for_chat("group:10001", signal={"eligible": True, "state": state, "reason": "silence_threshold_reached"}))
+        self.assertTrue(result["performed"])
+        asyncio.run(dispatcher.callback(False, ""))
+        self.assertGreaterEqual(state_engine.settle_calls[0]["next_due_at"] - now, 600)
 
     def test_wakeup_run_for_chat_falls_back_when_life_config_missing(self):
         wakeup_mod = importlib.import_module("astrmai.proactive.wakeup_service")

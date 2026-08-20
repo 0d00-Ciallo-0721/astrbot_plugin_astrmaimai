@@ -432,6 +432,20 @@ class MemoryGapCoverageTests(unittest.TestCase):
 
         self.assertEqual(result, "No relevant memory found for 'missing'.")
 
+    def test_memory_turn_pipeline_reports_maintenance_concurrency(self):
+        pipeline_mod = importlib.import_module("astrmai.memory.services.memory_turn_pipeline")
+        pipeline = pipeline_mod.MemoryTurnPipeline(
+            context=SimpleNamespace(),
+            gateway=SimpleNamespace(config=SimpleNamespace(memory=SimpleNamespace(maintenance_concurrency=3))),
+            engine=SimpleNamespace(),
+            session_summarizer=SimpleNamespace(summarize_session=lambda **kwargs: asyncio.sleep(0)),
+            instant_gate=SimpleNamespace(),
+            config=SimpleNamespace(memory=SimpleNamespace(maintenance_concurrency=3), timing=SimpleNamespace()),
+        )
+        status = pipeline.describe_runtime_status()
+        self.assertEqual(status["maintenance_concurrency"], 3)
+        self.assertEqual(status["active_maintenance"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

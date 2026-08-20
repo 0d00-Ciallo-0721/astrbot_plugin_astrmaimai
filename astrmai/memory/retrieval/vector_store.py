@@ -1,11 +1,27 @@
 import asyncio
 import json
+import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
+
+import numpy as np
 from astrbot.api import logger
 from astrbot.core.db.vec_db.faiss_impl.vec_db import FaissVecDB
 from ...infrastructure.runtime.turn_call_ledger import clamp_timeout_to_turn_budget
 from ..utils import SearchResult, TextProcessor
+
+
+class _QueryQueueTimeout(asyncio.TimeoutError):
+    """Raised when a vector query cannot obtain a bounded execution slot."""
+
+
+class _VectorStageTimeout(asyncio.TimeoutError):
+    def __init__(self, stage: str):
+        super().__init__(stage)
+        self.stage = stage
 
 class VectorRetriever:
     """
@@ -21,6 +37,19 @@ class VectorRetriever:
         self._cache_max_size = 1000
         self._failure_count = 0
         self._unavailable_until = 0.0
+        self._query_limit = self._query_concurrency()
+        self._query_semaphore = asyncio.Semaphore(self._query_limit)
+        self._active_queries = 0
+        self._index_executor = ThreadPoolExecutor(
+            max_workers=self._query_limit,
+            thread_name_prefix="astrmai-faiss",
+        )
+        self._index_lock = threading.RLock()
+        self._active_index_jobs = 0
+        self._background_index_tasks: set[asyncio.Task] = set()
+        self._half_open_probe_active = False
+        self._status_counts: Dict[str, int] = {}
+        self._last_stage_timings: Dict[str, float] = {}
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -37,10 +66,268 @@ class VectorRetriever:
     def _failure_threshold(self) -> int:
         return max(1, int(self._timing_value("faiss_failure_threshold", 3.0)))
 
+    def _query_concurrency(self) -> int:
+        return max(1, min(8, int(self._timing_value("faiss_query_concurrency", 2.0))))
+
+    def _faiss_thread_count(self) -> int:
+        return max(1, min(8, int(self._timing_value("faiss_thread_count", 1.0))))
+
+    def refresh_config(self, config) -> None:
+        self.config = config or {}
+        configured = self._query_concurrency()
+        if configured != self._query_limit and self._active_queries == 0:
+            previous_executor = self._index_executor
+            self._query_limit = configured
+            self._query_semaphore = asyncio.Semaphore(configured)
+            self._index_executor = ThreadPoolExecutor(
+                max_workers=configured,
+                thread_name_prefix="astrmai-faiss",
+            )
+            previous_executor.shutdown(wait=False, cancel_futures=True)
+
+    def close(self) -> None:
+        self._index_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _supports_phased_retrieval(self) -> bool:
+        return all(
+            getattr(self.faiss_db, name, None) is not None
+            for name in ("embedding_provider", "embedding_storage", "document_storage")
+        ) and getattr(getattr(self.faiss_db, "embedding_storage", None), "index", None) is not None
+
+    @staticmethod
+    def _remaining_timeout(deadline: float, stage: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise _VectorStageTimeout(stage)
+        return remaining
+
+    async def _await_stage(self, awaitable, *, deadline: float, stage: str, timings: Dict[str, float]):
+        stage_started = time.monotonic()
+        try:
+            timeout = self._remaining_timeout(deadline, stage)
+            if stage == "embedding":
+                timeout = min(
+                    timeout,
+                    max(0.1, self._timing_value("embedding_timeout_sec", 15.0)),
+                )
+            return await asyncio.wait_for(
+                awaitable,
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise _VectorStageTimeout(stage) from exc
+        finally:
+            timings[f"{stage}_ms"] = round((time.monotonic() - stage_started) * 1000.0, 1)
+
+    def _search_index_sync(self, vector: np.ndarray, k: int):
+        import faiss
+
+        with self._index_lock:
+            self._active_index_jobs += 1
+            try:
+                faiss.omp_set_num_threads(self._faiss_thread_count())
+                faiss.normalize_L2(vector)
+                return self.faiss_db.embedding_storage.index.search(vector, k)
+            finally:
+                self._active_index_jobs = max(0, self._active_index_jobs - 1)
+
+    def _insert_index_sync(self, vector: np.ndarray, doc_id: int) -> None:
+        import faiss
+
+        storage = self.faiss_db.embedding_storage
+        with self._index_lock:
+            self._active_index_jobs += 1
+            try:
+                storage.index.add_with_ids(
+                    vector.reshape(1, -1),
+                    np.array([doc_id], dtype=np.int64),
+                )
+                if getattr(storage, "path", None):
+                    faiss.write_index(storage.index, storage.path)
+            finally:
+                self._active_index_jobs = max(0, self._active_index_jobs - 1)
+
+    def _delete_index_sync(self, doc_id: int) -> None:
+        import faiss
+
+        storage = self.faiss_db.embedding_storage
+        with self._index_lock:
+            self._active_index_jobs += 1
+            try:
+                storage.index.remove_ids(np.array([doc_id], dtype=np.int64))
+                if getattr(storage, "path", None):
+                    faiss.write_index(storage.index, storage.path)
+            finally:
+                self._active_index_jobs = max(0, self._active_index_jobs - 1)
+
+    async def _run_index_job(self, func, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._index_executor, func, *args)
+
+    async def _retrieve_phased(
+        self,
+        *,
+        query: str,
+        k: int,
+        fetch_k: int,
+        metadata_filters: Optional[Dict[str, Any]],
+        deadline: float,
+        timings: Dict[str, float],
+    ):
+        try:
+            embedding = await self._await_stage(
+                self.faiss_db.embedding_provider.get_embedding(query),
+                deadline=deadline,
+                stage="embedding",
+                timings=timings,
+            )
+        except _VectorStageTimeout as exc:
+            setattr(exc, "stage_timings", dict(timings))
+            raise
+        vector = np.array([embedding], dtype=np.float32)
+        index_started = time.monotonic()
+        index_task = asyncio.create_task(
+            self._run_index_job(
+                self._search_index_sync,
+                vector,
+                fetch_k if metadata_filters else k,
+            )
+        )
+        try:
+            scores, indices = await asyncio.wait_for(
+                asyncio.shield(index_task),
+                timeout=self._remaining_timeout(deadline, "faiss_index"),
+            )
+        except asyncio.TimeoutError as exc:
+            setattr(exc, "astrmai_background_index_task", index_task)
+            stage_timeout = _VectorStageTimeout("faiss_index")
+            setattr(stage_timeout, "stage_timings", dict(timings))
+            setattr(stage_timeout, "astrmai_background_index_task", index_task)
+            raise stage_timeout from exc
+        except asyncio.CancelledError as exc:
+            setattr(exc, "astrmai_background_index_task", index_task)
+            raise
+        finally:
+            timings["faiss_index_ms"] = round((time.monotonic() - index_started) * 1000.0, 1)
+
+        scores = np.asarray(scores)
+        indices = np.asarray(indices)
+        if len(indices[0]) == 0 or indices[0][0] == -1:
+            return []
+        scores[0] = 1.0 - (scores[0] / 2.0)
+        try:
+            fetched_docs = await self._await_stage(
+                self.faiss_db.document_storage.get_documents(
+                    metadata_filters=metadata_filters or {},
+                    ids=indices[0],
+                ),
+                deadline=deadline,
+                stage="document_read",
+                timings=timings,
+            )
+        except _VectorStageTimeout as exc:
+            setattr(exc, "stage_timings", dict(timings))
+            raise
+        if not fetched_docs:
+            return []
+        indexed_docs = {doc["id"]: doc for doc in fetched_docs}
+        results = []
+        for position, index_id in enumerate(indices[0]):
+            document = indexed_docs.get(index_id)
+            if document is not None:
+                results.append(
+                    SimpleNamespace(
+                        similarity=float(scores[0][position]),
+                        data=document,
+                    )
+                )
+        return results[:k]
+
+    def _release_query_slot(self) -> None:
+        self._active_queries = max(0, self._active_queries - 1)
+        self._query_semaphore.release()
+
+    def _finish_background_index_task(self, task: asyncio.Task) -> None:
+        self._background_index_tasks.discard(task)
+        try:
+            task.result()
+        except BaseException:
+            # The foreground query already received the timeout. Consume any
+            # late worker exception so it cannot become an unhandled task error.
+            pass
+        self._release_query_slot()
+
+    async def _retrieve_with_budget(self, **kwargs):
+        timeout = max(0.1, float(kwargs.pop("timeout", 0.1) or 0.1))
+        wait_started = time.monotonic()
+        if self._query_semaphore.locked():
+            try:
+                await asyncio.wait_for(self._query_semaphore.acquire(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise _QueryQueueTimeout from exc
+        else:
+            await self._query_semaphore.acquire()
+        wait_ms = round((time.monotonic() - wait_started) * 1000.0, 1)
+        self._active_queries += 1
+        release_on_exit = True
+        stage_timings: Dict[str, float] = {}
+        try:
+            remaining = max(0.1, timeout - wait_ms / 1000.0)
+            deadline = time.monotonic() + remaining
+            if self._supports_phased_retrieval():
+                try:
+                    results = await self._retrieve_phased(
+                        query=kwargs["query"],
+                        k=kwargs["k"],
+                        fetch_k=kwargs["fetch_k"],
+                        metadata_filters=kwargs.get("metadata_filters"),
+                        deadline=deadline,
+                        timings=stage_timings,
+                    )
+                except BaseException as exc:
+                    setattr(exc, "stage_timings", dict(stage_timings))
+                    background_task = getattr(exc.__cause__, "astrmai_background_index_task", None)
+                    if background_task is None:
+                        background_task = getattr(exc, "astrmai_background_index_task", None)
+                    if background_task is not None and not background_task.done():
+                        release_on_exit = False
+                        self._background_index_tasks.add(background_task)
+                        background_task.add_done_callback(self._finish_background_index_task)
+                    raise
+            else:
+                stage_started = time.monotonic()
+                try:
+                    results = await asyncio.wait_for(
+                        self.faiss_db.retrieve(**kwargs),
+                        timeout=self._remaining_timeout(deadline, "faiss_db.retrieve"),
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise _VectorStageTimeout("faiss_db.retrieve") from exc
+                finally:
+                    stage_timings["faiss_db_retrieve_ms"] = round(
+                        (time.monotonic() - stage_started) * 1000.0,
+                        1,
+                    )
+            return results, wait_ms, stage_timings
+        finally:
+            if release_on_exit:
+                self._release_query_slot()
+
     def _circuit_open(self) -> bool:
         return time.monotonic() < self._unavailable_until
 
+    def _begin_circuit_probe(self) -> bool:
+        if self._circuit_open():
+            return False
+        if self._failure_count < self._failure_threshold():
+            return True
+        if self._half_open_probe_active:
+            return False
+        self._half_open_probe_active = True
+        return True
+
     def _mark_failure(self, reason: str) -> None:
+        self._half_open_probe_active = False
         self._failure_count += 1
         if self._failure_count >= self._failure_threshold():
             cooldown = max(5.0, self._timing_value("faiss_circuit_breaker_cooldown_sec", 180.0))
@@ -51,8 +338,32 @@ class VectorRetriever:
             )
 
     def _mark_success(self) -> None:
+        self._half_open_probe_active = False
         self._failure_count = 0
         self._unavailable_until = 0.0
+
+    def describe_status(self) -> Dict[str, Any]:
+        total = sum(self._status_counts.values())
+        degraded = sum(
+            count
+            for status, count in self._status_counts.items()
+            if status in {"timeout", "query_queue_timeout", "error", "circuit_open"}
+        )
+        return {
+            "query_concurrency": int(self._query_limit),
+            "faiss_thread_count": int(self._faiss_thread_count()),
+            "active_queries": int(self._active_queries),
+            "active_index_jobs": int(self._active_index_jobs),
+            "background_index_jobs": int(len(self._background_index_tasks)),
+            "failure_count": int(self._failure_count),
+            "circuit_open": bool(self._circuit_open()),
+            "half_open_probe_active": bool(self._half_open_probe_active),
+            "total_queries": int(total),
+            "degraded_queries": int(degraded),
+            "degraded_ratio": round(degraded / total, 4) if total else 0.0,
+            "status_counts": dict(self._status_counts),
+            "last_stage_timings": dict(self._last_stage_timings),
+        }
 
     @staticmethod
     def _normalize_metadata(raw_metadata: Any) -> Dict[str, Any]:
@@ -81,9 +392,40 @@ class VectorRetriever:
         if "last_access_time" not in metadata:
             metadata["last_access_time"] = time.time()
             
-        # 直接使用原生 faiss_db 的 insert
-        doc_id = await self.faiss_db.insert(content=content, metadata=metadata)
-        return doc_id
+        if not self._supports_phased_retrieval():
+            return await self.faiss_db.insert(content=content, metadata=metadata)
+
+        embedding = await asyncio.wait_for(
+            self.faiss_db.embedding_provider.get_embedding(content),
+            timeout=max(0.1, self._timing_value("embedding_timeout_sec", 15.0)),
+        )
+        vector = np.asarray(embedding, dtype=np.float32)
+        expected_dimension = int(
+            getattr(self.faiss_db.embedding_storage, "dimension", vector.shape[0])
+            or vector.shape[0]
+        )
+        if vector.shape[0] != expected_dimension:
+            raise ValueError(
+                f"embedding dimension mismatch: expected={expected_dimension} actual={vector.shape[0]}"
+            )
+        doc_id = await self.faiss_db.document_storage.insert_document(
+            str(uuid.uuid4()),
+            content,
+            metadata,
+        )
+        await self._run_index_job(self._insert_index_sync, vector, int(doc_id))
+        return int(doc_id)
+
+    async def delete_document(self, doc_key: str) -> bool:
+        if not self._supports_phased_retrieval():
+            await self.faiss_db.delete(doc_key)
+            return True
+        document = await self.faiss_db.document_storage.get_document_by_doc_id(doc_key)
+        if not document:
+            return False
+        await self._run_index_job(self._delete_index_sync, int(document["id"]))
+        await self.faiss_db.document_storage.delete_document_by_doc_id(doc_key)
+        return True
 
     def _record_observation(
         self,
@@ -95,10 +437,17 @@ class VectorRetriever:
         configured_timeout_sec: float | None = None,
         result_count: int = 0,
         error_type: str = "",
+        error_detail: str = "",
         requested_k: int = 0,
         fetch_k: int = 0,
         metadata_filter_count: int = 0,
+        timeout_origin: str = "",
+        stage_timings: Optional[Dict[str, float]] = None,
+        query_queue_wait_ms: float = 0.0,
     ) -> None:
+        normalized_status = str(status or "unknown")
+        self._status_counts[normalized_status] = self._status_counts.get(normalized_status, 0) + 1
+        self._last_stage_timings = dict(stage_timings or {})
         if observation is None:
             return
         cooldown_remaining = max(0.0, self._unavailable_until - time.monotonic())
@@ -109,7 +458,9 @@ class VectorRetriever:
         observation.clear()
         observation.update(
             {
-                "status": str(status or "unknown"),
+                "status": normalized_status,
+                "retrieve_stage": "phased" if self._supports_phased_retrieval() else "faiss_db.retrieve",
+                "timeout_origin": str(timeout_origin or ""),
                 "elapsed_ms": round(max(0.0, time.monotonic() - started_at) * 1000.0, 1),
                 "timeout_sec": round(max(0.0, effective_timeout), 3),
                 "configured_timeout_sec": round(max(0.0, configured_timeout), 3),
@@ -128,6 +479,13 @@ class VectorRetriever:
                 "circuit_open": bool(self._circuit_open()),
                 "cooldown_remaining_sec": round(cooldown_remaining, 3),
                 "error_type": str(error_type or ""),
+                "error_detail": str(error_detail or "")[:240],
+                "query_concurrency": int(self._query_limit),
+                "active_queries": int(self._active_queries),
+                "faiss_thread_count": int(self._faiss_thread_count()),
+                "query_queue_wait_ms": round(max(0.0, float(query_queue_wait_ms or 0.0)), 1),
+                "stage_timings": dict(stage_timings or {}),
+                "runtime_metrics": self.describe_status(),
             }
         )
 
@@ -158,7 +516,7 @@ class VectorRetriever:
                 requested_k=k,
             )
             return []
-        if self._circuit_open():
+        if not self._begin_circuit_probe():
             logger.warning("[VectorStore] Faiss circuit open; using lexical fallback")
             self._record_observation(
                 observation,
@@ -186,20 +544,40 @@ class VectorRetriever:
 
         # 执行原生检索
         try:
-            faiss_results = await asyncio.wait_for(
-                self.faiss_db.retrieve(
-                    query=processed_query,
-                    k=k,
-                    fetch_k=fetch_k,
-                    rerank=False,
-                    metadata_filters=metadata_filters if metadata_filters else None,
-                ),
+            faiss_results, query_wait_ms, stage_timings = await self._retrieve_with_budget(
+                query=processed_query,
+                k=k,
+                fetch_k=fetch_k,
+                rerank=False,
+                metadata_filters=metadata_filters if metadata_filters else None,
                 timeout=timeout_sec,
             )
             self._mark_success()
-        except asyncio.TimeoutError:
+        except _QueryQueueTimeout:
+            self._mark_failure("query_queue_timeout")
+            logger.warning("[VectorStore] query slot wait timed out; using lexical fallback")
+            self._record_observation(
+                observation,
+                status="query_queue_timeout",
+                started_at=started_at,
+                timeout_sec=timeout_sec,
+                configured_timeout_sec=configured_timeout_sec,
+                error_type="TimeoutError",
+                requested_k=k,
+                fetch_k=fetch_k,
+                metadata_filter_count=metadata_filter_count,
+            )
+            if observation is not None:
+                observation["query_queue_wait_ms"] = round(max(0.0, time.monotonic() - started_at) * 1000.0, 1)
+            return []
+        except asyncio.CancelledError:
+            self._half_open_probe_active = False
+            raise
+        except _VectorStageTimeout as exc:
             self._mark_failure("timeout")
-            logger.warning("[VectorStore] Faiss search timed out; using lexical fallback")
+            logger.warning(
+                f"[VectorStore] Faiss search timed out at {exc.stage}; using lexical fallback"
+            )
             self._record_observation(
                 observation,
                 status="timeout",
@@ -210,6 +588,9 @@ class VectorRetriever:
                 requested_k=k,
                 fetch_k=fetch_k,
                 metadata_filter_count=metadata_filter_count,
+                timeout_origin=exc.stage,
+                stage_timings=getattr(exc, "stage_timings", {}),
+                query_queue_wait_ms=locals().get("query_wait_ms", 0.0),
             )
             return []
         except Exception as e:
@@ -222,9 +603,11 @@ class VectorRetriever:
                 timeout_sec=timeout_sec,
                 configured_timeout_sec=configured_timeout_sec,
                 error_type=type(e).__name__,
+                error_detail=str(e),
                 requested_k=k,
                 fetch_k=fetch_k,
                 metadata_filter_count=metadata_filter_count,
+                stage_timings=getattr(e, "stage_timings", {}),
             )
             return []
 
@@ -254,5 +637,7 @@ class VectorRetriever:
             requested_k=k,
             fetch_k=fetch_k,
             metadata_filter_count=metadata_filter_count,
+            stage_timings=stage_timings,
+            query_queue_wait_ms=query_wait_ms,
         )
         return out

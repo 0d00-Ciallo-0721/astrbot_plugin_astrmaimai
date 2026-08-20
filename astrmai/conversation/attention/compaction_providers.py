@@ -21,6 +21,12 @@ from ...infrastructure.runtime.turn_call_ledger import (
 class CompactionProviderMixin:
     """Provider-calling methods extracted from ContextCompactionEngine."""
 
+    async def _run_compaction_model(self, awaitable_factory):
+        budget = getattr(self, "background_task_budget", None)
+        if budget is None:
+            return await awaitable_factory()
+        return await budget.run(awaitable_factory)
+
     def _compaction_provider_validated(self, context, configured: str) -> bool:
         cache = getattr(self, "_compaction_provider_validation", None)
         if cache is None:
@@ -247,14 +253,16 @@ class CompactionProviderMixin:
                     stable_prefix_text,
                     dynamic_payload_text,
                 )
-                response = await asyncio.wait_for(
-                    context.llm_generate(
-                        chat_provider_id=provider_id,
-                        system_prompt=system_prompt,
-                        prompt=prompt,
-                        **request_kwargs,
-                    ),
-                    timeout=self._compaction_provider_timeout_seconds(),
+                response = await self._run_compaction_model(
+                    lambda: asyncio.wait_for(
+                        context.llm_generate(
+                            chat_provider_id=provider_id,
+                            system_prompt=system_prompt,
+                            prompt=prompt,
+                            **request_kwargs,
+                        ),
+                        timeout=self._compaction_provider_timeout_seconds(),
+                    )
                 )
             except Exception as exc:
                 last_error_kind = exc.__class__.__name__
@@ -400,14 +408,16 @@ class CompactionProviderMixin:
                     stable_prefix_text,
                     dynamic_payload_text,
                 )
-                response = await asyncio.wait_for(
-                    context.llm_generate(
-                        chat_provider_id=provider_id,
-                        system_prompt=system_prompt,
-                        prompt=prompt,
-                        **request_kwargs,
-                    ),
-                    timeout=self._compaction_provider_timeout_seconds(),
+                response = await self._run_compaction_model(
+                    lambda: asyncio.wait_for(
+                        context.llm_generate(
+                            chat_provider_id=provider_id,
+                            system_prompt=system_prompt,
+                            prompt=prompt,
+                            **request_kwargs,
+                        ),
+                        timeout=self._compaction_provider_timeout_seconds(),
+                    )
                 )
             except Exception as exc:
                 last_error_kind = exc.__class__.__name__

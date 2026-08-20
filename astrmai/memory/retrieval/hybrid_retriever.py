@@ -22,6 +22,8 @@ class HybridRetriever:
 
     def refresh_config(self, config) -> None:
         self.config = config
+        if self.vector is not None and hasattr(self.vector, "refresh_config"):
+            self.vector.refresh_config(config)
 
     async def add_memory(self, content: str, metadata: Dict[str, Any]) -> int:
         doc_id = None
@@ -102,7 +104,14 @@ class HybridRetriever:
                 observation["fused_result_count"] = 0
                 observation["fallback_source"] = (
                     "bm25_empty"
-                    if vector_observation.get("status") in {"timeout", "error", "circuit_open", "unavailable"}
+                    if vector_observation.get("status") in {
+                        "timeout",
+                        "query_queue_timeout",
+                        "error",
+                        "circuit_open",
+                        "unavailable",
+                        "initialization_failed",
+                    }
                     else "none"
                 )
             return []

@@ -14,14 +14,23 @@ from ..contracts.reread import RereadActionRequest, RereadDispatchResult
 class RereadActionDispatcher:
     """Send a visible social reread without entering the LLM reply pipeline."""
 
-    def __init__(self, *, context=None, config=None, runtime_coordinator=None, dialogue_store=None):
+    def __init__(self, *, context=None, config=None, runtime_coordinator=None, dialogue_store=None, reread_observer=None):
         self.context = context
         self.config = config
         self.runtime_coordinator = runtime_coordinator
         self.dialogue_store = dialogue_store
+        self.reread_observer = reread_observer
 
     def refresh_config(self, config) -> None:
         self.config = config
+
+    async def _release_observer_claim(self, chat_id: str) -> None:
+        observer = self.reread_observer
+        if observer is not None and hasattr(observer, "release_dispatch"):
+            try:
+                await observer.release_dispatch(chat_id)
+            except Exception:
+                logger.debug("[RereadAction] cooldown release degraded", exc_info=True)
 
     @staticmethod
     def _send_key(request: RereadActionRequest) -> str:
@@ -37,12 +46,19 @@ class RereadActionDispatcher:
         if coordinator is not None and hasattr(coordinator, "claim_send"):
             if not await coordinator.claim_send(request.chat_id, send_key):
                 return RereadDispatchResult("duplicate", detail="send_claim_exists")
+        observer = self.reread_observer
+        if observer is not None and hasattr(observer, "claim_dispatch"):
+            if not await observer.claim_dispatch(request.chat_id):
+                if hasattr(coordinator, "mark_send_failed"):
+                    await coordinator.mark_send_failed(request.chat_id, send_key, "reread_cooldown")
+                return RereadDispatchResult("cooldown", detail="group_reread_cooldown")
         try:
             turn = event.get_extra("astrmai_turn_identity", None) if hasattr(event, "get_extra") else None
             if turn is not None and coordinator is not None and hasattr(coordinator, "is_current_turn"):
                 if not await coordinator.is_current_turn(turn):
                     if hasattr(coordinator, "mark_send_failed"):
                         await coordinator.mark_send_failed(request.chat_id, send_key, "stale_turn")
+                    await self._release_observer_claim(request.chat_id)
                     return RereadDispatchResult("stale", detail="stale_turn")
             chain = MessageChain()
             chain.chain.append(Comp.Plain(request.text))
@@ -60,6 +76,7 @@ class RereadActionDispatcher:
         except Exception as exc:
             if coordinator is not None and hasattr(coordinator, "mark_send_failed"):
                 await coordinator.mark_send_failed(request.chat_id, send_key, str(exc))
+            await self._release_observer_claim(request.chat_id)
             logger.warning("[RereadAction] send failed: %s", exc)
             return RereadDispatchResult("failed", detail=str(exc))
 

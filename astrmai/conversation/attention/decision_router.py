@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +45,8 @@ class AttentionDecisionRouter:
         self._consecutive_timeouts = 0
         self.participation_policy = ParticipationPolicy()
         self._participation_states: dict[str, ParticipationState] = {}
+        self._judge_ignore_cache: dict[str, tuple[float, str, int]] = {}
+        self._ambient_ignore_cache: dict[str, float] = {}
 
     @staticmethod
     def _consume_background_result(task: asyncio.Task) -> None:
@@ -148,6 +152,146 @@ class AttentionDecisionRouter:
 
     def _attention_config(self) -> Any:
         return getattr(getattr(self.gate, "config", None), "attention", None)
+
+    def _judge_ignore_cache_ttl(self) -> float:
+        config = self._attention_config()
+        try:
+            return max(0.0, float(getattr(config, "judge_ignore_cache_ttl_sec", 8.0) or 0.0))
+        except (TypeError, ValueError):
+            return 8.0
+
+    def _ambient_ignore_cache_ttl(self) -> float:
+        config = self._attention_config()
+        try:
+            return max(0.0, float(getattr(config, "judge_ambient_cooldown_sec", 3.0) or 0.0))
+        except (TypeError, ValueError):
+            return 3.0
+
+    @staticmethod
+    def _topic_epoch(focus_event: Any, focus_thread: Any) -> int:
+        try:
+            thread_epoch = int(getattr(focus_thread, "topic_epoch", 0) or 0)
+        except (TypeError, ValueError):
+            thread_epoch = 0
+        if thread_epoch > 0:
+            return thread_epoch
+        if focus_event is None or not hasattr(focus_event, "get_extra"):
+            return 0
+        canonical = focus_event.get_extra("astrmai_conversation_event", None)
+        try:
+            canonical_epoch = int(getattr(canonical, "topic_epoch", 0) or 0)
+        except (TypeError, ValueError):
+            canonical_epoch = 0
+        if canonical_epoch > 0:
+            return canonical_epoch
+        policy = focus_event.get_extra("astrmai_dialog_history_policy", None)
+        try:
+            return max(
+                0,
+                int(
+                    policy.get("topic_epoch", 0)
+                    if isinstance(policy, dict)
+                    else getattr(policy, "topic_epoch", 0)
+                ),
+            )
+        except (TypeError, ValueError):
+            return 0
+
+    def _judge_ignore_cache_key(self, chat_id: str, focus_event: Any, focus_thread: Any) -> str:
+        actor_id = ""
+        if focus_event is not None:
+            try:
+                actor_id = str(focus_event.get_sender_id() or "").strip()
+            except Exception:
+                actor_id = ""
+        topic_epoch = str(getattr(focus_thread, "topic_epoch", 0) or 0)
+        text = self._event_text(focus_event)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+        return "\x1f".join((str(chat_id or ""), actor_id, topic_epoch, digest))
+
+    def _cached_judge_ignore(self, chat_id: str, focus_event: Any, focus_thread: Any) -> bool:
+        ttl = self._judge_ignore_cache_ttl()
+        if ttl <= 0.0:
+            return False
+        key = self._judge_ignore_cache_key(chat_id, focus_event, focus_thread)
+        entry = self._judge_ignore_cache.get(key)
+        if entry is None:
+            return False
+        expires_at, _, _ = entry
+        if expires_at <= time.monotonic():
+            self._judge_ignore_cache.pop(key, None)
+            return False
+        if focus_event is not None and hasattr(focus_event, "set_extra"):
+            focus_event.set_extra("astrmai_judge_cache_hit", True)
+            focus_event.set_extra("astrmai_judge_cache_action", "IGNORE")
+            focus_event.set_extra("astrmai_judge_cache_scope", "exact_message")
+            focus_event.set_extra("astrmai_judge_avoided", True)
+        return True
+
+    def _cache_judge_ignore(self, chat_id: str, focus_event: Any, focus_thread: Any) -> None:
+        ttl = self._judge_ignore_cache_ttl()
+        if ttl <= 0.0:
+            return
+        self._prune_ignore_caches()
+        key = self._judge_ignore_cache_key(chat_id, focus_event, focus_thread)
+        self._judge_ignore_cache[key] = (time.monotonic() + ttl, str(chat_id or ""), int(time.time()))
+
+    def _ambient_ignore_cache_key(self, chat_id: str, focus_event: Any, focus_thread: Any) -> str:
+        topic_epoch = self._topic_epoch(focus_event, focus_thread)
+        return f"{str(chat_id or '')}\x1f{topic_epoch}" if topic_epoch > 0 else ""
+
+    def _cached_ambient_ignore(self, chat_id: str, focus_event: Any, focus_thread: Any) -> bool:
+        ttl = self._ambient_ignore_cache_ttl()
+        key = self._ambient_ignore_cache_key(chat_id, focus_event, focus_thread)
+        if ttl <= 0.0 or not key:
+            return False
+        expires_at = float(self._ambient_ignore_cache.get(key, 0.0) or 0.0)
+        if expires_at <= time.monotonic():
+            self._ambient_ignore_cache.pop(key, None)
+            return False
+        if focus_event is not None and hasattr(focus_event, "set_extra"):
+            focus_event.set_extra("astrmai_judge_cache_hit", True)
+            focus_event.set_extra("astrmai_judge_cache_action", "IGNORE")
+            focus_event.set_extra("astrmai_judge_cache_scope", "ambient_topic")
+            focus_event.set_extra("astrmai_judge_avoided", True)
+        return True
+
+    def _cache_ambient_ignore(self, chat_id: str, focus_event: Any, focus_thread: Any) -> None:
+        ttl = self._ambient_ignore_cache_ttl()
+        key = self._ambient_ignore_cache_key(chat_id, focus_event, focus_thread)
+        if ttl <= 0.0 or not key or self._is_direct_event(focus_event):
+            return
+        self._prune_ignore_caches()
+        self._ambient_ignore_cache[key] = time.monotonic() + ttl
+
+    def _prune_ignore_caches(self) -> None:
+        """Keep short-lived Judge caches bounded during long-running bot sessions."""
+        now = time.monotonic()
+        self._judge_ignore_cache = {
+            key: entry
+            for key, entry in self._judge_ignore_cache.items()
+            if float(entry[0] or 0.0) > now
+        }
+        self._ambient_ignore_cache = {
+            key: expires_at
+            for key, expires_at in self._ambient_ignore_cache.items()
+            if float(expires_at or 0.0) > now
+        }
+        max_entries = 2048
+        if len(self._judge_ignore_cache) > max_entries:
+            newest = sorted(
+                self._judge_ignore_cache.items(),
+                key=lambda item: float(item[1][0] or 0.0),
+                reverse=True,
+            )[:max_entries]
+            self._judge_ignore_cache = dict(newest)
+        if len(self._ambient_ignore_cache) > max_entries:
+            newest = sorted(
+                self._ambient_ignore_cache.items(),
+                key=lambda item: float(item[1] or 0.0),
+                reverse=True,
+            )[:max_entries]
+            self._ambient_ignore_cache = dict(newest)
 
     async def _recent_committed_turn(
         self,
@@ -514,6 +658,10 @@ class AttentionDecisionRouter:
                 raw_action="IGNORE",
                 reason=f"prefilter:{prefilter.reason}",
             )
+        if self._cached_judge_ignore(chat_id, focus_event, focus_thread):
+            return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="judge_ignore_cache")
+        if self._cached_ambient_ignore(chat_id, focus_event, focus_thread):
+            return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="judge_ambient_cooldown")
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_avoided", False)
         if not self.gate.judge or not hasattr(self.gate.judge, "evaluate"):
@@ -642,6 +790,9 @@ class AttentionDecisionRouter:
             )
         self._consecutive_timeouts = 0  # 重置计数器
         if raw_action in {"WAIT", "IGNORE", "TOOL_CALL"}:
+            if raw_action == "IGNORE":
+                self._cache_judge_ignore(chat_id, focus_event, focus_thread)
+                self._cache_ambient_ignore(chat_id, focus_event, focus_thread)
             return AttentionDecision(action=raw_action, raw_action=raw_action, reason="judge_gate")
         return AttentionDecision(action="PASS", raw_action=raw_action, reason="judge_pass")
 

@@ -44,6 +44,8 @@ class ProactiveDispatchDecision:
     reply_sent: bool = False
     status: str = "blocked"
     reply_preview: str = ""
+    completion_reason: str = ""
+    stage_ledger: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ProactiveDispatcher:
@@ -66,7 +68,83 @@ class ProactiveDispatcher:
         self._history: list[dict[str, Any]] = []
         self._cooldowns: dict[str, float] = {}
         self._callbacks: dict[str, CompletionCallback] = {}
+        self._completion_watchdogs: dict[str, asyncio.Task] = {}
+        self._terminal_intents: set[str] = set()
         self._dispatch_lock = asyncio.Lock()
+
+    def _completion_timeout_seconds(self, intent: ProactiveMessageIntent) -> float:
+        metadata_value = intent.metadata.get("completion_timeout_sec", None)
+        timing = getattr(self.config, "timing", None)
+        configured = getattr(timing, "proactive_completion_timeout_sec", 180.0)
+        try:
+            value = float(metadata_value if metadata_value is not None else configured)
+        except (TypeError, ValueError):
+            value = 180.0
+        return min(3600.0, max(5.0, value))
+
+    async def _watch_completion(
+        self,
+        intent_id: str,
+        timeout_sec: float,
+        decision: ProactiveDispatchDecision,
+        completion: CompletionCallback,
+    ) -> None:
+        try:
+            await asyncio.sleep(timeout_sec)
+        except asyncio.CancelledError:
+            return
+        if decision.reply_sent or decision.status != "queued":
+            return
+        decision.blocked_reason = "completion_timeout"
+        decision.completion_reason = "completion_timeout"
+        decision.stage_ledger.append(
+            {
+                "stage": "proactive.completion_watchdog",
+                "status": "timeout",
+                "reason": "completion_timeout",
+                "at": time.time(),
+                "timeout_sec": timeout_sec,
+            }
+        )
+        await self._sync_history_for_dispatch(intent_id, decision)
+        try:
+            result = completion(False, "")
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(
+                f"[ProactiveDispatcher] completion watchdog settle failed "
+                f"intent={intent_id}: {type(exc).__name__}"
+            )
+        finally:
+            self._completion_watchdogs.pop(intent_id, None)
+
+    def _arm_completion_watchdog(
+        self,
+        intent: ProactiveMessageIntent,
+        decision: ProactiveDispatchDecision,
+        completion: CompletionCallback,
+    ) -> None:
+        timeout_sec = self._completion_timeout_seconds(intent)
+        decision.stage_ledger.append(
+            {
+                "stage": "proactive.completion_watchdog",
+                "status": "armed",
+                "reason": "",
+                "at": time.time(),
+                "timeout_sec": timeout_sec,
+            }
+        )
+        task = asyncio.create_task(
+            self._watch_completion(intent.intent_id, timeout_sec, decision, completion),
+            name=f"proactive-completion-watchdog:{intent.intent_id}",
+        )
+        self._completion_watchdogs[intent.intent_id] = task
+
+    def _cancel_completion_watchdog(self, intent_id: str) -> None:
+        task = self._completion_watchdogs.pop(intent_id, None)
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
 
     @staticmethod
     def _preview(text: Any, limit: int = 160) -> str:
@@ -276,6 +354,7 @@ class ProactiveDispatcher:
             "status": decision.status,
             "blocked_reason": decision.blocked_reason,
             "reply_sent": decision.reply_sent,
+            "stage_ledger": [dict(entry) for entry in decision.stage_ledger],
         }
 
     def _remember(self, intent: ProactiveMessageIntent, decision: ProactiveDispatchDecision) -> None:
@@ -289,6 +368,7 @@ class ProactiveDispatcher:
             item["status"] = decision.status
             item["blocked_reason"] = decision.blocked_reason
             item["reply_sent"] = decision.reply_sent
+            item["stage_ledger"] = [dict(entry) for entry in decision.stage_ledger]
             return
 
     def list_intents(self, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -300,9 +380,62 @@ class ProactiveDispatcher:
             "available": bool(self.attention_gate and hasattr(self.attention_gate, "inject_external_event")),
             "history_size": len(self._history),
             "cooldown_chats": len(self._cooldowns),
+            "completion_watchdogs": len(self._completion_watchdogs),
         }
 
-    async def complete(self, intent_id: str, *, reply_sent: bool, reply_preview: str = "", synthetic_event_queued: bool | None = None) -> None:
+    async def shutdown(self) -> None:
+        """Cancel pending watchers and settle queued claims during teardown."""
+        for intent_id in list(self._completion_watchdogs):
+            self._cancel_completion_watchdog(intent_id)
+
+        pending_ids: list[str] = []
+        for item in self._history:
+            payload = item.get("decision", {})
+            if str(payload.get("status", "") or "") != "queued":
+                continue
+            intent_id = str(payload.get("intent_id", "") or "")
+            if not intent_id:
+                continue
+            payload["blocked_reason"] = "dispatcher_shutdown"
+            item["decision"] = payload
+            item["blocked_reason"] = "dispatcher_shutdown"
+            pending_ids.append(intent_id)
+            self._terminal_intents.add(intent_id)
+
+        for intent_id in pending_ids:
+            await self.complete(
+                intent_id,
+                reply_sent=False,
+                completion_reason="dispatcher_shutdown",
+            )
+            for item in reversed(self._history):
+                payload = item.get("decision", {})
+                if str(payload.get("intent_id", "") or "") != intent_id:
+                    continue
+                entries = list(payload.get("stage_ledger", []) or [])
+                entries.append(
+                    {
+                        "stage": "proactive.dispatcher_shutdown",
+                        "status": "settled",
+                        "reason": "dispatcher_shutdown",
+                        "at": time.time(),
+                    }
+                )
+                payload["stage_ledger"] = entries
+                item["decision"] = payload
+                item["stage_ledger"] = [dict(entry) for entry in entries]
+                break
+
+    async def complete(
+        self,
+        intent_id: str,
+        *,
+        reply_sent: bool,
+        reply_preview: str = "",
+        synthetic_event_queued: bool | None = None,
+        completion_reason: str = "",
+    ) -> None:
+        self._cancel_completion_watchdog(intent_id)
         callback = self._callbacks.pop(intent_id, None)
         decision = None
         cooldown_until = 0.0
@@ -313,7 +446,21 @@ class ProactiveDispatcher:
                     payload["synthetic_event_queued"] = bool(synthetic_event_queued)
                 payload["reply_sent"] = bool(reply_sent)
                 payload["reply_preview"] = self._preview(reply_preview, 120)
-                payload["status"] = "sent" if reply_sent else ("queued" if payload.get("synthetic_event_queued") else "skipped")
+                if completion_reason:
+                    payload["completion_reason"] = str(completion_reason)
+                payload["status"] = (
+                    "sent"
+                    if reply_sent
+                    else (
+                        "timeout"
+                        if completion_reason == "completion_timeout"
+                        else (
+                            "shutdown"
+                            if completion_reason == "dispatcher_shutdown"
+                            else ("queued" if payload.get("synthetic_event_queued") else "skipped")
+                        )
+                    )
+                )
                 item["decision"] = payload
                 item["reply_sent"] = bool(reply_sent)
                 item["status"] = payload["status"]
@@ -350,9 +497,17 @@ class ProactiveDispatcher:
         on_complete: CompletionCallback | None = None,
     ) -> ProactiveDispatchDecision:
         now = time.time()
+        stage_ledger: list[dict[str, Any]] = []
+
+        def record_stage(stage: str, status: str, reason: str = "") -> None:
+            stage_ledger.append({"stage": stage, "status": status, "reason": reason, "at": time.time()})
+
+        record_stage("proactive.candidate", "started")
         intent.created_at = intent.created_at or now
         intent.intent_id = self._new_intent_id(intent, now)
         allowed, blocked_reason, checks = await self._safety_check(intent, now=now)
+        if allowed:
+            record_stage("proactive.safety_check", "success")
         decision = ProactiveDispatchDecision(
             intent_id=intent.intent_id,
             chat_id=intent.chat_id,
@@ -362,24 +517,87 @@ class ProactiveDispatcher:
             blocked_reason=blocked_reason,
             safety_checks=checks,
             status="queued" if allowed else "blocked",
+            stage_ledger=stage_ledger,
         )
         self._remember(intent, decision)
         if not allowed:
+            record_stage("proactive.safety_check", "blocked", blocked_reason)
+            record_stage("proactive.dispatch", "blocked", blocked_reason)
+            await self._sync_history_for_dispatch(intent.intent_id, decision)
             return decision
 
         if on_complete:
             self._callbacks[intent.intent_id] = on_complete
 
         async def _completion(reply_sent: bool, reply_preview: str = "") -> None:
+            if intent.intent_id in self._terminal_intents or decision.status != "queued" or any(
+                item.get("stage") == "proactive.reply_commit"
+                for item in decision.stage_ledger
+            ):
+                return
+            self._cancel_completion_watchdog(intent.intent_id)
+            if not reply_sent and decision.blocked_reason == "completion_timeout":
+                completion_reason = "completion_timeout"
+                reply_commit_status = "timeout"
+            else:
+                completion_reason = decision.blocked_reason or ("reply_not_sent" if not reply_sent else "")
+                reply_commit_status = "success" if reply_sent else "skipped"
             decision.reply_sent = bool(reply_sent)
             decision.reply_preview = self._preview(reply_preview, 120)
-            decision.status = "sent" if reply_sent else "skipped"
-            await self.complete(
-                intent.intent_id,
-                reply_sent=reply_sent,
-                reply_preview=reply_preview,
-                synthetic_event_queued=decision.synthetic_event_queued,
+            decision.completion_reason = completion_reason
+            decision.status = (
+                "timeout"
+                if completion_reason == "completion_timeout"
+                else ("sent" if reply_sent else "skipped")
             )
+            decision.stage_ledger.append(
+                {
+                    "stage": "proactive.reply_commit",
+                    "status": reply_commit_status,
+                    "reason": completion_reason,
+                    "at": time.time(),
+                }
+            )
+            await self._sync_history_for_dispatch(intent.intent_id, decision)
+            try:
+                await self.complete(
+                    intent.intent_id,
+                    reply_sent=reply_sent,
+                    reply_preview=reply_preview,
+                    synthetic_event_queued=decision.synthetic_event_queued,
+                    completion_reason=completion_reason,
+                )
+            except asyncio.CancelledError:
+                decision.stage_ledger.append(
+                    {
+                        "stage": "proactive.state_settle",
+                        "status": "cancelled",
+                        "reason": "completion_cancelled",
+                        "at": time.time(),
+                    }
+                )
+                await self._sync_history_for_dispatch(intent.intent_id, decision)
+                raise
+            except Exception as exc:
+                decision.stage_ledger.append(
+                    {
+                        "stage": "proactive.state_settle",
+                        "status": "error",
+                        "reason": type(exc).__name__,
+                        "at": time.time(),
+                    }
+                )
+                await self._sync_history_for_dispatch(intent.intent_id, decision)
+                raise
+            decision.stage_ledger.append(
+                {
+                    "stage": "proactive.state_settle",
+                    "status": "success",
+                    "reason": "",
+                    "at": time.time(),
+                }
+            )
+            await self._sync_history_for_dispatch(intent.intent_id, decision)
 
         candidate_text = (
             "[主动开口候选]\n"
@@ -412,6 +630,7 @@ class ProactiveDispatcher:
                 "astrmai_proactive_generation": int(intent.metadata.get("captured_generation", 0) or 0),
                 "astrmai_proactive_claim_token": str(intent.metadata.get("claim_token", "") or ""),
                 "astrmai_proactive_chat_kind": str(intent.metadata.get("chat_kind", "") or ""),
+                "astrmai_proactive_stage_ledger": stage_ledger,
                 "astrmai_scheduled_scenario": str(intent.metadata.get("scenario", "") or ""),
                 "astrmai_scheduled_delivery_key": str(intent.metadata.get("delivery_key", "") or ""),
                 "astrmai_daily_schedule_slot": str(intent.metadata.get("schedule_slot", "") or ""),
@@ -424,19 +643,56 @@ class ProactiveDispatcher:
             event_data["group_id"] = str(intent.metadata.get("group_id", intent.chat_id) or "")
 
         async def _inject_event():
+            record_stage("proactive.generation_recheck", "started")
             generation_current, _ = await self._proactive_generation_current(intent)
             if not generation_current:
+                record_stage("proactive.generation_recheck", "blocked", "stale_generation")
                 return False
-            return await self.attention_gate.inject_external_event(intent.chat_id, event_data)
+            record_stage("proactive.generation_recheck", "success")
+            record_stage("proactive.event_enqueue", "started")
+            result = await self.attention_gate.inject_external_event(intent.chat_id, event_data)
+            record_stage(
+                "proactive.event_enqueue",
+                "success" if result else "skipped",
+                "" if result else "inject_rejected",
+            )
+            return result
 
-        lock_getter = getattr(self.attention_gate, "get_proactive_lock", None)
-        if callable(lock_getter):
-            injection_lock = lock_getter(intent.chat_id)
-            async with injection_lock:
+        try:
+            lock_getter = getattr(self.attention_gate, "get_proactive_lock", None)
+            if callable(lock_getter):
+                injection_lock = lock_getter(intent.chat_id)
+                async with injection_lock:
+                    result = await _inject_event()
+            else:
                 result = await _inject_event()
-        else:
-            result = await _inject_event()
+        except asyncio.CancelledError:
+            record_stage("proactive.event_enqueue", "cancelled", "dispatch_cancelled")
+            raise
+        except Exception as exc:
+            record_stage("proactive.event_enqueue", "error", type(exc).__name__)
+            decision.blocked_reason = f"event_enqueue:{type(exc).__name__}"
+            decision.status = "skipped"
+            result = False
         decision.synthetic_event_queued = bool(result)
+        if not decision.synthetic_event_queued and not decision.blocked_reason:
+            if any(
+                item.get("stage") == "proactive.generation_recheck"
+                and item.get("status") == "blocked"
+                for item in decision.stage_ledger
+            ):
+                decision.blocked_reason = "stale_generation"
+            elif any(
+                item.get("stage") == "proactive.event_enqueue"
+                and item.get("status") == "skipped"
+                for item in decision.stage_ledger
+            ):
+                decision.blocked_reason = "event_enqueue_rejected"
+            else:
+                decision.blocked_reason = "dispatch_rejected"
+        record_stage("proactive.dispatch", "queued" if decision.synthetic_event_queued else "skipped")
+        if decision.synthetic_event_queued:
+            self._arm_completion_watchdog(intent, decision, _completion)
         if not decision.reply_sent:
             decision.status = "queued" if decision.synthetic_event_queued else "skipped"
         await self._sync_history_for_dispatch(intent.intent_id, decision)

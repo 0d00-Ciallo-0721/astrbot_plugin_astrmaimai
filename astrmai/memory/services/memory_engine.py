@@ -143,6 +143,9 @@ class MemoryEngine:
                 refresh(config)
         self.embedding_models = self._configured_embedding_models(config)
         if self.embedding_models != old_embedding_models:
+            previous_retriever = self.vec_retriever
+            if previous_retriever is not None and hasattr(previous_retriever, "close"):
+                previous_retriever.close()
             self.faiss_db = None
             self.vec_retriever = None
             self.retriever = None
@@ -1067,6 +1070,7 @@ class MemoryEngine:
             config=self.config,
             observer=self.memory_observer,
             checkpoint_store=checkpoint_store,
+            background_task_budget=getattr(self, "background_task_budget", None),
         )
         await self.memory_pipeline.start()
 
@@ -1077,6 +1081,9 @@ class MemoryEngine:
         projector = getattr(self, "index_projector", None)
         if projector is not None:
             await projector.stop()
+        retriever = getattr(self, "vec_retriever", None)
+        if retriever is not None and hasattr(retriever, "close"):
+            retriever.close()
 
     async def run_memory_maintenance(self, chat_id: str) -> dict:
         pipeline = getattr(self, "memory_pipeline", None)

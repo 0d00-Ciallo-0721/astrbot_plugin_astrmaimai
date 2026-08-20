@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from ..shared.constants.defaults import InfrastructureSettings, build_infrastructure_settings
+from ..infrastructure.runtime.background_task_budget import BackgroundTaskBudget
 
 System2Callback = Callable[[Any, list[Any] | None], Awaitable[Any]]
 
@@ -156,6 +157,7 @@ class PluginRuntimeContext:
         default_factory=InfrastructureSettings
     )
     background_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    background_task_budget: BackgroundTaskBudget | None = None
     core: CoreServices = field(default_factory=CoreServices)
     workmode: WorkModeServices = field(default_factory=WorkModeServices)
     cognition: CognitionServices = field(default_factory=CognitionServices)
@@ -186,6 +188,15 @@ class PluginRuntimeContext:
 
     def rebuild_infrastructure_settings(self) -> None:
         self.infrastructure_settings = build_infrastructure_settings(self.config)
+        if self.background_task_budget is not None:
+            infra = getattr(self.config, "infra", None)
+            self.background_task_budget.refresh_limit(
+                int(getattr(infra, "background_task_concurrency", 2) or 2),
+                max_queue=int(getattr(infra, "background_task_queue_limit", 64) or 0),
+                wait_timeout_sec=float(
+                    getattr(infra, "background_task_wait_timeout_sec", 120.0) or 120.0
+                ),
+            )
 
     def set_boot_phase(self, phase: str) -> None:
         self.status.set_phase(phase)
@@ -379,6 +390,25 @@ class PluginRuntimeContext:
         )
 
     def build_diagnostics(self) -> dict[str, Any]:
+        vector_retriever = getattr(self.memory_engine, "vec_retriever", None)
+        vector_status = (
+            vector_retriever.describe_status()
+            if vector_retriever is not None and hasattr(vector_retriever, "describe_status")
+            else {"available": False}
+        )
+        try:
+            proactive_status = (
+                self.proactive_task.describe_status()
+                if self.proactive_task is not None and hasattr(self.proactive_task, "describe_status")
+                else {"running": False}
+            )
+        except Exception as exc:
+            proactive_status = {"running": False, "error": str(exc)}
+        reread_status = (
+            self.group_reread_observer.describe_status()
+            if self.group_reread_observer is not None and hasattr(self.group_reread_observer, "describe_status")
+            else {"active_groups": 0}
+        )
         return {
             "status": self.status.as_dict(),
             "infrastructure": {
@@ -389,6 +419,12 @@ class PluginRuntimeContext:
                     "api_timeout": self.infrastructure_settings.gateway.api_timeout,
                     "debug_mode": self.infrastructure_settings.gateway.debug_mode,
                 },
+                "background_task_budget": (
+                    self.background_task_budget.status()
+                    if self.background_task_budget is not None
+                    and hasattr(self.background_task_budget, "status")
+                    else {"limit": 0, "active": 0, "available_slots": 0}
+                ),
                 "features": {
                     "work_mode_enabled": self.infrastructure_settings.features.work_mode_enabled,
                     "private_chat_enabled": self.infrastructure_settings.features.private_chat_enabled,
@@ -422,6 +458,11 @@ class PluginRuntimeContext:
             "chat_loop": self.chat_loop_kernel.describe_status_sync()
             if self.chat_loop_kernel is not None and hasattr(self.chat_loop_kernel, "describe_status_sync")
             else {"enabled": False, "tracked_chats": 0},
+            "memory": {
+                "vector_retrieval": vector_status,
+            },
+            "proactive": proactive_status,
+            "group_reread_observer": reread_status,
         }
 
     def build_capability_overview_sync(self) -> dict[str, Any]:

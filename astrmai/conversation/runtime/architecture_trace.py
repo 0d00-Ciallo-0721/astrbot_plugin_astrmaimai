@@ -180,6 +180,16 @@ def build_architecture_trace_contract(
         "phase_age_ms": float(_extra(event, "astrmai_participation_phase_age_ms", 0.0) or 0.0),
     }
     context_stats = list(trace_item.get("context_block_stats", ()) or ())
+    memory_retrieval = {
+        "vector_fallback": dict(memory_funnel.get("vector_fallback") or {})
+        if isinstance(memory_funnel.get("vector_fallback"), Mapping)
+        else {},
+        "hybrid_observations": [
+            dict(item)
+            for item in list(memory_funnel.get("hybrid_observations", ()) or ())[-4:]
+            if isinstance(item, Mapping)
+        ],
+    }
     return {
         "schema_version": ARCHITECTURE_TRACE_SCHEMA_VERSION,
         "turn_id": str(trace_item.get("turn_id", "") or ""),
@@ -202,6 +212,30 @@ def build_architecture_trace_contract(
             "action": str(turn_context.attention.judge_action or ""),
             "outcome": str(_extra(event, "astrmai_judge_outcome", "") or ""),
             "timeout": bool(_extra(event, "astrmai_judge_timeout", False)),
+            # These values are nullable so legacy traces remain distinguishable
+            # from an observed negative result.
+            "cache_hit": _extra(event, "astrmai_judge_cache_hit", None),
+            "cache_action": str(_extra(event, "astrmai_judge_cache_action", "") or ""),
+            "cache_scope": str(_extra(event, "astrmai_judge_cache_scope", "") or ""),
+            "avoided": _extra(event, "astrmai_judge_avoided", None),
+            "prefilter_judge_agreement": _extra(
+                event, "astrmai_prefilter_judge_agreement", None
+            ),
+        },
+        "timing_coverage": dict(trace_item.get("timing_coverage", {}) or {}),
+        "stage_ledger": [
+            dict(entry)
+            for entry in list(trace_item.get("stage_ledger", ()) or ())[-64:]
+            if isinstance(entry, Mapping)
+        ],
+        "topic_activity": {
+            "valid": bool(_extra(event, "astrmai_topic_activity_valid", False)),
+            "kind": str(_extra(event, "astrmai_topic_activity_kind", "") or ""),
+            "reason": str(_extra(event, "astrmai_topic_activity_reason", "") or ""),
+            "source": str(_extra(event, "astrmai_topic_activity_source", "") or ""),
+            "effective_user_response": bool(_extra(event, "astrmai_effective_user_response", False)),
+            "state_before": dict(_extra(event, "astrmai_topic_activity_state_before", {}) or {}),
+            "state_after": dict(_extra(event, "astrmai_topic_activity_state_after", {}) or {}),
         },
         "context_block_stats": context_stats,
         "reply_plan": _reply_plan_payload(_extra(event, "astrmai_reply_plan", None)),
@@ -220,6 +254,7 @@ def build_architecture_trace_contract(
             "disposition": str(_extra(event, "astrmai_expression_disposition", "") or ""),
         },
         "memory_actor_filter": memory_filter,
+        "memory_retrieval_observation": memory_retrieval,
         "proactive_observation": {
             "is_proactive": bool(proactive.is_proactive),
             "source": proactive.source,
@@ -234,6 +269,11 @@ def build_architecture_trace_contract(
             "next_due_at": float(proactive.next_due_at or 0.0),
             "unanswered_count": int(proactive.unanswered_count or 0),
             "cancel_reason": proactive.cancel_reason,
+            "stage_ledger": [
+                dict(item)
+                for item in list(_extra(event, "astrmai_proactive_stage_ledger", ()) or ())[-16:]
+                if isinstance(item, Mapping)
+            ],
         },
         "architecture_observation": architecture_observation,
         "rollout": rollout_state(config),

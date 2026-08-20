@@ -131,6 +131,174 @@ class ProactiveGapCoverageTests(unittest.TestCase):
         self.assertEqual(decision.blocked_reason, "")
         self.assertNotIn("chat-expired", dispatcher._cooldowns)
 
+    def test_allowed_dispatch_records_safety_and_completion_stages(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return True
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-stages",
+                    source="wakeup",
+                    reason="stage coverage",
+                    guidance="say one line",
+                )
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            await callback(True, "done")
+            return dispatcher.list_intents(limit=1)[0]
+
+        history = asyncio.run(_run())
+        stages = history["decision"]["stage_ledger"]
+        self.assertTrue(any(item["stage"] == "proactive.safety_check" and item["status"] == "success" for item in stages))
+        self.assertTrue(any(item["stage"] == "proactive.reply_commit" for item in stages))
+        self.assertTrue(any(item["stage"] == "proactive.state_settle" and item["status"] == "success" for item in stages))
+
+    def test_completion_watchdog_settles_stuck_queued_intent(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return True
+
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-watchdog",
+                    source="wakeup",
+                    reason="stuck completion",
+                    guidance="say one line",
+                )
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            await dispatcher._watch_completion(decision.intent_id, 0.01, decision, callback)
+            return dispatcher.list_intents(limit=1)[0]
+
+        history = asyncio.run(_run())
+        self.assertEqual(history["decision"]["status"], "timeout")
+        self.assertEqual(history["decision"]["blocked_reason"], "completion_timeout")
+        stages = history["decision"]["stage_ledger"]
+        self.assertTrue(any(item["stage"] == "proactive.completion_watchdog" and item["status"] == "timeout" for item in stages))
+        self.assertTrue(any(item["stage"] == "proactive.reply_commit" and item["status"] == "timeout" for item in stages))
+        self.assertTrue(any(item["stage"] == "proactive.state_settle" for item in stages))
+
+    def test_dispatcher_shutdown_settles_queued_claim_and_ignores_late_callback(self):
+        class _AttentionGate:
+            def __init__(self):
+                self.event_data = None
+
+            async def inject_external_event(self, chat_id, event_data):
+                self.event_data = event_data
+                return True
+
+        callback_results = []
+        attention_gate = _AttentionGate()
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=attention_gate,
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        async def _run():
+            decision = await dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-shutdown",
+                    source="wakeup",
+                    reason="shutdown test",
+                    guidance="say one line",
+                ),
+                on_complete=lambda sent, preview: callback_results.append((sent, preview)),
+            )
+            callback = attention_gate.event_data["extra"]["astrmai_proactive_completion_callback"]
+            await dispatcher.shutdown()
+            await callback(True, "late reply")
+            return decision, dispatcher.list_intents(limit=1)[0]
+
+        decision, history = asyncio.run(_run())
+        self.assertEqual(history["decision"]["status"], "shutdown")
+        self.assertEqual(history["decision"]["blocked_reason"], "dispatcher_shutdown")
+        self.assertEqual(callback_results, [(False, "")])
+        self.assertEqual(dispatcher.describe_status()["completion_watchdogs"], 0)
+        self.assertTrue(
+            any(
+                entry["stage"] == "proactive.dispatcher_shutdown"
+                for entry in history["decision"]["stage_ledger"]
+            )
+        )
+
+    def test_dispatch_rejection_records_stable_reason(self):
+        class _AttentionGate:
+            async def inject_external_event(self, chat_id, event_data):
+                return False
+
+        dispatcher = self.dispatcher_mod.ProactiveDispatcher(
+            attention_gate=_AttentionGate(),
+            runtime_coordinator=SimpleNamespace(
+                get_activity_snapshot=lambda chat_id: asyncio.sleep(
+                    0,
+                    result={"latest_activity_ts": time.time(), "wait_targets": [], "executor_pending": 0},
+                )
+            ),
+            state_engine=SimpleNamespace(
+                get_state=lambda chat_id: asyncio.sleep(0, result=SimpleNamespace(energy=1.0)),
+            ),
+            config=_config(),
+        )
+
+        decision = asyncio.run(
+            dispatcher.dispatch(
+                self.dispatcher_mod.ProactiveMessageIntent(
+                    chat_id="chat-rejected",
+                    source="wakeup",
+                    reason="rejected injection",
+                    guidance="say one line",
+                )
+            )
+        )
+
+        self.assertFalse(decision.synthetic_event_queued)
+        self.assertEqual(decision.blocked_reason, "event_enqueue_rejected")
+        self.assertTrue(any(item["stage"] == "proactive.event_enqueue" for item in decision.stage_ledger))
+
     def test_dispatcher_blocks_conservatively_on_dirty_pending_snapshot(self):
         class _AttentionGate:
             async def inject_external_event(self, chat_id, event_data):
@@ -170,6 +338,15 @@ class ProactiveGapCoverageTests(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.blocked_reason, "user_waiting")
+
+        history = dispatcher.list_intents(limit=1)[0]
+        stages = history["decision"]["stage_ledger"]
+        self.assertEqual([item["stage"] for item in stages], [
+            "proactive.candidate",
+            "proactive.safety_check",
+            "proactive.dispatch",
+        ])
+        self.assertEqual(stages[-1]["reason"], "user_waiting")
 
     def test_wakeup_intent_preserves_dispatch_contract(self):
         service = self.wakeup_mod.WakeupService(
@@ -612,6 +789,42 @@ class ProactiveGapCoverageTests(unittest.TestCase):
                     ("analysis", "Alice"),
                 ],
             )
+
+        asyncio.run(_run())
+
+    def test_profiling_respects_persisted_user_cooldown(self):
+        async def _run():
+            calls = []
+            profile = SimpleNamespace(
+                user_id="user-1",
+                name="Alice",
+                know_times=3,
+                is_known=True,
+                message_count_for_profiling=100,
+                last_persona_gen_time=time.time() - 60,
+            )
+            task = self.task_mod.ProactiveTask.__new__(self.task_mod.ProactiveTask)
+            task._profile_semaphore = asyncio.Semaphore(1)
+            task._profiling_user_ids = set()
+            task.state_engine = SimpleNamespace(
+                get_active_states=lambda: [],
+                get_active_profiles=lambda: [profile],
+            )
+            task.config = SimpleNamespace(
+                life=SimpleNamespace(
+                    profiling_msg_threshold=5,
+                    profiling_user_cooldown_sec=21600,
+                )
+            )
+
+            async def _generate_analysis(_profile):
+                calls.append("analysis")
+
+            task._generate_persona_analysis = _generate_analysis
+            task._generate_nickname = lambda _profile: None
+            await task._run_profiling_task()
+            self.assertEqual(calls, [])
+            self.assertEqual(task._profiling_user_ids, set())
 
         asyncio.run(_run())
 

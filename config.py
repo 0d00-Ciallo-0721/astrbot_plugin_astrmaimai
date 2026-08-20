@@ -170,14 +170,26 @@ class AttentionConfig(BaseModel):
         description="高置信明确互动跳过 Judge，直接进入回复流程",
     )
     participation_drop_enabled: bool = Field(
-        default=False,
-        description="高置信无关消息直接丢弃；默认关闭并仅做影子观测",
+        default=True,
+        description="确定性的外部回执、机器人回声和空事件直接丢弃",
     )
     participation_hysteresis_ttl_sec: int = Field(
         default=180,
         ge=10,
         le=1800,
         description="已参与话题和当前对象的短期承接时间（秒）",
+    )
+    judge_ignore_cache_ttl_sec: float = Field(
+        default=8.0,
+        ge=0.0,
+        le=60.0,
+        description="同一群同一发送者同一短文本被忽略后的短期缓存时间（秒）",
+    )
+    judge_ambient_cooldown_sec: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=15.0,
+        description="同一群同一话题被忽略后的环境消息短暂冷却时间（秒）",
     )
     cognitive_loop_min_think_level: int = Field(
         default=2,
@@ -227,6 +239,7 @@ class EvolutionConfig(BaseModel):
     learning_pipeline_max_failures: int = Field(default=3, ge=1, le=20, description="单条学习管线连续失败后进入隔离的次数")
     learning_pipeline_quarantine_sec: int = Field(default=3600, ge=60, le=86400, description="学习管线连续失败后的隔离时间")
     learning_pipeline_timeout_sec: float = Field(default=60.0, ge=10.0, le=300.0, description="单轮表达或黑话学习管线的共享总时间预算")
+    learning_pipeline_concurrency: int = Field(default=1, ge=1, le=4, description="跨会话学习管线的最大并发数")
     learning_run_retention_days: int = Field(default=30, ge=1, le=365, description="学习运行诊断记录的保留天数")
     learning_run_max_per_pipeline_chat: int = Field(default=500, ge=10, le=10000, description="每条学习管线每个会话最多保留的运行诊断记录数")
     review_runner_interval_sec: int = Field(default=60, ge=30, le=600)
@@ -251,6 +264,8 @@ class LifeConfig(BaseModel):
     wakeup_min_energy: float = Field(default=0.6, ge=0.0, le=1.0)
     wakeup_cost: float = Field(default=0.2, ge=0.0, le=1.0)
     wakeup_cooldown: int = Field(default=28800, ge=0)
+    proactive_quiet_recheck_sec: int = Field(default=7200, ge=300, le=86400, description="主动发言后再次评估前的最短安静时间")
+    proactive_failure_backoff_factor: float = Field(default=2.0, ge=1.0, le=4.0, description="主动候选未发送时的退避倍数")
     proactive_max_unanswered: int = Field(default=2, ge=0, le=20, description="连续主动发言未获用户回应的上限")
     proactive_failure_retry_sec: int = Field(default=900, ge=10, le=86400, description="主动发言失败后的重试间隔（秒）")
     proactive_claim_lease_sec: int = Field(default=300, ge=10, le=3600, description="主动任务领取租约时长（秒）")
@@ -258,6 +273,8 @@ class LifeConfig(BaseModel):
     scheduled_scenarios_allow_inactive_chat: bool = Field(default=False, description="允许定时场景在会话不活跃时进入注意力判决")
     daily_schedule_enabled: bool = Field(default=True, description="为角色生成并持久化七时段日程")
     daily_schedule_ai_enabled: bool = Field(default=True, description="使用后台任务模型生成日程；失败时使用固定兜底日程")
+    daily_schedule_max_retries: int = Field(default=2, ge=0, le=5, description="日程模型生成失败后的最大重试次数")
+    daily_schedule_retry_base_sec: int = Field(default=300, ge=30, le=3600, description="日程模型生成失败后的首次重试等待时间")
     morning_greeting_enabled: bool = Field(default=True, description="在早安窗口产生一次主动问候候选")
     morning_greeting_time: str = Field(default="08:00", description="早安候选开始时间，格式 HH:MM")
     morning_greeting_window_min: int = Field(default=90, ge=5, le=360, description="早安候选有效窗口（分钟）")
@@ -271,6 +288,7 @@ class LifeConfig(BaseModel):
     weather_timeout_sec: float = Field(default=5.0, ge=1.0, le=30.0, description="天气查询硬超时（秒）")
     weather_cache_ttl_sec: int = Field(default=1800, ge=60, le=21600, description="天气结果缓存时长（秒）")
     profiling_msg_threshold: int = Field(default=50, ge=1)
+    profiling_user_cooldown_sec: int = Field(default=21600, ge=0, le=604800, description="同一用户两次画像生成之间的最短间隔（秒）")
     dream_interval_min: int = Field(default=30, ge=1, description="后台触发梦境整理记忆的周期(分钟)")
     dream_time_ranges: List[str] = Field(default_factory=list, description="允许触发 dream 的时间段列表，格式 HH:MM-HH:MM")
     min_memory_events_to_dream: int = Field(default=5, ge=1, description="进入 dream 整理前需要的最少长期记忆事件数")
@@ -486,6 +504,7 @@ class MemoryConfig(BaseModel):
     time_decay_rate: float = Field(default=0.01, ge=0.0, le=1.0)
     cleanup_interval: int = Field(default=3600, ge=1)
     summary_threshold: int = Field(default=30, ge=1)
+    maintenance_concurrency: int = Field(default=1, ge=1, le=4, description="记忆摘要维护同时处理的最大会话数")
     recall_top_k: int = Field(default=5, ge=1)
     memory_query_builder_enabled: bool = Field(default=True, repr=False)
     think1_semantic_intent_enabled: bool = Field(
@@ -528,6 +547,9 @@ class InfraConfig(BaseModel):
     backoff_factor: float = Field(default=1.5, ge=0.0)
     api_timeout: float = Field(default=15.0, ge=1.0, description="网关级绝对超时时间(秒)，超时后强制中断 API 请求")
     max_concurrent_llm_calls: int = Field(default=3, ge=1, description="全局 LLM 并发请求上限，防止后台任务雪崩导致 429")
+    background_task_concurrency: int = Field(default=2, ge=1, le=8, description="受预算后台任务并发上限")
+    background_task_queue_limit: int = Field(default=64, ge=0, le=2048, description="受预算后台任务排队上限")
+    background_task_wait_timeout_sec: float = Field(default=120.0, ge=0.1, le=3600.0, description="受预算后台任务最长排队时间")
     critical_path_reserved_slots: int = Field(
         default=1,
         ge=0,
@@ -678,6 +700,16 @@ class TimingConfig(BaseModel):
     model_request_timeout_sec: float = Field(default=15.0, ge=1.0, le=3600.0)
     turn_total_budget_sec: float = Field(default=360.0, ge=30.0, le=7200.0)
     main_reply_reserve_sec: float = Field(default=90.0, ge=0.0, le=1800.0)
+    sys2_lock_wait_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
+    executor_lock_wait_timeout_sec: float = Field(default=15.0, ge=0.1, le=600.0)
+    lane_prepare_timeout_sec: float = Field(default=20.0, ge=0.1, le=600.0)
+    lane_persist_timeout_sec: float = Field(default=5.0, ge=0.1, le=600.0)
+    proactive_completion_timeout_sec: float = Field(
+        default=180.0,
+        ge=5.0,
+        le=3600.0,
+        description="主动候选入队后等待最终回执的硬超时",
+    )
     reply_max_age_sec: float = Field(default=0.0, ge=0.0, le=7200.0)
     agent_execution_timeout_sec: int = Field(default=60, ge=1, le=7200)
     fast_mode_execution_timeout_sec: int = Field(default=15, ge=1, le=7200)
@@ -693,6 +725,8 @@ class TimingConfig(BaseModel):
     compaction_timeout_sec: float = Field(default=60.0, ge=1.0, le=1200.0)
     embedding_timeout_sec: float = Field(default=15.0, ge=1.0, le=600.0)
     faiss_timeout_sec: float = Field(default=20.0, ge=0.5, le=60.0)
+    faiss_query_concurrency: int = Field(default=2, ge=1, le=8, description="向量检索同时执行的最大查询数")
+    faiss_thread_count: int = Field(default=1, ge=1, le=8, description="单次向量索引查询使用的处理器线程数")
     faiss_failure_threshold: int = Field(default=3, ge=1, le=10)
     faiss_circuit_breaker_cooldown_sec: float = Field(default=180.0, ge=5.0, le=600.0)
     projection_retry_interval_sec: float = Field(default=60.0, ge=5.0, le=3600.0)

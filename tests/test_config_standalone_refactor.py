@@ -36,18 +36,36 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertFalse(config.memory.adaptive_top_k_enabled)
         self.assertFalse(config.memory.memory_retrieval_debug_trace_enabled)
         self.assertEqual(config.attention.judge_timeout, 3.0)
+        self.assertTrue(config.attention.participation_drop_enabled)
+        self.assertEqual(config.attention.judge_ambient_cooldown_sec, 3.0)
         self.assertEqual(config.sys3.max_steps, 30)
         self.assertEqual(config.sys3.tool_timeout, 120)
         self.assertEqual(config.timing.model_request_timeout_sec, 15.0)
         self.assertEqual(config.timing.fast_mode_execution_timeout_sec, 15)
         self.assertEqual(config.timing.reply_max_age_sec, 0.0)
+        self.assertEqual(config.timing.sys2_lock_wait_timeout_sec, 20.0)
+        self.assertEqual(config.timing.executor_lock_wait_timeout_sec, 15.0)
+        self.assertEqual(config.timing.lane_prepare_timeout_sec, 20.0)
+        self.assertEqual(config.timing.lane_persist_timeout_sec, 5.0)
         self.assertEqual(config.timing.faiss_timeout_sec, 20.0)
+        self.assertEqual(config.timing.faiss_query_concurrency, 2)
+        self.assertEqual(config.timing.faiss_thread_count, 1)
+        self.assertEqual(config.infra.background_task_concurrency, 2)
+        self.assertEqual(config.infra.background_task_queue_limit, 64)
+        self.assertEqual(config.infra.background_task_wait_timeout_sec, 120.0)
+        self.assertEqual(config.memory.maintenance_concurrency, 1)
         self.assertEqual(config.timing.image_resolve_timeout_sec, 15.0)
         self.assertEqual(config.timing.image_analysis_timeout_sec, 90.0)
         self.assertEqual(config.timing.vision_barrier_total_timeout_sec, 300.0)
         self.assertEqual(config.private_chat.image_barrier_timeout_sec, 90.0)
         self.assertEqual(config.evolution.jargon_min_count, 2)
         self.assertEqual(config.evolution.expression_min_count, 2)
+        self.assertEqual(config.evolution.learning_pipeline_concurrency, 1)
+        self.assertEqual(config.life.daily_schedule_max_retries, 2)
+        self.assertEqual(config.life.daily_schedule_retry_base_sec, 300)
+        self.assertEqual(config.life.proactive_quiet_recheck_sec, 7200)
+        self.assertEqual(config.life.proactive_failure_backoff_factor, 2.0)
+        self.assertEqual(config.life.profiling_user_cooldown_sec, 21600)
         self.assertEqual(config.reply.emotion_relationship_mapping, [])
 
     def test_emotion_catalog_accepts_deployed_custom_tags_and_relationship_override(self):
@@ -211,10 +229,25 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         performance_items = schema["performance"]["items"]
         vision_items = schema["vision"]["items"]
         evolution_items = schema["evolution"]["items"]
+        attention_items = schema["attention"]["items"]
+        infra_items = schema["infra"]["items"]
+        timing_items = schema["timing"]["items"]
+        self.assertEqual(timing_items["sys2_lock_wait_timeout_sec"]["default"], 20.0)
+        self.assertEqual(timing_items["executor_lock_wait_timeout_sec"]["default"], 15.0)
+        self.assertEqual(timing_items["lane_prepare_timeout_sec"]["default"], 20.0)
+        self.assertEqual(timing_items["lane_persist_timeout_sec"]["default"], 5.0)
+        memory_items = schema["memory"]["items"]
         reply_items = schema["reply"]["items"]
         self.assertIn("summary_threshold", performance_items)
         self.assertIn("use_native_main_reply_vision", vision_items)
         self.assertIn("native_main_reply_failure_cooldown_sec", vision_items)
+        self.assertIn("background_task_concurrency", infra_items)
+        self.assertIn("background_task_queue_limit", infra_items)
+        self.assertIn("background_task_wait_timeout_sec", infra_items)
+        self.assertIn("judge_ambient_cooldown_sec", attention_items)
+        self.assertIn("faiss_query_concurrency", timing_items)
+        self.assertIn("faiss_thread_count", timing_items)
+        self.assertIn("maintenance_concurrency", memory_items)
         self.assertEqual(
             vision_items["vision_reply_policy"]["options"],
             ["超时后忽略图片并继续回复", "必须识别成功后再回复"],
@@ -268,6 +301,7 @@ class ConfigStandaloneRefactorTests(unittest.TestCase):
         self.assertEqual(schema["sys3"]["items"]["max_steps"]["default"], 30)
         self.assertNotIn("tool_timeout", schema["sys3"]["items"])
         self.assertEqual(schema["life"]["items"]["energy_exhaustion"]["default"], 0.1)
+        self.assertEqual(schema["life"]["items"]["profiling_user_cooldown_sec"]["default"], 21600)
         meme_mapping_hint = schema["reply"]["items"]["emotion_mapping"]["hint"]
         self.assertIn("memes_data/memes/<标签名>/", meme_mapping_hint)
         self.assertIn("给模型看的情绪说明", meme_mapping_hint)

@@ -253,7 +253,11 @@ class WakeupService:
                     "not_sent",
                 )
                 return
-            next_wakeup_timestamp = time.time() + wakeup_cooldown
+            quiet_recheck = max(
+                0.0,
+                float(getattr(life_config, "proactive_quiet_recheck_sec", 7200) or 0.0),
+            )
+            next_wakeup_timestamp = time.time() + max(wakeup_cooldown, quiet_recheck)
             settle = getattr(self.state_engine, "settle_proactive_wakeup", None)
             if callable(settle):
                 await settle(
@@ -295,6 +299,20 @@ class WakeupService:
         if not callable(settle):
             return
         retry_seconds = float(getattr(life_config, "proactive_failure_retry_sec", 900) or 900)
+        backoff_factor = max(
+            1.0,
+            float(getattr(life_config, "proactive_failure_backoff_factor", 2.0) or 1.0),
+        )
+        current_state = None
+        if hasattr(self.state_engine, "get_state"):
+            try:
+                current_state = self.state_engine.get_state(chat_id)
+                if inspect.isawaitable(current_state):
+                    current_state = await current_state
+            except Exception:
+                current_state = None
+        failure_count = int(getattr(current_state, "unanswered_proactive_count", 0) or 0)
+        retry_seconds = min(86400.0, retry_seconds * backoff_factor ** min(failure_count, 4))
         await settle(
             chat_id,
             claim_token=claim_token,

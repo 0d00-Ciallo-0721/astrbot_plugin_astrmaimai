@@ -277,7 +277,7 @@ class ScheduledScenarioService:
         config: Any,
         db_path: Any,
         call_background_lane: Callable[..., Awaitable[str]],
-        task_launcher: Callable[[Awaitable[Any]], None],
+        task_launcher: Callable[[Callable[[], Awaitable[Any]]], None],
     ) -> None:
         self.state_engine = state_engine
         self.dispatcher = dispatcher
@@ -289,6 +289,8 @@ class ScheduledScenarioService:
         self.weather = WeatherProvider(config)
         self._schedule_cache: dict[str, tuple[dict[str, str], str]] = {}
         self._generation_started: set[str] = set()
+        self._generation_attempts: dict[str, int] = {}
+        self._generation_retry_at: dict[str, float] = {}
         self._last_tick_at = 0.0
         self._last_report: dict[str, Any] = {}
 
@@ -345,8 +347,10 @@ class ScheduledScenarioService:
             return
         if not bool(getattr(life, "daily_schedule_ai_enabled", True)):
             return
+        if float(self._generation_retry_at.get(plan_date, 0.0) or 0.0) > time.time():
+            return
         self._generation_started.add(plan_date)
-        self.task_launcher(self._generate_schedule(plan_date))
+        self.task_launcher(lambda: self._generate_schedule(plan_date))
 
     async def _generate_schedule(self, plan_date: str) -> None:
         prompt = (
@@ -365,11 +369,30 @@ class ScheduledScenarioService:
             normalized = DailyScheduleStore._normalize(parsed)
             await self.schedule_store.save(plan_date, normalized, source="model")
             self._schedule_cache[plan_date] = (normalized, "model")
+            self._generation_attempts.pop(plan_date, None)
+            self._generation_retry_at.pop(plan_date, None)
             logger.info(f"[ScheduledScenario] daily schedule generated date={plan_date}")
         except (asyncio.TimeoutError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(f"[ScheduledScenario] daily schedule degraded to fallback: {type(exc).__name__}: {exc}")
+            self._schedule_generation_failed(plan_date, exc)
         except Exception as exc:
             logger.warning(f"[ScheduledScenario] daily schedule model failure: {type(exc).__name__}: {exc}")
+            self._schedule_generation_failed(plan_date, exc)
+
+    def _schedule_generation_failed(self, plan_date: str, exc: Exception) -> None:
+        life = getattr(self.config, "life", None)
+        attempts = int(self._generation_attempts.get(plan_date, 0) or 0) + 1
+        self._generation_attempts[plan_date] = attempts
+        max_retries = max(0, int(getattr(life, "daily_schedule_max_retries", 2) or 0))
+        if attempts <= max_retries:
+            base = max(30, int(getattr(life, "daily_schedule_retry_base_sec", 300) or 300))
+            retry_at = time.time() + base * (2 ** max(0, attempts - 1))
+            self._generation_retry_at[plan_date] = retry_at
+            self._generation_started.discard(plan_date)
+            logger.info(
+                f"[ScheduledScenario] daily schedule retry scheduled date={plan_date} "
+                f"attempt={attempts} retry_at={retry_at:.0f} reason={type(exc).__name__}"
+            )
 
     def _scenario_for(self, now: datetime) -> str:
         life = getattr(self.config, "life", None)
@@ -528,6 +551,8 @@ class ScheduledScenarioService:
     def describe_status(self) -> dict[str, Any]:
         return {
             "generation_dates": sorted(self._generation_started)[-7:],
+            "generation_attempts": dict(self._generation_attempts),
+            "generation_retry_at": dict(self._generation_retry_at),
             "cached_schedule_dates": sorted(self._schedule_cache)[-7:],
             "weather_cached": self.weather._cached is not None,
             "last_tick": dict(self._last_report),

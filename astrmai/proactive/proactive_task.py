@@ -11,6 +11,10 @@ from astrbot.api import logger
 
 from ..conversation.runtime.architecture_rollout import rollout_enabled
 from ..infrastructure.context_economy import PromptTemplateId
+from ..infrastructure.runtime.background_task_budget import (
+    BackgroundTaskQueueFull,
+    BackgroundTaskQueueTimeout,
+)
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..learning.profiling.nickname_generator import NicknameGenerator
 from ..learning.profiling.profile_generator import ProfileGenerator
@@ -55,6 +59,7 @@ class ProactiveTask:
         config=None,
         runtime_coordinator=None,
         attention_gate=None,
+        background_task_budget=None,
     ):
         self.context = context
         self.state_engine = state_engine
@@ -63,6 +68,7 @@ class ProactiveTask:
         self.memory_engine = memory_engine
         self.reflector = reflector
         self.runtime_coordinator = runtime_coordinator
+        self.background_task_budget = background_task_budget
         self.auto_check_task = None
         self.reflect_tracker = None
         self.config = config if config else gateway.config
@@ -71,6 +77,7 @@ class ProactiveTask:
         self._background_tasks: set[asyncio.Task] = set()
         self._bg_semaphore = asyncio.Semaphore(2)
         self._profile_semaphore = asyncio.Semaphore(1)
+        self._profiling_user_ids: set[str] = set()
         self._last_profile_run = 0.0
         self._last_diary_date = ""
         self._diary_pending_date = ""
@@ -246,6 +253,10 @@ class ProactiveTask:
 
     async def stop(self):
         self._is_running = False
+        try:
+            await self.proactive_dispatcher.shutdown()
+        except Exception as exc:
+            logger.warning(f"[ProactiveTask] dispatcher shutdown degraded: {type(exc).__name__}")
         if self._task:
             self._task.cancel()
             try:
@@ -322,7 +333,12 @@ class ProactiveTask:
             promotion_engine=promotion_engine,
         )
 
-    def _fire_background_task(self, coro):
+    def _fire_background_task(self, awaitable_factory):
+        budget = getattr(self, "background_task_budget", None)
+        if budget is not None:
+            coro = budget.run(awaitable_factory)
+        else:
+            coro = awaitable_factory()
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
@@ -332,7 +348,10 @@ class ProactiveTask:
         try:
             exc = task.exception()
             if exc:
-                logger.error(f"[Proactive Task Error] {exc}", exc_info=exc)
+                if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
+                    logger.warning(f"[ProactiveTask] background task skipped: {exc}")
+                else:
+                    logger.error(f"[Proactive Task Error] {exc}", exc_info=exc)
         except asyncio.CancelledError:
             pass
 
@@ -510,19 +529,37 @@ class ProactiveTask:
 
             active_profiles = self.state_engine.get_active_profiles()
             threshold = int(getattr(getattr(self.config, "life", None), "profiling_msg_threshold", 200) or 200)
+            cooldown_sec = max(
+                0,
+                int(getattr(getattr(self.config, "life", None), "profiling_user_cooldown_sec", 21600) or 0),
+            )
+            active_user_ids = getattr(self, "_profiling_user_ids", None)
+            if active_user_ids is None:
+                active_user_ids = set()
+                self._profiling_user_ids = active_user_ids
 
             for profile in active_profiles:
-                if profile.know_times >= 3 and not getattr(profile, "is_known", False):
-                    try:
-                        await self._generate_nickname(profile)
-                    except Exception as exc:
-                        logger.error(f"[Life] nickname task degraded for {getattr(profile, 'name', '')}: {exc}")
-
-                if int(getattr(profile, "message_count_for_profiling", 0) or 0) >= threshold:
-                    try:
-                        await self._generate_persona_analysis(profile)
-                    except Exception as exc:
-                        logger.error(f"[Life] profiling task degraded for {getattr(profile, 'name', '')}: {exc}")
+                user_id = str(getattr(profile, "user_id", getattr(profile, "name", "")) or "")
+                if not user_id or user_id in active_user_ids:
+                    continue
+                last_generated_at = float(getattr(profile, "last_persona_gen_time", 0.0) or 0.0)
+                analysis_due = int(getattr(profile, "message_count_for_profiling", 0) or 0) >= threshold
+                if analysis_due and cooldown_sec > 0 and time.time() - last_generated_at < cooldown_sec:
+                    analysis_due = False
+                active_user_ids.add(user_id)
+                try:
+                    if profile.know_times >= 3 and not getattr(profile, "is_known", False):
+                        try:
+                            await self._generate_nickname(profile)
+                        except Exception as exc:
+                            logger.error(f"[Life] nickname task degraded for {getattr(profile, 'name', '')}: {exc}")
+                    if analysis_due:
+                        try:
+                            await self._generate_persona_analysis(profile)
+                        except Exception as exc:
+                            logger.error(f"[Life] profiling task degraded for {getattr(profile, 'name', '')}: {exc}")
+                finally:
+                    active_user_ids.discard(user_id)
 
     async def _run_reflection_tasks(self):
         enable_exp_mine = getattr(self.config.evolution, "enable_expression_mining", True) if hasattr(self.config, "evolution") else True
@@ -847,7 +884,9 @@ class ProactiveTask:
         except Exception as exc:
             logger.error(f"[ProactiveTask] group signin maintenance degraded: {exc}")
         try:
-            self._fire_background_task(self.heartflow_topic_digest_service.run_once(self.heartflow_manager))
+            self._fire_background_task(
+                lambda: self.heartflow_topic_digest_service.run_once(self.heartflow_manager)
+            )
         except Exception as exc:
             logger.error(f"[ProactiveTask] heartflow topic digest scheduling degraded: {exc}")
 
@@ -907,14 +946,16 @@ class ProactiveTask:
                     await self._run_maintenance_cycle()
 
                 if now - self._last_profile_run > 3600:
-                    await self._run_profiling_task()
                     self._last_profile_run = now
+                    self._fire_background_task(self._run_profiling_task)
 
                 if run_maintenance and self.diary_service.should_run(self._last_diary_date, now):
                     diary_date = time.strftime("%Y-%m-%d", time.localtime(now))
                     if self._diary_pending_date != diary_date:
                         self._diary_pending_date = diary_date
-                        self._fire_background_task(self._run_daily_diary_task_with_jitter(diary_date))
+                        self._fire_background_task(
+                            lambda: self._run_daily_diary_task_with_jitter(diary_date)
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -951,6 +992,7 @@ class ProactiveTask:
             "last_diary_date": self._last_diary_date,
             "diary_pending_date": self._diary_pending_date,
             "background_tasks": len(self._background_tasks),
+            "profiling_active_users": len(getattr(self, "_profiling_user_ids", set())),
             "dream_scheduler": self.dream_scheduler.describe_status(),
             "heartflow": self.heartflow_manager.describe_status(),
             "heartflow_topic_digest": self.heartflow_topic_digest_service.describe_status(),

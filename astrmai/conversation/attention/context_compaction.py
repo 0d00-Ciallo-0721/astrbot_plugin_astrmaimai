@@ -185,6 +185,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
         compaction_summary_max_tokens: int = 450,
         provider_id: str = "",
         gateway: Any = None,
+        background_task_budget: Any = None,
     ):
         self.dialogue_store = dialogue_store
         self.compaction_trigger_segments = int(compaction_trigger_segments or 40)
@@ -193,6 +194,7 @@ class ContextCompactionEngine(CompactionProviderMixin):
         self.compaction_summary_max_tokens = int(compaction_summary_max_tokens or 450)
         self.provider_id = str(provider_id or "")
         self.gateway = gateway
+        self.background_task_budget = background_task_budget
         self._cooldown_by_chat: dict[str, float] = {}
         self._success_cooldown_seconds = 20.0
         self._failure_cooldown_seconds = 10.0

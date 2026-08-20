@@ -119,6 +119,82 @@ class LearningRefactorTests(unittest.TestCase):
         )
         self.assertEqual(service.calls, [("chat-sync", 4)])
 
+    def test_learning_pipeline_concurrency_is_bounded(self):
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                mining_window_sec=60,
+                mining_window_min_messages=2,
+                mining_cooldown_sec=60,
+                mining_trigger=20,
+                learning_pipeline_concurrency=1,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.mod.EvolutionManager(_FakeDB(), SimpleNamespace(config=config), config=config)
+        started = 0
+        peak = 0
+        release = asyncio.Event()
+
+        async def _fake_pipeline(_pipeline, _group_id, _logs):
+            nonlocal started, peak
+            started += 1
+            peak = max(peak, started)
+            await release.wait()
+            started -= 1
+            return {"status": "completed"}
+
+        manager._run_learning_pipeline_unlimited = _fake_pipeline
+
+        async def _run():
+            first = asyncio.create_task(manager._run_learning_pipeline("expression", "chat-1", []))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(manager._run_learning_pipeline("expression", "chat-2", []))
+            await asyncio.sleep(0)
+            self.assertEqual(peak, 1)
+            release.set()
+            await asyncio.gather(first, second)
+
+        asyncio.run(_run())
+        self.assertEqual(manager._active_pipeline_tasks, 0)
+
+    def test_mining_trigger_while_running_is_coalesced_into_one_rerun(self):
+        config = SimpleNamespace(
+            evolution=SimpleNamespace(
+                mining_window_sec=60,
+                mining_window_min_messages=2,
+                mining_cooldown_sec=60,
+                mining_trigger=20,
+            ),
+            reply=SimpleNamespace(fallback_text="fallback"),
+        )
+        manager = self.mod.EvolutionManager(_FakeDB(), SimpleNamespace(config=config), config=config)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def _mine(group_id):
+            calls.append(group_id)
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+
+        manager._try_trigger_mining = _mine
+
+        async def _run():
+            manager._schedule_mining_if_triggered("chat-1", True)
+            await started.wait()
+            manager._schedule_mining_if_triggered("chat-1", True)
+            manager._schedule_mining_if_triggered("chat-1", True)
+            release.set()
+            for _ in range(20):
+                await asyncio.sleep(0)
+                if len(calls) == 2 and not manager._mining_tasks:
+                    break
+            await manager.stop_background_tasks()
+
+        asyncio.run(_run())
+        self.assertEqual(calls, ["chat-1", "chat-1"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -155,7 +155,12 @@ class MemoryIndexProjector:
         )
         while not self._retry_stop.is_set():
             try:
-                await self.retry_due(limit=int(self._config_value("projection_retry_batch_size", 20) or 20))
+                limit = int(self._config_value("projection_retry_batch_size", 20) or 20)
+                background_budget = getattr(self.engine, "background_task_budget", None)
+                if background_budget is not None:
+                    await background_budget.run(lambda: self.retry_due(limit=limit))
+                else:
+                    await self.retry_due(limit=limit)
                 await asyncio.wait_for(self._retry_stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 continue
@@ -197,6 +202,8 @@ class MemoryIndexProjector:
         deleted = 0
         faiss_db = getattr(self.engine, "faiss_db", None)
         faiss_delete = getattr(faiss_db, "delete", None) if faiss_db is not None else None
+        vector_retriever = getattr(self.engine, "vec_retriever", None)
+        coordinated_delete = getattr(vector_retriever, "delete_document", None)
         for memory_id in memory_ids:
             try:
                 rows = await self.engine._run_documents_query(
@@ -210,27 +217,57 @@ class MemoryIndexProjector:
                 # 旧实现只删 documents 行与 FTS，嵌入向量成为幽灵、top-k 名额被
                 # 已删条目挤占且索引文件只增不减。顺序关键：faiss.delete 内部按
                 # doc_id 反查 int id，必须先于任何 documents 行删除执行。
-                if callable(faiss_delete):
+                vector_delete_supported = callable(coordinated_delete) or callable(faiss_delete)
+                vector_delete_failed = False
+                if callable(coordinated_delete):
+                    for doc_key in doc_keys:
+                        try:
+                            result = await coordinated_delete(doc_key)
+                            if result is False:
+                                raise RuntimeError(
+                                    f"vector document not found during cleanup: {doc_key}"
+                                )
+                        except Exception:
+                            vector_delete_failed = True
+                            logger.debug(
+                                f"[MemoryIndexProjector] coordinated faiss delete degraded doc_id={doc_key}",
+                                exc_info=True,
+                            )
+                elif callable(faiss_delete):
                     for doc_key in doc_keys:
                         try:
                             await faiss_delete(doc_key)
-                            deleted += 1
                         except Exception:
+                            vector_delete_failed = True
                             logger.debug(
                                 f"[MemoryIndexProjector] faiss delete degraded doc_id={doc_key}",
                                 exc_info=True,
                             )
+                if vector_delete_supported and vector_delete_failed:
+                    await self._mark_pending_persisted(memory_id, "vector_delete_failed")
+                    logger.warning(
+                        f"[MemoryIndexProjector] retained document rows after vector delete failure "
+                        f"memory_id={memory_id} repair_scheduled={str(self.retry_scheduled(memory_id)).lower()}"
+                    )
+                    continue
                 removed_rows = await self.engine._execute_documents_write(
                     "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') = ?",
                     (memory_id,),
                     db_path=self._documents_db_path(),
                 )
-                if not callable(faiss_delete):
-                    deleted += removed_rows
+                deleted += removed_rows
                 await self._delete_fts_rows(int_ids)
                 await self._clear_pending_persisted(memory_id)
             except Exception as exc:
-                logger.warning(f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc}")
+                reason = f"cleanup_error:{type(exc).__name__}"
+                try:
+                    scheduled = await self._mark_pending_persisted(memory_id, reason)
+                except Exception:
+                    scheduled = False
+                logger.warning(
+                    f"[MemoryIndexProjector] cleanup degraded for {memory_id}: {exc} "
+                    f"repair_scheduled={str(scheduled).lower()}"
+                )
         return deleted
 
     async def rebuild_all(self) -> int:
@@ -273,6 +310,9 @@ class MemoryIndexProjector:
             "canonical_projectable_count": 0,
             "pending_projection_count": len(pending_ids),
             "pending_projection_reasons": pending_reasons,
+            "faiss_index_count": None,
+            "faiss_index_count_observed": False,
+            "faiss_index_count_delta_vs_projection": None,
         }
         try:
             projectable = await self.engine.v2_store.list_projectable()
@@ -280,6 +320,19 @@ class MemoryIndexProjector:
             report["canonical_projectable_count"] = len(projectable_ids)
             projection_rows = await self._projection_rows()
             report["projection_count"] = len(projection_rows)
+            faiss_db = getattr(self.engine, "faiss_db", None)
+            if faiss_db is None:
+                vector_retriever = getattr(self.engine, "vec_retriever", None)
+                faiss_db = getattr(vector_retriever, "faiss_db", None)
+            index = getattr(getattr(faiss_db, "embedding_storage", None), "index", None)
+            ntotal = getattr(index, "ntotal", None)
+            if ntotal is not None:
+                try:
+                    report["faiss_index_count"] = int(ntotal)
+                    report["faiss_index_count_observed"] = True
+                    report["faiss_index_count_delta_vs_projection"] = int(ntotal) - len(projection_rows)
+                except (TypeError, ValueError):
+                    pass
             by_canonical: dict[str, list[int]] = {}
             for doc_id, canonical_id in projection_rows:
                 by_canonical.setdefault(canonical_id, []).append(doc_id)
@@ -332,14 +385,37 @@ class MemoryIndexProjector:
         if session_id:
             rows = await self.engine._run_documents_query(
                 """
-                SELECT id FROM documents
+                SELECT id, doc_id FROM documents
                 WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL
                   AND json_extract(metadata, '$.session_id') = ?
                 """,
                 (session_id,),
                 db_path=self._documents_db_path(),
             )
-            deleted = await self.engine._execute_documents_write(
+        else:
+            rows = await self.engine._run_documents_query(
+                "SELECT id, doc_id FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
+                db_path=self._documents_db_path(),
+            )
+
+        int_ids = [int(row[0]) for row in rows if row and row[0] is not None]
+        doc_keys = [str(row[1]) for row in rows if row and len(row) > 1 and row[1]]
+        vector_retriever = getattr(self.engine, "vec_retriever", None)
+        coordinated_delete = getattr(vector_retriever, "delete_document", None)
+        faiss_db = getattr(self.engine, "faiss_db", None)
+        faiss_delete = getattr(faiss_db, "delete", None)
+        if doc_keys and not callable(coordinated_delete) and not callable(faiss_delete):
+            raise RuntimeError("vector delete capability unavailable during projection rebuild")
+        for doc_key in doc_keys:
+            if callable(coordinated_delete):
+                deleted = await coordinated_delete(doc_key)
+                if deleted is False:
+                    raise RuntimeError(f"vector document not found during projection rebuild: {doc_key}")
+            else:
+                await faiss_delete(doc_key)
+
+        if session_id:
+            await self.engine._execute_documents_write(
                 """
                 DELETE FROM documents
                 WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL
@@ -348,18 +424,13 @@ class MemoryIndexProjector:
                 (session_id,),
                 db_path=self._documents_db_path(),
             )
-            await self._delete_fts_rows([row[0] for row in rows if row])
-            return deleted
-        rows = await self.engine._run_documents_query(
-            "SELECT id FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
-            db_path=self._documents_db_path(),
-        )
-        deleted = await self.engine._execute_documents_write(
-            "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
-            db_path=self._documents_db_path(),
-        )
-        await self._delete_fts_rows([row[0] for row in rows if row])
-        return deleted
+        else:
+            await self.engine._execute_documents_write(
+                "DELETE FROM documents WHERE json_extract(metadata, '$.canonical_id') IS NOT NULL",
+                db_path=self._documents_db_path(),
+            )
+        await self._delete_fts_rows(int_ids)
+        return len(rows)
 
     async def _projection_rows(self) -> list[tuple[int, str]]:
         if not hasattr(self.engine, "_run_documents_query"):

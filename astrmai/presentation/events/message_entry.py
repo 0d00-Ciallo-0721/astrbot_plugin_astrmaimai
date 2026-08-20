@@ -377,6 +377,7 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
     except Exception:
         logger.exception("[AstrMai] is_direct_call_event failed")
         is_direct_call = False
+    event.set_extra("astrmai_defer_turn_trace_persist", True)
     try:
         with observe_stage(event, "attention.dispatch"):
             status = await facade.record_and_dispatch_attention(event, scope)
@@ -384,6 +385,15 @@ async def handle_global_message(facade: RuntimeFacadeProtocol, event):
         logger.exception("[AstrMai] record_and_dispatch_attention failed")
         status = "error"
         is_direct_call = False
+
+    flush_trace = getattr(facade, "flush_deferred_turn_trace", None)
+    if callable(flush_trace):
+        try:
+            await flush_trace(event, fallback_status=status)
+        except Exception:
+            logger.exception("[AstrMai] flush_deferred_turn_trace failed")
+    else:
+        event.set_extra("astrmai_defer_turn_trace_persist", False)
 
     if status == "error":
         # ponytail: surface the failure to the user instead of silently dropping the message (R10)

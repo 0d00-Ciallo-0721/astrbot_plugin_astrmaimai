@@ -181,6 +181,115 @@ class GatewayContextPassthroughRefactorTests(unittest.TestCase):
         self.assertTrue(request_trace["provider_visible_system_hash"])
         self.assertTrue(request_trace["provider_visible_prompt_hash"])
 
+    def test_chat_lane_prepare_timeout_is_bounded_and_recorded(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+            timing=SimpleNamespace(lane_prepare_timeout_sec=0.01),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+
+        class _SlowLaneManager:
+            async def ensure_lane(self, **kwargs):
+                await asyncio.sleep(1)
+
+        gateway.set_lane_manager(_SlowLaneManager())
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = _TraceEvent()
+
+        async def _run():
+            with self.assertRaises(asyncio.TimeoutError):
+                await gateway.chat_in_lane_result(
+                    lane_key=lane_key,
+                    base_origin="default:GroupMessage:group-1",
+                    prompt="hello",
+                    system_prompt="stable prompt",
+                    models=["model-a"],
+                    use_fallback=False,
+                    event=event,
+                )
+
+        asyncio.run(_run())
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "gateway.lane_prepare")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        self.assertEqual(stages[-1]["stage"], "gateway.lane_prepare")
+        self.assertEqual(stages[-1]["status"], "timeout")
+
+    def test_chat_lane_persist_timeout_does_not_block_successful_reply(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+            timing=SimpleNamespace(lane_prepare_timeout_sec=1.0, lane_persist_timeout_sec=0.01),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+        lane_manager = self.lane_mod.LaneManager(_FakeConversationManager())
+
+        async def _slow_persist(**kwargs):
+            await asyncio.sleep(1)
+            return []
+
+        lane_manager.append_visible_reply_artifact = _slow_persist
+        gateway.set_lane_manager(lane_manager)
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = _TraceEvent()
+
+        async def _run():
+            return await gateway.chat_in_lane_result(
+                lane_key=lane_key,
+                base_origin="default:GroupMessage:group-1",
+                prompt="hello",
+                system_prompt="stable prompt",
+                models=["model-a"],
+                use_fallback=False,
+                event=event,
+            )
+
+        result = asyncio.run(_run())
+
+        self.assertEqual(result.text, "ok")
+        stages = event.get_extra("astrmai_stage_ledger", [])
+        persist_stages = [stage for stage in stages if stage.get("stage") == "gateway.lane_persist"]
+        self.assertEqual(len(persist_stages), 1)
+        self.assertEqual(persist_stages[0]["status"], "timeout")
+
+    def test_tool_lane_prepare_timeout_is_bounded_and_recorded(self):
+        fake_context = _FakeContext()
+        config = SimpleNamespace(
+            infra=SimpleNamespace(max_concurrent_llm_calls=2, llm_retries=0, backoff_factor=1.5, api_timeout=10),
+            provider=SimpleNamespace(fallback_models=[]),
+            timing=SimpleNamespace(lane_prepare_timeout_sec=0.01),
+        )
+        gateway = self.gateway_mod.GlobalModelGateway(fake_context, config)
+
+        class _SlowLaneManager:
+            async def ensure_lane(self, **kwargs):
+                await asyncio.sleep(1)
+
+        gateway.set_lane_manager(_SlowLaneManager())
+        lane_key = self.lane_mod.LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+        event = _TraceEvent()
+
+        async def _run():
+            with self.assertRaises(asyncio.TimeoutError):
+                await gateway.tool_chat_in_lane_result(
+                    lane_key=lane_key,
+                    base_origin="default:GroupMessage:group-1",
+                    event=event,
+                    prompt="hello",
+                    system_prompt="stable prompt",
+                    tools=object(),
+                    models=["model-a"],
+                    max_steps=2,
+                    timeout=10,
+                )
+
+        asyncio.run(_run())
+        self.assertEqual(event.get_extra("astrmai_execution_status"), "queue_timeout")
+        self.assertEqual(event.get_extra("astrmai_queue_timeout_stage"), "gateway.lane_prepare")
+
     def test_tool_chat_in_lane_passes_image_urls_to_tool_loop_agent(self):
         fake_context = _FakeContext()
         config = SimpleNamespace(

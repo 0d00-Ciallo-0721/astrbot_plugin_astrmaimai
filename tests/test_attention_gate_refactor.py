@@ -230,6 +230,160 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertTrue(response.get_extra("astrmai_effective_user_response"))
         self.assertTrue(calls[-1][1]["effective_response"])
 
+    def test_topic_activity_rejects_mixed_and_image_messages(self):
+        image = SimpleNamespace(type="image")
+        plain = SimpleNamespace(type="plain")
+        mixed = _FakeEvent("user-1", "Alice", "图片里写了周末", components=[plain, image])
+        image_only = _FakeEvent("user-2", "Bob", "", components=[image])
+
+        mixed_result = self.gate._classify_topic_activity(
+            mixed.unified_msg_origin, mixed, "user-1", is_private=False
+        )
+        image_result = self.gate._classify_topic_activity(
+            image_only.unified_msg_origin, image_only, "user-2", is_private=False
+        )
+
+        self.assertFalse(mixed_result["valid"])
+        self.assertFalse(image_result["valid"])
+        self.assertEqual(mixed_result["reason"], "non_plain_text")
+        self.assertEqual(image_result["reason"], "non_plain_text")
+
+    def test_repeated_identical_ignored_message_uses_short_cache(self):
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        gate = SimpleNamespace(
+            config=SimpleNamespace(attention=SimpleNamespace(
+                participation_policy_enabled=False,
+                judge_ignore_cache_ttl_sec=30,
+            )),
+            judge=_SequenceJudge(["IGNORE", "PASS"]),
+            dialogue_store=None,
+        )
+        router = router_mod.AttentionDecisionRouter(gate)
+        first = _FakeEvent("u1", "Alice", "普通聊天")
+        second = _FakeEvent("u1", "Alice", "普通聊天", message_id="second")
+
+        async def _run():
+            result_one = await router.evaluate("default:GroupMessage:group-1", first, SimpleNamespace(topic_epoch=1), [first], is_strong_wakeup=False)
+            result_two = await router.evaluate("default:GroupMessage:group-1", second, SimpleNamespace(topic_epoch=1), [second], is_strong_wakeup=False)
+            return result_one, result_two
+
+        result_one, result_two = asyncio.run(_run())
+        self.assertEqual(result_one.action, "IGNORE")
+        self.assertEqual(result_two.reason, "judge_ignore_cache")
+        self.assertEqual(len(gate.judge.calls), 1)
+
+    def test_ignored_topic_uses_short_ambient_cooldown_across_senders(self):
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        gate = SimpleNamespace(
+            config=SimpleNamespace(
+                attention=SimpleNamespace(
+                    participation_policy_enabled=False,
+                    judge_ignore_cache_ttl_sec=0,
+                    judge_ambient_cooldown_sec=30,
+                )
+            ),
+            judge=_SequenceJudge(["IGNORE", "PASS"]),
+            dialogue_store=None,
+        )
+        router = router_mod.AttentionDecisionRouter(gate)
+        first = _FakeEvent("u1", "Alice", "第一条环境聊天")
+        second = _FakeEvent("u2", "Bob", "同话题的另一条环境聊天")
+        third = _FakeEvent("u3", "Carol", "新话题")
+
+        async def _run():
+            first_result = await router.evaluate(
+                "default:GroupMessage:group-1",
+                first,
+                SimpleNamespace(topic_epoch=1),
+                [first],
+                is_strong_wakeup=False,
+            )
+            second_result = await router.evaluate(
+                "default:GroupMessage:group-1",
+                second,
+                SimpleNamespace(topic_epoch=1),
+                [second],
+                is_strong_wakeup=False,
+            )
+            third_result = await router.evaluate(
+                "default:GroupMessage:group-1",
+                third,
+                SimpleNamespace(topic_epoch=2),
+                [third],
+                is_strong_wakeup=False,
+            )
+            return first_result, second_result, third_result
+
+        first_result, second_result, third_result = asyncio.run(_run())
+        self.assertEqual(first_result.action, "IGNORE")
+        self.assertEqual(second_result.reason, "judge_ambient_cooldown")
+        self.assertEqual(second.get_extra("astrmai_judge_cache_scope"), "ambient_topic")
+        self.assertEqual(third_result.action, "PASS")
+        self.assertEqual(len(gate.judge.calls), 2)
+
+    def test_strong_wakeup_bypasses_ambient_ignore_cooldown(self):
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        gate = SimpleNamespace(
+            config=SimpleNamespace(
+                attention=SimpleNamespace(
+                    participation_policy_enabled=False,
+                    judge_ignore_cache_ttl_sec=0,
+                    judge_ambient_cooldown_sec=30,
+                )
+            ),
+            judge=_SequenceJudge(["IGNORE"]),
+            dialogue_store=None,
+        )
+        router = router_mod.AttentionDecisionRouter(gate)
+        ambient = _FakeEvent("u1", "Alice", "环境聊天")
+        direct = _FakeEvent("u2", "Bob", "AstrMai")
+
+        async def _run():
+            await router.evaluate(
+                "default:GroupMessage:group-1",
+                ambient,
+                SimpleNamespace(topic_epoch=1),
+                [ambient],
+                is_strong_wakeup=False,
+            )
+            return await router.evaluate(
+                "default:GroupMessage:group-1",
+                direct,
+                SimpleNamespace(topic_epoch=1),
+                [direct],
+                is_strong_wakeup=True,
+            )
+
+        result = asyncio.run(_run())
+        self.assertEqual(result.action, "PASS")
+        self.assertEqual(result.reason, "prefilter:strong_wakeup")
+        self.assertEqual(len(gate.judge.calls), 1)
+
+    def test_judge_ignore_caches_prune_expired_entries_and_enforce_capacity(self):
+        router_mod = importlib.import_module("astrmai.conversation.attention.decision_router")
+        router = router_mod.AttentionDecisionRouter(SimpleNamespace())
+        now = time.monotonic()
+        router._judge_ignore_cache = {
+            f"expired-{index}": (now - 1.0, "chat", index)
+            for index in range(32)
+        }
+        router._judge_ignore_cache.update(
+            {
+                f"live-{index}": (now + 10.0 + index, "chat", index)
+                for index in range(2200)
+            }
+        )
+        router._ambient_ignore_cache = {
+            f"ambient-{index}": now + 10.0 + index
+            for index in range(2200)
+        }
+
+        router._prune_ignore_caches()
+
+        self.assertEqual(len(router._judge_ignore_cache), 2048)
+        self.assertEqual(len(router._ambient_ignore_cache), 2048)
+        self.assertFalse(any(key.startswith("expired-") for key in router._judge_ignore_cache))
+
     def test_message_dedup_prefers_platform_message_id_and_expires_fallback(self):
         first = _FakeEvent("user-1", "Alice", "same", message_id="message-1")
         second = _FakeEvent("user-1", "Alice", "same", message_id="message-2")
@@ -609,6 +763,42 @@ class RefactoredAttentionGateTests(unittest.TestCase):
             traced,
             [("default:GroupMessage:group-1", "skipped_ignore", None)],
         )
+
+    def test_session_worker_wait_stages_are_recorded_on_anchor_event(self):
+        self.gate.judge = _SequenceJudge(["IGNORE"])
+        self.gate._compute_debounce_delay = lambda *args, **kwargs: 0.0
+        focus = _FakeEvent(
+            "user-1",
+            "Alice",
+            "observe queue timing",
+            extras={"astrmai_timestamp": time.time()},
+        )
+
+        async def _run():
+            session = self.gate_mod.SessionContext()
+            session.accumulation_pool = [focus]
+            session.is_evaluating = True
+            await self.gate._debounce_and_judge(
+                "default:GroupMessage:group-1",
+                session,
+                "bot-1",
+                worker_event=focus,
+            )
+
+        asyncio.run(_run())
+
+        stages = focus.get_extra("astrmai_stage_ledger", [])
+        by_name = {item["stage"]: item for item in stages}
+        for name in (
+            "attention.worker_wait",
+            "attention.debounce",
+            "attention.vision_pair_wait",
+            "attention.session_lock",
+        ):
+            self.assertIn(name, by_name)
+            self.assertEqual(by_name[name]["status"], "success")
+            self.assertGreaterEqual(by_name[name]["elapsed_ms"], 0.0)
+        self.assertEqual(by_name["attention.worker_wait"]["metadata"]["chat_id"], "default:GroupMessage:group-1")
 
     def test_strong_wakeup_skips_judge_gate(self):
         captured = []
@@ -2129,6 +2319,49 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         asyncio.run(_run())
 
         self.assertLessEqual(max_running, self.gate.BACKGROUND_TASK_MAX_CONCURRENCY)
+
+    def test_generation_cancels_turn_while_waiting_for_background_slot(self):
+        coordinator_mod = importlib.import_module(
+            "astrmai.infrastructure.runtime.chat_runtime_coordinator"
+        )
+        coordinator = coordinator_mod.ChatRuntimeCoordinator()
+        self.gate.runtime_coordinator = coordinator
+        release = asyncio.Event()
+        inner_started = False
+
+        async def blocker():
+            await release.wait()
+
+        async def stale_inner():
+            nonlocal inner_started
+            inner_started = True
+
+        async def _run():
+            blockers = [
+                self.gate._fire_background_task(blocker())
+                for _ in range(self.gate.BACKGROUND_TASK_MAX_CONCURRENCY)
+            ]
+            await asyncio.sleep(0)
+            generation = await coordinator.advance_generation("chat-1", "thread-1")
+            event = _FakeEvent("user-1", "Alice", "queued")
+            event.set_extra(
+                "astrmai_turn_identity",
+                SimpleNamespace(chat_id="chat-1", thread_id="thread-1", generation=generation),
+            )
+            stale_task = self.gate._fire_background_task(stale_inner(), event)
+            await asyncio.sleep(0)
+            await coordinator.advance_generation("chat-1", "thread-1")
+            result = await asyncio.gather(stale_task, return_exceptions=True)
+            release.set()
+            await asyncio.gather(*blockers)
+            return result, event.get_extra("astrmai_stage_ledger", [])
+
+        result, stages = asyncio.run(_run())
+
+        self.assertIsInstance(result[0], asyncio.CancelledError)
+        self.assertFalse(inner_started)
+        slot_stages = [item for item in stages if item["stage"] == "attention.background_slot_wait"]
+        self.assertEqual(slot_stages[-1]["status"], "cancelled")
 
     def test_context_compaction_engine_coalesces_execution_but_keeps_message_accounting(self):
         compaction_mod = importlib.import_module("astrmai.conversation.attention.context_compaction")

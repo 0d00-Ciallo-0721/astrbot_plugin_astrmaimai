@@ -15,7 +15,7 @@ def _number(value: Any) -> float:
         return 0.0
 
 
-def _percentile(values: Iterable[float], percentile: float) -> float:
+def _percentile(values: Iterable[float], percentile: float, *, digits: int = 1) -> float:
     ordered = sorted(max(0.0, _number(value)) for value in values)
     if not ordered:
         return 0.0
@@ -23,9 +23,9 @@ def _percentile(values: Iterable[float], percentile: float) -> float:
     low = math.floor(rank)
     high = math.ceil(rank)
     if low == high:
-        return round(ordered[low], 1)
+        return round(ordered[low], digits)
     weighted = ordered[low] * (high - rank) + ordered[high] * (rank - low)
-    return round(weighted, 1)
+    return round(weighted, digits)
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:
@@ -150,6 +150,18 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     wait_reason_counts: Counter[str] = Counter()
     stale_category_counts: Counter[str] = Counter()
     judge_outcome_counts: Counter[str] = Counter()
+    judge_cache_hit_count = 0
+    judge_cache_avoided_count = 0
+    judge_observation_count = 0
+    judge_cache_action_counts: Counter[str] = Counter()
+    judge_cache_scope_counts: Counter[str] = Counter()
+    judge_avoidance_state_counts: Counter[str] = Counter()
+    prefilter_judge_agreement_counts: Counter[str] = Counter()
+    faiss_status_counts: Counter[str] = Counter()
+    faiss_timeout_origin_counts: Counter[str] = Counter()
+    faiss_fallback_source_counts: Counter[str] = Counter()
+    faiss_query_wait_ms: list[float] = []
+    faiss_degraded_ratio_samples: list[float] = []
     llm_stage_counts: Counter[str] = Counter()
     llm_status_counts: Counter[str] = Counter()
     llm_path_counts: Counter[str] = Counter()
@@ -158,6 +170,19 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
     llm_stage_latencies: defaultdict[str, list[float]] = defaultdict(list)
     stage_status_counts: Counter[str] = Counter()
     stage_latencies: defaultdict[str, list[float]] = defaultdict(list)
+    timing_coverage_ratios: list[float] = []
+    timing_unattributed_ms: list[float] = []
+    timing_total_ms: list[float] = []
+    timing_first_delay_ms: list[float] = []
+    timing_post_last_delay_ms: list[float] = []
+    timing_max_gap_ms: list[float] = []
+    topic_activity_kind_counts: Counter[str] = Counter()
+    topic_activity_reason_counts: Counter[str] = Counter()
+    topic_activity_valid_count = 0
+    topic_effective_response_count = 0
+    proactive_dispatch_status_counts: Counter[str] = Counter()
+    proactive_blocked_reason_counts: Counter[str] = Counter()
+    proactive_stage_status_counts: Counter[str] = Counter()
     memory_status_counts: Counter[str] = Counter()
     reply_lengths: list[float] = []
     judge_calls_per_turn: list[float] = []
@@ -241,6 +266,42 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
         if decision.get("judge_timeout") and judge_outcome != "timeout":
             judge_outcome_counts["timeout"] += 1
 
+        judge_contract = _safe_dict(
+            trace.get("judge_decision")
+            or _safe_dict(trace.get("architecture_contract")).get("judge_decision")
+        )
+        cache_hit = judge_contract.get("cache_hit", None)
+        avoided = judge_contract.get("avoided", None)
+        agreement = judge_contract.get("prefilter_judge_agreement", None)
+        if any(
+            value is not None
+            for value in (cache_hit, avoided, agreement, judge_contract.get("cache_action"), judge_contract.get("cache_scope"))
+        ):
+            judge_observation_count += 1
+        if isinstance(cache_hit, bool):
+            if cache_hit:
+                judge_cache_hit_count += 1
+        if isinstance(avoided, bool):
+            if avoided:
+                judge_cache_avoided_count += 1
+                judge_avoidance_state_counts["avoided"] += 1
+            else:
+                judge_avoidance_state_counts["called"] += 1
+        else:
+            judge_avoidance_state_counts["unknown"] += 1
+        cache_action = str(judge_contract.get("cache_action", "") or "")
+        cache_scope = str(judge_contract.get("cache_scope", "") or "")
+        if cache_action:
+            judge_cache_action_counts[cache_action] += 1
+        if cache_scope:
+            judge_cache_scope_counts[cache_scope] += 1
+        if agreement is True:
+            prefilter_judge_agreement_counts["true"] += 1
+        elif agreement is False:
+            prefilter_judge_agreement_counts["false"] += 1
+        else:
+            prefilter_judge_agreement_counts["unknown"] += 1
+
         calls = _safe_list(trace.get("llm_call_ledger"))
         llm_calls_per_turn.append(float(len(calls)))
         judge_count = 0
@@ -276,6 +337,48 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
         if not stages:
             missing["stage_ledger"] += 1
 
+        timing_coverage = _safe_dict(trace.get("timing_coverage"))
+        if timing_coverage:
+            timing_coverage_ratios.append(_number(timing_coverage.get("coverage_ratio")))
+            timing_unattributed_ms.append(_number(timing_coverage.get("unattributed_ms")))
+            timing_total_ms.append(
+                _number(timing_coverage.get("instrumented_ms"))
+                + _number(timing_coverage.get("unattributed_ms"))
+            )
+            timing_first_delay_ms.append(_number(timing_coverage.get("first_observed_delay_ms")))
+            timing_post_last_delay_ms.append(_number(timing_coverage.get("post_last_observed_delay_ms")))
+            timing_max_gap_ms.append(_number(timing_coverage.get("max_unattributed_gap_ms")))
+        else:
+            missing["timing_coverage"] += 1
+
+        topic_activity = _safe_dict(
+            trace.get("topic_activity") or trace.get("topic_observation")
+        )
+        if topic_activity:
+            if bool(topic_activity.get("valid")):
+                topic_activity_valid_count += 1
+            if bool(topic_activity.get("effective_user_response")):
+                topic_effective_response_count += 1
+            topic_kind = str(topic_activity.get("kind", "") or "")
+            topic_reason = str(topic_activity.get("reason", "") or "")
+            if topic_kind:
+                topic_activity_kind_counts[topic_kind] += 1
+            if topic_reason:
+                topic_activity_reason_counts[topic_reason] += 1
+
+        proactive = _safe_dict(trace.get("proactive_observation"))
+        if proactive:
+            dispatch_status = str(proactive.get("dispatch_status", "") or "")
+            blocked_reason = str(proactive.get("blocked_reason", "") or "")
+            if dispatch_status:
+                proactive_dispatch_status_counts[dispatch_status] += 1
+            if blocked_reason:
+                proactive_blocked_reason_counts[blocked_reason] += 1
+            for proactive_stage in _safe_list(proactive.get("stage_ledger")):
+                stage_name = str(proactive_stage.get("stage", "") or "unknown")
+                stage_status = str(proactive_stage.get("status", "") or "unknown")
+                proactive_stage_status_counts[f"{stage_name}:{stage_status}"] += 1
+
         contexts = _safe_list(trace.get("context_block_stats"))
         for context in contexts:
             total_chars = _number(context.get("total_chars"))
@@ -299,6 +402,36 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             missing["budget"] += 1
 
         memory = _safe_dict(trace.get("memory_funnel"))
+        architecture_contract = _safe_dict(trace.get("architecture_contract"))
+        memory_retrieval_contract = _safe_dict(
+            trace.get("memory_retrieval_observation")
+            or architecture_contract.get("memory_retrieval_observation")
+        )
+        hybrid_observations = _safe_list(
+            memory.get("hybrid_observations")
+            or memory_retrieval_contract.get("hybrid_observations")
+        )
+        for hybrid in hybrid_observations:
+            vector = _safe_dict(hybrid.get("vector"))
+            vector_status = str(vector.get("status", "") or "")
+            if vector_status:
+                faiss_status_counts[vector_status] += 1
+            timeout_origin = str(vector.get("timeout_origin", "") or "")
+            if timeout_origin:
+                faiss_timeout_origin_counts[timeout_origin] += 1
+            query_wait = vector.get("query_queue_wait_ms", None)
+            if query_wait is not None:
+                faiss_query_wait_ms.append(_number(query_wait))
+            runtime_metrics = _safe_dict(vector.get("runtime_metrics"))
+            if "degraded_ratio" in runtime_metrics:
+                faiss_degraded_ratio_samples.append(_number(runtime_metrics.get("degraded_ratio")))
+        vector_fallback = _safe_dict(
+            memory.get("vector_fallback")
+            or memory_retrieval_contract.get("vector_fallback")
+        )
+        fallback_source = str(vector_fallback.get("source", "") or "")
+        if fallback_source:
+            faiss_fallback_source_counts[fallback_source] += 1
         rewrite_trace = _safe_dict(
             memory.get("query_rewrite_trace")
             or memory.get("rewrite_trace")
@@ -504,6 +637,15 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "calls_per_turn_p95": _percentile(llm_calls_per_turn, 0.95),
             "judge_calls_per_turn_p50": _percentile(judge_calls_per_turn, 0.50),
             "judge_calls_per_turn_p95": _percentile(judge_calls_per_turn, 0.95),
+            "judge_observation_count": judge_observation_count,
+            "judge_cache_hit_count": judge_cache_hit_count,
+            "judge_avoided_count": judge_cache_avoided_count,
+            "judge_cache_action_counts": dict(judge_cache_action_counts.most_common()),
+            "judge_cache_scope_counts": dict(judge_cache_scope_counts.most_common()),
+            "judge_avoidance_state_counts": dict(judge_avoidance_state_counts.most_common()),
+            "prefilter_judge_agreement_counts": dict(
+                prefilter_judge_agreement_counts.most_common()
+            ),
             "attempts_per_call_p95": _percentile(attempt_counts, 0.95),
             "latency_by_stage": {
                 stage: {
@@ -526,6 +668,29 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 }
                 for stage, values in sorted(stage_latencies.items())
             },
+        },
+        "timing_coverage": {
+            "samples": len(timing_coverage_ratios),
+            "coverage_ratio_p50": _percentile(timing_coverage_ratios, 0.50),
+            "coverage_ratio_p05": _percentile(timing_coverage_ratios, 0.05),
+            "unattributed_ms_p50": _percentile(timing_unattributed_ms, 0.50),
+            "unattributed_ms_p95": _percentile(timing_unattributed_ms, 0.95),
+            "unattributed_ms_max": round(max(timing_unattributed_ms), 1) if timing_unattributed_ms else 0.0,
+            "total_ms_p95": _percentile(timing_total_ms, 0.95),
+            "first_observed_delay_ms_p95": _percentile(timing_first_delay_ms, 0.95),
+            "post_last_observed_delay_ms_p95": _percentile(timing_post_last_delay_ms, 0.95),
+            "max_unattributed_gap_ms_p95": _percentile(timing_max_gap_ms, 0.95),
+        },
+        "topic_activity": {
+            "valid_count": topic_activity_valid_count,
+            "effective_user_response_count": topic_effective_response_count,
+            "kind_counts": dict(topic_activity_kind_counts.most_common()),
+            "reason_counts": dict(topic_activity_reason_counts.most_common(20)),
+        },
+        "proactive": {
+            "dispatch_status_counts": dict(proactive_dispatch_status_counts.most_common()),
+            "blocked_reason_counts": dict(proactive_blocked_reason_counts.most_common(20)),
+            "stage_status_counts": dict(proactive_stage_status_counts.most_common()),
         },
         "reply": {
             "count_with_stats": len(reply_lengths),
@@ -578,6 +743,19 @@ def analyze_traces(traces: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "selected_count": memory_selected,
             "rendered_chars": memory_rendered_chars,
             "selection_rate": round(memory_selected / memory_candidates, 4) if memory_candidates else 0.0,
+        },
+        "faiss": {
+            "status_counts": dict(faiss_status_counts.most_common()),
+            "timeout_origin_counts": dict(faiss_timeout_origin_counts.most_common()),
+            "fallback_source_counts": dict(faiss_fallback_source_counts.most_common()),
+            "query_queue_wait_ms_p50": _percentile(faiss_query_wait_ms, 0.50),
+            "query_queue_wait_ms_p95": _percentile(faiss_query_wait_ms, 0.95),
+            "degraded_ratio_p50": _percentile(
+                faiss_degraded_ratio_samples, 0.50, digits=4
+            ),
+            "degraded_ratio_p95": _percentile(
+                faiss_degraded_ratio_samples, 0.95, digits=4
+            ),
         },
         "vision": {
             "trace_count": vision_trace_count,
@@ -637,6 +815,10 @@ def render_markdown(report: dict[str, Any]) -> str:
     vision = _safe_dict(report.get("vision"))
     relationship = _safe_dict(report.get("relationship"))
     expression = _safe_dict(report.get("expression"))
+    timing_coverage = _safe_dict(report.get("timing_coverage"))
+    topic_activity = _safe_dict(report.get("topic_activity"))
+    proactive = _safe_dict(report.get("proactive"))
+    faiss = _safe_dict(report.get("faiss"))
     lines = [
         "# AstrMai Turn Ledger Analysis",
         "",
@@ -647,6 +829,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Context chars P50/P95: {context.get('chars_p50', 0)} / {context.get('chars_p95', 0)}",
         f"- Duplicate context blocks: {int(context.get('duplicate_block_count', 0) or 0)}",
         f"- Turn budget exhausted: {int(budget.get('exhausted_count', 0) or 0)}",
+        f"- Timing coverage P50/P05: {timing_coverage.get('coverage_ratio_p50', 0)} / {timing_coverage.get('coverage_ratio_p05', 0)}",
+        f"- Unattributed time P50/P95/max ms: {timing_coverage.get('unattributed_ms_p50', 0)} / {timing_coverage.get('unattributed_ms_p95', 0)} / {timing_coverage.get('unattributed_ms_max', 0)}",
+        f"- First/post-last/max-gap P95 ms: {timing_coverage.get('first_observed_delay_ms_p95', 0)} / {timing_coverage.get('post_last_observed_delay_ms_p95', 0)} / {timing_coverage.get('max_unattributed_gap_ms_p95', 0)}",
         f"- Memory candidates/selected: {int(memory.get('candidate_count', 0) or 0)} / {int(memory.get('selected_count', 0) or 0)}",
         "",
         "## Status",
@@ -656,9 +841,34 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## LLM Stages"])
     for key, value in _safe_dict(llm.get("stage_counts")).items():
         lines.append(f"- `{key}`: {value}")
+    lines.append(
+        f"- Judge observed/cache-hit/avoided: {int(llm.get('judge_observation_count', 0) or 0)} / "
+        f"{int(llm.get('judge_cache_hit_count', 0) or 0)} / "
+        f"{int(llm.get('judge_avoided_count', 0) or 0)}"
+    )
+    for key, value in _safe_dict(llm.get("judge_cache_scope_counts")).items():
+        lines.append(f"- `judge_cache_scope:{key}`: {value}")
+    for key, value in _safe_dict(llm.get("prefilter_judge_agreement_counts")).items():
+        lines.append(f"- `prefilter_judge_agreement:{key}`: {value}")
     lines.extend(["", "## Skip Reasons"])
     for key, value in _safe_dict(report.get("skip_reasons")).items():
         lines.append(f"- `{key}`: {value}")
+    lines.extend(["", "## Topic Activity"])
+    lines.append(f"- Valid activity: {int(topic_activity.get('valid_count', 0) or 0)}")
+    lines.append(
+        f"- Effective user responses: {int(topic_activity.get('effective_user_response_count', 0) or 0)}"
+    )
+    for key, value in _safe_dict(topic_activity.get("kind_counts")).items():
+        lines.append(f"- `kind:{key}`: {value}")
+    for key, value in _safe_dict(topic_activity.get("reason_counts")).items():
+        lines.append(f"- `reason:{key}`: {value}")
+    lines.extend(["", "## Proactive Lifecycle"])
+    for key, value in _safe_dict(proactive.get("dispatch_status_counts")).items():
+        lines.append(f"- `dispatch:{key}`: {value}")
+    for key, value in _safe_dict(proactive.get("blocked_reason_counts")).items():
+        lines.append(f"- `blocked:{key}`: {value}")
+    for key, value in _safe_dict(proactive.get("stage_status_counts")).items():
+        lines.append(f"- `stage:{key}`: {value}")
     lines.extend(["", "## Decision Diagnostics"])
     for label, values in (
         ("wait", _safe_dict(decision.get("wait_reasons"))),
@@ -674,6 +884,21 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- `{key}`: {value}")
     else:
         lines.append("- No observed rewrite traces")
+    lines.extend(["", "## Faiss Retrieval"])
+    for key, value in _safe_dict(faiss.get("status_counts")).items():
+        lines.append(f"- `status:{key}`: {value}")
+    for key, value in _safe_dict(faiss.get("timeout_origin_counts")).items():
+        lines.append(f"- `timeout:{key}`: {value}")
+    for key, value in _safe_dict(faiss.get("fallback_source_counts")).items():
+        lines.append(f"- `fallback:{key}`: {value}")
+    lines.append(
+        f"- Query queue wait P50/P95 ms: {faiss.get('query_queue_wait_ms_p50', 0)} / "
+        f"{faiss.get('query_queue_wait_ms_p95', 0)}"
+    )
+    lines.append(
+        f"- Runtime degraded ratio P50/P95: {faiss.get('degraded_ratio_p50', 0)} / "
+        f"{faiss.get('degraded_ratio_p95', 0)}"
+    )
     lines.extend(["", "## Vision"])
     lines.append(f"- Vision traces: {int(vision.get('trace_count', 0) or 0)}")
     lines.append(

@@ -885,8 +885,8 @@
       "participation_drop_enabled": {
         "description": "无关消息直接过滤",
         "type": "bool",
-        "default": false,
-        "hint": "开启后，高置信无关回执和回声会直接过滤，不再调用注意力模型。建议先保持关闭，让系统只记录影子判断，确认没有误判后再开启。"
+        "default": true,
+        "hint": "开启后，只对外部插件未指向回执、机器人回声和空事件做确定性过滤；普通群聊文本仍交给注意力模型。"
       },
       "participation_hysteresis_ttl_sec": {
         "description": "群聊短期承接时间（秒）",
@@ -895,6 +895,22 @@
         "minimum": 10,
         "maximum": 1800,
         "hint": "机器人刚回复过某人后，在同一话题内保留自然承接的时间。话题切换或超时会立即失效。"
+      },
+      "judge_ignore_cache_ttl_sec": {
+        "description": "忽略判决短期缓存时间（秒）",
+        "type": "float",
+        "default": 8.0,
+        "minimum": 0.0,
+        "maximum": 60.0,
+        "hint": "同一群、同一发送者和同一短文本在短时间内再次进入窗口时复用忽略结果，减少重复判决；设置为零可关闭。"
+      },
+      "judge_ambient_cooldown_sec": {
+        "description": "同话题环境消息冷却时间（秒）",
+        "type": "float",
+        "default": 3.0,
+        "minimum": 0.0,
+        "maximum": 15.0,
+        "hint": "同一话题刚被判定忽略后，短时间内的非指向环境消息不再重复判决；明确互动和新话题不受影响。"
       }
     }
   },
@@ -975,6 +991,14 @@
         "type": "int",
         "default": 30,
         "hint": "当记忆或对话积累到一定规模后，会更倾向于做摘要压缩。"
+      },
+      "maintenance_concurrency": {
+        "description": "记忆维护最大并发数",
+        "type": "int",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 4,
+        "hint": "限制同时运行记忆摘要维护的会话数量，避免后台摘要占满模型和数据库资源。"
       },
       "recall_top_k": {
         "description": "单次召回记忆条数",
@@ -1253,6 +1277,14 @@
         "maximum": 300.0,
         "hint": "表达或黑话单轮从提取、增强到持久化共用该预算；超时不推进游标，等待后续重试。"
       },
+      "learning_pipeline_concurrency": {
+        "description": "跨会话学习管线最大并发数",
+        "type": "int",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 4,
+        "hint": "限制不同会话同时运行表达和黑话学习的数量，避免后台学习占满模型、处理器和数据库资源。"
+      },
       "learning_run_retention_days": {
         "description": "学习运行记录保留天数",
         "type": "int",
@@ -1421,6 +1453,22 @@
         "default": 28800,
         "hint": "两次主动开口之间至少间隔多久。"
       },
+      "proactive_quiet_recheck_sec": {
+        "description": "主动发言后的最短安静时间（秒）",
+        "type": "int",
+        "default": 7200,
+        "minimum": 300,
+        "maximum": 86400,
+        "hint": "主动发言后至少等待两小时并确认没有新的有效话题活动，才允许再次评估。"
+      },
+      "proactive_failure_backoff_factor": {
+        "description": "主动候选失败退避倍数",
+        "type": "float",
+        "default": 2.0,
+        "minimum": 1.0,
+        "maximum": 4.0,
+        "hint": "主动候选被拦截或发送失败时逐步延长下一次评估等待时间，避免后台重复尝试。"
+      },
       "proactive_max_unanswered": {
         "description": "连续未回应主动消息上限",
         "type": "int",
@@ -1462,6 +1510,22 @@
         "type": "bool",
         "default": true,
         "hint": "生成失败或超时时自动使用内置日程，不会阻塞聊天。"
+      },
+      "daily_schedule_max_retries": {
+        "description": "日程生成最大重试次数",
+        "type": "int",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 5,
+        "hint": "日程模型输出异常时有限次重试；超过次数后保留固定兜底日程，避免后台持续占用资源。"
+      },
+      "daily_schedule_retry_base_sec": {
+        "description": "日程生成首次重试等待时间（秒）",
+        "type": "int",
+        "default": 300,
+        "minimum": 30,
+        "maximum": 3600,
+        "hint": "日程模型失败后等待多久再进行首次重试，后续重试等待时间会逐步增加。"
       },
       "morning_greeting_enabled": {
         "description": "启用早安候选",
@@ -1532,6 +1596,14 @@
         "type": "int",
         "default": 50,
         "hint": "与某个用户互动到一定量后，系统才会尝试形成更稳定的画像。"
+      },
+      "profiling_user_cooldown_sec": {
+        "description": "同一用户画像生成冷却（秒）",
+        "type": "int",
+        "default": 21600,
+        "minimum": 0,
+        "maximum": 604800,
+        "hint": "同一用户刚生成画像后，即使短时间内再次达到消息阈值，也会等到冷却结束再生成，避免重复占用后台模型。"
       }
     }
   },
@@ -1677,6 +1749,46 @@
         "maximum": 1800,
         "hint": "意图判决、查询改写等前置步骤不会占用这部分预算，确保仍有时间生成主回复。"
       },
+      "sys2_lock_wait_timeout_sec": {
+        "description": "认知执行锁最长等待（秒）",
+        "type": "float",
+        "default": 20.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "同一群聊已有认知回合执行时，新的回合最多等待这段时间；超时后直接丢弃过期回合，不继续占用队列。"
+      },
+      "executor_lock_wait_timeout_sec": {
+        "description": "回复执行锁最长等待（秒）",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "同一群聊已有回复生成时，新的回复最多等待这段时间；超时后结束本轮并释放排队计数。"
+      },
+      "lane_prepare_timeout_sec": {
+        "description": "会话通道准备最长等待（秒）",
+        "type": "float",
+        "default": 20.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "准备模型会话通道和历史记录的最长等待时间；超时后停止本轮模型切换，避免通道锁形成长时间排队。"
+      },
+      "lane_persist_timeout_sec": {
+        "description": "会话历史写入最长等待（秒）",
+        "type": "float",
+        "default": 5.0,
+        "minimum": 0.1,
+        "maximum": 600,
+        "hint": "模型回复完成后写入会话历史的最长等待时间；超时只跳过本次历史写入，不阻塞已经生成的可见回复。"
+      },
+      "proactive_completion_timeout_sec": {
+        "description": "主动候选最终回执最长等待（秒）",
+        "type": "float",
+        "default": 180.0,
+        "minimum": 5,
+        "maximum": 3600,
+        "hint": "主动候选入队后等待规划、执行和发送结果的最长时间；超时会按未发送处理并释放主动任务状态。"
+      },
       "reply_max_age_sec": {
         "description": "聊天回复最长有效时间（秒）",
         "type": "float",
@@ -1796,6 +1908,22 @@
         "minimum": 0.5,
         "maximum": 60,
         "hint": "向量检索默认最多等待 20 秒；超时后立即使用文字检索，不会中断本轮聊天。"
+      },
+      "faiss_query_concurrency": {
+        "description": "向量检索最大并发数",
+        "type": "int",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 8,
+        "hint": "限制同时运行的向量查询数量，避免高峰期并发检索争抢处理器和索引资源。"
+      },
+      "faiss_thread_count": {
+        "description": "单次向量索引查询线程数",
+        "type": "int",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 8,
+        "hint": "限制每次向量索引查询使用的处理器线程数，避免单次检索占满处理器。"
       },
       "faiss_failure_threshold": {
         "description": "向量检索连续失败次数",
@@ -2096,6 +2224,30 @@
         "type": "int",
         "default": 3,
         "hint": "同一时间最多允许多少个模型请求同时进行。数值过大可能更容易触发限流。"
+      },
+      "background_task_concurrency": {
+        "description": "受预算后台任务并发数",
+        "type": "int",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 8,
+        "hint": "限制已接入预算的学习、主动和记忆维护任务同时运行的数量；消息入口、注意力判断和常驻任务使用各自的调度边界。"
+      },
+      "background_task_queue_limit": {
+        "description": "受预算后台任务排队上限",
+        "type": "int",
+        "default": 64,
+        "minimum": 0,
+        "maximum": 2048,
+        "hint": "等待后台执行名额的任务达到此数量后，新任务会立即拒绝，避免高峰期持续堆积。填零表示繁忙时不允许排队。"
+      },
+      "background_task_wait_timeout_sec": {
+        "description": "受预算后台任务最长排队时间（秒）",
+        "type": "float",
+        "default": 120.0,
+        "minimum": 0.1,
+        "maximum": 3600.0,
+        "hint": "后台任务等待执行名额超过该时间后会放弃本次运行，避免过期任务在拥堵解除后集中启动。"
       },
       "critical_path_reserved_slots": {
         "description": "回复链保留并发槽位",

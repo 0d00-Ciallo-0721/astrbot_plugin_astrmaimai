@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import List, Optional
 
@@ -17,10 +18,17 @@ class LaneTranscriptMixin:
         max_turns: int = 4,
         max_age_seconds: Optional[float] = None,
     ) -> str:
-        lane_umo, _conversation_id, history, _ = await self.ensure_lane(
-            lane_key=lane_key,
-            base_origin=base_origin,
-        )
+        ensure_lane = getattr(self, "_ensure_lane_with_timeout", None)
+        if callable(ensure_lane):
+            lane_umo, _conversation_id, history, _ = await ensure_lane(
+                lane_key=lane_key,
+                base_origin=base_origin,
+            )
+        else:
+            lane_umo, _conversation_id, history, _ = await asyncio.wait_for(
+                self.ensure_lane(lane_key=lane_key, base_origin=base_origin),
+                timeout=20.0,
+            )
         if not history:
             return ""
 

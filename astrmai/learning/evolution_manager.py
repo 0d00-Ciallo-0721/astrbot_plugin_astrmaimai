@@ -10,6 +10,10 @@ from typing import Any, Dict, List
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+from ..infrastructure.runtime.background_task_budget import (
+    BackgroundTaskQueueFull,
+    BackgroundTaskQueueTimeout,
+)
 from ..infrastructure.runtime.lane_manager import LaneKey
 from ..memory.contracts.memory_query import MemoryWriteRequest
 from .contracts.learning_events import (
@@ -86,11 +90,12 @@ def _jargon_sense_evidence(evidence: dict[str, Any], sense: dict[str, Any]) -> d
 
 
 class EvolutionManager:
-    def __init__(self, db, gateway, config=None, event_bus=None):
+    def __init__(self, db, gateway, config=None, event_bus=None, background_task_budget=None):
         self.db = db
         self.gateway = gateway
         self.config = config if config else gateway.config
         self.event_bus = event_bus
+        self.background_task_budget = background_task_budget
         self.expression_miner = ExpressionMiner(
             gateway,
             self.config,
@@ -117,7 +122,11 @@ class EvolutionManager:
         self._lock_mutex = asyncio.Lock()
         self._background_tasks: set[asyncio.Task] = set()
         self._mining_tasks: Dict[str, asyncio.Task] = {}
+        self._mining_rerun_requested: set[str] = set()
         self._backlog_task: asyncio.Task | None = None
+        self._pipeline_limit = self._learning_pipeline_concurrency()
+        self._pipeline_semaphore = asyncio.Semaphore(self._pipeline_limit)
+        self._active_pipeline_tasks = 0
         self._backlog_failure_until: dict[str, float] = {}
         # Runtime cache mirrors persisted checkpoint failures; evidence is retained on failure.
         self._backlog_failure_counts: dict[str, int] = {}
@@ -160,6 +169,10 @@ class EvolutionManager:
             1,
         )
         self.jargon_miner.min_messages = self._pipeline_threshold("jargon")
+        configured_limit = self._learning_pipeline_concurrency()
+        if configured_limit != self._pipeline_limit and self._active_pipeline_tasks == 0:
+            self._pipeline_limit = configured_limit
+            self._pipeline_semaphore = asyncio.Semaphore(configured_limit)
         if self.jargon_miner.enricher is not None:
             self.jargon_miner.enricher.config = config
         if not self._backlog_enabled() and self._backlog_task is not None:
@@ -167,6 +180,10 @@ class EvolutionManager:
 
     def _evolution_config(self):
         return getattr(self.config, "evolution", None)
+
+    def _learning_pipeline_concurrency(self) -> int:
+        evolution = self._evolution_config()
+        return max(1, min(4, int(getattr(evolution, "learning_pipeline_concurrency", 1) or 1)))
 
     def _backlog_enabled(self) -> bool:
         evolution = self._evolution_config()
@@ -221,7 +238,11 @@ class EvolutionManager:
                 self._mining_locks[group_id] = asyncio.Lock()
             return self._mining_locks[group_id]
 
-    def _fire_background_task(self, coro):
+    def _fire_background_task(self, awaitable_factory):
+        if self.background_task_budget is not None:
+            coro = self.background_task_budget.run(awaitable_factory)
+        else:
+            coro = awaitable_factory()
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._handle_task_result)
@@ -233,13 +254,17 @@ class EvolutionManager:
             return
         current = self._mining_tasks.get(group_id)
         if current is not None and not current.done():
+            self._mining_rerun_requested.add(group_id)
             return
-        task = self._fire_background_task(self._try_trigger_mining(group_id))
+        task = self._fire_background_task(lambda: self._try_trigger_mining(group_id))
         self._mining_tasks[group_id] = task
 
         def _release(done_task: asyncio.Task) -> None:
             if self._mining_tasks.get(group_id) is done_task:
                 self._mining_tasks.pop(group_id, None)
+            if group_id in self._mining_rerun_requested:
+                self._mining_rerun_requested.discard(group_id)
+                self._schedule_mining_if_triggered(group_id, True)
 
         task.add_done_callback(_release)
 
@@ -248,7 +273,10 @@ class EvolutionManager:
         try:
             exc = task.exception()
             if exc:
-                logger.error(f"[Evolution Task Error] {exc}", exc_info=exc)
+                if isinstance(exc, (BackgroundTaskQueueFull, BackgroundTaskQueueTimeout)):
+                    logger.warning(f"[Evolution Task] background task skipped: {exc}")
+                else:
+                    logger.error(f"[Evolution Task Error] {exc}", exc_info=exc)
         except asyncio.CancelledError:
             logger.debug(f"[Evolution Task] task cancelled: {task.get_name()}")
 
@@ -752,6 +780,11 @@ class EvolutionManager:
                 "expression": dict(getattr(self.expression_miner, "last_report", {}) or {}),
                 "jargon": dict(getattr(self.jargon_miner, "last_report", {}) or {}),
                 "last_outcomes": dict(self._last_mining_outcomes),
+            },
+            "pipeline_runtime": {
+                "configured_concurrency": int(self._pipeline_limit),
+                "active_tasks": int(self._active_pipeline_tasks),
+                "available_slots": max(0, int(getattr(self._pipeline_semaphore, "_value", 0) or 0)),
             },
             "run_retention": {
                 "days": self._learning_run_retention_days(),
@@ -1301,6 +1334,20 @@ class EvolutionManager:
         group_id: str,
         logs: List["MessageLog"],
     ) -> dict[str, Any]:
+        await self._pipeline_semaphore.acquire()
+        self._active_pipeline_tasks += 1
+        try:
+            return await self._run_learning_pipeline_unlimited(pipeline, group_id, logs)
+        finally:
+            self._active_pipeline_tasks = max(0, self._active_pipeline_tasks - 1)
+            self._pipeline_semaphore.release()
+
+    async def _run_learning_pipeline_unlimited(
+        self,
+        pipeline: str,
+        group_id: str,
+        logs: List["MessageLog"],
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         timeout_sec = max(
             0.01,
@@ -1843,9 +1890,10 @@ class EvolutionManager:
     async def start_background_tasks(self) -> None:
         if self._backlog_task is not None and not self._backlog_task.done():
             return
-        self._backlog_task = self._fire_background_task(self._backlog_mining_loop())
+        self._backlog_task = self._fire_background_task(self._backlog_mining_loop)
 
     async def stop_background_tasks(self) -> None:
+        self._mining_rerun_requested.clear()
         tasks = [task for task in [self._backlog_task, *self._background_tasks] if task is not None and not task.done()]
         for task in tasks:
             task.cancel()

@@ -191,6 +191,17 @@ class MemoryInjectionService:
             rewrite_trace = query_metadata.get("query_rewrite_trace")
             if isinstance(rewrite_trace, dict):
                 payload = {**payload, "query_rewrite_trace": dict(rewrite_trace)}
+            trace_payload = dict(query_metadata.get("_trace") or {})
+            hybrid_observations = [
+                dict(item)
+                for item in list(trace_payload.get("hybrid_observations") or [])[-4:]
+                if isinstance(item, dict)
+            ]
+            vector_fallback = trace_payload.get("vector_fallback")
+            if hybrid_observations:
+                payload = {**payload, "hybrid_observations": hybrid_observations}
+            if isinstance(vector_fallback, dict) and vector_fallback:
+                payload = {**payload, "vector_fallback": dict(vector_fallback)}
             if hasattr(event, "set_extra"):
                 event.set_extra("astrmai_memory_funnel", dict(payload))
 

@@ -138,6 +138,27 @@ class ExecutedTraceFieldContractTests(unittest.TestCase):
         self.assertEqual(item["memory_funnel"]["status"], "skipped")
         self.assertEqual(item["memory_funnel"]["skip_reason"], "think_level_0")
 
+    def test_legacy_topic_observation_carries_semantic_activity_contract(self):
+        event = self._executed_event()
+        event.set_extra("astrmai_topic_activity_valid", True)
+        event.set_extra("astrmai_topic_activity_kind", "message")
+        event.set_extra("astrmai_topic_activity_reason", "semantic_topic_text")
+        event.set_extra("astrmai_topic_activity_source", "attention_gate")
+        event.set_extra("astrmai_effective_user_response", True)
+        event.set_extra("astrmai_topic_activity_state_before", {"unanswered_count": 1})
+        event.set_extra("astrmai_topic_activity_state_after", {"unanswered_count": 0})
+
+        item = self._build(event)
+        observation = item["topic_observation"]
+
+        self.assertTrue(observation["valid"])
+        self.assertEqual(observation["kind"], "message")
+        self.assertEqual(observation["reason"], "semantic_topic_text")
+        self.assertEqual(observation["source"], "attention_gate")
+        self.assertTrue(observation["effective_user_response"])
+        self.assertEqual(observation["state_before"]["unanswered_count"], 1)
+        self.assertEqual(observation["state_after"]["unanswered_count"], 0)
+
     def test_vision_observation_survives_trace_assembly(self):
         event = self._executed_event()
         with turn_telemetry_scope(event):

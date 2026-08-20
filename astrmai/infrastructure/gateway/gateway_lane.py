@@ -11,8 +11,11 @@ from ..runtime.runtime_contracts import LLMCallResult
 from ..runtime.trace_runtime import append_trace_stage, preview_text
 from ..runtime.turn_call_ledger import (
     begin_llm_call,
+    begin_stage,
+    clamp_timeout_to_turn_budget,
     current_turn_telemetry,
     finish_llm_call,
+    finish_stage,
     record_llm_attempt,
     remaining_turn_budget,
 )
@@ -21,6 +24,56 @@ from .output_guard import validate_visible_output_text
 
 
 class GatewayLaneMixin:
+    def _lane_prepare_timeout(self, event: Any) -> float:
+        timing = getattr(getattr(self, "config", None), "timing", None)
+        try:
+            configured = float(getattr(timing, "lane_prepare_timeout_sec", 20.0) or 20.0)
+        except (TypeError, ValueError):
+            configured = 20.0
+        return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
+
+    def _lane_persist_timeout(self, event: Any) -> float:
+        timing = getattr(getattr(self, "config", None), "timing", None)
+        try:
+            configured = float(getattr(timing, "lane_persist_timeout_sec", 5.0) or 5.0)
+        except (TypeError, ValueError):
+            configured = 5.0
+        return clamp_timeout_to_turn_budget(event, max(0.1, configured), reserve_for_reply=True)
+
+    async def _ensure_lane_bounded(self, event: Any, **kwargs):
+        stage_id = begin_stage(
+            event,
+            "gateway.lane_prepare",
+            critical_path=True,
+            metadata={"lane_scope": str(getattr(kwargs.get("lane_key"), "scope_id", "") or "")},
+        )
+        timeout_sec = self._lane_prepare_timeout(event)
+        if timeout_sec <= 0.0:
+            finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
+            if event is not None and hasattr(event, "set_extra"):
+                event.set_extra("astrmai_execution_status", "queue_timeout")
+                event.set_extra("astrmai_queue_timeout_stage", "gateway.lane_prepare")
+            raise asyncio.TimeoutError("lane preparation exceeded turn budget")
+        try:
+            result = await asyncio.wait_for(
+                self.lane_manager.ensure_lane(**kwargs),
+                timeout=max(0.1, timeout_sec),
+            )
+        except asyncio.TimeoutError:
+            finish_stage(event, stage_id, status="timeout", reason="queue_timeout")
+            if event is not None and hasattr(event, "set_extra"):
+                event.set_extra("astrmai_execution_status", "queue_timeout")
+                event.set_extra("astrmai_queue_timeout_stage", "gateway.lane_prepare")
+            raise
+        except asyncio.CancelledError:
+            finish_stage(event, stage_id, status="cancelled", reason="acquire_cancelled")
+            raise
+        except Exception as exc:
+            finish_stage(event, stage_id, status="error", reason=type(exc).__name__)
+            raise
+        finish_stage(event, stage_id, metadata={"timeout_sec": timeout_sec})
+        return result
+
     @staticmethod
     def _stringify_request_cache_control(value: Any) -> str:
         if not value:
@@ -133,22 +186,48 @@ class GatewayLaneMixin:
             and history_policy.rotation_reason == "lightweight_event"
         )
         if artifact_text and not skip_history_persist:
+            persist_stage = begin_stage(
+                event,
+                "gateway.lane_persist",
+                critical_path=True,
+                metadata={"lane_scope": str(getattr(effective_lane_key, "scope_id", "") or "")},
+            )
+            persist_timeout = self._lane_persist_timeout(event)
             try:
+                if persist_timeout <= 0.0:
+                    raise asyncio.TimeoutError("lane persistence exceeded turn budget")
                 artifact = self._build_lane_artifact(result, artifact_text)
-                await self.lane_manager.append_visible_reply_artifact(
-                    lane_key=effective_lane_key,
-                    base_origin=base_origin,
-                    raw_user_text=raw_user_text or prompt,
-                    artifact=artifact,
-                    token_usage=usage.get("total_tokens", 0),
-                    prefix_hash=workload_policy.effective_prefix_hash,
-                    model_id=model_id,
-                    persona_id=persona_id,
-                    template_id=workload_policy.template_id,
-                    schema_id=workload_policy.schema_id,
-                    persona_core_version=workload_policy.persona_core_version,
+                await asyncio.wait_for(
+                    self.lane_manager.append_visible_reply_artifact(
+                        lane_key=effective_lane_key,
+                        base_origin=base_origin,
+                        raw_user_text=raw_user_text or prompt,
+                        artifact=artifact,
+                        token_usage=usage.get("total_tokens", 0),
+                        prefix_hash=workload_policy.effective_prefix_hash,
+                        model_id=model_id,
+                        persona_id=persona_id,
+                        template_id=workload_policy.template_id,
+                        schema_id=workload_policy.schema_id,
+                        persona_core_version=workload_policy.persona_core_version,
+                    ),
+                    timeout=max(0.1, persist_timeout),
                 )
+                finish_stage(event, persist_stage, metadata={"timeout_sec": persist_timeout})
+            except asyncio.CancelledError:
+                finish_stage(event, persist_stage, status="cancelled", reason="acquire_cancelled")
+                raise
+            except asyncio.TimeoutError:
+                finish_stage(
+                    event,
+                    persist_stage,
+                    status="timeout",
+                    reason="queue_timeout",
+                    metadata={"timeout_sec": persist_timeout},
+                )
+                logger.warning("[Gateway] lane history persistence timed out after successful call")
             except Exception as exc:
+                finish_stage(event, persist_stage, status="error", reason=type(exc).__name__)
                 logger.warning(f"[Gateway] lane history degraded after successful call: {exc}")
         trace_kwargs: Dict[str, Any] = {
             "workload_family": workload_policy.family.value,
@@ -419,7 +498,8 @@ class GatewayLaneMixin:
         if not models:
             raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
         model_hint = models[0]
-        lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
+        lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
+            event,
             lane_key=effective_lane_key,
             base_origin=base_origin,
             prefix_hash=workload_policy.effective_prefix_hash,
@@ -748,7 +828,8 @@ class GatewayLaneMixin:
         if not attempt_queue:
             raise LLMCascadeFailureException(f"未配置可用模型池: {lane_key.task_family}")
 
-        lane_umo, conversation_id, history, _ = await self.lane_manager.ensure_lane(
+        lane_umo, conversation_id, history, _ = await self._ensure_lane_bounded(
+            event,
             lane_key=effective_lane_key,
             base_origin=base_origin,
             prefix_hash=workload_policy.effective_prefix_hash,

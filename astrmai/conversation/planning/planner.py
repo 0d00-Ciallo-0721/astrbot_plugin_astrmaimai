@@ -1110,6 +1110,20 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         status: str,
         reply_text: str | None = None,
     ) -> None:
+        if (
+            hasattr(event, "get_extra")
+            and hasattr(event, "set_extra")
+            and bool(event.get_extra("astrmai_defer_turn_trace_persist", False))
+        ):
+            event.set_extra(
+                "astrmai_deferred_turn_trace",
+                {
+                    "chat_id": str(chat_id or ""),
+                    "status": str(status or ""),
+                    "reply_text": str(reply_text or ""),
+                },
+            )
+            return
         turn_context = ensure_turn_context(event)
         if not turn_context.perception.chat_id:
             turn_context.perception.chat_id = str(chat_id or "")
@@ -1189,6 +1203,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     "llm_call_ledger": telemetry["llm_call_ledger"],
                     "context_block_stats": telemetry["context_block_stats"],
                     "stage_ledger": telemetry["stage_ledger"],
+                    "timing_coverage": telemetry["timing_coverage"],
                     "vision_observation": telemetry["vision_observation"],
                     "reply_stats": telemetry["reply_stats"],
                     "budget": telemetry["budget"],
@@ -1304,6 +1319,19 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                 ):
                     item["learning_context_observation"] = learning_observation
             topic_observation = {
+                "valid": bool(event.get_extra("astrmai_topic_activity_valid", False)),
+                "kind": str(event.get_extra("astrmai_topic_activity_kind", "") or ""),
+                "reason": str(event.get_extra("astrmai_topic_activity_reason", "") or ""),
+                "source": str(event.get_extra("astrmai_topic_activity_source", "") or ""),
+                "effective_user_response": bool(
+                    event.get_extra("astrmai_effective_user_response", False)
+                ),
+                "state_before": dict(
+                    event.get_extra("astrmai_topic_activity_state_before", {}) or {}
+                ),
+                "state_after": dict(
+                    event.get_extra("astrmai_topic_activity_state_after", {}) or {}
+                ),
                 "preview_source": str(event.get_extra("astrmai_topic_preview_source", "") or ""),
                 "preview_kind": str(event.get_extra("astrmai_topic_preview_kind", "") or ""),
                 "preview_safe": bool(event.get_extra("astrmai_topic_preview_safe", False)),
@@ -1332,7 +1360,7 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
                     event.get_extra("astrmai_internal_context_leak_blocked", False)
                 ),
             }
-            if any(value not in ("", False, None) for value in topic_observation.values()):
+            if any(value not in ("", False, None, {}) for value in topic_observation.values()):
                 item["topic_observation"] = topic_observation
         item["decision_observation"] = {
             "status": str(status or ""),
@@ -1396,9 +1424,12 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
             "actor_whitelist",
             "participation_decision",
             "judge_decision",
+            "timing_coverage",
+            "stage_ledger",
             "reply_plan",
             "reply_commit",
             "memory_actor_filter",
+            "memory_retrieval_observation",
             "proactive_observation",
         ):
             item[field_name] = architecture_contract[field_name]

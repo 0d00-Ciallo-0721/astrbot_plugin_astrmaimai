@@ -8,6 +8,7 @@ chat blockage.
 import asyncio
 import importlib
 import unittest
+from types import SimpleNamespace
 
 
 class ExecutorLockRegressionTests(unittest.TestCase):
@@ -80,6 +81,45 @@ class ExecutorLockRegressionTests(unittest.TestCase):
             state = coordinator._states.get(chat_id)
             if state is not None:
                 self.assertEqual(state.executor_pending, 0)
+
+        asyncio.run(_run())
+
+    def test_local_executor_timeout_rolls_back_pending_counter(self):
+        executor_mod = importlib.import_module("astrmai.conversation.execution.executor")
+        executor = executor_mod.ConcurrentExecutor.__new__(executor_mod.ConcurrentExecutor)
+        executor.runtime_coordinator = None
+        executor.config = SimpleNamespace(
+            timing=SimpleNamespace(executor_lock_wait_timeout_sec=0.1)
+        )
+        executor._global_lock = asyncio.Lock()
+        executor._chat_locks = {}
+        executor._chat_pending_count = {}
+
+        class _Event:
+            def __init__(self):
+                self.extras = {}
+
+            def get_extra(self, key, default=None):
+                return self.extras.get(key, default)
+
+            def set_extra(self, key, value):
+                self.extras[key] = value
+
+        async def _run():
+            event = _Event()
+            first_lock, using_coordinator, outcome = await executor._acquire_chat_execution_lock("chat", event)
+            self.assertIsNotNone(first_lock)
+            self.assertFalse(using_coordinator)
+            self.assertEqual(outcome, "")
+
+            second_lock, _, second_outcome = await executor._acquire_chat_execution_lock("chat", event)
+            self.assertIsNone(second_lock)
+            self.assertEqual(second_outcome, "queue_timeout")
+            self.assertEqual(executor._chat_pending_count["chat"], 1)
+
+            await executor._release_chat_execution_lock("chat", False, first_lock)
+            self.assertNotIn("chat", executor._chat_pending_count)
+            self.assertNotIn("chat", executor._chat_locks)
 
         asyncio.run(_run())
 

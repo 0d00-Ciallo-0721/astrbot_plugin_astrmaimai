@@ -112,7 +112,7 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
             config=config or _config(),
             db_path=self.db_path,
             call_background_lane=lambda *args, **kwargs: asyncio.sleep(0, result="{}"),
-            task_launcher=lambda coro: coro.close(),
+            task_launcher=lambda factory: factory().close(),
         )
 
     def test_morning_candidate_is_persisted_and_not_repeated_after_restart(self):
@@ -186,6 +186,24 @@ class ScheduledScenarioServiceTests(unittest.TestCase):
         loaded = asyncio.run(service.schedule_store.load("2026-05-11"))
 
         self.assertEqual(loaded, (payload, "model"))
+
+    def test_failed_model_schedule_is_retryable_with_backoff(self):
+        service = self._service(
+            _Dispatcher(),
+            _config(
+                daily_schedule_ai_enabled=True,
+                daily_schedule_max_retries=2,
+                daily_schedule_retry_base_sec=30,
+            ),
+        )
+        service.call_background_lane = lambda *args, **kwargs: asyncio.sleep(0, result="invalid")
+
+        asyncio.run(service._generate_schedule("2026-05-11"))
+
+        self.assertEqual(service._generation_attempts["2026-05-11"], 1)
+        self.assertNotIn("2026-05-11", service._generation_started)
+        self.assertGreater(service._generation_retry_at["2026-05-11"], 0.0)
+        self.assertEqual(service.describe_status()["generation_attempts"]["2026-05-11"], 1)
 
     def test_festival_provider_covers_fixed_and_floating_dates(self):
         provider = self.module.FestivalProvider

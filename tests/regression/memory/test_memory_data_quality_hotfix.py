@@ -120,6 +120,74 @@ class FaissAwareCleanupTests(unittest.TestCase):
         self.assertEqual(deleted, 2)
         self.assertEqual(calls[0], ("sql_delete", "mem-1"))
 
+    def test_failed_faiss_delete_retains_rows_for_retry(self):
+        calls = []
+
+        class _Faiss:
+            async def delete(self, doc_id):
+                calls.append(("faiss", doc_id))
+                raise RuntimeError("faiss unavailable")
+
+        class _Engine:
+            faiss_db = _Faiss()
+
+            async def _run_documents_query(self, sql, params, db_path=None):
+                return [(7, "doc-abc")]
+
+            async def _execute_documents_write(self, sql, params, db_path=None):
+                calls.append(("sql_delete", params[0]))
+                return 1
+
+        projector = MemoryIndexProjector.__new__(MemoryIndexProjector)
+        projector.engine = _Engine()
+        projector._pending_projection_ids = set()
+        projector._pending_projection_reasons = {}
+        projector._pending_projection_scheduled = {}
+        projector._delete_fts_rows = lambda ids: None
+        projector._documents_db_path = lambda: None
+
+        async def _fts(ids):
+            calls.append(("fts", tuple(ids)))
+
+        projector._delete_fts_rows = _fts
+
+        deleted = asyncio.run(projector.cleanup_deleted(["mem-1"]))
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(calls, [("faiss", "doc-abc")])
+        self.assertEqual(projector.pending_reason("mem-1"), "vector_delete_failed")
+
+    def test_sql_cleanup_failure_is_scheduled_for_retry(self):
+        calls = []
+
+        class _Faiss:
+            async def delete(self, doc_id):
+                calls.append(("faiss", doc_id))
+
+        class _Engine:
+            faiss_db = _Faiss()
+            v2_store = None
+
+            async def _run_documents_query(self, sql, params, db_path=None):
+                return [(7, "doc-abc")]
+
+            async def _execute_documents_write(self, sql, params, db_path=None):
+                calls.append(("sql_delete", params[0]))
+                raise RuntimeError("database locked")
+
+        projector = MemoryIndexProjector.__new__(MemoryIndexProjector)
+        projector.engine = _Engine()
+        projector._pending_projection_ids = set()
+        projector._pending_projection_reasons = {}
+        projector._pending_projection_scheduled = {}
+        projector._delete_fts_rows = lambda ids: None
+        projector._documents_db_path = lambda: None
+
+        deleted = asyncio.run(projector.cleanup_deleted(["mem-1"]))
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(projector.pending_reason("mem-1"), "cleanup_error:RuntimeError")
+
 
 class MaintenanceScheduleTests(unittest.TestCase):
     """WU-04：调度接通、purge 分步、按日节流。"""

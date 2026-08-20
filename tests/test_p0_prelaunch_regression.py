@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -105,6 +106,9 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(retriever._failure_count, 1)
         self.assertTrue(retriever._circuit_open())
         self.assertEqual(observation["status"], "timeout")
+        self.assertEqual(observation["retrieve_stage"], "faiss_db.retrieve")
+        self.assertEqual(observation["timeout_origin"], "faiss_db.retrieve")
+        self.assertGreaterEqual(observation["elapsed_ms"], 0.0)
         self.assertTrue(observation["circuit_open"])
         self.assertGreater(observation["cooldown_remaining_sec"], 0.0)
         self.assertEqual(observation["configured_timeout_sec"], 4.0)
@@ -140,6 +144,8 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
 
         self.assertEqual(results, [])
         self.assertEqual(observation["status"], "timeout")
+        self.assertEqual(observation["retrieve_stage"], "faiss_db.retrieve")
+        self.assertEqual(observation["timeout_origin"], "faiss_db.retrieve")
         self.assertEqual(observation["timeout_sec"], 20.0)
         self.assertEqual(observation["configured_timeout_sec"], 20.0)
         self.assertEqual(observation["effective_timeout_sec"], 20.0)
@@ -172,6 +178,214 @@ class P0PrelaunchRegressionTests(unittest.TestCase):
         self.assertEqual(observation["configured_timeout_sec"], 20.0)
         self.assertEqual(observation["effective_timeout_sec"], 1.25)
         self.assertTrue(observation["timeout_budget_clamped"])
+
+    def test_vector_store_limits_query_concurrency_and_reports_queue_wait(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            def __init__(self):
+                self.started = 0
+                self.active = 0
+                self.maximum_active = 0
+                self.release = asyncio.Event()
+
+            async def retrieve(self, **kwargs):
+                self.started += 1
+                self.active += 1
+                self.maximum_active = max(self.maximum_active, self.active)
+                try:
+                    await self.release.wait()
+                    return []
+                finally:
+                    self.active -= 1
+
+        config = SimpleNamespace(timing=SimpleNamespace(faiss_query_concurrency=1, faiss_timeout_sec=2.0))
+        faiss = _Faiss()
+        retriever = VectorRetriever(faiss, config=config)
+        first_observation, second_observation = {}, {}
+
+        async def _run():
+            first = asyncio.create_task(retriever.search("first", observation=first_observation))
+            while faiss.started < 1:
+                await asyncio.sleep(0)
+            second = asyncio.create_task(retriever.search("second", observation=second_observation))
+            await asyncio.sleep(0.01)
+            self.assertEqual(faiss.maximum_active, 1)
+            faiss.release.set()
+            await asyncio.gather(first, second)
+
+        asyncio.run(_run())
+        self.assertEqual(faiss.maximum_active, 1)
+        self.assertGreaterEqual(second_observation["query_queue_wait_ms"], 0.0)
+
+    def test_vector_store_phased_retrieval_reports_embedding_index_and_document_timings(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        search_threads = []
+
+        class _Embedding:
+            async def get_embedding(self, query):
+                await asyncio.sleep(0)
+                return [1.0, 0.0]
+
+        class _Index:
+            def search(self, vector, k):
+                search_threads.append(threading.current_thread().name)
+                return [[0.1]], [[7]]
+
+        class _Storage:
+            index = _Index()
+
+        class _Documents:
+            async def get_documents(self, metadata_filters, ids):
+                return [{"id": 7, "text": "hit", "metadata": {"kind": "memory"}}]
+
+        faiss = SimpleNamespace(
+            embedding_provider=_Embedding(),
+            embedding_storage=_Storage(),
+            document_storage=_Documents(),
+        )
+        observation = {}
+        results = asyncio.run(VectorRetriever(faiss).search("hello", observation=observation))
+
+        self.assertEqual(len(results), 1, observation)
+        self.assertEqual(results[0].content, "hit")
+        self.assertEqual(observation["retrieve_stage"], "phased")
+        self.assertIn("embedding_ms", observation["stage_timings"])
+        self.assertIn("faiss_index_ms", observation["stage_timings"])
+        self.assertIn("document_read_ms", observation["stage_timings"])
+        self.assertEqual(observation["timeout_origin"], "")
+        self.assertTrue(search_threads[0].startswith("astrmai-faiss"))
+
+    def test_vector_store_phased_timeout_identifies_embedding_stage(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Embedding:
+            async def get_embedding(self, query):
+                await asyncio.Event().wait()
+
+        faiss = SimpleNamespace(
+            embedding_provider=_Embedding(),
+            embedding_storage=SimpleNamespace(index=object()),
+            document_storage=SimpleNamespace(),
+        )
+        config = SimpleNamespace(timing=SimpleNamespace(faiss_timeout_sec=0.5, faiss_failure_threshold=3))
+        observation = {}
+        with patch(
+            "astrmai.memory.retrieval.vector_store.clamp_timeout_to_turn_budget",
+            return_value=0.01,
+        ):
+            results = asyncio.run(VectorRetriever(faiss, config).search("hello", observation=observation))
+
+        self.assertEqual(results, [])
+        self.assertEqual(observation["status"], "timeout")
+        self.assertEqual(observation["timeout_origin"], "embedding")
+        self.assertIn("embedding_ms", observation["stage_timings"])
+
+    def test_vector_store_keeps_slot_until_timed_out_index_thread_finishes(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Embedding:
+            async def get_embedding(self, query):
+                return [1.0, 0.0]
+
+        release_index = threading.Event()
+        index_started = threading.Event()
+        faiss = SimpleNamespace(
+            embedding_provider=_Embedding(),
+            embedding_storage=SimpleNamespace(index=object()),
+            document_storage=SimpleNamespace(),
+        )
+        retriever = VectorRetriever(
+            faiss,
+            SimpleNamespace(
+                timing=SimpleNamespace(
+                    faiss_timeout_sec=0.5,
+                    faiss_query_concurrency=1,
+                    faiss_failure_threshold=10,
+                )
+            ),
+        )
+
+        def blocking_search(vector, k):
+            index_started.set()
+            release_index.wait(timeout=2.0)
+            return [[0.1]], [[-1]]
+
+        retriever._search_index_sync = blocking_search
+
+        async def run():
+            with patch(
+                "astrmai.memory.retrieval.vector_store.clamp_timeout_to_turn_budget",
+                return_value=0.02,
+            ):
+                first_observation = {}
+                first = asyncio.create_task(retriever.search("first", observation=first_observation))
+                while not index_started.is_set():
+                    await asyncio.sleep(0)
+                await first
+                self.assertEqual(first_observation["timeout_origin"], "faiss_index")
+                self.assertEqual(retriever.describe_status()["active_queries"], 1)
+                self.assertEqual(retriever.describe_status()["background_index_jobs"], 1)
+
+                second_observation = {}
+                await retriever.search("second", observation=second_observation)
+                self.assertEqual(second_observation["status"], "query_queue_timeout")
+                self.assertEqual(retriever.describe_status()["active_queries"], 1)
+
+                release_index.set()
+                for _ in range(100):
+                    if retriever.describe_status()["active_queries"] == 0:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(retriever.describe_status()["active_queries"], 0)
+                self.assertEqual(retriever.describe_status()["background_index_jobs"], 0)
+
+        asyncio.run(run())
+
+    def test_vector_store_allows_only_one_half_open_probe(self):
+        from astrmai.memory.retrieval.vector_store import VectorRetriever
+
+        class _Faiss:
+            def __init__(self):
+                self.calls = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def retrieve(self, **kwargs):
+                self.calls += 1
+                self.started.set()
+                await self.release.wait()
+                return []
+
+        faiss = _Faiss()
+        retriever = VectorRetriever(
+            faiss,
+            SimpleNamespace(
+                timing=SimpleNamespace(
+                    faiss_failure_threshold=1,
+                    faiss_timeout_sec=2.0,
+                )
+            ),
+        )
+        retriever._failure_count = 1
+        retriever._unavailable_until = 0.0
+
+        async def run():
+            first_observation = {}
+            first = asyncio.create_task(retriever.search("probe", observation=first_observation))
+            await faiss.started.wait()
+            second_observation = {}
+            second = await retriever.search("parallel", observation=second_observation)
+            self.assertEqual(second, [])
+            self.assertEqual(second_observation["status"], "circuit_open")
+            self.assertTrue(second_observation["runtime_metrics"]["half_open_probe_active"])
+            faiss.release.set()
+            await first
+
+        asyncio.run(run())
+        self.assertEqual(faiss.calls, 1)
+        self.assertEqual(retriever.describe_status()["failure_count"], 0)
 
     def test_hybrid_retriever_reports_bm25_fallback_when_vector_is_unhealthy(self):
         from astrmai.memory.retrieval.hybrid_retriever import HybridRetriever

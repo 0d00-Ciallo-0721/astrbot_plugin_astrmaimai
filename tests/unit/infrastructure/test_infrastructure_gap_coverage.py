@@ -175,6 +175,33 @@ class InfrastructureGapCoverageTests(unittest.TestCase):
         self.assertIn("user-b", contents)
         self.assertIn("assistant-b", contents)
 
+    def test_lane_history_and_transcript_reads_are_bounded(self):
+        from astrmai.infrastructure.runtime.lane_manager import LaneKey, LaneManager
+
+        manager = LaneManager(
+            _ConcurrentConversationManager(),
+            config=SimpleNamespace(
+                timing=SimpleNamespace(lane_prepare_timeout_sec=0.01),
+            ),
+        )
+        lane_key = LaneKey(subsystem="sys2", task_family="dialog", scope_id="group-1")
+
+        async def _slow_ensure_lane(**kwargs):
+            await asyncio.sleep(1)
+
+        manager.ensure_lane = _slow_ensure_lane
+
+        async def _run():
+            with self.assertRaises(asyncio.TimeoutError):
+                await manager.get_lane_history(lane_key, "default:GroupMessage:group-1")
+            with self.assertRaises(asyncio.TimeoutError):
+                await manager.get_recent_transcript(
+                    lane_key,
+                    "default:GroupMessage:group-1",
+                )
+
+        asyncio.run(_run())
+
     def test_event_bus_stop_allows_workers_to_restart_on_next_publish(self):
         from astrmai.infrastructure.runtime.event_bus import EventBus
 

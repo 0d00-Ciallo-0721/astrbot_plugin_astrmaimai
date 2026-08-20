@@ -20,7 +20,12 @@ from ..threading.group_thread_resolver import resolve_group_thread
 from ...infrastructure.compat.legacy_compat import emit_legacy_focus_thread_extras
 from ...infrastructure.gateway.output_guard import validate_visible_output_text
 from ...infrastructure.runtime.trace_runtime import debug_trace, new_trace_id, preview_text
-from ...infrastructure.runtime.turn_call_ledger import attach_background_task_trace, rebind_turn_telemetry
+from ...infrastructure.runtime.turn_call_ledger import (
+    attach_background_task_trace,
+    begin_stage,
+    finish_stage,
+    rebind_turn_telemetry,
+)
 from ...shared.helpers.plugin_helpers import event_mentions_actor, get_event_self_id
 from ..planning.message_renderer import MessageRenderer
 from .decision_router import AttentionDecisionRouter
@@ -64,6 +69,22 @@ class _SyntheticExternalEvent(AstrMessageEvent):
 
 
 class AttentionGate:
+    @staticmethod
+    def _proactive_activity_snapshot(state: Any) -> dict[str, float | int]:
+        if state is None:
+            return {}
+        return {
+            "last_real_user_activity_at": float(
+                getattr(state, "last_real_user_activity_at", 0.0) or 0.0
+            ),
+            "next_proactive_due_at": float(
+                getattr(state, "next_proactive_due_at", 0.0) or 0.0
+            ),
+            "unanswered_proactive_count": int(
+                getattr(state, "unanswered_proactive_count", 0) or 0
+            ),
+        }
+
     ATTENTION_WINDOW_TTL_SECONDS = 180.0
     ATTENTION_WINDOW_MAX_EVENTS = 12
     BACKGROUND_TASK_MAX_CONCURRENCY = 8
@@ -420,11 +441,36 @@ class AttentionGate:
             if coordinator is not None and hasattr(coordinator, "unregister_turn_task"):
                 await coordinator.unregister_turn_task(turn, task)
 
+    async def _run_background_slot(self, coro, event=None):
+        acquired = False
+        wait_stage = begin_stage(
+            event,
+            "attention.background_slot_wait",
+            critical_path=True,
+            metadata={"limit": int(self.BACKGROUND_TASK_MAX_CONCURRENCY)},
+        )
+        try:
+            async with self._background_task_semaphore:
+                acquired = True
+                finish_stage(event, wait_stage)
+                wait_stage = ""
+                return await coro
+        except asyncio.CancelledError:
+            finish_stage(event, wait_stage, status="cancelled", reason="superseded_or_shutdown")
+            if not acquired and hasattr(coro, "close"):
+                coro.close()
+            raise
+        except Exception as exc:
+            finish_stage(event, wait_stage, status="error", reason=type(exc).__name__)
+            raise
+
     async def _run_background_task(self, coro, event=None):
-        async with self._background_task_semaphore:
-            if event is not None:
-                return await self._run_managed_system2_task(coro, event)
-            return await coro
+        if event is not None:
+            return await self._run_managed_system2_task(
+                self._run_background_slot(coro, event),
+                event,
+            )
+        return await self._run_background_slot(coro)
 
     def _fire_background_task(self, coro, event=None):
         task = asyncio.create_task(self._run_background_task(coro, event))
@@ -482,6 +528,7 @@ class AttentionGate:
                 self_id,
                 is_private=is_private,
                 is_strong_wakeup=is_strong_wakeup,
+                worker_event=event,
             )
         )
         task._worker_context = SimpleNamespace(chat_id=chat_id, session=session, self_id=self_id, event=event)
@@ -573,6 +620,22 @@ class AttentionGate:
             return False
         return any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in normalized)
 
+    @staticmethod
+    def _is_pure_text_activity_event(event: AstrMessageEvent) -> bool:
+        message = getattr(getattr(event, "message_obj", None), "message", None)
+        if not message:
+            return bool(str(getattr(event, "message_str", "") or "").strip())
+        component_types = {
+            str(getattr(component, "type", component.__class__.__name__)).lstrip("_").lower()
+            for component in message
+        }
+        return bool(str(getattr(event, "message_str", "") or "").strip()) and component_types <= {
+            "plain",
+            "text",
+            "reply",
+            "at",
+        }
+
     def _classify_topic_activity(
         self,
         chat_id: str,
@@ -599,6 +662,9 @@ class AttentionGate:
             return result
         if bool(event.get_extra("astrmai_is_command", False)) or bool(event.get_extra("heartflow_is_command", False)):
             result["reason"] = "command"
+            return result
+        if not self._is_pure_text_activity_event(event):
+            result["reason"] = "non_plain_text"
             return result
 
         projection = MessageRenderer.project_topic_preview(event, max_chars=120)
@@ -694,18 +760,31 @@ class AttentionGate:
             recorder = getattr(self.state_engine, "record_real_user_activity", None)
             if callable(recorder):
                 try:
+                    state_loader = getattr(self.state_engine, "get_state", None)
+                    if callable(state_loader):
+                        state_before = state_loader(chat_id)
+                        if inspect.isawaitable(state_before):
+                            state_before = await state_before
+                        snapshot_before = self._proactive_activity_snapshot(state_before)
+                        if snapshot_before:
+                            event.set_extra("astrmai_topic_activity_state_before", snapshot_before)
                     try:
-                        await recorder(
+                        state = await recorder(
                             chat_id,
                             chat_kind="group" if bool(event.get_group_id()) else "private",
                             occurred_at=now,
                             effective_response=bool(topic_activity.get("effective_response", False)),
                         )
                     except TypeError:
-                        await recorder(
+                        state = await recorder(
                             chat_id,
                             chat_kind="group" if bool(event.get_group_id()) else "private",
                             occurred_at=now,
+                        )
+                    if state is not None:
+                        event.set_extra(
+                            "astrmai_topic_activity_state_after",
+                            self._proactive_activity_snapshot(state),
                         )
                     event.set_extra("astrmai_proactive_generation_invalidated", True)
                 except Exception as exc:
@@ -1683,17 +1762,58 @@ class AttentionGate:
         *,
         is_private: bool = False,
         is_strong_wakeup: bool = False,
+        worker_event: AstrMessageEvent | None = None,
     ):
         current_is_strong_wakeup = is_strong_wakeup
         while True:
+            wait_event = worker_event
+            wait_stage = begin_stage(
+                wait_event,
+                "attention.worker_wait",
+                critical_path=True,
+                metadata={"chat_id": str(chat_id or ""), "private": bool(is_private)},
+            )
             if is_private and self.private_turn_coordinator is not None:
-                await self.private_turn_coordinator.wait_for_input_stability(session)
+                try:
+                    await self.private_turn_coordinator.wait_for_input_stability(session)
+                finally:
+                    finish_stage(wait_event, wait_stage, metadata={"kind": "input_stability"})
             else:
-                await asyncio.sleep(self._compute_debounce_delay(session, is_private, current_is_strong_wakeup))
-                await self._wait_for_pending_vision_pairing(session)
-            async with session.lock:
-                batch_events = list(session.accumulation_pool)
-                session.accumulation_pool.clear()
+                try:
+                    debounce_stage = begin_stage(
+                        wait_event,
+                        "attention.debounce",
+                        critical_path=True,
+                        metadata={"chat_id": str(chat_id or "")},
+                    )
+                    try:
+                        await asyncio.sleep(self._compute_debounce_delay(session, is_private, current_is_strong_wakeup))
+                    finally:
+                        finish_stage(wait_event, debounce_stage)
+                    pairing_stage = begin_stage(
+                        wait_event,
+                        "attention.vision_pair_wait",
+                        critical_path=True,
+                        metadata={"chat_id": str(chat_id or "")},
+                    )
+                    try:
+                        await self._wait_for_pending_vision_pairing(session)
+                    finally:
+                        finish_stage(wait_event, pairing_stage)
+                finally:
+                    finish_stage(wait_event, wait_stage)
+            lock_stage = begin_stage(
+                wait_event,
+                "attention.session_lock",
+                critical_path=True,
+                metadata={"chat_id": str(chat_id or "")},
+            )
+            try:
+                async with session.lock:
+                    batch_events = list(session.accumulation_pool)
+                    session.accumulation_pool.clear()
+            finally:
+                finish_stage(wait_event, lock_stage)
 
             if batch_events:
                 # OPT-02/RT-01: 排水循环的晚到批次不得沿用 worker 创建时刻旧 turn 的

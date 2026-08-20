@@ -232,6 +232,9 @@ class RuntimeFacadeProtocol(Protocol):
     async def record_and_dispatch_attention(self, event: Any, scope: Any) -> str:
         ...
 
+    async def flush_deferred_turn_trace(self, event: Any, *, fallback_status: str = "") -> bool:
+        ...
+
     def cancel_group_wait_if_interrupted(self, event: Any, group_wait_result: str, status: str) -> None:
         ...
 

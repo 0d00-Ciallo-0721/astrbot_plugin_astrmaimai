@@ -17,7 +17,6 @@ from ..presentation.events.message_entry import handle_global_message
 from ..presentation.events.result_sniffer import sniff_external_plugin_results
 from ..presentation.events.startup_hooks import on_program_start as run_startup_hook
 from ..infrastructure.runtime.lane_manager import LaneKey
-from ..infrastructure.gateway.gateway_exceptions import LLMCascadeFailureException
 from ..shared.helpers.plugin_helpers import format_model_pool
 from .lifecycle import PluginLifecycleManager
 from .runtime_context import PluginRuntimeContext
@@ -495,6 +494,28 @@ class PluginFacade(RuntimeFacadeProtocol):
             return tick_result.dispatch_result
         return await self.runtime.attention_gate.process_event(event)
 
+    async def flush_deferred_turn_trace(self, event, *, fallback_status: str = "") -> bool:
+        if not hasattr(event, "get_extra") or not hasattr(event, "set_extra"):
+            return False
+        pending = event.get_extra("astrmai_deferred_turn_trace", None)
+        if not isinstance(pending, dict):
+            pending = {}
+        planner = getattr(self.runtime, "system2_planner", None)
+        recorder = getattr(planner, "record_turn_trace", None)
+        if not callable(recorder):
+            return False
+        chat_id = str(
+            pending.get("chat_id")
+            or getattr(event, "unified_msg_origin", "")
+            or ""
+        )
+        status = str(pending.get("status") or fallback_status or "unknown")
+        reply_text = str(pending.get("reply_text") or "")
+        event.set_extra("astrmai_defer_turn_trace_persist", False)
+        event.set_extra("astrmai_deferred_turn_trace", None)
+        await recorder(chat_id, event, status=status, reply_text=reply_text or None)
+        return True
+
     def cancel_group_wait_if_interrupted(self, event, group_wait_result, status) -> None:
         if (
             event.get_group_id()
@@ -790,69 +811,10 @@ class PluginFacade(RuntimeFacadeProtocol):
         return await self.runtime.runtime_coordinator.get_sys2_lock(chat_id)
 
     async def _system2_entry(self, main_event, events_to_process: list | None = None):
-        if self.runtime.system2_runner:
-            return await self.runtime.system2_runner.run(main_event, events_to_process)
+        runner = self.runtime.system2_runner
+        if runner is None:
+            from ..conversation.execution.system2_runner import System2Runner
 
-        chat_id = main_event.unified_msg_origin
-        lock = await self._get_sys2_lock(chat_id)
-        logger.debug(f"[{chat_id}] System 2 请求已登记，正在排队等待进入主执行队列...")
-
-        async with lock:
-            try:
-                queue_events = events_to_process.copy() if isinstance(events_to_process, list) and events_to_process else [main_event]
-                main_event.set_extra("astrmai_reply_sent", False)
-                main_event.set_extra("astrmai_wait_targets", [])
-                main_event.set_extra("astrmai_wait_target_name", "")
-
-                await self.runtime.state_engine.consume_energy(chat_id)
-                await self.runtime.lane_manager.ensure_lane(
-                    lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
-                    base_origin=chat_id,
-                )
-                await self.runtime.system2_planner.plan_and_execute(main_event, queue_events)
-                reply_sent = bool(main_event.get_extra("astrmai_reply_sent", False))
-
-                wait_targets = list(main_event.get_extra("astrmai_wait_targets", []) or [])
-                wait_target_name = str(main_event.get_extra("astrmai_wait_target_name", "") or "")
-                await self.runtime.runtime_coordinator.update_wait_targets(chat_id, wait_targets, wait_target_name)
-                if getattr(self.runtime, "chat_loop_kernel", None) is not None:
-                    await self.runtime.chat_loop_kernel.sync_runtime_wait_targets(chat_id, wait_targets, wait_target_name)
-
-                is_private = main_event.get_extra("is_private_chat", False)
-                if reply_sent and is_private and self.runtime.private_chat_manager:
-                    sender_id = str(main_event.get_sender_id())
-                    if getattr(self.runtime, "chat_loop_kernel", None) is not None:
-                        await self.runtime.chat_loop_kernel.arm_private_wait(
-                            chat_id,
-                            {
-                                "user_id": sender_id,
-                                "target_ids": [sender_id],
-                                "target_name": str(main_event.get_sender_name() or ""),
-                                "timeout": float(getattr(self.runtime.private_chat_manager, "timeout_sec", 0.0) or 0.0),
-                                "reason": "private_followup_wait",
-                            },
-                        )
-                    has_reply = await self.runtime.private_chat_manager.wait_for_new_message(sender_id, chat_id=chat_id)
-                    if not has_reply:
-                        logger.info(f"[{chat_id}] 私聊用户长时间未回复，会话已自然休眠。")
-                        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
-                            await self.runtime.chat_loop_kernel.expire_wait(chat_id, "private_wait_timeout")
-                elif reply_sent and main_event.get_group_id() and self.runtime.group_reply_wait_manager:
-                    if self.runtime.group_reply_wait_manager.register_from_reply_event(main_event):
-                        if getattr(self.runtime, "chat_loop_kernel", None) is not None:
-                            payload = self.runtime.group_reply_wait_manager.get_wait_info(
-                                chat_id,
-                                thread_id=str(main_event.get_extra("astrmai_turn_thread_id", "") or ""),
-                            )
-                            if payload:
-                                await self.runtime.chat_loop_kernel.arm_group_wait(chat_id, payload)
-            except LLMCascadeFailureException:
-                logger.exception(f"[AstrMai] Gateway cascade failure for {chat_id}, returning fallback")
-                fallback = str(getattr(getattr(self.runtime.config, "reply", None), "fallback_text", "") or "（陷入了短暂的沉默...）")
-                await self.runtime.reply_engine.handle_reply(main_event, fallback, chat_id)
-            except Exception as e:
-                logger.error(f"[AstrMai] System2 unexpected error for {chat_id}: {e}", exc_info=True)
-                fallback = str(getattr(getattr(self.runtime.config, "reply", None), "fallback_text", "") or "（陷入了短暂的沉默...）")
-                await self.runtime.reply_engine.handle_reply(main_event, fallback, chat_id)
-            finally:
-                logger.debug(f"[AstrMai] System2 execution finished safely for {chat_id}.")
+            runner = System2Runner(self.runtime)
+            self.runtime.system2_runner = runner
+        return await runner.run(main_event, events_to_process)

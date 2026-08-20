@@ -44,7 +44,7 @@ def _config(**overrides):
         architecture_rollout=SimpleNamespace(**defaults),
         attention=SimpleNamespace(
             participation_force_pass_enabled=True,
-            participation_drop_enabled=False,
+            participation_drop_enabled=True,
         ),
     )
 
@@ -66,7 +66,7 @@ def test_rollout_cutovers_are_independent_and_reported():
     assert state["memory_actor_filter_enabled"] is True
     assert state["proactive_due_enabled"] is False
     assert state["participation_force_pass_enabled"] is True
-    assert state["participation_drop_enabled"] is False
+    assert state["participation_drop_enabled"] is True
 
 
 def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
@@ -118,6 +118,11 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     event.set_extra("astrmai_conversation_event", canonical)
     event.set_extra("astrmai_reply_plan", plan)
     event.set_extra("astrmai_committed_bot_turn", committed)
+    event.set_extra("astrmai_judge_cache_hit", True)
+    event.set_extra("astrmai_judge_cache_action", "IGNORE")
+    event.set_extra("astrmai_judge_cache_scope", "ambient_topic")
+    event.set_extra("astrmai_judge_avoided", True)
+    event.set_extra("astrmai_prefilter_judge_agreement", False)
 
     contract = build_architecture_trace_contract(
         event=event,
@@ -125,7 +130,13 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
         trace_item={
             "turn_id": "turn-1",
             "turn_total_elapsed_ms": 12.5,
+            "timing_coverage": {"coverage_ratio": 0.4, "unattributed_ms": 7.5},
+            "stage_ledger": [{"stage": "attention.dispatch", "elapsed_ms": 2.0}],
             "context_block_stats": [{"block_type": "shared_timeline", "char_count": 120}],
+            "memory_funnel": {
+                "vector_fallback": {"source": "bm25", "used": True},
+                "hybrid_observations": [{"vector": {"status": "timeout"}}],
+            },
         },
         status="executed",
         config=_config(),
@@ -137,9 +148,18 @@ def test_architecture_trace_contract_links_full_chain_without_raw_reply_text():
     assert contract["turn_target"]["target_actor_id"] == "actor-1"
     assert contract["actor_whitelist"] == ["actor-1", "bot-1"]
     assert contract["judge_decision"]["action"] == "REPLY"
+    assert contract["judge_decision"]["cache_hit"] is True
+    assert contract["judge_decision"]["cache_action"] == "IGNORE"
+    assert contract["judge_decision"]["cache_scope"] == "ambient_topic"
+    assert contract["judge_decision"]["avoided"] is True
+    assert contract["judge_decision"]["prefilter_judge_agreement"] is False
+    assert contract["timing_coverage"]["unattributed_ms"] == 7.5
+    assert contract["stage_ledger"][0]["stage"] == "attention.dispatch"
     assert contract["reply_plan"]["planned_char_count"] == len("绝密草稿文本")
     assert contract["reply_commit"]["commit_id"] == committed.commit_id
     assert contract["memory_actor_filter"]["actor_whitelist"] == ["actor-1", "bot-1"]
+    assert contract["memory_retrieval_observation"]["vector_fallback"]["source"] == "bm25"
+    assert contract["memory_retrieval_observation"]["hybrid_observations"][0]["vector"]["status"] == "timeout"
     assert contract["status"] == "executed"
     assert "绝密草稿文本" not in serialized
     assert "实际可见回复文本" not in serialized

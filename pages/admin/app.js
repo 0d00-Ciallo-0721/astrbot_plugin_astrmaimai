@@ -904,6 +904,18 @@ async function renderDashboardOverview() {
         ${detailsJson("查看模型与健康诊断", { models, health: healthData })}
       `)}
     </div>
+    ${section("运行时压力与社交动作", "查看当前排队、检索、主动会话和复读动作的运行快照。", `
+      <div class="grid compact-grid">
+        ${metric("后台活动", runtimeStatus?.infrastructure?.background_task_budget?.active ?? 0)}
+        ${metric("后台排队", runtimeStatus?.infrastructure?.background_task_budget?.queued ?? 0)}
+        ${metric("向量降级比例", `${((runtimeStatus?.memory?.vector_retrieval?.degraded_ratio ?? 0) * 100).toFixed(1)}%`)}
+        ${metric("复读活跃群", runtimeStatus?.group_reread_observer?.active_groups ?? 0)}
+      </div>
+      ${detailsJson("后台预算", runtimeStatus?.infrastructure?.background_task_budget || {})}
+      ${detailsJson("向量检索状态", runtimeStatus?.memory?.vector_retrieval || {})}
+      ${detailsJson("主动会话状态", runtimeStatus?.proactive || {})}
+      ${detailsJson("复读动作状态", runtimeStatus?.group_reread_observer || {})}
+    `)}
     ${section("统一观测", "默认只显示统计摘要，异常详情按需展开。", `
       <div class="grid">
         ${metric("Retained Events", obsSnapshot.retained_events ?? 0)}
