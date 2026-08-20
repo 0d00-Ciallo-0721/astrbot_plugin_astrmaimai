@@ -2227,6 +2227,78 @@ class RefactoredAttentionGateTests(unittest.TestCase):
         self.assertTrue(event.get_extra("astrmai_proactive_completed"))
         self.assertEqual(event.get_extra("judge_action"), "WAIT")
 
+    def test_proactive_duplicate_event_completes_before_return(self):
+        completed = []
+        traced = []
+
+        async def completion(reply_sent, reply_preview):
+            completed.append((reply_sent, reply_preview))
+
+        async def trace_callback(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        self.gate._claim_message = lambda event: False
+        self.gate.turn_trace_callback = trace_callback
+        event = _FakeEvent(
+            "astrmai_proactive_candidate",
+            "主动开口候选",
+            "重复候选",
+            extras={
+                "astrmai_is_proactive_event": True,
+                "astrmai_proactive_completion_callback": completion,
+                "astrmai_proactive_dispatch_decision": {},
+            },
+        )
+
+        result = asyncio.run(self.gate.process_event(event))
+
+        self.assertEqual(result, "DUPLICATED")
+        self.assertEqual(completed, [(False, "")])
+        self.assertTrue(event.get_extra("astrmai_proactive_completed"))
+        self.assertEqual(
+            event.get_extra("astrmai_proactive_dispatch_decision")["blocked_reason"],
+            "duplicate_event",
+        )
+        self.assertEqual(traced, [(event.unified_msg_origin, "skipped_duplicate_event", None)])
+
+    def test_proactive_private_sensor_filter_completes_before_return(self):
+        completed = []
+        traced = []
+
+        class RejectingSensors(_FakeSensors):
+            async def should_process_message(self, event):
+                return False
+
+        async def completion(reply_sent, reply_preview):
+            completed.append((reply_sent, reply_preview))
+
+        async def trace_callback(chat_id, event, *, status, reply_text=None):
+            traced.append((chat_id, status, reply_text))
+
+        self.gate.sensors = RejectingSensors()
+        self.gate.turn_trace_callback = trace_callback
+        event = _FakePrivateEvent(
+            "astrmai_proactive_candidate",
+            "主动开口候选",
+            "私聊候选",
+            extras={
+                "astrmai_is_proactive_event": True,
+                "astrmai_proactive_completion_callback": completion,
+                "astrmai_proactive_dispatch_decision": {},
+            },
+        )
+
+        result = asyncio.run(self.gate.process_event(event))
+
+        self.assertEqual(result, "FILTERED")
+        self.assertEqual(completed, [(False, "")])
+        self.assertTrue(event.get_extra("astrmai_proactive_completed"))
+        self.assertEqual(
+            event.get_extra("astrmai_proactive_dispatch_decision")["blocked_reason"],
+            "sensor_filtered",
+        )
+        self.assertEqual(traced, [(event.unified_msg_origin, "skipped_sensor_filter", None)])
+
     def test_debounce_worker_drain_loop_keeps_late_arrivals(self):
         captured = []
         first_batch_entered = asyncio.Event()

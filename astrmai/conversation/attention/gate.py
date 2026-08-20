@@ -1502,16 +1502,30 @@ class AttentionGate:
             return "PROACTIVE_BLOCKED"
 
         if not self._claim_message(event):
-            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
+            if is_proactive_event:
                 append_proactive_stage(event, "proactive.sensor", "blocked", "duplicate_event")
+                await self._complete_proactive_candidate(event, reason="duplicate_event")
+                await self._finalize_pre_planner_turn(
+                    event,
+                    _chat_id,
+                    status="skipped_duplicate_event",
+                )
             return "DUPLICATED"
 
         private_ingress = not bool(event.get_group_id())
         sensor_checked = False
         if private_ingress:
             if not await self._passes_sensor_filters(event, str(getattr(event, "message_str", "") or "")):
-                if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
+                if is_proactive_event:
                     append_proactive_stage(event, "proactive.sensor", "blocked", "sensor_filtered")
+                    await self._complete_proactive_candidate(event, reason="sensor_filtered")
+                    await self._finalize_pre_planner_turn(
+                        event,
+                        _chat_id,
+                        status="skipped_sensor_filter",
+                    )
                 return "FILTERED"
             sensor_checked = True
 
