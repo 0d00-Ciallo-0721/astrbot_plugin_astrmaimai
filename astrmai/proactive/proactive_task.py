@@ -336,7 +336,7 @@ class ProactiveTask:
     def _fire_background_task(self, awaitable_factory):
         budget = getattr(self, "background_task_budget", None)
         if budget is not None:
-            coro = budget.run(awaitable_factory)
+            coro = budget.run(awaitable_factory, task_name="proactive")
         else:
             coro = awaitable_factory()
         task = asyncio.create_task(coro)

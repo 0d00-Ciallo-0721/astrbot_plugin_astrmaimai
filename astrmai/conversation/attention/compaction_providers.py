@@ -25,7 +25,7 @@ class CompactionProviderMixin:
         budget = getattr(self, "background_task_budget", None)
         if budget is None:
             return await awaitable_factory()
-        return await budget.run(awaitable_factory)
+        return await budget.run(awaitable_factory, task_name="compaction")
 
     def _compaction_provider_validated(self, context, configured: str) -> bool:
         cache = getattr(self, "_compaction_provider_validation", None)

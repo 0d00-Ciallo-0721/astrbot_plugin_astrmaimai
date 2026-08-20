@@ -43,6 +43,7 @@ from .planning_input_loader import PlanningInputLoader
 from .planner_prompt_context import PlannerPromptContextMixin
 from .planner_side_inputs import PlannerSideInputMixin
 from .think_level_policy import ThinkLevelPolicy
+from ...proactive.dispatcher import append_proactive_stage
 
 
 class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
@@ -1980,16 +1981,26 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         turn_context = ensure_turn_context(event)
         turn_context.proactive.reply_sent = reply_sent
         turn_context.proactive.dispatch_status = "sent" if reply_sent else "skipped"
+        append_proactive_stage(
+            event,
+            "proactive.planner",
+            "success" if reply_sent else "blocked",
+            "" if reply_sent else "planner_no_reply",
+        )
         decision = event.get_extra("astrmai_proactive_dispatch_decision", None)
         if decision is not None:
             if isinstance(decision, dict):
                 decision["reply_sent"] = reply_sent
                 decision["reply_preview"] = reply_preview
                 decision["status"] = "sent" if reply_sent else "skipped"
+                if not reply_sent and not decision.get("blocked_reason"):
+                    decision["blocked_reason"] = "planner_no_reply"
             else:
                 setattr(decision, "reply_sent", reply_sent)
                 setattr(decision, "reply_preview", reply_preview)
                 setattr(decision, "status", "sent" if reply_sent else "skipped")
+                if not reply_sent and not getattr(decision, "blocked_reason", ""):
+                    setattr(decision, "blocked_reason", "planner_no_reply")
         callback = event.get_extra("astrmai_proactive_completion_callback", None)
         if callable(callback):
             try:
@@ -2015,6 +2026,8 @@ class Planner(PlannerPromptContextMixin, PlannerSideInputMixin):
         sender_name = event.get_sender_name() or "群友/用户"
         turn_context = ensure_turn_context(event)
         self._apply_proactive_context(event)
+        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+            append_proactive_stage(event, "proactive.planner", "started")
 
         retrieve_keys = event.get_extra("retrieve_keys", [])
         if not isinstance(retrieve_keys, list):

@@ -36,6 +36,7 @@ from .perception import PerceptionBuilder
 from .thread_builder import build_focus_thread, resolve_thread_root
 from .vision_binding import extract_image_base64, extract_image_base64_from_url
 from .window_buffer import AttentionWindowBuffer
+from ...proactive.dispatcher import append_proactive_stage
 
 
 class _SyntheticExternalEvent(AstrMessageEvent):
@@ -1527,6 +1528,8 @@ class AttentionGate:
                     )
                     if fast_result:
                         return fast_result
+                if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                    append_proactive_stage(event, "proactive.sensor", "blocked", "sensor_filtered")
                 await self._complete_proactive_candidate(event, reason="sensor_filtered")
                 await self._finalize_pre_planner_turn(
                     event,
@@ -1649,6 +1652,7 @@ class AttentionGate:
 
         is_proactive_event = bool(event.get_extra("astrmai_is_proactive_event", False))
         if is_proactive_event:
+            append_proactive_stage(event, "proactive.sensor", "success")
             now = time.time()
             event.set_extra("astrmai_timestamp", now)
             ensure_turn_context(event).perception.timestamp = now
@@ -1690,13 +1694,29 @@ class AttentionGate:
         *,
         is_strong_wakeup: bool,
     ) -> str:
-        decision = await self.decision_router.evaluate(
-            chat_id,
-            focus_event,
-            focus_thread,
-            events,
-            is_strong_wakeup=is_strong_wakeup,
-        )
+        is_proactive = bool(focus_event.get_extra("astrmai_is_proactive_event", False))
+        if is_proactive:
+            append_proactive_stage(focus_event, "proactive.attention", "started")
+        try:
+            decision = await self.decision_router.evaluate(
+                chat_id,
+                focus_event,
+                focus_thread,
+                events,
+                is_strong_wakeup=is_strong_wakeup,
+            )
+        except Exception as exc:
+            if is_proactive:
+                append_proactive_stage(focus_event, "proactive.attention", "error", type(exc).__name__)
+            raise
+        if is_proactive:
+            blocked = decision.action in {"WAIT", "IGNORE"}
+            append_proactive_stage(
+                focus_event,
+                "proactive.attention",
+                "blocked" if blocked else "success",
+                str(decision.reason or decision.action).lower() if blocked else "",
+            )
         return decision.action
 
     async def _send_private_topic_confirmation(

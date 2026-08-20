@@ -15,6 +15,16 @@ from .rhythm import evaluate_proactive_rhythm
 CompletionCallback = Callable[[bool, str], Awaitable[None] | None]
 
 
+def append_proactive_stage(event: Any, stage: str, status: str, reason: str = "") -> None:
+    """Append lifecycle telemetry without allowing observability to affect delivery."""
+    try:
+        ledger = event.get_extra("astrmai_proactive_stage_ledger", None)
+        if isinstance(ledger, list):
+            ledger.append({"stage": str(stage), "status": str(status), "reason": str(reason or ""), "at": time.time()})
+    except Exception:
+        logger.debug("[ProactiveDispatcher] lifecycle telemetry degraded", exc_info=True)
+
+
 @dataclass(slots=True)
 class ProactiveMessageIntent:
     chat_id: str
@@ -505,6 +515,9 @@ class ProactiveDispatcher:
         record_stage("proactive.candidate", "started")
         intent.created_at = intent.created_at or now
         intent.intent_id = self._new_intent_id(intent, now)
+        claim_token = str(intent.metadata.get("claim_token", "") or "")
+        if claim_token:
+            record_stage("proactive.claim", "success")
         allowed, blocked_reason, checks = await self._safety_check(intent, now=now)
         if allowed:
             record_stage("proactive.safety_check", "success")
@@ -525,6 +538,8 @@ class ProactiveDispatcher:
             record_stage("proactive.dispatch", "blocked", blocked_reason)
             await self._sync_history_for_dispatch(intent.intent_id, decision)
             return decision
+
+        record_stage("proactive.sensor", "delegated", "attention_gate")
 
         if on_complete:
             self._callbacks[intent.intent_id] = on_complete

@@ -396,6 +396,12 @@ class PluginRuntimeContext:
             if vector_retriever is not None and hasattr(vector_retriever, "describe_status")
             else {"available": False}
         )
+        attention_router = getattr(self.attention_gate, "decision_router", None)
+        attention_status = (
+            attention_router.describe_status()
+            if attention_router is not None and hasattr(attention_router, "describe_status")
+            else {"available": False}
+        )
         try:
             proactive_status = (
                 self.proactive_task.describe_status()
@@ -461,6 +467,7 @@ class PluginRuntimeContext:
             "memory": {
                 "vector_retrieval": vector_status,
             },
+            "attention": attention_status,
             "proactive": proactive_status,
             "group_reread_observer": reread_status,
         }

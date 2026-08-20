@@ -158,7 +158,10 @@ class MemoryIndexProjector:
                 limit = int(self._config_value("projection_retry_batch_size", 20) or 20)
                 background_budget = getattr(self.engine, "background_task_budget", None)
                 if background_budget is not None:
-                    await background_budget.run(lambda: self.retry_due(limit=limit))
+                    await background_budget.run(
+                        lambda: self.retry_due(limit=limit),
+                        task_name="memory_projection",
+                    )
                 else:
                     await self.retry_due(limit=limit)
                 await asyncio.wait_for(self._retry_stop.wait(), timeout=interval)

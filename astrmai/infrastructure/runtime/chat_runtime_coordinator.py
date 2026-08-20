@@ -38,7 +38,9 @@ class ActivityRecord:
 @dataclass
 class ChatRuntimeState:
     sys2_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    sys2_thread_locks: Dict[str, asyncio.Lock] = field(default_factory=dict)
     executor_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    executor_thread_locks: Dict[str, asyncio.Lock] = field(default_factory=dict)
     executor_pending: int = 0
     wait_targets: List[str] = field(default_factory=list)
     wait_target_name: str = ""
@@ -74,11 +76,22 @@ class ChatRuntimeCoordinator:
                 self._states[chat_id] = ChatRuntimeState()
             return self._states[chat_id]
 
-    async def get_sys2_lock(self, chat_id: str) -> asyncio.Lock:
+    async def get_sys2_lock(self, chat_id: str, thread_id: str = "") -> asyncio.Lock:
         state = await self._get_state(chat_id)
-        return state.sys2_lock
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            return state.sys2_lock
+        async with self._lock:
+            if normalized_thread_id not in state.sys2_thread_locks and len(state.sys2_thread_locks) >= self.MAX_THREAD_GENERATIONS_PER_CHAT:
+                state.sys2_thread_locks.pop(next(iter(state.sys2_thread_locks)), None)
+            return state.sys2_thread_locks.setdefault(normalized_thread_id, asyncio.Lock())
 
-    async def try_acquire_executor(self, chat_id: str, max_pending: int = 2) -> Optional[asyncio.Lock]:
+    async def try_acquire_executor(
+        self,
+        chat_id: str,
+        max_pending: int = 2,
+        thread_id: str = "",
+    ) -> Optional[asyncio.Lock]:
         async with self._lock:
             if self._shutdown:
                 return None
@@ -86,7 +99,16 @@ class ChatRuntimeCoordinator:
             if state.executor_pending >= max_pending:
                 return None
             state.executor_pending += 1
-            executor_lock = state.executor_lock
+            normalized_thread_id = str(thread_id or "").strip()
+            if normalized_thread_id:
+                if normalized_thread_id not in state.executor_thread_locks and len(state.executor_thread_locks) >= self.MAX_THREAD_GENERATIONS_PER_CHAT:
+                    state.executor_thread_locks.pop(next(iter(state.executor_thread_locks)), None)
+                executor_lock = state.executor_thread_locks.setdefault(
+                    normalized_thread_id,
+                    asyncio.Lock(),
+                )
+            else:
+                executor_lock = state.executor_lock
         try:
             await executor_lock.acquire()
         except asyncio.CancelledError:
@@ -97,14 +119,19 @@ class ChatRuntimeCoordinator:
             raise
         return executor_lock
 
-    async def release_executor(self, chat_id: str) -> None:
+    async def release_executor(self, chat_id: str, thread_id: str = "") -> None:
         executor_lock: Optional[asyncio.Lock] = None
         async with self._lock:
             state = self._states.get(chat_id)
             if not state:
                 return
             state.executor_pending = max(0, state.executor_pending - 1)
-            executor_lock = state.executor_lock
+            normalized_thread_id = str(thread_id or "").strip()
+            executor_lock = (
+                state.executor_thread_locks.get(normalized_thread_id)
+                if normalized_thread_id
+                else state.executor_lock
+            )
         if executor_lock is not None and executor_lock.locked():
             executor_lock.release()
 

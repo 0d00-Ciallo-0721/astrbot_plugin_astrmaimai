@@ -19,8 +19,15 @@ class System2Runner:
         self.runtime = runtime
         self.followup_manager = FollowupManager(runtime)
 
-    async def get_sys2_lock(self, chat_id: str):
-        return await self.runtime.runtime_coordinator.get_sys2_lock(chat_id)
+    async def get_sys2_lock(self, chat_id: str, thread_id: str = ""):
+        getter = self.runtime.runtime_coordinator.get_sys2_lock
+        try:
+            lock = await getter(chat_id, thread_id=thread_id)
+            self._last_lock_scope = "thread" if thread_id else "chat_fallback"
+            return lock
+        except TypeError:
+            self._last_lock_scope = "chat"
+            return await getter(chat_id)
 
     def _prepare_queue_events(self, main_event, events_to_process: list | None) -> list:
         return events_to_process.copy() if isinstance(events_to_process, list) and events_to_process else [main_event]
@@ -61,8 +68,20 @@ class System2Runner:
                 raise asyncio.TimeoutError
             await asyncio.wait_for(
                 self.runtime.lane_manager.ensure_lane(
-                    lane_key=LaneKey(subsystem="sys2", task_family="dialog", scope_id=chat_id),
-                    base_origin=chat_id,
+                    lane_key=LaneKey(
+                        subsystem="sys2",
+                        task_family="dialog",
+                        scope_id=(
+                            f"{chat_id}#thread:{self._turn_thread_id(main_event)}"
+                            if getattr(main_event.get_extra("astrmai_turn_identity", None), "thread_id", "")
+                            else chat_id
+                        ),
+                    ),
+                    base_origin=(
+                        f"{chat_id}@@thread:{self._turn_thread_id(main_event)}"
+                        if getattr(main_event.get_extra("astrmai_turn_identity", None), "thread_id", "")
+                        else chat_id
+                    ),
                 ),
                 timeout=max(0.1, timeout_sec),
             )
@@ -121,7 +140,9 @@ class System2Runner:
 
     async def run(self, main_event, events_to_process: list | None = None):
         chat_id = main_event.unified_msg_origin
-        lock = await self.get_sys2_lock(chat_id)
+        thread_id = self._turn_thread_id(main_event)
+        lock = await self.get_sys2_lock(chat_id, thread_id)
+        lock_scope = str(getattr(self, "_last_lock_scope", "thread" if thread_id else "chat_fallback"))
         queue_events = self._prepare_queue_events(main_event, events_to_process)
         debug_trace(main_event, "system2.enter", chat_id=chat_id, queue_size=len(queue_events))
         logger.debug(f"[{chat_id}] System 2 request queued and waiting for execution slot.")
@@ -133,7 +154,7 @@ class System2Runner:
             metadata={
                 "chat_id": str(chat_id or ""),
                 "thread_id": self._turn_thread_id(main_event),
-                "lock_scope": "chat",
+                "lock_scope": lock_scope,
                 "queue_size": len(queue_events),
             },
         )

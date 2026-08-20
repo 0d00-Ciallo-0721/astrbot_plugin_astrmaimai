@@ -47,6 +47,20 @@ class AttentionDecisionRouter:
         self._participation_states: dict[str, ParticipationState] = {}
         self._judge_ignore_cache: dict[str, tuple[float, str, int]] = {}
         self._ambient_ignore_cache: dict[str, float] = {}
+        self._diagnostic_counts: dict[str, int] = {}
+
+    def _count(self, name: str, amount: int = 1) -> None:
+        key = str(name or "unknown")
+        self._diagnostic_counts[key] = self._diagnostic_counts.get(key, 0) + int(amount or 0)
+
+    def describe_status(self) -> dict[str, Any]:
+        self._prune_ignore_caches()
+        return {
+            "counts": dict(self._diagnostic_counts),
+            "judge_ignore_cache_size": len(self._judge_ignore_cache),
+            "ambient_ignore_cache_size": len(self._ambient_ignore_cache),
+            "participation_state_count": len(self._participation_states),
+        }
 
     @staticmethod
     def _consume_background_result(task: asyncio.Task) -> None:
@@ -642,7 +656,9 @@ class AttentionDecisionRouter:
                 is_strong_wakeup=is_strong_wakeup,
             )
         self._record_prefilter(focus_event, prefilter)
+        self._count(f"prefilter_{prefilter.action.lower()}")
         if prefilter.action == "FORCE_PASS":
+            self._count("judge_avoided_force_pass")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_avoided", True)
             return AttentionDecision(
@@ -651,6 +667,7 @@ class AttentionDecisionRouter:
                 reason=f"prefilter:{prefilter.reason}",
             )
         if prefilter.action == "DROP":
+            self._count("judge_avoided_drop")
             if focus_event is not None and hasattr(focus_event, "set_extra"):
                 focus_event.set_extra("astrmai_judge_avoided", True)
             return AttentionDecision(
@@ -659,8 +676,10 @@ class AttentionDecisionRouter:
                 reason=f"prefilter:{prefilter.reason}",
             )
         if self._cached_judge_ignore(chat_id, focus_event, focus_thread):
+            self._count("judge_avoided_exact_cache")
             return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="judge_ignore_cache")
         if self._cached_ambient_ignore(chat_id, focus_event, focus_thread):
+            self._count("judge_avoided_ambient_cache")
             return AttentionDecision(action="IGNORE", raw_action="IGNORE", reason="judge_ambient_cooldown")
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_avoided", False)
@@ -725,6 +744,7 @@ class AttentionDecisionRouter:
             )
 
         judge_evaluate = self.gate.judge.evaluate
+        self._count("judge_called")
         if self._judge_supports_context_kwargs(judge_evaluate):
             judge_coroutine = judge_evaluate(
                 chat_id,
@@ -780,6 +800,7 @@ class AttentionDecisionRouter:
                 reason="judge_empty_response",
             )
         raw_action = str(getattr(result, "action", "PASS") or "PASS").upper()
+        self._count(f"judge_action_{raw_action.lower()}")
         if focus_event is not None and hasattr(focus_event, "set_extra"):
             focus_event.set_extra("astrmai_judge_outcome", raw_action.lower())
         if participation_result is not None:
@@ -788,6 +809,11 @@ class AttentionDecisionRouter:
                 shadow_action=participation_result.action,
                 judge_action=raw_action,
             )
+            agreement = focus_event.get_extra("astrmai_prefilter_judge_agreement", None) if hasattr(focus_event, "get_extra") else None
+            if agreement is True:
+                self._count("prefilter_judge_agreement_true")
+            elif agreement is False:
+                self._count("prefilter_judge_agreement_false")
         self._consecutive_timeouts = 0  # 重置计数器
         if raw_action in {"WAIT", "IGNORE", "TOOL_CALL"}:
             if raw_action == "IGNORE":

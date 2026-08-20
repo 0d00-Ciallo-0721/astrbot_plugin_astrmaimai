@@ -807,8 +807,12 @@ class PluginFacade(RuntimeFacadeProtocol):
                 chat_id,
             )
 
-    async def _get_sys2_lock(self, chat_id: str):
-        return await self.runtime.runtime_coordinator.get_sys2_lock(chat_id)
+    async def _get_sys2_lock(self, chat_id: str, thread_id: str = ""):
+        getter = self.runtime.runtime_coordinator.get_sys2_lock
+        try:
+            return await getter(chat_id, thread_id=thread_id)
+        except TypeError:
+            return await getter(chat_id)
 
     async def _system2_entry(self, main_event, events_to_process: list | None = None):
         runner = self.runtime.system2_runner

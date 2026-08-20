@@ -104,6 +104,7 @@ class ConcurrentExecutor:
         self.image_resolver = image_resolver
         self.reread_action_dispatcher = None
         self._chat_locks = {}
+        self._chat_thread_locks = {}
         self._chat_pending_count = {}
         self._global_lock = asyncio.Lock()
         self._native_vision_breakers: dict[str, float] = {}
@@ -814,15 +815,21 @@ class ConcurrentExecutor:
 
     async def _acquire_chat_execution_lock(self, chat_id: str, event: AstrMessageEvent | None = None):
         timeout_sec = self._executor_lock_wait_timeout(event) if event is not None else 15.0
+        thread_id = self._turn_thread_id(event) if event is not None else ""
         using_runtime_coordinator = self.runtime_coordinator is not None
         if using_runtime_coordinator:
             if timeout_sec <= 0.0:
                 return None, True, "queue_timeout"
             try:
-                chat_lock = await asyncio.wait_for(
-                    self.runtime_coordinator.try_acquire_executor(chat_id, max_pending=2),
-                    timeout=max(0.1, timeout_sec),
-                )
+                try:
+                    acquire = self.runtime_coordinator.try_acquire_executor(
+                        chat_id,
+                        max_pending=2,
+                        thread_id=thread_id,
+                    )
+                except TypeError:
+                    acquire = self.runtime_coordinator.try_acquire_executor(chat_id, max_pending=2)
+                chat_lock = await asyncio.wait_for(acquire, timeout=max(0.1, timeout_sec))
             except asyncio.TimeoutError:
                 return None, True, "queue_timeout"
             if chat_lock is None:
@@ -836,7 +843,13 @@ class ConcurrentExecutor:
             if self._chat_pending_count[chat_id] >= 2:
                 return None, False, "too_many_pending"
             self._chat_pending_count[chat_id] += 1
-            chat_lock = self._chat_locks[chat_id]
+            if not hasattr(self, "_chat_thread_locks"):
+                self._chat_thread_locks = {}
+            if thread_id:
+                thread_locks = self._chat_thread_locks.setdefault(chat_id, {})
+                chat_lock = thread_locks.setdefault(thread_id, asyncio.Lock())
+            else:
+                chat_lock = self._chat_locks[chat_id]
         if timeout_sec <= 0.0:
             acquired = False
         else:
@@ -859,16 +872,22 @@ class ConcurrentExecutor:
         chat_id: str,
         using_runtime_coordinator: bool,
         chat_lock: Optional[asyncio.Lock],
+        event: AstrMessageEvent | None = None,
     ) -> None:
         if chat_lock is not None and chat_lock.locked():
             chat_lock.release()
         if using_runtime_coordinator:
-            await self.runtime_coordinator.release_executor(chat_id)
+            thread_id = self._turn_thread_id(event) if event is not None else ""
+            try:
+                await self.runtime_coordinator.release_executor(chat_id, thread_id=thread_id)
+            except TypeError:
+                await self.runtime_coordinator.release_executor(chat_id)
             return
         async with self._global_lock:
             self._chat_pending_count[chat_id] -= 1
             if self._chat_pending_count[chat_id] == 0:
                 self._chat_locks.pop(chat_id, None)
+                getattr(self, "_chat_thread_locks", {}).pop(chat_id, None)
                 self._chat_pending_count.pop(chat_id, None)
 
     @staticmethod
@@ -2228,7 +2247,7 @@ class ConcurrentExecutor:
             metadata={
                 "chat_id": str(chat_id or ""),
                 "thread_id": self._turn_thread_id(event),
-                "lock_scope": "chat",
+                "lock_scope": "thread" if self._turn_thread_id(event) else "chat_fallback",
             },
         )
         try:
@@ -2379,7 +2398,7 @@ class ConcurrentExecutor:
                 if hasattr(event, "_is_final_reply_phase"):
                     delattr(event, "_is_final_reply_phase")
         finally:
-            await self._release_chat_execution_lock(chat_id, using_runtime_coordinator, chat_lock)
+            await self._release_chat_execution_lock(chat_id, using_runtime_coordinator, chat_lock, event)
     async def _handle_fatal_fallback(self, event: AstrMessageEvent, chat_id: str, error_detail: str) -> Optional[str]:
         logger.error(f"[{chat_id}] fatal executor fallback triggered")
         if "required_tool_not_called:" in str(error_detail or ""):

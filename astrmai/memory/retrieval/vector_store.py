@@ -50,6 +50,8 @@ class VectorRetriever:
         self._half_open_probe_active = False
         self._status_counts: Dict[str, int] = {}
         self._last_stage_timings: Dict[str, float] = {}
+        self._timeout_origin_counts: Dict[str, int] = {}
+        self._stage_latency_samples: Dict[str, list[float]] = {}
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -362,7 +364,28 @@ class VectorRetriever:
             "degraded_queries": int(degraded),
             "degraded_ratio": round(degraded / total, 4) if total else 0.0,
             "status_counts": dict(self._status_counts),
+            "timeout_origin_counts": dict(self._timeout_origin_counts),
+            "stage_latency_ms": {
+                stage: self._latency_summary(samples)
+                for stage, samples in self._stage_latency_samples.items()
+            },
             "last_stage_timings": dict(self._last_stage_timings),
+        }
+
+    @staticmethod
+    def _latency_summary(samples: list[float]) -> Dict[str, float | int]:
+        if not samples:
+            return {"count": 0, "avg": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+        ordered = sorted(float(value) for value in samples)
+        def percentile(ratio: float) -> float:
+            index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * ratio)))
+            return round(ordered[index], 1)
+        return {
+            "count": len(ordered),
+            "avg": round(sum(ordered) / len(ordered), 1),
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "max": round(ordered[-1], 1),
         }
 
     @staticmethod
@@ -448,6 +471,23 @@ class VectorRetriever:
         normalized_status = str(status or "unknown")
         self._status_counts[normalized_status] = self._status_counts.get(normalized_status, 0) + 1
         self._last_stage_timings = dict(stage_timings or {})
+        normalized_origin = str(timeout_origin or "").strip()
+        if normalized_origin:
+            self._timeout_origin_counts[normalized_origin] = (
+                self._timeout_origin_counts.get(normalized_origin, 0) + 1
+            )
+        for stage, value in (stage_timings or {}).items():
+            if not str(stage).endswith("_ms"):
+                continue
+            samples = self._stage_latency_samples.setdefault(str(stage), [])
+            samples.append(round(max(0.0, float(value or 0.0)), 1))
+            if len(samples) > 512:
+                del samples[:-512]
+        if query_queue_wait_ms:
+            queue_samples = self._stage_latency_samples.setdefault("query_queue_wait_ms", [])
+            queue_samples.append(round(max(0.0, float(query_queue_wait_ms)), 1))
+            if len(queue_samples) > 512:
+                del queue_samples[:-512]
         if observation is None:
             return
         cooldown_remaining = max(0.0, self._unavailable_until - time.monotonic())

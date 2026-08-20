@@ -414,7 +414,8 @@ class MemoryTurnPipeline:
                         lambda: self.session_summarizer.summarize_session(
                             session_id=chat_id,
                             chat_history_text=history_text,
-                        )
+                        ),
+                        task_name="memory_maintenance",
                     )
                 else:
                     await self.session_summarizer.summarize_session(

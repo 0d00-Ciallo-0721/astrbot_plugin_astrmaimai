@@ -75,7 +75,7 @@ class PersonaSummarizer:
         budget = self.background_task_budget
         if budget is None:
             return await awaitable_factory()
-        return await budget.run(awaitable_factory)
+        return await budget.run(awaitable_factory, task_name="persona")
 
     @classmethod
     def normalize_structured_core(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
