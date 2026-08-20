@@ -539,6 +539,8 @@ class ProactiveDispatcher:
             await self._sync_history_for_dispatch(intent.intent_id, decision)
             return decision
 
+        if not claim_token:
+            record_stage("proactive.claim", "not_required", "claim_token_absent")
         record_stage("proactive.sensor", "delegated", "attention_gate")
 
         if on_complete:

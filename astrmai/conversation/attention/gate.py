@@ -107,6 +107,7 @@ class AttentionGate:
         chat_loop_kernel=None,
         conversation_continuity=None,
         turn_trace_callback=None,
+        background_task_budget=None,
     ):
         self.state_engine = state_engine
         self.judge = judge
@@ -122,6 +123,7 @@ class AttentionGate:
         self.chat_loop_kernel = chat_loop_kernel
         self.conversation_continuity = conversation_continuity
         self.turn_trace_callback = turn_trace_callback
+        self.background_task_budget = background_task_budget
         self._proactive_injection_lock: dict[str, asyncio.Lock] = {}
         self._proactive_dispatching: dict[str, bool] = {}
         self._deferred_messages: dict[str, list] = {}  # ponytail: R12 — queue blocked messages
@@ -466,12 +468,18 @@ class AttentionGate:
             raise
 
     async def _run_background_task(self, coro, event=None):
-        if event is not None:
-            return await self._run_managed_system2_task(
-                self._run_background_slot(coro, event),
-                event,
-            )
-        return await self._run_background_slot(coro)
+        async def _run() -> Any:
+            if event is not None:
+                return await self._run_managed_system2_task(
+                    self._run_background_slot(coro, event),
+                    event,
+                )
+            return await self._run_background_slot(coro)
+
+        budget = getattr(self, "background_task_budget", None)
+        if budget is not None:
+            return await budget.run(_run, task_name="attention")
+        return await _run()
 
     def _fire_background_task(self, coro, event=None):
         task = asyncio.create_task(self._run_background_task(coro, event))
@@ -1237,6 +1245,20 @@ class AttentionGate:
             return
         if bool(event.get_extra("astrmai_proactive_completed", False)):
             return
+        ledger = event.get_extra("astrmai_proactive_stage_ledger", [])
+        normalized_reason = str(reason or "proactive_candidate_skipped")
+        if not any(
+            isinstance(item, dict)
+            and item.get("status") in {"blocked", "error", "cancelled"}
+            and item.get("stage") in {"proactive.sensor", "proactive.attention", "proactive.planner"}
+            for item in list(ledger or [])
+        ):
+            stage = (
+                "proactive.attention"
+                if normalized_reason in {"proactive_judge_wait", "proactive_judge_ignore"}
+                else "proactive.sensor"
+            )
+            append_proactive_stage(event, stage, "blocked", normalized_reason)
         event.set_extra("astrmai_proactive_completed", True)
         decision = event.get_extra("astrmai_proactive_dispatch_decision", None)
         if decision is not None:
@@ -1244,12 +1266,12 @@ class AttentionGate:
                 decision["reply_sent"] = False
                 decision["reply_preview"] = ""
                 decision["status"] = "skipped"
-                decision["blocked_reason"] = str(reason or "proactive_candidate_skipped")
+                decision["blocked_reason"] = normalized_reason
             else:
                 setattr(decision, "reply_sent", False)
                 setattr(decision, "reply_preview", "")
                 setattr(decision, "status", "skipped")
-                setattr(decision, "blocked_reason", str(reason or "proactive_candidate_skipped"))
+                setattr(decision, "blocked_reason", normalized_reason)
         callback = event.get_extra("astrmai_proactive_completion_callback", None)
         if callable(callback):
             try:
@@ -1480,12 +1502,16 @@ class AttentionGate:
             return "PROACTIVE_BLOCKED"
 
         if not self._claim_message(event):
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                append_proactive_stage(event, "proactive.sensor", "blocked", "duplicate_event")
             return "DUPLICATED"
 
         private_ingress = not bool(event.get_group_id())
         sensor_checked = False
         if private_ingress:
             if not await self._passes_sensor_filters(event, str(getattr(event, "message_str", "") or "")):
+                if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                    append_proactive_stage(event, "proactive.sensor", "blocked", "sensor_filtered")
                 return "FILTERED"
             sensor_checked = True
 
@@ -1527,6 +1553,8 @@ class AttentionGate:
                         rejected_perception.is_strong_wakeup,
                     )
                     if fast_result:
+                        if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                            append_proactive_stage(event, "proactive.attention", "success", "fast_wakeup")
                         return fast_result
                 if bool(event.get_extra("astrmai_is_proactive_event", False)):
                     append_proactive_stage(event, "proactive.sensor", "blocked", "sensor_filtered")
@@ -1575,6 +1603,8 @@ class AttentionGate:
 
         forced = await self._handle_force_engage(event, chat_id)
         if forced:
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                append_proactive_stage(event, "proactive.attention", "success", "force_engage")
             return forced
 
         if is_direct:
@@ -1586,6 +1616,8 @@ class AttentionGate:
 
         fast_result = None if is_private else await self._handle_fast_wakeup(event, chat_id, is_strong_wakeup)
         if fast_result:
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                append_proactive_stage(event, "proactive.attention", "success", "fast_wakeup")
             return fast_result
 
         if self._should_ignore_passive_group_image(
@@ -1594,6 +1626,9 @@ class AttentionGate:
             extracted_images,
             is_strong_wakeup,
         ):
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                append_proactive_stage(event, "proactive.sensor", "success")
+                append_proactive_stage(event, "proactive.attention", "blocked", "passive_group_image")
             await self._complete_proactive_candidate(event, reason="passive_group_image")
             await self._finalize_pre_planner_turn(
                 event,
@@ -1632,6 +1667,8 @@ class AttentionGate:
 
         throttle_result = self._should_skip_by_throttle(msg_str, extracted_images, chat_state, chat_id, is_private, is_strong_wakeup)
         if throttle_result:
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                append_proactive_stage(event, "proactive.attention", "blocked", str(throttle_result).lower())
             await self._complete_proactive_candidate(event, reason=str(throttle_result or "throttled").lower())
             await self._finalize_pre_planner_turn(
                 event,
@@ -1642,6 +1679,8 @@ class AttentionGate:
 
         repeater_result = self._handle_repeater_echo(session, is_private, extracted_images, msg_str)
         if repeater_result:
+            if bool(event.get_extra("astrmai_is_proactive_event", False)):
+                append_proactive_stage(event, "proactive.attention", "blocked", str(repeater_result).lower())
             await self._complete_proactive_candidate(event, reason=repeater_result)
             await self._finalize_pre_planner_turn(
                 event,

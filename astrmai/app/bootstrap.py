@@ -94,6 +94,14 @@ class PluginBootstrap:
                     )
                     or 120.0
                 ),
+                execution_timeout_sec=float(
+                    getattr(
+                        getattr(self.config, "infra", None),
+                        "background_task_execution_timeout_sec",
+                        300.0,
+                    )
+                    or 300.0
+                ),
             ),
         )
         runtime.set_boot_phase("bootstrap.logging")
@@ -487,6 +495,7 @@ class PluginBootstrap:
                 "record_turn_trace",
                 None,
             ),
+            background_task_budget=getattr(runtime, "background_task_budget", None),
         )
         return InteractionServices(
             frequency_controller=frequency_controller,

@@ -550,6 +550,7 @@ class InfraConfig(BaseModel):
     background_task_concurrency: int = Field(default=2, ge=1, le=8, description="受预算后台任务并发上限")
     background_task_queue_limit: int = Field(default=64, ge=0, le=2048, description="受预算后台任务排队上限")
     background_task_wait_timeout_sec: float = Field(default=120.0, ge=0.1, le=3600.0, description="受预算后台任务最长排队时间")
+    background_task_execution_timeout_sec: float = Field(default=300.0, ge=0.1, le=7200.0, description="单个后台任务最长执行时间，超时后强制取消")
     critical_path_reserved_slots: int = Field(
         default=1,
         ge=0,

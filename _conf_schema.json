@@ -2249,6 +2249,14 @@
         "maximum": 3600.0,
         "hint": "后台任务等待执行名额超过该时间后会放弃本次运行，避免过期任务在拥堵解除后集中启动。"
       },
+      "background_task_execution_timeout_sec": {
+        "description": "单个后台任务最长执行时间（秒）",
+        "type": "float",
+        "default": 300.0,
+        "minimum": 0.1,
+        "maximum": 7200.0,
+        "hint": "任务获得执行名额后超过该时间会被取消并记录为执行超时，避免慢模型或慢网络长期占满后台预算。"
+      },
       "critical_path_reserved_slots": {
         "description": "回复链保留并发槽位",
         "type": "int",

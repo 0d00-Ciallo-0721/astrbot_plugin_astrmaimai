@@ -196,6 +196,9 @@ class PluginRuntimeContext:
                 wait_timeout_sec=float(
                     getattr(infra, "background_task_wait_timeout_sec", 120.0) or 120.0
                 ),
+                execution_timeout_sec=float(
+                    getattr(infra, "background_task_execution_timeout_sec", 300.0) or 300.0
+                ),
             )
 
     def set_boot_phase(self, phase: str) -> None:

@@ -52,6 +52,7 @@ class VectorRetriever:
         self._last_stage_timings: Dict[str, float] = {}
         self._timeout_origin_counts: Dict[str, int] = {}
         self._stage_latency_samples: Dict[str, list[float]] = {}
+        self._index_lock_wait_samples: list[float] = []
 
     def _timing_value(self, name: str, default: float) -> float:
         timing = getattr(self.config, "timing", None)
@@ -124,7 +125,10 @@ class VectorRetriever:
     def _search_index_sync(self, vector: np.ndarray, k: int):
         import faiss
 
-        with self._index_lock:
+        lock_started = time.monotonic()
+        self._index_lock.acquire()
+        self._record_index_lock_wait((time.monotonic() - lock_started) * 1000.0)
+        try:
             self._active_index_jobs += 1
             try:
                 faiss.omp_set_num_threads(self._faiss_thread_count())
@@ -132,12 +136,17 @@ class VectorRetriever:
                 return self.faiss_db.embedding_storage.index.search(vector, k)
             finally:
                 self._active_index_jobs = max(0, self._active_index_jobs - 1)
+        finally:
+            self._index_lock.release()
 
     def _insert_index_sync(self, vector: np.ndarray, doc_id: int) -> None:
         import faiss
 
         storage = self.faiss_db.embedding_storage
-        with self._index_lock:
+        lock_started = time.monotonic()
+        self._index_lock.acquire()
+        self._record_index_lock_wait((time.monotonic() - lock_started) * 1000.0)
+        try:
             self._active_index_jobs += 1
             try:
                 storage.index.add_with_ids(
@@ -148,12 +157,17 @@ class VectorRetriever:
                     faiss.write_index(storage.index, storage.path)
             finally:
                 self._active_index_jobs = max(0, self._active_index_jobs - 1)
+        finally:
+            self._index_lock.release()
 
     def _delete_index_sync(self, doc_id: int) -> None:
         import faiss
 
         storage = self.faiss_db.embedding_storage
-        with self._index_lock:
+        lock_started = time.monotonic()
+        self._index_lock.acquire()
+        self._record_index_lock_wait((time.monotonic() - lock_started) * 1000.0)
+        try:
             self._active_index_jobs += 1
             try:
                 storage.index.remove_ids(np.array([doc_id], dtype=np.int64))
@@ -161,6 +175,13 @@ class VectorRetriever:
                     faiss.write_index(storage.index, storage.path)
             finally:
                 self._active_index_jobs = max(0, self._active_index_jobs - 1)
+        finally:
+            self._index_lock.release()
+
+    def _record_index_lock_wait(self, wait_ms: float) -> None:
+        self._index_lock_wait_samples.append(round(max(0.0, float(wait_ms or 0.0)), 1))
+        if len(self._index_lock_wait_samples) > 512:
+            del self._index_lock_wait_samples[:-512]
 
     async def _run_index_job(self, func, *args):
         loop = asyncio.get_running_loop()
@@ -369,8 +390,42 @@ class VectorRetriever:
                 stage: self._latency_summary(samples)
                 for stage, samples in self._stage_latency_samples.items()
             },
+            "index_lock_wait_ms": self._latency_summary(self._index_lock_wait_samples),
+            "index_ntotal": self._index_count(),
+            "document_storage_count": self._document_storage_count(),
             "last_stage_timings": dict(self._last_stage_timings),
         }
+
+    def _index_count(self) -> int | None:
+        index = getattr(getattr(self.faiss_db, "embedding_storage", None), "index", None)
+        try:
+            value = getattr(index, "ntotal", None)
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _document_storage_count(self) -> int | None:
+        storage = getattr(self.faiss_db, "document_storage", None)
+        for name in ("count_documents", "count", "document_count", "size"):
+            value = getattr(storage, name, None)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        for name in ("documents", "_documents"):
+            value = getattr(storage, name, None)
+            if value is not None:
+                try:
+                    return len(value)
+                except TypeError:
+                    pass
+        return None
 
     @staticmethod
     def _latency_summary(samples: list[float]) -> Dict[str, float | int]:

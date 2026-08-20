@@ -6,6 +6,7 @@ from unittest.mock import patch
 from astrmai.app.runtime_context import PluginRuntimeContext
 from astrmai.infrastructure.runtime.background_task_budget import (
     BackgroundTaskBudget,
+    BackgroundTaskExecutionTimeout,
     BackgroundTaskQueueFull,
     BackgroundTaskQueueTimeout,
 )
@@ -347,6 +348,23 @@ class BackgroundTaskBudgetTests(unittest.TestCase):
 
         self.assertEqual(status["active_queries"], 1)
         self.assertEqual(status["degraded_ratio"], 0.25)
+
+    def test_task_kind_records_duration_failure_and_execution_timeout(self):
+        async def run():
+            budget = BackgroundTaskBudget(1, execution_timeout_sec=0.1)
+
+            async def slow_task():
+                await asyncio.sleep(0.2)
+
+            with self.assertRaises(BackgroundTaskExecutionTimeout):
+                await budget.run(slow_task, task_name="embedding")
+
+            status = budget.status()
+            self.assertEqual(status["execution_timed_out_by_kind"], {"embedding": 1})
+            self.assertEqual(status["completed_by_kind"], {"embedding": 1})
+            self.assertIn("embedding", status["duration_ms_by_kind"])
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
